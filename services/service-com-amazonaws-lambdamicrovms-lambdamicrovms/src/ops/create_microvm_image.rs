@@ -259,7 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `clientToken`: "If you retry a request that completed successfully using the
         // same client token, the operation returns the successful response without
         // performing any further actions."
-        if let Some((image, version)) = replayed(&store, input.client_token.as_deref()) {
+        if let Some((image, version)) = replayed(&store, &region, input.client_token.as_deref()) {
             return Ok(output_of(image, version));
         }
 
@@ -292,7 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(image_id) => crate::state::is_published_managed_base_image(image_id),
             None => {
                 !crate::state::is_own_microvm_image_arn(&input.base_image_arn)
-                    || store.image(&input.base_image_arn).is_some()
+                    || store.image(&region, &input.base_image_arn).is_some()
             }
         };
         if !base_image_resolves {
@@ -309,22 +309,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ValidationException` naming the taken name (recorded AWS behaviour), not
         // with the `ConflictException` its model also declares — and it answers it
         // only once the request itself and the references it names have been found
-        // good, so a caller whose request is wrong is never told to rename.
-        if store.images.contains_key(&input.name) {
+        // good, so a caller whose request is wrong is never told to rename. The name is
+        // taken within the REGION the request was signed for, which is the one endpoint
+        // the image it would name can be addressed through.
+        if store.image_named(&region, &input.name).is_some() {
             return Err(CreateMicrovmImageErrorModeled::ValidationException(ValidationException {
                 message: Some(crate::state::image_name_conflict_message(&input.name)),
             })
             .into());
         }
 
-        // The account's image quota: the modelled 402 rather than an unbounded store.
-        if store.images.len() >= crate::state::MAX_MICROVM_IMAGES {
+        // The account's image quota in this region: the modelled 402 rather than an
+        // unbounded store.
+        if store.image_count(&region) >= crate::state::MAX_MICROVM_IMAGES {
             return Err(CreateMicrovmImageErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: Some(format!(
                         "this account already holds its limit of {} MicroVM images",
                         crate::state::MAX_MICROVM_IMAGES
                     )),
+                    resource_id: Some(input.name.clone()),
+                    resource_type: Some("MicrovmImage".to_string()),
+                    service_code: Some("lambda".to_string()),
+                    quota_code: None,
+                },
+            )
+            .into());
+        }
+
+        // The store's REGION quota: the region a record is held under comes from the
+        // request's own credential scope, so opening one more partition than the store
+        // keeps is the same modelled 402 rather than an unbounded store
+        // (`crate::state::MAX_REGIONS`).
+        if store.would_open_region(&region) {
+            return Err(CreateMicrovmImageErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(crate::state::too_many_regions_message()),
                     resource_id: Some(input.name.clone()),
                     resource_type: Some("MicrovmImage".to_string()),
                     service_code: Some("lambda".to_string()),
@@ -359,7 +379,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //   which is this service's own CloudWatch log group for the image when the
         //   caller names neither arm of the union.
         let base_image_version = Some(input.base_image_version.unwrap_or_else(|| {
-            store.resolve_base_image_version(&input.base_image_arn)
+            store.resolve_base_image_version(&region, &input.base_image_arn)
         }));
         // The resolution is shared with every other operation that mints a version, so
         // the records a create and an update persist cannot disagree about it.
@@ -413,9 +433,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut versions = ::std::collections::BTreeMap::new();
         versions.insert(image_version.clone(), version);
 
-        store.arn_index.insert(image_arn.clone(), input.name.clone());
-        store.images.insert(
-            input.name.clone(),
+        store.insert_image(
+            &region,
             MicrovmImage {
                 // The image's own identity, minted once with the record: the handle a
                 // client stores for the image it just created and joins every later
@@ -435,6 +454,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         if let Some(token) = input.client_token {
             store.record_minted(
+                &region,
                 "CreateMicrovmImage",
                 &token,
                 MintedResource::Image {
@@ -446,7 +466,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The response is the PERSISTED record, read back out of the store.
-        let Some((image, version)) = stored(&store, &input.name, &image_version) else {
+        let Some((image, version)) = stored(&store, &region, &input.name, &image_version) else {
             return Err(unavailable());
         };
         Ok(output_of(image, version))
@@ -469,26 +489,28 @@ fn unavailable() -> CreateMicrovmImageError {
 /// differs is answered with the original record rather than with an unmodelled error.
 fn replayed<'a>(
     store: &'a ServiceState,
+    region: &str,
     client_token: Option<&str>,
 ) -> Option<(&'a MicrovmImage, &'a MicrovmImageVersion)> {
     let MintedResource::Image {
         image_arn,
         image_version,
-    } = store.minted_by("CreateMicrovmImage", client_token)?
+    } = store.minted_by(region, "CreateMicrovmImage", client_token)?
     else {
         return None;
     };
-    let image = store.image(image_arn)?;
+    let image = store.image(region, image_arn)?;
     Some((image, image.versions.get(image_version)?))
 }
 
-/// The persisted image named `name` together with one of its versions.
+/// The persisted image named `name` in `region` together with one of its versions.
 fn stored<'a>(
     store: &'a ServiceState,
+    region: &str,
     name: &str,
     image_version: &str,
 ) -> Option<(&'a MicrovmImage, &'a MicrovmImageVersion)> {
-    let image = store.images.get(name)?;
+    let image = store.image_named(region, name)?;
     Some((image, image.versions.get(image_version)?))
 }
 

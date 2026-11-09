@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
 
         let after = match input.next_token.as_deref() {
             Some(token) => Some(decode_token(token)?),
@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::is_managed_microvm_image_arn(&input.image_identifier) {
             return Err(ListMicrovmImageVersionsErrorModeled::AccessDeniedException(
                 AccessDeniedException {
-                    message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+                    message: Some(crate::state::access_denied_message()),
                 },
             )
             .into());
@@ -221,8 +221,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // identifier this API can address is a request that can NEVER succeed (400),
         // and only a well-formed identifier naming no image of this account is the
         // not-yet-created condition a poll may retry (404).
-        let image = match store.resolve_image_reference(&input.image_identifier) {
-            crate::state::ImageReference::Resolved(name) => store.images.get(&name),
+        let image = match store.resolve_image_reference(&region, &input.image_identifier) {
+            crate::state::ImageReference::Resolved(name) => store.image_named(&region, &name),
             crate::state::ImageReference::Absent => None,
             crate::state::ImageReference::Malformed => {
                 return Err(ListMicrovmImageVersionsErrorModeled::ValidationException(

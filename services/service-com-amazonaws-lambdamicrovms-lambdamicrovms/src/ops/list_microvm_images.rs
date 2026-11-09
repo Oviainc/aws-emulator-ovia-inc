@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
 
         let after = match input.next_token.as_deref() {
             Some(token) => Some(decode_token(token)?),
@@ -191,8 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `nameFilter` "filters images whose name contains the specified string", so it
         // SELECTS by substring: a filter that matches no image is an empty page, not a
-        // missing resource.
-        let matching = store.images.values().filter(|image| {
+        // missing resource. The images listed are the ones of the REGION the request was
+        // signed for — an image minted through another region's endpoint belongs to that
+        // endpoint's listing and to no other.
+        let matching = store.images_in(&region).filter(|image| {
             input
                 .name_filter
                 .as_deref()

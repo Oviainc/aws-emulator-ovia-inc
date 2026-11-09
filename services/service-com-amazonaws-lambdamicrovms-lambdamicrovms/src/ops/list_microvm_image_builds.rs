@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
 
         let after = match input.next_token.as_deref() {
             Some(token) => Some(decode_token(token)?),
@@ -188,12 +188,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // Deciding this before the lookup is the point: a 404 here would tell a caller
         // with no permission on the identifier whether it exists.
-        let image_name = match store.resolve_image_reference(&input.image_identifier) {
+        let image_name = match store.resolve_image_reference(&region, &input.image_identifier) {
             crate::state::ImageReference::Resolved(name) => name,
             crate::state::ImageReference::Absent => {
                 return Err(ListMicrovmImageBuildsErrorModeled::AccessDeniedException(
                     AccessDeniedException {
-                        message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+                        message: Some(crate::state::access_denied_message()),
                     },
                 )
                 .into());
@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Past the verdict the lookup is an own-account one, so a version this
         // account's own image does not hold is the modelled 404.
-        let Some(image) = store.images.get(&image_name) else {
+        let Some(image) = store.image_named(&region, &image_name) else {
             return Err(not_found(crate::state::image_not_found_message(
                 &input.image_identifier,
             )));

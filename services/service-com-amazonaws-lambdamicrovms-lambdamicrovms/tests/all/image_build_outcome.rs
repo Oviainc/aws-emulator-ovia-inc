@@ -40,7 +40,7 @@ use crate::microvm_lifecycle::{as_uri_value, call, image_body, PAST_THE_SPAN, RE
 
 /// A router carrying this service and the one its builds resolve their code artifact
 /// against — Amazon S3 — over ONE shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Verifying signatures is the emulator's concern, not this service's; these tests
@@ -78,7 +78,7 @@ fn s3(router: &MultiServiceRouter) -> aws_sdk_s3::Client {
 
 /// Stage one object through Amazon S3's OWN operations, creating its bucket first: what
 /// a build can fetch is what that service really holds.
-async fn stage_object(router: &MultiServiceRouter, bucket: &str, key: &str) {
+pub(crate) async fn stage_object(router: &MultiServiceRouter, bucket: &str, key: &str) {
     let client = s3(router);
     // A regional endpoint requires the create to state its own location constraint.
     let created = client
@@ -111,7 +111,7 @@ async fn stage_object(router: &MultiServiceRouter, bucket: &str, key: &str) {
 }
 
 /// Create one image whose `codeArtifact` is `uri` and return the ARN the create minted.
-async fn create_image(router: &MultiServiceRouter, name: &str, uri: &str) -> String {
+pub(crate) async fn create_image(router: &MultiServiceRouter, name: &str, uri: &str) -> String {
     let (status, body) = call(
         router,
         "POST",
@@ -124,7 +124,7 @@ async fn create_image(router: &MultiServiceRouter, name: &str, uri: &str) -> Str
 }
 
 /// `GET /2025-09-09/microvm-images/{identifier}`.
-async fn get_image(router: &MultiServiceRouter, identifier: &str) -> (u16, Value) {
+pub(crate) async fn get_image(router: &MultiServiceRouter, identifier: &str) -> (u16, Value) {
     let uri = format!(
         "/2025-09-09/microvm-images/{}",
         as_uri_value(identifier)
@@ -144,7 +144,7 @@ async fn list_versions(router: &MultiServiceRouter, identifier: &str) -> Vec<Val
 }
 
 /// `GET /2025-09-09/microvm-images/{identifier}/versions/{image_version}`.
-async fn get_version(
+pub(crate) async fn get_version(
     router: &MultiServiceRouter,
     identifier: &str,
     image_version: &str,

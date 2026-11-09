@@ -165,7 +165,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::Instant::now();
         store.materialize_due(now);
 
-        let Some(vm) = store.microvm(&input.microvm_identifier) else {
+        let region = crate::state::request_region(ctx);
+        let Some(vm) = store.microvm(&region, &input.microvm_identifier) else {
             // The not-found envelope this service puts on the wire: a request-derived
             // `message`, with the optional `resourceType`/`resourceId` unset.
             return Err(CreateMicrovmAuthTokenErrorModeled::ResourceNotFoundException(
@@ -215,8 +216,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Only the DIGEST of the token is kept, so the caller holds the one copy of the
-        // secret and the endpoint can still recognise it.
+        // secret and the endpoint can still recognise it. The record carries the REGION
+        // the mint was authorised in beside the `microvmId`, the same compound identity
+        // the lookup above resolved through, so a token can never authenticate a MicroVM
+        // of another region's partition.
         state.lock().record_auth_token(
+            &region,
             &microvm_id,
             &token,
             input.expiration_in_minutes,

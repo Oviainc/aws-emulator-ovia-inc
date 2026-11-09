@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMicrovmImageVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMicrovmImageVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMicrovmImageVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Publishes the `status` the request asks for on one stored
+//! [`crate::state::MicrovmImageVersion`] and moves the image's own
+//! `latestActiveImageVersion` with it — the authorization verdict on the
+//! `imageIdentifier` first, as on every customer-facing call addressed at one.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +183,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMicrovmImageVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMicrovmImageVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMicrovmImageVersion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
+        let region = crate::state::request_region(ctx);
+        let updated_at = crate::state::now_datetime();
+
+        let mut store = state.lock();
+        store.materialize_due(::std::time::Instant::now());
+
+        // AUTHORIZATION BEFORE EXISTENCE, the verdict every customer-facing call
+        // addressed at a `MicrovmImageIdentifier` takes first
+        // (`crate::state::resolve_image_access`): an identifier this account holds no
+        // record of in the region the request was signed for — AWS's own catalogue,
+        // another account's, or one minted through another region's endpoint — is
+        // DENIED whether or not it names anything, so a refusal never tells a caller
+        // with no permission on an identifier whether it exists.
+        let name = match store.resolve_image_access(&region, &input.image_identifier) {
+            crate::state::ImageAccess::Granted(name) => name,
+            crate::state::ImageAccess::Absent => {
+                return Err(not_found(crate::state::image_not_found_message(
+                    &input.image_identifier,
+                )));
+            }
+            crate::state::ImageAccess::Denied => {
+                return Err(
+                    UpdateMicrovmImageVersionErrorModeled::AccessDeniedException(
+                        AccessDeniedException {
+                            message: Some(crate::state::access_denied_message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::ImageAccess::Malformed => {
+                return Err(
+                    UpdateMicrovmImageVersionErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::invalid_arn_format_message(
+                                &input.image_identifier,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        let Some(image) = store.image_named_mut(&region, &name) else {
+            return Err(not_found(crate::state::image_not_found_message(
+                &input.image_identifier,
+            )));
+        };
+        // Past the image's verdict the lookup is an own-account one, so a version that
+        // image does not hold is the modelled 404 — named by the image's own ARN, the
+        // one identity of the record whichever form the request addressed it by.
+        if !image.versions.contains_key(&input.image_version) {
+            let message = crate::state::image_version_not_found_message(
+                &image.image_arn,
+                &input.image_version,
+            );
+            return Err(not_found(message));
+        }
+
+        // "Updates the status of a specific MicroVM image version": the one rule that
+        // publishes a version's availability and moves the image's
+        // `latestActiveImageVersion` with it
+        // ([`crate::state::MicrovmImage::publish_version_status`]). The version's STATE
+        // is what its build settled on, and is left exactly as it is.
+        image.publish_version_status(&input.image_version, &input.status, updated_at);
+
+        // The response is the PERSISTED record, read back out of the store.
+        let Some(image) = store.image_named(&region, &name) else {
+            return Err(unavailable());
+        };
+        let Some(version) = image.versions.get(&input.image_version) else {
+            return Err(unavailable());
+        };
+        Ok(rendered(&image.image_arn, version))
+    }
+}
+
+/// The modelled server error for a store this handler cannot reach.
+fn unavailable() -> UpdateMicrovmImageVersionError {
+    UpdateMicrovmImageVersionErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the MicroVM image store is unavailable".to_string()),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+/// 404: the request named an image this account's own record no longer holds, or a
+/// version the resolved image does not hold.
+///
+/// `ResourceNotFoundException` models `message` as the only required member;
+/// `resourceType` and `resourceId` are optional and this service leaves them unset, so
+/// the message is the whole envelope.
+fn not_found(message: String) -> UpdateMicrovmImageVersionError {
+    UpdateMicrovmImageVersionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_type: None,
+        resource_id: None,
+    })
+    .into()
+}
+
+/// The STORED version record as this operation's response: the same projection of the
+/// same record the version's own read answers with, so what this call reports and what a
+/// later `GetMicrovmImageVersion` reports cannot disagree.
+fn rendered(
+    image_arn: &str,
+    version: &crate::state::MicrovmImageVersion,
+) -> UpdateMicrovmImageVersionOutput {
+    UpdateMicrovmImageVersionOutput {
+        image_arn: image_arn.to_string(),
+        image_version: version.image_version.clone(),
+        state: version.state.clone(),
+        status: version.status.clone(),
+        base_image_arn: version.base_image_arn.clone(),
+        base_image_version: version.base_image_version.clone(),
+        build_role_arn: version.build_role_arn.clone(),
+        description: version.description.clone(),
+        code_artifact: version.code_artifact.clone(),
+        logging: version.logging.clone(),
+        egress_network_connectors: crate::state::wire_list(&version.egress_network_connectors),
+        cpu_configurations: crate::state::wire_list(&version.cpu_configurations),
+        resources: crate::state::wire_list(&version.resources),
+        additional_os_capabilities: crate::state::wire_list(&version.additional_os_capabilities),
+        hooks: version.hooks.clone(),
+        environment_variables: crate::state::wire_map(&version.environment_variables),
+        created_at: version.created_at,
+        updated_at: version.updated_at,
+        // "The reason for the current state": the version's own one projection of the
+        // reason its builds recorded, so a failed build's diagnosis stays readable
+        // through a status change.
+        state_reason: version.reported_state_reason(),
+        tags: crate::state::wire_map(&version.tags),
     }
 }

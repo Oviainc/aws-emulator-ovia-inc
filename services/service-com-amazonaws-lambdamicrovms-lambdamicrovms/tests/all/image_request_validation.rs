@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     base_image_not_found_message, default_log_group, image_name_conflict_message,
     image_not_found_message, invalid_arn_format_message, managed_base_image_arn,
-    ACCESS_DENIED_MESSAGE, CODE_ARTIFACT_URI_REQUIREMENT, DEFAULT_CPU_ARCHITECTURE,
+    access_denied_message, CODE_ARTIFACT_URI_REQUIREMENT, DEFAULT_CPU_ARCHITECTURE,
     DEFAULT_MINIMUM_MEMORY_IN_MIB, MANAGED_BASE_IMAGE_IDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -347,7 +347,7 @@ async fn an_image_lookup_separates_a_malformed_identifier_from_an_absent_one() {
         (
             "a well-formed ARN naming no image",
             expected_image_arn("never-created"),
-            403,
+            404,
         ),
         (
             "a well-formed ARN of another partition",
@@ -399,7 +399,7 @@ async fn an_image_lookup_separates_a_malformed_identifier_from_an_absent_one() {
                 );
                 assert_eq!(
                     body["message"].as_str(),
-                    Some(ACCESS_DENIED_MESSAGE),
+                    Some(access_denied_message().as_str()),
                     "case {case:?}: expected the modelled denial sentence, got {:?}",
                     body["message"]
                 );

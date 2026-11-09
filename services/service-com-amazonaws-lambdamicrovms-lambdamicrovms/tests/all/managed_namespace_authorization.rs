@@ -16,7 +16,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    managed_base_image_arn, published_managed_base_image_versions, ACCESS_DENIED_MESSAGE,
+    managed_base_image_arn, published_managed_base_image_versions, access_denied_message,
     MANAGED_BASE_IMAGE_IDS,
 };
 
@@ -56,7 +56,7 @@ fn assert_denied(status: u16, body: &Value, case: &str) {
     );
     assert_eq!(
         body["message"].as_str(),
-        Some(ACCESS_DENIED_MESSAGE),
+        Some(access_denied_message().as_str()),
         "case {case}: expected the modelled denial sentence, got {:?}",
         body["message"]
     );

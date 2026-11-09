@@ -178,12 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
 
         let mut store = state.lock();
         store.materialize_due(::std::time::Instant::now());
 
-        let Some(vm) = store.microvm(&input.microvm_identifier) else {
+        let Some(vm) = store.microvm(&region, &input.microvm_identifier) else {
             // `ResourceNotFoundException` models `message` as the only required
             // member; `resourceType` and `resourceId` stay unset (see
             // `crate::state::microvm_not_found_message`).

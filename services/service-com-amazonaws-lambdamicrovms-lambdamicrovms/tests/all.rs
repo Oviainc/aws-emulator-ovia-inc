@@ -35,6 +35,8 @@ mod image_request_validation;
 mod image_version_listing;
 #[path = "all/image_version_read_path.rs"]
 mod image_version_read_path;
+#[path = "all/image_version_status_publication.rs"]
+mod image_version_status_publication;
 #[path = "all/list_tags_read_path.rs"]
 mod list_tags_read_path;
 #[path = "all/managed_base_image_catalogue.rs"]
@@ -57,6 +59,8 @@ mod microvm_runtime_path;
 mod microvm_suspend_resume;
 #[path = "all/recorded_image_identity.rs"]
 mod recorded_image_identity;
+#[path = "all/region_scoped_resources.rs"]
+mod region_scoped_resources;
 #[path = "all/resource_tag_removal.rs"]
 mod resource_tag_removal;
 #[path = "all/resource_tagging.rs"]

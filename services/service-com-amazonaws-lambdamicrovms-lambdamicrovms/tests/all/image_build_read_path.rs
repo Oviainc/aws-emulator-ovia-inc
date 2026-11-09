@@ -19,7 +19,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     image_build_not_found_message, image_version_not_found_message, invalid_arn_format_message,
-    managed_base_image_arn, published_managed_base_image_versions, ACCESS_DENIED_MESSAGE,
+    managed_base_image_arn, published_managed_base_image_versions, access_denied_message,
     BUILD_STATE_IN_PROGRESS, BUILD_STATE_SUCCESSFUL, BUILD_TARGETS,
     DEFAULT_MINIMUM_MEMORY_IN_MIB, FIRST_IMAGE_VERSION, MANAGED_BASE_IMAGE_IDS, MAX_LIST_PAGE,
 };
@@ -207,7 +207,7 @@ fn assert_denied(status: u16, body: &Value, case: &str) {
     );
     assert_eq!(
         body["message"].as_str(),
-        Some(ACCESS_DENIED_MESSAGE),
+        Some(access_denied_message().as_str()),
         "case {case}: expected the modelled denial sentence, got {:?}",
         body["message"]
     );

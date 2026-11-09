@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
 
         let mut store = state.lock();
         // A resource whose asynchronous deletion the clock has already made due is gone
@@ -194,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // other operation resolves an identifier through, so an ARN of another
         // partition, region or account resolves to nothing rather than to a local
         // resource of the same name.
-        let Some(image) = store.image_mut(&input.resource) else {
+        let Some(image) = store.image_mut(&region, &input.resource) else {
             // A well-formed taggable ARN naming nothing this account holds is the
             // missing-resource condition, not a bad request: `message` is the only
             // required member of `ResourceNotFoundException`, and this service leaves

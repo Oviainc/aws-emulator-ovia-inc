@@ -176,29 +176,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
 
         let mut store = state.lock();
         store.materialize_due(::std::time::Instant::now());
 
         // `MicrovmImageIdentifier` is "The ARN or ID of the MicroVmImage", and what the
         // read answers for one is decided by AUTHORIZATION BEFORE EXISTENCE
-        // (`crate::state::resolve_image_access`): an identifier this account holds no
-        // record of, now or before — a resource of AWS's own catalogue, another
-        // account's, another partition's — is DENIED, whether or not it names anything,
-        // so the read never tells a caller with no permission on an identifier whether
-        // it exists. Only an identifier of this account's own gets an answer about
-        // existence, and the remaining answers mean different things to a client polling
-        // an image it believes is being built or deleted: a malformed identifier is a
-        // request that can NEVER succeed (400) and this account's own record being gone
-        // is the condition a poll may retry (404).
-        let image = match store.resolve_image_access(&input.image_identifier) {
-            crate::state::ImageAccess::Granted(name) => store.images.get(&name),
+        // (`crate::state::resolve_image_access`), at two scopes. ACCESS is the ACCOUNT's:
+        // an identifier outside this account's own image namespace — a resource of AWS's
+        // own catalogue, another account's, another partition's, or a value spelling this
+        // resource type in a form `MicrovmImageArn` does not admit — is DENIED whether or
+        // not it names anything, so the read never tells a caller with no permission on an
+        // identifier whether it exists. EXISTENCE is the REGION's: an identifier of this
+        // account's own namespace gets an answer about the record, which is the absence
+        // (404) for a name nothing was created under here, for a record this account
+        // deleted and for one minted through another REGION's endpoint — the condition a
+        // poll may retry. A malformed identifier is a request that can NEVER succeed
+        // (400).
+        let image = match store.resolve_image_access(&region, &input.image_identifier) {
+            crate::state::ImageAccess::Granted(name) => store.image_named(&region, &name),
             crate::state::ImageAccess::Absent => None,
             crate::state::ImageAccess::Denied => {
                 return Err(GetMicrovmImageErrorModeled::AccessDeniedException(
                     AccessDeniedException {
-                        message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+                        message: Some(crate::state::access_denied_message()),
                     },
                 )
                 .into());

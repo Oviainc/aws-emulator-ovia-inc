@@ -21,7 +21,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     image_not_found_message, image_version_not_found_message, invalid_arn_format_message,
-    managed_base_image_arn, next_image_version, ACCESS_DENIED_MESSAGE, FIRST_IMAGE_VERSION,
+    managed_base_image_arn, next_image_version, access_denied_message, FIRST_IMAGE_VERSION,
     MANAGED_BASE_IMAGE_IDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -175,7 +175,7 @@ fn assert_denied(status: u16, body: &Value, case: &str) {
     );
     assert_eq!(
         body["message"].as_str(),
-        Some(ACCESS_DENIED_MESSAGE),
+        Some(access_denied_message().as_str()),
         "case {case}: expected the modelled denial sentence, got {:?}",
         body["message"]
     );
@@ -486,12 +486,13 @@ async fn a_version_the_image_does_not_hold_is_not_found() {
     );
 }
 
-/// RULE: the verdict on the image is decided BEFORE anything is looked up, so a version
-/// read on an `imageIdentifier` this account holds no record of — the AWS-owned managed
-/// catalogue, another account's, region's, partition's or vendor's namespace, or a name
-/// nothing was created under — is refused 403 `AccessDeniedException`, identically
-/// whether or not the identifier names a resource; a value that is no identifier this API
-/// can address is HTTP 400 `ValidationException`.
+/// RULE: the verdict on the image is decided BEFORE anything is looked up and at the
+/// ACCOUNT's scope, so a version read on an `imageIdentifier` OUTSIDE this account's own
+/// image namespace — the AWS-owned managed catalogue, another account's, partition's or
+/// vendor's — is refused 403 `AccessDeniedException`, identically whether or not the
+/// identifier names a resource; an identifier of this account's own namespace that this
+/// region holds no record of is reported absent (404), and a value that is no identifier
+/// this API can address is HTTP 400 `ValidationException`.
 #[tokio::test]
 async fn a_version_read_outside_this_accounts_own_images_is_denied() {
     let router = emulator();
@@ -518,14 +519,6 @@ async fn a_version_read_outside_this_accounts_own_images_is_denied() {
         (
             "an AWS-owned ARN the catalogue does not publish".to_string(),
             managed_base_image_arn(REGION, "no-such-base-image"),
-        ),
-        (
-            "this account's namespace, a name nothing was created under".to_string(),
-            expected_image_arn("never-created"),
-        ),
-        (
-            "this account's namespace in another region, a name it holds".to_string(),
-            format!("arn:aws:lambda:eu-central-1:{ACCOUNT}:microvm-image:{held}"),
         ),
         (
             "another account's ARN for a name this one holds".to_string(),
@@ -568,6 +561,31 @@ async fn a_version_read_outside_this_accounts_own_images_is_denied() {
             body, &first,
             "case {case}: the denial must be indistinguishable from {first_case}'s, got {body}"
         );
+    }
+
+    // An identifier of this account's OWN namespace that this region holds no record of
+    // is answered about existence instead: a name nothing was created under, and a name
+    // this account holds in ANOTHER region.
+    let absent = [
+        (
+            "this account's namespace, a name nothing was created under",
+            expected_image_arn("never-created"),
+        ),
+        (
+            "this account's namespace in another region, a name it holds",
+            format!("arn:aws:lambda:eu-central-1:{ACCOUNT}:microvm-image:{held}"),
+        ),
+    ];
+    for (case, identifier) in &absent {
+        for image_version in [FIRST_IMAGE_VERSION, "9.9"] {
+            let (status, body) = get_version(&router, identifier, image_version).await;
+            assert_not_found(
+                status,
+                &body,
+                &image_not_found_message(identifier),
+                &format!("{case} ({identifier}) version {image_version}"),
+            );
+        }
     }
 
     // A value that is no identifier this API can address is a request that can never

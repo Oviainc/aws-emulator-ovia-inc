@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
 
         let mut store = state.lock();
         store.materialize_due(::std::time::Instant::now());
@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deleted keeps selecting the MicroVMs that run it.
         let image_arn_filter = input.image_identifier.as_deref().map(|identifier| {
             store
-                .image(identifier)
+                .image(&region, identifier)
                 .map_or_else(|| identifier.to_string(), |image| image.image_arn.clone())
         });
 
@@ -202,7 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(crate::state::MAX_LIST_PAGE)
             .clamp(1, crate::state::MAX_LIST_PAGE);
 
-        let matching = store.microvms.values().filter(|vm| {
+        // The MicroVMs listed are the ones of the REGION the request was signed for: a
+        // MicroVM run through another region's endpoint belongs to that endpoint's
+        // listing and to no other.
+        let matching = store.microvms_in(&region).filter(|vm| {
             image_arn_filter
                 .as_deref()
                 .is_none_or(|arn| vm.image_arn == arn)

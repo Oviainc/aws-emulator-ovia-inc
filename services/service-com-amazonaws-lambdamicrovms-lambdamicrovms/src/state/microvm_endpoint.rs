@@ -91,6 +91,12 @@ const NO_MICROVM_GUEST: &str = "This MicroVM endpoint is not implemented: the \
 /// [`ServiceState::auth_tokens`] under [`auth_token_digest`] of the token.
 #[derive(Debug, Clone)]
 pub struct MicrovmAuthToken {
+    /// The REGION whose endpoint authorised the mint — the partition holding the MicroVM
+    /// the token grants access to. Every resource of this service is regional
+    /// ([`super::regions`]), so the identity a presented token is matched on is this
+    /// region AND [`Self::microvm_id`] together: a token can authenticate nothing in
+    /// another region's partition.
+    pub region: String,
     /// The `microvmId` the token grants access to — "The ID of the MicroVM to create
     /// an authentication token for", so it authenticates at that MicroVM's address and
     /// at no other.
@@ -250,19 +256,25 @@ pub fn serve_request(
     let mut store = state.lock();
     store.materialize_due(now);
 
-    let Some(microvm_id) = store
-        .microvm(&addressed)
-        .filter(|vm| is_connectable_microvm_state(&vm.state))
-        .map(|vm| vm.microvm_id.clone())
+    // The address carries the MicroVM's own id rather than a region, so the record is
+    // resolved wherever this store holds it (see `super::regions`) — and the region that
+    // holds it is half the identity a presented token has to match.
+    let Some((region, microvm_id)) = store
+        .microvm_anywhere(&addressed)
+        .filter(|(_, vm)| is_connectable_microvm_state(&vm.state))
+        .map(|(region, vm)| (region.to_string(), vm.microvm_id.clone()))
     else {
         return endpoint_response(head, 404, NO_MICROVM_AT_THIS_ADDRESS);
     };
 
-    let guest_port = store.microvm_guest_port(&microvm_id);
+    let guest_port = store.microvm_guest_port(&region, &microvm_id);
     let authenticated = presented
         .and_then(|digest| store.auth_tokens.get(&digest))
         .is_some_and(|token| {
-            token.microvm_id == microvm_id
+            // The token's identity is the REGION and the `microvmId` together: a token
+            // minted against one region's partition grants nothing at another's.
+            token.region == region
+                && token.microvm_id == microvm_id
                 && token.expires_at > now
                 && grants_port(&token.allowed_ports, guest_port)
         });
@@ -358,6 +370,7 @@ impl ServiceState {
     /// token cannot grant access past it.
     pub fn record_auth_token(
         &mut self,
+        region: &str,
         microvm_id: &str,
         token: &str,
         expiration_in_minutes: i32,
@@ -371,7 +384,7 @@ impl ServiceState {
             u64::try_from(MAX_MAXIMUM_DURATION_IN_SECONDS).unwrap_or_default(),
         );
         let microvm_end = self
-            .microvm(microvm_id)
+            .microvm(region, microvm_id)
             .and_then(|vm| vm.expiry_due_at)
             .or_else(|| now.checked_add(platform_limit))
             .unwrap_or(now);
@@ -392,6 +405,7 @@ impl ServiceState {
         self.auth_tokens.insert(
             auth_token_digest(token),
             MicrovmAuthToken {
+                region: region.to_string(),
                 microvm_id: microvm_id.to_string(),
                 allowed_ports,
                 expires_at,
@@ -403,9 +417,12 @@ impl ServiceState {
     /// The port a MicroVM's guest publishes its listener on: `Hooks$port`, "the port
     /// number on which the hooks listener runs", of the image version the MicroVM runs.
     /// `None` when that image version declares none.
-    pub fn microvm_guest_port(&self, microvm_id: &str) -> Option<i32> {
-        let vm = self.microvm(microvm_id)?;
-        let image = self.image(&vm.image_arn)?;
+    ///
+    /// Both records are read in `region`: a MicroVM and the image it runs are resources
+    /// of the same regional partition.
+    pub fn microvm_guest_port(&self, region: &str, microvm_id: &str) -> Option<i32> {
+        let vm = self.microvm(region, microvm_id)?;
+        let image = self.image(region, &vm.image_arn)?;
         image
             .versions
             .get(&vm.image_version)?
@@ -417,14 +434,24 @@ impl ServiceState {
     /// Forget every authentication token the clock has expired, and every one whose
     /// MicroVM can no longer be connected to — both owed at the same instant whether
     /// or not anybody called. Applied by [`ServiceState::materialize_due`].
+    ///
+    /// A token is kept only while the MicroVM of ITS OWN region is still connectable, so
+    /// an identically-named MicroVM of another partition keeps nothing alive.
     pub(super) fn expire_auth_tokens(&mut self, now: Instant) {
-        let connectable: BTreeSet<String> = self
-            .microvms
-            .values()
-            .filter(|vm| is_connectable_microvm_state(&vm.state))
-            .map(|vm| vm.microvm_id.clone())
+        let connectable: BTreeSet<(String, String)> = self
+            .regions
+            .iter()
+            .flat_map(|(region, regional)| {
+                regional
+                    .microvms
+                    .values()
+                    .filter(|vm| is_connectable_microvm_state(&vm.state))
+                    .map(|vm| (region.clone(), vm.microvm_id.clone()))
+            })
             .collect();
-        self.auth_tokens
-            .retain(|_, token| token.expires_at > now && connectable.contains(&token.microvm_id));
+        self.auth_tokens.retain(|_, token| {
+            token.expires_at > now
+                && connectable.contains(&(token.region.clone(), token.microvm_id.clone()))
+        });
     }
 }

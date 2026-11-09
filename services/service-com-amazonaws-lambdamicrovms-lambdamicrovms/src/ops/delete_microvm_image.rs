@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
 
         let mut store = state.lock();
         let now = ::std::time::Instant::now();
@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::is_managed_microvm_image_arn(&input.image_identifier) {
             return Err(DeleteMicrovmImageErrorModeled::AccessDeniedException(
                 AccessDeniedException {
-                    message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+                    message: Some(crate::state::access_denied_message()),
                 },
             )
             .into());
@@ -192,9 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call addressed at a resource that is not there — that 404 is the terminal
         // signal a cleanup loop reconciles on, and it is what keeps a delete of a
         // mistyped identifier from being reported as a deletion.
-        let state_after_deletion = match store.resolve_image_reference(&input.image_identifier) {
+        let state_after_deletion = match store
+            .resolve_image_reference(&region, &input.image_identifier)
+        {
             crate::state::ImageReference::Resolved(name) => {
-                let Some(image) = store.images.get_mut(&name) else {
+                let Some(image) = store.image_named_mut(&region, &name) else {
                     return Err(not_found(&input.image_identifier));
                 };
                 if image.delete_due_at.is_none() {

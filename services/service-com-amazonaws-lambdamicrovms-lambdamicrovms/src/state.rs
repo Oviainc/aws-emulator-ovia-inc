@@ -46,6 +46,11 @@ pub mod microvm_endpoint;
 /// produce an image at all.
 pub mod code_artifact;
 
+/// The region a record belongs to: every resource of this service is regional, so the
+/// store is partitioned by region and every lookup is scoped to the region the request
+/// was signed for.
+pub mod regions;
+
 /// The region an ARN carries when the request is unsigned, matching the region
 /// the emulator's generated client config defaults to.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -130,16 +135,25 @@ pub const MAX_MICROVM_IMAGES: usize = 500;
 /// and chosen for the same reasons as [`MAX_MICROVM_IMAGES`], on `RunMicrovm`.
 pub const MAX_ACTIVE_MICROVMS: usize = 500;
 
-/// How many of this account's REMOVED image ARNs the store remembers — see
-/// [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::removed_image_arns`], which is what
-/// keeps a read of an image this account created and then deleted reporting absence.
+/// How many REGIONS this store holds records for.
 ///
-/// The figure is chosen, like [`MAX_MICROVM_IMAGES`]: generous against the images one
-/// account can hold at a time, and finite, so an account that creates and deletes
-/// images forever cannot grow the store without bound. Reaching it drops the oldest
-/// removal, whose ARN is then judged like any other identifier this account holds no
-/// record of.
-pub const MAX_REMOVED_IMAGE_ARNS: usize = 10 * MAX_MICROVM_IMAGES;
+/// The store is partitioned by the region a request was signed for ([`request_region`]),
+/// and that region comes from the request's own credential scope — so the partition key
+/// is a value the CALLER chooses, and without a ceiling a caller signing for endlessly
+/// many region names would grow the store without bound. This caps that one dimension,
+/// so the whole store is bounded by [`MAX_REGIONS`] partitions, each by
+/// [`MAX_MICROVM_IMAGES`], [`MAX_ACTIVE_MICROVMS`] and [`MAX_IDEMPOTENCY_RECORDS`]. The
+/// figure is chosen, like [`MAX_MICROVM_IMAGES`]: generous against the regions AWS
+/// publishes, so no realistic use meets it, and finite.
+pub const MAX_REGIONS: usize = 64;
+
+/// The `message` of the 402 a create answers when it would open a record in a region
+/// past [`MAX_REGIONS`]. AWS publishes no wording for it, so — like the message the
+/// per-account image quota answers with — the sentence states the rule and the limit it
+/// is built from.
+pub fn too_many_regions_message() -> String {
+    format!("this account already holds MicroVM resources in its limit of {MAX_REGIONS} regions")
+}
 
 /// How many versions one MicroVM image may hold.
 ///
@@ -329,22 +343,57 @@ pub fn s3_object_uri(uri: &str) -> Option<(&str, &str)> {
     (!bucket.is_empty() && !key.is_empty()).then_some((bucket, key))
 }
 
+/// The ARN partition this emulator mints its own ARNs in, read off an ARN
+/// [`microvm_image_arn`] builds rather than written here as a literal, so the partition
+/// an identifier is held to has one source of truth. A reference built in another
+/// partition names a resource no call to this emulator can reach.
+///
+/// The emulator's account contract does not change while the process runs, so the
+/// partition is derived once and every later identifier is judged against that one
+/// value.
+pub fn emulator_partition() -> &'static str {
+    static PARTITION: ::std::sync::OnceLock<String> = ::std::sync::OnceLock::new();
+    PARTITION.get_or_init(|| {
+        let minted = microvm_image_arn("", "partition-probe");
+        ::service_common::arn::parse(&minted)
+            .map(|arn| arn.partition.to_string())
+            .unwrap_or_default()
+    })
+}
+
+/// The image NAME an ARN of THIS account's own `microvm-image` namespace carries, or
+/// `None` when `arn` names no image of it.
+///
+/// Read through the one shared ARN parse (`service_common::arn`): the partition is the
+/// one this emulator serves ([`emulator_partition`]), the vendor is this service's
+/// `arnNamespace` (`lambda`), the account is the emulator's own, and the resource is in
+/// the form `MicrovmImageArn`'s own pattern defines
+/// (`^arn:[a-z0-9-]+:lambda:[a-z0-9-]*:[a-z0-9]*:microvm-image:.+$`) — the type
+/// `microvm-image`, a colon, and a non-empty name. A value spelling that resource any
+/// other way (`microvm-image/<name>`) is outside the pattern, so it names no image of
+/// this service whatever account it carries; an ARN of any other account — an
+/// AWS-MANAGED base image carries `aws` there — belongs to another namespace, see
+/// [`managed_microvm_image_id`].
+pub fn own_microvm_image_name(arn: &str) -> Option<&str> {
+    let parsed = ::service_common::arn::parse(arn)?;
+    if parsed.partition != emulator_partition()
+        || parsed.vendor != "lambda"
+        || parsed.account != ::engine::emulator_account_id()
+    {
+        return None;
+    }
+    parsed
+        .resource
+        .strip_prefix("microvm-image:")
+        .filter(|name| !name.is_empty())
+}
+
 /// Whether `arn` names a MicroVM image in THIS account's own `microvm-image`
 /// namespace — the one namespace this emulator holds, and can therefore resolve a
-/// reference against.
-///
-/// Read through the one shared ARN parse (`service_common::arn`): the vendor is this
-/// service's `arnNamespace` (`lambda`), the account is the emulator's own, and the
-/// resource type is the one `MicrovmImageArn`'s pattern
-/// (`^arn:[a-z0-9-]+:lambda:[a-z0-9-]*:[a-z0-9]*:microvm-image:.+$`) names. An ARN of
-/// any other account — an AWS-MANAGED base image carries `aws` there — belongs to
-/// another namespace; see [`managed_microvm_image_id`].
+/// reference against. Says NOTHING about whether such an image exists, or about which
+/// region holds it; see [`own_microvm_image_name`].
 pub fn is_own_microvm_image_arn(arn: &str) -> bool {
-    ::service_common::arn::parse(arn).is_some_and(|parsed| {
-        parsed.vendor == "lambda"
-            && parsed.account == ::engine::emulator_account_id()
-            && parsed.resource_type() == "microvm-image"
-    })
+    own_microvm_image_name(arn).is_some()
 }
 
 /// The ids of the AWS-MANAGED MicroVM base images this service publishes — the
@@ -712,6 +761,17 @@ pub fn no_active_version_message(image: &str) -> String {
     format!("No active version found for MicroVM image {image}")
 }
 
+/// The `message` of the 404 `RunMicrovm` answers when the version it resolved holds no
+/// build that produced an image.
+///
+/// A version's STATUS says whether it may be launched from and its STATE says what its
+/// build produced, so a version published ACTIVE whose builds all failed resolves
+/// normally and then has nothing to launch: the refusal names the missing BUILD, for the
+/// image and version the launch resolved, rather than reporting the version absent.
+pub fn no_image_build_message(image_arn: &str, image_version: &str) -> String {
+    format!("No image build found for MicroVM image {image_arn} and version {image_version}")
+}
+
 /// The `message` of the 404 a version-addressed call answers when the image it resolved
 /// carries no such `imageVersion`, built from the image the request named and that
 /// version.
@@ -731,11 +791,20 @@ pub fn image_build_not_found_message(image: &str, image_version: &str, build_id:
 
 /// The `message` of the 403 a read answers for a resource the caller may not read.
 ///
-/// `AccessDeniedException` is documented as "You do not have sufficient access to
-/// perform this action."; AWS's own message additionally names the CALLING PRINCIPAL,
-/// which is caller identity rather than anything of this request, so the modelled
-/// sentence for the error class is the whole envelope here.
-pub const ACCESS_DENIED_MESSAGE: &str = "You do not have sufficient access to perform this action.";
+/// `AccessDeniedException`'s documented sentence ("You do not have sufficient access to
+/// perform this action.") describes the error CLASS; what AWS puts on the wire for this
+/// refusal names the CALLING PRINCIPAL — "User: &lt;caller&gt; is not authorized to perform
+/// this operation", whose one variable part is the identity that signed the request
+/// (recorded AWS behaviour). That identity is this emulator's own published principal,
+/// the same one `sts:GetCallerIdentity` answers with
+/// (`service_common::caller_principal`), so the sentence carries nothing of the request
+/// and a denial says nothing about what the identifier it refused names.
+pub fn access_denied_message() -> String {
+    format!(
+        "User: {} is not authorized to perform this operation",
+        ::service_common::caller_principal::ambient_user_arn()
+    )
+}
 
 /// The version the NEXT build of an image is minted as, given the versions it
 /// already holds.
@@ -1136,6 +1205,52 @@ impl MicrovmImage {
     ) -> Vec<RecordedMember> {
         vec![RecordedMember::Text(member, self.id.clone())]
     }
+
+    /// Publish `status` for this image's version `image_version`, at `at`.
+    ///
+    /// `MicrovmImageVersionStatus` is "the availability status of the version: ACTIVE
+    /// (can be used by `RunMicrovm`) or INACTIVE (blocked from launching new MicroVMs)",
+    /// and `latestActiveImageVersion` is "the latest active version of the MicroVM
+    /// image" — so publishing a status is what moves that pointer, and exactly one
+    /// version of an image is ACTIVE: the one just published takes the pointer and the
+    /// one that held it steps down. Taking the status off the version the image was
+    /// serving leaves the image with no active version, which is the state a launch that
+    /// pins none is then refused from.
+    ///
+    /// The STATE of a version is what its build settled on and is NOT touched here: the
+    /// status says whether the version may be launched from, which a caller sets
+    /// whatever that build produced. The image's own state settles to
+    /// [`IMAGE_STATE_UPDATED`] because publishing a status is an update of the image —
+    /// unless a lifecycle of the image is still in flight, which owns that state until
+    /// the work it started ends ([`is_image_lifecycle_in_flight`]).
+    pub fn publish_version_status(&mut self, image_version: &str, status: &str, at: DateTime) {
+        let Some(version) = self.versions.get_mut(image_version) else {
+            return;
+        };
+        version.status = status.to_string();
+        version.updated_at = Some(at);
+
+        if status == VERSION_STATUS_ACTIVE {
+            if let Some(previous) = self
+                .latest_active_image_version
+                .replace(image_version.to_string())
+            {
+                if previous != image_version {
+                    if let Some(stepped_down) = self.versions.get_mut(&previous) {
+                        stepped_down.status = VERSION_STATUS_INACTIVE.to_string();
+                        stepped_down.updated_at = Some(at);
+                    }
+                }
+            }
+        } else if self.latest_active_image_version.as_deref() == Some(image_version) {
+            self.latest_active_image_version = None;
+        }
+
+        self.updated_at = Some(at);
+        if !is_image_lifecycle_in_flight(&self.state) {
+            self.state = IMAGE_STATE_UPDATED.to_string();
+        }
+    }
 }
 
 /// Mint a MicroVM image's `id`: the identity the service hands back for the image it
@@ -1250,31 +1365,19 @@ pub struct IdempotencyRecord {
 
 /// Per-service state for com-amazonaws-lambdamicrovms-lambdamicrovms. A handler reaches it through [`service_state`].
 ///
-/// Every map here is bounded: `images` by [`MAX_MICROVM_IMAGES`], `microvms` by
-/// [`MAX_ACTIVE_MICROVMS`] plus the [`TERMINATED_MICROVM_RETENTION`] reclaim,
-/// `removed_image_arns` by [`MAX_REMOVED_IMAGE_ARNS`], and `idempotency` by
-/// [`MAX_IDEMPOTENCY_RECORDS`] and [`IDEMPOTENCY_RETENTION`].
+/// Every resource this service mints is REGIONAL, so the records live in one
+/// [`regions::RegionalStore`] per region and every lookup is scoped to the region the
+/// request was signed for ([`request_region`]) — see the [`regions`] module.
+///
+/// Every map here is bounded: each region's `images` by [`MAX_MICROVM_IMAGES`], its
+/// `microvms` by [`MAX_ACTIVE_MICROVMS`] plus the [`TERMINATED_MICROVM_RETENTION`]
+/// reclaim, and its `idempotency` by [`MAX_IDEMPOTENCY_RECORDS`] and
+/// [`IDEMPOTENCY_RETENTION`].
 #[derive(Debug)]
 pub struct ComAmazonawsLambdamicrovmsLambdamicrovmsState {
-    /// Images by `name` (`ImageName` is unique within the account).
-    pub images: BTreeMap<String, MicrovmImage>,
-    /// `imageArn` -> image `name`, so an identifier resolves by ARN or by name.
-    pub arn_index: BTreeMap<String, String>,
-    /// MicroVMs by `microvmId`. The ids sort in creation order, which is the
-    /// order `ListMicrovms` pages through.
-    pub microvms: BTreeMap<String, Microvm>,
-    /// MicroVM ARN -> `microvmId`, so an identifier resolves by ARN or by id.
-    pub microvm_arn_index: BTreeMap<String, String>,
-    /// The `imageArn`s of images this account HELD and whose records the clock's
-    /// deletion has since removed, each with the instant it went.
-    ///
-    /// A record this account created is one the account is granted, whether or not it
-    /// still exists, so a call addressed at one may REPORT ITS ABSENCE rather than
-    /// refuse access — see [`Self::resolve_image_access`]. Bounded by
-    /// [`MAX_REMOVED_IMAGE_ARNS`], oldest removal first.
-    pub removed_image_arns: BTreeMap<String, Instant>,
-    /// `clientToken` -> the resource that token already minted.
-    pub idempotency: BTreeMap<String, IdempotencyRecord>,
+    /// The records of each region, keyed by the region they were created in. A region
+    /// nothing was ever created in holds no entry at all.
+    pub regions: BTreeMap<String, regions::RegionalStore>,
     /// The live authentication tokens a published MicroVM endpoint accepts, keyed by
     /// the DIGEST of the token rather than by the token itself
     /// ([`microvm_endpoint::auth_token_digest`]) — the caller keeps the only copy of
@@ -1303,12 +1406,7 @@ impl Default for ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     /// as of now — see [`Self::managed_catalogue_published_at`].
     fn default() -> Self {
         Self {
-            images: BTreeMap::new(),
-            arn_index: BTreeMap::new(),
-            microvms: BTreeMap::new(),
-            microvm_arn_index: BTreeMap::new(),
-            removed_image_arns: BTreeMap::new(),
-            idempotency: BTreeMap::new(),
+            regions: BTreeMap::new(),
             auth_tokens: BTreeMap::new(),
             microvm_proxy: None,
             next_microvm_seq: 0,
@@ -1380,7 +1478,24 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     ///
     /// This is the only write a reporting operation performs: each transition was
     /// owed at this same instant whether or not anybody called.
+    ///
+    /// The records live per region ([`regions`]), so each region's are settled on their
+    /// own; the authentication tokens are held once for the whole store, because the
+    /// address they authenticate at is a MicroVM's own rather than a regional endpoint
+    /// of this service.
     pub fn materialize_due(&mut self, now: Instant) {
+        for regional in self.regions.values_mut() {
+            regional.materialize_due(now);
+        }
+        self.expire_auth_tokens(now);
+    }
+}
+
+impl regions::RegionalStore {
+    /// Apply every lifecycle transition the clock has already made due to the records of
+    /// ONE region — the clock-owed transitions this module's header describes, applied
+    /// where the records they move live.
+    pub(crate) fn materialize_due(&mut self, now: Instant) {
         for image in self.images.values_mut() {
             let due: Vec<String> = image
                 .versions
@@ -1478,10 +1593,6 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
         for name in removed {
             if let Some(image) = self.images.remove(&name) {
                 self.arn_index.remove(&image.image_arn);
-                // The record is gone, but it was THIS account's: the ARN it was minted
-                // under stays an identifier the account is granted, so a later call
-                // addressed at it reports the absence instead of refusing access.
-                self.remember_removed_image(image.image_arn, now);
             }
         }
 
@@ -1538,9 +1649,10 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
             self.microvm_arn_index.remove(&arn);
         }
         self.idempotency.retain(|_, record| record.expires_at > now);
-        self.expire_auth_tokens(now);
     }
+}
 
+impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     /// The AWS-managed base images this service publishes, in catalogue-id order and
     /// projected into `region`.
     ///
@@ -1592,202 +1704,6 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
                 ),
             })
             .collect()
-    }
-
-    /// How many MicroVMs are not terminated — what [`MAX_ACTIVE_MICROVMS`] caps.
-    pub fn active_microvm_count(&self) -> usize {
-        self.microvms
-            .values()
-            .filter(|vm| vm.state != MICROVM_STATE_TERMINATED)
-            .count()
-    }
-
-    /// What `client_token` already minted on `operation`, if anything.
-    pub fn minted_by(&self, operation: &str, client_token: Option<&str>) -> Option<&MintedResource> {
-        let key = idempotency_key(operation, client_token?);
-        Some(&self.idempotency.get(&key)?.minted)
-    }
-
-    /// Record what `client_token` minted on `operation`, evicting the record closest
-    /// to expiry when the store is at [`MAX_IDEMPOTENCY_RECORDS`].
-    pub fn record_minted(
-        &mut self,
-        operation: &str,
-        client_token: &str,
-        minted: MintedResource,
-        now: Instant,
-    ) {
-        let key = idempotency_key(operation, client_token);
-        if !self.idempotency.contains_key(&key) && self.idempotency.len() >= MAX_IDEMPOTENCY_RECORDS
-        {
-            let evict = self
-                .idempotency
-                .iter()
-                .min_by_key(|(_, record)| record.expires_at)
-                .map(|(token, _)| token.clone());
-            if let Some(token) = evict {
-                self.idempotency.remove(&token);
-            }
-        }
-        self.idempotency.insert(
-            key,
-            IdempotencyRecord {
-                minted,
-                expires_at: now + IDEMPOTENCY_RETENTION,
-            },
-        );
-    }
-
-    /// The name of the image `identifier` names, resolving either form
-    /// `MicrovmImageIdentifier` documents ("The ARN or ID of the MicroVmImage").
-    ///
-    /// An ARN resolves ONLY through [`Self::arn_index`], so it names the image whose
-    /// stored `imageArn` it IS. Matching just its resource segment would resolve
-    /// another partition's, region's or account's ARN to a local image of the same
-    /// name.
-    pub fn resolve_image_name(&self, identifier: &str) -> Option<String> {
-        if identifier.starts_with("arn:") {
-            return self.arn_index.get(identifier).cloned();
-        }
-        self.images
-            .contains_key(identifier)
-            .then(|| identifier.to_string())
-    }
-
-    /// What `identifier` resolves to, which is what says whether the caller gets the
-    /// image, a not-found or a refusal.
-    ///
-    /// `MicrovmImageIdentifier` is "The ARN or ID of the MicroVmImage", so the
-    /// identifier is resolved as an id this account holds FIRST and read as an ARN
-    /// only when it names no held image: a value that is neither — a bare string that
-    /// is no id of this account and no ARN — addresses nothing this API can name, so it
-    /// is [`ImageReference::Malformed`] rather than absent.
-    pub fn resolve_image_reference(&self, identifier: &str) -> ImageReference {
-        if let Some(name) = self.resolve_image_name(identifier) {
-            return ImageReference::Resolved(name);
-        }
-        if ::service_common::arn::parse(identifier).is_some() {
-            return ImageReference::Absent;
-        }
-        ImageReference::Malformed
-    }
-
-    /// Remember that the image minted under `image_arn` was removed at `removed_at`,
-    /// dropping the oldest removal when the store is at [`MAX_REMOVED_IMAGE_ARNS`].
-    fn remember_removed_image(&mut self, image_arn: String, removed_at: Instant) {
-        if !self.removed_image_arns.contains_key(&image_arn)
-            && self.removed_image_arns.len() >= MAX_REMOVED_IMAGE_ARNS
-        {
-            let evict = self
-                .removed_image_arns
-                .iter()
-                .min_by_key(|(_, at)| **at)
-                .map(|(arn, _)| arn.clone());
-            if let Some(arn) = evict {
-                self.removed_image_arns.remove(&arn);
-            }
-        }
-        self.removed_image_arns.insert(image_arn, removed_at);
-    }
-
-    /// Whether this account holds, or has held, the MicroVM image `identifier` names.
-    ///
-    /// This is the grant a call on a `MicrovmImageIdentifier` is judged against: the
-    /// records an account created are the ones it is permitted to read, and a record it
-    /// created does not stop being its own when the record itself goes
-    /// ([`Self::removed_image_arns`]). An identifier of another namespace — AWS's own
-    /// ([`is_managed_microvm_image_arn`]), another account's, another partition's or
-    /// another vendor's — names nothing this account was ever granted.
-    pub fn grants_microvm_image(&self, identifier: &str) -> bool {
-        self.resolve_image_name(identifier).is_some()
-            || self.removed_image_arns.contains_key(identifier)
-    }
-
-    /// What a customer-facing call addressed at the `MicrovmImageIdentifier`
-    /// `identifier` answers, AUTHORIZATION first.
-    ///
-    /// The service decides access before it looks anything up, so it never reports the
-    /// absence of an identifier the caller is not permitted to read: an identifier this
-    /// account neither holds nor held ([`Self::grants_microvm_image`]) is
-    /// [`ImageAccess::Denied`] whether or not it names a resource, and only an
-    /// identifier of this account's own gets an answer about existence —
-    /// [`ImageAccess::Granted`] while the record is there and [`ImageAccess::Absent`]
-    /// once it is gone. A value that is no identifier of this API at all
-    /// ([`ImageReference::Malformed`]) is a bad REQUEST, which is decided on the input
-    /// rather than on any grant.
-    pub fn resolve_image_access(&self, identifier: &str) -> ImageAccess {
-        match self.resolve_image_reference(identifier) {
-            ImageReference::Malformed => ImageAccess::Malformed,
-            reference => match (self.grants_microvm_image(identifier), reference) {
-                (false, _) => ImageAccess::Denied,
-                (true, ImageReference::Resolved(name)) => ImageAccess::Granted(name),
-                (true, _) => ImageAccess::Absent,
-            },
-        }
-    }
-
-    /// The image `identifier` names, by ARN or by name.
-    pub fn image(&self, identifier: &str) -> Option<&MicrovmImage> {
-        let name = self.resolve_image_name(identifier)?;
-        self.images.get(&name)
-    }
-
-    /// The `microvmId` the `identifier` names, resolving either form
-    /// `MicrovmIdentifier` documents ("The ARN or ID of the MicroVm").
-    ///
-    /// An ARN resolves ONLY through [`Self::microvm_arn_index`], so it names the
-    /// MicroVM whose stored ARN it IS. Matching just its resource segment would
-    /// resolve another partition's, region's or account's ARN to a local MicroVM of
-    /// the same id.
-    pub fn resolve_microvm_id(&self, identifier: &str) -> Option<String> {
-        if identifier.starts_with("arn:") {
-            return self.microvm_arn_index.get(identifier).cloned();
-        }
-        self.microvms
-            .contains_key(identifier)
-            .then(|| identifier.to_string())
-    }
-
-    /// The MicroVM `identifier` names, by ARN or by id.
-    pub fn microvm(&self, identifier: &str) -> Option<&Microvm> {
-        let id = self.resolve_microvm_id(identifier)?;
-        self.microvms.get(&id)
-    }
-
-    /// The image `identifier` names, for mutation.
-    pub fn image_mut(&mut self, identifier: &str) -> Option<&mut MicrovmImage> {
-        let name = self.resolve_image_name(identifier)?;
-        self.images.get_mut(&name)
-    }
-
-    /// The version of the base image `base_image_arn` names, for a request that named
-    /// none.
-    ///
-    /// `baseImageVersion` is "the specific version of the base MicroVM image to use",
-    /// so the service resolves one rather than recording none: the base image's own
-    /// active version when this account holds it, and otherwise the initial version,
-    /// [`FIRST_IMAGE_VERSION`].
-    ///
-    /// A reference into the AWS-managed catalogue takes that same initial version
-    /// rather than the newest GENERATION the catalogue publishes for it
-    /// ([`latest_managed_base_image_version`]), so the catalogue is deliberately NOT
-    /// consulted here: the recorded create answers the `major.minor` initial version
-    /// for an unpinned build on a managed base image, while a build that pins a
-    /// generation records the generation it pinned.
-    pub fn resolve_base_image_version(&self, base_image_arn: &str) -> String {
-        if let Some(active) = self
-            .image(base_image_arn)
-            .and_then(|image| image.latest_active_image_version.clone())
-        {
-            return active;
-        }
-        FIRST_IMAGE_VERSION.to_string()
-    }
-
-    /// The MicroVM `identifier` names, for mutation.
-    pub fn microvm_mut(&mut self, identifier: &str) -> Option<&mut Microvm> {
-        let id = self.resolve_microvm_id(identifier)?;
-        self.microvms.get_mut(&id)
     }
 
     /// Mint the next `microvmId`. Zero-padded so the ids sort in creation

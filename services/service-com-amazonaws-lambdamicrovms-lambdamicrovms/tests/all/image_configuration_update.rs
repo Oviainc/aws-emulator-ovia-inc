@@ -26,7 +26,7 @@ use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     base_image_not_found_message, default_log_group, image_not_found_message,
     image_not_updatable_message, invalid_arn_format_message, managed_base_image_arn,
     managed_network_connector_arn, next_image_version, service_state,
-    too_many_image_versions_message, ACCESS_DENIED_MESSAGE, CODE_ARTIFACT_URI_REQUIREMENT,
+    too_many_image_versions_message, access_denied_message, CODE_ARTIFACT_URI_REQUIREMENT,
     DEFAULT_CPU_ARCHITECTURE, DEFAULT_EGRESS_NETWORK_CONNECTOR, DEFAULT_MINIMUM_MEMORY_IN_MIB,
     FIRST_IMAGE_VERSION, MANAGED_BASE_IMAGE_IDS, MAX_MICROVM_IMAGE_VERSIONS,
 };
@@ -556,7 +556,7 @@ async fn an_identifier_naming_no_image_of_this_account_is_refused() {
             managed.clone(),
             403,
             "AccessDeniedException",
-            ACCESS_DENIED_MESSAGE.to_string(),
+            access_denied_message(),
         ),
         (
             "an ARN for a name never created",
@@ -739,7 +739,7 @@ fn seed_versions(engine: &engine::InMemoryEngine, name: &str, count: usize) {
     let state = service_state(engine).expect("the service's own store");
     let mut store = state.lock();
     let image = store
-        .image_mut(name)
+        .image_mut(REGION, name)
         .unwrap_or_else(|| panic!("the created image {name:?} is held"));
     let template = image
         .versions

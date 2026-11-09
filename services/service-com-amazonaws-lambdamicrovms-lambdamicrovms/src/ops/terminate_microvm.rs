@@ -153,13 +153,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
 
         let mut store = state.lock();
         store.materialize_due(now);
 
-        let Some(vm) = store.microvm_mut(&input.microvm_identifier) else {
+        let Some(vm) = store.microvm_mut(&region, &input.microvm_identifier) else {
             // The not-found envelope this service puts on the wire: a
             // request-derived `message`, with `resourceType` and `resourceId` unset.
             return Err(TerminateMicrovmErrorModeled::ResourceNotFoundException(

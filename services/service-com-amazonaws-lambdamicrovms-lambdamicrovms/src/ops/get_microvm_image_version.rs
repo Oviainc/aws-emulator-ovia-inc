@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
 
         // The read REPORTS state, so the only write it performs is the one the clock
         // already owed: a build, a deletion or an expiry that was due at this instant
@@ -219,13 +219,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // mean different things to a client polling a version it believes is being
         // built: a malformed identifier is a request that can NEVER succeed (400) and
         // this account's own record being gone is the condition a poll may retry (404).
-        let image = match store.resolve_image_access(&input.image_identifier) {
-            crate::state::ImageAccess::Granted(name) => store.images.get(&name),
+        let image = match store.resolve_image_access(&region, &input.image_identifier) {
+            crate::state::ImageAccess::Granted(name) => store.image_named(&region, &name),
             crate::state::ImageAccess::Absent => None,
             crate::state::ImageAccess::Denied => {
                 return Err(GetMicrovmImageVersionErrorModeled::AccessDeniedException(
                     AccessDeniedException {
-                        message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+                        message: Some(crate::state::access_denied_message()),
                     },
                 )
                 .into());

@@ -3,14 +3,16 @@
 //! End-to-end tests for the order in which `GetMicrovmImage` decides what to answer,
 //! driven over the same router the emulator boots.
 //!
-//! RULE: the read decides ACCESS BEFORE EXISTENCE. An `imageIdentifier` this account
-//! holds no record of — now or before — is refused with the modelled authorization error
-//! (HTTP 403 `AccessDeniedException`) whether or not it names a resource, so the read
-//! never reports absence for an identifier the caller may not read and cannot be used to
-//! probe which images an account has. Only an identifier of this account's OWN record
-//! gets an answer about existence: the record while it is there, and the modelled
-//! not-found (HTTP 404 `ResourceNotFoundException`) once the deletion this account asked
-//! for has taken it.
+//! RULE: the read decides ACCESS BEFORE EXISTENCE, and the two questions are asked at
+//! different scopes. ACCESS is the ACCOUNT's: an `imageIdentifier` outside this account's
+//! own image namespace is refused with the modelled authorization error (HTTP 403
+//! `AccessDeniedException`) whether or not it names a resource, so the read never reports
+//! absence for an identifier the caller may not read and cannot be used to probe AWS's
+//! own catalogue or another account's images. EXISTENCE is the REGION's: an identifier of
+//! this account's own namespace gets an answer about the record — the record while this
+//! region holds it, and the modelled not-found (HTTP 404 `ResourceNotFoundException`)
+//! when it does not, which is the one answer a name nothing was created under, a record
+//! the account deleted and an image minted through another region's endpoint all get.
 //!
 //! Each test states that rule and exercises it over a SET of inputs; the values any one
 //! row happens to carry are examples, not the specification. The wire harness
@@ -19,8 +21,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    image_not_found_message, managed_base_image_arn, ACCESS_DENIED_MESSAGE,
-    MANAGED_BASE_IMAGE_IDS,
+    image_not_found_message, managed_base_image_arn, MANAGED_BASE_IMAGE_IDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -68,6 +69,15 @@ async fn delete_image(router: &MultiServiceRouter, identifier: &str) -> (u16, Va
     .await
 }
 
+/// The sentence AWS words this refusal with, spelled out here rather than read from the
+/// crate so a change to the wording fails this suite: fixed text `User: ` and ` is not
+/// authorized to perform this operation`, with the one variable part the identity that
+/// signed the request — the account's own IAM user, which `sts:GetCallerIdentity`
+/// reports as `arn:aws:iam::<account>:user/emulator`.
+fn expected_denial_sentence() -> String {
+    format!("User: arn:aws:iam::{ACCOUNT}:user/emulator is not authorized to perform this operation")
+}
+
 /// The refusal every denied row must carry: the modelled status, code and sentence.
 fn assert_denied(status: u16, body: &Value, case: &str) {
     assert_eq!(status, 403, "case {case}: expected 403, got {status} {body}");
@@ -78,15 +88,33 @@ fn assert_denied(status: u16, body: &Value, case: &str) {
     );
     assert_eq!(
         body["message"].as_str(),
-        Some(ACCESS_DENIED_MESSAGE),
-        "case {case}: expected the modelled denial sentence, got {:?}",
+        Some(expected_denial_sentence().as_str()),
+        "case {case}: expected the denial sentence naming the caller, got {:?}",
         body["message"]
     );
 }
 
-/// RULE: every well-formed `imageIdentifier` this account holds no record of is denied
-/// 403 `AccessDeniedException`, whichever namespace it names and whether or not it names
-/// a resource that exists.
+/// The absence every own-account row that names no record of this region must carry.
+fn assert_absent(status: u16, body: &Value, identifier: &str, case: &str) {
+    assert_eq!(status, 404, "case {case}: expected 404, got {status} {body}");
+    assert_eq!(
+        body["__type"].as_str(),
+        Some("ResourceNotFoundException"),
+        "case {case}: expected ResourceNotFoundException, got {body}"
+    );
+    assert_eq!(
+        body["message"].as_str(),
+        Some(image_not_found_message(identifier).as_str()),
+        "case {case}: expected the read path's own message for {identifier}, got {:?}",
+        body["message"]
+    );
+}
+
+/// RULE: every well-formed `imageIdentifier` OUTSIDE this account's own image namespace
+/// is denied 403 `AccessDeniedException`, whichever other namespace it names and whether
+/// or not it names a resource that exists — while an identifier of this account's own
+/// namespace that this region holds no record of is reported absent (404), the answer
+/// that says nothing about any other account's resources.
 #[tokio::test]
 async fn a_read_of_an_identifier_this_account_was_never_granted_is_denied() {
     let router = emulator();
@@ -112,12 +140,12 @@ async fn a_read_of_an_identifier_this_account_was_never_granted_is_denied() {
         longest.len()
     );
 
-    // Rows differ in WHY the account holds no record of the identifier: it names AWS's
-    // own catalogue (an entry that exists, and one that does not), this account's own
-    // namespace with a name nothing was created under (short, at the length bound, and
-    // repeating a name the account DOES hold in another region), another account's,
-    // another partition's, another vendor's, and another resource type's.
-    let mut rows: Vec<(String, String)> = MANAGED_BASE_IMAGE_IDS
+    // Denied rows differ in WHICH namespace outside this account's own the identifier
+    // names: AWS's own catalogue (an entry that exists, and one that does not), another
+    // account's, another partition's, another vendor's, another resource type's, and this
+    // account's own resource type spelled in a form `MicrovmImageArn`'s pattern does not
+    // admit (`microvm-image/<name>` rather than `microvm-image:<name>`).
+    let mut denied: Vec<(String, String)> = MANAGED_BASE_IMAGE_IDS
         .iter()
         .map(|image_id| {
             (
@@ -126,22 +154,10 @@ async fn a_read_of_an_identifier_this_account_was_never_granted_is_denied() {
             )
         })
         .collect();
-    rows.extend([
+    denied.extend([
         (
             "an AWS-owned ARN the catalogue does not publish".to_string(),
             managed_base_image_arn(REGION, "no-such-base-image"),
-        ),
-        (
-            "this account's namespace, a name nothing was created under".to_string(),
-            expected_image_arn("never-created"),
-        ),
-        (
-            "this account's namespace, at the identifier length bound".to_string(),
-            longest,
-        ),
-        (
-            "this account's namespace in another region, a name it holds".to_string(),
-            format!("arn:aws:lambda:eu-central-1:{ACCOUNT}:microvm-image:{held}"),
         ),
         (
             "another account's ARN for a name this one holds".to_string(),
@@ -162,15 +178,37 @@ async fn a_read_of_an_identifier_this_account_was_never_granted_is_denied() {
     ]);
 
     let mut refusals: Vec<(String, Value)> = Vec::new();
-    for (case, identifier) in &rows {
+    for (case, identifier) in &denied {
         let (status, body) = get_image(&router, identifier).await;
         assert_denied(status, &body, &format!("{case} ({identifier})"));
         refusals.push((case.clone(), body));
     }
 
+    // Absent rows are this account's OWN namespace with no record of them in this
+    // region: a name nothing was created under, one at the identifier length bound, and
+    // a name this account holds in ANOTHER region.
+    let absent: Vec<(String, String)> = vec![
+        (
+            "this account's namespace, a name nothing was created under".to_string(),
+            expected_image_arn("never-created"),
+        ),
+        (
+            "this account's namespace, at the identifier length bound".to_string(),
+            longest,
+        ),
+        (
+            "this account's namespace in another region, a name it holds".to_string(),
+            format!("arn:aws:lambda:eu-central-1:{ACCOUNT}:microvm-image:{held}"),
+        ),
+    ];
+    for (case, identifier) in &absent {
+        let (status, body) = get_image(&router, identifier).await;
+        assert_absent(status, &body, identifier, &format!("{case} ({identifier})"));
+    }
+
     // The refusal says NOTHING about existence: the answer for an AWS-owned image the
     // catalogue publishes — a resource that unambiguously exists — is byte for byte the
-    // answer for an identifier of this account's own namespace that names nothing.
+    // answer for an identifier of another account's namespace that names nothing.
     let (first_case, first) = refusals
         .first()
         .cloned()
@@ -184,8 +222,8 @@ async fn a_read_of_an_identifier_this_account_was_never_granted_is_denied() {
     }
 
     // The positive control: this account's own image is still served through the same
-    // path, so the rows above are denied by the verdict and not by a dead path — and the
-    // denials changed nothing a later caller sees.
+    // path, so the rows above are refused by the verdict and not by a dead path — and the
+    // refusals changed nothing a later caller sees.
     let (status, image) = get_image(&router, &held_arn).await;
     assert_eq!(
         status, 200,
@@ -305,8 +343,10 @@ async fn a_read_of_this_accounts_own_record_reports_it_gone_once_the_delete_is_d
 }
 
 /// RULE: the verdict is on the identifier, not on its spelling — the resource field of an
-/// ARN carries its type and id separated by `:` or `/`, and an identifier in either form
-/// that this account holds no record of is denied the same way.
+/// ARN carries its type and id separated by `:` or `/`, and `MicrovmImageArn`'s own
+/// pattern (`^arn:[a-z0-9-]+:lambda:[a-z0-9-]*:[a-z0-9]*:microvm-image:.+$`) admits only
+/// the `:` form, so a value spelling this resource type with a `/` names no image of this
+/// account and is denied whichever name follows it.
 #[tokio::test]
 async fn the_denial_does_not_depend_on_which_resource_form_the_arn_uses() {
     let router = emulator();

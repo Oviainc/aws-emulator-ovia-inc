@@ -227,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due(now);
 
         // `clientToken` replay returns the MicroVM that token already minted.
-        if let Some(vm) = replayed(&store, input.client_token.as_deref()) {
+        if let Some(vm) = replayed(&store, &region, input.client_token.as_deref()) {
             return Ok(output_of(vm));
         }
 
@@ -239,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::is_managed_microvm_image_arn(&input.image_identifier) {
             return Err(RunMicrovmErrorModeled::AccessDeniedException(
                 AccessDeniedException {
-                    message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+                    message: Some(crate::state::access_denied_message()),
                 },
             )
             .into());
@@ -254,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // wait for a version).
         let (image_arn, image_version) = match input.image_version.as_deref() {
             None => {
-                let resolved = store.image(&input.image_identifier).and_then(|image| {
+                let resolved = store.image(&region, &input.image_identifier).and_then(|image| {
                     let arn = image.image_arn.clone();
                     image
                         .latest_active_image_version
@@ -268,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // otherwise by the identifier the request carried — there is
                         // no ARN to name for an image that does not exist.
                         let named = store
-                            .image(&input.image_identifier)
+                            .image(&region, &input.image_identifier)
                             .map(|image| image.image_arn.clone())
                             .unwrap_or_else(|| input.image_identifier.clone());
                         return Err(no_active_version(&named));
@@ -276,7 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             Some(requested) => {
-                let Some(image) = store.image(&input.image_identifier) else {
+                let Some(image) = store.image(&region, &input.image_identifier) else {
                     return Err(version_not_found(&input.image_identifier, requested));
                 };
                 let image_arn = image.image_arn.clone();
@@ -298,9 +298,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The account's concurrent-MicroVM quota: the modelled 402 rather than an
-        // unbounded store.
-        if store.active_microvm_count() >= crate::state::MAX_ACTIVE_MICROVMS {
+        // A MicroVM is launched from what a build PRODUCED, so the version the
+        // resolution settled on must hold a build that produced an image. A version can
+        // be published ACTIVE whatever state its build settled in
+        // (`UpdateMicrovmImageVersion` sets the status, not the state), so a version
+        // whose builds all failed resolves here and is refused as the missing build it
+        // is rather than launching a MicroVM from nothing.
+        let built = store
+            .image(&region, &image_arn)
+            .and_then(|image| image.versions.get(&image_version))
+            .is_some_and(|version| {
+                version
+                    .builds
+                    .values()
+                    .any(|build| build.state == crate::state::BUILD_STATE_SUCCESSFUL)
+            });
+        if !built {
+            return Err(no_image_build(&image_arn, &image_version));
+        }
+
+        // The account's concurrent-MicroVM quota in this region: the modelled 402
+        // rather than an unbounded store.
+        if store.active_microvm_count(&region) >= crate::state::MAX_ACTIVE_MICROVMS {
             return Err(RunMicrovmErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: Some(format!(
@@ -339,37 +358,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let microvm_arn = crate::state::microvm_arn(&region, &microvm_id);
         let endpoint = crate::state::microvm_endpoint::endpoint_url(&endpoint_base, &microvm_id);
         store
-            .microvm_arn_index
-            .insert(microvm_arn.clone(), microvm_id.clone());
-        store.microvms.insert(
-            microvm_id.clone(),
-            Microvm {
-                microvm_id: microvm_id.clone(),
-                microvm_arn,
-                state: crate::state::MICROVM_STATE_PENDING.to_string(),
-                endpoint,
-                image_arn,
-                image_version,
-                execution_role_arn: input.execution_role_arn,
-                idle_policy: input.idle_policy,
-                logging: input.logging,
-                maximum_duration_in_seconds,
-                started_at,
-                terminated_at: None,
-                state_reason: None,
-                ingress_network_connectors: input.ingress_network_connectors.unwrap_or_default(),
-                egress_network_connectors: input.egress_network_connectors.unwrap_or_default(),
-                // "The MicroVM starts in PENDING state and transitions to RUNNING
-                // once provisioning completes."
-                provision_due_at: Some(now + crate::state::MICROVM_PROVISION_SPAN),
-                suspend_due_at: None,
-                terminate_due_at: None,
-                expiry_due_at: Some(now + ::std::time::Duration::from_secs(maximum_duration)),
-                reclaim_due_at: None,
-            },
-        );
+            .insert_microvm(
+                &region,
+                Microvm {
+                    microvm_id: microvm_id.clone(),
+                    microvm_arn,
+                    state: crate::state::MICROVM_STATE_PENDING.to_string(),
+                    endpoint,
+                    image_arn,
+                    image_version,
+                    execution_role_arn: input.execution_role_arn,
+                    idle_policy: input.idle_policy,
+                    logging: input.logging,
+                    maximum_duration_in_seconds,
+                    started_at,
+                    terminated_at: None,
+                    state_reason: None,
+                    ingress_network_connectors: input
+                        .ingress_network_connectors
+                        .unwrap_or_default(),
+                    egress_network_connectors: input
+                        .egress_network_connectors
+                        .unwrap_or_default(),
+                    // "The MicroVM starts in PENDING state and transitions to RUNNING
+                    // once provisioning completes."
+                    provision_due_at: Some(now + crate::state::MICROVM_PROVISION_SPAN),
+                    suspend_due_at: None,
+                    terminate_due_at: None,
+                    expiry_due_at: Some(now + ::std::time::Duration::from_secs(maximum_duration)),
+                    reclaim_due_at: None,
+                },
+            );
         if let Some(token) = input.client_token {
             store.record_minted(
+                &region,
                 "RunMicrovm",
                 &token,
                 MintedResource::Microvm {
@@ -380,7 +402,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The response is the PERSISTED record, read back out of the store.
-        let Some(vm) = store.microvms.get(&microvm_id) else {
+        let Some(vm) = store.microvm(&region, &microvm_id) else {
             return Err(unavailable());
         };
         Ok(output_of(vm))
@@ -430,6 +452,17 @@ fn version_not_found(image: &str, image_version: &str) -> RunMicrovmError {
     .into()
 }
 
+/// 404: the version the launch resolved holds no build that produced an image, so there
+/// is nothing to run it from.
+fn no_image_build(image_arn: &str, image_version: &str) -> RunMicrovmError {
+    RunMicrovmErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::no_image_build_message(image_arn, image_version),
+        resource_type: None,
+        resource_id: None,
+    })
+    .into()
+}
+
 /// 409: the image's current state does not allow running a MicroVM from it.
 fn conflict(message: String, image_arn: &str) -> RunMicrovmError {
     RunMicrovmErrorModeled::ConflictException(ConflictException {
@@ -453,12 +486,17 @@ fn duration_out_of_range(value: i32) -> RunMicrovmError {
 }
 
 /// The MicroVM `client_token` already minted, if it minted one.
-fn replayed<'a>(store: &'a ServiceState, client_token: Option<&str>) -> Option<&'a Microvm> {
-    let MintedResource::Microvm { microvm_id } = store.minted_by("RunMicrovm", client_token)?
+fn replayed<'a>(
+    store: &'a ServiceState,
+    region: &str,
+    client_token: Option<&str>,
+) -> Option<&'a Microvm> {
+    let MintedResource::Microvm { microvm_id } =
+        store.minted_by(region, "RunMicrovm", client_token)?
     else {
         return None;
     };
-    store.microvms.get(microvm_id)
+    store.microvm(region, microvm_id)
 }
 
 /// The modelled response for a stored MicroVM.

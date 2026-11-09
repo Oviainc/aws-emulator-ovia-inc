@@ -29,7 +29,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::microvm_image_and_instance_paths::{delete_image, get_image};
 use crate::microvm_lifecycle::{
-    as_uri_value, call, expected_image_arn, image_body, ACCOUNT, PAST_THE_SPAN,
+    as_uri_value, call, expected_image_arn, image_body, ACCOUNT, PAST_THE_SPAN, REGION,
 };
 
 /// Every member a listed version shares with the `CreateMicrovmImage` response: the
@@ -106,7 +106,7 @@ fn seed_versions(engine: &engine::InMemoryEngine, name: &str, versions: &[&str])
     let state = service_state(engine).expect("the service's own store");
     let mut store = state.lock();
     let image = store
-        .image_mut(name)
+        .image_mut(REGION, name)
         .unwrap_or_else(|| panic!("the created image {name:?} is held"));
     let template = image
         .versions
@@ -127,7 +127,7 @@ fn clear_versions(engine: &engine::InMemoryEngine, name: &str) {
     let state = service_state(engine).expect("the service's own store");
     let mut store = state.lock();
     store
-        .image_mut(name)
+        .image_mut(REGION, name)
         .unwrap_or_else(|| panic!("the created image {name:?} is held"))
         .versions
         .clear();
