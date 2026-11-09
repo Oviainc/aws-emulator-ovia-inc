@@ -72,6 +72,10 @@ pub struct SourceDocument {
     /// the bound index's dimension; empty when the knowledge base binds to no
     /// index this emulator holds, so there is nothing to compute it against.
     pub vector: Vec<f32>,
+    /// The CHUNK of the document's text the index holds beside that vector
+    /// ([`ingestion_index::leading_chunk`]), which is what a retrieval of this
+    /// document answers as its content.
+    pub chunk: String,
 }
 
 /// What one pass over a data source's source found.
@@ -241,13 +245,18 @@ pub fn crawl_data_source<Eng: Send + Sync + 'static>(
         // The document's text is what its vector is computed from; bytes that
         // are not text carry no terms, so such a document takes the vector a
         // document with no terms takes.
+        let text = String::from_utf8_lossy(&object.body);
         let vector = dimension.map_or_else(Vec::new, |dimension| {
-            document_vector(&String::from_utf8_lossy(&object.body), dimension)
+            document_vector(&text, dimension)
         });
         crawled.documents.push(SourceDocument {
             uri: source_uri(bucket, key),
             digest: content_digest(&object.body),
             vector,
+            // The chunk the index holds beside the vector, so a retrieval of this
+            // document answers the text the job really read rather than a later look
+            // at the object.
+            chunk: ingestion_index::leading_chunk(&text),
         });
     }
     Some(crawled)
@@ -305,6 +314,7 @@ impl IndexedVectors {
 pub fn index_source_vectors<Eng: Send + Sync + 'static>(
     engine: &Eng,
     binding: &S3VectorsBinding,
+    data_source_id: &str,
     documents: &[SourceDocument],
 ) -> IndexedVectors {
     use ::service_com_amazonaws_s3vectors_s3vectors::state as vectors;
@@ -321,10 +331,17 @@ pub fn index_source_vectors<Eng: Send + Sync + 'static>(
         let vector = vectors::StoredVector {
             key: source_vector_key(&document.uri),
             data: document.vector.clone(),
-            metadata: ::aws_smithy_types::Document::Object(HashMap::from([(
-                SOURCE_URI_METADATA_KEY.to_string(),
-                ::aws_smithy_types::Document::String(document.uri.clone()),
-            )])),
+            // What the knowledge base records with the chunk: its text, its id, the
+            // data source it came from and its source file's modality, beside the
+            // source URI this plane keys its own bookkeeping by. One place decides
+            // those fields, so the plane that READS them back for a retrieval cannot
+            // drift from this one ([`ingestion_index`]).
+            metadata: ingestion_index::chunk_metadata(
+                data_source_id,
+                &document.uri,
+                &document.chunk,
+                SOURCE_URI_METADATA_KEY,
+            ),
         };
         if vectors::vector_data_defect(index, &vector.data).is_some() {
             continue;

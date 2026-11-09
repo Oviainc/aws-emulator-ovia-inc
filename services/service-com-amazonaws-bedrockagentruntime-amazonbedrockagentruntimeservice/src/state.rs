@@ -22,6 +22,20 @@
 //! and whether that caller's identity-based permissions cover `bedrock:<Operation>` on
 //! the session. It lives here, not in a handler, because all of them must decide it the
 //! same way.
+//!
+//! The service's own store is the session; the KNOWLEDGE BASE a retrieval reads is
+//! owned by the Bedrock Agent build-time plane and the S3 object store, so what a
+//! retrieval may report from them lives in two submodules of its own rather than in a
+//! handler:
+//!
+//! * [`knowledge_base_retrieval`] — which chunks of which ingested source a knowledge
+//!   base holds, and where each one came from;
+//! * [`retrieval_filter`] — which of those chunks a request's `filter` admits.
+
+/// See the module docs: what a knowledge-base retrieval may report.
+pub mod knowledge_base_retrieval;
+/// See the module docs: which chunks a retrieval's `filter` admits.
+pub mod retrieval_filter;
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;

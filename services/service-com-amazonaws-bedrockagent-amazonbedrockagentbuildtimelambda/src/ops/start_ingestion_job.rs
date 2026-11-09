@@ -348,8 +348,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|uri| !crawled.documents.iter().any(|document| &document.uri == uri))
                 .collect();
             crate::state::remove_source_vectors(&*self.engine, binding, &gone);
-            indexed =
-                crate::state::index_source_vectors(&*self.engine, binding, &crawled.documents);
+            indexed = crate::state::index_source_vectors(
+                &*self.engine,
+                binding,
+                &input.data_source_id,
+                &crawled.documents,
+            );
         }
 
         let mut state = state.lock();

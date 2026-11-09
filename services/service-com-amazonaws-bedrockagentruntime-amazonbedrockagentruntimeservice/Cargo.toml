@@ -15,6 +15,11 @@ service-common = { path = "../common" }
 # neither store.
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The knowledge bases, data sources and the vector store binding a retrieval reads, from
+# the plane that OWNS them, and the vector index their ingestions wrote. Read-only: this
+# service writes no part of either.
+service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda = { workspace = true }
+service-com-amazonaws-s3vectors-s3vectors = { workspace = true }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -24,7 +29,9 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `time` is for the retrieval test's wait over the ingestion spans the Bedrock Agent
+# plane's clock owes; `macros`/`rt` come from the workspace entry.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -36,6 +43,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The retrieval test seeds the objects a data source is crawled from, and follows a
+# citation back to one, through S3 itself.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

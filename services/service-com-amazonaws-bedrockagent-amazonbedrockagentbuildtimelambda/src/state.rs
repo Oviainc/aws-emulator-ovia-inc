@@ -127,6 +127,10 @@ pub use flow_aliases::*;
 pub use ingestion::*;
 pub use vector_store::*;
 
+/// What an ingestion records in the bound vector index beside the vector: the published
+/// knowledge-base metadata fields a retrieval reads a chunk back from.
+pub mod ingestion_index;
+
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};

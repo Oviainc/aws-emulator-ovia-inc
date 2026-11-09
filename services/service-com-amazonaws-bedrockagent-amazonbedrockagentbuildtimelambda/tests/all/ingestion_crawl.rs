@@ -65,10 +65,10 @@ const EMBEDDING_MODEL: &str =
     "arn:aws:bedrock:eu-west-1::foundation-model/amazon.titan-embed-text-v2:0";
 
 /// The vector bucket every knowledge base here binds to.
-const VECTOR_BUCKET: &str = "arn:aws:s3vectors:::bucket/crawl-vectors";
+pub(crate) const VECTOR_BUCKET: &str = "arn:aws:s3vectors:::bucket/crawl-vectors";
 
 /// The index of [`VECTOR_BUCKET`] the vectors are written into.
-const INDEX: &str = "crawl-index";
+pub(crate) const INDEX: &str = "crawl-index";
 
 /// The S3 bucket the data sources here are crawled from.
 const SOURCE_BUCKET: &str = "crawl-source-documents";
@@ -91,7 +91,7 @@ const STATISTICS_MEMBERS: [&str; 8] = [
 
 /// One HTTP answer from the emulator, parsed.
 #[derive(Debug)]
-struct Answer {
+pub(crate) struct Answer {
     status: u16,
     body: Value,
 }
@@ -122,13 +122,18 @@ impl Answer {
 
 /// The emulator under test: one router over one shared engine, exactly as the
 /// production router mounts this service.
-struct Emulator {
+///
+/// `pub(crate)`, with the seams a sibling suite drives it through, so the suite that
+/// asserts what an ingestion RECORDS beside each vector
+/// (`tests/all/ingestion_index.rs`) drives the emulator exactly the way this one does
+/// instead of growing a second copy of the harness.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         // The vector store the knowledge base binds to, and the bucket the data
         // source is crawled from: both set up before anything names them, as a
@@ -175,7 +180,7 @@ impl Emulator {
 
     /// Store `body` at `key` of the source bucket, through Amazon S3's own
     /// store — the one map its `PutObject` writes and its `GetObject` reads.
-    fn hold_object(&self, key: &str, body: &str) {
+    pub(crate) fn hold_object(&self, key: &str, body: &str) {
         let state = s3_state(&*self.engine).expect("the object store on this engine");
         let mut store = state.lock();
         let written = store.put_object(
@@ -190,7 +195,7 @@ impl Emulator {
     }
 
     /// Take the object at `key` out of the source bucket again.
-    fn drop_object(&self, key: &str) {
+    pub(crate) fn drop_object(&self, key: &str) {
         let state = s3_state(&*self.engine).expect("the object store on this engine");
         let mut store = state.lock();
         let removed = store.remove_object(SOURCE_BUCKET, key);
@@ -201,7 +206,7 @@ impl Emulator {
     }
 
     /// Create a knowledge base bound to [`INDEX`] and answer its minted id.
-    async fn knowledge_base(&self, name: &str) -> String {
+    pub(crate) async fn knowledge_base(&self, name: &str) -> String {
         let created = self
             .call(
                 "PUT",
@@ -233,7 +238,7 @@ impl Emulator {
     }
 
     /// Attach an S3 data source over `prefixes` and answer its minted id.
-    async fn data_source(
+    pub(crate) async fn data_source(
         &self,
         knowledge_base_id: &str,
         name: &str,
@@ -267,7 +272,11 @@ impl Emulator {
 
     /// Start an ingestion job and wait for the clock to complete it, answering
     /// the completed job as `GetIngestionJob` reports it.
-    async fn run_ingestion_job(&self, knowledge_base_id: &str, data_source_id: &str) -> Answer {
+    pub(crate) async fn run_ingestion_job(
+        &self,
+        knowledge_base_id: &str,
+        data_source_id: &str,
+    ) -> Answer {
         let started = self
             .call(
                 "PUT",
@@ -375,8 +384,8 @@ impl Emulator {
     }
 }
 
-/// The `s3://` URI one source object lives at.
-fn uri(key: &str) -> String {
+/// The `s3://` URI of one source document, as a knowledge-base document names it.
+pub(crate) fn uri(key: &str) -> String {
     format!("s3://{SOURCE_BUCKET}/{key}")
 }
 

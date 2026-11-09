@@ -17,6 +17,8 @@ mod collection_length_refusals;
 mod date_time_wire_form;
 #[path = "all/invocations.rs"]
 mod invocations;
+#[path = "all/knowledge_base_retrieval.rs"]
+mod knowledge_base_retrieval;
 #[path = "all/list_sessions.rs"]
 mod list_sessions;
 #[path = "all/pattern_constraint_messages.rs"]

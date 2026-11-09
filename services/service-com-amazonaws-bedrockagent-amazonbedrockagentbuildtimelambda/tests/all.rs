@@ -37,6 +37,8 @@ mod flow_version_prepare_ordering;
 mod flow_version_snapshots;
 #[path = "all/immutable_configuration_members.rs"]
 mod immutable_configuration_members;
+#[path = "all/ingestion_index.rs"]
+mod ingestion_index;
 #[path = "all/ingestion_crawl.rs"]
 mod ingestion_crawl;
 #[path = "all/ingestion_job_lifecycle.rs"]
