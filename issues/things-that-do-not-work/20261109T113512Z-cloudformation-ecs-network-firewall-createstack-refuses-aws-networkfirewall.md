@@ -1,0 +1,28 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudformation__ecs__network-firewall.deploy-networkfirewall-container-association-ecs-cluster-round-trip-and-delete cloudformation__ecs__network-firewall.deploy-networkfirewall-container-association-invalid-cluster-arn-rejected-and-rolled-back
+Issue-Key: cloudformation__ecs__network-firewall|CreateStack|ValidationError
+Issue-Commit: e38416fc0970ac2ae0c65df6bda0d7aff4be2337
+
+# cloudformation__ecs__network-firewall: CreateStack refuses AWS::NetworkFirewall::ContainerAssociation as an unrecognized resource type, so no container-association template can be deployed
+
+> _Note: this issue was identified against the code base at commit `e38416fc0970ac2ae0c65df6bda0d7aff4be2337`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateStack
+
+## Description
+Cause 1 of 1: CloudFormation's template-type registry does not know AWS::NetworkFirewall::ContainerAssociation, so CreateStack rejects any template declaring one before anything is provisioned.
+AWS: the resource type exists and is backed by the Network Firewall container-association API (Smithy com.amazonaws.networkfirewall#CreateContainerAssociation / DescribeContainerAssociation / ListContainerAssociations / UpdateContainerAssociation / DeleteContainerAssociation are all bound to the service). CreateContainerAssociation takes ContainerAssociationName (ResourceName, required, length 1-128, pattern ^[a-zA-Z0-9-]+$), Type (ContainerMonitoringType enum, required), ContainerMonitoringConfigurations (required list, each entry's ClusterArn is a ResourceArn with pattern ^arn:aws) and Tags, and returns ContainerAssociationArn plus Status. CloudFormation therefore ACCEPTS such a template: it provisions the association (Ref returns its ARN, Fn::GetAtt Status returns ACTIVE), an update that drops the resource deletes the association while leaving the ECS cluster ACTIVE, and a malformed ClusterArn is caught by early property validation — a PROPERTY_VALIDATION/FAILED/FAIL row reading 'Property value [<value>] does not match pattern: ^arn:aws' at '/Resources/<logical id>/Properties/ContainerMonitoringConfigurations/0/ClusterArn' — which rolls the stack back to ROLLBACK_COMPLETE. Fixed text of that row: 'Property value [' / '] does not match pattern: ' plus the member's modeled pattern; the variable parts are the offending value from the request and the property path of the member.
+Emulator: CreateStack answers 400 ValidationError with Message 'Template format error: Unrecognized resource types: [AWS::NetworkFirewall::ContainerAssociation]' and no stack is created, for both the valid template and the malformed-ClusterArn template.
+Why: Network Firewall container associations cannot be managed as infrastructure-as-code at all. Every template-driven workflow (deploy, the association-dropping update, the property-validation rejection, and the stack-delete cleanup that should leave the ECS cluster INACTIVE) is unreachable, and clients see an AWS-style 'unrecognized resource type' error for a type AWS does recognize — which reads as a client/template bug rather than a missing emulator feature.
+Fix: register AWS::NetworkFirewall::ContainerAssociation in CloudFormation's resource-type registry and add its provisioner, wired to the Network Firewall CreateContainerAssociation/UpdateContainerAssociation/DeleteContainerAssociation handlers, with Ref -> ContainerAssociationArn, GetAtt Status, tag propagation, and the modeled ^arn:aws pattern on ContainerMonitoringConfigurations[].ClusterArn enforced by early property validation. Related but not covering: open issue 20261107T075601Z-cloudformation-ec2-ssm-cloudformation-ssm-aws-ssm-maintenancewindowtarget-unrecognised-ec2-ref.md reports the same 'Unrecognized resource types' shape for AWS::SSM::MaintenanceWindowTarget and does not carry these replay keys or this resource type.
+Traces: cloudformation__ecs__network-firewall.deploy-networkfirewall-container-association-ecs-cluster-round-trip-and-delete; cloudformation__ecs__network-firewall.deploy-networkfirewall-container-association-invalid-cluster-arn-rejected-and-rolled-back.
+
+## Evidence
+Expected: CreateStack accepts the template and the stack settles (CREATE_COMPLETE for the valid ClusterArn; ROLLBACK_COMPLETE with the validation row ('<logical id>', 'PROPERTY_VALIDATION', 'FAILED', 'FAIL', 'Property value [not-an-arn] does not match pattern: ^arn:aws', '/Resources/<logical id>/Properties/ContainerMonitoringConfigurations/0/ClusterArn') for the malformed one).
+Actual (both checks, at CreateStack): botocore.exceptions.ClientError: An error occurred (ValidationError) when calling the CreateStack operation: Template format error: Unrecognized resource types: [AWS::NetworkFirewall::ContainerAssociation]
+
+## Steps to Reproduce
+Replay the behavioral suite and re-run the check ids in trace_ids. Minimal repro: CreateStack with TemplateBody {"AWSTemplateFormatVersion": "2010-09-09", "Resources": {"Cluster": {"Type": "AWS::ECS::Cluster", "Properties": {"ClusterName": "<cluster>"}}, "Assoc": {"Type": "AWS::NetworkFirewall::ContainerAssociation", "Properties": {"ContainerAssociationName": "<assoc>", "Type": "ECS", "ContainerMonitoringConfigurations": [{"ClusterArn": {"Fn::GetAtt": ["Cluster", "Arn"]}}]}}}, "Outputs": {"AssocArn": {"Value": {"Ref": "Assoc"}}, "AssocStatus": {"Value": {"Fn::GetAtt": ["Assoc", "Status"]}}}} — the call is refused. Repeat with ClusterArn set to the literal "not-an-arn" to reach the property-validation arm.
