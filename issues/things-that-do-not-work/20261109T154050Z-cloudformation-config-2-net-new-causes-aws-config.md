@@ -1,0 +1,62 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudformation__config.deploy-config-account-scoped-resources-round-trip-and-delete cloudformation__config.deploy-config-aggregation-authorization-invalid-region-rejected
+Issue-Key: cloudformation__config|CreateStack|ValidationError
+Issue-Key: cloudformation__config.deploy-config-aggregation-authorization-invalid-region-rejected|run#11|AssertionError|assert good_outputs["AggAuthRef"] == expected_ref, (
+Issue-Commit: 45bd6d867b1a7177de267d075c8182289448ffad
+
+# cloudformation__config: 2 net-new causes — AWS::Config::StoredQuery is not a registered resource type, and AWS::Config::AggregationAuthorization hands back a minted physical id instead of the composite <account>|<region>
+
+> _Note: this issue was identified against the code base at commit `45bd6d867b1a7177de267d075c8182289448ffad`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateStack
+
+## Description
+TWO distinct root causes on the CloudFormation provisioning path for account-scoped AWS Config resources, grounded in the two failing behavioral checks of service heading `cloudformation__config`. TWO CAUSES must be closed before submitting.
+
+Neither is covered by an open issue. The nearest neighbours were checked and do NOT cover them: 20261109T113214Z-cloudformation-ivs-mediatailor-createstack-refuses-aws-ivs-adconfiguration.md, 20261109T123922Z-application-signals-cloudformation-aws-applicationsignals-groupingconfiguration-instrumentationconfig-servicelevelobjective.md and the other "unrecognized resource type" issues name other services' types, never AWS::Config::*; 20261108T194913Z-config-a-cloudformation-deployed-custom-lambda-aws-config.md covers AWS::Config::ConfigRule evaluation, not the type registry or the aggregation-authorization identifier; 20261103T034739Z-config-listtagsforresource-tagresource-do-not-resolve-an-aggregationauthorization.md covers tag resolution on an AggregationAuthorization ARN, not its CloudFormation physical resource id.
+
+--- Cause 1 of 2: CloudFormation does not recognize AWS::Config::StoredQuery, so every template that provisions a Config stored query is refused outright (check cloudformation__config.deploy-config-account-scoped-resources-round-trip-and-delete).
+AWS: AWS::Config::StoredQuery is a registered CloudFormation resource type (documented at aws-resource-config-storedquery; its primary identifier is QueryName, with readOnly attributes QueryId and QueryArn available through Fn::GetAtt, and a Tags property). Config models the underlying API: PutStoredQuery (input StoredQuery required + Tags, errors ValidationException/TooManyTagsException/ResourceConcurrentModificationException, all 400) and GetStoredQuery (output StoredQuery; errors ResourceNotFoundException, ValidationException) — Smithy: PutStoredQuery, GetStoredQuery in com.amazonaws.configservice#StarlingDoveService. A CreateStack whose Resources contain `{"Type": "AWS::Config::StoredQuery", "Properties": {QueryName, QueryDescription, QueryExpression, Tags}}` is ACCEPTED (it returns a StackId) and the stack reaches CREATE_COMPLETE with the query readable through Config's own GetStoredQuery, `Ref` resolving to the QueryName and Fn::GetAtt QueryId/QueryArn resolving to the minted id/ARN (recorded behavior; CloudFormation's template validator only rejects types it does not have in its registry).
+Emulator: CreateStack is refused synchronously, 400 `ValidationError` with the message `Template format error: Unrecognized resource types: [AWS::Config::StoredQuery]`. The fixed text here is "Template format error: Unrecognized resource types: [" + the bracketed list of type names from the template + "]"; the type name is taken from the request. Because the whole CreateStack is refused, the stack is never created and the sibling AWS::Config::AggregationAuthorization and AWS::Config::ConfigurationAggregator resources in the same template are never provisioned either.
+Why: a client that provisions Config stored queries as infrastructure-as-code (the only supported declarative path for them) cannot deploy its stack at all; the refusal is also indistinguishable from a genuine template typo, so the caller is told its template is malformed when it is valid against real CloudFormation.
+Fix: the CloudFormation service's template resource-type registry plus a resource provider/handler for AWS::Config::StoredQuery — register the type, map create/read/update/delete onto Config's PutStoredQuery/GetStoredQuery/DeleteStoredQuery, make the physical resource id the QueryName (so `Ref` returns it) and expose QueryId and QueryArn as GetAtt attributes, propagating the template's Tags and the stack's own tags.
+
+--- Cause 2 of 2: an AWS::Config::AggregationAuthorization provisioned by a stack is given a generated physical resource id, so `Ref` (and DescribeStackResources' PhysicalResourceId) returns `<stack>-<logicalId>-<suffix>` instead of the resource's two-part primary identifier `<AuthorizedAccountId>|<AuthorizedAwsRegion>` (check cloudformation__config.deploy-config-aggregation-authorization-invalid-region-rejected; the same expectation is asserted by the check in cause 1, which never reaches it).
+AWS: AWS::Config::AggregationAuthorization has a COMPOSITE primary identifier — AuthorizedAccountId and AuthorizedAwsRegion (the underlying API takes exactly those two required members: Smithy PutAggregationAuthorization.AuthorizedAccountId required @pattern ^\\d{12}$, PutAggregationAuthorization.AuthorizedAwsRegion required @length 1..64) — so CloudFormation does not mint a name for it: the physical resource id, and therefore `Ref`, is the two properties joined by a single '|' (recorded behavior: the control stack's Output `{"Ref": "AggAuth"}` is `<account>|<region>`, and even a resource whose create was REJECTED is reported by DescribeStackResources with PhysicalResourceId `<account>|<region>` for the region it was requested under). Fn::GetAtt "AggregationAuthorizationArn" returns the ARN Config reports for the same authorization.
+Emulator: the provider mints a stack-scoped name and uses it as the physical id, so the control stack's `Ref` output is a generated identifier of the form `<stackName>-<logicalId>-<hexSuffix>` (replay: 'sim2real-cfgagginv-good-stack-<suffix>-AggAuth-<suffix>'), which the check reports as `expected the control's Ref to be '<account>|us-west-2', got '…-AggAuth-…' as its region part`. The variable parts of the requirement are the account id and the region from the request/stack; the literal names in the replay line are per-run values and are not part of it.
+Why: `Ref` on this resource is the documented way a template passes the authorization's identity to other resources and Outputs, and the composite id is what a client uses to correlate the stack resource with DescribeAggregationAuthorizations and to import/retain it. A minted id makes those lookups fail, and makes a rolled-back resource untraceable to the account/region pair it was requested for.
+Fix: the AWS::Config::AggregationAuthorization resource provider in the CloudFormation service (its create/read path and the physical-resource-id derivation) — derive the physical id from the resolved AuthorizedAccountId and AuthorizedAwsRegion as `<account>|<region>` rather than generating one, including on the failure path so DescribeStackResources reports it for a rejected create.
+
+Traces (failing check ids, as examples): cloudformation__config.deploy-config-account-scoped-resources-round-trip-and-delete (cause 1; it also asserts cause 2's Ref, unreached), cloudformation__config.deploy-config-aggregation-authorization-invalid-region-rejected (cause 2).
+
+## Evidence
+Replay of simparity-behavioral-aws-v1 against the emulator built from this checkout: 124/179 passed, bootstrap_signal false (the emulator was serving — 115/161 config checks and 3/4 cloudformation__config__s3 checks passed). Service heading `cloudformation__config`: 0/2 passed.
+
+Cause 1 — cloudformation__config.deploy-config-account-scoped-resources-round-trip-and-delete [error]:
+  Request: CreateStack StackName=<name>, Tags=[{Key:'sim2real',Value:<name>}], TemplateBody with Resources AggAuth (AWS::Config::AggregationAuthorization), Aggregator (AWS::Config::ConfigurationAggregator) and Query:
+    {"Type":"AWS::Config::StoredQuery","Properties":{"QueryName":<name>,"QueryDescription":<text>,"QueryExpression":<SELECT …>,"Tags":[{"Key":"sim2real-check","Value":<check>}]}}
+  File "client.py", line 1094, in _make_api_call
+  botocore.exceptions.ClientError: An error occurred (ValidationError) when calling the CreateStack operation: Template format error: Unrecognized resource types: [AWS::Config::StoredQuery]
+  expected: CreateStack accepted (StackId returned), stack CREATE_COMPLETE, Outputs QueryRef == QueryName, QueryId/QueryArn == GetStoredQuery's values, the template's Tags on the query's ARN, and after DeleteStack GetStoredQuery answers ResourceNotFoundException "The query '<QueryName>' provided in the request is invalid. Please check the query name."
+  got:      400 ValidationError at CreateStack; no stack, no query, no aggregator, no authorization.
+
+Cause 2 — cloudformation__config.deploy-config-aggregation-authorization-invalid-region-rejected [mismatch]:
+  The control stack (AWS::Config::AggregationAuthorization with AuthorizedAccountId={Ref:AWS::AccountId}, AuthorizedAwsRegion={Ref:AWS::Region}) DID reach CREATE_COMPLETE, so the divergence is the identifier only.
+  File "check_cloudformation__config_deploy_config_aggregation_authorization_invalid_region_rejected.py", line 227, in run
+  AssertionError: expected the control's Ref to be '<account>|us-west-2', got 'sim2real-cfgagginv-good-stack-8060d2907ef2-AggAuth-4455B9DD542A' as its region part
+  expected Output AggAuthRef: "<AuthorizedAccountId>|<AuthorizedAwsRegion>" (both taken from the resolved template properties)
+  got:      a minted '<stackName>-<logicalId>-<suffix>' identifier
+  The same check further requires DescribeStackResources on the ROLLED-BACK stack to report PhysicalResourceId "<account>|<bad-region>" for the AggAuth resource (not reached).
+
+Per-run values (stack names from ctx.unique_name, the generated suffixes, the account id, request ids, timestamps) are not part of any requirement; the requirements are the CreateStack acceptance, the stack/resource statuses, and the composite physical-identifier form above.
+
+Model grounding (services/service-com-amazonaws-configservice-starlingdoveservice/smithy-model/com-amazonaws-configservice-starlingdoveservice.json): PutAggregationAuthorization input is exactly {AuthorizedAccountId (required, ^\\d{12}$), AuthorizedAwsRegion (required, len 1..64), Tags}; PutStoredQuery/GetStoredQuery/DeleteStoredQuery exist and are implemented in this service (the stored-query stubs are filed fixed), so the only thing missing for cause 1 is the CloudFormation-side type registration.
+
+## Steps to Reproduce
+1. git_clone the repo; build and boot the emulator; replay simparity-behavioral-aws-v1.
+2. Cause 1: CreateStack with a template containing a single resource of Type AWS::Config::StoredQuery (Properties QueryName/QueryDescription/QueryExpression/Tags). Observe 400 ValidationError "Template format error: Unrecognized resource types: [AWS::Config::StoredQuery]" instead of an accepted stack that reaches CREATE_COMPLETE; then confirm GetStoredQuery(QueryName) would resolve the query and that Ref/GetAtt QueryId/QueryArn match it.
+3. Cause 2: CreateStack with one AWS::Config::AggregationAuthorization whose AuthorizedAccountId={"Ref":"AWS::AccountId"} and AuthorizedAwsRegion={"Ref":"AWS::Region"}, and Outputs {"AggAuthRef":{"Ref":"AggAuth"}}. Wait for CREATE_COMPLETE and read DescribeStacks Outputs: AggAuthRef must be "<account id>|<region>", not a generated name. Then deploy the same template with an unsupported region string, let it roll back, and check DescribeStackResources reports PhysicalResourceId "<account id>|<that region>" for the AggAuth resource.
+4. Re-replay both check ids in trace_ids to confirm the fix: cloudformation__config.deploy-config-account-scoped-resources-round-trip-and-delete, cloudformation__config.deploy-config-aggregation-authorization-invalid-region-rejected.
