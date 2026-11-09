@@ -1,0 +1,52 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: s3__sagemaker.sagemaker-model-artifact-s3-key-not-found-negative s3__sagemaker.sagemaker-model-creation-cross-account-bucket-policy-negative
+Issue-Key: s3__sagemaker.sagemaker-model-artifact-s3-key-not-found-negative|run#17|AssertionError|assert good_desc["TransformJobStatus"] == "Completed", good_desc.get("FailureReason")
+Issue-Key: s3__sagemaker|CreateModel|ValidationException
+Issue-Commit: 81c00d0cdf8c8d837a6edaf703850a5ccd4fe73e
+
+# s3__sagemaker: 2 net-new causes — a transform job runs no inference container (never Completed, no S3 output), and CreateModel's denied-model-data refusal drops its ListBucket sentence
+
+> _Note: this issue was identified against the code base at commit `81c00d0cdf8c8d837a6edaf703850a5ccd4fe73e`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateTransformJob
+
+## Description
+Two net-new behavioral root causes on the SageMaker model/transform path, both reached through S3-backed model artifacts. Neither failing check is marked ALREADY FILED or OWNED by the replay, so no open issue carries their replay keys.
+
+Cause 1 of 2: CreateTransformJob is accepted but no model inference is ever performed, so DescribeTransformJob never reaches Completed and nothing is written to S3OutputPath.
+AWS: CreateTransformJob (Smithy: input TransformJobName/ModelName/TransformInput/TransformOutput/TransformResources all required; output TransformJobArn; errors ResourceInUse, ResourceLimitExceeded, ResourceNotFound) starts a batch transform that pulls the model's artifact from ModelDataUrl, runs the model container over every record of TransformInput, and writes one output object per input object under TransformOutput.S3OutputPath. DescribeTransformJob (Smithy: output TransformJobStatus required, enum; FailureReason @length 0..1024, TransformStartTime/TransformEndTime optional) advances TransformJobStatus InProgress -> Completed for a job whose model artifact and role are valid, and sets FailureReason only on Failed. That a valid job settles to Completed with its output objects present is recorded behavior only; the model enumerates the states but does not name the terminal one.
+Emulator: the job is accepted and then terminates without transforming anything. DescribeTransformJob reports a non-Completed status whose FailureReason is the emulator-authored sentence 'This emulator runs no model inference container, so no records were transformed and no output object was written to the job's S3OutputPath.' — a string AWS never emits in FailureReason — and no object appears under S3OutputPath. In this check the transform is used as the positive control that proves a good artifact plus a propagated role is usable, so the control itself fails and the negative half (a ModelDataUrl naming a nonexistent S3 key) is never reached.
+Why: a client that submits a batch transform and polls DescribeTransformJob until TransformJobStatus == 'Completed' before reading predictions from S3 either loops forever or sees a Failed job for a perfectly valid model, and any pipeline that scores data with batch transform produces no output at all. A client that surfaces FailureReason to its users shows emulator prose instead of an AWS diagnostic, so retry/alerting logic keyed on the reason text never matches.
+Fix: the batch-transform executor behind CreateTransformJob (its job state machine and the S3 output writer it drives) must actually run the model container over the input objects, write the per-object results under TransformOutput.S3OutputPath, and advance the stored TransformJobStatus to Completed with TransformStartTime/TransformEndTime set and FailureReason absent; FailureReason must carry an AWS-shaped diagnostic only when the job genuinely fails. Related open issues describe the same no-execution family but do not own this check: 20261029T211510Z-s3-sagemaker-sagemaker-jobs-never-execute-and-are-never-validated.md and 20261108T162008Z-s3-sagemaker-8-net-new-causes-sagemaker-job.md.
+Traces: s3__sagemaker.sagemaker-model-artifact-s3-key-not-found-negative.
+
+Cause 2 of 2: the CreateModel ValidationException for model data the execution role cannot read is missing its final sentence, so the refusal never mentions the s3:ListBucket requirement for multi-model/uncompressed artifacts.
+AWS: CreateModel (Smithy: input ModelName required, PrimaryContainer/Containers, ExecutionRoleArn; output ModelArn required; modeled error ResourceLimitExceeded, plus the service-common ValidationException) resolves the container's ModelDataUrl with the ExecutionRoleArn at create time and, when the object cannot be read (here because the bucket policy denies the role, Deny-wins over any identity policy), refuses with ValidationException whose Message is a fixed five-sentence template: 'Could not access model data at <s3-uri>. Please ensure that the role "<role-arn>" exists and that its trust relationship policy allows the action "sts:AssumeRole" for the service principal "sagemaker.amazonaws.com". Also ensure that the role has "s3:GetObject" permissions and that the object is located in <region>. If your Model uses multiple models or uncompressed models, please ensure that the role has "s3:ListBucket" permission.' The fixed text is every word of that template; the variable parts are the s3:// URI from the request's ModelDataUrl, the role ARN from ExecutionRoleArn, and the region the endpoint serves.
+Emulator: the code (ValidationException) and the first three sentences match, but the message stops after '... and that the object is located in us-west-2.' — the trailing 'If your Model uses multiple models or uncompressed models, please ensure that the role has "s3:ListBucket" permission.' sentence is never emitted.
+Why: a client or operator that matches or displays this refusal loses the one hint that distinguishes a GetObject-only grant from the ListBucket grant a multi-model or uncompressed artifact needs, so a wrongly-scoped role is diagnosed as a trust-policy problem; test suites and runbooks that assert on the full AWS sentence fail against the emulator.
+Fix: the CreateModel handler's model-data-access validation message template must emit the complete AWS sentence set, appending the ListBucket sentence after the region sentence, with the URI, role ARN and region interpolated from the request.
+Traces: s3__sagemaker.sagemaker-model-creation-cross-account-bucket-policy-negative.
+
+## Evidence
+Cause 1 — check s3__sagemaker.sagemaker-model-artifact-s3-key-not-found-negative, [mismatch]:
+  assert good_desc["TransformJobStatus"] == "Completed", good_desc.get("FailureReason")
+  AssertionError: This emulator runs no model inference container, so no records were transformed and no output object was written to the job's S3OutputPath.
+The check first stages a real model.tar.gz at model/good/model.tar.gz and a CSV at transform/input/records.csv, creates the model with a propagated role, and runs the transform as a positive control. Expected: TransformJobStatus 'Completed' and the predictions object present under S3OutputPath. Observed: a non-Completed status carrying the quoted emulator-authored FailureReason and no output object. The bucket/key names and job names are per-run values; the requirement is the terminal status, the presence of the output object, and that FailureReason is absent on success.
+
+Cause 2 — check s3__sagemaker.sagemaker-model-creation-cross-account-bucket-policy-negative, [mismatch]:
+  assert err.get("Message") == want
+  expected: 'Could not access model data at s3://<bucket>/model/xgboost-model.tar.gz. Please ensure that the role "<role-arn>" exists and that its trust relationship policy allows the action "sts:AssumeRole" for the service principal "sagemaker.amazonaws.com". Also ensure that the role has "s3:GetObject" permissions and that the object is located in us-west-2. If your Model uses multiple models or uncompressed models, please ensure that the role has "s3:ListBucket" permission.'
+  got:      the same text truncated after '... and that the object is located in us-west-2.'
+Error code ValidationException matched; only the Message diverges. The bucket name, role ARN and region in the recording are values taken from the request and the serving region, not part of the requirement — the missing final sentence is fixed text.
+
+Smithy consulted (services/service-com-amazonaws-sagemaker-sagemaker/smithy-model/com-amazonaws-sagemaker-sagemaker.json): CreateModel input ModelName (required), ExecutionRoleArn (RoleArn pattern ^arn:aws[a-z\-]*:iam::\d{12}:role/...), output ModelArn (required); CreateTransformJob input TransformJobName/ModelName/TransformInput/TransformOutput/TransformResources (required), errors ResourceInUse/ResourceLimitExceeded/ResourceNotFound; DescribeTransformJob output TransformJobStatus (required enum), FailureReason (@length 0..1024), TransformStartTime/TransformEndTime.
+
+## Steps to Reproduce
+Replay the behavioral suite (run_behavioral_suite) and re-run the two checks listed in trace_ids.
+
+Cause 1 manually: create a bucket, upload a CSV to <bucket>/transform/input/records.csv and a valid model.tar.gz (containing an inference script) to <bucket>/model/good/model.tar.gz; create a SageMaker execution role trusted by sagemaker.amazonaws.com with s3:GetObject/PutObject/ListBucket on that bucket; CreateModel with PrimaryContainer.ModelDataUrl pointing at the good artifact; CreateTransformJob with TransformInput = s3://<bucket>/transform/input/ and TransformOutput.S3OutputPath = s3://<bucket>/transform/output/; poll DescribeTransformJob. AWS reaches TransformJobStatus 'Completed' with no FailureReason and an output object per input object; the emulator never reaches Completed and writes nothing, reporting FailureReason 'This emulator runs no model inference container, ...'.
+
+Cause 2 manually: create two buckets, put the same model.tar.gz in both, and attach to one a bucket policy that denies the execution role (while the role's identity policy allows s3:GetObject); call CreateModel with ModelDataUrl pointing into the denied bucket and read the ValidationException Message. AWS returns the five-sentence template ending with the s3:ListBucket sentence; the emulator truncates it after the region sentence.
