@@ -501,3 +501,91 @@ pub fn ip_address_type_has_ipv4(ip_address_type: &str) -> bool {
 pub fn ip_address_type_has_ipv6(ip_address_type: &str) -> bool {
     matches!(ip_address_type, "ipv6" | "dualstack")
 }
+
+/// The `ipAddressType` values a CDN distribution may carry.
+///
+/// The modelled `LightsailDistribution$ipAddressType` and
+/// `CreateDistributionRequest$ipAddressType` each document the domain their
+/// resource has: "The possible values are `ipv4` for IPv4 only, and `dualstack`
+/// for IPv4 and IPv6" — two of the three members the shared `IpAddressType`
+/// enum carries. In documented order, which is the order a refusal names them
+/// in.
+pub const DISTRIBUTION_IP_ADDRESS_TYPES: &[&str] = &["ipv4", "dualstack"];
+
+/// How the model words each member of the `IpAddressType` enum, from the
+/// documentation every member of it shares: "`ipv4` for IPv4 only, `ipv6` for
+/// IPv6 only, and `dualstack` for IPv4 and IPv6". In that documented order, so a
+/// refusal built from it reads the way the documentation does.
+const IP_ADDRESS_TYPE_PHRASES: [(&str, &str); 3] = [
+    ("ipv4", "ipv4 for IPv4 only"),
+    ("ipv6", "ipv6 for IPv6 only"),
+    ("dualstack", "dualstack for IPv4 and IPv6"),
+];
+
+/// The `ipAddressType` values a resource of `resource_type` may carry, from THAT
+/// resource's own modelled member rather than from the shared `IpAddressType`
+/// enum the input members target.
+///
+/// A distribution's member documents two values
+/// ([`DISTRIBUTION_IP_ADDRESS_TYPES`]), while `Instance$ipAddressType` and
+/// `LoadBalancer$ipAddressType` each document all three ("The possible values
+/// are `ipv4` for IPv4 only, `ipv6` for IPv6 only, and `dualstack` for IPv4 and
+/// IPv6"), which is the whole enum.
+pub fn ip_address_types_of(resource_type: &str) -> &'static [&'static str] {
+    if resource_type == RESOURCE_TYPE_DISTRIBUTION {
+        DISTRIBUTION_IP_ADDRESS_TYPES
+    } else {
+        crate::ops::types::IP_ADDRESS_TYPE_VALUES
+    }
+}
+
+/// The message refusing `ip_address_type` for a resource of `resource_type`, and
+/// `None` when that resource may carry it.
+///
+/// The one owner of the per-resource value domain: every door that writes a
+/// resource's `ipAddressType` — the creates and `SetIpAddressType` — asks this,
+/// so a value the resource's own member does not document is refused wherever it
+/// arrives rather than at one door only. For an instance and a load balancer the
+/// domain is the whole enum the member targets, which the centralized
+/// constraint walk already holds a request to, so those doors ask it to keep ONE
+/// owner of the rule rather than because a request could get past the walk.
+pub fn ip_address_type_refusal(resource_type: &str, ip_address_type: &str) -> Option<String> {
+    let admitted = ip_address_types_of(resource_type);
+    if admitted.contains(&ip_address_type) {
+        return None;
+    }
+    Some(format!(
+        "ipAddressType '{ip_address_type}' is not an IP address type a {resource_type} can \
+         have: the possible values are {}",
+        possible_ip_address_types_phrase(admitted)
+    ))
+}
+
+/// `values` as the documentation words a value domain: each value with what it
+/// gives the resource, the last one introduced by "and".
+///
+/// A value [`IP_ADDRESS_TYPE_PHRASES`] has no wording for is still named, as
+/// itself, so a member the model may add later is listed rather than dropped
+/// from the refusal.
+fn possible_ip_address_types_phrase(values: &[&str]) -> String {
+    let phrases: Vec<&str> = IP_ADDRESS_TYPE_PHRASES
+        .iter()
+        .filter(|(value, _)| values.contains(value))
+        .map(|(_, phrase)| *phrase)
+        .chain(
+            values
+                .iter()
+                .filter(|value| {
+                    !IP_ADDRESS_TYPE_PHRASES
+                        .iter()
+                        .any(|(known, _)| known == *value)
+                })
+                .copied(),
+        )
+        .collect();
+    match phrases.split_last() {
+        None => String::new(),
+        Some((last, &[])) => (*last).to_string(),
+        Some((last, leading)) => format!("{}, and {last}", leading.join(", ")),
+    }
+}

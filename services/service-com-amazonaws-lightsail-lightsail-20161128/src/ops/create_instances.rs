@@ -233,11 +233,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ip_address_type
             .clone()
             .unwrap_or_else(|| crate::state::DEFAULT_IP_ADDRESS_TYPE.to_string());
-        if !IP_ADDRESS_TYPE_VALUES.contains(&ip_address_type.as_str()) {
-            return Err(invalid(format!(
-                "ipAddressType must be one of [{}], got '{ip_address_type}'",
-                IP_ADDRESS_TYPE_VALUES.join(", ")
-            )));
+        // Which address types the resource being created may carry is documented
+        // on ITS own `ipAddressType` member, not on the shared enum, so the
+        // domain comes from the crate's one owner of it — all three members for
+        // an instance ("ipv4 for IPv4 only, ipv6 for IPv6 only, and dualstack
+        // for IPv4 and IPv6").
+        if let Some(message) = crate::state::ip_address_type_refusal(
+            crate::state::RESOURCE_TYPE_INSTANCE,
+            &ip_address_type,
+        ) {
+            return Err(invalid(message));
         }
         if input.instance_names.is_empty() {
             return Err(invalid(

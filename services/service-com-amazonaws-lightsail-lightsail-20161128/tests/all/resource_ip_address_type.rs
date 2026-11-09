@@ -18,6 +18,12 @@
 //! outside the one Region its API is served in are each refused, and a refused
 //! request records nothing.
 //!
+//! WHICH address types each kind of resource may be given is the resource's own
+//! documented domain, and a distribution's is narrower than the shared enum, so
+//! the distribution cases here move it between the two values its own member
+//! documents; `distribution_ip_address_type_domain.rs` is where that domain and
+//! the refusal of a value outside it are pinned.
+//!
 //! Each case is a TABLE whose rows differ along what the rule generalises over:
 //! which address type the resource starts with and which one it is moved to
 //! (every ordered pair of the modelled `IpAddressType` values, so each row
@@ -42,8 +48,16 @@ use crate::instance_metadata_ipv6_region::IPV6_METADATA_REGION;
 use crate::instance_start_addresses::attach_static_ip;
 
 /// Every value of the modelled `IpAddressType` enum
-/// (`crate::ops::types::IP_ADDRESS_TYPE_VALUES`).
+/// (`crate::ops::types::IP_ADDRESS_TYPE_VALUES`), which is the domain an
+/// INSTANCE and a LOAD BALANCER each document for their own `ipAddressType`.
 const IP_ADDRESS_TYPES: [&str; 3] = ["dualstack", "ipv4", "ipv6"];
+
+/// The address types a DISTRIBUTION may carry, from
+/// `smithy_query(query="doc",shape="LightsailDistribution",member="ipAddressType")`:
+/// "The possible values are `ipv4` for IPv4 only, and `dualstack` for IPv4 and
+/// IPv6" — two of the three members the shared enum carries. What a distribution
+/// does with the third is `distribution_ip_address_type_domain.rs`.
+const DISTRIBUTION_IP_ADDRESS_TYPES: [&str; 2] = ["ipv4", "dualstack"];
 
 /// The `operationType` the log entry of this call carries, the modelled
 /// `OperationType` enum's own `SetIpAddressType` member.
@@ -645,7 +659,7 @@ async fn setting_a_distributions_ip_address_type_redeploys_it() {
         .await;
     wait_for_state(&emulator, origin, "running").await;
 
-    for (position, to) in IP_ADDRESS_TYPES.iter().enumerate() {
+    for (position, to) in DISTRIBUTION_IP_ADDRESS_TYPES.iter().enumerate() {
         let case = format!("distribution -> {to}");
         let name = format!("typed-cdn-{position}");
         emulator

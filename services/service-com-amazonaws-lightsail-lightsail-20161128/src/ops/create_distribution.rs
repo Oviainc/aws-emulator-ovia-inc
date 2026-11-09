@@ -229,11 +229,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What is left is what the model cannot express: the origin has to name
         // a resource, its response timeout has to be within the documented
         // range, a default cache behaviour has to say what it is, the bundle
-        // has to be a plan a new distribution may use, the caller-sized lists
-        // have to be within their bounds, private origin access is only for a
-        // bucket origin, a certificate the request names has to be an issued
-        // certificate of this account, and the name must still be free. Each is
-        // checked BEFORE the first write, so a refused request creates nothing.
+        // has to be a plan a new distribution may use, the address type has to
+        // be one a DISTRIBUTION may carry (its own member documents a narrower
+        // domain than the enum), the caller-sized lists have to be within their
+        // bounds, private origin access is only for a bucket origin, a
+        // certificate the request names has to be an issued certificate of this
+        // account, and the name must still be free. Each is checked BEFORE the
+        // first write, so a refused request creates nothing.
         let Some(origin_name) = input.origin.name.clone() else {
             return Err(invalid(
                 "origin.name must name the Lightsail instance, bucket, container service or \
@@ -290,12 +292,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.custom_error_responses.as_deref().unwrap_or_default(),
         )
         .map_err(invalid)?;
-        // "The IP address type for the distribution. [...] The default value is
-        // dualstack."
+        // "The IP address type for the distribution. The possible values are
+        // ipv4 for IPv4 only, and dualstack for IPv4 and IPv6. The default value
+        // is dualstack." A distribution's documented domain is NARROWER than the
+        // `IpAddressType` enum this member targets, so which of the enum's
+        // members a distribution may carry is asked of the crate's one owner of
+        // the per-resource domain, the one `SetIpAddressType` asks too.
         let ip_address_type = input
             .ip_address_type
             .clone()
             .unwrap_or_else(|| crate::state::DEFAULT_IP_ADDRESS_TYPE.to_string());
+        if let Some(message) = crate::state::ip_address_type_refusal(
+            crate::state::RESOURCE_TYPE_DISTRIBUTION,
+            &ip_address_type,
+        ) {
+            return Err(invalid(message));
+        }
         let private_origin_access = input.enable_private_origin_access.unwrap_or(false);
 
         let name = input.distribution_name.clone();

@@ -180,12 +180,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `resourceName` carries the modelled `ResourceName` pattern, so the
         // centralized walk refused anything outside them before this body ran.
         // What is left is what the model cannot express: the resource type has to
-        // be one of the kinds this action sets the address type OF, the named
-        // resource has to be one this account holds, a distribution is addressed
-        // only from the Region its API is served in, and a change that moves an
-        // instance's bundle needs the caller's agreement to it. Every one of
-        // those is checked BEFORE the first write, so a refused request records
-        // nothing.
+        // be one of the kinds this action sets the address type OF, the address
+        // type has to be one the resource's OWN modelled member documents, the
+        // named resource has to be one this account holds, a distribution is
+        // addressed only from the Region its API is served in, and a change that
+        // moves an instance's bundle needs the caller's agreement to it. Every
+        // one of those is checked BEFORE the first write, so a refused request
+        // records nothing.
         let resource_type = input.resource_type;
         let resource_name = input.resource_name;
         let ip_address_type = input.ip_address_type;
@@ -200,6 +201,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  IP address type of: the resource values are {}",
                 SETTABLE_RESOURCE_TYPES.join(", ")
             )));
+        }
+        // The input member targets the shared `IpAddressType` enum, but which of
+        // its members a resource may actually CARRY is documented on that
+        // resource's own `ipAddressType`, and a distribution's domain is
+        // narrower than the enum. Asked of the crate's one owner of that
+        // per-resource domain, which the creates ask too, and before anything is
+        // read or written.
+        if let Some(message) =
+            crate::state::ip_address_type_refusal(&resource_type, &ip_address_type)
+        {
+            return Err(invalid(message));
         }
         // Lightsail serves the distribution APIs from the N. Virginia endpoint
         // ALONE — this operation's own `resourceType` documentation says

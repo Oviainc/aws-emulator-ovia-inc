@@ -279,13 +279,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bounded AND collapsed by key here: the tags of a resource obey one
         // rule whether a create or a later tag change put them there.
         let tags = crate::state::tags_created_from(input.tags.as_deref()).map_err(invalid)?;
-        // `ipAddressType` targets the modelled enum, so the walk already refused
-        // anything but its three members; an absent one gets the documented
-        // default.
+        // `ipAddressType` targets the modelled enum, and a LOAD BALANCER's own
+        // member documents every one of its members ("ipv4 for IPv4 only, ipv6
+        // for IPv6 only, and dualstack for IPv4 and IPv6"); the domain is still
+        // asked of the crate's one owner of it, so this door and
+        // `SetIpAddressType` agree. An absent one gets the documented default.
         let ip_address_type = input
             .ip_address_type
             .clone()
             .unwrap_or_else(|| crate::state::DEFAULT_IP_ADDRESS_TYPE.to_string());
+        if let Some(message) = crate::state::ip_address_type_refusal(
+            crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+            &ip_address_type,
+        ) {
+            return Err(invalid(message));
+        }
 
         // "Use the GetLoadBalancerTlsPolicies action to get a list of TLS policy
         // names that you can specify": a name that catalog does not report names

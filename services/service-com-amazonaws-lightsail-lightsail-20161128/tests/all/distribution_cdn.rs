@@ -133,8 +133,16 @@ const TLS_VERSIONS: &[&str] = &[
 ];
 
 /// Every member of the modelled `IpAddressType` enum
-/// (`smithy_query(query="shape",shape="IpAddressType")`).
+/// (`smithy_query(query="shape",shape="IpAddressType")`), which is the domain
+/// `InputOrigin$ipAddressType` documents ("ipv4 for IPv4 only, ipv6 for IPv6
+/// only, and dualstack for IPv4 and IPv6") for the connection to the origin.
 const IP_ADDRESS_TYPES: &[&str] = &["dualstack", "ipv4", "ipv6"];
+
+/// The address types the DISTRIBUTION itself may be given, from
+/// `smithy_query(query="doc",shape="CreateDistributionRequest",member="ipAddressType")`:
+/// "The possible values are `ipv4` for IPv4 only, and `dualstack` for IPv4 and
+/// IPv6" — narrower than the enum the member targets.
+const DISTRIBUTION_IP_ADDRESS_TYPES: &[&str] = &["ipv4", "dualstack"];
 
 /// The instance blueprint, bundle and zone the origin instance in this suite is
 /// created from: the origin's own configuration is not what any case is about.
@@ -480,7 +488,10 @@ const ROWS: &[Row] = &[
         response_timeout: Some(45),
         behavior: "dont-cache",
         bundle_id: "small_1_0",
-        ip_address_type: Some("ipv6"),
+        // The distribution's own address type, whose documented domain is
+        // `ipv4` and `dualstack`; the `ipv6` above is the ORIGIN connection's,
+        // whose member documents all three.
+        ip_address_type: Some("ipv4"),
         tags: &[],
         cache_behaviors: &[],
         custom_error_responses: &[(500, "502", "/oops.html", 5)],
@@ -1010,14 +1021,14 @@ async fn every_published_bundle_creates_a_distribution_on_that_plan() {
     }
 }
 
-/// Every member of the modelled `IpAddressType` enum, and every member of the
+/// Every address type a distribution may be given, and every member of the
 /// modelled `ViewerMinimumTlsProtocolVersionEnum`, is kept as asked.
 #[tokio::test(flavor = "current_thread")]
 async fn every_modelled_enum_member_is_kept_verbatim() {
     let emulator = Emulator::new();
     create_origins(&emulator).await;
 
-    for (index, ip_address_type) in IP_ADDRESS_TYPES.iter().enumerate() {
+    for (index, ip_address_type) in DISTRIBUTION_IP_ADDRESS_TYPES.iter().enumerate() {
         let tls_version = TLS_VERSIONS[index % TLS_VERSIONS.len()];
         let name = format!("cdn-enum-{index}");
         emulator
@@ -1044,6 +1055,30 @@ async fn every_modelled_enum_member_is_kept_verbatim() {
             Some(tls_version),
             "case viewerMinimumTlsProtocolVersion {tls_version}: expected it kept verbatim, \
              got {stored:?}"
+        );
+    }
+
+    // Every member of the `IpAddressType` enum, on the member whose own
+    // documentation admits all three: the connection to the ORIGIN.
+    for (index, ip_address_type) in IP_ADDRESS_TYPES.iter().enumerate() {
+        let name = format!("cdn-origin-enum-{index}");
+        emulator
+            .ok(
+                "CreateDistribution",
+                json!({
+                    "distributionName": name,
+                    "origin": {"name": ORIGIN_INSTANCE, "ipAddressType": ip_address_type},
+                    "defaultCacheBehavior": {"behavior": "cache"},
+                    "bundleId": "small_1_0",
+                }),
+            )
+            .await;
+        let stored = read(&emulator, &name).await;
+        assert_eq!(
+            stored["origin"]["ipAddressType"].as_str(),
+            Some(*ip_address_type),
+            "case origin.ipAddressType {ip_address_type}: expected it kept verbatim, got \
+             {stored:?}"
         );
     }
 

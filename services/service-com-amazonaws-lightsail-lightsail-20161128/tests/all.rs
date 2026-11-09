@@ -177,6 +177,8 @@ mod distribution_custom_error_page_path;
 mod distribution_custom_error_responses;
 #[path = "all/distribution_delete.rs"]
 mod distribution_delete;
+#[path = "all/distribution_ip_address_type_domain.rs"]
+mod distribution_ip_address_type_domain;
 #[path = "all/distribution_listing.rs"]
 mod distribution_listing;
 #[path = "all/distribution_metric_data.rs"]
