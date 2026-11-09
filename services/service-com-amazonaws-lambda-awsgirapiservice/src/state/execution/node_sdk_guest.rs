@@ -30,6 +30,9 @@
 //! * A service whose protocol this seam does not bind, and an operation name that is not
 //!   one, are REFUSED: the call is reported as not made rather than answered with a
 //!   made-up success.
+//! * A `Date` a handler puts on a timestamp member travels as the seconds since the epoch
+//!   an AWS JSON protocol carries a timestamp as, which is the form a v3 client sends one
+//!   in — not the ISO text a `Date` reports itself as.
 //! * Nothing here is the containment. Which services can be reached, the bounds on a call
 //!   and the signature it carries are all host code's ([`super::aws_api`], [`super::node`]).
 
@@ -331,7 +334,34 @@ function serviceError(answered) {
 // with a text body.
 var BLOB_PARAMETERS = { s3: ['Body'] };
 
+// A native date a handler puts on a timestamp member, rendered the way the protocol carries
+// one: an SDK takes a `Date` for a member the model types as a timestamp and sends the
+// seconds since the epoch, where `JSON.stringify` on its own would write the ISO text a
+// `Date` reports itself as. The walk copies plain objects and arrays only, so a value held
+// as bytes — a typed array, a Buffer — is handed on exactly as it arrived.
+function timestamps(value) {
+    if (value instanceof Date) {
+        return Math.floor(value.getTime() / 1000);
+    }
+    if (Array.isArray(value)) {
+        return value.map(timestamps);
+    }
+    if (value !== null && typeof value === 'object') {
+        var prototype = Object.getPrototypeOf(value);
+        if (prototype !== Object.prototype && prototype !== null) {
+            return value;
+        }
+        var rendered = {};
+        Object.keys(value).forEach(function (name) {
+            rendered[name] = timestamps(value[name]);
+        });
+        return rendered;
+    }
+    return value;
+}
+
 function sentInput(input) {
+    input = timestamps(input);
     var members = BLOB_PARAMETERS[SERVICE];
     if (members === undefined || input === null || typeof input !== 'object') {
         return input;

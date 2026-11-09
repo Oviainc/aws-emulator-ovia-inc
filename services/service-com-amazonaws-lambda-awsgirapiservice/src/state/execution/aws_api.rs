@@ -248,6 +248,26 @@ pub const APIS: &[Api] = &[
         },
         answer_model: Some(&CLOUDWATCH_LOGS),
     },
+    // `services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/smithy-model/
+    // com-amazonaws-cloudwatch-graniteserviceversion20100801.json`: awsJson1_0 (beside the
+    // legacy `awsQuery` its SDKs keep speaking), sigv4Name `monitoring`, endpointPrefix
+    // `monitoring`, sdkId `CloudWatch`, service shape `GraniteServiceVersion20100801`.
+    //
+    // A function that PUBLISHES ITS OWN METRIC is the other half of an instrumented handler:
+    // a custom datapoint a handler counts over the event it just processed is submitted
+    // through `PutMetricData`, and read back through this service's own metric reads, so a
+    // handler that cannot reach it can report nothing about its own work.
+    Api {
+        sdk_token: "cloudwatch",
+        signing_name: "monitoring",
+        endpoint_prefix: "monitoring",
+        model: Some(CLOUDWATCH_MODEL),
+        protocol: Protocol::AwsJson {
+            target_prefix: "GraniteServiceVersion20100801",
+            json_version: "1.0",
+        },
+        answer_model: Some(&CLOUDWATCH),
+    },
     // `services/service-com-amazonaws-apigateway-backplanecontrolservice/smithy-model/
     // com-amazonaws-apigateway-backplanecontrolservice.json`: restJson1, sigv4Name
     // `apigateway`, endpointPrefix `apigateway`, sdkId `API Gateway`. Its requests are bound
@@ -488,6 +508,10 @@ pub(super) const CLOUDWATCH_LOGS_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-cloudwatchlogs-logs-20140328/smithy-model/\
      com-amazonaws-cloudwatchlogs-logs-20140328.json"
 );
+pub(super) const CLOUDWATCH_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-cloudwatch-graniteserviceversion20100801/smithy-model/\
+     com-amazonaws-cloudwatch-graniteserviceversion20100801.json"
+);
 pub(super) const SECRETSMANAGER_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-secretsmanager-secretsmanager/smithy-model/\
      com-amazonaws-secretsmanager-secretsmanager.json"
@@ -566,6 +590,10 @@ static DYNAMODB: super::blob_members::ServiceModel = super::blob_members::Servic
 };
 static CLOUDWATCH_LOGS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
     source: CLOUDWATCH_LOGS_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
+static CLOUDWATCH: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: CLOUDWATCH_MODEL,
     plan: ::std::sync::OnceLock::new(),
 };
 static SECRETSMANAGER: super::blob_members::ServiceModel = super::blob_members::ServiceModel {

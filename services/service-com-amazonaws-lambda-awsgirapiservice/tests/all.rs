@@ -211,6 +211,8 @@ mod handler_customer_key_access;
 mod handler_db_auth_token;
 #[path = "all/handler_logging_facility.rs"]
 mod handler_logging_facility;
+#[path = "all/handler_metric_timestamp.rs"]
+mod handler_metric_timestamp;
 #[path = "all/handler_object_store_sdk.rs"]
 mod handler_object_store_sdk;
 #[path = "all/handler_dynamodb_binary_attributes.rs"]

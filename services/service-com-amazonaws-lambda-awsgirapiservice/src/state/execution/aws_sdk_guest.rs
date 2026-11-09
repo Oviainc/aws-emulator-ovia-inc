@@ -35,7 +35,9 @@
 //!   nothing.
 //! * There is no paginator: `client.get_paginator(...)` raises rather than pretending to
 //!   serve one. A blob member travels as the base64 text an AWS JSON protocol carries it
-//!   as, in both directions, and `bytes` a handler passes are encoded to it.
+//!   as, in both directions, and `bytes` a handler passes are encoded to it. A `datetime`
+//!   a handler passes for a timestamp member travels as the seconds since the epoch that
+//!   same protocol carries a timestamp as, whether or not it carries a zone of its own.
 //! * A member of an ANSWER that carries an object's own bytes — `GetObject`'s `Body` — is
 //!   handed over as `botocore.response.StreamingBody`, the stream the SDK's own client
 //!   answers with, so a handler reads it with `read()`; which members those are is named by
@@ -412,14 +414,37 @@ def _operation_name(method):
     return "".join(part[:1].upper() + part[1:] for part in method.split("_") if part)
 
 
+def _epoch_seconds(value):
+    """A `datetime` as the seconds since the epoch a JSON protocol carries a timestamp as.
+
+    An SDK takes a native date-time for an input member the model types as a timestamp and
+    sends it in the form the called service's protocol carries one in, which for the AWS
+    JSON protocols this SDK speaks is the seconds since the epoch. A value carrying its own
+    zone is read in that zone; one carrying none is read as UTC, the zone a function runs
+    in, so the two forms of the same instant travel as the same number.
+    """
+    import datetime
+
+    if value.tzinfo is not None:
+        value = value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return int((value - datetime.datetime(1970, 1, 1)).total_seconds())
+
+
 def _encoded(value):
     """A value `json` does not write by itself.
 
     Every protocol this SDK speaks carries a blob as base64 text, so the `bytes` a handler
-    passes are encoded to it. Anything else is a value this SDK cannot send, and says so.
+    passes are encoded to it, and a timestamp as the seconds since the epoch, so a
+    `datetime` a handler passes for a timestamp member is converted to them
+    ([`_epoch_seconds`]) rather than refused: a native date-time is what an SDK takes for
+    such a member. Anything else is a value this SDK cannot send, and says so.
     """
+    import datetime
+
     if isinstance(value, (bytes, bytearray)):
         return base64.b64encode(bytes(value)).decode("ascii")
+    if isinstance(value, datetime.datetime):
+        return _epoch_seconds(value)
     raise TypeError("%r is not a value an AWS SDK call can carry" % (value,))
 
 
