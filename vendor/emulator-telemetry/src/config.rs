@@ -365,9 +365,10 @@ fn serialize_min_client_version<S: serde::Serializer>(
 /// The server-side telemetry configuration served by the config endpoint.
 /// Unknown fields are ignored; out-of-range values are clamped by
 /// [`ServerConfig::clamped`]. Defaults come from the [`crate::policy`]
-/// fallbacks and apply only when the endpoint is unreachable (or a field is
-/// absent) and no cached config exists. Serialization is the canonical form
-/// the cache persists: known fields only, validated values only.
+/// fallbacks and fill in only fields a server response leaves absent; with
+/// neither a response nor a cached config there is no config at all and the
+/// client collects nothing. Serialization is the canonical form the cache
+/// persists: known fields only, validated values only.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ServerConfig {
@@ -642,11 +643,10 @@ pub(crate) fn load_cached_config(
     Ok(cache.load(project_id)?.and_then(|entry| entry.fetched))
 }
 
-fn cached_or_default(cached: &Option<CachedConfig>) -> ServerConfig {
-    cached
-        .as_ref()
-        .map(|entry| entry.config.clone())
-        .unwrap_or_default()
+/// The cached decision, if any: without one the server has never allowed
+/// collection, so there is nothing to fall back to.
+fn cached_decision(cached: &Option<CachedConfig>) -> Option<ServerConfig> {
+    cached.as_ref().map(|entry| entry.config.clone())
 }
 
 fn read_config_response(
@@ -667,10 +667,11 @@ fn read_config_response(
 }
 
 /// The outcome of one config refresh. `config` is the configuration in force
-/// — `None` when there is no trustworthy decision at all: the server could
-/// not be reached AND the cached decision could not be read, in which case
-/// the caller must not collect. `cache_error` is the first cache read or
-/// write failure met on the way, whether or not a decision was still reached.
+/// — `None` when there is no trustworthy decision at all: the server gave no
+/// usable response AND no cached decision exists or it could not be read, in
+/// which case the caller must not collect. `cache_error` is the first cache
+/// read or write failure met on the way, whether or not a decision was still
+/// reached.
 #[derive(Debug)]
 pub(crate) struct ConfigRefresh {
     pub config: Option<ServerConfig>,
@@ -678,21 +679,21 @@ pub(crate) struct ConfigRefresh {
 }
 
 impl ConfigRefresh {
-    fn decided(config: ServerConfig) -> Self {
+    fn decided(config: Option<ServerConfig>) -> Self {
         Self {
-            config: Some(config),
+            config,
             cache_error: None,
         }
     }
 
     fn from_update(
-        applied: Result<ServerConfig, ConfigCacheError>,
-        fallback: ServerConfig,
+        applied: Result<Option<ServerConfig>, ConfigCacheError>,
+        fallback: Option<ServerConfig>,
     ) -> Self {
         match applied {
             Ok(config) => Self::decided(config),
             Err(error) => Self {
-                config: Some(fallback),
+                config: fallback,
                 cache_error: Some(error),
             },
         }
@@ -701,7 +702,8 @@ impl ConfigRefresh {
 
 /// A refresh that obtained nothing new from the server: pace the next retry
 /// and answer with the decision currently on disk (which another process may
-/// have refreshed meanwhile). With no readable cache there is no decision.
+/// have refreshed meanwhile). With no cached decision, or none readable, there
+/// is no decision.
 fn settle_without_response(
     cache: &ServerConfigCache,
     project_id: &ProjectId,
@@ -718,19 +720,19 @@ fn settle_without_response(
     let retry_after = now.saturating_add(policy::CONFIG_FETCH_RETRY_INTERVAL.as_secs());
     let applied = cache.update(project_id, |entry| {
         entry.retry_after = retry_after;
-        cached_or_default(&entry.fetched)
+        cached_decision(&entry.fetched)
     });
-    ConfigRefresh::from_update(applied, cached_or_default(snapshot))
+    ConfigRefresh::from_update(applied, cached_decision(snapshot))
 }
 
 /// Return the current server config, refreshing over HTTP when the TTL has
 /// lapsed. Honors `ETag`/`If-None-Match` (a 304 revalidates the cache without
 /// a body). On a fetch or parse failure the cached decision stays in force;
-/// with no cache at all the compiled [`crate::policy`] fallbacks apply — the
-/// client fails silent on a broken config endpoint. A response is applied to
-/// the cache only if the entry is still the one the request was made from;
-/// otherwise the newer decision another process stored meanwhile wins and is
-/// returned. A cache that exists but cannot be read is never mistaken for an
+/// with no cache at all there is no decision — the client never collects on
+/// terms the server did not set, and fails silent on a broken config
+/// endpoint. A response is applied to the cache only if the entry is still
+/// the one the request was made from; otherwise the newer decision another
+/// process stored meanwhile wins and is returned. A cache that exists but cannot be read is never mistaken for an
 /// absent one: a fresh server response still decides, but without one the
 /// refresh yields no decision.
 pub(crate) fn current_config(
@@ -749,11 +751,11 @@ pub(crate) fn current_config(
         if let Some(cached) = &snapshot {
             let ttl = cached.config.config_ttl_seconds;
             if now_epoch_seconds < cached.fetched_at.saturating_add(ttl) {
-                return ConfigRefresh::decided(cached.config.clone());
+                return ConfigRefresh::decided(Some(cached.config.clone()));
             }
         }
         if now_epoch_seconds < entry.retry_after {
-            return ConfigRefresh::decided(cached_or_default(&snapshot));
+            return ConfigRefresh::decided(cached_decision(&snapshot));
         }
     }
 
@@ -788,9 +790,9 @@ pub(crate) fn current_config(
                     }
                     entry.retry_after = 0;
                 }
-                cached_or_default(&entry.fetched)
+                cached_decision(&entry.fetched)
             });
-            ConfigRefresh::from_update(applied, cached_or_default(&snapshot))
+            ConfigRefresh::from_update(applied, cached_decision(&snapshot))
         }
         Ok(response) if response.status().is_success() => {
             let parsed = read_config_response(response).and_then(|(body, etag)| {
@@ -817,9 +819,9 @@ pub(crate) fn current_config(
                     entry.fetched = Some(fetched);
                     entry.retry_after = 0;
                 }
-                cached_or_default(&entry.fetched)
+                cached_decision(&entry.fetched)
             });
-            ConfigRefresh::from_update(applied, config)
+            ConfigRefresh::from_update(applied, Some(config))
         }
         _ => settle_without_response(cache, project_id, now_epoch_seconds, &snapshot, load_error),
     }
@@ -1621,6 +1623,27 @@ mod tests {
     }
 
     #[test]
+    fn no_cache_and_no_response_yields_no_decision_even_while_pacing_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ServerConfigCache::open(dir.path());
+        let http = build_http_client().unwrap();
+        let endpoint = Endpoint::parse(&refused_base_url()).unwrap();
+        let now = crate::wire::epoch_seconds_now();
+
+        let first = current_config(&http, &cache, &endpoint, &test_project(), now);
+        assert!(
+            first.config.is_none(),
+            "the shipped defaults never stand in for a server that never answered"
+        );
+        assert!(first.cache_error.is_none());
+        let paced = current_config(&http, &cache, &endpoint, &test_project(), now);
+        assert!(
+            paced.config.is_none(),
+            "a paced retry with nothing cached is still no decision"
+        );
+    }
+
+    #[test]
     fn server_config_parses_the_shipped_shape_and_ignores_unknown_fields() {
         let raw = r#"{
             "enabled": true,
@@ -1658,9 +1681,8 @@ mod tests {
         let fallback = ServerConfig::default();
         assert!(
             fallback.enabled,
-            "an unreachable config endpoint falls back to shipped defaults and \
-             keeps sending — the LOCAL master \
-             switch is what gates consent"
+            "a config response that omits `enabled` keeps collecting — the LOCAL \
+             master switch is what gates consent"
         );
         assert_eq!(fallback.flush_interval_seconds, 300);
         assert_eq!(fallback.max_rows_per_batch, 1000);

@@ -9,7 +9,7 @@ use crate::client::{
     resolve_config_endpoint, CrashHook, ModelOperation, OperationFailure, OperationHandle,
     TelemetryClient, TelemetryOptions,
 };
-use crate::config::Endpoint;
+use crate::config::{Endpoint, ServerConfigCache};
 use crate::metadata::sanitize_request_metadata;
 use crate::outbox::Outbox;
 use crate::policy::{
@@ -430,14 +430,44 @@ fn oversized_config_response_is_rejected_and_negatively_cached() {
         1,
         "a rejected config response is not refetched on every flush"
     );
+    client.shutdown(WAIT);
+    assert_eq!(
+        server.ingest_bodies().len(),
+        0,
+        "with no cached config a rejected response is no decision: nothing is sent"
+    );
+    assert_eq!(
+        persisted_installation_id(dir.path()),
+        None,
+        "no installation id is written before the server allows collection"
+    );
+}
+
+/// The final flush never falls back to the shipped defaults: once the
+/// session's own decision has expired and no cached config is left, the
+/// shutdown sends nothing.
+#[test]
+fn shutdown_without_a_cache_or_a_current_session_decision_sends_nothing() {
+    let config =
+        default_config_json().replace("\"configTtlSeconds\": 3600", "\"configTtlSeconds\": 1");
+    let server = TestServer::start(&config);
+    let dir = tempfile::tempdir().unwrap();
+    opt_in(dir.path());
+
+    let client = client_for(&server.base_url, dir.path());
+    assert!(client.flush_blocking(WAIT));
+    std::fs::remove_file(dir.path().join(SERVER_CONFIG_CACHE_FILE)).unwrap();
+    record_sample_op(&client, "FinalOperation", Outcome::Success);
+    std::thread::sleep(Duration::from_millis(2100));
+    client.shutdown(WAIT);
+
     assert!(
-        server
+        !server
             .ingest_bodies()
             .iter()
-            .any(|body| body.contains("FallbackOperation")),
-        "the documented fallback config remains active"
+            .any(|body| body.contains("FinalOperation")),
+        "the final flush sends nothing on terms the server did not set"
     );
-    client.shutdown(WAIT);
 }
 
 #[test]
@@ -1202,26 +1232,70 @@ fn startup_notice_is_a_single_line_naming_the_controls() {
     configless.shutdown(WAIT);
 }
 
+/// First run offline: with no cached server config and no response, the
+/// server has never allowed collection, so the shipped defaults never stand in
+/// for it — no installation id is written and nothing is queued or sent.
 #[test]
-fn unreachable_config_endpoint_falls_back_and_keeps_sending() {
+fn first_run_with_an_unreachable_config_endpoint_writes_and_queues_nothing() {
     let dir = tempfile::tempdir().unwrap();
     opt_in(dir.path());
 
     let client = client_for(&refused_base_url(), dir.path());
-    assert!(
-        client.is_active(),
-        "an unreachable endpoint never disables an opted-in client"
-    );
     record_sample_op(&client, "SendMessage", Outcome::Success);
     assert!(client.flush_blocking(WAIT));
+    assert!(
+        !client.recording_active(),
+        "no server decision yet means no collection"
+    );
+    assert!(client.config_cache_error().is_none());
+    assert!(client.state_purge_error().is_none());
     client.shutdown(WAIT);
 
+    assert_eq!(
+        persisted_installation_id(dir.path()),
+        None,
+        "no installation id is written before the server allows collection"
+    );
+    assert_eq!(
+        Outbox::open(dir.path()).unwrap().pending_count().unwrap(),
+        0,
+        "nothing is queued before the server allows collection"
+    );
+}
+
+/// A cached allow keeps deciding while the config endpoint is unreachable:
+/// the offline session collects, queues and attempts delivery as before.
+#[test]
+fn a_cached_enabled_config_keeps_collecting_while_the_endpoint_is_unreachable() {
+    let server = TestServer::start(&default_config_json());
+    let dir = tempfile::tempdir().unwrap();
+    opt_in(dir.path());
+    let online = client_for(&server.base_url, dir.path());
+    assert!(online.flush_blocking(WAIT));
+    online.shutdown(WAIT);
+    let installation_id = persisted_installation_id(dir.path()).expect("the server allowed it");
+    // Expire the cached decision so the offline start must try the endpoint.
+    ServerConfigCache::open(dir.path())
+        .update(&ProjectId::new(TEST_PROJECT_ID).unwrap(), |entry| {
+            entry.fetched.as_mut().unwrap().fetched_at = 0;
+        })
+        .unwrap();
+
+    let client = client_for(&refused_base_url(), dir.path());
+    record_sample_op(&client, "SendMessage", Outcome::Success);
+    assert!(client.flush_blocking(WAIT));
+    assert!(
+        client.recording_active(),
+        "an unreachable endpoint never overrides the cached allow"
+    );
+    client.shutdown(WAIT);
+
+    assert_eq!(persisted_installation_id(dir.path()), Some(installation_id));
     let outbox = Outbox::open(dir.path()).unwrap();
     let due = outbox.due_batches(u64::MAX, 100).unwrap();
     assert!(
         due.iter().any(|b| b.body.contains("SendMessage")),
-        "with /v1/config unreachable the policy fallback keeps building batches \
-         (on any failure use built-in defaults and keep sending)"
+        "the cached allow keeps building batches while /v1/config is unreachable"
     );
     assert!(
         due.iter().any(|b| b.attempts >= 1),
@@ -2216,6 +2290,62 @@ fn every_effective_off_path_purges_the_existing_state() {
     assert!(!client.is_active());
     client.shutdown(WAIT);
     assert_no_persisted_state(no_endpoint.path(), "no endpoint");
+}
+
+/// An embedding application that opts out while a client is running gets the
+/// same purge as an opt-out at start: the installation id and the batches the
+/// session queued are deleted, and nothing more is sent. A plain shutdown keeps
+/// them, which is why the opt-out needs its own call.
+#[test]
+fn opting_out_a_running_client_purges_the_existing_state() {
+    let server = TestServer::start(&default_config_json());
+    server
+        .behavior
+        .ingest_fail_all
+        .store(true, Ordering::SeqCst);
+    let seed = |dir: &Path| {
+        opt_in(dir);
+        let client = client_for(&server.base_url, dir);
+        assert!(client.is_active());
+        record_sample_op(&client, "SendMessage", Outcome::Success);
+        assert!(client.flush_blocking(WAIT));
+        assert!(dir.join(INSTALLATION_ID_FILE).exists());
+        assert!(dir.join(OUTBOX_FILE).exists());
+        client
+    };
+
+    let shut_down = tempfile::tempdir().unwrap();
+    seed(shut_down.path()).shutdown(Duration::ZERO);
+    assert!(
+        shut_down.path().join(INSTALLATION_ID_FILE).exists()
+            && shut_down.path().join(OUTBOX_FILE).exists(),
+        "a shutdown alone keeps the local state"
+    );
+
+    let opted_out = tempfile::tempdir().unwrap();
+    let client = seed(opted_out.path());
+    server
+        .behavior
+        .ingest_fail_all
+        .store(false, Ordering::SeqCst);
+    let ingest_posts_before = server.ingest_bodies().len();
+    record_sample_op(&client, "SendMessage", Outcome::Success);
+    client.opt_out();
+
+    assert!(!client.recording_active());
+    assert_eq!(client.state_purge_error(), None);
+    assert_no_persisted_state(opted_out.path(), "opt-out of a running client");
+    assert_eq!(
+        server.ingest_bodies().len(),
+        ingest_posts_before,
+        "an opt-out sends nothing, not even the final flush"
+    );
+    assert!(
+        opted_out.path().join(EMULATOR_CONFIG_FILE_NAME).exists(),
+        "the user's config file is never telemetry's to delete"
+    );
+    client.opt_out();
+    assert_no_persisted_state(opted_out.path(), "a repeated opt-out");
 }
 
 /// The server's decision must outlive the purge it triggers: the next start,

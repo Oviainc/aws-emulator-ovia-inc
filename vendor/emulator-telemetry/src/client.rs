@@ -964,6 +964,34 @@ impl TelemetryClient {
         }
     }
 
+    /// Opt out after the client started: stop collecting for the rest of the
+    /// process and delete the stored installation id and outbox, as an opt-out
+    /// at start does. Call it when an embedding application switches telemetry
+    /// off while a client is running; [`TelemetryClient::shutdown`] alone keeps
+    /// the local state, and the next process would send what it queued.
+    ///
+    /// Closes the collection gate first, so the final flush sends nothing,
+    /// then shuts the worker down within [`policy::SHUTDOWN_FLUSH_BUDGET`] and
+    /// deletes the state. A worker still stalled in a request when the budget
+    /// runs out is abandoned, not awaited, and may still hold the outbox open;
+    /// where the platform refuses to delete an open file, the deletion fails.
+    /// Any deletion failure is reported by
+    /// [`TelemetryClient::state_purge_error`]. A client that never started a
+    /// worker returns at once: its start already deleted the state when it
+    /// was off.
+    pub fn opt_out(&self) {
+        let Some(live) = &self.inner.live else {
+            return;
+        };
+        self.inner.gate.close(|| {});
+        self.shutdown(policy::SHUTDOWN_FLUSH_BUDGET);
+        self.inner.gate.close(|| {
+            if let Err(error) = purge_state(&live.crash_reporter.state_dir) {
+                self.inner.purge_failure.record(error);
+            }
+        });
+    }
+
     #[cfg(test)]
     pub(crate) fn report_crash_for_test(&self) {
         if let Some(live) = &self.inner.live {
@@ -1662,9 +1690,10 @@ enum Halt {
     /// The gate was already closed — a shutdown outlived this startup or
     /// flush — so nothing may be stored, drained, or sent any more.
     Closed,
-    /// Neither the server nor a readable cached decision is available: the
-    /// client may not fall back to its shipped defaults over a decision it
-    /// cannot read, so it collects nothing until the next start.
+    /// Neither the server nor a readable cached decision is available (first
+    /// run offline, or an unreadable cache): the client may not fall back to
+    /// its shipped defaults over a decision the server never made or it cannot
+    /// read, so it collects nothing until the next start.
     NoDecision,
     /// The server allowed collection but the installation id could not be
     /// persisted, so the session collects nothing and keeps every artifact.
@@ -1686,9 +1715,11 @@ impl WorkerState {
     /// Fetch (or reuse) the server config and apply the collection decision:
     /// `Ok` opens the gate, `Err` reports why the worker must stop. When the
     /// config cannot be fetched the cached copy decides — so a server that was
-    /// last seen disabled stays denied even offline. When the cache cannot be
-    /// read either, the decision this session last applied stands in within
-    /// its TTL; past that there is no decision. The first cache read or write
+    /// last seen disabled stays denied even offline. When there is no cached
+    /// copy or it cannot be read, the decision this session last applied
+    /// stands in within its TTL; past that, or before the server ever
+    /// answered, there is no decision and nothing — not even the installation
+    /// id — is written. The first cache read or write
     /// failure is surfaced once through the notice and
     /// [`TelemetryClient::config_cache_error`].
     fn refresh_config(&mut self, now: u64) -> Result<ServerConfig, Halt> {
@@ -1856,11 +1887,12 @@ impl WorkerState {
         let now = epoch_seconds_now();
         let _ = self.outbox.enforce_bounds(now);
         let config = if deadline.is_some() {
-            // A missing cache falls back to this session's decision before the shipped
-            // defaults, so the final flush never sends on terms the server did not set.
+            // A missing cache falls back to this session's decision and never to the
+            // shipped defaults, so the final flush never sends on terms the server did
+            // not set.
             let config = match load_cached_config(&self.config_cache, &self.context.project_id) {
                 Ok(Some(cached)) => Some(cached.config),
-                Ok(None) => Some(self.session_config(now).unwrap_or_default()),
+                Ok(None) => self.session_config(now),
                 Err(error) => {
                     self.report_cache_error(error);
                     self.session_config(now)

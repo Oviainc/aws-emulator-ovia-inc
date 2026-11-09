@@ -467,14 +467,15 @@ pub const SQLITE_JOURNAL_MODE: &str = "WAL";
 
 // ---------------------------------------------------------------------------
 // Server-config fallbacks and clamps
-// (the fallbacks mirror the shipped backend's Prod values and apply ONLY when
-// /v1/config is unreachable and no cached config exists)
+// (the fallbacks mirror the shipped backend's Prod values and fill in ONLY
+// fields a /v1/config response leaves absent; with no response and no cached
+// config there is no decision and nothing is collected)
 // ---------------------------------------------------------------------------
 
-/// Fallback for `enabled` when `/v1/config` is unreachable and no cached
-/// config exists (on any failure use built-in defaults and keep sending; a
-/// broken config endpoint may only ever make the client fall back to its
-/// shipped defaults, never stop it or make it worse). The LOCAL master switch
+/// Fallback for `enabled` when a `/v1/config` response omits the field. It
+/// never stands in for a missing decision: with `/v1/config` unreachable and
+/// no cached config the client collects nothing, so no installation id is
+/// written before the server allows collection. The LOCAL master switch
 /// still gates everything before this fallback can apply.
 pub const FALLBACK_ENABLED: bool = true;
 

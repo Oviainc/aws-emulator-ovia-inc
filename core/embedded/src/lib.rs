@@ -20,7 +20,6 @@ pub use emulator_server::{TlsCertificateAuthority, VendedCredentials};
 use emulator_telemetry::{TelemetryClient, TelemetryOptions};
 use smithy_server_runtime::EmbeddedEmulator;
 use std::sync::Once;
-use std::time::Duration;
 
 /// The project id this emulator reports to telemetry.
 const TELEMETRY_PROJECT_ID: &str = "proj-a85d506b35244f71850223e92be29acb";
@@ -111,24 +110,22 @@ impl Default for AwsEmulatorEmbedded {
 /// records for the whole process and installs no panic hook; its final flush runs when the
 /// process exits.
 ///
-/// [`Telemetry::Off`] wins for the whole process, whichever emulator says it and whenever. If
-/// the first emulator says it, nothing ever starts and nothing on disk is touched, so a later
-/// default emulator cannot turn telemetry on. If a client is already running, it is shut down
-/// at once and collects nothing more.
+/// [`Telemetry::Off`] wins for the whole process, whichever emulator says it and whenever, and
+/// deletes the stored installation id and outbox. If the first emulator says it, the client
+/// starts opted out: it records and sends nothing, and a later default emulator cannot turn
+/// telemetry on. If a client is already running, it opts out at once and sends nothing more.
 fn start_telemetry(telemetry: Telemetry) {
     static START: Once = Once::new();
     START.call_once(|| {
-        if telemetry == Telemetry::Off {
-            return;
-        }
-        if let Some(options) = telemetry_options() {
+        if let Some(mut options) = telemetry_options() {
+            options.embedding_opt_out = telemetry == Telemetry::Off;
             emulator_telemetry::init_global(TelemetryClient::start(options));
             emulator_telemetry::flush_at_process_exit();
         }
     });
     if telemetry == Telemetry::Off {
         if let Some(client) = emulator_telemetry::global() {
-            client.shutdown(Duration::ZERO);
+            client.opt_out();
         }
     }
 }
