@@ -2860,6 +2860,13 @@ impl StoredStack {
     /// CloudFormation reports a resource only once its creation has started. The pending
     /// deployment itself is LEFT in place, since it is also what the stack's own deletion
     /// deletes ([`Self::current_resources`]).
+    ///
+    /// That transition's REASON comes with its status: "Success/failure message associated
+    /// with the resource" is where the owning service's refusal of the resource survives into
+    /// the per-resource views, so the resource whose failure stopped the create reports why it
+    /// failed and not merely that it did. A transition with nothing to explain carries no
+    /// reason, so a resource in a success status reports none — the member is then absent, as
+    /// it is for every other resource whose status speaks for itself.
     pub fn keep_failed_resources(
         &mut self,
         transitions: &[provisioning::ResourceTransition],
@@ -2881,7 +2888,9 @@ impl StoredStack {
                     .get(&resource.logical_id)
                     .copied()
                     .unwrap_or(now);
-                Some(DeployedResource::new(resource.clone(), &status.status, at))
+                let mut record = DeployedResource::new(resource.clone(), &status.status, at);
+                record.status_reason = status.reason.clone();
+                Some(record)
             })
             .collect();
         self.resources = installed;

@@ -278,10 +278,11 @@ async fn continuing_a_rollback_is_refused_unless_the_rollback_failed() {
 
     // While the create is still in flight, and once it has completed: neither is a status a
     // rollback can be continued from, and the stack is left exactly where it is. The refusal
-    // names the status the stack is in, which is a different one in each of the two rows.
-    for (case, in_status) in [
-        ("while the create is in progress", status::CREATE_IN_PROGRESS),
-        ("after the create completed", status::CREATE_COMPLETE),
+    // names the call that cannot be made and nothing of the stack, so it is the same sentence
+    // in both rows however the status differs.
+    for case in [
+        "while the create is in progress",
+        "after the create completed",
     ] {
         let (http_status, body) = call(
             &router,
@@ -293,7 +294,7 @@ async fn continuing_a_rollback_is_refused_unless_the_rollback_failed() {
             http_status, 400,
             "case {case:?}: expected the call to be refused with 400, got {http_status} {body}"
         );
-        let expected = cannot_continue_update_rollback(in_status);
+        let expected = cannot_continue_update_rollback();
         assert!(
             body.contains(&expected),
             "case {case:?}: expected the refusal to be {expected:?}, got {body}"

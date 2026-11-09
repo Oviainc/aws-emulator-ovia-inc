@@ -891,6 +891,37 @@ pub(super) const SSM_TARGET_PREFIX: &str = "AmazonSSM";
 /// again").
 pub(super) const PARAMETER_NOT_FOUND: &str = "ParameterNotFound";
 
+/// The Systems Manager operations the `AWS::SSM::Parameter` provider asks for, by name: the
+/// one call that "create[s] or update[s] a parameter in Parameter Store" and the one that
+/// removes it.
+///
+/// Named rather than spelled at each call because the provider REPORTS which of them was
+/// refused ([`parameter_handler_refusal`]), so the name in the report and the name in the
+/// `X-Amz-Target` cannot drift apart.
+pub(super) const PUT_PARAMETER: &str = "PutParameter";
+pub(super) const DELETE_PARAMETER: &str = "DeleteParameter";
+
+/// How the `AWS::SSM::Parameter` provider reports a Systems Manager call it was refused.
+///
+/// CloudFormation quotes the resource provider's own message in the failed resource's
+/// `ResourceStatusReason` (`super::super::provisioning`), and this type's provider reports the
+/// API OPERATION it asked for beside that service's refusal of it — so the reason says both
+/// which call failed and why, which is what a client diagnosing a failed deployment of a
+/// parameter reads. The two parts are the operation this provider named and the message the
+/// owning service worded; the error CODE is left exactly as that service answered it, since
+/// the class the failure is reported under is decided from the code and never from this text.
+fn parameter_handler_refusal(operation: &str, refusal: Refusal) -> Refusal {
+    let message = if refusal.message.is_empty() {
+        format!("Error occurred during operation '{operation}'.")
+    } else {
+        format!(
+            "Error occurred during operation '{operation}': {}",
+            refusal.message
+        )
+    };
+    Refusal { message, ..refusal }
+}
+
 /// The `AWS::SSM::Parameter` properties `PutParameter` takes under the SAME member name.
 ///
 /// Source: AWS's CloudFormation resource reference for the type against
@@ -932,7 +963,9 @@ pub(super) async fn put_parameter(
     if !tags.is_empty() {
         request.insert("Tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
     }
-    call_ssm(ctx, region, "PutParameter", &Value::Object(request)).await?;
+    call_ssm(ctx, region, PUT_PARAMETER, &Value::Object(request))
+        .await
+        .map_err(|refusal| parameter_handler_refusal(PUT_PARAMETER, refusal))?;
     Ok(Created::default())
 }
 
@@ -951,7 +984,9 @@ pub(super) async fn update_parameter(
 ) -> Result<Created, Refusal> {
     let mut request = parameter_request(declared, &resource.physical_resource_id);
     request.insert("Overwrite".to_string(), Value::Bool(true));
-    call_ssm(ctx, region, "PutParameter", &Value::Object(request)).await?;
+    call_ssm(ctx, region, PUT_PARAMETER, &Value::Object(request))
+        .await
+        .map_err(|refusal| parameter_handler_refusal(PUT_PARAMETER, refusal))?;
     Ok(Created::default())
 }
 
@@ -964,12 +999,12 @@ pub(super) async fn delete_parameter(
     physical_resource_id: &str,
 ) -> Result<(), Refusal> {
     let request = serde_json::json!({ "Name": physical_resource_id });
-    match call_ssm(ctx, region, "DeleteParameter", &request).await {
+    match call_ssm(ctx, region, DELETE_PARAMETER, &request).await {
         Ok(_) => Ok(()),
         // Judged on the error CODE, never on the message, which carries the request's own
         // parameter name.
         Err(refusal) if refusal.code == PARAMETER_NOT_FOUND => Ok(()),
-        Err(refusal) => Err(refusal),
+        Err(refusal) => Err(parameter_handler_refusal(DELETE_PARAMETER, refusal)),
     }
 }
 

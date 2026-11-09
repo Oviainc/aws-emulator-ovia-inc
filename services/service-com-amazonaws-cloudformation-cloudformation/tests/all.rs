@@ -133,6 +133,8 @@ mod extension_registry;
 mod extension_registry_lifecycle;
 #[path = "all/failed_create_rollback.rs"]
 mod failed_create_rollback;
+#[path = "all/failed_resource_status_reason.rs"]
+mod failed_resource_status_reason;
 #[path = "all/forced_deletion_is_gated_by_status.rs"]
 mod forced_deletion_is_gated_by_status;
 #[path = "all/forced_stack_deletion.rs"]

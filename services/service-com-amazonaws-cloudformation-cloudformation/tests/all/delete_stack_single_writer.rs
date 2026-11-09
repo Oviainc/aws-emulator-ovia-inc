@@ -166,7 +166,7 @@ async fn a_delete_is_refused_while_an_update_is_in_flight() {
             assert_refused(
                 &case,
                 delete_stack(&router, stack, &[], token).await,
-                &format!("Stack:{stack_id} is in {held} state and can not be deleted."),
+                &format!("Stack [{stack_id}] cannot be deleted while in status {held}"),
             );
             // The refused delete changed nothing: the operation in flight is still the one
             // the stack is running.

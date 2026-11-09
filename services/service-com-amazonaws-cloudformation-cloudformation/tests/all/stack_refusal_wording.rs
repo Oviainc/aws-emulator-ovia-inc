@@ -7,8 +7,8 @@
 //! there" class with a different fixed template per operation — the name bare, single-quoted,
 //! square-bracketed, colon-prefixed, or introduced by "with id" — and the only variable part
 //! of any of them is what the request named; a refusal about a stack whose current STATUS
-//! does not admit the call names the operation that cannot be called and, where the service's
-//! sentence states it, the status the stack is in — never the stack itself; and an operation
+//! does not admit the call names the operation that cannot be called and nothing of the stack
+//! — neither the stack itself nor the status it is in; and an operation
 //! that addresses a record WITHIN a stack (a change set) resolves the stack FIRST, so a
 //! request naming a stack that is not addressable is refused about the stack rather than
 //! about the record.**
@@ -77,16 +77,10 @@ fn labelled(name: &str) -> String {
 /// The sentence `ContinueUpdateRollback` answers for a stack whose status the continuation
 /// cannot be started from.
 ///
-/// Two of them, by which workflow refuses: a stack whose status belongs to the UPDATE family
-/// had an update, so the operation the caller named refuses and states that operation and the
-/// status the stack is in; a stack in any other status is refused by the internal rollback
-/// operation's own state gate, which names neither the stack nor its status.
-fn cannot_continue(in_status: &str) -> String {
-    if in_status.starts_with("UPDATE_") {
-        return format!("ContinueUpdateRollback cannot be called from stack with {in_status} status.");
-    }
-    "RollbackUpdatedStack cannot be called from current stack status".to_string()
-}
+/// ONE of them, whatever the stack's status: the call is refused by the state gate of the
+/// internal rollback operation a continuation resumes, which names that operation and neither
+/// the stack nor the status it is in.
+const CANNOT_CONTINUE: &str = "RollbackUpdatedStack cannot be called from current stack status";
 
 /// The fixed sentence `RollbackStack` answers for a stack whose status a rollback cannot be
 /// started from: it states the statuses the call CAN be made from and nothing of the stack.
@@ -526,18 +520,16 @@ async fn a_status_gated_rollback_refusal_names_only_the_status_it_was_refused_fr
             );
             wait_for_the_transition().await;
         }
-        // The status the stack is in when the calls below arrive, which is the one variable
-        // part of the continuation's refusal.
+        // The stack is readable throughout, and NEITHER refusal below carries the status it
+        // reports.
         let (status, described) = describe_stack(&router, "wording-status").await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected the stack to be readable, got {status} {described}"
         );
-        let in_status = xml_text(&described, "StackStatus").unwrap_or_default();
-        let cannot_continue = cannot_continue(&in_status);
 
         for (action, expected) in [
-            ("ContinueUpdateRollback", cannot_continue.as_str()),
+            ("ContinueUpdateRollback", CANNOT_CONTINUE),
             ("RollbackStack", CANNOT_ROLL_BACK),
         ] {
             let members = vec![member("StackName", "wording-status")];
@@ -560,9 +552,9 @@ async fn a_status_gated_rollback_refusal_names_only_the_status_it_was_refused_fr
         }
     }
 
-    // The status a call was refused FROM is the only part of this run's state either
-    // sentence carries: neither names the stack — not by id and not by the name the request
-    // sent — and the rollback's sentence names no status at all.
+    // NEITHER sentence carries any part of this run's state: neither names the stack — not by
+    // id and not by the name the request sent — and neither names the status the call was
+    // refused from.
     let (status, described) = describe_stack(&router, "wording-status").await;
     assert_eq!(
         status, 200,
@@ -574,18 +566,11 @@ async fn a_status_gated_rollback_refusal_names_only_the_status_it_was_refused_fr
         "expected the refused calls to leave the stack where it was, got {reported:?}"
     );
     for (case, action, sentence) in &answered {
-        for leaked in [stack_id.as_str(), "wording-status"] {
+        for leaked in [stack_id.as_str(), "wording-status", reported.as_str()] {
             assert!(
                 !sentence.contains(leaked),
-                "case {case:?} on {action}: expected the refusal to name no stack, got \
-                 {leaked:?} in {sentence:?}"
-            );
-        }
-        if *action == "RollbackStack" {
-            assert!(
-                !sentence.contains(reported.as_str()),
-                "case {case:?} on {action}: expected a sentence carrying no status at all, \
-                 got {reported:?} in {sentence:?}"
+                "case {case:?} on {action}: expected the refusal to name no part of the stack, \
+                 got {leaked:?} in {sentence:?}"
             );
         }
     }

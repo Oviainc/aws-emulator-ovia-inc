@@ -445,7 +445,7 @@ async fn a_canceled_delete_never_leaves_an_in_progress_status() {
     // the update had already settled, and is the accepted-and-cancelled call instead.
     if code == 400 {
         assert!(
-            body.contains(status::UPDATE_IN_PROGRESS) && body.contains("can not be deleted"),
+            body.contains(status::UPDATE_IN_PROGRESS) && body.contains("cannot be deleted while"),
             "case {case:?}: expected the refusal to name the update in flight, got {body}"
         );
     } else {

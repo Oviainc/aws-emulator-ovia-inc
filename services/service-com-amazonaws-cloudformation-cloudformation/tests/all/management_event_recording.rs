@@ -348,10 +348,9 @@ async fn a_read_and_a_write_are_told_apart_by_what_the_record_carries() {
             vec![member("StackName", "audit-kinds")],
         ),
     ] {
-        // The delete is served only once the update has settled ("… is in
-        // UPDATE_IN_PROGRESS state and can not be deleted"), by the same rule the create
-        // above is waited out under: CloudFormation runs one operation at a time against a
-        // stack.
+        // The delete is served only once the update has settled ("cannot be deleted while in
+        // status UPDATE_IN_PROGRESS"), by the same rule the create above is waited out under:
+        // CloudFormation runs one operation at a time against a stack.
         if action == "DeleteStack" {
             wait_for_the_transition().await;
         }

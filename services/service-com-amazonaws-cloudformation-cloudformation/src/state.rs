@@ -3844,13 +3844,13 @@ pub fn stack_cannot_be_updated(stack_id: &str, status: &str) -> String {
 /// The message CloudFormation answers a DELETION of a stack whose current status does not
 /// allow one ([`status_takes_a_delete`]).
 ///
-/// The same frame the refusal of an UPDATE of such a stack carries
-/// ([`stack_cannot_be_updated`]) — the stack's id, the status it is in and the operation that
-/// cannot be carried out from it — since the two refuse the same class of request: a call
-/// whose stack is busy with another operation. The two variable parts are read off the stack
-/// the request resolved; no part of the sentence comes from any one run.
+/// A DELETION is refused in its OWN words rather than in the frame an UPDATE of a busy stack
+/// is refused with ([`stack_cannot_be_updated`]): the deletion's sentence brackets the stack
+/// and states the status as the condition the delete cannot be carried out IN. The two
+/// variable parts are read off the stack the request resolved — its id and the status it is
+/// in — and no part of the sentence comes from any one run.
 pub fn stack_cannot_be_deleted(stack_id: &str, status: &str) -> String {
-    format!("Stack:{stack_id} is in {status} state and can not be deleted.")
+    format!("Stack [{stack_id}] cannot be deleted while in status {status}")
 }
 
 /// Whether a stack whose last operation left it in `status` can take a DELETE, or whether the
@@ -3974,26 +3974,16 @@ pub fn stack_cannot_be_rolled_back() -> String {
 /// The message CloudFormation answers when `ContinueUpdateRollback` names a stack whose
 /// current status is not one a rollback can be continued from.
 ///
-/// TWO sentences, chosen by which workflow refuses the call. A stack whose status belongs to
-/// the UPDATE family ([`UPDATE_STATUS_PREFIX`]) — every one of them but the
-/// `UPDATE_ROLLBACK_FAILED` a continuation IS made from — had an update, so the operation the
-/// caller named is what refuses, and its sentence states that operation and the status the
-/// stack is in: the one variable part, read from the stack the request resolved. A stack in
-/// any other status never had an update to roll back at all, so the refusal comes from the
-/// internal rollback operation's own state gate ([`ROLLBACK_UPDATED_STACK_STATUS_GATE`]),
-/// which names that operation and no part of the stack.
-pub fn cannot_continue_update_rollback(status: &str) -> String {
-    if status.starts_with(UPDATE_STATUS_PREFIX) {
-        return format!("ContinueUpdateRollback cannot be called from stack with {status} status.");
-    }
+/// ONE sentence, whatever the stack's status is: the call is refused by the state gate of the
+/// INTERNAL rollback operation a continuation resumes
+/// ([`ROLLBACK_UPDATED_STACK_STATUS_GATE`]), which names that operation and no part of the
+/// stack — neither its id nor the status it is really in, both of which are this run's own
+/// state and are what `DescribeStacks` reports. The same shape `RollbackStack`'s and
+/// `CancelUpdateStack`'s status refusals have: a status gate states which call cannot be made,
+/// not what the stack holds.
+pub fn cannot_continue_update_rollback() -> String {
     ROLLBACK_UPDATED_STACK_STATUS_GATE.to_string()
 }
-
-/// What the statuses of the UPDATE family share: `StackStatus`'s update values all begin with
-/// it (`smithy_query(query="shape", shape="StackStatus")` gives `UPDATE_IN_PROGRESS`,
-/// `UPDATE_FAILED`, `UPDATE_COMPLETE`, `UPDATE_ROLLBACK_*`, …), which is what tells a stack
-/// that HAD an update from one that never did.
-pub const UPDATE_STATUS_PREFIX: &str = "UPDATE_";
 
 /// The fixed sentence the internal rollback operation's state gate answers: the call cannot be
 /// made from the status the stack is in, stated without naming the stack or that status.
