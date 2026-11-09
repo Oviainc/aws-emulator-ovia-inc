@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConversionTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConversionTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the conversion tasks [`crate::state`] holds — "the specified
+//! conversion tasks or all your conversion tasks" — narrowed by the `ConversionTaskIds` the
+//! request names. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConversionTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A READ ONLY: nothing about a task changes because it was described, so two identical
+//! calls answer identically and no caller can move a task by polling it. The only writes
+//! this handler drives are the moves the CLOCK already owed every resource of the store
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]) — the end
+//! of a cancellation `CancelConversionTask` started among them — each of which was due at
+//! this instant whether or not anybody called, so the report is of the state a later caller
+//! would have been shown anyway.
+//!
+//! A task is reported as the modelled `ConversionTask` shape the store keeps
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::conversion_tasks`]), so a member the
+//! writer of a task set round-trips here without a field-by-field copy, and this report and
+//! the state `CancelConversionTask` acts on cannot drift apart.
+//!
+//! `ConversionTaskId` carries no modelled pattern, so an id from the request is read against
+//! the form the operations that MINT one use, through the crate's one reader of that form
+//! ([`crate::state::conversion_task_id_is_well_formed`]): a value outside it is no
+//! conversion task id at all and names nothing to look up, so it is refused
+//! [`crate::state::invalid_conversion_task_id_format`] — HTTP 400
+//! [`crate::state::INVALID_CONVERSION_TASK_ID`], the code this service answers for a
+//! conversion task id it cannot resolve — BEFORE the store is reached. An id EC2 COULD have
+//! issued that the account holds no task for is NOT an error: this operation reports a LIST
+//! of the account's conversion tasks, which an account holding none of them reports empty, so
+//! such an id selects no row — the rule the sibling VM-import describes of this crate hold
+//! for their own id members ([`crate::state::require_well_formed_import_snapshot_task_id`]).
 //!
 //! ## Shape of an operation
 //!
@@ -130,23 +149,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DESCRIBE_CONVERSION_TASKS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// "Describes the specified conversion tasks or all your conversion tasks": the
+    /// account's stored tasks, narrowed to the `ConversionTaskIds` the request names, or
+    /// every one of them when it names none.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConversionTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConversionTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConversionTasks"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            MAX_RESOURCE_IDS, conversion_task_id_is_well_formed, dry_run_operation,
+            invalid_conversion_task_id_format, require_service_state,
+        };
+
+        // A conversion task carries no Region member of its own (it has no ARN and the zone
+        // it imports into is the task's, not the request's), so nothing here depends on the
+        // Region the request was signed for. The store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+
+        // The number of ids is bounded BEFORE any per-id work, so a request of a million
+        // duplicates is refused rather than collected first.
+        let requested_ids = input.conversion_task_ids.as_deref().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "ConversionTaskIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // An id that is not one EC2 issues for a conversion task of either kind names no
+        // resource to look up, so the FORM of every id is judged before the store is
+        // reached. The ids also go into a SET, so naming one twice names it once and
+        // narrowing a stored task is a logarithmic lookup rather than a scan of up to
+        // `MAX_RESOURCE_IDS` ids per task under the state lock.
+        let mut named_ids: ::std::collections::BTreeSet<&str> =
+            ::std::collections::BTreeSet::new();
+        for conversion_task_id in requested_ids {
+            if !conversion_task_id_is_well_formed(conversion_task_id) {
+                return Err(invalid_conversion_task_id_format(conversion_task_id));
+            }
+            named_ids.insert(conversion_task_id.as_str());
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the store is
+        // reached: the flag asks whether the request WOULD have worked, so one that would
+        // have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The moves the clock already owed — the end of a cancellation among them — are
+        // observed here, not caused: each was due at this instant whether or not anybody
+        // called, so this changes nothing a later caller would otherwise have seen, and the
+        // state reported below is the state that caller is shown.
+        store.materialize_due_transitions();
+
+        // The store is keyed by `ConversionTaskId` in an ordered map, so the report is in
+        // that one stable id order however the request listed its ids.
+        let conversion_tasks: Vec<ConversionTask> = store
+            .conversion_tasks
+            .iter()
+            .filter(|(conversion_task_id, _)| {
+                named_ids.is_empty() || named_ids.contains(conversion_task_id.as_str())
+            })
+            .map(|(_, task)| task.clone())
+            .collect();
+
+        // The member is reported even when the account holds no conversion task at all: an
+        // account with none has an EMPTY list of them, which is what the operation answers,
+        // rather than no answer about its tasks.
+        Ok(DescribeConversionTasksOutput {
+            conversion_tasks: Some(conversion_tasks),
+        })
     }
 }

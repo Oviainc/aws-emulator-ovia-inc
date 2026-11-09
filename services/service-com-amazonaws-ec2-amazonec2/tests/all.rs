@@ -15,23 +15,19 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
-// What `CreateFleet` creates: the EC2 Fleet the store holds for a request, the instances its
-// target capacity places (Spot capacity through Spot Instance requests of the account,
-// On-Demand capacity launched directly), the clock-owed `submitted` -> `active` move of an
-// asynchronous fleet, the instances an `instant` fleet reports, and what it refuses without
-// placing anything. Declared beside `prefix_lists` for the reason the note above gives: the
-// sorted neighbourhood and the tail of this file are where every new ec2 suite inserts its
-// lines.
-#[path = "all/create_fleet.rs"]
-mod create_fleet;
-// What `DescribeFleets` reports out of the EC2 Fleet store: each fleet as `CreateFleet`
-// stored it, the instances an `instant` fleet launched, the instant fleets a report naming no
-// ids leaves out, the narrowing its documented filters and `FleetIds` do, the pages it cuts
-// the store into, and what it refuses. Declared beside `prefix_lists` for the reason the note
-// above gives: the sorted neighbourhood and the tail of this file are where every new ec2
-// suite inserts its lines.
-#[path = "all/describe_fleets.rs"]
-mod describe_fleets;
+// The account's KEY PAIRS: the key `CreateKeyPair` generates for each type and format, the
+// public half the store keeps and `DescribeKeyPairs` reports, the fingerprint each type is
+// fingerprinted with, what each call refuses, and what the published filters select.
+// Declared beside `prefix_lists` for the reason the note above gives: the sorted
+// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/key_pairs.rs"]
+mod key_pairs;
+// The ONE snapshot resource the EBS direct APIs and EC2 both describe: a snapshot
+// `ebs:StartSnapshot` minted reported and resolved on the EC2 side through its whole
+// lifecycle, the narrowings that select it, and the refusal that stays for an id nothing
+// holds. Declared beside `prefix_lists` for the reason the note above gives: the sorted
+#[path = "all/ebs_direct_api_snapshots.rs"]
+mod ebs_direct_api_snapshots;
 // The IPv6 address pools the account holds: the pool a BYOIP IPv6 provision creates under
 // the id the range reports, the blocks it holds in address order, the narrowing its
 // documented filters and `PoolIds` do, the pages `DescribeIpv6Pools` cuts the store into,
@@ -64,8 +60,6 @@ mod vpc_block_public_access_options;
 // the order of a launch's two counts, the one attribute type a modify names, the attributes
 // a reset acts on, and the hardware a Dedicated Host can be configured for — each in EC2's
 // own sentence for that violation class, with the bound the operation publishes in it.
-// Declared beside `prefix_lists` for the reason the note above gives: the sorted
-// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/published_parameter_limits.rs"]
 mod published_parameter_limits;
 // EC2 as a regional service: a stored resource is reported only in the Region it was created
@@ -133,12 +127,16 @@ mod replace_network_acl_entry;
 // retires, and what `DescribeVpcEncryptionControls` reports back out of that one store — with
 // the clock-owed moves each starts, the narrowing and paging of the report, and the refusals
 // each answers. Declared beside `prefix_lists` for the reason the note above gives: the
+// sorted neighbourhood and the tail of this file are where every new ec2 suite inserts its
+// lines.
 #[path = "all/vpc_encryption_controls.rs"]
 mod vpc_encryption_controls;
 // The route path out of a VPC: an internet gateway attached to exactly one VPC, a route
 // table created for one VPC with the local route it comes with, one route per destination
 // against a target of that VPC, and a subnet associated with one table of its own VPC — each
 // read back through its own describe. Declared beside `prefix_lists` for the reason the note
+// above gives: the sorted neighbourhood and the tail of this file are where every new ec2
+// suite inserts its lines.
 #[path = "all/vpc_internet_path.rs"]
 mod vpc_internet_path;
 // The create side of the route table slice: the one table `CreateRouteTable` stores for the
@@ -903,6 +901,10 @@ mod instance_metadata_defaults;
 // The SQL Server High Availability state every enabled instance is reported in.
 #[path = "all/instance_sql_ha_states.rs"]
 mod instance_sql_ha_states;
+// Every SQL Server High Availability state an enabled instance HAS HELD, over the period the
+// request asks about.
+#[path = "all/instance_sql_ha_history_states.rs"]
+mod instance_sql_ha_history_states;
 #[path = "all/instance_type_offerings.rs"]
 mod instance_type_offerings;
 #[path = "all/instance_types.rs"]
@@ -1634,6 +1636,13 @@ mod account_wide_read_authorization;
 // reported it, and every sibling left as resolvable as it was. Declared beside
 #[path = "all/delete_launch_template_resolution.rs"]
 mod delete_launch_template_resolution;
+// Which Reserved Instance offerings the service publishes for a Region — the product of the
+// places one can be used, the product descriptions, the offering classes, the payment options
+// and the terms — how each is priced from its own terms, how the narrowing members, the
+// documented filters, the offering ids and the pages select from it, and that the describe is a
+// read whose ids the exchange operations resolve. Declared at the tail of this file, which is
+#[path = "all/describe_reserved_instances_offerings.rs"]
+mod describe_reserved_instances_offerings;
 // The tag filter family on the describes of a taggable resource: `tag:<key>`, `tag-key` and
 // `tag-value` over the tags a Capacity Reservation and a Capacity Reservation Fleet really
 // hold, and the names outside the documented set and the family that are still refused.
@@ -1651,34 +1660,18 @@ mod account_attributes;
 // each refuse a type the service does not publish, naming the value. Declared at the tail of
 #[path = "all/launch_instance_type_catalog.rs"]
 mod launch_instance_type_catalog;
-// The ONE snapshot resource the EBS direct APIs and EC2 both describe: a snapshot
-// `ebs:StartSnapshot` minted reported and resolved on the EC2 side through its whole
-// lifecycle, the narrowings that select it, and the refusal that stays for an id nothing
-// holds. Declared beside `prefix_lists` for the reason the note above gives: the sorted
-#[path = "all/ebs_direct_api_snapshots.rs"]
-mod ebs_direct_api_snapshots;
-// Every SQL Server High Availability state an enabled instance HAS HELD, over the period the
-// request asks about.
-#[path = "all/instance_sql_ha_history_states.rs"]
-mod instance_sql_ha_history_states;
-// Which Reserved Instance offerings the service publishes for a Region — the product of the
-// places one can be used, the product descriptions, the offering classes, the payment options
-// and the terms — how each is priced from its own terms, how the narrowing members, the
-// documented filters, the offering ids and the pages select from it, and that the describe is a
-// read whose ids the exchange operations resolve. Declared at the tail of this file, which is
-#[path = "all/describe_reserved_instances_offerings.rs"]
-mod describe_reserved_instances_offerings;
 // How an idempotency conflict is WORDED: the Network Access Analyzer / Reachability Analyzer
 // actions answer that surface's own sentence beside `IdempotentParameterMismatch`, while the
 // older resource creates of this service answer theirs. Declared at the tail of this file,
 // which is where every new ec2 suite inserts its lines.
 #[path = "all/network_insights_idempotency_wording.rs"]
 mod network_insights_idempotency_wording;
-// The account's KEY PAIRS: the key `CreateKeyPair` generates for each type and format, the
-// public half the store keeps and `DescribeKeyPairs` reports, the fingerprint each type is
-// fingerprinted with, what each call refuses, and what the published filters select.
-#[path = "all/key_pairs.rs"]
-mod key_pairs;
+// What `DescribeConversionTasks` reports out of the conversion-task store: every member of a
+// stored task of either kind of VM import, the narrowing `ConversionTaskIds` does, the
+// refusals for an id outside the minted form and for one no task answers to, the clock-owed
+// end of a cancellation observed rather than caused, and the dry-run answer. Declared at the
+#[path = "all/conversion_task_reporting.rs"]
+mod conversion_task_reporting;
 // `ModifyLaunchTemplate`: the default version it moves to the version a request names — by
 // number or by one of the aliases the launch template API documents — what both readers of
 // the template then report, and the refusals that move nothing.
@@ -1689,3 +1682,16 @@ mod modify_launch_template_default_version;
 // the lifecycle then sees. Declared at the tail of this file, which is where every new ec2
 #[path = "all/delete_snapshot.rs"]
 mod delete_snapshot;
+// What `CreateFleet` creates: the EC2 Fleet the store holds for a request, the instances its
+// target capacity places (Spot capacity through Spot Instance requests of the account,
+// On-Demand capacity launched directly), the clock-owed `submitted` -> `active` move of an
+// asynchronous fleet, the instances an `instant` fleet reports, and what it refuses without
+// placing anything. Declared beside `prefix_lists` for the reason the note above gives: the
+#[path = "all/create_fleet.rs"]
+mod create_fleet;
+// What `DescribeFleets` reports out of the EC2 Fleet store: each fleet as `CreateFleet`
+// stored it, the instances an `instant` fleet launched, the instant fleets a report naming no
+// ids leaves out, the narrowing its documented filters and `FleetIds` do, the pages it cuts
+// the store into, and what it refuses. Declared beside `prefix_lists` for the reason the note
+#[path = "all/describe_fleets.rs"]
+mod describe_fleets;
