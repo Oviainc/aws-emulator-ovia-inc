@@ -117,6 +117,22 @@ const FAMILY_ROWS: &[FamilyRow] = &[
         completed_stop: "COMPLETE",
         capped_stop: "MAX_TOKENS",
     },
+    // A provider Amazon Bedrock serves on the OpenAI-compatible chat completions
+    // schema: the body binds `messages` and `max_tokens`, and the answer is a
+    // `chat.completion` object whose one choice carries the assistant's message, the
+    // finish reason and the prompt/completion token counts.
+    FamilyRow {
+        model_id: "moonshotai.kimi-k2.5",
+        family: state::ModelFamily::OpenAiChat,
+        request: r#"{"messages":[{"role":"user","content":"Name two planets."}],"max_tokens":256}"#,
+        capped_request: r#"{"messages":[{"role":"user","content":"Name two planets."}],"max_tokens":3}"#,
+        text_pointer: "/choices/0/message/content",
+        input_token_pointer: "/usage/prompt_tokens",
+        output_token_pointer: "/usage/completion_tokens",
+        stop_pointer: "/choices/0/finish_reason",
+        completed_stop: "stop",
+        capped_stop: "length",
+    },
 ];
 
 /// A row of [`FAMILY_ROWS`].
@@ -254,7 +270,7 @@ impl Call {
             .to_string()
     }
 
-    fn header(&self, name: &str) -> String {
+    pub(crate) fn header(&self, name: &str) -> String {
         self.headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -1356,6 +1372,8 @@ const LLAMA_BODY: &str = r#"{"prompt":"hi"}"#;
 /// A body the Anthropic Claude Messages API accepts: it binds the three members
 /// that API documents as required.
 const CLAUDE_BODY: &str = r#"{"anthropic_version":"bedrock-2023-05-31","max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#;
+/// A body the OpenAI-compatible chat completions envelope accepts.
+const OPENAI_CHAT_BODY: &str = r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":64}"#;
 
 fn identifier_rows() -> Vec<IdentifierRow> {
     let invalid = Some(state::INVALID_MODEL_IDENTIFIER_MESSAGE);
@@ -1422,8 +1440,16 @@ fn identifier_rows() -> Vec<IdentifierRow> {
             body: LLAMA_BODY,
         },
         IdentifierRow {
-            case: "a text provider whose envelope this emulator does not render",
-            model_id: "ai21.jamba-1-5-mini-v1:0",
+            case: "a catalogued model of a provider served on the OpenAI-compatible schema",
+            model_id: "moonshotai.kimi-k2.5",
+            status: 200,
+            code: "",
+            message: None,
+            body: OPENAI_CHAT_BODY,
+        },
+        IdentifierRow {
+            case: "a published provider's id at a version the catalogue does not carry",
+            model_id: "ai21.jamba-9-9-mega-v9:0",
             status: 400,
             code: "ValidationException",
             message: invalid,
@@ -1679,6 +1705,7 @@ async fn every_active_text_model_in_the_inventory_is_served_in_its_family_envelo
             state::ModelFamily::Llama => "/generation",
             state::ModelFamily::Mistral => "/outputs/0/text",
             state::ModelFamily::CohereCommand => "/generations/0/text",
+            state::ModelFamily::OpenAiChat => "/choices/0/message/content",
         };
         assert!(
             body.pointer(text_pointer)
@@ -2088,13 +2115,34 @@ async fn an_invoke_body_is_checked_against_the_invoked_family_request_schema() {
         );
     }
 
-    // A body that is not a JSON object cannot be read as a request at all,
-    // whatever the family.
-    for (case, body) in [
-        ("plain text", "not json at all"),
-        ("a JSON array", "[1,2,3]"),
-        ("a bare JSON string", "\"hi\""),
-        ("a truncated object", "{\"prompt\":"),
+    // A body that is not a request of the family at all: bytes whose JSON cannot be parsed
+    // are a syntax fault in the document, and a document that parses but is not an object
+    // is no request of any family. The two are DIFFERENT refusals, and the literal sentence
+    // of each is pinned here rather than compared against the constant the handler itself
+    // carries.
+    for (case, body, expected) in [
+        (
+            "plain text",
+            "not json at all",
+            "The JSON object in the request body is malformed. Fix the syntax errors and \
+             retry your request.",
+        ),
+        (
+            "a truncated object",
+            "{\"prompt\":",
+            "The JSON object in the request body is malformed. Fix the syntax errors and \
+             retry your request.",
+        ),
+        (
+            "a JSON array",
+            "[1,2,3]",
+            "Malformed input request, please reformat your input and try again.",
+        ),
+        (
+            "a bare JSON string",
+            "\"hi\"",
+            "Malformed input request, please reformat your input and try again.",
+        ),
     ] {
         let call = send(
             &router,
@@ -2113,8 +2161,8 @@ async fn an_invoke_body_is_checked_against_the_invoked_family_request_schema() {
         );
         assert_eq!(
             call.json()["message"].as_str(),
-            Some(state::MALFORMED_BODY_MESSAGE),
-            "case {case:?}: expected the malformed-body refusal, got {:?}",
+            Some(expected),
+            "case {case:?}: expected the refusal {expected:?}, got {:?}",
             call.json()["message"]
         );
     }

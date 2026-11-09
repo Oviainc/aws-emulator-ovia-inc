@@ -1170,6 +1170,35 @@ pub(super) fn return_values(
             attributes.insert("GatewayArn".to_string(), arn);
             (id, attributes)
         }
+        // Amazon Bedrock's own control plane: the guardrail an `AWS::Bedrock::Guardrail`
+        // declares. "Ref returns the guardrail ARN" (the type's primary identifier);
+        // Fn::GetAtt: GuardrailId, GuardrailArn, Version. Amazon Bedrock MINTS the id —
+        // `CreateGuardrail` answers a `guardrailId` of `^[a-z0-9]+$`, which is what every
+        // guardrail API takes as its `guardrailIdentifier` and which the guardrail's NAME
+        // (`^[0-9a-zA-Z-_]+$`) is not — so the values here are STAND-INS of the forms that
+        // service's own model fixes, and `super::provisioning` re-points them at what the
+        // create really answered ([`super::provisioner::Provisioner::BedrockGuardrail`]).
+        // The create opens the guardrail's `DRAFT` revision (`version` is `^DRAFT$`), which
+        // is the version a freshly created guardrail carries.
+        BEDROCK_GUARDRAIL => {
+            let id = service_assigned_label(
+                BEDROCK_GUARDRAIL_ID_SALT,
+                name,
+                BEDROCK_GUARDRAIL_ID_DIGITS,
+            );
+            let arn = ::emulator_server::emulator_arn(
+                BEDROCK_ARN_NAMESPACE,
+                region,
+                &format!("guardrail/{id}"),
+            );
+            attributes.insert("GuardrailId".to_string(), id);
+            attributes.insert("GuardrailArn".to_string(), arn.clone());
+            attributes.insert(
+                "Version".to_string(),
+                BEDROCK_GUARDRAIL_DRAFT_VERSION.to_string(),
+            );
+            (arn, attributes)
+        }
         // "Ref returns the name"; Fn::GetAtt: Name, WorkloadIdentityArn. A workload
         // identity is named, not id'd: `CreateWorkloadIdentity` takes a `name`
         // (`^[A-Za-z0-9_.-]+$`) and answers that name plus the ARN, whose shape the model
@@ -1577,6 +1606,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         ECS_SERVICE => &["Name"],
         ELB_LISTENER => &["ListenerArn"],
         ELB_LISTENER_RULE => &["IsDefault", "RuleArn"],
+        BEDROCK_GUARDRAIL => &["GuardrailArn", "GuardrailId", "Version"],
         "AWS::BedrockAgentCore::Memory" => &["MemoryArn", "MemoryId"],
         "AWS::BedrockAgentCore::Runtime" => {
             &["AgentRuntimeArn", "AgentRuntimeId", "AgentRuntimeVersion"]
@@ -1814,6 +1844,12 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // states.)
         || resource_type == BACKUP_PLAN
         || resource_type == BACKUP_SELECTION
+        // An Amazon Bedrock guardrail is one more: `CreateGuardrail` takes the guardrail's
+        // NAME and answers the `guardrailId` Amazon Bedrock minted (`^[a-z0-9]+$`) with the
+        // ARN built around it, which is the identity every guardrail API takes as its
+        // `guardrailIdentifier` — a pattern the name itself does not satisfy — so neither
+        // the id nor the ARN can be computed from the template.
+        || resource_type == BEDROCK_GUARDRAIL
         // An Amazon EC2 VPC, a subnet of one and a security group of one are three more:
         // `CreateVpc`, `CreateSubnet` and `CreateSecurityGroup` take no identifier at all —
         // EC2 assigns each resource an id of its own published form — and "Ref returns the
@@ -1912,6 +1948,27 @@ pub const BEDROCK_KNOWLEDGE_BASE: &str = "AWS::Bedrock::KnowledgeBase";
 pub const BEDROCK_AGENT: &str = "AWS::Bedrock::Agent";
 pub const BEDROCK_AGENT_ALIAS: &str = "AWS::Bedrock::AgentAlias";
 pub const BEDROCK_DATA_SOURCE: &str = "AWS::Bedrock::DataSource";
+
+/// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Bedrock GUARDRAIL, the one
+/// resource of that estate whose owning API is Bedrock's own control plane
+/// (`CreateGuardrail`) rather than the agent build-time one.
+pub const BEDROCK_GUARDRAIL: &str = "AWS::Bedrock::Guardrail";
+
+/// Amazon Bedrock's ARN namespace, which is that model's own `awsService.arnNamespace`
+/// (`bedrock`) — the namespace a guardrail ARN carries
+/// (`arn:aws:bedrock:<region>:<account>:guardrail/<id>`, from `GuardrailArn`'s pattern).
+pub const BEDROCK_ARN_NAMESPACE: &str = "bedrock";
+
+/// The salt the guardrail-id stand-in is derived under, and how many characters it carries:
+/// `GuardrailId` is `^[a-z0-9]+$` with `@length(max: 64)`, so the stand-in is lower-case
+/// alphanumeric and carries no separator. Twelve characters is the length Amazon Bedrock's
+/// own minted ids carry.
+const BEDROCK_GUARDRAIL_ID_SALT: &str = "bedrock/guardrail";
+const BEDROCK_GUARDRAIL_ID_DIGITS: usize = 12;
+
+/// The version a freshly created guardrail carries: `CreateGuardrail`'s `version` is
+/// `^DRAFT$` ("This value will always be DRAFT").
+const BEDROCK_GUARDRAIL_DRAFT_VERSION: &str = "DRAFT";
 
 /// The `AWS::<cloudFormationName>::<Resource>` types of the two OpenSearch Serverless
 /// resources a stack creates. The middle segment is that service's own

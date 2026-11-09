@@ -173,11 +173,16 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
         // rule `Converse` applies too.
         crate::state::validate_tool_results(messages).map_err(validation)?;
 
-        // The `toolChoice` stage: a mandatory choice obliges the turn to request
-        // a tool, under an id minted here.
+        // The tool stage: a mandatory `toolChoice` obliges the turn to request a
+        // tool, and a choice left to the model is decided from the conversation
+        // (`crate::state::tool_use_turn`) — under an id minted here.
         let tool_use = state
             .lock()
-            .forced_tool_use(input.tool_config.as_ref(), crate::state::now_millis())
+            .tool_use_for_turn(
+                input.tool_config.as_ref(),
+                input.messages.as_ref(),
+                crate::state::now_millis(),
+            )
             .map_err(validation)?;
 
         // The prompt-cache stage both Converse operations share: a `cachePoint`

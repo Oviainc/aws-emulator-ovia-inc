@@ -246,7 +246,11 @@ fn bedrock_runtime_claims_exactly_the_path_space_its_model_binds() {
 /// RULE: a request this service claims is routed by the URI its MODEL binds —
 /// `override_operation` takes over exactly the two operations whose output is a
 /// `@streaming` union (which the generated object-safe routing table cannot serve) and
-/// leaves every other modelled route to that table.
+/// serves every other MODELLED route through the shared request-id report, which
+/// delegates to the very operation that table names for the request. So
+/// `override_operation` answers for a request exactly when the model binds a route this
+/// service serves, and declines every other one — leaving the router's routing-error path
+/// untouched.
 ///
 /// The rows are every `/model/{modelId}/…` route the model publishes
 /// (`smithy_query(query="digest")`: `converse`, `converse-stream`, `invoke`,
@@ -256,7 +260,7 @@ fn bedrock_runtime_claims_exactly_the_path_space_its_model_binds() {
 /// route matcher over this service's routing table
 /// (`service_common::addresses_modeled_route`), so the two literal tails routed by hand
 /// cannot drift away from the model — a tail this service overrides that resolves to no
-/// route, or a routable streaming operation it fails to override, fails here.
+/// route, or a routable operation it fails to serve, fails here.
 #[test]
 fn override_operation_routes_exactly_the_modelled_event_stream_uris() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -282,21 +286,21 @@ fn override_operation_routes_exactly_the_modelled_event_stream_uris() {
             "Converse, served by the generated table",
             "POST",
             "/model/amazon.nova-pro-v1%3A0/converse",
-            false,
+            true,
             true,
         ),
         (
             "InvokeModel, served by the generated table",
             "POST",
             "/model/amazon.nova-pro-v1%3A0/invoke",
-            false,
+            true,
             true,
         ),
         (
             "CountTokens, served by the generated table",
             "POST",
             "/model/amazon.nova-pro-v1%3A0/count-tokens",
-            false,
+            true,
             true,
         ),
         // The model binds this route, but the generated table wires no operation for it
@@ -316,7 +320,7 @@ fn override_operation_routes_exactly_the_modelled_event_stream_uris() {
             "StartAsyncInvoke, outside the /model path space",
             "POST",
             "/async-invoke",
-            false,
+            true,
             true,
         ),
         (

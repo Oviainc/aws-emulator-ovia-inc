@@ -2573,11 +2573,18 @@ pub fn conditionally_replacing_properties(resource_type: &str) -> &'static [&'st
 /// `UpdateKnowledgeBase` takes a `knowledgeBaseId` together with a new required `name`, as
 /// `UpdateAgent` takes an `agentId` and an `agentName`, `UpdateAgentAlias` an
 /// `agentAliasId` and an `agentAliasName`, and `UpdateDataSource` a data source's id and a
-/// new `name`. Renaming such a resource is a modification of it, not a recreation.
+/// new `name`. Renaming such a resource is a modification of it, not a recreation. An Amazon
+/// Bedrock GUARDRAIL is in that position too: `UpdateGuardrail` takes a
+/// `guardrailIdentifier` together with a new required `name`, the guardrail being identified
+/// by the id Amazon Bedrock minted for it.
 fn name_is_create_only(resource_type: &str) -> bool {
     !matches!(
         resource_type,
-        BEDROCK_KNOWLEDGE_BASE | BEDROCK_AGENT | BEDROCK_AGENT_ALIAS | BEDROCK_DATA_SOURCE
+        BEDROCK_KNOWLEDGE_BASE
+            | BEDROCK_AGENT
+            | BEDROCK_AGENT_ALIAS
+            | BEDROCK_DATA_SOURCE
+            | BEDROCK_GUARDRAIL
     )
 }
 

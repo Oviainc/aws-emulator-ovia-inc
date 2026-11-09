@@ -546,6 +546,17 @@ impl<O: ErasedOperation> RequestIdReportingOperation<O> {
             report: with_request_id_header,
         }
     }
+
+    /// The operation this report wraps, for a service that asks it a question of its own
+    /// before handing it the request (whether its front door claims that request, say).
+    ///
+    /// Wrapping an operation to report the request id must not take away what the service
+    /// could ask the operation before, which is why the wrapped operation is reachable
+    /// rather than swallowed; it is handed out as a BORROW, so nothing outside can serve a
+    /// request through it unreported.
+    pub fn inner(&self) -> &O {
+        &self.operation
+    }
 }
 
 impl<O: ErasedOperation> ErasedOperation for RequestIdReportingOperation<O> {

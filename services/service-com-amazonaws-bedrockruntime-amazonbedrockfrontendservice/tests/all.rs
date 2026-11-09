@@ -27,6 +27,8 @@ mod bedrock_runtime_inference;
 mod bedrock_runtime_request_claim;
 #[path = "all/bedrock_runtime_streaming.rs"]
 mod bedrock_runtime_streaming;
+#[path = "all/catalogued_model_inference.rs"]
+mod catalogued_model_inference;
 #[path = "all/converse_prompt_cache.rs"]
 mod converse_prompt_cache;
 #[path = "all/converse_tool_choice.rs"]

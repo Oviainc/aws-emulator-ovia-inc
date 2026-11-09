@@ -33,6 +33,13 @@
 //! refused configuration. A configuration that passes no role (`s3Config` only, or no
 //! destination at all) has no such decision to take and is stored as given.
 //!
+//! Neither is a destination Amazon Bedrock could not deliver into. Delivery is REGIONAL —
+//! the service writes the records from the Region the configuration is installed in — so a
+//! bucket living in another Region is refused with the modelled `ValidationException`
+//! (HTTP 400) rather than installed, and nothing is stored for it
+//! ([`crate::state::cross_region_logging_bucket`], which judges both buckets a
+//! configuration can name).
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -151,6 +158,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 PutModelInvocationLoggingConfigurationErrorModeled::AccessDeniedException(
                     AccessDeniedException {
                         message: Some(denial),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Then the destinations themselves: delivery is regional, so a bucket outside this
+        // Region is not a destination this configuration could be served from and the
+        // configuration is refused as input rather than installed
+        // ([`crate::state::logging_destination`]).
+        if let Some(refusal) =
+            crate::state::cross_region_logging_bucket(ctx, &region, &input.logging_config).await
+        {
+            return Err(
+                PutModelInvocationLoggingConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(refusal),
                     },
                 )
                 .into(),

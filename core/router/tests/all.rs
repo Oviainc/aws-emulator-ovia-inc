@@ -221,6 +221,10 @@ mod apigateway_s3_service_integration;
 // the sorted `b…` span (where the other bedrock suites land) are both regions concurrently
 #[path = "all/bedrock_model_customization_pass_role.rs"]
 mod bedrock_model_customization_pass_role;
+#[path = "all/bedrock_catalogue_is_invocable.rs"]
+mod bedrock_catalogue_is_invocable;
+#[path = "all/bedrock_logging_destination_region.rs"]
+mod bedrock_logging_destination_region;
 #[path = "all/bedrock_model_invocation_logging_pass_role.rs"]
 mod bedrock_model_invocation_logging_pass_role;
 #[path = "all/cloudformation_firehose_stream_stabilisation.rs"]
@@ -963,8 +967,8 @@ mod cloudformation_provisions_mq_brokers;
 mod cloudformation_refuses_mq_brokers;
 #[path = "all/cloudformation_provisions_agentcore_workload_identities.rs"]
 mod cloudformation_provisions_agentcore_workload_identities;
-#[path = "all/events_lambda_target_dead_letter_capture.rs"]
-mod events_lambda_target_dead_letter_capture;
+#[path = "all/cloudformation_provisions_bedrock_guardrails.rs"]
+mod cloudformation_provisions_bedrock_guardrails;
 #[path = "all/events_lambda_target_resource_policy.rs"]
 mod events_lambda_target_resource_policy;
 #[path = "all/events_lambda_target_runs_the_handler.rs"]
@@ -1043,16 +1047,8 @@ mod cloudformation_wafv2_protection_stack;
 // from compiling, so the duplicate lines are removed and the first declaration of each
 // stands. Add a NEW suite in the sorted span its name belongs to, and check it is not
 // already declared before appending it here.
-// The five suites that stood here — `apigateway_iam_authenticated_invoke`,
-// `cloudformation_rollback_triggers_revert_the_operation`,
-// `cloudformation_wafv2_protection_stack`, `lambda_sqs_event_source_batching_window` and
-// `cloudformation_asset_bucket_publishing_role` — are each ALREADY declared above (the first
-// four in the sorted head, the fifth at line 34, and the wafv2 one at line 1006). Two
-// from compiling; the duplicate lines are removed here and the first declaration of each
-// stands.
 // Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
 // reason those entries record: the appended tail at the end of this file and the `e…` span
-// are both regions concurrently landing suites add their line to.
 #[path = "all/eks_control_plane_logs.rs"]
 mod eks_control_plane_logs;
 // Declared in this same head region, for the reason the note above records.
@@ -1062,9 +1058,6 @@ mod bedrock_agentcore_data_plane_parent_resources;
 // at the end of this file: the tail is where every suite landing in the same window appends.
 #[path = "all/cloudfront_edge_metrics_drive_the_alarm_chain.rs"]
 mod cloudfront_edge_metrics_drive_the_alarm_chain;
-// Several suites that stood here are each ALREADY declared above, in the sorted head: two
-// concurrent changes appended the same entry, which is a redefinition and stops this target
-// from compiling, so the duplicate lines are removed and the first declaration of each
 // stands.
 // Nothing below this point re-declares a suite: several landing in the same window each
 // appended their own entry to this tail, so the same suite stood here two and three times
@@ -1079,7 +1072,6 @@ mod cloudfront_edge_metrics_drive_the_alarm_chain;
 mod cloudformation_provisions_config_recording;
 // Declared here, in the appended tail, for the reason the entries above record: the tail and
 // the sorted `c…` span (where every cloudformation and codepipeline suite would land) are
-// both regions concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_codebuild_projects.rs"]
 mod cloudformation_provisions_codebuild_projects;
 #[path = "all/ecr_push_triggers_its_pipeline.rs"]
@@ -1095,13 +1087,9 @@ mod codepipeline_build_action_invokes_codebuild;
 #[path = "all/zz_opensearch_fgac_probe.rs"]
 mod zz_opensearch_fgac_probe;
 // The five suites that stood here — `apigateway_iam_authenticated_invoke`,
-// `cloudformation_rollback_triggers_revert_the_operation`,
-// `cloudformation_wafv2_protection_stack`, `lambda_sqs_event_source_batching_window` and
 // `cloudformation_asset_bucket_publishing_role` — are each ALREADY declared above (the first
 // four in the sorted head, the fifth at line 34, and the wafv2 one at line 1006). Two
-// concurrent changes appended the same entry, which is a redefinition and stops this target
 // from compiling; the duplicate lines are removed here and the first declaration of each
-// stands.
 // Declared here, in this same head region, for the reason the entries above record: this
 // suite holds THIS list to one declaration per suite, so it belongs to no service's span of
 // the sorted list either.
@@ -1123,27 +1111,6 @@ mod ses_send_event_reports_what_answered;
 // `cloudformation_provisions_config_recording` is NOT re-declared here: it is already declared
 // earlier in this same tail, and a second `mod` for the same file is a redefinition that stops
 // this target from compiling.
-// `cloudformation_wafv2_protection_stack` is NOT re-declared here: it is already declared in
-// the sorted head, and a second `mod` for the same file is a redefinition that stops this
-// target from compiling.
-// `bedrock_agentcore_data_plane_parent_resources` is NOT re-declared here either: it stands
-// in the sorted head, and one `mod` per file is what this target compiles with.
-// Declared here, in the appended tail, for the reason the entries above record: the sorted
-// `e…` span is a region concurrently landing suites add their line to.
-// `cloudformation_asset_bucket_publishing_role` — are each ALREADY declared above, in the
-// sorted head. Two concurrent changes appended the same entry, which is a redefinition and
-// stops this target from compiling; the duplicate lines are removed here and the first
-// declaration of each stands. `bedrock_agentcore_data_plane_parent_resources`, which stood
-// just below, was appended the same way and is declared in that head too.
-// The suites that stood here — `apigateway_iam_authenticated_invoke`,
-// `cloudformation_wafv2_protection_stack`, `lambda_sqs_event_source_batching_window`,
-// `cloudformation_asset_bucket_publishing_role` and
-// `bedrock_agentcore_data_plane_parent_resources` — are each ALREADY declared above, in the
-// declaration of each stands.
-// Several suites that stood here are each ALREADY declared above: two concurrent changes
-// appended the same entry, which is a redefinition and stops this target from compiling, so
-// the duplicate lines are removed and the first declaration of each stands.
-// appended tail and the sorted `c…`/`s…` spans are both regions concurrently landing suites
 #[path = "all/ses_configuration_sets_shared_across_v1_and_v2.rs"]
 mod ses_configuration_sets_shared_across_v1_and_v2;
 #[path = "all/cloudformation_deployed_configuration_set_reaches_the_email_api.rs"]
@@ -1165,10 +1132,6 @@ mod sesv2_probe3;
 // `s…` span every SNS suite lands in is a region concurrently landing suites append to.
 #[path = "all/sns_lambda_invoke_permission_revocation.rs"]
 mod sns_lambda_invoke_permission_revocation;
-// Several suites that stood here are each ALREADY declared above, in the sorted head: two
-// from compiling, so the duplicate lines are removed and the first declaration of each
-// stands. Add a NEW suite in the sorted span its name belongs to, and check it is not
-// already declared before appending it here.
 // Declared here, in the appended tail: the log group a stack DECLARES, read back by the name
 // the stack published, and the records the function pointed at it leaves in it.
 #[path = "all/cloudformation_declared_log_group_takes_its_function_logs.rs"]
@@ -1205,3 +1168,5 @@ mod cloudformation_ec2_instance_rollback;
 // or earlier in the tail, where their own entry records why they were placed there: two
 // concurrent changes appending one entry is a redefinition that stops this target from
 // compiling, so the duplicate lines are gone and ONE declaration of each stands.
+#[path = "all/events_lambda_target_dead_letter_capture.rs"]
+mod events_lambda_target_dead_letter_capture;

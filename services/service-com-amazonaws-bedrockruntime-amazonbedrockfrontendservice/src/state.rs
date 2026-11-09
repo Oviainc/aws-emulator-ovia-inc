@@ -66,10 +66,25 @@ pub mod enforced_guardrail;
 /// a turn serves, which says plainly that no language model ran.
 pub mod generation;
 
+/// Which tool request a Converse-API turn makes for a request that offers tools, which is
+/// what starts the tool-use round trip.
+pub mod tool_use_turn;
+
+/// The base models this plane resolves a `modelId` against, and how each one is served.
+/// Here rather than in this file so one file holds one concern; the inventory the state
+/// struct seeds itself with is this module's.
+pub mod model_catalog;
+
+/// The OpenAI-compatible chat-completions `InvokeModel` envelope, which is the request and
+/// response shape of the providers Amazon Bedrock serves on that schema.
+pub mod openai_chat;
+
 // Re-exported so every handler and every caller of this module reaches the
 // generation stage where it reached it before: the stage MOVED into its own
 // module, it did not change, and nothing about the text a turn serves differs.
-pub use generation::{emulated_completion, EmulatedCompletion, EMULATED_COMPLETION_FLOOR};
+pub use generation::{
+    emulated_completion, emulated_completion_with, EmulatedCompletion, EMULATED_COMPLETION_FLOOR,
+};
 
 /// The most async-invoke records this emulator retains.
 ///
@@ -158,7 +173,7 @@ pub struct ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
 impl Default for ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
     fn default() -> Self {
         let mut models = BTreeMap::new();
-        for entry in seed_models() {
+        for entry in model_catalog::seed_models() {
             models.insert(entry.model_id.clone(), entry);
         }
         Self {
@@ -273,9 +288,17 @@ impl ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
         format!("tooluse_{}", &hex::encode(digest)[..22])
     }
 
-    /// The tool request a mandatory `toolChoice` obliges this turn to make, or
-    /// `None` when the request leaves the choice to the model (`auto`, or no
-    /// `toolChoice` at all).
+    /// The tool request this turn makes, or `None` when the turn generates text
+    /// instead.
+    ///
+    /// `toolChoice` decides how much of this is the model's own
+    /// ([`tool_use_turn`]): a MANDATORY choice (`any`, or `tool` naming one of the
+    /// tools offered) obliges the turn to request a tool, and `auto` — the
+    /// default, and what a request carrying no `toolChoice` gets — leaves the
+    /// decision to the model, which is taken here from the state of the
+    /// CONVERSATION: a turn whose latest message answers no tool request asks for
+    /// the first tool the request offers, and the turn that is handed the
+    /// `toolResult` for it answers in text.
     ///
     /// The request carries the arguments the chosen tool's own `inputSchema`
     /// describes ([`tool_input_arguments`]), so a client reading `toolUse.input`
@@ -284,9 +307,10 @@ impl ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
     /// `Err` carries the refusal sentence for a choice the request's own tools
     /// cannot satisfy; the caller answers it with the operation's modelled
     /// `ValidationException` (400).
-    pub fn forced_tool_use(
+    pub fn tool_use_for_turn(
         &mut self,
         tool_config: Option<&ToolConfiguration>,
+        messages: Option<&Vec<Message>>,
         at_millis: i64,
     ) -> Result<Option<ToolUseBlock>, String> {
         let Some(config) = tool_config else {
@@ -294,9 +318,21 @@ impl ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
         };
         let requestable = requestable_tool_names(config);
         let name = match &config.tool_choice {
-            // `auto` leaves it to the model, and a model that generates text is
-            // what this emulator serves.
-            Some(ToolChoice::Auto(_)) | None => return Ok(None),
+            // `auto`, and a request that states no choice at all: the model
+            // decides. The tools this request offers have not been called for the
+            // latest prompt unless that prompt is itself the result of one, so the
+            // turn requests the first tool offered — and answers in text once the
+            // result is in hand. A tool list that offers no requestable tool
+            // leaves nothing to request, which is text too.
+            Some(ToolChoice::Auto(_)) | None => {
+                if tool_use_turn::latest_turn_answers_a_tool_request(messages) {
+                    return Ok(None);
+                }
+                match requestable.first() {
+                    Some(name) => (*name).to_string(),
+                    None => return Ok(None),
+                }
+            }
             // "The model must request at least one tool": the first tool the
             // request offers is the one requested, so the choice is answered
             // from the request rather than from a guess.
@@ -551,6 +587,11 @@ pub enum ModelFamily {
     Mistral,
     /// Cohere Command.
     CohereCommand,
+    /// The OpenAI-compatible chat completions envelope, which is the published
+    /// `InvokeModel` body format of every provider Amazon Bedrock onboards on that
+    /// schema — the providers whose own API is the OpenAI chat-completions API. See
+    /// [`openai_chat`].
+    OpenAiChat,
 }
 
 /// What a base model takes and produces.
@@ -603,10 +644,10 @@ pub enum ModelLifecycle {
 pub struct ModelEntry {
     /// The bare model id, e.g. `anthropic.claude-3-sonnet-20240229-v1:0`.
     pub model_id: String,
-    /// Which `InvokeModel` body envelope the model speaks, or `None` when this
-    /// emulator implements none for it — every non-text modality, and the text
-    /// providers whose envelope it does not render (see [`seed_models`]). An
-    /// invocation of one is refused, never answered with an invented payload.
+    /// Which `InvokeModel` body envelope the model speaks, or `None` when the model
+    /// generates no text at all — every non-text modality, where this emulator computes
+    /// no inference (see [`model_catalog`]). An invocation of one is refused, never
+    /// answered with an invented payload.
     pub family: Option<ModelFamily>,
     /// What the model takes and produces.
     pub modality: ModelModality,
@@ -635,156 +676,6 @@ pub struct ModelEntry {
     /// The model's own ceiling on generated tokens, which caps
     /// `inferenceConfig.maxTokens`. Zero for a model that generates no text.
     pub max_output_tokens: u32,
-}
-
-/// The foundation model ids this service recognises.
-///
-/// Ids as published in "Amazon Bedrock base model IDs (on-demand throughput)"
-/// and "Supported foundation models in Amazon Bedrock" in the Amazon Bedrock
-/// User Guide, and the retired ones in "Model lifecycle". The inventory carries
-/// an id whether or not this emulator can serve it, because resolving the
-/// IDENTIFIER and serving the MODEL are separate steps: a recognised id is
-/// never reported as an invalid identifier.
-///
-/// It covers, for every provider whose `InvokeModel` envelope
-/// [`invoke_model_response_body`] renders (Amazon Titan and Nova, Anthropic
-/// Claude, Meta Llama, Mistral AI and Cohere Command), that provider's
-/// published on-demand base models — text models served in their own envelope,
-/// non-text models recognised but refused — plus the retired ids of every
-/// provider, which need no envelope. A text provider whose envelope is not
-/// implemented (AI21 Jamba, DeepSeek, Writer, Qwen) is NOT listed, so its id
-/// is answered as an identifier this emulator cannot interpret.
-fn seed_models() -> Vec<ModelEntry> {
-    // A text model served in its family's envelope.
-    let text = |model_id: &str, family: ModelFamily, supports_converse: bool, max: u32| ModelEntry {
-        model_id: model_id.to_string(),
-        family: Some(family),
-        modality: ModelModality::Text,
-        lifecycle: ModelLifecycle::Active,
-        supports_converse,
-        // `CountTokens` counts with the MODEL's own tokenizer, and AWS publishes
-        // it for the Anthropic Claude family (`CountTokens` "Supported
-        // models"); the recorded corpus shows the service refusing the count for
-        // a model outside that set rather than answering one.
-        supports_count_tokens: matches!(family, ModelFamily::AnthropicMessages),
-        // No text model is invocable asynchronously: `StartAsyncInvoke`'s result
-        // is an artifact written to Amazon S3, which is what the video
-        // generation models produce.
-        supports_async_invoke: false,
-        max_output_tokens: max,
-    };
-    // A recognised model whose modality this emulator computes nothing for.
-    let unserved = |model_id: &str, modality: ModelModality| ModelEntry {
-        model_id: model_id.to_string(),
-        family: None,
-        modality,
-        lifecycle: ModelLifecycle::Active,
-        supports_converse: false,
-        supports_count_tokens: false,
-        supports_async_invoke: false,
-        max_output_tokens: 0,
-    };
-    // A video generation model: recognised, served by `StartAsyncInvoke` only
-    // ("Use asynchronous invocation for video generation" in the Amazon Bedrock
-    // User Guide — a video model has no synchronous `InvokeModel` envelope), and
-    // carrying a `modelInput` schema in [`async_model_input_schema`].
-    let async_video = |model_id: &str| ModelEntry {
-        model_id: model_id.to_string(),
-        family: None,
-        modality: ModelModality::Video,
-        lifecycle: ModelLifecycle::Active,
-        supports_converse: false,
-        supports_count_tokens: false,
-        supports_async_invoke: true,
-        max_output_tokens: 0,
-    };
-    // A model past its end of life: recognised, not servable.
-    let retired = |model_id: &str, modality: ModelModality| ModelEntry {
-        model_id: model_id.to_string(),
-        family: None,
-        modality,
-        lifecycle: ModelLifecycle::EndOfLife,
-        supports_converse: false,
-        supports_count_tokens: false,
-        supports_async_invoke: false,
-        max_output_tokens: 0,
-    };
-    use ModelFamily::{AnthropicMessages, CohereCommand, Llama, Mistral, Nova, TitanText};
-    use ModelModality::{Embedding, Image, Text};
-    vec![
-        // Anthropic Claude — 4k max output tokens on Claude 3, 8k on 3.5 and
-        // 3.7 ("Inference parameters for foundation models", Anthropic Claude).
-        text("anthropic.claude-3-haiku-20240307-v1:0", AnthropicMessages, true, 4096),
-        text("anthropic.claude-3-sonnet-20240229-v1:0", AnthropicMessages, true, 4096),
-        text("anthropic.claude-3-opus-20240229-v1:0", AnthropicMessages, true, 4096),
-        text("anthropic.claude-3-5-haiku-20241022-v1:0", AnthropicMessages, true, 8192),
-        text("anthropic.claude-3-5-sonnet-20240620-v1:0", AnthropicMessages, true, 8192),
-        text("anthropic.claude-3-5-sonnet-20241022-v2:0", AnthropicMessages, true, 8192),
-        text("anthropic.claude-3-7-sonnet-20250219-v1:0", AnthropicMessages, true, 8192),
-        // Amazon Titan Text. Titan Text Express is past its end of life (below).
-        text("amazon.titan-text-lite-v1", TitanText, true, 4096),
-        text("amazon.titan-text-premier-v1:0", TitanText, true, 3072),
-        // Amazon Nova understanding models — 5k max output tokens.
-        text("amazon.nova-micro-v1:0", Nova, true, 5120),
-        text("amazon.nova-lite-v1:0", Nova, true, 5120),
-        text("amazon.nova-pro-v1:0", Nova, true, 5120),
-        text("amazon.nova-premier-v1:0", Nova, true, 5120),
-        // Meta Llama 3 and later — 2k max generation length.
-        text("meta.llama3-8b-instruct-v1:0", Llama, true, 2048),
-        text("meta.llama3-70b-instruct-v1:0", Llama, true, 2048),
-        text("meta.llama3-1-8b-instruct-v1:0", Llama, true, 2048),
-        text("meta.llama3-1-70b-instruct-v1:0", Llama, true, 2048),
-        text("meta.llama3-1-405b-instruct-v1:0", Llama, true, 2048),
-        text("meta.llama3-2-1b-instruct-v1:0", Llama, true, 2048),
-        text("meta.llama3-2-3b-instruct-v1:0", Llama, true, 2048),
-        text("meta.llama3-2-11b-instruct-v1:0", Llama, true, 2048),
-        text("meta.llama3-2-90b-instruct-v1:0", Llama, true, 2048),
-        text("meta.llama3-3-70b-instruct-v1:0", Llama, true, 2048),
-        // Mistral AI.
-        text("mistral.mistral-7b-instruct-v0:2", Mistral, true, 8192),
-        text("mistral.mixtral-8x7b-instruct-v0:1", Mistral, true, 4096),
-        text("mistral.mistral-small-2402-v1:0", Mistral, true, 8192),
-        text("mistral.mistral-large-2402-v1:0", Mistral, true, 8192),
-        text("mistral.mistral-large-2407-v1:0", Mistral, true, 8192),
-        // Cohere Command: the text models are InvokeModel-only, the R models
-        // are served by Converse too.
-        text("cohere.command-text-v14", CohereCommand, false, 4096),
-        text("cohere.command-light-text-v14", CohereCommand, false, 4096),
-        text("cohere.command-r-v1:0", CohereCommand, true, 4096),
-        text("cohere.command-r-plus-v1:0", CohereCommand, true, 4096),
-        // Recognised ids whose modality this emulator serves no inference for.
-        unserved("amazon.titan-embed-text-v1", Embedding),
-        unserved("amazon.titan-embed-text-v2:0", Embedding),
-        unserved("amazon.titan-embed-image-v1", Embedding),
-        unserved("cohere.embed-english-v3", Embedding),
-        unserved("cohere.embed-multilingual-v3", Embedding),
-        unserved("amazon.titan-image-generator-v1", Image),
-        unserved("amazon.titan-image-generator-v2:0", Image),
-        unserved("amazon.nova-canvas-v1:0", Image),
-        // The video generation models, which are the models `StartAsyncInvoke`
-        // serves. Ids from "Supported foundation models in Amazon Bedrock";
-        // their `modelInput` schemas are in [`async_model_input_schema`], which
-        // must carry one for every id listed here.
-        async_video("amazon.nova-reel-v1:0"),
-        async_video("amazon.nova-reel-v1:1"),
-        async_video("luma.ray-v2:0"),
-        // Past end of life ("Model lifecycle"). Amazon Titan Text Express and
-        // the first generation of Anthropic Claude on Bedrock are there: the
-        // recorded corpus shows the service answering 404 with the end-of-life
-        // reason for them, which is what makes the id recognised but unserved.
-        retired("amazon.titan-text-express-v1", Text),
-        retired("anthropic.claude-v1", Text),
-        retired("anthropic.claude-v2", Text),
-        retired("anthropic.claude-v2:1", Text),
-        retired("anthropic.claude-instant-v1", Text),
-        retired("ai21.j2-mid-v1", Text),
-        retired("ai21.j2-ultra-v1", Text),
-        retired("ai21.j2-grande-instruct", Text),
-        retired("ai21.j2-jumbo-instruct", Text),
-        retired("meta.llama2-13b-chat-v1", Text),
-        retired("meta.llama2-70b-chat-v1", Text),
-        retired("stability.stable-diffusion-xl-v0", Image),
-    ]
 }
 
 /// The service's fixed message for a `modelId` it cannot interpret as naming a
@@ -1257,7 +1148,7 @@ pub fn service_value_order(path: &str, values: &[String]) -> Option<Vec<String>>
 /// models AWS publishes asynchronous invocation for ("Use asynchronous
 /// invocation for video generation" in the Amazon Bedrock User Guide).
 ///
-/// The inventory ([`seed_models`]) marks exactly these
+/// The inventory ([`model_catalog`]) marks exactly these
 /// [`ModelEntry::supports_async_invoke`], and [`async_model_input_rules`]
 /// carries one request schema per id; the crate's tests pin all three lists
 /// against each other, so a model cannot be made async-capable without the
@@ -1699,6 +1590,14 @@ pub fn decode_page_token(token: &str) -> Option<(i64, String)> {
 // ---------------------------------------------------------------------------
 // Time
 // ---------------------------------------------------------------------------
+
+/// Now, in epoch SECONDS: the unit a response envelope that states the instant it was
+/// created in reports it in (the OpenAI-compatible chat completions envelope's `created`,
+/// [`openai_chat`]). Read off the same clock as [`now_millis`], so the two cannot disagree
+/// about when a call was served.
+pub fn now_seconds() -> i64 {
+    now_millis() / 1_000
+}
 
 /// Now, in epoch milliseconds.
 ///
@@ -2324,8 +2223,8 @@ pub struct ConverseTurn {
     /// [`emulated_completion`] — never the request's own text echoed back.
     /// EMPTY for a turn that requests a tool, which generates no text.
     pub text: String,
-    /// The tool this turn requests, when the request obliged it to request one
-    /// ([`ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState::forced_tool_use`]).
+    /// The tool this turn requests, when the request offered one the turn asks for
+    /// ([`ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState::tool_use_for_turn`]).
     pub tool_use: Option<ToolUseBlock>,
     /// The input tokens this turn is charged for. A turn whose request marks a
     /// cacheable prefix is charged only for the prompt text after the last
@@ -2447,8 +2346,8 @@ impl<'a> TurnInference<'a> {
 /// construction; the only difference between them is how the turn is framed on
 /// the wire.
 ///
-/// `tool_use` is the tool request the turn is obliged to make, from
-/// [`ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState::forced_tool_use`]:
+/// `tool_use` is the tool request this turn makes, from
+/// [`ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState::tool_use_for_turn`]:
 /// a turn that requests a tool generates no text, so the whole of what it
 /// answers is that one content block and the tokens it reports for its output
 /// are that block's.
@@ -2496,12 +2395,16 @@ pub fn converse_turn(
         .unwrap_or(model.max_output_tokens)
         .min(model.max_output_tokens);
     let turns = messages.map(Vec::len).unwrap_or_default();
-    let completion = emulated_completion(
+    let completion = emulated_completion_with(
         &model.model_id,
         u32::try_from(turns).unwrap_or(u32::MAX),
         input_tokens,
         max_output_tokens,
         inference.stop_sequences,
+        // A turn handed a tool's result states that result: the exchange the tool
+        // request started is only finished by an answer that reports what came back
+        // ([`tool_use_turn::tool_result_clauses`]).
+        &tool_use_turn::tool_result_clauses(messages),
     );
     let output_tokens = count_text_tokens(&completion.text);
     ConverseTurn {
@@ -2606,6 +2509,7 @@ pub fn body_max_tokens(family: ModelFamily, body: &serde_json::Value) -> Option<
         ModelFamily::Nova => "/inferenceConfig/max_new_tokens",
         ModelFamily::Llama => "/max_gen_len",
         ModelFamily::Mistral | ModelFamily::CohereCommand => "/max_tokens",
+        ModelFamily::OpenAiChat => openai_chat::MAX_TOKENS_POINTER,
     };
     body.pointer(pointer)
         .and_then(serde_json::Value::as_u64)
@@ -2637,6 +2541,7 @@ pub fn body_stop_sequences(family: ModelFamily, body: &serde_json::Value) -> Vec
         ModelFamily::Llama => return Vec::new(),
         ModelFamily::Mistral => "/stop",
         ModelFamily::CohereCommand => "/stop_sequences",
+        ModelFamily::OpenAiChat => openai_chat::STOP_SEQUENCES_POINTER,
     };
     let configured = match body.pointer(pointer) {
         Some(serde_json::Value::Array(sequences)) => sequences.as_slice(),
@@ -2732,6 +2637,22 @@ pub fn body_inference_ranges(family: ModelFamily) -> &'static [BodyInferenceRang
             BodyInferenceRange {
                 pointer: "/p",
                 name: "p",
+                min: 0.0,
+                max: 1.0,
+            },
+        ],
+        // The OpenAI-compatible chat completions API bounds its sampling temperature at 2
+        // and its nucleus mass at 1, under the two names it publishes them by.
+        ModelFamily::OpenAiChat => &[
+            BodyInferenceRange {
+                pointer: "/temperature",
+                name: "temperature",
+                min: 0.0,
+                max: 2.0,
+            },
+            BodyInferenceRange {
+                pointer: "/top_p",
+                name: "top_p",
                 min: 0.0,
                 max: 1.0,
             },
@@ -3634,9 +3555,25 @@ pub fn emulated_completion_text(model_id: &str, messages: u32, input_tokens: u32
     emulated_completion(model_id, messages, input_tokens, u32::MAX, &[]).text
 }
 
-/// The refusal message for an `InvokeModel` body that is not even a JSON object:
-/// "You must provide the body in JSON format" is all the operation documents
-/// about a body it cannot read.
+/// The refusal message for an `InvokeModel` body whose JSON cannot be PARSED: the bytes
+/// are not a JSON document at all, so there is no request to read.
+///
+/// "You must provide the body in JSON format" is all the operation's own documentation says
+/// about such a body, and this is the sentence Amazon Bedrock states that refusal in — the
+/// recorded one for this class. The fault is the DOCUMENT's syntax rather than any one
+/// member of it, so the message names no member and carries no value of the request.
+pub const MALFORMED_JSON_BODY_MESSAGE: &str =
+    "The JSON object in the request body is malformed. Fix the syntax errors and retry \
+     your request.";
+
+/// The refusal message for a body that IS a JSON document but is not a request of the
+/// invoked family: a value that is not an object, so no member of the family's documented
+/// request schema can be read off it.
+///
+/// A different class from the one above and worded differently by Amazon Bedrock: here the
+/// document parsed and what it holds is not the request, which is the same complaint a body
+/// missing a required member gets ([`invoke_body_violation`] states that one with the
+/// member's own name).
 pub const MALFORMED_BODY_MESSAGE: &str =
     "Malformed input request, please reformat your input and try again.";
 
@@ -3661,20 +3598,26 @@ fn required_body_slots(family: ModelFamily) -> &'static [&'static [&'static str]
         ModelFamily::Mistral => &[&["prompt", "messages"]],
         // Cohere Command (text) takes `prompt`, Command R takes `message`.
         ModelFamily::CohereCommand => &[&["prompt", "message"]],
+        // The OpenAI-compatible chat completions API takes a chat transcript, or a raw
+        // prompt in the completion form of the same API ([`openai_chat`]).
+        ModelFamily::OpenAiChat => openai_chat::REQUIRED_SLOTS,
     }
 }
 
 /// The refusal `InvokeModel` owes for a body that does not satisfy `family`'s
 /// documented request schema, or `None` when it does.
 ///
-/// The body is model-specific, so this is the only place the request's own
-/// shape is checked: a body that is not a JSON object cannot be read at all,
-/// and one that omits a member the family requires is reported naming that
-/// member, as a schema violation is.
+/// The body is model-specific, so this is the only place the request's own shape is
+/// checked, and the three ways it can fail are three different complaints: bytes whose JSON
+/// cannot be PARSED are a syntax fault in the document
+/// ([`MALFORMED_JSON_BODY_MESSAGE`]); a document that parses but is not an object is no
+/// request of the family ([`MALFORMED_BODY_MESSAGE`]); and one that omits a member the
+/// family requires is reported naming that member, as a schema violation is.
 pub fn invoke_body_violation(family: ModelFamily, body: &[u8]) -> Option<String> {
-    let Ok(serde_json::Value::Object(members)) = serde_json::from_slice::<serde_json::Value>(body)
-    else {
-        return Some(MALFORMED_BODY_MESSAGE.to_string());
+    let members = match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(serde_json::Value::Object(members)) => members,
+        Ok(_) => return Some(MALFORMED_BODY_MESSAGE.to_string()),
+        Err(_) => return Some(MALFORMED_JSON_BODY_MESSAGE.to_string()),
     };
     for slot in required_body_slots(family) {
         if slot.iter().any(|name| members.contains_key(*name)) {
@@ -3748,6 +3691,15 @@ pub fn invoke_model_response_body(
                 "finish_reason": stop_reason,
             }],
         }),
+        ModelFamily::OpenAiChat => openai_chat::response_body(
+            model_id,
+            completion_id,
+            text,
+            input_tokens,
+            output_tokens,
+            stop_reason,
+            now_seconds(),
+        ),
     }
 }
 
@@ -3785,6 +3737,8 @@ pub fn family_stop_reason(family: ModelFamily, stopped_at_token_cap: bool) -> &'
         (ModelFamily::Llama | ModelFamily::Mistral, false) => "stop",
         (ModelFamily::CohereCommand, true) => "MAX_TOKENS",
         (ModelFamily::CohereCommand, false) => "COMPLETE",
+        (ModelFamily::OpenAiChat, true) => openai_chat::FINISH_REASON_LENGTH,
+        (ModelFamily::OpenAiChat, false) => openai_chat::FINISH_REASON_STOP,
     }
 }
 
@@ -3961,6 +3915,18 @@ pub fn invoke_model_stream_chunks(
                 "response": turn.response.clone(),
             }),
         ],
+        // The streaming form of the OpenAI-compatible chat completions envelope:
+        // `chat.completion.chunk` objects whose `delta` carries the increment
+        // ([`openai_chat`]).
+        ModelFamily::OpenAiChat => openai_chat::stream_chunks(
+            model_id,
+            completion_id,
+            text,
+            input_tokens,
+            output_tokens,
+            stop_reason,
+            now_seconds(),
+        ),
     };
 
     // The service's own accounting, on the terminal chunk and nowhere else.

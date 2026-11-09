@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The tool-calling half of the Converse envelope, end to end over HTTP: what a
-//! mandatory `toolConfig.toolChoice` obliges a turn to answer, and how a later
-//! turn's `toolResult` is addressed to the tool request it answers.
+//! The tool-calling half of the Converse envelope, end to end over HTTP: which tool
+//! a turn requests for a request that offers one, and how a later turn's `toolResult`
+//! is addressed to the tool request it answers.
 //!
 //! Every case drives the real router through the harness the other suites of this
 //! target use, so what is asserted is the wire behaviour a client sees.
@@ -28,8 +28,8 @@ struct ChoiceRow {
     /// A model the registry serves and the Converse API supports.
     model_id: &'static str,
     tool_config: Value,
-    /// The tool the turn must request, or `None` where the choice leaves it to
-    /// the model, which generates text here.
+    /// The tool the turn must request, or `None` where the request offers no tool
+    /// the turn could ask for.
     requested: Option<&'static str>,
 }
 
@@ -130,18 +130,33 @@ fn choice_rows() -> Vec<ChoiceRow> {
             requested: Some("web_search"),
         },
         ChoiceRow {
-            case: "auto leaves the choice to the model",
+            case: "auto over a single tool requests it",
             model_id: "amazon.nova-lite-v1:0",
             tool_config: json!({
                 "tools": [tool_spec("get_stock_price")],
                 "toolChoice": {"auto": {}},
             }),
+            requested: Some("get_stock_price"),
+        },
+        ChoiceRow {
+            case: "a tool config with no choice at all requests the first tool offered",
+            model_id: "meta.llama3-8b-instruct-v1:0",
+            tool_config: json!({"tools": [tool_spec("get_stock_price"), tool_spec("get_time")]}),
+            requested: Some("get_stock_price"),
+        },
+        ChoiceRow {
+            case: "auto over a list that offers no requestable tool",
+            model_id: "amazon.nova-lite-v1:0",
+            tool_config: json!({
+                "tools": [{"cachePoint": {"type": "default"}}],
+                "toolChoice": {"auto": {}},
+            }),
             requested: None,
         },
         ChoiceRow {
-            case: "a tool config with no choice at all",
+            case: "no choice at all over a list that offers no requestable tool",
             model_id: "meta.llama3-8b-instruct-v1:0",
-            tool_config: json!({"tools": [tool_spec("get_stock_price")]}),
+            tool_config: json!({"tools": [{"cachePoint": {"type": "default"}}]}),
             requested: None,
         },
     ]
@@ -179,15 +194,16 @@ fn assert_tool_use_id(case: &str, id: &str) {
     );
 }
 
-/// RULE: a `toolChoice` that makes a tool call MANDATORY (`any`, or `tool`
-/// naming one of the tools the request offers) ends the turn by requesting a
-/// tool: the response's `stopReason` is `tool_use` and the assistant message is
-/// exactly one `toolUse` block carrying a server-minted `toolUseId`, the name of
-/// the tool the choice settles on and an `input` member — no text. A choice that
-/// leaves the decision to the model (`auto`, or none) leaves the turn generating
-/// text.
+/// RULE: a turn whose request OFFERS a tool it can ask for ends by requesting one:
+/// the response's `stopReason` is `tool_use` and the assistant message is exactly one
+/// `toolUse` block carrying a server-minted `toolUseId`, the name of the tool the
+/// choice settles on and an `input` member — no text. A mandatory `toolChoice` (`any`,
+/// or `tool` naming one of the tools the request offers) settles which tool that is;
+/// `auto`, and a request stating no choice at all, leave it to the model, which asks
+/// for the first tool offered. A request whose tool list offers no requestable tool
+/// has nothing to ask for, so its turn generates text.
 #[tokio::test]
-async fn a_mandatory_tool_choice_requests_a_tool_and_an_optional_one_does_not() {
+async fn a_turn_requests_a_tool_the_request_offers_and_generates_text_when_it_offers_none() {
     let router = emulator();
     let mut minted: Vec<String> = Vec::new();
 
@@ -219,8 +235,8 @@ async fn a_mandatory_tool_choice_requests_a_tool_and_an_optional_one_does_not() 
             Some(expected) => {
                 assert_eq!(
                     stop, "tool_use",
-                    "case {case:?}: a mandatory toolChoice must stop the turn to call the \
-                     tool, got {stop:?} with content {block}"
+                    "case {case:?}: a turn offered a tool it can request must stop to call \
+                     it, got {stop:?} with content {block}"
                 );
                 let tool_use = &block["toolUse"];
                 assert!(
@@ -229,7 +245,7 @@ async fn a_mandatory_tool_choice_requests_a_tool_and_an_optional_one_does_not() 
                 );
                 assert!(
                     block.get("text").is_none(),
-                    "case {case:?}: a forced tool call generates no text, got {block}"
+                    "case {case:?}: a turn that requests a tool generates no text, got {block}"
                 );
                 assert_eq!(
                     tool_use["name"].as_str(),
@@ -255,8 +271,8 @@ async fn a_mandatory_tool_choice_requests_a_tool_and_an_optional_one_does_not() 
             None => {
                 assert_eq!(
                     stop, "end_turn",
-                    "case {case:?}: an optional toolChoice leaves the turn generating text, \
-                     got {stop:?} with content {block}"
+                    "case {case:?}: a request offering no requestable tool leaves the turn \
+                     generating text, got {stop:?} with content {block}"
                 );
                 assert!(
                     block["text"].is_string(),
@@ -271,8 +287,9 @@ async fn a_mandatory_tool_choice_requests_a_tool_and_an_optional_one_does_not() 
     }
 
     assert!(
-        minted.len() >= 7,
-        "the table must cover the mandatory choices, got {} rows: {minted:?}",
+        minted.len() >= 9,
+        "the table must cover every choice form a turn can request a tool under, got {} \
+         rows: {minted:?}",
         minted.len()
     );
 }
@@ -546,8 +563,8 @@ fn frames_named(frames: &[(String, Value)], name: &str) -> Vec<Value> {
         .collect()
 }
 
-/// RULE: `ConverseStream` frames the same turn `Converse` serves, so a mandatory
-/// `toolChoice` makes the stream open the content block with a
+/// RULE: `ConverseStream` frames the same turn `Converse` serves, so a turn that
+/// requests a tool makes the stream open the content block with a
 /// `contentBlockStart` naming the minted `toolUseId` and the tool requested,
 /// deliver that request's input in the block's `contentBlockDelta` frames, and
 /// report `tool_use` on `messageStop`.
@@ -586,8 +603,8 @@ async fn converse_stream_frames_the_tool_request_the_turn_makes() {
                 assert_eq!(
                     stops,
                     vec!["tool_use".to_string()],
-                    "case {case:?}: a mandatory toolChoice must stop the stream on tool_use, \
-                     got {stops:?} over frames {order:?}"
+                    "case {case:?}: a turn offered a tool it can request must stop the \
+                     stream on tool_use, got {stops:?} over frames {order:?}"
                 );
                 let starts = frames_named(&frames, "contentBlockStart");
                 assert_eq!(
@@ -624,7 +641,8 @@ async fn converse_stream_frames_the_tool_request_the_turn_makes() {
                 for payload in frames_named(&frames, "contentBlockDelta") {
                     assert!(
                         payload["delta"].get("text").is_none(),
-                        "case {case:?}: a forced tool call streams no text, got {payload}"
+                        "case {case:?}: a turn that requests a tool streams no text, got \
+                         {payload}"
                     );
                 }
             }
@@ -632,8 +650,8 @@ async fn converse_stream_frames_the_tool_request_the_turn_makes() {
                 assert_eq!(
                     stops,
                     vec!["end_turn".to_string()],
-                    "case {case:?}: an optional toolChoice leaves the turn generating text, \
-                     got {stops:?} over frames {order:?}"
+                    "case {case:?}: a request offering no requestable tool leaves the turn \
+                     generating text, got {stops:?} over frames {order:?}"
                 );
                 assert!(
                     frames_named(&frames, "contentBlockStart").is_empty(),

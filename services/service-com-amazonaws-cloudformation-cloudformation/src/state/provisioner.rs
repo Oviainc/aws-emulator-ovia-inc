@@ -475,7 +475,7 @@ use super::template::{
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
     APIGATEWAYV2_STAGE, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT, BATCH_COMPUTE_ENVIRONMENT,
-    BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, CLOUDWATCH_DASHBOARD,
+    BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, BEDROCK_GUARDRAIL, CLOUDWATCH_DASHBOARD,
     CLOUDWATCH_METRIC_STREAM, CODEARTIFACT_DOMAIN, CODEARTIFACT_REPOSITORY,
     CODEBUILD_PROJECT,
     CODEBUILD_REPORT_GROUP, CODECOMMIT_REPOSITORY, CODEDEPLOY_APPLICATION,
@@ -827,6 +827,12 @@ pub(super) enum Provisioner {
     BackupVault,
     BackupPlan,
     BackupSelection,
+    /// `AWS::Bedrock::Guardrail`: a guardrail of Amazon Bedrock's own control plane, which
+    /// `CreateGuardrail` creates under the name the template states, `UpdateGuardrail`
+    /// changes and `DeleteGuardrail` removes. Amazon Bedrock MINTS the `guardrailId` and
+    /// the ARN the type publishes, so both are read off that create's own answer and the
+    /// ARN is the identity a `Ref` resolves to.
+    BedrockGuardrail,
     /// `AWS::BedrockAgentCore::WorkloadIdentity`: a workload identity of the Amazon Bedrock
     /// AgentCore control plane, which `CreateWorkloadIdentity` creates under the name the
     /// template states, `UpdateWorkloadIdentity` changes and `DeleteWorkloadIdentity`
@@ -975,6 +981,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         BACKUP_VAULT => Some(Provisioner::BackupVault),
         BACKUP_PLAN => Some(Provisioner::BackupPlan),
         BACKUP_SELECTION => Some(Provisioner::BackupSelection),
+        BEDROCK_GUARDRAIL => Some(Provisioner::BedrockGuardrail),
         BEDROCK_AGENTCORE_WORKLOAD_IDENTITY => {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
         }
@@ -1400,6 +1407,12 @@ impl Provisioner {
             // `BackupSelection` and no tags: AWS Backup tags a plan and a vault, not a
             // selection, so no tags are propagated to one.
             Self::BackupSelection => create_backup_selection(ctx, region, resource).await,
+            // `AWS::Bedrock::Guardrail` publishes `Tags`, and `CreateGuardrail` takes the
+            // `TagList` of its own, so a guardrail a stack creates carries the tags
+            // CloudFormation gives it beside the ones the declaration asks for.
+            Self::BedrockGuardrail => {
+                create_bedrock_guardrail(ctx, region, resource, propagated).await
+            }
             // `AWS::BedrockAgentCore::WorkloadIdentity` publishes `Tags`, and
             // `CreateWorkloadIdentity` takes a tag MAP of its own, so an identity a stack
             // creates carries the tags CloudFormation gives it beside the ones the
@@ -1904,6 +1917,13 @@ impl Provisioner {
             // a changed declaration of that list is applied to the identity the stack
             // created rather than replacing it, and a declaration that states none leaves
             // it with none ([`update_workload_identity`]).
+            // `UpdateGuardrail` "updates a guardrail with the values you specify", so a
+            // changed declaration is applied to the guardrail the stack created rather
+            // than replacing it; the guardrail's identity is the ARN Amazon Bedrock
+            // minted, which an update leaves alone.
+            Self::BedrockGuardrail => update_bedrock_guardrail(ctx, region, resource, declared)
+                .await
+                .map(Some),
             Self::BedrockAgentCoreWorkloadIdentity => {
                 update_workload_identity(ctx, region, resource, declared)
                     .await
@@ -2397,6 +2417,11 @@ impl Provisioner {
             // The delete addresses the selection by the PAIR AWS Backup keys one by, and
             // the plan half of that pair is on the resource's own declaration.
             Self::BackupSelection => delete_backup_selection(ctx, region, resource).await,
+            // The delete addresses the guardrail by the identifier Amazon Bedrock keyed it
+            // by, which is this resource's physical id.
+            Self::BedrockGuardrail => {
+                delete_bedrock_guardrail(ctx, region, physical_resource_id).await
+            }
             Self::BedrockAgentCoreWorkloadIdentity => {
                 delete_workload_identity(ctx, region, physical_resource_id).await
             }
@@ -2772,6 +2797,11 @@ impl Provisioner {
             Self::RedshiftCluster => {
                 describe_redshift_cluster(ctx, region, physical_resource_id).await
             }
+            // Amazon Bedrock's own read of the guardrail the stack created, by the
+            // identifier it was created under.
+            Self::BedrockGuardrail => {
+                describe_bedrock_guardrail(ctx, region, physical_resource_id).await
+            }
             // Amazon Redshift's own read of the subnet group the stack created, by the name
             // it was created under.
             Self::RedshiftClusterSubnetGroup => {
@@ -2811,6 +2841,7 @@ impl Provisioner {
 // of an arm uses.
 mod tests;
 mod config_recording;
+mod bedrock_guardrails;
 mod data_and_storage;
 mod iam_identities;
 mod application_services;
@@ -2820,6 +2851,7 @@ pub(crate) use network_and_delivery::*;
 use platform_services::*;
 pub(crate) use application_services::*;
 use config_recording::*;
+use bedrock_guardrails::*;
 use iam_identities::*;
 use data_and_storage::*;
 

@@ -257,6 +257,13 @@ pub mod evaluation_datasets;
 /// storage) whose bucket a name is, while the records the decision guards live here.
 pub mod model_source;
 
+/// Whether the Amazon S3 destinations a model invocation logging configuration names are in
+/// the Region whose logging it configures. Beside this module for the reason
+/// [`model_source`] is: deciding it means asking another emulated service (object storage)
+/// where a bucket lives, while the configuration the decision guards lives here.
+pub mod logging_destination;
+pub use logging_destination::*;
+
 /// The foundation-model catalogue this emulator publishes, and the renderings the model
 /// and inference profile surfaces report it through. Here rather than in this file so one
 /// file holds one concern; every name it declares is re-exported below, so a handler still

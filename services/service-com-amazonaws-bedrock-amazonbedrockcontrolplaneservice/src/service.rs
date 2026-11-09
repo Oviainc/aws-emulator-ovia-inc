@@ -88,6 +88,23 @@
 //! instead of the whole ARN, the ARN built from that id — else that family's collection, so
 //! a policy scoped to one resource or to one family is evaluated against what the caller
 //! addressed and never against an ARN of another family the request happens to carry.
+//!
+//! # Naming the request a response answers
+//!
+//! Every response AWS sends names the request it answered, in the response header this
+//! protocol reports that id in (`x-amzn-RequestId`) — on a success exactly as on a
+//! failure. It is a property of the RESPONSE and not of any modelled shape: no output and
+//! no error shape of this model declares it, so no handler can set it, and the framework's
+//! `restJson1` renderers do not write it.
+//!
+//! The rule is not restated here: `service_common::query_error_envelope` owns it for every
+//! emulated service, and this file only chooses the report this protocol takes (the header
+//! alone — `restJson1` has no envelope element for the id) and wires it at the two layers
+//! every response of this service passes through: each operation is served through
+//! [`RequestIdReportingOperation::header`] around its [`Gated`] wrapper, and the three
+//! framework-level error renderers through [`RequestIdEnvelopeDefinition::header_only`],
+//! which covers a response no operation produced (a routing failure, a transport failure
+//! detected up front, a pre-dispatch authentication refusal).
 
 pub mod authorization;
 pub mod data_automation_tagging;
@@ -100,9 +117,12 @@ use std::sync::Arc;
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::constraints::{path, PatternTrait};
 use aws_smithy_schema_server::ProtocolError;
+use service_common::query_error_envelope::{
+    RequestIdEnvelopeDefinition, RequestIdReportingOperation,
+};
 use smithy_server_runtime::{
-    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
-    Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
+    http, BoxFuture, DeserializableStruct, ErasedOperation, ErasedServiceDefinition, Operation,
+    OperationContext, Refusal, Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
 };
 
 /// The error code this service answers a refused ARN with: the modelled
@@ -143,7 +163,9 @@ const CROSS_REGION_ARN_INPUTS: &[(&str, &str)] = &[
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, with its three framework-level error renderers wrapped so a
+    /// response no operation produced still names the request it answers.
+    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
     /// One [`Gated`] per modelled operation, keyed by the routing key the model
     /// names that operation by ([`Operation::NAME`], the same key the generated routing
     /// table uses). Built once here, never per request; each entry carries the operation's
@@ -153,8 +175,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The Bedrock Data Automation half of the three tagging paths this service binds:
     /// built once here over the same shared engine, and handed back from
     /// `override_operation` for a tagging request whose `resourceARN` names one of that
-    /// service's resources (see [`data_automation_tagging`]).
-    data_automation_tagging: data_automation_tagging::DataAutomationTagging<Eng>,
+    /// service's resources (see [`data_automation_tagging`]). Wrapped in the shared
+    /// request-id report, as every other operation of this service is.
+    data_automation_tagging:
+        RequestIdReportingOperation<data_automation_tagging::DataAutomationTagging<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -164,10 +188,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             gated: gated_table::<Eng>(&engine),
-            data_automation_tagging: data_automation_tagging::DataAutomationTagging::new(
-                Arc::clone(&engine),
+            data_automation_tagging: RequestIdReportingOperation::header(
+                data_automation_tagging::DataAutomationTagging::new(Arc::clone(&engine)),
             ),
-            entry: crate::ServiceDefinition::new(engine),
+            entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(engine)),
         }
     }
 }
@@ -176,7 +200,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
-        // The router reads it through this one accessor. Do not edit the entry.
+        // The router reads it through this one accessor. Do not edit the entry: what is
+        // handed back is the shared `RequestIdEnvelopeDefinition`, which reads identity,
+        // protocol and the routing table straight off that entry and adds the request-id
+        // header to the three error renderers (see the module docs).
         &self.entry
     }
 
@@ -229,7 +256,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // service's resources is served out of that model here, which is the first seam
         // handed the body the ARN lives in (see [`data_automation_tagging`]). Every other
         // request, tagging or not, is this service's own.
-        if self.data_automation_tagging.serves(key, req) {
+        if self.data_automation_tagging.inner().serves(key, req) {
             return Some(&self.data_automation_tagging);
         }
         self.gated.get(key).map(|wrapper| &**wrapper)
@@ -784,9 +811,10 @@ fn gated_table<Eng: Send + Sync + 'static>(
             $(
                 wrappers.insert(
                     <crate::ops::$module::$operation<Eng> as Operation>::NAME,
-                    Box::new(Gated::<crate::ops::$module::$operation<Eng>, Eng>::new(
-                        Arc::clone(engine),
-                    )) as Box<dyn ErasedOperation>,
+                    Box::new(RequestIdReportingOperation::header(Gated::<
+                        crate::ops::$module::$operation<Eng>,
+                        Eng,
+                    >::new(Arc::clone(engine)))) as Box<dyn ErasedOperation>,
                 );
             )+
         };

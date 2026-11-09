@@ -67,6 +67,34 @@ pub fn emulated_completion(
     max_output_tokens: u32,
     stop_sequences: &[String],
 ) -> EmulatedCompletion {
+    emulated_completion_with(
+        model_id,
+        messages,
+        input_tokens,
+        max_output_tokens,
+        stop_sequences,
+        &[],
+    )
+}
+
+/// The same completion with further clauses the CALLER computed appended, each admitted
+/// only while the generation budget still has room for it.
+///
+/// The clauses a caller adds are facts about the request that was served which the turn
+/// has to state for the exchange to mean anything — the result a `toolResult` handed back
+/// ([`super::tool_use_turn::tool_result_clauses`]), which is the whole point of a tool-use
+/// round trip. They are appended AFTER the notice that no model ran, so a completion can
+/// never be read as inference, and they are subject to the same budget rule as the clauses
+/// above: a clause that does not fit the ceiling the caller allowed is left out rather
+/// than squeezed in.
+pub fn emulated_completion_with(
+    model_id: &str,
+    messages: u32,
+    input_tokens: u32,
+    max_output_tokens: u32,
+    stop_sequences: &[String],
+    closing: &[String],
+) -> EmulatedCompletion {
     let halted = |text: String, truncated: bool| match halt_at_stop_sequence(&text, stop_sequences)
     {
         Some(text) => EmulatedCompletion {
@@ -85,7 +113,10 @@ pub fn emulated_completion(
     for clause in [
         format!(" {model_id} generated no text for this request."),
         format!(" The request carried {messages} message(s) and {input_tokens} input token(s)."),
-    ] {
+    ]
+    .iter()
+    .chain(closing.iter())
+    {
         let extended = format!("{text}{clause}");
         if count_text_tokens(&extended) > max_output_tokens {
             break;

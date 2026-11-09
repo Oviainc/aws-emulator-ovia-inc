@@ -39,6 +39,33 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## Naming the request a response answers
+//!
+//! Every response AWS sends names the request it answered, in the response header this
+//! protocol reports that id in (`x-amzn-RequestId`) — on a success exactly as on a
+//! failure, and on a streamed answer exactly as on a unary one. It is a property of the
+//! RESPONSE and not of any modelled shape: no output and no error shape of this model
+//! declares it, so no handler can set it, and the framework's `restJson1` renderers do
+//! not write it. A client reads it as its SDK's response metadata, which is how a call is
+//! correlated with the invocation-logging record written for it.
+//!
+//! The rule is not restated here: `service_common::query_error_envelope` owns it for every
+//! emulated service, and this file only chooses the report this protocol takes (the header
+//! alone — `restJson1` has no envelope element for the id) and wires it at the layers every
+//! response of this service passes through:
+//!
+//! * [`RequestIdHeaderOperation`] for every operation the generated routing table serves,
+//!   and [`RequestIdReportingOperation::header`] around each of the two event-stream
+//!   operations this file routes itself — between them, everything an operation answers: a
+//!   success, a modelled error, and a constraint refusal raised while it was being served;
+//! * [`RequestIdEnvelopeDefinition::header_only`], the definition wrapper
+//!   [`Service::definition`] hands back, covers a response NO operation produced: a routing
+//!   failure, a transport failure detected up front, and a pre-dispatch authentication
+//!   refusal.
+//!
+//! Nothing else about a response changes: the status, the other headers and every byte of
+//! the body stay as the renderer wrote them.
 
 use crate::ops::converse_stream::ConverseStream;
 use crate::ops::invoke_model_with_response_stream::InvokeModelWithResponseStream;
@@ -47,10 +74,11 @@ use aws_smithy_schema_server::{Violation, ViolationKind};
 use service_common::event_stream::EventStreamRoute;
 // `request_path`: the one reader of a request URI's path, shared rather than inlined
 // again here.
-use service_common::request_path;
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+use service_common::query_error_envelope::{
+    RequestIdEnvelopeDefinition, RequestIdHeaderOperation, RequestIdReportingOperation,
 };
+use service_common::request_path;
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock};
 
@@ -215,10 +243,16 @@ fn resource_reference_refusal(refusal: &Refusal) -> Option<Refused> {
 /// [`EventStreamRoute`] and routed by [`EmulatedService::override_operation`] —
 /// which the router consults FIRST, before the generated table.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
-    converse_stream: EventStreamRoute<ConverseStream<Eng>>,
+    /// The generated entry, with its three framework-level error renderers wrapped so a
+    /// response no operation produced still names the request it answers.
+    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
+    converse_stream: RequestIdReportingOperation<EventStreamRoute<ConverseStream<Eng>>>,
     invoke_model_with_response_stream:
-        EventStreamRoute<InvokeModelWithResponseStream<Eng>>,
+        RequestIdReportingOperation<EventStreamRoute<InvokeModelWithResponseStream<Eng>>>,
+    /// Serves every operation the generated routing table names, so each response an
+    /// operation produced names the request it answers. Held, not built per request:
+    /// `override_operation` hands back a borrow of it.
+    request_id: RequestIdHeaderOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -227,11 +261,16 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
-            converse_stream: EventStreamRoute(ConverseStream::new(Arc::clone(&engine))),
-            invoke_model_with_response_stream: EventStreamRoute(
-                InvokeModelWithResponseStream::new(engine),
+            entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(
+                Arc::clone(&engine),
+            )),
+            converse_stream: RequestIdReportingOperation::header(EventStreamRoute(
+                ConverseStream::new(Arc::clone(&engine)),
+            )),
+            invoke_model_with_response_stream: RequestIdReportingOperation::header(
+                EventStreamRoute(InvokeModelWithResponseStream::new(engine)),
             ),
+            request_id: RequestIdHeaderOperation,
         }
     }
 }
@@ -240,7 +279,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
-        // The router reads it through this one accessor. Do not edit the entry.
+        // The router reads it through this one accessor. Do not edit the entry: what is
+        // handed back is the shared `RequestIdEnvelopeDefinition`, which reads identity,
+        // protocol and the routing table straight off that entry and adds the request-id
+        // header to the three error renderers (see the module docs).
         &self.entry
     }
 
@@ -280,14 +322,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // which this slice does not implement — still resolves through the
         // generated table and keeps answering the framework's "modeled but not
         // served" response rather than being half-served here.
-        if req.method() != http::Method::POST.as_str() {
-            return None;
+        //
+        // Each of the two is served through the shared request-id report, and every other
+        // request the generated table answers goes through `RequestIdHeaderOperation` —
+        // the one place every operation's response passes, so no operation can answer
+        // without naming the request it answered. A request the table does not answer
+        // declines here exactly as it would there, leaving the router's routing-error path
+        // (which names the request itself, through the definition wrapper) unchanged.
+        if req.method() == http::Method::POST.as_str() {
+            match inference_route(request_path(req.uri())) {
+                Some("converse-stream") => return Some(&self.converse_stream),
+                Some("invoke-with-response-stream") => {
+                    return Some(&self.invoke_model_with_response_stream)
+                }
+                _ => {}
+            }
         }
-        match inference_route(request_path(req.uri()))? {
-            "converse-stream" => Some(&self.converse_stream),
-            "invoke-with-response-stream" => Some(&self.invoke_model_with_response_stream),
-            _ => None,
-        }
+        self.entry
+            .routes(req)
+            .then_some(&self.request_id as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
