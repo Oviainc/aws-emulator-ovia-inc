@@ -303,16 +303,12 @@ impl ABTestRecord {
 
 /// Mint an `abTestId` for a test of `name` created at `created_at`.
 ///
-/// `ABTestId`'s pattern is `^[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`: the name the
-/// request asked for (itself `^[a-zA-Z][a-zA-Z0-9_]{0,47}$`, so every character of it is
-/// one the id admits), then a ten-character discriminator — the low bits of the creation
-/// instant in epoch milliseconds and of the engine-wide sequence, five lowercase hex
-/// digits each, which keeps two tests created in one millisecond apart.
+/// `ABTestId`'s pattern is `^[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`, which is the
+/// shared form [`super::mint_named_resource_id`] builds: the name the request asked for,
+/// then a ten-character discriminator that keeps two tests created in one millisecond
+/// apart.
 pub fn mint_ab_test_id(name: &str, created_at: SystemTime, seq: u64) -> String {
-    let millis = created_at
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |since_epoch| since_epoch.as_millis());
-    format!("{name}-{:05x}{:05x}", millis & 0xf_ffff, seq & 0xf_ffff)
+    super::mint_named_resource_id(name, created_at, seq)
 }
 
 /// The ARN an A/B test is addressed by in `region`: `ABTestArn`'s `ab-test/<abTestId>`

@@ -90,6 +90,11 @@ use std::time::{Duration, SystemTime};
 mod ab_tests;
 pub use ab_tests::*;
 
+/// The batch-evaluation plane: [`BatchEvaluationRecord`], the job records
+/// `StartBatchEvaluation` writes and `GetBatchEvaluation` reports back.
+mod batch_evaluations;
+pub use batch_evaluations::*;
+
 /// The browser tools plane: [`BrowserStore`] and [`BrowserSessionRecord`], plus the
 /// lookups and the write path the browser session operations go through.
 mod browser;
@@ -340,6 +345,14 @@ pub struct ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     /// token answers with that test instead of creating a second one. Bounded by
     /// [`MAX_AB_TEST_IDEMPOTENCY_RECORDS`].
     pub ab_test_idempotency: BTreeMap<String, String>,
+    /// The batch evaluation jobs `StartBatchEvaluation` started, keyed by the
+    /// `batchEvaluationId` this emulator minted for each one. Bounded by
+    /// [`MAX_BATCH_EVALUATIONS`]; see [`batch_evaluations`].
+    pub batch_evaluations: BTreeMap<String, BatchEvaluationRecord>,
+    /// The `batchEvaluationId` each `StartBatchEvaluation` `clientToken` already
+    /// started, so a replayed token answers with that job instead of starting a second
+    /// one. Bounded by [`MAX_BATCH_EVALUATION_IDEMPOTENCY_RECORDS`].
+    pub batch_evaluation_idempotency: BTreeMap<String, String>,
 }
 
 impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
@@ -1856,6 +1869,8 @@ pub enum NotFoundResource {
     /// A browser, addressed by `browserIdentifier`: the tool the service provides or a
     /// browser the control plane created.
     Browser,
+    /// A batch evaluation job, addressed by `batchEvaluationId`.
+    BatchEvaluation,
 }
 
 impl NotFoundResource {
@@ -1869,6 +1884,7 @@ impl NotFoundResource {
             Self::EventRead | Self::EventDelete => "Event",
             Self::Evaluator => "Evaluator",
             Self::Browser => "Browser",
+            Self::BatchEvaluation => "Batch Evaluation",
         }
     }
 
@@ -1934,6 +1950,23 @@ pub fn mint_event_id(seq: u64) -> String {
 /// `SessionId`'s pattern is `^[a-zA-Z0-9][a-zA-Z0-9-_]*$` with length 1..100.
 pub fn mint_session_id(seq: u64) -> String {
     format!("session-{seq:016x}")
+}
+
+/// Mint an id for a resource NAMED by the request that created it, in the form every
+/// shape of this service whose pattern is `^[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`
+/// publishes (`ABTestId`, `BatchEvaluationId`): the name the request asked for (itself
+/// `^[a-zA-Z][a-zA-Z0-9_]{0,47}$`, so every character of it is one the id admits), then a
+/// ten-character discriminator — the low bits of the creation instant in epoch
+/// milliseconds and of the engine-wide sequence, five lowercase hex digits each, which
+/// keeps two resources created in one millisecond apart.
+///
+/// The ONE home of that id form, so two planes that publish the identical pattern cannot
+/// spell it differently ([`mint_ab_test_id`], [`mint_batch_evaluation_id`]).
+pub fn mint_named_resource_id(name: &str, created_at: SystemTime, seq: u64) -> String {
+    let millis = created_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_millis());
+    format!("{name}-{:05x}{:05x}", millis & 0xf_ffff, seq & 0xf_ffff)
 }
 
 /// Mint a `memoryRecordId` for a record created at `created_at`.

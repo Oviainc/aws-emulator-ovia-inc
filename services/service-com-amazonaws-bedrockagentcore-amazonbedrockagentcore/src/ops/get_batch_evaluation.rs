@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBatchEvaluation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBatchEvaluation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one batch evaluation job back from [`crate::state`]: the identity
+//! `StartBatchEvaluation` minted for it, the configuration it was started with, and the
+//! `BatchEvaluationStatus` the clock implies for a job started at that instant
+//! ([`crate::state::BatchEvaluationRecord::status_as_of`]). A `batchEvaluationId` no job
+//! is held for is refused 404 `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBatchEvaluation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is a REPORTING operation (`@readonly`): it writes nothing, and the lifecycle it
+//! reports follows from the start instant alone, so a job reaches the same status at the
+//! same moment whether or not anybody reads it.
+//!
+//! No judge model runs in this emulator — the on-demand `Evaluate` surface says the same
+//! of itself — so a job carries no rating: `evaluationResults`, `insightResults`,
+//! `failureAnalysisResult`, `userIntentResult` and `executionSummaryResult` are left out
+//! rather than filled with numbers nothing computed, and `errorDetails` is left out
+//! because nothing failed.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +208,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBatchEvaluation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBatchEvaluationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBatchEvaluation"))
+        // Request metadata is not read by this operation: the `batchEvaluationId` is
+        // bound into `input` by the centralized request walk, and the ARN this reports is
+        // the one minted when the job was started.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetBatchEvaluationErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the shared engine does not carry this service's state".to_string()),
+            })
+        })?;
+
+        // One reading of the clock for the whole response, so the status and the instant
+        // of the transition it reports cannot come from two different moments.
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        let job = store
+            .resolve_batch_evaluation(&input.batch_evaluation_id)
+            .map_err(|message| {
+                GetBatchEvaluationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                )
+            })?;
+
+        Ok(GetBatchEvaluationOutput {
+            batch_evaluation_id: job.batch_evaluation_id.clone(),
+            batch_evaluation_arn: job.batch_evaluation_arn.clone(),
+            batch_evaluation_name: job.name.clone(),
+            status: job.status_as_of(now).to_string(),
+            created_at: ::aws_smithy_types::DateTime::from(job.created_at),
+            evaluators: job.evaluators.clone(),
+            insights: job.insights.clone(),
+            data_source_config: Some(job.data_source_config.clone()),
+            output_config: job.output_config.clone(),
+            // No judge model and no insight analysis run here, so this job has produced
+            // no rating, no cluster and no failure to report.
+            evaluation_results: None,
+            insight_results: None,
+            failure_analysis_result: None,
+            user_intent_result: None,
+            execution_summary_result: None,
+            error_details: None,
+            description: job.description.clone(),
+            updated_at: Some(::aws_smithy_types::DateTime::from(job.updated_at_as_of(now))),
+            kms_key_arn: job.kms_key_arn.clone(),
+        })
     }
 }

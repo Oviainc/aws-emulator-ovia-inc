@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartBatchEvaluation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartBatchEvaluation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a batch evaluation job in [`crate::state`]: this emulator mints the
+//! `batchEvaluationId` and the ARN it is addressed by, stores the data source, the
+//! evaluators, the insights, the per-session evaluation metadata, the output
+//! configuration, the KMS key, the description and the tags the request asked for, and
+//! reports that stored record back. `GetBatchEvaluation` reports what this call wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartBatchEvaluation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The response is 202 Accepted, so the job is `PENDING` and runs through the rest of
+//! its lifecycle on the clock ([`crate::state::BatchEvaluationRecord::status_as_of`]) —
+//! nothing is slept for here.
+//!
+//! `clientToken` is an `@idempotencyToken`, so a replayed token answers with the job it
+//! already started rather than starting a second one. Two starts that carry no token, or
+//! different ones, are two jobs even when they name the same `batchEvaluationName`: each
+//! gets its own `batchEvaluationId`.
 //!
 //! ## Shape of an operation
 //!
@@ -174,6 +179,28 @@ impl From<StartBatchEvaluationErrorModeled> for StartBatchEvaluationError {
     }
 }
 
+/// A stored batch evaluation job as this operation reports it, as of `now`: the identity
+/// this call minted, the configuration it was started with and the status the clock
+/// implies for a job started at that instant.
+fn started_output(
+    record: &crate::state::BatchEvaluationRecord,
+    now: ::std::time::SystemTime,
+) -> StartBatchEvaluationOutput {
+    StartBatchEvaluationOutput {
+        batch_evaluation_id: record.batch_evaluation_id.clone(),
+        batch_evaluation_arn: record.batch_evaluation_arn.clone(),
+        batch_evaluation_name: record.name.clone(),
+        evaluators: record.evaluators.clone(),
+        insights: record.insights.clone(),
+        status: record.status_as_of(now).to_string(),
+        created_at: ::aws_smithy_types::DateTime::from(record.created_at),
+        output_config: record.output_config.clone(),
+        tags: record.tags.clone(),
+        kms_key_arn: record.kms_key_arn.clone(),
+        description: record.description.clone(),
+    }
+}
+
 /// The `StartBatchEvaluation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -210,18 +237,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartBatchEvaluation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartBatchEvaluationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartBatchEvaluation"))
+        // The region segment of the ARN this call mints is the region the request was
+        // signed for, read off its SigV4 credential scope.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartBatchEvaluationErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the shared engine does not carry this service's state".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // `clientToken` is an `@idempotencyToken` whose documented effect is that a token
+        // matching an earlier request is ignored rather than refused: answer with the job
+        // that token already started, so no second job is started.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(started) = store.batch_evaluation_for_token(token) {
+                return Ok(started_output(started, ::std::time::SystemTime::now()));
+            }
+        }
+
+        let seq = store.next_seq();
+        let created_at = ::std::time::SystemTime::now();
+        let record = crate::state::BatchEvaluationRecord::started(
+            seq,
+            &region,
+            input.batch_evaluation_name.clone(),
+            input.description.clone(),
+            input.data_source_config.clone(),
+            input.evaluators.clone(),
+            input.insights.clone(),
+            input.evaluation_metadata.clone(),
+            input.output_config.clone(),
+            input.tags.clone(),
+            input.kms_key_arn.clone(),
+            created_at,
+        );
+        // Built from what is about to be stored, so the response and the store cannot
+        // disagree.
+        let output = started_output(&record, created_at);
+        store.insert_batch_evaluation(record, input.client_token);
+
+        Ok(output)
     }
 }
