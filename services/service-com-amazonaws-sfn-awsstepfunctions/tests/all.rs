@@ -35,6 +35,8 @@ mod arn_validation;
 mod backup_task_integration;
 #[path = "all/callback_service_integration.rs"]
 mod callback_service_integration;
+#[path = "all/caller_identity_authorization.rs"]
+mod caller_identity_authorization;
 #[path = "all/choice_and_wait_evaluation.rs"]
 mod choice_and_wait_evaluation;
 #[path = "all/client_error_wrappers.rs"]

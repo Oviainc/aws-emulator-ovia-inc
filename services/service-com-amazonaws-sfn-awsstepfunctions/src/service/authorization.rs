@@ -1,7 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Whether IAM lets the caller HAND THIS SERVICE A ROLE — the `iam:PassRole`
-//! authorization step a control-plane operation takes before it writes anything.
+//! Whether IAM lets the CALLER make the request at all: the identity-based
+//! authorization step an operation takes before it writes anything.
+//!
+//! Two questions are asked here, and both are decided from the documents in force on
+//! the principal the request signed as:
+//!
+//! * may the caller HAND THIS SERVICE A ROLE (`iam:PassRole`,
+//!   [`pass_role_denial`]) — the step a control-plane request that names a `roleArn`
+//!   takes;
+//! * may the caller PERFORM AN ACTION OF THIS SERVICE on the resource its request
+//!   names ([`caller_action_denial`]) — the step AWS's own frontend takes for every
+//!   call, which is what makes an operation of this service refusable by a
+//!   least-privilege policy: starting an execution is `states:StartExecution` on the
+//!   state machine the request names, so a caller whose identity-based policies do
+//!   not allow that action is refused with `AccessDeniedException` (HTTP 400) and
+//!   nothing is started. Both read the same documents through the same evaluator, so
+//!   the two cannot decide one principal differently.
 //!
 //! A state machine's `roleArn` is "the Amazon Resource Name (ARN) of the IAM role to
 //! use for this state machine" (`CreateStateMachine$roleArn`): the role every
@@ -42,7 +57,10 @@
 //! Nothing is refused on evidence this emulator does not have:
 //!
 //! * **the account's own published credential**, which no IAM record holds policies
-//!   for — the position AWS account root credentials are in — may pass any role;
+//!   for — the position AWS account root credentials are in — may pass any role and
+//!   perform any action of this service, which is also what keeps an emulated service
+//!   calling this one through the in-process callback from being refused for want of a
+//!   grant;
 //! * **a principal carrying an attachment whose document this account does not hold**
 //!   (an AWS-managed policy belongs to AWS, so the store holds no document for it) is
 //!   not refused on a grant that cannot be read, though an explicit `Deny` in a
@@ -50,6 +68,10 @@
 //!   DOES hold still caps it;
 //! * **an engine carrying no STS or IAM store**, where no session and no policy can
 //!   exist.
+//!
+//! Whether the RESOURCE a request names exists is deliberately not part of either
+//! question: AWS authorizes a call before it resolves what the call is about, so the
+//! decision is taken from the caller's documents and the ARN the request carried.
 //!
 //! Whether the role the request names EXISTS is deliberately not part of this: the
 //! control plane does not resolve a state machine's role, which is the deploy-time /
@@ -69,6 +91,19 @@ use ::service_common::iam_authorization::{self as iam, Decision};
 /// The IAM action a request that hands this service a role performs: "To pass a role
 /// to a service, a user must have the `iam:PassRole` permission".
 pub const PASS_ROLE_ACTION: &str = "iam:PassRole";
+
+/// The namespace every IAM action of THIS service is written under: the model's own
+/// `awsService.arnNamespace` (`smithy_query(query="service_info")`), which is also the
+/// prefix a policy names one of its calls by.
+const ACTION_NAMESPACE: &str = "states";
+
+/// The IAM action the operation named `operation` performs: `<namespace>:<Operation>`,
+/// the one rule AWS names an action of this service by — so an operation passes its
+/// own modelled name and no call site spells an action string of its own.
+#[must_use]
+pub fn operation_action(operation: &str) -> String {
+    format!("{ACTION_NAMESPACE}:{operation}")
+}
 
 /// `iam:PassedToService` — IAM's condition key for the SERVICE a role is being passed
 /// to, which AWS guidance tells a caller to scope every `iam:PassRole` grant with, and
@@ -103,16 +138,53 @@ pub fn pass_role_denial<Eng: Send + Sync + 'static>(
 ) -> Option<String> {
     let caller = caller(engine, ctx);
     let context = pass_context();
-    let request =
-        iam::Request::new(PASS_ROLE_ACTION, role_arn, &caller.principals).with_context(&context);
+    denial(&caller, PASS_ROLE_ACTION, role_arn, &context)
+}
+
+/// Why this caller may not perform `action` on `resource`, or `None` when it may —
+/// including every caller this gate does not bound (see the module docs).
+///
+/// `action` is the IAM action the operation performs ([`operation_action`]) and
+/// `resource` the ARN the REQUEST carried for what it addresses, so the decision does
+/// not depend on whether that resource exists: AWS authorizes a call before it resolves
+/// what the call is about, which is also what keeps a refused call from telling an
+/// unauthorized caller whether a resource is there.
+///
+/// Call it BEFORE this service's store is read or written: a refused call must leave
+/// nothing behind. Nothing is cached, so a policy `iam:PutRolePolicy` wrote takes effect
+/// on the next request and one it replaced stops granting on the next request.
+pub fn caller_action_denial<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    resource: &str,
+) -> Option<String> {
+    let caller = caller(engine, ctx);
+    // No condition context: a call of this service carries no key a statement of its
+    // own could be scoped by here, and a clause over a key the request does not carry
+    // is left undecided by the shared evaluator rather than guessed at.
+    denial(&caller, action, resource, &[])
+}
+
+/// Why `caller` may not perform `action` on `resource` under the documents in force on
+/// it, or `None` when it may — IAM's own order, read once for every question this
+/// module asks, so the two gates cannot decide one principal differently.
+fn denial(
+    caller: &Caller,
+    action: &str,
+    resource: &str,
+    context: &[(String, String)],
+) -> Option<String> {
+    let request = iam::Request::new(action, resource, &caller.principals).with_context(context);
     let identity_said = iam::identity_decision(&caller.documents, &request);
     // The decision is taken FIRST, so an explicit `Deny` in a document that CAN be
-    // read refuses the pass whatever else the principal carries — including a grant
+    // read refuses the call whatever else the principal carries — including a grant
     // this emulator cannot read, which only lifts the DEFAULT deny.
     if identity_said == Decision::Denied {
         return Some(not_authorized(
             &caller.arn,
-            role_arn,
+            action,
+            resource,
             "with an explicit deny in an identity-based policy",
         ));
     }
@@ -121,8 +193,9 @@ pub fn pass_role_denial<Eng: Send + Sync + 'static>(
     if !granted {
         return Some(not_authorized(
             &caller.arn,
-            role_arn,
-            &format!("because no identity-based policy allows the {PASS_ROLE_ACTION} action"),
+            action,
+            resource,
+            &format!("because no identity-based policy allows the {action} action"),
         ));
     }
     // "A permissions boundary sets the maximum permissions that an identity-based
@@ -135,10 +208,10 @@ pub fn pass_role_denial<Eng: Send + Sync + 'static>(
         // it; a boundary that merely states nothing withheld the grant.
         Decision::Denied => "with an explicit deny in a permissions boundary".to_string(),
         Decision::NotStated => {
-            format!("because no permissions boundary allows the {PASS_ROLE_ACTION} action")
+            format!("because no permissions boundary allows the {action} action")
         }
     };
-    Some(not_authorized(&caller.arn, role_arn, &reason))
+    Some(not_authorized(&caller.arn, action, resource, &reason))
 }
 
 /// The condition context this pass carries: the SERVICE the role is being passed to
@@ -157,11 +230,11 @@ fn pass_context() -> [(String, String); 1] {
 /// The sentence IAM states an authorization failure with: who was refused, which
 /// action, on which resource, and which of IAM's two rules refused it. Every value in
 /// it comes from the request and from the stored policies — the principal from the
-/// credential the request presented, the resource from the role ARN it carried.
-fn not_authorized(principal: &str, role_arn: &str, reason: &str) -> String {
+/// credential the request presented, the resource from the ARN the request carried.
+fn not_authorized(principal: &str, action: &str, resource: &str, reason: &str) -> String {
     format!(
-        "User: {principal} is not authorized to perform: {PASS_ROLE_ACTION} on resource: \
-         {role_arn} {reason}"
+        "User: {principal} is not authorized to perform: {action} on resource: \
+         {resource} {reason}"
     )
 }
 
@@ -320,7 +393,7 @@ mod tests {
                 "with an explicit deny in an identity-based policy".to_string(),
             ),
         ] {
-            let stated = not_authorized(principal, role, &reason);
+            let stated = not_authorized(principal, PASS_ROLE_ACTION, role, &reason);
             let expected = format!(
                 "User: {principal} is not authorized to perform: {PASS_ROLE_ACTION} on resource: \
                  {role} {reason}"
@@ -330,6 +403,55 @@ mod tests {
                 "case {case:?}: expected IAM's wording {expected:?}, got {stated:?}"
             );
         }
+    }
+
+    /// RULE: an action of this service is its operation's own name under the service's
+    /// action namespace, so a policy naming that action covers the operation and a
+    /// policy naming another one does not.
+    ///
+    /// The rows are operations of this service the gate is taken for, plus one the
+    /// issue this rule was written for did not cite.
+    #[test]
+    fn an_action_of_this_service_is_its_operations_name_under_the_namespace() {
+        for (case, operation, expected) in [
+            ("an asynchronous start", "StartExecution", "states:StartExecution"),
+            (
+                "a synchronous start",
+                "StartSyncExecution",
+                "states:StartSyncExecution",
+            ),
+            (
+                "an operation the issue did not cite",
+                "DescribeExecution",
+                "states:DescribeExecution",
+            ),
+        ] {
+            let stated = operation_action(operation);
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: expected the action {expected:?}, got {stated:?}"
+            );
+        }
+    }
+
+    /// RULE: the refusal of an action of this service names the principal, the action
+    /// and the resource the REQUEST carried, in IAM's own wording — the same sentence
+    /// whichever action is refused.
+    #[test]
+    fn the_refusal_names_the_principal_the_action_and_the_resource() {
+        let principal = "arn:aws:sts::000000000000:assumed-role/Runner/one-session";
+        let machine = "arn:aws:states:us-east-1:000000000000:stateMachine:hello";
+        let action = operation_action("StartExecution");
+        let reason = format!("because no identity-based policy allows the {action} action");
+        let stated = not_authorized(principal, &action, machine, &reason);
+        let expected = format!(
+            "User: {principal} is not authorized to perform: {action} on resource: {machine} \
+             {reason}"
+        );
+        assert_eq!(
+            stated, expected,
+            "case a refused start: expected IAM's wording {expected:?}, got {stated:?}"
+        );
     }
 
     /// RULE: the decision is the shared evaluation of the caller's documents, so a
