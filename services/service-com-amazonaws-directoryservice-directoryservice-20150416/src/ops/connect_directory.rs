@@ -340,6 +340,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             log_subscription: None,
             conditional_forwarders: ::std::collections::BTreeMap::new(),
             computers: ::std::collections::BTreeMap::new(),
+            // No update activity until an update of the directory's setup is asked for;
+            // a fresh directory has had none.
+            update_activities: Vec::new(),
             next_computer_rid: crate::state::FIRST_COMPUTER_RID,
             // The accounts an AD Connector serves live in the self-managed directory it
             // connects to, so it holds none of its own.

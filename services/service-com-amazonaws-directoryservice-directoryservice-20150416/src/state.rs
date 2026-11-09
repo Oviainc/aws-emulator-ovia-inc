@@ -66,13 +66,19 @@
 //! field here: the model marks it `@sensitive`, no operation reports it back, and state
 //! this emulator does not need is state it must not hold.
 
+/// The sentences this service words a refusal with, kept together so two operations
+/// cannot word one failure two ways. Re-exported below, so every one of them is still
+/// reached as `crate::state::<name>`.
+mod diagnostics;
 pub mod directory_network;
 pub mod directory_servers;
+pub mod directory_updates;
 pub mod ec2_subnets;
 pub mod security_log;
 pub mod subnet_zones;
-mod diagnostics;
+
 pub use diagnostics::*;
+pub use directory_updates::UpdateActivityRecord;
 
 pub use directory_network::{server_address, SubnetNetwork};
 pub use directory_servers::{os_version_of, MICROSOFT_AD_OS_VERSION};
@@ -90,7 +96,7 @@ use crate::ops::types::{
     DirectoryDescription, DirectoryLimits, DirectoryVpcSettings,
     DirectoryVpcSettingsDescription, DomainController, EventTopic, IpRouteInfo, LDAPSSettingInfo,
     LogSubscription, RegionDescription, SchemaExtensionInfo, SettingEntry, SharedDirectory,
-    Snapshot, SnapshotLimits, Tag, Trust,
+    Snapshot, SnapshotLimits, Tag, Trust, UpdateInfoEntry, UpdateValue,
 };
 
 /// How long a status transition a create owes takes to fall due.
@@ -2215,6 +2221,11 @@ pub struct Directory {
     /// `UpdateSettings` is what changes one. A directory type that has no settings
     /// ([`SETTINGS_DIRECTORY_TYPES`]) carries none.
     pub settings: BTreeMap<String, DirectorySettingRecord>,
+    /// The updates made to this directory's setup, oldest first:
+    /// `DescribeUpdateDirectory` reports the ones of the `UpdateType` it is asked about
+    /// ([`Directory::update_activities_of`]). The activities live on the directory record,
+    /// so deleting the directory takes its history with it.
+    pub update_activities: Vec<UpdateActivityRecord>,
     /// The next RID this directory's domain hands to an account created in it, starting
     /// at [`FIRST_COMPUTER_RID`]. A pool rather than `computers.len()`: a RID a domain has
     /// handed out is never handed out again.
@@ -4269,6 +4280,7 @@ fn refusal_restating_its_request_id<E: ModeledFailure>(diagnostic: &str) -> E {
     let stated = with_request_id(diagnostic, &request_id);
     E::from_parts(with_request_id(&stated, &request_id), request_id)
 }
+
 
 /// What a handler answers when [`service_state`] cannot reach this service's store.
 ///

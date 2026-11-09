@@ -160,15 +160,14 @@ fn stated_from_request<O: Operation>(
         return None;
     }
     let offending = offending_entries(&violations);
-    let restated: Vec<Violation> = violations
-        .iter()
-        .map(super::enum_value_set_in_the_services_own_order)
-        .collect();
+    let restated: Vec<Violation> = violations.iter().map(super::stated_violation).collect();
     let stated = aws_validation_refusal_over_elements_stating(
         &Refusal::Invalid(restated),
-        // A `@pattern` is quoted as the model writes it, which is what the framework's own
-        // clause does: this module changes which MEMBER a clause is stated at and nothing
-        // about how any requirement reads.
+        // The expression a clause quotes arrives already quoted the way this service quotes
+        // one (`super::stated_pattern` restated it above, with the anchor pair the model
+        // wraps it in dropped), so the rendering here leaves it as it is: this module
+        // changes which MEMBER a clause is stated at and nothing about how any requirement
+        // reads.
         |pattern| pattern.to_string(),
         // The value a clause stated at a list member quotes: the entries of that member the
         // element constraint refused, in the order the request sent them.
@@ -246,6 +245,13 @@ fn offending_entries(violations: &[Violation]) -> HashMap<String, String> {
 /// since that is the schema codegen attached its element constraints to. `None` where no
 /// handed-over shape declares a constraint on that member's elements, which leaves the clause
 /// the framework's own.
+///
+/// A `@pattern` inside the NESTED set keeps the expression the model declares, anchors and
+/// all: the recorded element clause this module was built on (the one-entry `DnsIpAddrs`
+/// refusal the module header quotes, pinned row by row in
+/// `tests/all/refusal_classification_rules.rs`) states it that way, while the per-member
+/// clause drops the pair ([`super::stated_pattern`]). The two renderings are what the two
+/// recordings show, so neither is derived from the other.
 fn element_set_in_the_services_own_order(
     input_schema: &'static Schema,
     collection: &str,

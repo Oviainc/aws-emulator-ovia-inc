@@ -86,6 +86,7 @@ fn listings(directory_id: &str) -> Vec<Listing> {
     let extensions = id.clone();
     let tags = id.clone();
     let client_auth = id.clone();
+    let updates = id.clone();
     vec![
         Listing {
             operation: "DescribeDirectories",
@@ -155,6 +156,13 @@ fn listings(directory_id: &str) -> Vec<Listing> {
             error: "InvalidParameterException",
             body: Box::new(move |token| {
                 json!({ "DirectoryId": &client_auth, "Type": "SmartCard", "NextToken": token })
+            }),
+        },
+        Listing {
+            operation: "DescribeUpdateDirectory",
+            error: "InvalidNextTokenException",
+            body: Box::new(move |token| {
+                json!({ "DirectoryId": &updates, "UpdateType": "OS", "NextToken": token })
             }),
         },
         Listing {

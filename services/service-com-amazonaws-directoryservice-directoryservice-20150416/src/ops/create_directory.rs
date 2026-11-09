@@ -338,6 +338,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // fresh directory holds none, and its RID pool starts where Active Directory
             // starts handing them out.
             computers: ::std::collections::BTreeMap::new(),
+            // No update activity until an update of the directory's setup is asked for;
+            // a fresh directory has had none.
+            update_activities: Vec::new(),
             next_computer_rid: crate::state::FIRST_COMPUTER_RID,
             // The create makes the directory's administrator account, the one its
             // `Password` is the password of; `ResetUserPassword` is what resets it.

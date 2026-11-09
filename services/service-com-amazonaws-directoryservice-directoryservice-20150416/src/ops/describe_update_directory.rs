@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeUpdateDirectory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeUpdateDirectory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeUpdateDirectory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the updates made to a stored directory's setup, for the one `UpdateType` the
+//! request asks about, from the activities held on that directory's record in
+//! [`crate::state`].
+//!
+//! A REPORT about a directory, so the directory is RESOLVED: an id satisfying the modelled
+//! `DirectoryId` pattern that names no stored directory is answered with the modelled
+//! `DirectoryDoesNotExistException`, carrying this service's shared sentence for a
+//! directory nothing is stored under ([`crate::state::no_such_directory`]) — the same
+//! answer `DescribeLDAPSSettings` and `DescribeClientAuthenticationSettings` give for the
+//! same id, and the answer a caller polling an update of a directory that is gone branches
+//! on. Resolution comes AFTER the boundary's own constraint walk, so an `UpdateType`
+//! outside the modelled value set is still refused before the store is reached at all.
+//!
+//! Nothing is reported that nothing recorded: the activities listed are the ones an update
+//! of this directory's setup recorded, so a directory whose setup nobody has updated
+//! reports an empty list rather than an invented update — the same way
+//! `DescribeClientAuthenticationSettings` reports a directory nothing has configured. See
+//! [`crate::state::directory_updates`] for what an activity holds.
+//!
+//! The reads are a page at a time, ordered oldest activity first, with the opaque
+//! `NextToken` every paginated operation of this service issues: it carries the filter its
+//! page was issued under, so a token replayed under another filter — or one another listing
+//! issued — is refused with the modelled `InvalidNextTokenException` rather than misread.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +96,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::CURSOR_SEPARATOR;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,18 +171,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeUpdateDirectory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeUpdateDirectoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeUpdateDirectory"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Authorization comes FIRST, on the ARN of the directory the request NAMED, so a
+        // caller IAM does not permit is refused before the store is reached and learns
+        // nothing about whether that directory exists.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::directory_arn(ctx, &input.directory_id),
+        )
+        .map_err(DescribeUpdateDirectoryErrorModeled::AccessDeniedException)?;
+
+        // The cursor a previous page handed back: the rank of the activity this page
+        // resumes after, together with the filter it was issued under — the `DirectoryId`,
+        // the `UpdateType` and the `RegionName` the request narrowed to. A later page asked
+        // for under a different filter decodes to a different string and is refused.
+        let filter = crate::state::cursor_filter(&[
+            &input.directory_id,
+            &input.update_type,
+            input.region_name.as_deref().unwrap_or_default(),
+        ]);
+        let after_rank = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(resume_rank(token, &filter).ok_or_else(|| {
+                DescribeUpdateDirectoryErrorModeled::InvalidNextTokenException(
+                    crate::state::invalid_next_token(),
+                )
+            })?),
+        };
+        // This operation declares no `Limit`, so every page is this listing's own size.
+        let page_size = crate::state::page_size(None);
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        let directory = store.directories.get(&input.directory_id).ok_or_else(|| {
+            DescribeUpdateDirectoryErrorModeled::DirectoryDoesNotExistException(
+                crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
+            )
+        })?;
+
+        // Only the activities of the requested `UpdateType` — narrowed further to one
+        // Region when the request named one — and only the ones after the rank the cursor
+        // resumes at.
+        let mut page: Vec<(usize, UpdateInfoEntry)> = directory
+            .update_activities_of(&input.update_type, input.region_name.as_deref())
+            .into_iter()
+            .filter(|(rank, _)| after_rank.is_none_or(|after| *rank > after))
+            .map(|(rank, activity)| (rank, activity.to_update_info_entry()))
+            .collect();
+        drop(store);
+
+        let truncated = page.len() > page_size;
+        page.truncate(page_size);
+        let page_ended_after = page.last().map(|(rank, _)| *rank);
+
+        Ok(DescribeUpdateDirectoryOutput {
+            update_activities: Some(page.into_iter().map(|(_, entry)| entry).collect()),
+            // Only a truncated page has a next one; the final page carries no token.
+            next_token: if truncated {
+                page_ended_after.map(|rank| page_cursor(rank, &filter))
+            } else {
+                None
+            },
+        })
+    }
+}
+
+/// Which listing this operation's `NextToken` belongs to, so a token issued by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "update-directory";
+
+/// The `NextToken` a page of this listing that ended after `rank` hands back: the rank,
+/// then the filter the page was issued under, encoded the way every listing of this service
+/// encodes a cursor ([`crate::state::encode_cursor`]).
+fn page_cursor(rank: usize, filter: &str) -> String {
+    crate::state::encode_cursor(CURSOR_KIND, &format!("{rank}{CURSOR_SEPARATOR}{filter}"))
+}
+
+/// The rank a page asked for with `token` resumes after, or `None` when `token` is not one
+/// THIS listing issued under `filter` — which is what the modelled
+/// `InvalidNextTokenException` is answered for.
+fn resume_rank(token: &str, filter: &str) -> Option<usize> {
+    crate::state::decode_cursor(CURSOR_KIND, token).and_then(|value| {
+        let (rank, issued_for) = value.split_once(CURSOR_SEPARATOR)?;
+        if issued_for != filter {
+            return None;
+        }
+        rank.parse::<usize>().ok()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The filter a page of this listing is issued under, built the way the handler builds
+    /// it from a request's `DirectoryId`, `UpdateType` and `RegionName`.
+    fn filter(directory_id: &str, update_type: &str, region: &str) -> String {
+        crate::state::cursor_filter(&[directory_id, update_type, region])
+    }
+
+    /// RULE: the cursor this listing issues resumes the page it ended, and only for the
+    /// filter and the listing that issued it — a token issued under another filter, by
+    /// another listing, or not by this service at all resumes nothing, which is what the
+    /// modelled `InvalidNextTokenException` is answered for.
+    #[test]
+    fn a_cursor_resumes_only_the_filter_and_listing_that_issued_it() {
+        let issued_for = filter("d-0123456789", "OS", "");
+        for rank in [0usize, 1, 7, 1_000] {
+            let token = page_cursor(rank, &issued_for);
+            assert_eq!(
+                resume_rank(&token, &issued_for),
+                Some(rank),
+                "case {rank}: expected the cursor to resume after its own rank, got \
+                 {:?}",
+                resume_rank(&token, &issued_for)
+            );
+        }
+
+        // One token, replayed under each filter a different request would build: the
+        // directory, the update type and the Region each bind it.
+        let token = page_cursor(3, &issued_for);
+        for (case, other) in [
+            ("another directory", filter("d-ffffffffff", "OS", "")),
+            ("another update type", filter("d-0123456789", "SIZE", "")),
+            (
+                "a Region the first page did not name",
+                filter("d-0123456789", "OS", "us-east-1"),
+            ),
+        ] {
+            assert_eq!(
+                resume_rank(&token, &other),
+                None,
+                "case {case:?}: expected a token issued under another filter to resume \
+                 nothing"
+            );
+        }
+
+        // ...and the ways a token can fail to be one of this listing's at all.
+        for (case, token) in [
+            ("a token that is not hex", "not-a-token".to_string()),
+            ("hex that decodes to nothing", "6162636465".to_string()),
+            ("an empty token", String::new()),
+            (
+                "a token another listing issued",
+                crate::state::encode_cursor("snapshots", &format!("3|{issued_for}")),
+            ),
+        ] {
+            assert_eq!(
+                resume_rank(&token, &issued_for),
+                None,
+                "case {case:?}: expected the token to resume nothing"
+            );
+        }
     }
 }

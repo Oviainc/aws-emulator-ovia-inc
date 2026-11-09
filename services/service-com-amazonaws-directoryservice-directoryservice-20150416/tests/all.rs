@@ -57,6 +57,8 @@ mod directory_os_version;
 mod directory_settings;
 #[path = "all/directory_unsharing.rs"]
 mod directory_unsharing;
+#[path = "all/directory_update_reads.rs"]
+mod directory_update_reads;
 #[path = "all/domain_controller_resize.rs"]
 mod domain_controller_resize;
 #[path = "all/domain_controllers.rs"]
@@ -119,3 +121,5 @@ mod trust_outcomes;
 mod trusts;
 #[path = "all/user_passwords.rs"]
 mod user_passwords;
+#[path = "all/validation_pattern_wording.rs"]
+mod validation_pattern_wording;
