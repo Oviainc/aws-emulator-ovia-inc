@@ -11,7 +11,9 @@
 //! that exists only once a put has stored one; a put holds exactly the settings its request
 //! carries and removes the ones it excludes ("If a configuration already exists for a
 //! function, version, or alias, this operation overwrites it. If you exclude any settings,
-//! they are removed"), an update changes only the settings its request carries, every read
+//! they are removed"), an update changes only the settings its request carries — its two
+//! destination slots included, each on its own (see
+//! [`crate::event_invoke_config_destination_slots`]) — every read
 //! of that qualifier reports what is stored against the qualified ARN it was addressed on,
 //! and a qualifier holding none answers `ResourceNotFoundException` (HTTP 404) to every read,
 //! update and delete of one. A destination is written to by Lambda acting as the function's
@@ -117,13 +119,13 @@ fn function_arn(name: &str) -> String {
 /// function's ARN qualified by that qualifier, `$LATEST` when the call addressed the
 /// unpublished version — AWS's own documented answer to a put that named no qualifier
 /// carries the `:$LATEST` suffix, which `FunctionArn`'s pattern admits.
-fn configured_arn(name: &str, qualifier: Option<&str>) -> String {
+pub(crate) fn configured_arn(name: &str, qualifier: Option<&str>) -> String {
     format!("{}:{}", function_arn(name), qualifier.unwrap_or("$LATEST"))
 }
 
 /// Where the four single-configuration operations are bound, for the function `reference`
 /// names, optionally with the `Qualifier` query parameter.
-fn config_uri(reference: &str, qualifier: Option<&str>) -> String {
+pub(crate) fn config_uri(reference: &str, qualifier: Option<&str>) -> String {
     let base = format!("/2019-09-25/functions/{reference}/event-invoke-config");
     match qualifier {
         Some(qualifier) => format!("{base}?Qualifier={qualifier}"),
@@ -199,7 +201,7 @@ async fn list_configs(router: &MultiServiceRouter, reference: &str, query: &str)
 }
 
 /// Publish one version of `name` and report the version label it was given.
-async fn publish_version(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn publish_version(router: &MultiServiceRouter, name: &str) -> String {
     let answer = call(
         router,
         "POST",
@@ -564,11 +566,10 @@ async fn a_put_replaces_every_setting_and_an_update_changes_only_the_ones_it_car
             seed.clone(),
         ),
         (
-            "an update carrying a destination config states the whole of it",
+            "an update stating one destination slot leaves the other as it stands",
             "POST",
             json!({ "DestinationConfig": { "OnFailure": { "Destination": BUS_DESTINATION } } }),
             Settings {
-                on_success: None,
                 on_failure: Some(BUS_DESTINATION),
                 ..seed.clone()
             },

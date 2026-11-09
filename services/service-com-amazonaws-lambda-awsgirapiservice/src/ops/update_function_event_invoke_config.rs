@@ -10,7 +10,10 @@
 //! Only the settings the request CARRIES are changed: "To set one option without affecting
 //! existing settings for other options, use UpdateFunctionEventInvokeConfig", which is what
 //! separates it from `PutFunctionEventInvokeConfig`, whose request replaces the
-//! configuration whole. A qualifier that holds no configuration has nothing to update, so
+//! configuration whole. The two destination SLOTS of `DestinationConfig` are settings of
+//! their own under that same sentence, so a request that states one of them leaves the other
+//! exactly as the configuration holds it (see [`crate::state::EventInvokeConfigRecord::apply_update`]).
+//! A qualifier that holds no configuration has nothing to update, so
 //! such a request is refused `ResourceNotFoundException` (see
 //! [`crate::state::no_event_invoke_config_message`]) rather than creating one.
 //!

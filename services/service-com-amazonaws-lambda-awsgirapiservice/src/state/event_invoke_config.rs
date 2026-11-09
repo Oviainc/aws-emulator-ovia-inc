@@ -121,23 +121,20 @@ impl EventInvokeConfigRecord {
         if let Some(age) = maximum_event_age_in_seconds {
             self.maximum_event_age_in_seconds = Some(age);
         }
-        // `DestinationConfig` is ONE setting of the request, so a request carrying it
-        // states the whole destination configuration: the slot it leaves out is removed,
-        // which is also how the member's own pattern lets a caller clear one slot while
-        // naming the other (see [`named_destination`]).
+        // Each destination SLOT is a setting of its own, so the rule this operation applies
+        // to every other setting applies to the slots one at a time: the slot a request
+        // STATES replaces the held destination, and the slot it states nothing about keeps
+        // the destination the configuration holds. A slot stated with no destination — the
+        // empty string the member's pattern admits, or no `Destination` member at all — is
+        // how a caller takes that destination away (see [`named_destination`]), which is
+        // what lets one slot be cleared while the other stands.
         if let Some(config) = destination_config {
-            self.on_success = named_destination(
-                config
-                    .on_success
-                    .as_ref()
-                    .and_then(|slot| slot.destination.as_deref()),
-            );
-            self.on_failure = named_destination(
-                config
-                    .on_failure
-                    .as_ref()
-                    .and_then(|slot| slot.destination.as_deref()),
-            );
+            if let Some(slot) = config.on_success.as_ref() {
+                self.on_success = named_destination(slot.destination.as_deref());
+            }
+            if let Some(slot) = config.on_failure.as_ref() {
+                self.on_failure = named_destination(slot.destination.as_deref());
+            }
         }
         self.last_modified = now;
     }
