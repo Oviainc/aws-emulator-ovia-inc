@@ -121,6 +121,14 @@ pub fn tagged_resources(
             &association.tags,
         ));
     }
+    for certificate in state.client_certificates.values() {
+        rows.push((
+            TaggedResource::ClientCertificate {
+                client_certificate_id: certificate.id.clone(),
+            },
+            &certificate.tags,
+        ));
+    }
     rows.into_iter()
         .filter(|(_, tags)| !tags.is_empty())
         .map(|(resource, tags)| (tagged_resource_arn(region, &resource), tags.clone()))

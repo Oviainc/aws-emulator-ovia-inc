@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetClientCertificates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetClientCertificates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetClientCertificates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Gets a collection of `ClientCertificate` resources: the account's certificates, in the
+//! order they were generated, one `position`/`limit` page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -134,7 +127,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetClientCertificates<Eng>
 {
     type Input = GetClientCertificatesInput;
-    type Output = GetClientCertificatesOutput;
+    type Output = Paged<GetClientCertificatesOutput>;
     type Error = GetClientCertificatesError;
 
     const NAME: &'static str = "GetClientCertificates";
@@ -147,18 +140,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetClientCertificates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetClientCertificatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetClientCertificates"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let store = state.lock();
+        // A client certificate belongs to the ACCOUNT, so this collection is the account's
+        // certificates, and the order they were generated in is the stable sequence a
+        // `position` cursor walks.
+        let ordered = store.client_certificate_ids_in_creation_order();
+        let page = crate::state::page_of(&ordered, input.position.as_deref(), input.limit)
+            .map_err(|message| {
+                GetClientCertificatesErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+            })?;
+        // Each listed certificate is rendered by the one `ClientCertificate` body this
+        // crate owns, so a listed certificate and its own `GetClientCertificate` read
+        // cannot report a record differently. Nothing here writes: listing the collection
+        // leaves every record as a later caller will find it.
+        let items: Vec<GenerateClientCertificateOutput> = page
+            .ids
+            .iter()
+            .filter_map(|id| store.client_certificates.get(id))
+            .map(super::generate_client_certificate::client_certificate_body)
+            .collect();
+        Ok(Paged::new(
+            GetClientCertificatesOutput {
+                items: Some(items),
+                position: page.next_position.clone(),
+            },
+            page.echoed_limit(),
+        ))
     }
 }

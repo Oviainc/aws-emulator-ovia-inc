@@ -66,10 +66,10 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// label and a `Stage`'s `clientCertificateId` names one of. A client certificate
     /// belongs to the ACCOUNT rather than to one API, so it sits beside the APIs here.
     ///
-    /// `GenerateClientCertificate` is the operation that mints one, and it is still
-    /// scaffolded, so this map is empty until that operation is implemented — a stage
-    /// therefore names no certificate of this account, which is the refusal
-    /// [`NO_SUCH_CLIENT_CERTIFICATE`] words.
+    /// `GenerateClientCertificate` is the operation that mints one, so a `clientCertificateId`
+    /// no entry of this map answers to names no certificate of this account — which is the
+    /// refusal [`NO_SUCH_CLIENT_CERTIFICATE`] words. See [`client_certificates`] for the
+    /// record's material, its validity window and the reference a stage holds on it.
     pub client_certificates: BTreeMap<String, ClientCertificateEntry>,
     /// The account-level settings `UpdateAccount` writes and `GetAccount` reports.
     /// There is exactly one per account, so it is a field rather than a map.
@@ -116,16 +116,27 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
 /// holds beside the id it is keyed by.
 #[derive(Debug, Clone, Default)]
 pub struct ClientCertificateEntry {
+    /// "The identifier of the client certificate", minted by
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::mint_id`] and the key this
+    /// record is held under.
+    pub id: String,
     /// "The description of the client certificate".
     pub description: Option<String>,
-    /// "The PEM-encoded public key of the client certificate".
+    /// "The PEM-encoded public key of the client certificate", the certificate API Gateway
+    /// generated for this record; see [`mint_client_certificate_pem`].
     pub pem_encoded_certificate: Option<String>,
     /// "The timestamp when the client certificate was created".
-    pub created_date: Option<i64>,
-    /// "The timestamp when the client certificate will expire".
-    pub expiration_date: Option<i64>,
+    pub created_date: Option<::aws_smithy_types::DateTime>,
+    /// "The timestamp when the client certificate will expire": the creation instant plus
+    /// [`CLIENT_CERTIFICATE_VALIDITY`], which is the window the generated material itself
+    /// bears.
+    pub expiration_date: Option<::aws_smithy_types::DateTime>,
     /// "The collection of tags" the certificate carries.
     pub tags: BTreeMap<String, String>,
+    /// This certificate's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a listing
+    /// can report creation order rather than id order.
+    pub sequence: u64,
 }
 
 /// The `BadRequestException` message for a `clientCertificateId` that names no client
@@ -2433,16 +2444,6 @@ pub const MAX_TAG_VALUE_CHARS: usize = 256;
 /// address at all.
 const ARN_SERVICE: &str = "apigateway";
 
-/// The leading resource-portion segment of each taggable resource kind whose records
-/// this emulator does not keep: the operation that generates a client certificate is
-/// still a scaffold, so nothing can answer to one of these ARNs — while the ARN itself is
-/// a well-formed ARN of a taggable API Gateway resource and so is not a malformed
-/// request.
-///
-/// The segments are the first path segment of each kind's read URI; see the section
-/// comment above for the `smithy_query` calls they come from.
-const UNSTORED_TAGGABLE_KINDS: &[&str] = &["clientcertificates"];
-
 /// The resource one `resourceArn` names: the stored record a tag collection hangs off,
 /// as [`parse_tagged_resource`] read it out of the ARN.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2466,10 +2467,8 @@ pub enum TaggedResource {
     /// `/domainnameaccessassociations/{id}` — a [`DomainNameAccessAssociationEntry`]'s
     /// tags, where the path segment is the record's minted id.
     DomainNameAccessAssociation { access_association_id: String },
-    /// A taggable kind this emulator keeps no records of; see
-    /// [`UNSTORED_TAGGABLE_KINDS`]. `kind` is that list's entry and `id` the identifier
-    /// the ARN carried, so the refusal can name what it could not resolve.
-    Unstored { kind: &'static str, id: String },
+    /// `/clientcertificates/{clientCertificateId}` — a [`ClientCertificateEntry`]'s tags.
+    ClientCertificate { client_certificate_id: String },
 }
 
 impl TaggedResource {
@@ -2494,7 +2493,7 @@ impl TaggedResource {
             TaggedResource::UsagePlan { .. } => "usageplans",
             TaggedResource::DomainName { .. } => "domainnames",
             TaggedResource::DomainNameAccessAssociation { .. } => "domainnameaccessassociations",
-            TaggedResource::Unstored { kind, .. } => kind,
+            TaggedResource::ClientCertificate { .. } => "clientcertificates",
         }
     }
 }
@@ -2563,14 +2562,11 @@ pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
                 access_association_id: (*access_association_id).to_string(),
             })
         }
-        [kind, id] => UNSTORED_TAGGABLE_KINDS
-            .iter()
-            .copied()
-            .find(|known| known == kind)
-            .map(|known| TaggedResource::Unstored {
-                kind: known,
-                id: (*id).to_string(),
-            }),
+        ["clientcertificates", client_certificate_id] => {
+            Some(TaggedResource::ClientCertificate {
+                client_certificate_id: (*client_certificate_id).to_string(),
+            })
+        }
         _ => None,
     }
 }
@@ -2595,7 +2591,9 @@ pub fn tagged_resource_path(resource: &TaggedResource) -> String {
         TaggedResource::DomainNameAccessAssociation {
             access_association_id,
         } => format!("/domainnameaccessassociations/{access_association_id}"),
-        TaggedResource::Unstored { kind, id } => format!("/{kind}/{id}"),
+        TaggedResource::ClientCertificate {
+            client_certificate_id,
+        } => format!("/clientcertificates/{client_certificate_id}"),
     }
 }
 
@@ -3257,7 +3255,13 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 .get(access_association_id)
                 .map(|association| &association.tags)
                 .ok_or_else(|| NO_SUCH_ACCESS_ASSOCIATION.to_string()),
-            TaggedResource::Unstored { kind, id } => Err(no_such_tagged_resource(kind, id)),
+            TaggedResource::ClientCertificate {
+                client_certificate_id,
+            } => self
+                .client_certificates
+                .get(client_certificate_id)
+                .map(|certificate| &certificate.tags)
+                .ok_or_else(|| NO_SUCH_CLIENT_CERTIFICATE.to_string()),
         }
     }
 
@@ -3317,7 +3321,13 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 .get_mut(access_association_id)
                 .map(|association| &mut association.tags)
                 .ok_or_else(|| NO_SUCH_ACCESS_ASSOCIATION.to_string()),
-            TaggedResource::Unstored { kind, id } => Err(no_such_tagged_resource(kind, id)),
+            TaggedResource::ClientCertificate {
+                client_certificate_id,
+            } => self
+                .client_certificates
+                .get_mut(client_certificate_id)
+                .map(|certificate| &mut certificate.tags)
+                .ok_or_else(|| NO_SUCH_CLIENT_CERTIFICATE.to_string()),
         }
     }
 }
@@ -3792,7 +3802,7 @@ pub fn invalid_access_association_source(access_association_source: &str) -> Str
 /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::access_associations_depend_on`]).
 ///
 /// AWS publishes no fixed sentence for this condition, so the message is BUILT FROM
-/// STORED STATE the way [`no_such_tagged_resource`] is: it names the record the request
+/// STORED STATE the way [`no_such_rest_api`] is: it names the record the request
 /// addressed and the dependent resource kind, in the modelled spelling of both
 /// (`DomainName`, `DomainNameAccessAssociation`), so the caller can see which call to
 /// make first.
@@ -3848,20 +3858,6 @@ pub fn rest_api_in_use_by_base_path_mapping(
     format!(
         "Cannot delete REST API '{rest_api_id}', is referenced in base path mapping: \
          {referencing}"
-    )
-}
-
-/// The `NotFoundException` message for a well-formed ARN of a taggable resource kind
-/// this emulator keeps no records of (see [`UNSTORED_TAGGABLE_KINDS`]): nothing answers
-/// to it, which is a missing resource and not a malformed request.
-///
-/// AWS states no fixed sentence here either, so the message is BUILT FROM THE REQUEST —
-/// it names the resource portion the lookup could not resolve, qualified by the account
-/// the lookup ran in, the way [`no_such_rest_api`] does.
-pub fn no_such_tagged_resource(kind: &str, id: &str) -> String {
-    format!(
-        "Invalid resource identifier specified {}:/{kind}/{id}",
-        ::emulator_server::emulator_account_id()
     )
 }
 
@@ -4347,3 +4343,9 @@ pub mod vpc_endpoints;
 /// them; re-exported whole, so a handler still reaches each name as `crate::state::…`.
 mod usage;
 pub use usage::*;
+
+/// The `ClientCertificate` records of the account — the material one carries, how long it
+/// is valid for and the reference a stage holds on it; re-exported whole, so a handler
+/// still reaches each name as `crate::state::…`.
+mod client_certificates;
+pub use client_certificates::*;

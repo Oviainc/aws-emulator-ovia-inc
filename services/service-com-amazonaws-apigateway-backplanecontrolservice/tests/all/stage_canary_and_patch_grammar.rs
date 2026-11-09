@@ -804,10 +804,10 @@ async fn a_stage_presents_only_a_client_certificate_the_account_has() {
     let deployment = create_deployment(&gateway, &api, "client certificate", json!({})).await;
     create_stage(&gateway, &api, &deployment, "prod", json!({})).await;
 
-    // Rows differ along the form of the identifier: one shaped like a minted id, one that
-    // is not, and the empty value. The account has no client certificates — the operation
-    // that mints one is `GenerateClientCertificate` — so none of them names one.
-    for value in ["abcdef1234", "not-a-certificate", ""] {
+    // Rows differ along the form of the identifier: one shaped like a minted id and one
+    // that is not. The account has no client certificates — the operation that mints one is
+    // `GenerateClientCertificate` — so neither of them names one.
+    for value in ["abcdef1234", "not-a-certificate"] {
         let case = format!("replace /clientCertificateId with {value:?}");
         let answer = patch_stage(&gateway, &api, "prod", replace("/clientCertificateId", value))
             .await;
@@ -820,6 +820,26 @@ async fn a_stage_presents_only_a_client_certificate_the_account_has() {
             read.body["clientCertificateId"]
         );
     }
+
+    // An EMPTY value names no certificate and asks for none: it releases the association
+    // rather than being looked up, as the recorded client-certificate lifecycle shows AWS
+    // doing when a caller takes a stage's certificate back off it with a `replace` — so it
+    // leaves the stage with none and is accepted.
+    let case = "replace /clientCertificateId with \"\"";
+    let updated = patch_ok(
+        &gateway,
+        &api,
+        "prod",
+        case,
+        replace("/clientCertificateId", ""),
+    )
+    .await;
+    assert_members(
+        &updated,
+        &[("clientCertificateId", Value::Null)],
+        case,
+        "UpdateStage",
+    );
 
     // A `remove` of the member leaves the stage with none and is not a lookup of one.
     let case = "remove /clientCertificateId";

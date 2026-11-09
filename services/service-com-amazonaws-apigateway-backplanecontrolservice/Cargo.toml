@@ -128,6 +128,12 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 # services in this tree use, with the same `default-features = false` + `std` spelling:
 # the clock itself is `std`'s, so no time-zone database is pulled in.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# `GenerateClientCertificate` ISSUES the client certificate it reports: the caller supplies
+# no key material, so the PEM a record carries is a real self-signed X.509 certificate
+# generated here (`state::client_certificates`). The maintained generator the sibling
+# services in this tree use for certificate material, at the same version, so this emulator
+# has one way of issuing a certificate rather than a hand-rolled DER writer.
+rcgen = "0.13"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

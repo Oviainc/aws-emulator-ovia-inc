@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteClientCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteClientCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteClientCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the `ClientCertificate` resource: removing the record is what makes every later
+//! read of that certificate stop reporting it.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +161,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteClientCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClientCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteClientCertificate"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+
+        // The identifier is resolved against stored state before anything is removed. A
+        // client certificate belongs to the ACCOUNT rather than to one API, so the id is
+        // resolved account-wide; one that names no certificate is the modelled not-found,
+        // including a second delete of the same id, which names no certificate once the
+        // first one has taken it away.
+        if !store
+            .client_certificates
+            .contains_key(&input.client_certificate_id)
+        {
+            return Err(DeleteClientCertificateErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::NO_SUCH_CLIENT_CERTIFICATE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A `Stage` that still names this certificate in its `clientCertificateId` PRESENTS
+        // it to its integration endpoint, so deleting the certificate would leave that
+        // stage holding an identifier this service says names nothing. Such a delete is
+        // refused while the reference stands — in the error class this service refuses a
+        // delete blocked by a standing reference with (`DeleteVpcLink`'s own, for an
+        // integration that still reaches a link). The stages are left exactly as the caller
+        // wrote them; clearing the reference is the caller's own `UpdateStage` patch of
+        // `/clientCertificateId`.
+        if let Some(stage_name) =
+            store.stage_referencing_client_certificate(&input.client_certificate_id)
+        {
+            return Err(DeleteClientCertificateErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::client_certificate_in_use(
+                        &input.client_certificate_id,
+                        &stage_name,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The lookup, the dependency check and the removal share ONE hold of the store
+        // lock, so two concurrent deletes of one record cannot both remove it.
+        store
+            .client_certificates
+            .remove(&input.client_certificate_id);
+        // The store lock is released before the outcome is recorded: the critical section
+        // covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — the identifier the request carried, never the deleted
+        // certificate's material or tags.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            client_certificate = ?input.client_certificate_id,
+            outcome = "deleted",
+            "client certificate deleted",
+        );
+        Ok(DeleteClientCertificateOutput)
     }
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateClientCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateClientCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateClientCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes information about a `ClientCertificate` resource: the one member of the record a
+//! caller can patch, applied to the stored certificate and reported back from it.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +80,70 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    patch_optional_string, ClientCertificateEntry, InvalidPathRefusal, Patch, PatchFailure,
+    SupportedPatchPaths, MAX_STRING_CHARS,
+};
+
+/// The paths a `ClientCertificate` can be addressed by, in the order API Gateway prints
+/// them in its refusal.
+///
+/// The `ClientCertificate` shape this service models declares five members
+/// (`smithy_query(query="shape", shape="ClientCertificate")`), and four of them are not
+/// caller-editable: `clientCertificateId` is the record's key and the path label of every
+/// later read of it, which a patch would leave addressing nothing; `pemEncodedCertificate`
+/// is the material API Gateway ITSELF generated, so a caller can neither supply nor replace
+/// it; `createdDate` and `expirationDate` are the window the service stamped that material
+/// with. So `description` is the one member "Changes information about an ClientCertificate
+/// resource" can change — and `tags` are changed through `TagResource`/`UntagResource` —
+/// which is why the published set is a `replace`-only one; see
+/// [`SupportedPatchPaths::replace_only`].
+const PATCH_PATHS: SupportedPatchPaths = SupportedPatchPaths::replace_only(&["/description"]);
+
+/// How this operation words a refusal of a patch `path` it cannot apply: the path quoted,
+/// the `op` that named it and the paths this resource publishes. Reaches every path
+/// refusal the request goes on to produce, so one unapplicable pointer reads the same
+/// whether it names no member of the certificate, names one of the members the service
+/// itself assigns, or is no JSON Pointer at all.
+const INVALID_PATH: InvalidPathRefusal = InvalidPathRefusal::PathOpAndSupported(PATCH_PATHS);
+
+/// Apply one patch to a COPY of a stored client certificate.
+fn apply_patch(entry: &mut ClientCertificateEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    match patch.member() {
+        // `patch_optional_string` is this crate's one reading of an op on a single-valued
+        // optional string member: `add`/`replace` set it, `remove` clears it, and any
+        // other op is refused as unsupported.
+        "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+        // Every other member of the record is the SERVICE's: the id it is keyed by, the
+        // certificate API Gateway generated and the window that certificate is valid over
+        // are not things a caller patches, so a pointer naming one is refused rather than
+        // applied.
+        _ => Err(patch.unsupported_path()),
+    }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateClientCertificateError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateClientCertificateErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateClientCertificateErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateClientCertificateErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +217,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateClientCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateClientCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateClientCertificate"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches =
+            crate::state::parse_patches_refused_with(input.patch_operations.as_ref(), INVALID_PATH)
+                .map_err(patch_failure)?;
+
+        let mut store = state.lock();
+
+        // A client certificate belongs to the ACCOUNT, so the identifier is resolved
+        // account-wide; one that names no stored certificate is the modelled not-found,
+        // answered BEFORE any patch is applied.
+        let mut updated = store
+            .client_certificates
+            .get(&input.client_certificate_id)
+            .ok_or_else(|| {
+                UpdateClientCertificateErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_CLIENT_CERTIFICATE.to_string()),
+                })
+            })?
+            .clone();
+
+        // Applied to the COPY: a list whose later op is refused leaves the stored record
+        // untouched, rather than keeping the ops before it.
+        for patch in &patches {
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+
+        store
+            .client_certificates
+            .insert(input.client_certificate_id.clone(), updated);
+        let stored = store
+            .client_certificates
+            .get(&input.client_certificate_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // Rendered through the one `ClientCertificate` body this crate builds, so the update
+        // reports the record exactly as `GetClientCertificate` will read it back — the
+        // generated certificate and the window it is valid over included, neither of which a
+        // patch of this resource touches.
+        let body = super::generate_client_certificate::client_certificate_body(stored);
+        let output = UpdateClientCertificateOutput {
+            client_certificate_id: body.client_certificate_id,
+            description: body.description,
+            pem_encoded_certificate: body.pem_encoded_certificate,
+            created_date: body.created_date,
+            expiration_date: body.expiration_date,
+            tags: body.tags,
+        };
+        // Everything below is owned, so the store lock is released before the access record
+        // is emitted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            client_certificate = ?input.client_certificate_id,
+            patch_operations = patches.len(),
+            outcome = "updated",
+            "client certificate updated",
+        );
+        Ok(output)
     }
 }

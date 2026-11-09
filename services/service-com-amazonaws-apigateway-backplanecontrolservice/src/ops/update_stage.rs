@@ -587,8 +587,21 @@ fn apply_stage_patch(
             patch_optional_string(&mut entry.client_certificate_id, patch, MAX_STRING_CHARS)?;
             // "The identifier of a client certificate for an API stage"
             // (`Stage$clientCertificateId`): the stage presents that certificate to its
-            // integration endpoint, so the value has to name one the ACCOUNT has —
-            // refused as a bad REQUEST for the reason [`require_deployment`] gives.
+            // integration endpoint, so a value has to name one the ACCOUNT has — refused
+            // as a bad REQUEST for the reason [`require_deployment`] gives.
+            //
+            // An EMPTY value names no certificate and asks for none: it RELEASES the
+            // association, as a `remove` of the member does, so it is the one value that is
+            // not looked up. That is what lets a caller stop a stage presenting a
+            // certificate — and what makes the certificate deletable again — through the
+            // same `replace` that assigned it.
+            if entry
+                .client_certificate_id
+                .as_deref()
+                .is_some_and(str::is_empty)
+            {
+                entry.client_certificate_id = None;
+            }
             if let Some(certificate) = &entry.client_certificate_id {
                 if !context.client_certificates.contains(certificate) {
                     return Err(PatchFailure::BadRequest(

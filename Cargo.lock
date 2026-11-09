@@ -8453,6 +8453,7 @@ dependencies = [
  "http",
  "mime",
  "percent-encoding",
+ "rcgen",
  "regex",
  "serde",
  "serde_json",

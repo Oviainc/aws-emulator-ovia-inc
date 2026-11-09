@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GenerateClientCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GenerateClientCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GenerateClientCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Generates a `ClientCertificate` of the account: this is the operation that MINTS one,
+//! so the record it stores is what every later read of that certificate reports.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +78,50 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::ClientCertificateEntry;
+
+/// The `ClientCertificate` body for a stored certificate — the one place this crate renders
+/// that shape, so `GenerateClientCertificate`, `GetClientCertificate`,
+/// `GetClientCertificates` and `UpdateClientCertificate` cannot report a record
+/// differently.
+///
+/// Every member comes off the record: the id it is keyed by, the description the caller set
+/// (absent while it has none), the certificate API Gateway issued for it, and the window
+/// that certificate is valid over. `tags` is absent while the certificate carries none, the
+/// way the sibling account resources of this service report a tag collection.
+pub fn client_certificate_body(entry: &ClientCertificateEntry) -> GenerateClientCertificateOutput {
+    GenerateClientCertificateOutput {
+        client_certificate_id: Some(entry.id.clone()),
+        description: entry.description.clone(),
+        pem_encoded_certificate: entry.pem_encoded_certificate.clone(),
+        created_date: entry.created_date,
+        expiration_date: entry.expiration_date,
+        tags: crate::state::stored_map(entry.tags.clone()),
+    }
+}
+
+/// Refuse a request whose caller-sized members would grow the store past a bound.
+///
+/// Called BEFORE the store lock is taken, so an over-sized request never reaches the
+/// records at all. Each bound is this emulator's resource guard for a member API Gateway
+/// publishes no limit for, and the tags a create carries are checked by the SAME rule
+/// `TagResource` applies, so a tag this service refuses on one path cannot be stored
+/// through the other.
+fn bound_input(input: &GenerateClientCertificateInput) -> Result<(), String> {
+    use crate::state::{bound_chars, bound_entries, bound_tag, MAX_STRING_CHARS, MAX_TAGS};
+
+    if let Some(description) = &input.description {
+        bound_chars("description", description, MAX_STRING_CHARS)?;
+    }
+    if let Some(tags) = &input.tags {
+        bound_entries("tags", tags.len(), MAX_TAGS)?;
+        for (key, value) in tags {
+            bound_tag(key, value)?;
+        }
+    }
+    Ok(())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,18 +194,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GenerateClientCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GenerateClientCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GenerateClientCertificate"))
+        let bad_request = |message: String| -> Self::Error {
+            GenerateClientCertificateErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store unchecked: the request's members are
+        // bounded first, before the store lock is taken at all.
+        bound_input(&input).map_err(bad_request)?;
+
+        let created_date = crate::state::now();
+        let expiration_date = crate::state::client_certificate_expiration(created_date);
+        let mut store = state.lock();
+
+        // Bound the growth a caller drives, at API Gateway's published quota for the
+        // account's client certificates.
+        if store.client_certificates.len() >= crate::state::MAX_CLIENT_CERTIFICATES {
+            return Err(GenerateClientCertificateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    retry_after_seconds: None,
+                    message: Some(crate::state::quota_reached(
+                        "Client Certificates",
+                        "account",
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_id();
+        let sequence = store.next_sequence();
+        // The certificate is ISSUED for this record, over the record's own validity window.
+        // A record is stored only once its material exists: a certificate that did not
+        // issue is reported as a failure rather than persisted with nothing in the member
+        // every later read of it would have to answer from. The failure states that
+        // condition itself (`state::client_certificate_not_issued`), and is non-retryable
+        // for the reason given there.
+        let pem_encoded_certificate = crate::state::mint_client_certificate_pem(
+            &id,
+            created_date,
+            expiration_date,
+        )
+        .ok_or_else(crate::state::client_certificate_not_issued)?;
+        let entry = ClientCertificateEntry {
+            id: id.clone(),
+            description: input.description,
+            pem_encoded_certificate: Some(pem_encoded_certificate),
+            created_date: Some(created_date),
+            // "The timestamp when the client certificate will expire": the creation instant
+            // plus the span a generated certificate is valid for, which is the window the
+            // issued material itself bears.
+            expiration_date: Some(expiration_date),
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<String, String>>(),
+            sequence,
+        };
+
+        // `id` comes from the store's own id bijection, so it names no existing certificate
+        // and this inserts. Reading the entry back means what the caller is told is what a
+        // later `GetClientCertificate` will report.
+        store.client_certificates.insert(id.clone(), entry);
+        let stored = store
+            .client_certificates
+            .get(&id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let output = client_certificate_body(stored);
+        // Everything below is owned, so the store lock is released before the record is
+        // formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — the issued certificate is the caller's data and is never a field.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            client_certificate = ?id,
+            outcome = "generated",
+            "client certificate generated",
+        );
+        Ok(output)
     }
 }
