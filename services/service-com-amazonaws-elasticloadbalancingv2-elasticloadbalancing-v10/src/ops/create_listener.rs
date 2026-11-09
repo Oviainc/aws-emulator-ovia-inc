@@ -461,6 +461,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.load_balancer_arn,
             now,
         );
+        // This load balancer now CHECKS the target groups its new listener forwards to, so
+        // their host-count series open here ([`crate::state::host_counts`]).
+        drop(guard);
+        crate::state::drive_host_count_metrics(&self.engine);
         Ok(CreateListenerOutput {
             listeners: Some(listeners),
         })

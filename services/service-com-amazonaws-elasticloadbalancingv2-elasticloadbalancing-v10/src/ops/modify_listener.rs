@@ -405,6 +405,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &load_balancer_arn,
             ::std::time::SystemTime::now(),
         );
+        // Which target groups this load balancer checks has changed with its actions, so a
+        // host-count series opens for a pair it now routes and closes for one it does not
+        // ([`crate::state::host_counts`]).
+        drop(guard);
+        crate::state::drive_host_count_metrics(&self.engine);
         Ok(ModifyListenerOutput {
             listeners: Some(listeners),
         })

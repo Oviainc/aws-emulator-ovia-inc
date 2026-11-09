@@ -47,9 +47,8 @@ use std::time::Duration;
 /// test run sees.
 const SLACK: Duration = Duration::from_millis(400);
 
-/// Wait out `span` plus [`SLACK`]. The workspace's `tokio` carries no `time` feature, so
-/// this waits on the std clock as the rest of this crate's suites do; nothing else is
-/// pending on this runtime.
+/// Wait out `span` plus [`SLACK`]. This suite waits on the std clock as the rest of this
+/// crate's suites do; nothing else is pending on this runtime.
 fn wait_out(span: Duration) {
     std::thread::sleep(span + SLACK);
 }

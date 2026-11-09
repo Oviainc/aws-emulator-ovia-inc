@@ -365,6 +365,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(prefix) = input.enable_prefix_for_ipv6_source_nat.clone() {
             load_balancer.enable_prefix_for_ipv6_source_nat = Some(prefix);
         }
+        // A load balancer holds one interface per subnet it is attached to, so the subnets
+        // this call left it with are the subnets its interfaces sit in: a subnet it still has
+        // keeps the interface already there, one it has left gives its interface back, and
+        // one it has just been given gets an interface of its own
+        // ([`crate::state::service_interfaces`]).
+        let held = ::std::mem::take(&mut load_balancer.network_interface_ids);
+        let record = load_balancer.clone();
+        let placed = crate::state::reconcile_load_balancer_interfaces(
+            &*self.engine,
+            &record,
+            &held,
+        );
+        let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) else {
+            return Err(not_found(&input.load_balancer_arn));
+        };
+        load_balancer.network_interface_ids = placed;
 
         Ok(SetSubnetsOutput {
             // Read back off the record rather than echoed from the request, so the answer

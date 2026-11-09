@@ -474,6 +474,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .and_then(|pools| pools.ipv4_ipam_pool_id.clone()),
             // No capacity-reservation write has touched a load balancer being created.
             capacity_reservation_modified_at: None,
+            // Filled in with the interfaces this load balancer is given below, once it has
+            // the id its description names it by.
+            network_interface_ids: Vec::new(),
             attributes: std::collections::HashMap::new(),
             tags: tag_map(input.tags.as_deref())?,
             listener_arns: Vec::new(),
@@ -535,6 +538,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
         );
         candidate.id = id;
+        // A load balancer is reached at an ADDRESS inside each subnet it is attached to, and
+        // those addresses belong to elastic network interfaces of the account's EC2
+        // inventory: one service-managed interface per subnet, placed where every reader of
+        // that inventory sees it ([`crate::state::service_interfaces`]).
+        candidate.network_interface_ids =
+            crate::state::place_load_balancer_interfaces(&*self.engine, &candidate);
 
         guard
             .name_to_lb_arn

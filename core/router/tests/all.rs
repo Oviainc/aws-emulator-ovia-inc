@@ -17,11 +17,11 @@
 // else appends to.
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
-// Declared here, in this same head region, for the reason the entry above records: the two
-// services sharing the `agent-registry` signing name are two crates, so neither crate's own
-// test target can mount both and ask which of them claims a request.
-#[path = "all/agent_registry_signing_name_routing.rs"]
-mod agent_registry_signing_name_routing;
+// Declared here, in this same head region, for the reason the entry above records: what a
+// load balancer PUBLISHES for the target groups it routes to, and what it holds in the
+// account's EC2 inventory, which spans three services.
+#[path = "all/elbv2_host_counts_and_interfaces.rs"]
+mod elbv2_host_counts_and_interfaces;
 // Declared here, in this same head region, for the reason the entry above records: the
 // account's verified sending identity, which one SES surface records and the other
 // discovers.
@@ -140,8 +140,6 @@ mod greengrass_signing_name_routing;
 // the sorted `c…` span (where every cloudformation suite lands) are both regions
 #[path = "all/cloudformation_deployed_domain_index_lifecycle.rs"]
 mod cloudformation_deployed_domain_index_lifecycle;
-#[path = "all/cloudformation_domain_access_policy_revision.rs"]
-mod cloudformation_domain_access_policy_revision;
 // the sorted `g…` span (beside the other glue suites) are both regions concurrently landing
 // suites add their line to.
 #[path = "all/glue_studio_notebook_catalog_through_the_router.rs"]
@@ -1210,6 +1208,18 @@ mod bedrock_catalogue_is_invocable;
 mod bedrock_logging_destination_region;
 #[path = "all/cloudformation_provisions_bedrock_guardrails.rs"]
 mod cloudformation_provisions_bedrock_guardrails;
+// Declared here, beside the sibling suites it shares its rule with: the whole deployed
+// pipeline, from an `AWS::Events::Rule`/`AWS::Lambda::Permission` template to the permitted
+// target's own work product and the un-permitted sibling's dead letter.
+#[path = "all/cloudformation_events_rule_lambda_target_permission_boundary.rs"]
+mod cloudformation_events_rule_lambda_target_permission_boundary;
+// Declared here, in this same head region, for the reason the entry above records: the two
+// services sharing the `agent-registry` signing name are two crates, so neither crate's own
+// test target can mount both and ask which of them claims a request.
+#[path = "all/agent_registry_signing_name_routing.rs"]
+mod agent_registry_signing_name_routing;
+#[path = "all/cloudformation_domain_access_policy_revision.rs"]
+mod cloudformation_domain_access_policy_revision;
 // Declared in the appended tail, which is where every new suite inserts its lines: the whole
 // deploy -> fire -> deliver -> stack-delete round trip of a stack-deployed
 // `AWS::Scheduler::Schedule`.

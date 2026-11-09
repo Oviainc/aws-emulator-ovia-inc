@@ -335,6 +335,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::time::SystemTime::now(),
         );
 
+        // Which target groups this load balancer checks follows the same associations, so a
+        // host-count series opens for a pair it now routes and closes for one it does not
+        // ([`crate::state::host_counts`]).
+        drop(guard);
+        crate::state::drive_host_count_metrics(&self.engine);
+
         Ok(ModifyRuleOutput {
             rules: Some(vec![modified]),
         })

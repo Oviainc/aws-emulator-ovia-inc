@@ -55,7 +55,21 @@ pub use rule_actions::{check_redirect_actions, redirects_to_itself, REDIRECT_LOO
 /// and the two spans the clock owes a registration.
 pub mod target_health;
 
-pub use target_health::{deregistration_delay, DEREGISTRATION_DELAY_ATTRIBUTE};
+pub use target_health::{deregistration_delay, TargetProbe, DEREGISTRATION_DELAY_ATTRIBUTE};
+
+/// The periodic health check of the registrations a load balancer routes to, and the
+/// host-count series that check is published as.
+pub mod host_counts;
+
+pub use host_counts::{drive_host_count_metrics, HostCountPublisher};
+
+/// The load balancer's OWN network interfaces, which live in the inventory EC2 holds.
+pub mod service_interfaces;
+
+pub use service_interfaces::{
+    apply_load_balancer_security_groups, place_load_balancer_interfaces,
+    reconcile_load_balancer_interfaces, release_load_balancer_interfaces,
+};
 
 /// What this store released WITH ITS CONTAINER, which is what makes a delete of it
 /// idempotent.
@@ -411,6 +425,10 @@ pub struct LoadBalancerRecord {
     /// one does: a load balancer nobody has written a reservation for has no such
     /// instant to report.
     pub capacity_reservation_modified_at: Option<SystemTime>,
+    /// The elastic network interfaces this load balancer holds in the account's EC2
+    /// inventory, one per subnet it is attached to ([`service_interfaces`]). Empty for a
+    /// load balancer placed where there was no inventory to put one in.
+    pub network_interface_ids: Vec<String>,
     pub attributes: HashMap<String, String>,
     pub tags: HashMap<String, String>,
     pub listener_arns: Vec<String>,
@@ -3179,6 +3197,9 @@ pub struct RegisteredTarget {
     /// registration `DeregisterTargets` put in `draining`; `None` for one nothing has
     /// deregistered ([`target_health`]).
     pub draining_until: Option<SystemTime>,
+    /// Where the periodic health check of this registration has got to, and the verdict it
+    /// has reached ([`target_health::TargetProbe`]).
+    pub probe: TargetProbe,
     /// The workload whose own scheduler registered this target, when another emulated
     /// service owns the registration rather than a `RegisterTargets` caller: the identifier
     /// of the task, instance or function it stands for.
@@ -4319,6 +4340,10 @@ pub struct ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     /// makes a delete of one of them idempotent ([`CascadedReleases`]). A bounded window,
     /// so it does not grow with the number of calls.
     pub cascaded_releases: CascadedReleases,
+    /// Where the host-count series of each routed `(load balancer, target group)` pair has
+    /// got to, and the one clock that advances them ([`host_counts`]). A series per pair
+    /// being checked, so it does not grow with the number of calls either.
+    pub host_counts: HostCountPublisher,
 }
 
 impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {

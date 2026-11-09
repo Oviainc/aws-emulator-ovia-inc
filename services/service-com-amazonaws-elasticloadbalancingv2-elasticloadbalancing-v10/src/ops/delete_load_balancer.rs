@@ -175,7 +175,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The model: deleting a load balancer that is not there succeeds, so the
         // answer does not depend on whether this removed anything.
+        //
+        // The interfaces it holds in the account's EC2 inventory carry its traffic, so they
+        // do not outlive it: they are read off the record before it goes and given back
+        // after ([`crate::state::service_interfaces`]).
+        let network_interface_ids = guard
+            .load_balancers
+            .get(&input.load_balancer_arn)
+            .map(|load_balancer| load_balancer.network_interface_ids.clone())
+            .unwrap_or_default();
         guard.remove_load_balancer(&input.load_balancer_arn);
+        crate::state::release_load_balancer_interfaces(&*self.engine, &network_interface_ids);
         // A load balancer that is gone presents no certificate, so every reference its
         // listeners held is given up — the service holding those certificates reads that
         // from the shared directory, and until the teardown falls due it still counts as
@@ -186,6 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.load_balancer_arn,
             ::std::time::SystemTime::now(),
         );
+        // A load balancer that is gone checks no target group, so the host-count series of
+        // every pair it was routing closes here ([`crate::state::host_counts`]).
+        drop(guard);
+        crate::state::drive_host_count_metrics(&self.engine);
 
         Ok(DeleteLoadBalancerOutput {})
     }

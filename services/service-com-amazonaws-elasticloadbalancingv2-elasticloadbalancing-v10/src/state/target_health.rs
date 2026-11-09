@@ -118,6 +118,67 @@ const UNAVAILABLE: (&str, &str, &str) = (
     "Target.HealthCheckDisabled",
     "Health checks are not enabled for this target group",
 );
+const UNHEALTHY_TIMED_OUT: (&str, &str, &str) =
+    (UNHEALTHY_STATE, "Target.Timeout", "Request timed out");
+
+/// The `TargetHealthStateEnum` value of a registration the load balancer can route to.
+///
+/// `TargetHealth$State`'s own documentation gives it no reason code ("a reason code is not
+/// provided") and no description, so a healthy registration reports the state alone.
+pub const HEALTHY_STATE: &str = "healthy";
+
+/// The `TargetHealthStateEnum` value of a registration whose health checks the load balancer
+/// could not get an answer to.
+pub const UNHEALTHY_STATE: &str = "unhealthy";
+
+/// Where the periodic health check of ONE registration has got to: what the checks have
+/// observed in a row, and the verdict those runs have reached.
+///
+/// `UnhealthyThresholdCount` is "the number of consecutive health check failures required
+/// before considering a target unhealthy" and `HealthyThresholdCount` "the number of
+/// consecutive health check successes required before considering an unhealthy target
+/// healthy", so the verdict only MOVES once that many consecutive checks disagree with it —
+/// which is what [`TargetProbe::observed`] folds an observation into. A registration no check
+/// has observed anything about carries the verdict it started with, which is the one the
+/// clock owes it ([`TargetGroupRecord::health_of`]).
+#[derive(Debug, Clone, Default)]
+pub struct TargetProbe {
+    /// Consecutive failing checks since the last passing one.
+    failures: u32,
+    /// Consecutive passing checks since the last failing one.
+    passes: u32,
+    /// Whether the checks have decided this registration is unhealthy.
+    unhealthy: bool,
+}
+
+impl TargetProbe {
+    /// Fold one check's observation into the verdict: `observed` is whether the check
+    /// passed, and the two thresholds are the target group's own.
+    ///
+    /// A threshold the group reports as less than one still takes one check, so a verdict is
+    /// never reached by no check at all.
+    pub fn observed(&mut self, observed: bool, healthy_threshold: i32, unhealthy_threshold: i32) {
+        let threshold = |configured: i32| configured.max(1).unsigned_abs();
+        if observed {
+            self.failures = 0;
+            self.passes = self.passes.saturating_add(1);
+            if self.passes >= threshold(healthy_threshold) {
+                self.unhealthy = false;
+            }
+        } else {
+            self.passes = 0;
+            self.failures = self.failures.saturating_add(1);
+            if self.failures >= threshold(unhealthy_threshold) {
+                self.unhealthy = true;
+            }
+        }
+    }
+
+    /// Whether the checks have decided this registration is unhealthy.
+    pub fn is_unhealthy(&self) -> bool {
+        self.unhealthy
+    }
+}
 
 /// One reported health, from a `(state, reason, description)` triple above.
 fn reported(state: (&str, &str, &str)) -> TargetHealth {
@@ -236,6 +297,7 @@ impl TargetGroupRecord {
                 registered_at: now,
                 healthy_at: now + SETTLE_AFTER,
                 draining_until: None,
+                probe: TargetProbe::default(),
                 registered_for: Some(workload.to_string()),
             },
         );
@@ -276,8 +338,15 @@ impl TargetGroupRecord {
         if now < target.healthy_at {
             return reported(INITIAL);
         }
+        if target.probe.is_unhealthy() {
+            // The checks have run and this registration answered none of them: the load
+            // balancer considers a target unhealthy once the group's threshold of
+            // consecutive failures is reached, and `TargetHealth$Reason` words that for a
+            // check nothing answered.
+            return reported(UNHEALTHY_TIMED_OUT);
+        }
         TargetHealth {
-            state: Some("healthy".to_string()),
+            state: Some(HEALTHY_STATE.to_string()),
             reason: None,
             description: None,
         }

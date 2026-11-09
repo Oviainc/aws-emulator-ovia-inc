@@ -244,6 +244,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // target that was draining returns it to service: it is checked from
                     // now rather than removed when the drain it was in runs out.
                     draining_until: None,
+                    // No check has observed this registration yet, so it starts with the
+                    // verdict the clock owes it ([`crate::state::target_health`]).
+                    probe: crate::state::TargetProbe::default(),
                     // A registration this API made is the CALLER's: no other service's
                     // scheduler owns it, so no reconcile of another workload's targets may
                     // take it out of the group.
@@ -251,6 +254,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             );
         }
+
+        // The group's host counts have changed, and a registration of a group a load
+        // balancer routes to is checked from now on ([`crate::state::host_counts`]).
+        drop(guard);
+        crate::state::drive_host_count_metrics(&self.engine);
 
         Ok(RegisterTargetsOutput {})
     }

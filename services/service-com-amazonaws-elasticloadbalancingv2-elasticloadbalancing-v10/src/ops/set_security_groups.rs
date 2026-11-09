@@ -278,6 +278,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             load_balancer.enforce_security_group_inbound_rules_on_private_link_traffic =
                 Some(enforce);
         }
+        // Those groups govern traffic to this load balancer's own network interfaces, so the
+        // groups the account's EC2 inventory reports for them are the ones it carries now
+        // ([`crate::state::service_interfaces`]). The interfaces themselves are untouched:
+        // each keeps the address it holds.
+        crate::state::apply_load_balancer_security_groups(
+            &*self.engine,
+            &load_balancer.network_interface_ids,
+            &load_balancer.security_groups,
+        );
 
         Ok(SetSecurityGroupsOutput {
             // Read back off the record rather than echoed from the request, so the answer

@@ -25,7 +25,7 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -47,6 +47,19 @@ hex = { workspace = true }
 # and the semantics are that service's, and the data plane here asks it for the decision
 # rather than keeping a second reading of a rule tree (`service::web_acl`).
 service-com-amazonaws-wafv2-awswaf-20190729 = { workspace = true }
+# The CloudWatch metric store, which is where the host-count series a load balancer
+# publishes for the target groups it routes to LIVES: those datapoints are read back through
+# `GetMetricStatistics` / `GetMetricData` / `ListMetrics` and graded by CloudWatch's own alarm
+# evaluation, so they are appended to that service's own store rather than kept in a second
+# copy no reader reads (`src/state/host_counts.rs`).
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The account's EC2 inventory, for the two facts this service WRITES to and READS from it
+# rather than resolving per request: the elastic network interfaces a load balancer holds in
+# its subnets (`src/state/service_interfaces.rs`), and whether anything of the account stands
+# behind a registered target, which is what one health check can observe
+# (`src/state/host_counts.rs`). Both run off a clock with no request to carry a callback, so
+# they reach that service's own store on the shared engine.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

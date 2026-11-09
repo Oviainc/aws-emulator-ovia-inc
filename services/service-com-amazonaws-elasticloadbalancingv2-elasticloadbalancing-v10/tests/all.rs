@@ -33,6 +33,8 @@ mod declared_action_set;
 mod describe_input_bounds;
 #[path = "all/forward_action_config_and_mutual_authentication.rs"]
 mod forward_action_config_and_mutual_authentication;
+#[path = "all/host_count_health_checks.rs"]
+mod host_count_health_checks;
 #[path = "all/input_rejection_classes.rs"]
 mod input_rejection_classes;
 #[path = "all/ip_targets.rs"]
