@@ -11,7 +11,8 @@
 //! assume from this service's principal the pipe settles in the terminal failure state of
 //! the move that was in flight — `CREATE_FAILED`, `UPDATE_FAILED`, `START_FAILED` — carrying
 //! a `StateReason` that names the role and the assume that failed, and it runs nothing. A
-//! move that can be completed leaves no reason behind.
+//! move that can be completed leaves the user-initiated reason its caller drove it with
+//! (`tests/all/pipe_state_reason.rs` has that rule's own table).
 //!
 //! `tests/all/pipe_metrics.rs` asserts the OTHER half of the execution role: a role this
 //! service CAN assume whose policies bar one stage's call, which is a pipe that runs and
@@ -26,6 +27,7 @@ use service_com_amazonaws_pipes_pipes::state::pipe_state::{
     CREATE_FAILED, RUNNING, START_FAILED, UPDATE_FAILED,
 };
 use service_com_amazonaws_pipes_pipes::state::TRANSIENT_PIPE_STATES;
+use service_com_amazonaws_pipes_pipes::state::USER_INITIATED_STATE_REASON;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::pipe_data_plane::{collect_at_least, collect_during, given_queue, send, QUIET};
@@ -344,7 +346,7 @@ async fn create_pipe_fails_the_creation_of_a_pipe_whose_role_it_cannot_assume() 
             row.case, row.settles_in, described.body
         );
         // The failure says WHICH role could not be assumed and WHAT could not be done with
-        // it; a creation that completed leaves no reason behind.
+        // it; a creation that completed rests with the reason its caller drove it with.
         let reason = described.string("StateReason");
         if row.settles_in == CREATE_FAILED {
             assert!(
@@ -356,9 +358,10 @@ async fn create_pipe_fails_the_creation_of_a_pipe_whose_role_it_cannot_assume() 
                 row.case
             );
         } else {
-            assert!(
-                reason.is_empty(),
-                "case {:?}: a completed creation leaves no StateReason, got {reason:?}",
+            assert_eq!(
+                reason, USER_INITIATED_STATE_REASON,
+                "case {:?}: a completed creation rests in the state its caller asked for, \
+                 so its StateReason is {USER_INITIATED_STATE_REASON}, got {reason:?}",
                 row.case
             );
         }
@@ -489,8 +492,8 @@ async fn update_pipe_fails_the_update_that_leaves_a_pipe_on_a_role_it_cannot_ass
         "case {case:?}: expected a pipe whose update failed to deliver nothing, got {delivered:?}"
     );
 
-    // And the update back onto a role that can be assumed completes, leaves no reason and
-    // moves the record that was waiting all along.
+    // And the update back onto a role that can be assumed completes, rests with the
+    // user-initiated reason and moves the record that was waiting all along.
     let updated = call(
         &router,
         "PUT",
@@ -512,9 +515,10 @@ async fn update_pipe_fails_the_update_that_leaves_a_pipe_on_a_role_it_cannot_ass
         described.body
     );
     let reason = described.string("StateReason");
-    assert!(
-        reason.is_empty(),
-        "case {case:?}: a completed update leaves no StateReason, got {reason:?}"
+    assert_eq!(
+        reason, USER_INITIATED_STATE_REASON,
+        "case {case:?}: a completed update rests in the state its caller asked for, so its \
+         StateReason is {USER_INITIATED_STATE_REASON}, got {reason:?}"
     );
     let delivered = collect_at_least(&router, &target_url, 1, BUDGET).await;
     assert_eq!(

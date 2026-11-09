@@ -611,3 +611,104 @@ async fn an_update_during_a_move_in_flight_reports_one_sentence_naming_the_pipe(
         );
     }
 }
+
+/// RULE: a request PARAMETER this service cannot interpret AT ALL — the opaque
+/// continuation token, which a caller passes back exactly as it was issued — is refused
+/// with `ValidationException` (400) reporting ONE sentence that names the parameter and
+/// states the reason class, with the per-field detail in the modelled `fieldList` rather
+/// than inside `message`.
+///
+/// The rows differ along the form of the unreadable token: text that is not the token's
+/// encoding at all, an encoding of bytes that are not text, and a truncated encoding. A
+/// token this service DID issue is accepted at the end of the table, so what the rows
+/// refuse is the token and not paging.
+#[tokio::test]
+async fn a_continuation_token_this_service_cannot_read_reports_one_parameter_sentence() {
+    let router = router();
+    for name in ["tokena", "tokenb"] {
+        let created = create(
+            &router,
+            name,
+            create_body("arn:aws:sqs:us-west-2:000000000000:orders", TARGET, json!({})),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {name:?}: the fixture pipe must be created, got {created:?}"
+        );
+    }
+
+    // (case, the `NextToken` query value the row sends)
+    let rows: Vec<(&str, &str)> = vec![
+        ("not an encoding at all", "not-a-token"),
+        ("a word that is not an encoding", "zzzz"),
+        ("an encoding of bytes that are not text", "ff"),
+        ("an encoding of a longer run of non-text bytes", "fffefd"),
+        ("a truncated encoding", "abc"),
+    ];
+    for (case, token) in rows {
+        let refused = call(
+            &router,
+            "GET",
+            &format!("/v1/pipes?NextToken={token}"),
+            None,
+            REGION,
+        )
+        .await;
+        assert_eq!(
+            (refused.status, refused.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected 400 ValidationException, got {refused:?}"
+        );
+        assert_eq!(
+            message(&refused),
+            "Parameter NextToken is not valid. Reason: Malformed request.",
+            "case {case:?}: expected the one invalid-parameter sentence, got {refused:?}"
+        );
+        assert!(
+            !message(&refused).contains("ValidationErrorFields"),
+            "case {case:?}: the per-field detail belongs in fieldList, not in message: \
+             {refused:?}"
+        );
+        let fields = field_list(&refused);
+        assert_eq!(
+            fields.len(),
+            1,
+            "case {case:?}: expected one fieldList entry for the refused parameter, \
+             got {fields:?}"
+        );
+        assert_eq!(
+            fields[0].0, "NextToken",
+            "case {case:?}: expected the fieldList entry to name NextToken, got {fields:?}"
+        );
+        assert!(
+            !fields[0].1.is_empty(),
+            "case {case:?}: expected the fieldList entry to say why, got {fields:?}"
+        );
+        assert!(
+            !message(&refused).contains(token),
+            "case {case:?}: the sentence states the reason class rather than echoing the \
+             token, got {refused:?}"
+        );
+    }
+
+    // The token this service issued is read, so the rows above refuse the token itself.
+    let first = call(&router, "GET", "/v1/pipes?Limit=1", None, REGION).await;
+    let issued = first.string("NextToken");
+    assert!(
+        !issued.is_empty(),
+        "the fixture listing must issue a NextToken, got {first:?}"
+    );
+    let resumed = call(
+        &router,
+        "GET",
+        &format!("/v1/pipes?Limit=1&NextToken={issued}"),
+        None,
+        REGION,
+    )
+    .await;
+    assert_eq!(
+        resumed.status, 200,
+        "a NextToken this service issued must be accepted, got {resumed:?}"
+    );
+}

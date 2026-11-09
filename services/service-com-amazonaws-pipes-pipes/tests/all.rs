@@ -49,6 +49,8 @@ mod pipe_record_envelope;
 mod pipe_refusal_bodies;
 #[path = "all/pipe_source_checkout.rs"]
 mod pipe_source_checkout;
+#[path = "all/pipe_state_reason.rs"]
+mod pipe_state_reason;
 #[path = "all/pipe_tagging.rs"]
 mod pipe_tagging;
 #[path = "all/pipe_target_parameter_refusal.rs"]

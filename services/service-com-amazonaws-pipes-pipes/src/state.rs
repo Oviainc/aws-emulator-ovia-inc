@@ -336,6 +336,34 @@ pub fn validation_field(
     }
 }
 
+/// The reason clause [`invalid_parameter`] states for a parameter value this service cannot
+/// interpret AT ALL — one it can neither read nor act on, as against a value it read and
+/// found outside a modelled constraint, which the boundary validator reports against that
+/// constraint.
+///
+/// Recorded behaviour for the one such parameter this service has, the opaque continuation
+/// token: the reason is this fixed phrase for the error class rather than anything derived
+/// from the value, which the service by definition could not read.
+pub const MALFORMED_REQUEST_REASON: &str = "Malformed request";
+
+/// The `ValidationException` a single uninterpretable request PARAMETER is refused with:
+/// ONE sentence naming the parameter and the reason it was refused for, with the per-field
+/// detail in the modelled `fieldList` where a client reads per-field detail.
+///
+/// Fixed text (`Parameter `, ` is not valid. Reason: ` and the closing stop) around two
+/// variable parts: `member`, the name of the rejected parameter as the request spells it,
+/// and `reason`, the fixed phrase for the class of refusal.
+pub fn invalid_parameter(
+    member: &str,
+    reason: &str,
+    detail: impl Into<String>,
+) -> ValidationException {
+    ValidationException {
+        message: Some(format!("Parameter {member} is not valid. Reason: {reason}.")),
+        field_list: Some(vec![validation_field(member, detail)]),
+    }
+}
+
 /// The `ValidationException` this service refuses a request with: the fields that failed
 /// validation reported BOTH as the modelled `fieldList` and, in the exception's `message`,
 /// as the JSON document this service words a refusal as — a `ValidationErrorFields` array
@@ -855,9 +883,17 @@ const DEFAULT_REGION: &str = "us-east-1";
 /// pipe (see [`ComAmazonawsPipesPipesState::settle_due_transitions`]).
 pub const STATE_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
+/// The `StateReason` of a pipe whose current state is one its CALLER drove it into — the
+/// state a lifecycle call (a creation with a `DesiredState`, a start, a stop, an update)
+/// asked the pipe to be in, as against one this service moved it to on its own.
+///
+/// Recorded behaviour: a pipe resting in the state its caller asked for reports this
+/// FIXED token. It says HOW the pipe reached its state, so it is neither read from the
+/// request nor minted per call.
+pub const USER_INITIATED_STATE_REASON: &str = "USER_INITIATED";
+
 /// A state move the clock owes a pipe: at `due_at` its `CurrentState` becomes `to`, and
-/// its `StateReason` becomes `reason` — the sentence that says why the move landed where
-/// it did, which a move that simply succeeded has none of.
+/// its `StateReason` becomes `reason` — why the pipe is in the state the move left it in.
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
     /// The monotonic instant the move became (or becomes) due.
@@ -869,11 +905,15 @@ pub struct PendingTransition {
 }
 
 /// The move owed to the clock when a lifecycle call starts a transition into `to`.
+///
+/// The move is one the CALLER asked for, so the state it lands in is reported as
+/// [`USER_INITIATED_STATE_REASON`] — the same reason the transient state on the way there
+/// already carries ([`PipeRecord::note_user_initiated`]).
 pub fn pending_transition(to: &str) -> PendingTransition {
     PendingTransition {
         due_at: Instant::now() + STATE_SETTLE_DELAY,
         to: to.to_string(),
-        reason: None,
+        reason: Some(USER_INITIATED_STATE_REASON.to_string()),
     }
 }
 
@@ -923,9 +963,20 @@ pub struct PipeRecord {
 }
 
 impl PipeRecord {
+    /// Record that the state this pipe is in now is one its caller asked for: its
+    /// `StateReason` becomes [`USER_INITIATED_STATE_REASON`].
+    ///
+    /// Every lifecycle write a REQUEST drives goes through here, so a pipe reports why it
+    /// is where it is from the moment the call lands — whether it is still mid-move or
+    /// already resting — and no earlier failure's reason outlives the state it described.
+    pub fn note_user_initiated(&mut self) {
+        self.state_reason = Some(USER_INITIATED_STATE_REASON.to_string());
+    }
+
     /// Put the pipe into `transient` now and owe it the move to `settled`.
     pub fn begin_transition(&mut self, transient: &str, settled: &str) {
         self.current_state = transient.to_string();
+        self.note_user_initiated();
         self.pending = Some(pending_transition(settled));
     }
 
@@ -934,6 +985,9 @@ impl PipeRecord {
     /// carrying `reason`.
     pub fn begin_failed_transition(&mut self, transient: &str, failed: &str, reason: String) {
         self.current_state = transient.to_string();
+        // The transient state is still one the caller asked for; the failure's own reason
+        // replaces this one when the move it describes lands.
+        self.note_user_initiated();
         self.pending = Some(failed_transition(failed, reason));
     }
 
@@ -942,8 +996,9 @@ impl PipeRecord {
     /// transient state.
     ///
     /// The `StateReason` is the settled move's own: a move that failed installs the
-    /// sentence saying why, and one that simply landed clears whatever a previous failure
-    /// had left, because the reason describes the state the pipe is in now.
+    /// sentence saying why, and one the caller drove installs
+    /// [`USER_INITIATED_STATE_REASON`], because the reason describes how the pipe came to
+    /// be in the state it is in now and not how it came to be in an earlier one.
     pub fn settle(&mut self, now: Instant) {
         let settled = match &self.pending {
             Some(pending) if now >= pending.due_at => pending.clone(),

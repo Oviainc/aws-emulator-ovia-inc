@@ -329,7 +329,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The move the clock owes: `CREATING` -> where this creation lands.
             pending: Some(pending),
             desired_state,
-            state_reason: None,
+            // The pipe is `CREATING` because this caller asked for it, and the move it is
+            // making was asked for too, so the reason is the user-initiated one from here
+            // until a failed move replaces it with its own.
+            state_reason: Some(crate::state::USER_INITIATED_STATE_REASON.to_string()),
             source: input.source.clone(),
             source_parameters: input.source_parameters.clone(),
             enrichment: input.enrichment.clone(),

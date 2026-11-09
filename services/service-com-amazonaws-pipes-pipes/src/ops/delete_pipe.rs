@@ -172,6 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         pipe.desired_state = crate::state::requested_state::DELETED.to_string();
         pipe.current_state = crate::state::pipe_state::DELETING.to_string();
+        // The deletion this call applied is the reason the pipe is `DELETING`, the same
+        // user-initiated reason every other caller-driven move reports.
+        pipe.note_user_initiated();
         pipe.pending = None;
         pipe.last_modified_time = ::std::time::SystemTime::now();
 

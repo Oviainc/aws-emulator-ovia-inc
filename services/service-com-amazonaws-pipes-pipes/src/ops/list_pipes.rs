@@ -211,18 +211,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let limit = usize::try_from(limit).unwrap_or(1);
 
         // A `NextToken` is opaque to its caller, who passes back one THIS service issued;
-        // anything else is refused rather than silently read as a name.
+        // anything else is refused rather than silently read as a name. The token is one
+        // this service cannot interpret — not a value outside a modelled constraint — so
+        // the refusal is the sentence naming the parameter, with the detail in `fieldList`.
         let start_after = match input.next_token.as_deref() {
             None => None,
             Some(token) => match crate::state::decode_next_token(token) {
                 Some(after) => Some(after),
                 None => {
                     return Err(ListPipesErrorModeled::ValidationException(
-                        crate::state::validation_error(vec![crate::state::validation_field(
+                        crate::state::invalid_parameter(
                             "NextToken",
+                            crate::state::MALFORMED_REQUEST_REASON,
                             "must be a NextToken returned by a previous ListPipes call, \
                              passed back unchanged",
-                        )]),
+                        ),
                     )
                     .into());
                 }
