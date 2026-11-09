@@ -17,6 +17,8 @@ mod connector_catalog;
 mod connector_configuration;
 #[path = "all/connector_describe.rs"]
 mod connector_describe;
+#[path = "all/flow_concurrent_start.rs"]
+mod flow_concurrent_start;
 #[path = "all/flow_execution_cancellation.rs"]
 mod flow_execution_cancellation;
 #[path = "all/flow_lifecycle.rs"]
