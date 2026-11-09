@@ -145,6 +145,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
+        // Classified by FORM before anything is read: `sandboxId` is typed only
+        // `NonEmptyString`, so a value that is neither a sandbox id nor the ARN carrying
+        // one names no sandbox at all, and there is nothing to resolve an execution
+        // within — refused ahead of the read rather than answered with a not-found
+        // partition that would read as "this sandbox holds no such execution". The rule
+        // is `crate::state::sandbox_identifier_violation`.
+        if let Some(message) = crate::state::sandbox_identifier_violation(&input.sandbox_id) {
+            return Err(BatchGetCommandExecutionsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         // `sandboxId` is documented as "A sandboxId", and the sibling
         // `StartCommandExecution` takes either form, so an ARN resolves to the same
         // sandbox here too — the rewrite every sandbox-addressing operation shares.

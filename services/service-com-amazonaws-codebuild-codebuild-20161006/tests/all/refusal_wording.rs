@@ -544,18 +544,21 @@ async fn an_absent_webhook_is_refused_in_codebuilds_own_words() {
 /// names no identifier, so no ARN for a resource that does not exist is disclosed and
 /// the sentence is the same on every operation that ACTS ON a sandbox.
 /// (`StartSandboxConnection`, which opens a session into one, classifies an id it cannot
-/// resolve as invalid input instead — see `tests/all/sandbox_connection.rs`.)
+/// resolve as invalid input instead — see `tests/all/sandbox_connection.rs`. A value that
+/// is no sandbox identifier at all is refused ahead of the lookup by every operation whose
+/// member takes "a sandboxId or sandboxArn" — see
+/// `tests/all/identifier_shape_refusals.rs`.)
 #[tokio::test]
 async fn an_absent_sandbox_is_refused_in_codebuilds_own_words() {
     let router = emulator();
 
-    // Identifiers of the documented `<project-name>:<uuid>` shape that name nothing,
-    // the ARN form of one of them, and a bare project name.
+    // Identifiers of the documented `<project-name>:<uuid>` shape that name nothing, the
+    // ARN form of one of them, and one whose second half is not a uuid.
     let absent = [
         "sandbox-proj:3f3ec2b3-57b1-4a16-9a6a-4a4d2b9c9a11".to_string(),
         "another-proj:00000000-0000-8000-8000-000000000000".to_string(),
         state::sandbox_arn(REGION, "sandbox-proj:1"),
-        "sandbox-proj".to_string(),
+        "sandbox-proj:0001".to_string(),
     ];
 
     for identifier in absent {

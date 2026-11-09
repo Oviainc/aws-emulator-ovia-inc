@@ -461,10 +461,12 @@ async fn an_absent_policy_target_is_refused_on_the_arn_member() {
 /// CODE is what an SDK branches on, so each operation carries the class CodeBuild assigns
 /// it.
 ///
-/// The rows span the forms an unresolvable identifier takes: the documented
-/// `<project>:<uuid>` shape, one of a project that was never created, a bare project name,
-/// and a sandbox ARN — `sandboxId` is documented as "A sandboxId or sandboxArn", so both
-/// forms are driven.
+/// The rows span the forms a WELL-FORMED unresolvable identifier takes: the documented
+/// `<project>:<uuid>` shape, one of a project that was never created, a second half that is
+/// not a uuid, and a sandbox ARN — `sandboxId` is documented as "A sandboxId or sandboxArn",
+/// so both forms are driven. A value that is no sandbox identifier at all is a different
+/// class, refused by its own sentence ahead of any lookup — see
+/// `tests/all/identifier_shape_refusals.rs`.
 #[tokio::test]
 async fn an_unresolvable_sandbox_id_is_bad_input_to_a_connection() {
     let router = emulator();
@@ -479,7 +481,10 @@ async fn an_unresolvable_sandbox_id_is_bad_input_to_a_connection() {
             "a project that was never created",
             "no-such-proj:3f3ec2b3-57b1-4a16-9a6a-4a4d2b9c9a11".to_string(),
         ),
-        ("a bare project name", "sandbox-proj".to_string()),
+        (
+            "a second half that is not a uuid",
+            "sandbox-proj:0001".to_string(),
+        ),
         (
             "an ARN of a sandbox never minted",
             state::sandbox_arn(REGION, "sandbox-proj:never-minted"),

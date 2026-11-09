@@ -517,7 +517,9 @@ async fn a_command_execution_settles_once_from_stored_state_and_never_changes_ag
 /// `ResourceNotFoundException`, a sandbox whose session has ENDED with
 /// `InvalidInputException` stating the status it is in, and a refused submission persists
 /// nothing. A sandbox still being provisioned is neither: it takes the submission, which
-/// is `a_queued_sandbox_takes_a_command_submission`'s subject.
+/// is `a_queued_sandbox_takes_a_command_submission`'s subject. (A value that is no sandbox
+/// identifier at all never reaches the lookup — `tests/all/identifier_shape_refusals.rs`
+/// drives that class.)
 #[tokio::test]
 async fn start_command_execution_refuses_a_sandbox_it_cannot_run_a_command_in() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -544,8 +546,8 @@ async fn start_command_execution_refuses_a_sandbox_it_cannot_run_a_command_in() 
             state::sandbox_arn(REGION, &unknown_uuid),
         ),
         (
-            "a project name rather than a sandbox id",
-            "cmd-refuse".to_string(),
+            "an id whose second half is not a uuid",
+            "cmd-refuse:nothing-started".to_string(),
         ),
         ("a held id in the wrong case", held_id.to_uppercase()),
         (

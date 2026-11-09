@@ -152,6 +152,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = crate::state::now_millis();
 
+        // Classified by FORM before the sandbox is resolved: `sandboxId` is typed only
+        // `NonEmptyString`, so a value that is neither a sandbox id nor the ARN carrying
+        // one names no sandbox at all and is refused as bad input rather than reported as
+        // a missing resource — the shared rule
+        // `crate::state::sandbox_identifier_violation`, which keeps the two absent-input
+        // classes apart.
+        if let Some(message) = crate::state::sandbox_identifier_violation(&input.sandbox_id) {
+            return Err(malformed_sandbox_id(message));
+        }
+
         // `sandboxId` is documented as "A sandboxId or sandboxArn", so either form
         // names the same record — the rewrite every sandbox-addressing operation
         // shares.
@@ -247,6 +257,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn sandbox_not_found() -> StartCommandExecutionError {
     StartCommandExecutionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(crate::state::SANDBOX_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The modelled refusal for a `sandboxId` that is not a sandbox identifier at all.
+///
+/// The SHAPE question, which is a different refusal from the absence of a sandbox: a
+/// value carrying no sandbox to look up is bad input (the modelled
+/// `InvalidInputException`), where a well-formed identifier this account holds no sandbox
+/// for is the missing resource [`sandbox_not_found`] reports. The sentence comes from
+/// [`crate::state::sandbox_identifier_violation`], the rule that judged the form, and is
+/// fixed text naming nothing of the request.
+fn malformed_sandbox_id(message: &str) -> StartCommandExecutionError {
+    StartCommandExecutionErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message.to_string()),
     })
     .into()
 }

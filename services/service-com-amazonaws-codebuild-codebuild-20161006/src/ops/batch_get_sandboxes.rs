@@ -153,6 +153,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `ids` takes "a comma separated list of sandboxIds or sandboxArns", and an entry
+        // that is neither is no sandbox identifier at all: it is refused here, ahead of
+        // any lookup, rather than absorbed into `sandboxesNotFound`, which a caller could
+        // not tell from "this account holds no such sandbox". The rule itself is
+        // `crate::state::sandbox_identifier_violation`.
+        if let Some(message) = input
+            .ids
+            .iter()
+            .find_map(|entry| crate::state::sandbox_identifier_violation(entry))
+        {
+            return Err(BatchGetSandboxesErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         let now = crate::state::now_millis();
         let mut sandboxes = Vec::new();
         let mut not_found = Vec::new();

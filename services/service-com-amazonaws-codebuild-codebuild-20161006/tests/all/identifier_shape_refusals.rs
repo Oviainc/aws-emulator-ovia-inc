@@ -136,6 +136,41 @@ async fn batch_get_fleets_refuses_a_name_that_is_not_a_fleet_name() {
     }
 }
 
+/// Every way a value can lack the structure a sandbox identifier has, each in a value of
+/// its own: no separator at all, a half of the pair missing, nothing but the separator,
+/// and an ARN whose resource segment names something other than a sandbox.
+///
+/// A sandbox-addressing member is documented as "a sandboxId or sandboxArn"
+/// (`smithy_query(query="doc", shape="StartSandboxConnectionInput", member="sandboxId")`),
+/// and a sandbox id is the structured `<projectName>:<id>` pair `StartSandbox` mints — so
+/// ONE table serves every operation that addresses a sandbox and the rows cannot drift
+/// apart between them. `project` is the project the values are written around, so a row
+/// names a project that really exists where that could matter.
+fn unstructured_sandbox_ids(project: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("a bare name", project.to_string()),
+        (
+            "a bare uuid",
+            "00000000-0000-8000-8000-000000000000".to_string(),
+        ),
+        ("a project with no id", format!("{project}:")),
+        ("an id with no project", ":0001".to_string()),
+        ("the separator alone", ":".to_string()),
+        (
+            "a project ARN rather than a sandbox ARN",
+            state::project_arn(REGION, project),
+        ),
+        (
+            "a build ARN rather than a sandbox ARN",
+            state::build_arn(REGION, &format!("{project}:0001")),
+        ),
+        (
+            "another service's ARN",
+            "arn:aws:s3:::bucket/key".to_string(),
+        ),
+    ]
+}
+
 /// RULE: a sandbox identifier is either a sandbox ARN or the structured
 /// `<projectName>:<id>` pair a sandbox id is, so `ListCommandExecutionsForSandbox`
 /// refuses a bare, unstructured value with `InvalidInputException` before it lists
@@ -146,29 +181,7 @@ async fn list_command_executions_for_sandbox_refuses_an_id_that_is_not_a_sandbox
     let router = emulator();
     create_project(&router, "cmd-shape", json!({})).await;
 
-    // Every way an identifier can lack a sandbox id's structure: no separator at all, a
-    // half of the pair missing, nothing but the separator, and an ARN whose resource
-    // segment names something other than a sandbox.
-    let refused = [
-        ("a bare name", "cmd-shape".to_string()),
-        ("a bare uuid", "00000000-0000-8000-8000-000000000000".to_string()),
-        ("a project with no id", "cmd-shape:".to_string()),
-        ("an id with no project", ":0001".to_string()),
-        ("the separator alone", ":".to_string()),
-        (
-            "a project ARN rather than a sandbox ARN",
-            state::project_arn(REGION, "cmd-shape"),
-        ),
-        (
-            "a build ARN rather than a sandbox ARN",
-            state::build_arn(REGION, "cmd-shape:0001"),
-        ),
-        (
-            "another service's ARN",
-            "arn:aws:s3:::bucket/key".to_string(),
-        ),
-    ];
-    for (case, sandbox_id) in refused {
+    for (case, sandbox_id) in unstructured_sandbox_ids("cmd-shape") {
         let (status, body) = call(
             &router,
             "ListCommandExecutionsForSandbox",
@@ -214,6 +227,219 @@ async fn list_command_executions_for_sandbox_refuses_an_id_that_is_not_a_sandbox
         )
         .await;
         assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {body}");
+        assert_eq!(
+            body["commandExecutions"],
+            json!([]),
+            "case {case:?}: a sandbox holding nothing lists nothing, got {body}"
+        );
+    }
+}
+
+/// One operation that addresses a sandbox: its name and the request body that carries
+/// `identifier` on the member documented as "a sandboxId or sandboxArn".
+type SandboxAddressed = (&'static str, fn(&str) -> Value);
+
+/// Every operation of this service that takes a sandbox by that member, with the request
+/// that addresses `identifier` through it.
+///
+/// `smithy_query(query="operation", operation="StartSandboxConnection,StartCommandExecution,\
+/// BatchGetCommandExecutions,ListCommandExecutionsForSandbox,BatchGetSandboxes")` is where
+/// the list comes from: those five are the members documented "a sandboxId or sandboxArn"
+/// (`BatchGetSandboxes$ids` as "a comma separated list" of them). `StopSandbox$id` is
+/// documented differently and is not one of them.
+const SANDBOX_ADDRESSING_OPERATIONS: [SandboxAddressed; 5] = [
+    ("StartSandboxConnection", |identifier| {
+        json!({"sandboxId": identifier})
+    }),
+    ("StartCommandExecution", |identifier| {
+        json!({"sandboxId": identifier, "command": "echo hi"})
+    }),
+    ("BatchGetCommandExecutions", |identifier| {
+        json!({"sandboxId": identifier, "commandExecutionIds": ["any-execution"]})
+    }),
+    ("ListCommandExecutionsForSandbox", |identifier| {
+        json!({"sandboxId": identifier})
+    }),
+    ("BatchGetSandboxes", |identifier| {
+        json!({"ids": [identifier]})
+    }),
+];
+
+/// RULE: a member documented as "a sandboxId or sandboxArn" is classified by FORM before
+/// it is resolved — a value that is neither the structured `<projectName>:<id>` pair a
+/// sandbox id is nor a sandbox ARN carries no sandbox to look up, so every operation
+/// taking one refuses it with 400 `InvalidInputException` stating `Invalid sandbox ID
+/// provided`, ahead of any lookup. The ABSENCE of a sandbox is the other class entirely,
+/// and each operation keeps its own answer for it.
+///
+/// The rows span the class twice over: every way a value can lack a sandbox id's
+/// structure, against every operation that addresses a sandbox.
+#[tokio::test]
+async fn every_sandbox_addressing_operation_refuses_an_id_that_is_not_a_sandbox_id() {
+    let router = emulator();
+    create_project(&router, "shape-sbx", json!({})).await;
+
+    for (operation, request) in SANDBOX_ADDRESSING_OPERATIONS {
+        for (row, identifier) in unstructured_sandbox_ids("shape-sbx") {
+            let case = format!("{operation} for {row}");
+            let (status, body) = call(&router, operation, request(&identifier)).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400, got {status} with {body}"
+            );
+            assert_eq!(
+                error_type(&body),
+                "InvalidInputException",
+                "case {case:?}: expected InvalidInputException, got {body}"
+            );
+            assert_eq!(
+                message(&body),
+                state::INVALID_SANDBOX_ID_MESSAGE,
+                "case {case:?}: expected CodeBuild's invalid-sandbox-id sentence, got {body}"
+            );
+            assert!(
+                !message(&body).contains(&identifier),
+                "case {case:?}: the sentence must not echo the value, got {body}"
+            );
+        }
+    }
+}
+
+/// RULE: the other half of the same classification — a WELL-FORMED sandbox identifier
+/// this account holds no sandbox for is not a malformed value, so each operation answers
+/// it as it answers an absent sandbox: the connection with the bad-input sentence `No
+/// sandbox found with specified ID`, the command submission with 400
+/// `ResourceNotFoundException` `Sandbox does not exist`, and the reads successfully, from
+/// the store.
+///
+/// The rows span the forms a well-formed identifier takes: the documented
+/// `<project>:<uuid>` shape, a project that was never created, a second half that is not a
+/// uuid, and the ARN form.
+#[tokio::test]
+async fn a_well_formed_sandbox_id_keeps_each_operations_absent_answer() {
+    let router = emulator();
+    create_project(&router, "shape-absent", json!({})).await;
+
+    let absent = [
+        (
+            "the documented shape, never minted",
+            "shape-absent:00000000-0000-8000-8000-000000000000".to_string(),
+        ),
+        (
+            "a project that was never created",
+            "no-such-project:3f3ec2b3-57b1-4a16-9a6a-4a4d2b9c9a11".to_string(),
+        ),
+        (
+            "a second half that is not a uuid",
+            "shape-absent:0001".to_string(),
+        ),
+        (
+            "the ARN of an id never minted",
+            state::sandbox_arn(REGION, "shape-absent:never-minted"),
+        ),
+    ];
+
+    for (row, identifier) in &absent {
+        // Opening a connection: still bad input, but CodeBuild's OTHER sentence — which
+        // is the whole point of classifying by form first.
+        let case = format!("StartSandboxConnection for {row}");
+        let (status, body) = call(
+            &router,
+            "StartSandboxConnection",
+            json!({"sandboxId": identifier}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_type(&body),
+            "InvalidInputException",
+            "case {case:?}: expected InvalidInputException, got {body}"
+        );
+        assert_eq!(
+            message(&body),
+            state::UNRESOLVABLE_SANDBOX_ID_MESSAGE,
+            "case {case:?}: expected CodeBuild's unresolvable-sandbox-id sentence, got {body}"
+        );
+
+        // Submitting a command: the absence of the sandbox, as a missing resource.
+        let case = format!("StartCommandExecution for {row}");
+        let (status, body) = call(
+            &router,
+            "StartCommandExecution",
+            json!({"sandboxId": identifier, "command": "echo hi"}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_type(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body}"
+        );
+        assert_eq!(
+            message(&body),
+            state::SANDBOX_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected CodeBuild's absent-sandbox sentence, got {body}"
+        );
+
+        // The batch read of sandboxes: no refusal at all — the entry is reported under
+        // `sandboxesNotFound`, as the caller wrote it.
+        let case = format!("BatchGetSandboxes for {row}");
+        let (status, body) = call(&router, "BatchGetSandboxes", json!({"ids": [identifier]})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["sandboxes"],
+            json!([]),
+            "case {case:?}: nothing resolves, so sandboxes must be [], got {body}"
+        );
+        assert_eq!(
+            body["sandboxesNotFound"],
+            json!([identifier]),
+            "case {case:?}: the entry must be reported as written, got {body}"
+        );
+
+        // The reads WITHIN a sandbox: answered from the store too, holding nothing.
+        let case = format!("BatchGetCommandExecutions for {row}");
+        let (status, body) = call(
+            &router,
+            "BatchGetCommandExecutions",
+            json!({"sandboxId": identifier, "commandExecutionIds": ["any-execution"]}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["commandExecutions"],
+            json!([]),
+            "case {case:?}: nothing resolves, so commandExecutions must be [], got {body}"
+        );
+        assert_eq!(
+            body["commandExecutionsNotFound"],
+            json!(["any-execution"]),
+            "case {case:?}: the id asked for must be reported missing, got {body}"
+        );
+
+        let case = format!("ListCommandExecutionsForSandbox for {row}");
+        let (status, body) = call(
+            &router,
+            "ListCommandExecutionsForSandbox",
+            json!({"sandboxId": identifier}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} with {body}"
+        );
         assert_eq!(
             body["commandExecutions"],
             json!([]),

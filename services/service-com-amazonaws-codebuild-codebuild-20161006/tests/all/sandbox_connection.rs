@@ -599,9 +599,12 @@ async fn a_sandbox_outside_its_run_phase_cannot_be_connected_to() {
     );
 }
 
-/// RULE: an id — or ARN — no sandbox of the account answers to is refused by THIS
-/// operation as bad input: `InvalidInputException` (HTTP 400) carrying CodeBuild's fixed
-/// unresolvable-id sentence and naming nothing of the request.
+/// RULE: a WELL-FORMED id — or ARN — no sandbox of the account answers to is refused by
+/// THIS operation as bad input: `InvalidInputException` (HTTP 400) carrying CodeBuild's
+/// fixed unresolvable-id sentence and naming nothing of the request. A value that is not a
+/// sandbox identifier at all is the other class and carries the other sentence — see
+/// `tests/all/identifier_shape_refusals.rs`, which drives it across every operation that
+/// addresses a sandbox.
 #[tokio::test]
 async fn an_unresolvable_sandbox_is_refused_as_invalid_input() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -619,7 +622,6 @@ async fn an_unresolvable_sandbox_is_refused_as_invalid_input() {
             "missing-proj:00000000-0000-8000-8000-000000000000".to_string(),
         ),
         ("an id of another project", "other-proj:1".to_string()),
-        ("the project name alone", "missing-proj".to_string()),
         (
             "an ARN of a sandbox never minted",
             state::sandbox_arn(REGION, "missing-proj:never-minted"),

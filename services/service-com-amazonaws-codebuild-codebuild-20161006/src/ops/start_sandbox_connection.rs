@@ -6,7 +6,8 @@
 //!
 //! A connection is a session INTO the sandbox's live session, so it needs one to act
 //! on: a sandbox that is still queued, or that has stopped or timed out, is refused,
-//! and an id no sandbox answers to is refused as invalid input. Each call starts its OWN
+//! and an id no sandbox answers to is refused as invalid input — as is, with its own
+//! sentence, a value that is not a sandbox identifier at all. Each call starts its OWN
 //! session — a fresh session id, its own token and its own data-channel URL — and that
 //! session is persisted ([`crate::state::StoredSandboxConnection`]) for as long as it
 //! can be used, which is as long as the sandbox session it connects to lives.
@@ -146,6 +147,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = crate::state::now_millis();
 
+        // Classified by FORM before anything is resolved. `sandboxId` is typed only
+        // `NonEmptyString`, so the SHAPE of the identifier is this handler's rule: a value
+        // that is neither a sandbox id nor the ARN carrying one names no sandbox at all,
+        // so it is refused as a value this operation cannot act on rather than reported as
+        // an identifier nothing answers to — which is what keeps the two absent-input
+        // classes apart. The rule itself is
+        // `crate::state::sandbox_identifier_violation`, shared with every other operation
+        // that takes a sandbox by either form.
+        if let Some(message) = crate::state::sandbox_identifier_violation(&input.sandbox_id) {
+            return Err(malformed_sandbox_id(message));
+        }
+
         // `sandboxId` is documented as "A sandboxId or sandboxArn", so either form names
         // the same record — the rewrite every sandbox-addressing operation shares.
         let store_id = crate::state::sandbox_store_id(&input.sandbox_id);
@@ -227,10 +240,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// session is a value the operation cannot act on at all. Worded by the one sentence
 /// CodeBuild answers that with ([`crate::state::UNRESOLVABLE_SANDBOX_ID_MESSAGE`]), which
 /// names no identifier — so nothing about the request, and no ARN for a sandbox that does
-/// not exist, reaches the wire.
+/// not exist, reaches the wire. It is the WELL-FORMED half of the two refusals: a value
+/// that is not a sandbox identifier at all is refused by [`malformed_sandbox_id`] instead.
 fn unresolvable_sandbox_id() -> StartSandboxConnectionError {
     StartSandboxConnectionErrorModeled::InvalidInputException(InvalidInputException {
         message: Some(crate::state::UNRESOLVABLE_SANDBOX_ID_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The modelled refusal for a `sandboxId` that is not a sandbox identifier at all.
+///
+/// The other half of the same `InvalidInputException`: CodeBuild separates a value whose
+/// FORM carries no sandbox to look up from a well-formed identifier whose sandbox is gone,
+/// so a client can tell a garbled identifier (fix the caller) from a session that has
+/// ended (expected, often benign). The sentence comes from
+/// [`crate::state::sandbox_identifier_violation`], the rule that judged the form, and is
+/// fixed text naming nothing of the request.
+fn malformed_sandbox_id(message: &str) -> StartSandboxConnectionError {
+    StartSandboxConnectionErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message.to_string()),
     })
     .into()
 }
