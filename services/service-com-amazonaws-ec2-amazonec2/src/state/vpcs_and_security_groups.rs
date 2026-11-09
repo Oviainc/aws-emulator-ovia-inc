@@ -2829,6 +2829,33 @@ pub fn invalid_launch_template_id_malformed<E>(
     )
 }
 
+/// Refuse a launch template id an operation with EC2's STRICT launch-template validator
+/// could not resolve, in the wording that names the id as "specified": HTTP 400
+/// [`INVALID_LAUNCH_TEMPLATE_ID_MALFORMED`], `The specified launch template ID '<id>' is
+/// malformed.`
+///
+/// A SECOND wording of that code beside [`invalid_launch_template_id_malformed`] (which says
+/// `Invalid launch template ID: '<id>'`) and [`launch_template_ids_malformed`] (which names a
+/// LIST of them), and a named constructor rather than a literal at a call site for the reason
+/// [`crate::scaffolded::Scaffolded::instance_id_is_malformed`] is one: EC2's per-operation
+/// validators do not agree about an id they cannot resolve, and WHICH wording an operation
+/// answers is a fact of that operation, recorded by its caller — `ec2.create-fleet-contract`
+/// pins this sentence for `CreateFleet`. The one variable part is the id the request sent,
+/// cut to length by [`echoed_resource_id`] the way every refusal of this crate bounds a value
+/// it repeats back.
+pub fn specified_launch_template_id_is_malformed<E>(
+    launch_template_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_LAUNCH_TEMPLATE_ID_MALFORMED,
+        400,
+        format!(
+            "The specified launch template ID '{}' is malformed.",
+            echoed_resource_id(launch_template_id)
+        ),
+    )
+}
+
 /// Refuse the launch template ids of a request that name no launch template of the account:
 /// HTTP 400 [`INVALID_LAUNCH_TEMPLATE_ID_MALFORMED`], naming every one of them in the one
 /// message.

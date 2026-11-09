@@ -2330,6 +2330,12 @@ pub mod enclave_certificate_iam_roles;
 mod account_attributes;
 mod network_acl_store;
 mod fleets;
+/// How an EC2 Fleet's capacity becomes instances — the pools it places, the one launch of an
+/// instance from a launch specification that a fleet and a Spot Instance request share, and
+/// the projection of what a fleet placed — in a file of its own rather than as more lines
+/// here. Everything it declares is re-exported below, so a handler reaches it as
+/// `crate::state::place_fleet_instances` like any helper of this module.
+mod fleet_placements;
 mod network_insights;
 mod nat_gateways_and_vpn_connections;
 mod spot_fleets;
@@ -2429,6 +2435,7 @@ pub use spot_fleets::*;
 pub use nat_gateways_and_vpn_connections::*;
 pub use network_insights::*;
 pub use fleets::*;
+pub use fleet_placements::*;
 pub use network_acl_store::*;
 pub use account_attributes::*;
 

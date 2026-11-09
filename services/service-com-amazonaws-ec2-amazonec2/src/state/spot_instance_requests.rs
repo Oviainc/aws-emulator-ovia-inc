@@ -566,7 +566,9 @@ impl ComAmazonawsEc2Amazonec2State {
             .map(|(request_id, _)| request_id.clone())
             .collect();
         for request_id in due {
-            self.fulfill_spot_instance_request(&request_id);
+            // A request a CALLER placed tags the request, not the instance it launches, so
+            // the instance this fulfilment mints carries no tags of its own.
+            self.fulfill_spot_instance_request(&request_id, BTreeMap::new());
         }
     }
 
@@ -574,9 +576,14 @@ impl ComAmazonawsEc2Amazonec2State {
     /// `active` / `fulfilled`.
     ///
     /// Every launch parameter comes off the request's own stored launch specification, so
-    /// the instance is the one the request described; the request keeps its tags (they tag
-    /// "the Spot Instance request on creation",
-    /// `RequestSpotInstancesRequest$TagSpecifications`, not the instance).
+    /// the instance is the one the request described, and the launch itself is the one every
+    /// placement from a launch specification goes through
+    /// ([`Self::launch_specified_instance`]) — so an instance a request launches and one an
+    /// EC2 Fleet places are the same kind of instance. `tags` are the tags the instance
+    /// itself carries: a request a CALLER placed tags the request ("the Spot Instance
+    /// request on creation", `RequestSpotInstancesRequest$TagSpecifications`) and so gives
+    /// the instance none, while a fleet's `instance` tag specifications tag "the instances
+    /// at launch" (`CreateFleetRequest$TagSpecifications`).
     ///
     /// A request this store has no room to launch for — no instance slot, or no private
     /// address left — stays `open` carrying [`SPOT_STATUS_CAPACITY_NOT_AVAILABLE`], which
@@ -588,7 +595,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// caller-chosen string the instance holds is one
     /// [`spot_instance_request_payload_bytes`] charged for the request that launched it, so
     /// the store's byte ceiling was cleared before this move was ever owed.
-    pub(super) fn fulfill_spot_instance_request(&mut self, request_id: &str) {
+    pub(super) fn fulfill_spot_instance_request(
+        &mut self,
+        request_id: &str,
+        tags: BTreeMap<String, String>,
+    ) {
         let Some(record) = self.spot_instance_requests.get(request_id) else {
             return;
         };
@@ -598,114 +609,23 @@ impl ComAmazonawsEc2Amazonec2State {
             .fulfillment
             .as_ref()
             .map_or_else(SystemTime::now, |fulfillment| fulfillment.at);
-        let availability_zone = launch
-            .placement
-            .as_ref()
-            .and_then(|placement| placement.availability_zone.clone())
-            .or_else(|| {
-                availability_zones_in_region(&region)
-                    .first()
-                    .map(|zone| zone.zone_name.clone())
-            })
-            .unwrap_or_else(|| region.clone());
 
-        if self.instances.len() >= MAX_STORED_INSTANCES {
-            self.leave_spot_instance_request_unplaced(request_id, at);
-            return;
-        }
-        let Some(private_ip) = self.allocate_private_ip() else {
+        let Some(launched) = self.launch_specified_instance(SpecifiedLaunch {
+            launch: &launch,
+            region: &region,
+            // The instance was launched when the fulfillment fell due, not when somebody
+            // next asked about it.
+            at,
+            spot_instance_request_id: Some(request_id),
+            tags,
+        }) else {
             self.leave_spot_instance_request_unplaced(request_id, at);
             return;
         };
-
-        // A Spot Instance is its own reservation: one instance launched by one request.
-        let reservation_id = self.mint_reservation_id();
-        self.insert_reservation(ReservationRecord {
-            reservation_id: reservation_id.clone(),
-            owner_id: ::engine::emulator_account_id().to_string(),
-            requester_id: None,
-            instance_ids: Vec::new(),
-        });
-        let instance_id = self.mint_instance_id();
-        let (image_kernel_id, image_ramdisk_id) =
-            self.image_kernel_and_ramdisk(launch.image_id.as_deref());
-        let instance_type = launch
-            .instance_type
-            .clone()
-            .unwrap_or_else(|| DEFAULT_INSTANCE_TYPE.to_string());
-        self.insert_instance(InstanceRecord {
-            instance_id: instance_id.clone(),
-            reservation_id,
-            image_id: launch.image_id.clone(),
-            instance_type: instance_type.clone(),
-            key_name: launch.key_name.clone(),
-            subnet_id: launch.subnet_id.clone(),
-            security_groups: launch
-                .security_groups
-                .iter()
-                .flatten()
-                .map(|group| (group.group_id.clone(), group.group_name.clone()))
-                .collect(),
-            private_dns_name: private_dns_name(&private_ip, &region),
-            private_ip,
-            // A public address comes from a default-VPC subnet or an Elastic IP, neither of
-            // which this slice models — the same answer `RunInstances` gives.
-            public_ip: None,
-            // An instance AWS has just launched is `pending`; the clock owes it `running`,
-            // on the same span as every other transition of this crate.
-            state: InstanceStateName::Pending,
-            pending_transition: Some(PendingTransition::starting_now(InstanceStateName::Running)),
-            state_transition_reason: None,
-            state_reason: None,
-            // Nobody has asked to reboot an instance that has just been launched, and
-            // nobody has interrupted it either.
-            queued_reboots: 0,
-            last_reboot_queued_at: None,
-            diagnostic_interrupts: 0,
-            last_diagnostic_interrupt_at: None,
-            // The guest's FIRST boot: the operating system comes up as the instance finishes
-            // starting, the same instant the `pending` -> `running` move above falls due.
-            boots: Vec::new(),
-            boot_due: Some(at + TRANSITION_DELAY),
-            // The instance was launched when the fulfillment fell due, not when somebody
-            // next asked about it.
-            launch_time: at,
-            ami_launch_index: 0,
-            user_data: launch.user_data.clone(),
-            placement_az: availability_zone.clone(),
-            monitoring_state: if launch
-                .monitoring
-                .as_ref()
-                .is_some_and(|monitoring| monitoring.enabled)
-            {
-                MONITORING_STATE_ENABLED.to_string()
-            } else {
-                MONITORING_STATE_DISABLED.to_string()
-            },
-            // The launch specification says whether monitoring is on from the start, so
-            // there is no move for the clock to make.
-            monitoring_transition: None,
-            // A Spot launch specification configures none of the option sets an instance
-            // reports, so every one of them is at its documented default.
-            detail: InstanceDetail::default(),
-            architecture: architecture_for(&instance_type),
-            // The launch specification's kernel and RAM disk, falling back to the ones the
-            // AMI carries — the same resolution `RunInstances` makes.
-            kernel_id: launch.kernel_id.clone().or(image_kernel_id),
-            ramdisk_id: launch.ramdisk_id.clone().or(image_ramdisk_id),
-            // Nothing in a Spot launch specification sets source/destination checking, so
-            // the instance starts at the documented default.
-            source_dest_check: DEFAULT_SOURCE_DEST_CHECK,
-            ebs_optimized: launch.ebs_optimized.unwrap_or(false),
-            // Hibernation is `InstanceInterruptionBehavior`'s business for a Spot
-            // Instance, and the launch specification carries no hibernation member.
-            hibernation_configured: false,
-            disable_api_termination: false,
-            // The request's tags tag the REQUEST; nothing tags the instance.
-            tags: BTreeMap::new(),
-            client_token: None,
-            spot_instance_request_id: Some(request_id.to_string()),
-        });
+        let LaunchedInstance {
+            instance_id,
+            availability_zone,
+        } = launched;
 
         if let Some(record) = self.spot_instance_requests.get_mut(request_id) {
             record.view.state = Some(SPOT_REQUEST_STATE_ACTIVE.to_string());

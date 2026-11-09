@@ -2964,6 +2964,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// One token names ONE fleet, because one call mints one — the same arrangement as
     /// [`Self::capacity_reservation_fleet_client_tokens`].
     pub spot_fleet_request_client_tokens: HashMap<String, String>,
+    /// A `CreateFleet` `ClientToken` and the EC2 Fleet that call created, so a repeat of the
+    /// same request answers with that fleet instead of placing more capacity. One token
+    /// names ONE fleet, because one call creates one — the same arrangement as
+    /// [`Self::spot_fleet_request_client_tokens`].
+    pub fleet_client_tokens: HashMap<String, String>,
     /// A `&'static str` so only a member of the modelled `SnapshotBlockPublicAccessState`
     /// catalog can ever be stored here: the word comes from this module's own constants,
     /// never from a request. Read it through
@@ -3456,6 +3461,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // one, and no token names one.
             spot_fleet_requests: BTreeMap::new(),
             spot_fleet_request_client_tokens: HashMap::new(),
+            fleet_client_tokens: HashMap::new(),
             placement_groups: BTreeMap::new(),
             // A fresh account holds no key pair until `CreateKeyPair` mints one.
             key_pairs: BTreeMap::new(),

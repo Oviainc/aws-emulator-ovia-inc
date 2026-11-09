@@ -118,6 +118,9 @@ fn seed_fleet(
             valid_until: None,
             tags: Vec::new(),
             context: None,
+            spot_options: None,
+            on_demand_options: None,
+            pools: Vec::new(),
             instances,
         })
         .expect("the store must have room for one more fleet")
@@ -128,6 +131,7 @@ fn on_demand(instance_id: &str) -> FleetInstanceRecord {
     FleetInstanceRecord {
         instance_id: instance_id.to_string(),
         spot_instance_request_id: None,
+        pool: 0,
     }
 }
 
@@ -136,6 +140,7 @@ fn spot(instance_id: &str, request_id: &str) -> FleetInstanceRecord {
     FleetInstanceRecord {
         instance_id: instance_id.to_string(),
         spot_instance_request_id: Some(request_id.to_string()),
+        pool: 0,
     }
 }
 

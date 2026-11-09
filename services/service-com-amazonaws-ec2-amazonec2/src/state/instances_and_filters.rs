@@ -450,6 +450,11 @@ impl ComAmazonawsEc2Amazonec2State {
         // one nobody answered by its own `ExpirationTime` expired at that instant — both owed
         // whether or not anybody called, the same contract as the `pending` VPC above.
         self.materialize_due_vpc_peering_connections(now, SystemTime::now());
+        // An EC2 Fleet `CreateFleet` accepted as `submitted` is `active` once its due
+        // instant has passed: "the EC2 Fleet places an asynchronous request for your desired
+        // capacity" (`FleetData$Type`), and that request was taken on at the same instant
+        // whether or not anybody called.
+        self.materialize_due_fleets(now);
         let carrier_gateways = &mut self.carrier_gateways;
         self.carrier_gateway_available_at
             .retain(|carrier_gateway_id, due_at| {

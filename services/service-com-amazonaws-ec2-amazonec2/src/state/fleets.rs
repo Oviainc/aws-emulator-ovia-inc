@@ -20,9 +20,49 @@ pub const FLEET_TYPE_MAINTAIN: &str = "maintain";
 /// The `active` member of [`FLEET_STATE_CODE_VALUES`].
 pub const FLEET_STATE_ACTIVE: &str = "active";
 
+/// The `submitted` member of [`FLEET_STATE_CODE_VALUES`]: where an asynchronous fleet — one
+/// of type `maintain` or `request`, which "places an asynchronous request for your desired
+/// capacity" (`FleetData$Type`) — starts, before the clock owes it [`FLEET_STATE_ACTIVE`].
+///
+/// A fleet stored in this state is the one thing that makes [`FleetRecord::activate_at`]
+/// fall due, so the two cannot disagree about which fleets still owe the move.
+pub const FLEET_STATE_SUBMITTED: &str = "submitted";
+
 /// The `fulfilled` member of [`FLEET_ACTIVITY_STATUS_VALUES`]: "`fulfilled` when the fleet
 /// size meets or exceeds target capacity" (`FleetData$ActivityStatus`).
 pub const FLEET_ACTIVITY_STATUS_FULFILLED: &str = "fulfilled";
+
+/// The `pending_fulfillment` member of [`FLEET_ACTIVITY_STATUS_VALUES`]: the fleet is still
+/// short of its target capacity, which is what a fleet that placed less capacity than it was
+/// asked for reports.
+pub const FLEET_ACTIVITY_STATUS_PENDING_FULFILLMENT: &str = "pending_fulfillment";
+
+/// `ResourceType`'s `fleet` member — the resource an EC2 Fleet's own `TagSpecifications`
+/// tag: "specify a resource type of `fleet` to tag the fleet"
+/// (`CreateFleetRequest$TagSpecifications`).
+pub const RESOURCE_TYPE_FLEET: &str = "fleet";
+
+/// `ResourceType`'s `instance` member — the resource an EC2 Fleet's `instance` tag
+/// specifications tag: "`instance` to tag the instances at launch"
+/// (`CreateFleetRequest$TagSpecifications`).
+pub const RESOURCE_TYPE_INSTANCE: &str = "instance";
+
+/// The resource types an `instant` EC2 Fleet's `TagSpecifications` may name, from the
+/// member's own documentation: "If the fleet type is `instant`, specify a resource type of
+/// `fleet` to tag the fleet, `instance` to tag the instances at launch, `volume` to tag the
+/// volumes at launch, or `network-interface` to tag the network interfaces at launch."
+///
+/// A fleet of any other type may name only [`RESOURCE_TYPE_FLEET`]: "if the fleet type is
+/// `maintain` or `request` … you cannot specify a resource type of `instance`, `volume`, or
+/// `network-interface`". Only the first two have a resource this slice stores: a launched
+/// instance's root volume and primary network interface are derived from the instance
+/// itself, so tags for them are carried by no resource here.
+pub const INSTANT_FLEET_TAGGABLE_RESOURCES: &[&str] = &[
+    RESOURCE_TYPE_FLEET,
+    RESOURCE_TYPE_INSTANCE,
+    "volume",
+    RESOURCE_TYPE_NETWORK_INTERFACE,
+];
 
 /// The `healthy` member of the modelled `InstanceHealthStatus` catalog
 /// ([`crate::ops::types::INSTANCE_HEALTH_STATUS_VALUES`]).
@@ -49,6 +89,12 @@ pub struct FleetInstanceRecord {
     /// instance was placed through, or `None` for an On-Demand instance, which is placed
     /// through no Spot request.
     pub spot_instance_request_id: Option<String>,
+    /// Which pool of the fleet ([`FleetRecord::pools`]) placed this instance — an index into
+    /// that list, so the launch template and overrides the instance was launched from are
+    /// held once per pool rather than copied onto every instance of it. An index the fleet
+    /// has no pool for reports no launch template, which is what a fleet stored with no
+    /// pools at all has.
+    pub pool: usize,
 }
 
 /// One stored EC2 Fleet: the modelled [`FleetData`](crate::ops::types::FleetData) every
@@ -59,6 +105,16 @@ pub struct FleetRecord {
     pub fleet: crate::ops::types::FleetData,
     /// The instances the fleet has launched, in launch order.
     pub instances: Vec<FleetInstanceRecord>,
+    /// The pools the fleet places its capacity in, in the order the request described them:
+    /// one per launch template and override combination, named by
+    /// [`FleetInstanceRecord::pool`].
+    pub pools: Vec<FleetPoolView>,
+    /// When the fleet's [`FLEET_STATE_SUBMITTED`] -> [`FLEET_STATE_ACTIVE`] move falls due,
+    /// or `None` for a fleet that owes no move — one stored `active` already, and one whose
+    /// move has been applied. The due instant is stored; nothing sleeps for it, and
+    /// [`ComAmazonawsEc2Amazonec2State::materialize_due_fleets`] is the one place it is
+    /// applied.
+    pub activate_at: Option<Instant>,
 }
 
 impl FleetRecord {
@@ -114,13 +170,22 @@ pub struct FleetSpec {
     pub tags: Vec<Tag>,
     /// `FleetData$Context` — "Reserved".
     pub context: Option<String>,
+    /// `FleetData$SpotOptions`, "the configuration of Spot Instances in an EC2 Fleet", as the
+    /// writer resolved it: every word out of its own modelled catalog.
+    pub spot_options: Option<crate::ops::types::SpotOptions>,
+    /// `FleetData$OnDemandOptions`, "the configuration of On-Demand Instances in an EC2
+    /// Fleet", resolved the same way.
+    pub on_demand_options: Option<crate::ops::types::OnDemandOptions>,
+    /// The pools the fleet places its capacity in ([`FleetRecord::pools`]).
+    pub pools: Vec<FleetPoolView>,
     /// The instances the fleet has launched, in launch order.
     pub instances: Vec<FleetInstanceRecord>,
 }
 
 /// The caller-chosen bytes one stored fleet holds: its client token, its context, its tags
-/// and the launch template names, versions and overrides it keeps, plus the id of each
-/// instance and Spot request it names.
+/// and the launch template names, versions and overrides it keeps, the prices its option
+/// structures carry, plus the id of each instance and Spot request it names and the launch
+/// template its pools name.
 ///
 /// The ONE definition of that charge, the way [`capacity_block_payload_bytes`] is for a
 /// Capacity Block: a writer charges exactly it, on top of the fixed
@@ -128,6 +193,7 @@ pub struct FleetSpec {
 pub fn fleet_payload_bytes(
     fleet: &crate::ops::types::FleetData,
     instances: &[FleetInstanceRecord],
+    pools: &[FleetPoolView],
 ) -> usize {
     let text = |value: Option<&String>| value.map_or(0, String::len);
     let template_bytes: usize = fleet
@@ -173,6 +239,24 @@ pub fn fleet_payload_bytes(
         .saturating_add(tag_list_bytes(fleet.tags.as_deref().unwrap_or_default()))
         .saturating_add(template_bytes)
         .saturating_add(instance_bytes)
+        .saturating_add(
+            fleet
+                .spot_options
+                .as_ref()
+                .map_or(0, |options| text(options.max_total_price.as_ref())),
+        )
+        .saturating_add(
+            fleet
+                .on_demand_options
+                .as_ref()
+                .map_or(0, |options| text(options.max_total_price.as_ref())),
+        )
+        .saturating_add(
+            pools
+                .iter()
+                .map(FleetPoolView::payload_bytes)
+                .fold(0usize, usize::saturating_add),
+        )
 }
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -240,18 +324,23 @@ impl ComAmazonawsEc2Amazonec2State {
             valid_from: spec.valid_from.map(system_time_to_date_time),
             valid_until: spec.valid_until.map(system_time_to_date_time),
             replace_unhealthy_instances: spec.replace_unhealthy_instances,
-            // The option structures, the launch errors and the per-fleet instance report
-            // belong to the operations that create and report a fleet; a fleet carries none
-            // of them just by being stored.
-            spot_options: None,
-            on_demand_options: None,
+            // The option structures as the WRITER resolved them: every word comes out of its
+            // own modelled catalog, so a fleet reports the configuration EC2 read rather
+            // than the request's own text. The launch errors and the per-fleet instance
+            // report are not stored members: both are derived from the instances the fleet
+            // actually placed ([`fleet_instance_groups`]), so the create and every later
+            // report of one fleet read the same instances. Reserved capacity is not a
+            // capacity source this store places, so no fleet of it carries those options.
+            spot_options: spec.spot_options,
+            on_demand_options: spec.on_demand_options,
             reserved_capacity_options: None,
             tags: Some(spec.tags),
             errors: None,
             instances: None,
             context: spec.context,
         };
-        let charge = STORED_RECORD_OVERHEAD_BYTES + fleet_payload_bytes(&fleet, &spec.instances);
+        let charge = STORED_RECORD_OVERHEAD_BYTES
+            + fleet_payload_bytes(&fleet, &spec.instances, &spec.pools);
         // The byte ceiling is asked before the record is stored, not after: a fleet carries
         // caller-chosen text (its tags, its client token, its launch-template overrides), so
         // a write that would cross [`MAX_STORED_BYTES`] stores nothing at all and its caller
@@ -263,11 +352,40 @@ impl ComAmazonawsEc2Amazonec2State {
         self.fleets.insert(
             fleet_id.clone(),
             FleetRecord {
+                // A fleet stored as `submitted` owes the move to `active`, on the span every
+                // clock-owed move of this crate takes; one stored in any other state owes
+                // nothing. Derived HERE, from the state the fleet is stored in, so no writer
+                // can store a `submitted` fleet that never becomes active.
+                activate_at: (fleet.fleet_state.as_deref() == Some(FLEET_STATE_SUBMITTED))
+                    .then(|| due_instant(TRANSITION_DELAY)),
                 fleet,
                 instances: spec.instances,
+                pools: spec.pools,
             },
         );
         Some(fleet_id)
+    }
+
+    /// Apply the [`FLEET_STATE_SUBMITTED`] -> [`FLEET_STATE_ACTIVE`] move every EC2 Fleet
+    /// that owed one by `now` has made.
+    ///
+    /// Reached only through [`Self::materialize_due_transitions`], so a reporting operation
+    /// observes the move without having caused it: it was owed at this instant whether or
+    /// not anybody called. "`maintain` - The EC2 Fleet places an asynchronous request for
+    /// your desired capacity" (`FleetData$Type`), so a fleet of that kind is `submitted`
+    /// while EC2 takes the request on and `active` once it has; the capacity it placed is a
+    /// fact of the CALL that created it, which is why only the state word moves here.
+    pub fn materialize_due_fleets(&mut self, now: Instant) {
+        for record in self.fleets.values_mut() {
+            if record.activate_at.is_none_or(|due_at| now < due_at) {
+                continue;
+            }
+            // The move is applied once; nothing is owed on this fleet any more.
+            record.activate_at = None;
+            if record.fleet.fleet_state.as_deref() == Some(FLEET_STATE_SUBMITTED) {
+                record.fleet.fleet_state = Some(FLEET_STATE_ACTIVE.to_string());
+            }
+        }
     }
 }
 
@@ -338,10 +456,24 @@ pub fn invalid_fleet_id_malformed<E>(fleet_id: &str) -> Scaffolded<E> {
 }
 
 /// Refuse a request that named a fleet id no EC2 Fleet of the account has: HTTP 400
-/// `InvalidFleetId.NotFound`, through the one helper that words every such refusal
-/// ([`id_not_found`]).
+/// `InvalidFleetId.NotFound`.
+///
+/// EC2 words this refusal as a BATCH — `The FleetId(s) <ids> do not exist.` — however many
+/// ids the request named, the way it words the same refusal for a Spot Fleet request
+/// (`The SpotFleetRequestId(s) <ids> do not exist.`). The ids are the ones the request sent.
 pub fn invalid_fleet_id_not_found<E>(fleet_id: &str) -> Scaffolded<E> {
-    id_not_found(INVALID_FLEET_ID_NOT_FOUND, "fleet ID", fleet_id)
+    fleet_ids_not_found(&[fleet_id])
+}
+
+/// The refusal above for the ids of ONE request, which is where the batch wording comes
+/// from: an operation that resolves several fleet ids reports every one it could not find in
+/// a single message.
+pub fn fleet_ids_not_found<E>(fleet_ids: &[&str]) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_FLEET_ID_NOT_FOUND,
+        400,
+        format!("The FleetId(s) {} do not exist.", fleet_ids.join(", ")),
+    )
 }
 
 /// Refuse `fleet_id` unless it is a well-formed EC2 Fleet id, BEFORE any lookup: the

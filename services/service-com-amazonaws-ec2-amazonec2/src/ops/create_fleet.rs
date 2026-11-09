@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFleet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFleet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates an EC2 Fleet in [`crate::state`] and places the instances its
+//! target capacity asks for — "instances are launched immediately if there is available
+//! capacity" (see the modelled contract below) — then answers the `FleetId` the store
+//! minted, with the instances and launch errors an `instant` fleet reports. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFleet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every parameter is validated and every resource the launch names resolved before
+//! anything is written, so `DryRun` answers `DryRunOperation` only for a request that would
+//! otherwise have succeeded, and a repeated `ClientToken` reports the fleet the first call
+//! created rather than creating a second one. The capacity itself is REAL: each instance is
+//! an instance of this account's instance store, and a Spot pool's instances are placed
+//! through Spot Instance requests `DescribeSpotInstanceRequests` reports, so nothing a
+//! fleet reports is a value nothing backs.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +193,1257 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFleet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFleetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFleet"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            DEFAULT_TARGET_CAPACITY_TYPE_CAPACITY_BLOCK, DEFAULT_TARGET_CAPACITY_TYPE_ON_DEMAND,
+            DEFAULT_TARGET_CAPACITY_TYPE_RESERVED_CAPACITY, DEFAULT_TARGET_CAPACITY_TYPE_SPOT,
+            FLEET_ACTIVITY_STATUS_FULFILLED, FLEET_ACTIVITY_STATUS_PENDING_FULFILLMENT,
+            FLEET_ON_DEMAND_ALLOCATION_STRATEGY_PRIORITIZED, FLEET_STATE_ACTIVE,
+            FLEET_STATE_SUBMITTED, FLEET_TYPE_INSTANT, FLEET_TYPE_MAINTAIN,
+            FleetPlacementSpec, FleetPoolPlacement, FleetSpec,
+            INSTANCE_INTERRUPTION_BEHAVIOR_TERMINATE, INSTANCE_LIFECYCLE_ON_DEMAND,
+            INSTANCE_LIFECYCLE_SPOT, MAX_CLIENT_TOKEN_CHARS, MAX_FLEET_INSTANCES, MAX_FLEET_POOLS,
+            MAX_STORED_BYTES, MAX_STORED_INSTANCES, MAX_STORED_SPOT_INSTANCE_REQUESTS,
+            SPOT_ALLOCATION_STRATEGY_DIVERSIFIED, SPOT_INSTANCE_TYPE_ONE_TIME,
+            SPOT_INSTANCE_TYPE_PERSISTENT, TARGET_CAPACITY_UNIT_TYPE_UNITS,
+            availability_zones_in_region, date_time_to_system_time,
+            modelled_catalog_word, request_region, require_service_state, resource_count_exceeded,
+            unsupported_operation,
+        };
+
+        // The Region of the request's SigV4 credential scope: the zone a launch template
+        // override names is resolved against that Region's zones, and the instances the
+        // fleet places are launched in it.
+        let region = request_region(ctx.parts());
+
+        // "The fleet type. The default value is `maintain`" (`$Type`), out of the modelled
+        // catalog so the stored word is EC2's own rather than the request's text.
+        let fleet_type = modelled_catalog_word(
+            input.r#type.as_deref(),
+            FLEET_TYPE_VALUES,
+            "type",
+            Some(FLEET_TYPE_MAINTAIN),
+        )?
+        .unwrap_or(FLEET_TYPE_MAINTAIN);
+        let instant = fleet_type == FLEET_TYPE_INSTANT;
+
+        // "The number of units to request" (`$TargetCapacitySpecification`). Every member of
+        // it is a plain modelled `Integer` with no `@range`, so this handler is the only
+        // place their floors and their relationship can be said.
+        let target = &input.target_capacity_specification;
+        let total_target = target.total_target_capacity;
+        if total_target < 0 {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{total_target}' for totalTargetCapacity. \
+                 It must not be negative"
+            )));
+        }
+        // "If the request type is `maintain`, you can specify a target capacity of 0 and add
+        // capacity later" (`TargetCapacitySpecificationRequest`) — so a fleet of any other
+        // type that asks for no capacity asks for nothing at all.
+        if total_target == 0 && fleet_type != FLEET_TYPE_MAINTAIN {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{total_target}' for totalTargetCapacity. A target capacity \
+                 of 0 is supported only for fleets of type {FLEET_TYPE_MAINTAIN}"
+            )));
+        }
+        let on_demand_target = target.on_demand_target_capacity.unwrap_or(0);
+        if on_demand_target < 0 {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{on_demand_target}' for onDemandTargetCapacity. \
+                 It must not be negative"
+            )));
+        }
+        let spot_target = target.spot_target_capacity.unwrap_or(0);
+        if spot_target < 0 {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{spot_target}' for spotTargetCapacity. \
+                 It must not be negative"
+            )));
+        }
+        // "The number of units to request, filled using the default target capacity type"
+        // (`$TotalTargetCapacity`): the On-Demand and Spot capacities are parts OF the
+        // total, so together they cannot ask for more than it.
+        if on_demand_target.saturating_add(spot_target) > total_target {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "The sum of onDemandTargetCapacity and spotTargetCapacity must not exceed \
+                 totalTargetCapacity",
+            ));
+        }
+        let default_capacity_type = modelled_catalog_word(
+            target.default_target_capacity_type.as_deref(),
+            DEFAULT_TARGET_CAPACITY_TYPE_VALUES,
+            "defaultTargetCapacityType",
+            Some(DEFAULT_TARGET_CAPACITY_TYPE_SPOT),
+        )?
+        .unwrap_or(DEFAULT_TARGET_CAPACITY_TYPE_SPOT);
+        // A Capacity Block and a Capacity Reservation are capacity this fleet would have to
+        // draw from a reservation the account holds, which this launch path does not place:
+        // refused rather than answered with Spot or On-Demand instances the request did not
+        // ask for.
+        if default_capacity_type == DEFAULT_TARGET_CAPACITY_TYPE_CAPACITY_BLOCK
+            || default_capacity_type == DEFAULT_TARGET_CAPACITY_TYPE_RESERVED_CAPACITY
+        {
+            return Err(unsupported_operation(format!(
+                "CreateFleet places {DEFAULT_TARGET_CAPACITY_TYPE_SPOT} and \
+                 {DEFAULT_TARGET_CAPACITY_TYPE_ON_DEMAND} capacity; \
+                 defaultTargetCapacityType '{default_capacity_type}' draws its capacity \
+                 from a reservation, which this service does not place"
+            )));
+        }
+        // "The unit for the target capacity. You can specify this parameter only when using
+        // attributed-based instance type selection. Default: `units` (the number of
+        // instances)" (`$TargetCapacityUnitType`) — and attribute-based selection is
+        // `InstanceRequirements`, which this launch path does not resolve (see
+        // [`resolve_pools`]), so a target capacity in any other unit has nothing to measure.
+        let capacity_unit_type = modelled_catalog_word(
+            target.target_capacity_unit_type.as_deref(),
+            TARGET_CAPACITY_UNIT_TYPE_VALUES,
+            "targetCapacityUnitType",
+            Some(TARGET_CAPACITY_UNIT_TYPE_UNITS),
+        )?
+        .unwrap_or(TARGET_CAPACITY_UNIT_TYPE_UNITS);
+        if capacity_unit_type != TARGET_CAPACITY_UNIT_TYPE_UNITS {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "targetCapacityUnitType '{capacity_unit_type}' may be specified only with \
+                 attribute-based instance type selection, which names the instance types \
+                 through launchTemplateConfigs.overrides.instanceRequirements"
+            )));
+        }
+
+        // "Indicates whether running instances should be terminated if the total target
+        // capacity of the EC2 Fleet is decreased below the current size of the EC2 Fleet.
+        // Supported only for fleets of type `maintain`"
+        // (`$ExcessCapacityTerminationPolicy`), and the same sentence on
+        // `$ReplaceUnhealthyInstances`: a fleet of another type is refused for naming
+        // either, rather than accepting a preference nothing of its kind acts on.
+        let excess_capacity_termination_policy = modelled_catalog_word(
+            input.excess_capacity_termination_policy.as_deref(),
+            FLEET_EXCESS_CAPACITY_TERMINATION_POLICY_VALUES,
+            "excessCapacityTerminationPolicy",
+            None,
+        )?;
+        if excess_capacity_termination_policy.is_some() && fleet_type != FLEET_TYPE_MAINTAIN {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "excessCapacityTerminationPolicy is supported only for fleets of type \
+                 {FLEET_TYPE_MAINTAIN}"
+            )));
+        }
+        if input.replace_unhealthy_instances == Some(true) && fleet_type != FLEET_TYPE_MAINTAIN {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "replaceUnhealthyInstances is supported only for fleets of type \
+                 {FLEET_TYPE_MAINTAIN}"
+            )));
+        }
+
+        // "The start date and time of the request" and "the end date and time of the
+        // request. At this point, no new EC2 Fleet requests are placed or able to fulfill
+        // the request" (`$ValidFrom` / `$ValidUntil`): a window that ends before it begins
+        // describes a request that could never be fulfilled.
+        let valid_from = input.valid_from.map(date_time_to_system_time);
+        let valid_until = input.valid_until.map(date_time_to_system_time);
+        if let (Some(from), Some(until)) = (valid_from, valid_until) {
+            if until <= from {
+                return Err(Scaffolded::invalid_parameter_value(
+                    "Invalid value for validUntil. It must be later than validFrom",
+                ));
+            }
+        }
+
+        // The option structures, resolved to the members of their own modelled catalogs with
+        // the documented defaults filled in, so what a describe reports is what EC2 read.
+        let spot_options = resolved_spot_options(input.spot_options.as_ref(), fleet_type)?;
+        let on_demand_options =
+            resolved_on_demand_options(input.on_demand_options.as_ref(), fleet_type)?;
+        // "Defines EC2 Fleet preferences for utilizing reserved capacity when
+        // `DefaultTargetCapacityType` is set to `reserved-capacity`"
+        // (`$ReservedCapacityOptions`) — that capacity type is refused above, so the
+        // preferences for it name a capacity source nothing here places.
+        if input.reserved_capacity_options.is_some() {
+            return Err(unsupported_operation(format!(
+                "reservedCapacityOptions applies to defaultTargetCapacityType \
+                 '{DEFAULT_TARGET_CAPACITY_TYPE_RESERVED_CAPACITY}', whose capacity this \
+                 service does not place"
+            )));
+        }
+
+        // "The key-value pair for tagging the EC2 Fleet request on creation"
+        // (`$TagSpecifications`): which resource types may be named depends on the fleet's
+        // type, and only the fleet and the instances it launches are resources this call
+        // creates.
+        let (fleet_tags, instance_tags) =
+            fleet_and_instance_tags(input.tag_specifications.as_deref(), fleet_type, Self::NAME)?;
+
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // "The configuration for the EC2 Fleet" (`$LaunchTemplateConfigs`) is where the
+        // fleet's launches come from, so a request that describes none describes no launch
+        // at all — the modelled `@length` of the list has `min: 0`, so the floor is here.
+        let configs = input.launch_template_configs.as_slice();
+        if configs.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter launchTemplateConfigs",
+            ));
+        }
+        // How many pools one call makes this handler resolve — each a launch template, a
+        // version, an AMI, a subnet and a zone lookup — is bounded before any of that work
+        // is done, by the bound the overrides publish.
+        let declared_pools = configs
+            .iter()
+            .map(|config| config.overrides.as_ref().map_or(1, Vec::len).max(1))
+            .fold(0usize, usize::saturating_add);
+        if declared_pools > MAX_FLEET_POOLS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request describes {declared_pools} launch template overrides, above \
+                 the maximum of {MAX_FLEET_POOLS}"
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // Every move the clock already owed is applied before anything is read back, for the
+        // reason the describes apply it: it was owed at this instant whether or not anybody
+        // called. Without it a `ClientToken` replay would answer a stale view of the fleet
+        // the first call created.
+        store.materialize_due_transitions();
+
+        // Each (launch template, override) pair is one pool of the fleet: a template the
+        // account does not hold, a version it does not have, an AMI it cannot see, a subnet
+        // it has none of or a zone the Region does not have refuses the whole request, with
+        // that resource's own error code.
+        let zones = availability_zones_in_region(&region);
+        let resolved = resolve_pools(&store, &region, &zones, configs)?;
+
+        // "Amazon EC2 calculates the difference between the total capacity and On-Demand
+        // capacity, and launches the difference as Spot capacity" (`RequestSpotFleet`): the
+        // capacity no member assigned is placed as the default target capacity type names.
+        let unassigned = total_target
+            .saturating_sub(on_demand_target)
+            .saturating_sub(spot_target);
+        let (on_demand_capacity, spot_capacity) =
+            if default_capacity_type == DEFAULT_TARGET_CAPACITY_TYPE_ON_DEMAND {
+                (on_demand_target.saturating_add(unassigned), spot_target)
+            } else {
+                (on_demand_target, spot_target.saturating_add(unassigned))
+            };
+
+        // What this store has room to place: a target capacity the model leaves unbounded can
+        // ask for more instances than any store holds, so the fleet places what it can and
+        // reports the rest of its target as unfulfilled.
+        let room = MAX_FLEET_INSTANCES.min(MAX_STORED_INSTANCES.saturating_sub(store.instances.len()));
+        let spot_room = room.min(
+            MAX_STORED_SPOT_INSTANCE_REQUESTS.saturating_sub(store.spot_instance_requests.len()),
+        );
+
+        // The On-Demand pools first, in the order the On-Demand allocation strategy puts
+        // them in: "`prioritized` - EC2 Fleet uses the priority that you assigned to each
+        // launch template override, launching the highest priority first", and the lower the
+        // number the higher the priority (`OnDemandOptionsRequest$AllocationStrategy`,
+        // `FleetLaunchTemplateOverridesRequest$Priority`).
+        let prioritized = on_demand_options
+            .as_ref()
+            .and_then(|options| options.allocation_strategy.as_deref())
+            == Some(FLEET_ON_DEMAND_ALLOCATION_STRATEGY_PRIORITIZED);
+        let mut on_demand_pools: Vec<&ResolvedPool> = resolved.pools.iter().collect();
+        if prioritized {
+            on_demand_pools.sort_by(|left, right| {
+                left.priority
+                    .partial_cmp(&right.priority)
+                    .unwrap_or(::std::cmp::Ordering::Equal)
+            });
+        }
+        // "Indicates that the fleet uses a single instance type to launch all Spot
+        // Instances" / "all Spot Instances into a single Availability Zone"
+        // (`SpotOptionsRequest$SingleInstanceType` / `$SingleAvailabilityZone`): either one
+        // keeps the whole Spot capacity in ONE pool, whatever the allocation strategy says,
+        // because every pool here is one instance type in one zone.
+        let single_pool = spot_options.as_ref().is_some_and(|options| {
+            options.single_instance_type == Some(true)
+                || options.single_availability_zone == Some(true)
+        });
+        // "The number of Spot pools across which to allocate your target Spot capacity …
+        // EC2 Fleet selects the cheapest Spot pools and evenly allocates your target Spot
+        // capacity across the number of Spot pools that you specify"
+        // (`SpotOptionsRequest$InstancePoolsToUseCount`): the capacity is drawn from that
+        // many pools and spread evenly over them. This emulator holds no Spot price history,
+        // so the pools it draws from are the FIRST that many the request gave — the order
+        // every other member of a launch template configuration is read in, and the same
+        // reading that decides which single pool an undiversified fleet draws from.
+        let spot_pools_to_use = spot_options
+            .as_ref()
+            .and_then(|options| options.instance_pools_to_use_count)
+            .and_then(|count| usize::try_from(count).ok());
+        let every_spot_pool: Vec<&ResolvedPool> = resolved.pools.iter().collect();
+        let drawn_from = if single_pool {
+            1
+        } else {
+            spot_pools_to_use.unwrap_or(every_spot_pool.len())
+        };
+        let spot_pools: &[&ResolvedPool] = every_spot_pool
+            .get(..drawn_from.min(every_spot_pool.len()))
+            .unwrap_or(&every_spot_pool);
+        // The capacity is spread evenly across the pools it is drawn from whenever the
+        // request asked for more than one of them — `diversified` draws from every pool, a
+        // pool count from that many — and otherwise all of it is placed in the first.
+        let spread_spot = !single_pool
+            && (spot_pools_to_use.is_some()
+                || spot_options
+                    .as_ref()
+                    .and_then(|options| options.allocation_strategy.as_deref())
+                    == Some(SPOT_ALLOCATION_STRATEGY_DIVERSIFIED));
+
+        let mut pools: Vec<FleetPoolPlacement> = Vec::new();
+        // The On-Demand capacity is allocated first and the Spot capacity gets the room it
+        // leaves, so the two together never place more instances than this store holds.
+        let on_demand_placements = pool_placements(
+            &on_demand_pools,
+            INSTANCE_LIFECYCLE_ON_DEMAND,
+            f64::from(on_demand_capacity),
+            false,
+            room,
+        );
+        let planned_on_demand: usize = on_demand_placements
+            .iter()
+            .map(|pool| pool.count)
+            .fold(0usize, usize::saturating_add);
+        let spot_placements = pool_placements(
+            spot_pools,
+            INSTANCE_LIFECYCLE_SPOT,
+            f64::from(spot_capacity),
+            spread_spot,
+            spot_room.saturating_sub(planned_on_demand),
+        );
+        pools.extend(on_demand_placements);
+        pools.extend(spot_placements);
+
+        // "The minimum target capacity for Spot Instances in the fleet. If this minimum
+        // capacity isn't reached, no instances are launched" (`$MinTargetCapacity`, and the
+        // same sentence on the On-Demand options): what has to reach the minimum is the
+        // capacity the pools can ACTUALLY place, so a fleet this store has no room for
+        // launches nothing at all rather than part of what was asked for.
+        let planned_capacity = |lifecycle: &str| -> f64 {
+            pools
+                .iter()
+                .filter(|pool| pool.view.lifecycle == lifecycle)
+                .map(|pool| pool.weighted_capacity * pool.count as f64)
+                .sum()
+        };
+        let below_minimum = [
+            (
+                spot_options
+                    .as_ref()
+                    .and_then(|options| options.min_target_capacity),
+                INSTANCE_LIFECYCLE_SPOT,
+            ),
+            (
+                on_demand_options
+                    .as_ref()
+                    .and_then(|options| options.min_target_capacity),
+                INSTANCE_LIFECYCLE_ON_DEMAND,
+            ),
+        ]
+        .into_iter()
+        .any(|(minimum, lifecycle)| {
+            minimum.is_some_and(|minimum| planned_capacity(lifecycle) < f64::from(minimum))
+        });
+        if below_minimum {
+            for pool in &mut pools {
+                pool.count = 0;
+            }
+        }
+        // A pool that places nothing is not a pool the fleet has: the instances name their
+        // pool by index ([`crate::state::FleetInstanceRecord::pool`]), so only the pools
+        // that place capacity are stored.
+        pools.retain(|pool| pool.count > 0);
+
+        // DryRun sits AFTER every parameter has been validated and every named resource
+        // resolved, and BEFORE the first write: the flag asks whether the request WOULD have
+        // succeeded, so one that would have been refused is refused with that reason
+        // instead, and one that would have succeeded leaves state untouched — not even an
+        // already-used `ClientToken` is answered with a success body.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // Idempotency: "unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`$ClientToken`) — one token names the fleet it
+        // created, so a replay reports that fleet and places no further capacity. Read
+        // before the ceilings, because a replay stores nothing and so need not clear the
+        // gates a fresh request has to.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.fleet_client_tokens.get(token).cloned())
+            .filter(|fleet_id| store.fleets.contains_key(fleet_id));
+        if let Some(fleet_id) = replayed {
+            return fleet_created(&store, &fleet_id, &zones);
+        }
+
+        // Nothing in this emulator reclaims a stored record, so both ceilings — the number
+        // of fleets and the caller-chosen bytes they hold — are asked before the write.
+        if !store.has_fleet_capacity() {
+            return Err(resource_count_exceeded(format!(
+                "This emulator holds {} EC2 Fleets, so it cannot store another",
+                store.fleets.len()
+            )));
+        }
+        let payload_bytes = requested_payload_bytes(&input, &fleet_tags, &instance_tags, &pools);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(resource_count_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        // The capacity itself: every instance the pools place is an instance of this
+        // account's instance store, and a Spot pool's instances are placed through Spot
+        // Instance requests of it.
+        let placed = store.place_fleet_instances(FleetPlacementSpec {
+            pools: &pools,
+            region: &region,
+            // "When this value is `maintain`, the EC2 Fleet … continues to maintain your
+            // desired Spot capacity by replenishing interrupted Spot Instances" (`$Type`),
+            // which is what a `persistent` Spot Instance request does and a `one-time`
+            // request does not (`SpotInstanceRequest$Type`).
+            spot_request_type: if fleet_type == FLEET_TYPE_MAINTAIN {
+                SPOT_INSTANCE_TYPE_PERSISTENT
+            } else {
+                SPOT_INSTANCE_TYPE_ONE_TIME
+            },
+            interruption_behavior: spot_options
+                .as_ref()
+                .and_then(|options| options.instance_interruption_behavior.as_deref())
+                .unwrap_or(INSTANCE_INTERRUPTION_BEHAVIOR_TERMINATE),
+            valid_until,
+            instance_tags: &instance_tags,
+        });
+
+        // "The number of units fulfilled by this request compared to the set target
+        // capacity" (`FleetData$FulfilledCapacity`): the capacity the fleet ACTUALLY placed,
+        // which is each placed instance's own weighted capacity — never the capacity that
+        // was asked for.
+        let mut fulfilled = 0.0_f64;
+        let mut fulfilled_on_demand = 0.0_f64;
+        for instance in &placed {
+            let Some(pool) = pools.get(instance.pool) else {
+                continue;
+            };
+            fulfilled += pool.weighted_capacity;
+            if !pool.is_spot() {
+                fulfilled_on_demand += pool.weighted_capacity;
+            }
+        }
+
+        let fleet_id = store
+            .insert_fleet(FleetSpec {
+                fleet_type: fleet_type.to_string(),
+                // "`instant` - The EC2 Fleet places a synchronous one-time request for your
+                // desired capacity" (`$Type`), so an `instant` fleet is already active when
+                // the call answers; the asynchronous types are `submitted` while EC2 takes
+                // the request on, and the clock owes them `active`.
+                fleet_state: if instant {
+                    FLEET_STATE_ACTIVE.to_string()
+                } else {
+                    FLEET_STATE_SUBMITTED.to_string()
+                },
+                // "`fulfilled` when the fleet size meets or exceeds target capacity"
+                // (`$ActivityStatus`), and a fleet short of it is still waiting for the rest.
+                activity_status: Some(
+                    if fulfilled >= f64::from(total_target) {
+                        FLEET_ACTIVITY_STATUS_FULFILLED
+                    } else {
+                        FLEET_ACTIVITY_STATUS_PENDING_FULFILLMENT
+                    }
+                    .to_string(),
+                ),
+                client_token: input.client_token.clone(),
+                create_time: ::std::time::SystemTime::now(),
+                launch_template_configs: resolved.configs,
+                target_capacity_specification: Some(TargetCapacitySpecification {
+                    total_target_capacity: Some(total_target),
+                    on_demand_target_capacity: Some(on_demand_target),
+                    spot_target_capacity: Some(spot_target),
+                    default_target_capacity_type: Some(default_capacity_type.to_string()),
+                    target_capacity_unit_type: Some(capacity_unit_type.to_string()),
+                }),
+                fulfilled_capacity: Some(fulfilled),
+                fulfilled_on_demand_capacity: Some(fulfilled_on_demand),
+                terminate_instances_with_expiration: input.terminate_instances_with_expiration,
+                replace_unhealthy_instances: input.replace_unhealthy_instances,
+                excess_capacity_termination_policy: excess_capacity_termination_policy
+                    .map(str::to_string),
+                valid_from,
+                valid_until,
+                tags: fleet_tags,
+                context: input.context.clone(),
+                spot_options,
+                on_demand_options,
+                pools: pools.iter().map(|pool| pool.view.clone()).collect(),
+                instances: placed.clone(),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(
+                    "the EC2 Fleet could not be stored after its capacity was placed",
+                )
+            })?;
+        if let Some(token) = input.client_token.clone() {
+            store.fleet_client_tokens.insert(token, fleet_id.clone());
+        }
+
+        // Answer the fleet as it was STORED, so a caller is told about a fleet a later
+        // describe reports rather than about one this handler merely built — its launch
+        // errors included, which are derived from what each pool was asked for and what the
+        // instance store holds for it.
+        fleet_created(&store, &fleet_id, &zones)
     }
+}
+
+/// One pool the request described, resolved against the store: the launch its instances are
+/// placed from, what one of them provides, how it is ordered against the other pools, and
+/// the launch template and overrides the fleet reports for it.
+///
+/// A pool is one (launch template, override) pair — "any parameters that you specify
+/// override the same parameters in the launch template"
+/// (`FleetLaunchTemplateConfigRequest$Overrides`) — and a configuration with no overrides is
+/// ONE pool: the template version as it stands.
+#[derive(Debug, Clone)]
+struct ResolvedPool {
+    /// The launch, as the modelled shape every placement of this crate takes.
+    launch: LaunchSpecification,
+    /// "The number of units provided by the specified instance type"
+    /// (`FleetLaunchTemplateOverridesRequest$WeightedCapacity`).
+    weighted_capacity: f64,
+    /// "The priority for the launch template override. The highest priority is launched
+    /// first" (`$Priority`), with the lowest priority there is for a pool that names none.
+    priority: f64,
+    /// "The maximum price per unit hour that you are willing to pay for a Spot Instance"
+    /// (`$MaxPrice`).
+    max_price: Option<String>,
+    /// What the fleet reports about the pool.
+    view: LaunchTemplateAndOverridesResponse,
+}
+
+/// What a request's `LaunchTemplateConfigs` resolved to.
+#[derive(Debug, Clone)]
+struct ResolvedConfigs {
+    /// One pool per (launch template, override) pair, in the order the request gave them.
+    pools: Vec<ResolvedPool>,
+    /// The configurations as the fleet stores and reports them
+    /// (`FleetData$LaunchTemplateConfigs`), with the launch template id and version
+    /// resolved.
+    configs: Vec<FleetLaunchTemplateConfig>,
+}
+
+/// Resolve every pool the request's `LaunchTemplateConfigs` describe, refusing the whole
+/// request for any resource the account cannot resolve.
+///
+/// A launch that names a launch template the account does not hold, a version it does not
+/// have, an AMI it cannot see, a subnet it has none of or a zone the signed Region does not
+/// have describes a launch that could never happen, so it is refused with that resource's
+/// own error code — the answer `RunInstances` gives for the same launch. Nothing is written
+/// here: this runs before the fleet's `DryRun` is answered.
+fn resolve_pools(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    region: &str,
+    zones: &[crate::state::AvailabilityZoneRecord],
+    configs: &[FleetLaunchTemplateConfigRequest],
+) -> Result<ResolvedConfigs, CreateFleetError> {
+    use crate::scaffolded::Scaffolded;
+    use crate::state::{
+        DEFAULT_FLEET_INSTANCE_WEIGHT, LAUNCH_TEMPLATE_VERSION_DEFAULT,
+        LOWEST_FLEET_OVERRIDE_PRIORITY, LaunchOverrides, availability_zone_of_region,
+        invalid_launch_template_name_not_found, invalid_subnet_id_not_found,
+        launch_from_template_data, launch_template_id_is_well_formed, require_visible_image,
+        resolve_launch_template_version, specified_launch_template_id_is_malformed,
+        validate_hourly_price,
+    };
+
+    let mut pools: Vec<ResolvedPool> = Vec::new();
+    let mut stored: Vec<FleetLaunchTemplateConfig> = Vec::with_capacity(configs.len());
+    for config in configs {
+        // "The launch template to use. You must specify either the launch template ID or
+        // launch template name in the request"
+        // (`FleetLaunchTemplateConfigRequest$LaunchTemplateSpecification`): a configuration
+        // with no template names no launch at all.
+        let Some(specification) = config.launch_template_specification.as_ref() else {
+            return Err(Scaffolded::missing_parameter(
+                "Each launchTemplateConfig must contain the parameter \
+                 launchTemplateSpecification",
+            ));
+        };
+        let template_id = match (
+            specification.launch_template_id.as_deref(),
+            specification.launch_template_name.as_deref(),
+        ) {
+            // "You must specify either the launch template ID or launch template name in the
+            // request" (`$LaunchTemplateSpecification`), so naming both is refused as a
+            // parameter combination and naming neither as a missing parameter.
+            (Some(_), Some(_)) => {
+                return Err(Scaffolded::invalid_parameter_combination(
+                    "Either the launch template ID or the launch template name may be \
+                     specified for a launchTemplateConfig, but not both",
+                ));
+            }
+            (None, None) => {
+                return Err(Scaffolded::missing_parameter(
+                    "Each launchTemplateSpecification must contain either the parameter \
+                     LaunchTemplateId or the parameter LaunchTemplateName",
+                ));
+            }
+            // A launch template id is one the SERVICE minted, so an id this account holds no
+            // template under is not a launch template id at all — the refusal this operation
+            // answers for one, recorded by `ec2.create-fleet-contract`, and the same verdict
+            // the describes of the account's launch templates give an unminted id.
+            (Some(id), None) => {
+                if !launch_template_id_is_well_formed(id)
+                    || !store.launch_templates.contains_key(id)
+                {
+                    return Err(specified_launch_template_id_is_malformed(id));
+                }
+                id.to_string()
+            }
+            (None, Some(name)) => store
+                .launch_template_id_for_name(name)
+                .ok_or_else(invalid_launch_template_name_not_found)?,
+        };
+        let Some(record) = store.launch_templates.get(&template_id) else {
+            return Err(specified_launch_template_id_is_malformed(&template_id));
+        };
+        // "The launch template version number, `$Latest`, or `$Default`"
+        // (`FleetLaunchTemplateSpecificationRequest$Version`): a configuration that names
+        // none launches the template's default version, which is the version a launch with
+        // no version named gets everywhere in this API.
+        let version = specification
+            .version
+            .as_deref()
+            .unwrap_or(LAUNCH_TEMPLATE_VERSION_DEFAULT);
+        let number = resolve_launch_template_version(record, version)?;
+        let Some(data) = record.versions.get(&number).map(|held| held.data.clone()) else {
+            return Err(Scaffolded::internal_error(format!(
+                "launch template '{template_id}' version '{version}' could not be read back"
+            )));
+        };
+        // The template as the fleet reports it: the id and the version the request RESOLVED
+        // to, so a report names the version the instances were launched from rather than the
+        // alias that selected it.
+        let template_view = FleetLaunchTemplateSpecification {
+            launch_template_id: Some(template_id.clone()),
+            launch_template_name: specification.launch_template_name.clone(),
+            version: Some(number.to_string()),
+        };
+
+        let overrides: Vec<Option<&FleetLaunchTemplateOverridesRequest>> =
+            match config.overrides.as_deref() {
+                None | Some([]) => vec![None],
+                Some(entries) => entries.iter().map(Some).collect(),
+            };
+        let mut stored_overrides: Vec<FleetLaunchTemplateOverrides> = Vec::new();
+        for over in overrides {
+            if let Some(over) = over {
+                // The override members this launch path does not apply to the instance it
+                // launches. Refused rather than accepted and dropped: an instance that does
+                // not carry the profile, the metadata options or the volumes the caller
+                // asked for is not the instance the request described.
+                for (member, named) in [
+                    (
+                        "instanceRequirements",
+                        over.instance_requirements.is_some(),
+                    ),
+                    ("blockDeviceMappings", over.block_device_mappings.is_some()),
+                    ("iamInstanceProfile", over.iam_instance_profile.is_some()),
+                    ("metadataOptions", over.metadata_options.is_some()),
+                ] {
+                    if named {
+                        return Err(crate::state::unsupported_operation(format!(
+                            "CreateFleet launches the instances a launch template and the \
+                             instance type, subnet, Availability Zone, key pair and AMI of \
+                             an override describe; the override member '{member}' is not \
+                             one this service applies"
+                        )));
+                    }
+                }
+            }
+
+            // "Either `AvailabilityZone` or `AvailabilityZoneId` must be specified in the
+            // request, but not both" (`$AvailabilityZone`), and the zone has to be one the
+            // signed Region has.
+            let zone = match (
+                over.and_then(|over| over.availability_zone.as_deref()),
+                over.and_then(|over| over.availability_zone_id.as_deref()),
+            ) {
+                (Some(_), Some(_)) => {
+                    return Err(Scaffolded::invalid_parameter_combination(
+                        "Either availabilityZone or availabilityZoneId may be specified for \
+                         a launch template override, not both",
+                    ));
+                }
+                (Some(zone_name), None) => Some(availability_zone_of_region(
+                    zones,
+                    region,
+                    "availabilityZone",
+                    zone_name,
+                    |zone| zone.zone_name.as_str(),
+                )?),
+                (None, Some(zone_id)) => Some(availability_zone_of_region(
+                    zones,
+                    region,
+                    "availabilityZoneId",
+                    zone_id,
+                    |zone| zone.zone_id.as_str(),
+                )?),
+                (None, None) => None,
+            };
+            if let Some(subnet_id) = over.and_then(|over| over.subnet_id.as_deref()) {
+                if !store.subnets.contains_key(subnet_id) {
+                    return Err(invalid_subnet_id_not_found(subnet_id));
+                }
+            }
+            let max_price = over.and_then(|over| over.max_price.clone());
+            validate_hourly_price("maxPrice", max_price.as_deref())?;
+
+            // "The ID of the AMI" (`$ImageId`) an override names, falling back to the
+            // template version's own: a pool with no AMI has nothing to launch.
+            let image_id = over
+                .and_then(|over| over.image_id.clone())
+                .or_else(|| data.image_id.clone());
+            let Some(image_id) = image_id else {
+                return Err(Scaffolded::missing_parameter(format!(
+                    "Launch template '{template_id}' names no imageId, so the EC2 Fleet has \
+                     no AMI to launch from"
+                )));
+            };
+            require_visible_image(store, &image_id)?;
+
+            // "If this value is not specified, the default is 1" (`$WeightedCapacity`). A
+            // weight of zero or less would make a pool provide nothing however many
+            // instances it launched, so it is refused rather than letting a fleet ask for an
+            // unbounded number of instances.
+            let weighted_capacity = over
+                .and_then(|over| over.weighted_capacity)
+                .unwrap_or(DEFAULT_FLEET_INSTANCE_WEIGHT);
+            if !weighted_capacity.is_finite() || weighted_capacity <= 0.0 {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{weighted_capacity}' for weightedCapacity. \
+                     It must be the number of units one instance provides"
+                )));
+            }
+            // "Valid values are whole numbers starting at `0`. The lower the number, the
+            // higher the priority. If no number is set, the launch template override has the
+            // lowest priority" (`$Priority`).
+            let priority = match over.and_then(|over| over.priority) {
+                None => LOWEST_FLEET_OVERRIDE_PRIORITY,
+                Some(priority) if priority.is_finite() && priority >= 0.0 => priority,
+                Some(priority) => {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{priority}' for priority. \
+                         Valid values are whole numbers starting at 0"
+                    )));
+                }
+            };
+
+            let override_view = FleetLaunchTemplateOverrides {
+                instance_type: over.and_then(|over| over.instance_type.clone()),
+                max_price: max_price.clone(),
+                subnet_id: over.and_then(|over| over.subnet_id.clone()),
+                // The zone the request named, as the Region's own name and id for it, so a
+                // report names one zone the same way however the request spelled it.
+                availability_zone: zone.map(|zone| zone.zone_name.clone()),
+                availability_zone_id: zone.map(|zone| zone.zone_id.clone()),
+                weighted_capacity: Some(weighted_capacity),
+                priority: over.and_then(|over| over.priority),
+                placement: over
+                    .and_then(|over| over.placement.as_ref())
+                    .map(|placement| PlacementResponse {
+                        group_name: placement.group_name.clone(),
+                    }),
+                // Both are refused above, so no pool carries either.
+                instance_requirements: None,
+                block_device_mappings: None,
+                image_id: over.and_then(|over| over.image_id.clone()),
+            };
+            let launch = launch_from_template_data(
+                &data,
+                &LaunchOverrides {
+                    instance_type: over.and_then(|over| over.instance_type.as_deref()),
+                    subnet_id: over.and_then(|over| over.subnet_id.as_deref()),
+                    availability_zone: zone.map(|zone| zone.zone_name.as_str()),
+                    key_name: over.and_then(|over| over.key_name.as_deref()),
+                    image_id: Some(&image_id),
+                },
+            );
+            // A configuration that gave no overrides reports none: the pool IS the template
+            // version, so there is nothing an override replaced in it.
+            let reported_override = over.is_some().then(|| override_view.clone());
+            if let Some(reported) = reported_override.clone() {
+                stored_overrides.push(reported);
+            }
+            pools.push(ResolvedPool {
+                launch,
+                weighted_capacity,
+                priority,
+                max_price,
+                view: LaunchTemplateAndOverridesResponse {
+                    launch_template_specification: Some(template_view.clone()),
+                    overrides: reported_override,
+                },
+            });
+        }
+        stored.push(FleetLaunchTemplateConfig {
+            launch_template_specification: Some(template_view),
+            overrides: (!stored_overrides.is_empty()).then_some(stored_overrides),
+        });
+    }
+    Ok(ResolvedConfigs {
+        pools,
+        configs: stored,
+    })
+}
+
+/// The pools `capacity` units of ONE capacity type are placed in, with the number of
+/// instances each places.
+///
+/// `pools` are the resolved pools in the order the capacity type's allocation strategy puts
+/// them in, and `spread` says whether the capacity is spread across all of them or drawn
+/// from the first; the arithmetic is the one allocation of a target capacity across weighted
+/// pools this crate has ([`crate::state::fleet_placement_counts`]). `room` is what this
+/// store can still place, so a target capacity the model leaves unbounded cannot ask for
+/// more instances than there is room for.
+fn pool_placements(
+    pools: &[&ResolvedPool],
+    lifecycle: &str,
+    capacity: f64,
+    spread: bool,
+    room: usize,
+) -> Vec<crate::state::FleetPoolPlacement> {
+    use crate::state::{FleetPoolPlacement, FleetPoolView, fleet_placement_counts};
+
+    let weights: Vec<f64> = pools.iter().map(|pool| pool.weighted_capacity).collect();
+    let counts = fleet_placement_counts(&weights, capacity, spread, room);
+    pools
+        .iter()
+        .zip(counts)
+        .map(|(pool, count)| FleetPoolPlacement {
+            launch: pool.launch.clone(),
+            weighted_capacity: pool.weighted_capacity,
+            priority: pool.priority,
+            max_price: pool.max_price.clone(),
+            view: FleetPoolView {
+                launch_template_and_overrides: Some(pool.view.clone()),
+                lifecycle: lifecycle.to_string(),
+                planned: count,
+            },
+            count,
+        })
+        .collect()
+}
+
+/// The fleet's Spot configuration as it will be STORED: every word out of its own modelled
+/// catalog, with the documented defaults filled in, so a describe reports the configuration
+/// EC2 read rather than the request's text.
+///
+/// The members `SpotOptionsRequest` documents as "supported only for fleets of type
+/// `instant`" are refused for a fleet of any other type, rather than accepted as a
+/// preference nothing of its kind acts on.
+fn resolved_spot_options(
+    request: Option<&SpotOptionsRequest>,
+    fleet_type: &str,
+) -> Result<Option<SpotOptions>, CreateFleetError> {
+    use crate::scaffolded::Scaffolded;
+    use crate::state::{
+        INSTANCE_INTERRUPTION_BEHAVIOR_TERMINATE, SPOT_ALLOCATION_STRATEGY_LOWEST_PRICE,
+        modelled_catalog_word, validate_hourly_price,
+    };
+
+    let allocation_strategy = modelled_catalog_word(
+        request.and_then(|options| options.allocation_strategy.as_deref()),
+        SPOT_ALLOCATION_STRATEGY_VALUES,
+        "spotOptions.allocationStrategy",
+        Some(SPOT_ALLOCATION_STRATEGY_LOWEST_PRICE),
+    )?;
+    // "The behavior when a Spot Instance is interrupted. Default: `terminate`"
+    // (`SpotOptionsRequest$InstanceInterruptionBehavior`).
+    let interruption_behavior = modelled_catalog_word(
+        request.and_then(|options| options.instance_interruption_behavior.as_deref()),
+        SPOT_INSTANCE_INTERRUPTION_BEHAVIOR_VALUES,
+        "spotOptions.instanceInterruptionBehavior",
+        Some(INSTANCE_INTERRUPTION_BEHAVIOR_TERMINATE),
+    )?;
+    // "The number of Spot pools across which to allocate your target Spot capacity"
+    // (`$InstancePoolsToUseCount`): a count of no pools allocates across nothing.
+    if let Some(count) = request.and_then(|options| options.instance_pools_to_use_count) {
+        if count < 1 {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{count}' for spotOptions.instancePoolsToUseCount. \
+                 It must be at least 1"
+            )));
+        }
+        // "Supported only when Spot `AllocationStrategy` is set to `lowest-price`"
+        // (`$InstancePoolsToUseCount`): every other strategy decides which pools the
+        // capacity is drawn from itself, so a count given beside one is refused rather than
+        // accepted and left unapplied.
+        if allocation_strategy != Some(SPOT_ALLOCATION_STRATEGY_LOWEST_PRICE) {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "spotOptions.instancePoolsToUseCount is supported only when \
+                 spotOptions.allocationStrategy is \
+                 {SPOT_ALLOCATION_STRATEGY_LOWEST_PRICE}"
+            )));
+        }
+    }
+    validate_hourly_price(
+        "spotOptions.maxTotalPrice",
+        request.and_then(|options| options.max_total_price.as_deref()),
+    )?;
+    let single_instance_type = request.and_then(|options| options.single_instance_type);
+    let single_availability_zone = request.and_then(|options| options.single_availability_zone);
+    let min_target_capacity = request.and_then(|options| options.min_target_capacity);
+    instant_only_fleet_options(
+        "spotOptions",
+        fleet_type,
+        single_instance_type,
+        single_availability_zone,
+        min_target_capacity,
+    )?;
+    // "The strategies for managing your Spot Instances that are at an elevated risk of being
+    // interrupted" (`$MaintenanceStrategies`): a preference the fleet keeps, with its one
+    // word read out of the modelled `FleetReplacementStrategy` catalog.
+    let maintenance_strategies = match request.and_then(|options| options.maintenance_strategies.as_ref())
+    {
+        None => None,
+        Some(strategies) => {
+            let rebalance = match strategies.capacity_rebalance.as_ref() {
+                None => None,
+                Some(rebalance) => Some(FleetSpotCapacityRebalance {
+                    replacement_strategy: modelled_catalog_word(
+                        rebalance.replacement_strategy.as_deref(),
+                        FLEET_REPLACEMENT_STRATEGY_VALUES,
+                        "spotOptions.maintenanceStrategies.capacityRebalance.replacementStrategy",
+                        None,
+                    )?
+                    .map(str::to_string),
+                    termination_delay: rebalance.termination_delay,
+                }),
+            };
+            Some(FleetSpotMaintenanceStrategies {
+                capacity_rebalance: rebalance,
+            })
+        }
+    };
+    Ok(Some(SpotOptions {
+        allocation_strategy: allocation_strategy.map(str::to_string),
+        maintenance_strategies,
+        instance_interruption_behavior: interruption_behavior.map(str::to_string),
+        instance_pools_to_use_count: request
+            .and_then(|options| options.instance_pools_to_use_count),
+        single_instance_type,
+        single_availability_zone,
+        min_target_capacity,
+        max_total_price: request.and_then(|options| options.max_total_price.clone()),
+    }))
+}
+
+/// The fleet's On-Demand configuration as it will be STORED, on the same contract as
+/// [`resolved_spot_options`].
+fn resolved_on_demand_options(
+    request: Option<&OnDemandOptionsRequest>,
+    fleet_type: &str,
+) -> Result<Option<OnDemandOptions>, CreateFleetError> {
+    use crate::state::{
+        FLEET_ON_DEMAND_ALLOCATION_STRATEGY_LOWEST_PRICE, modelled_catalog_word,
+        validate_hourly_price,
+    };
+
+    let allocation_strategy = modelled_catalog_word(
+        request.and_then(|options| options.allocation_strategy.as_deref()),
+        FLEET_ON_DEMAND_ALLOCATION_STRATEGY_VALUES,
+        "onDemandOptions.allocationStrategy",
+        Some(FLEET_ON_DEMAND_ALLOCATION_STRATEGY_LOWEST_PRICE),
+    )?;
+    validate_hourly_price(
+        "onDemandOptions.maxTotalPrice",
+        request.and_then(|options| options.max_total_price.as_deref()),
+    )?;
+    let single_instance_type = request.and_then(|options| options.single_instance_type);
+    let single_availability_zone = request.and_then(|options| options.single_availability_zone);
+    let min_target_capacity = request.and_then(|options| options.min_target_capacity);
+    instant_only_fleet_options(
+        "onDemandOptions",
+        fleet_type,
+        single_instance_type,
+        single_availability_zone,
+        min_target_capacity,
+    )?;
+    // "The strategy for using unused Capacity Reservations for fulfilling On-Demand
+    // capacity. Supported only for fleets of type `instant`"
+    // (`OnDemandOptionsRequest$CapacityReservationOptions`), with its one word read out of
+    // the modelled `FleetCapacityReservationUsageStrategy` catalog.
+    let capacity_reservation_options =
+        match request.and_then(|options| options.capacity_reservation_options.as_ref()) {
+            None => None,
+            Some(options) => {
+                if fleet_type != crate::state::FLEET_TYPE_INSTANT {
+                    return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                        format!(
+                            "onDemandOptions.capacityReservationOptions is supported only \
+                             for fleets of type {}",
+                            crate::state::FLEET_TYPE_INSTANT
+                        ),
+                    ));
+                }
+                Some(CapacityReservationOptions {
+                    usage_strategy: modelled_catalog_word(
+                        options.usage_strategy.as_deref(),
+                        FLEET_CAPACITY_RESERVATION_USAGE_STRATEGY_VALUES,
+                        "onDemandOptions.capacityReservationOptions.usageStrategy",
+                        None,
+                    )?
+                    .map(str::to_string),
+                })
+            }
+        };
+    Ok(Some(OnDemandOptions {
+        allocation_strategy: allocation_strategy.map(str::to_string),
+        capacity_reservation_options,
+        single_instance_type,
+        single_availability_zone,
+        min_target_capacity,
+        max_total_price: request.and_then(|options| options.max_total_price.clone()),
+    }))
+}
+
+/// Hold the three option members both option structures document as "supported only for
+/// fleets of type `instant`" to that rule, and the minimum target capacity to the bound and
+/// the combination its own documentation publishes.
+///
+/// `member` names the option structure the refusal is about, so one rule is stated once for
+/// the Spot and the On-Demand options rather than twice.
+fn instant_only_fleet_options(
+    member: &str,
+    fleet_type: &str,
+    single_instance_type: Option<bool>,
+    single_availability_zone: Option<bool>,
+    min_target_capacity: Option<i32>,
+) -> Result<(), CreateFleetError> {
+    use crate::scaffolded::Scaffolded;
+    use crate::state::{FLEET_TYPE_INSTANT, MAX_FLEET_MIN_TARGET_CAPACITY};
+
+    let instant = fleet_type == FLEET_TYPE_INSTANT;
+    for (named, asked) in [
+        ("singleInstanceType", single_instance_type == Some(true)),
+        (
+            "singleAvailabilityZone",
+            single_availability_zone == Some(true),
+        ),
+        ("minTargetCapacity", min_target_capacity.is_some()),
+    ] {
+        if asked && !instant {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "{member}.{named} is supported only for fleets of type {FLEET_TYPE_INSTANT}"
+            )));
+        }
+    }
+    if let Some(minimum) = min_target_capacity {
+        // "The minimum target capacity … If this minimum capacity isn't reached, no
+        // instances are launched. Constraints: Maximum value of `1000`"
+        // (`SpotOptionsRequest$MinTargetCapacity`).
+        if !(1..=MAX_FLEET_MIN_TARGET_CAPACITY).contains(&minimum) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{minimum}' for {member}.minTargetCapacity. \
+                 It must be between 1 and {MAX_FLEET_MIN_TARGET_CAPACITY}"
+            )));
+        }
+        // "At least one of the following must be specified: `SingleAvailabilityZone` |
+        // `SingleInstanceType`" (the same sentence on both option structures).
+        if single_instance_type != Some(true) && single_availability_zone != Some(true) {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "{member}.minTargetCapacity requires {member}.singleAvailabilityZone or \
+                 {member}.singleInstanceType"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The tags one `CreateFleet` assigns: the fleet's own, and the ones every instance it
+/// launches carries.
+///
+/// "You must specify the resource type to tag, otherwise the request will fail"
+/// (`TagSpecification`), and which types may be named is the fleet's TYPE's business: an
+/// `instant` fleet may tag the fleet, the instances, the volumes and the network interfaces
+/// its launch creates, while a `maintain` or `request` fleet may tag only the fleet
+/// ([`crate::state::INSTANT_FLEET_TAGGABLE_RESOURCES`]). The `volume` and
+/// `network-interface` entries name resources this slice stores none of — a launched
+/// instance's root volume and primary interface are derived from the instance itself — so
+/// their tags are carried by no resource here rather than landing on the instance, which
+/// would report a tag the caller set on something else. The per-resource bounds (the tag
+/// count, each key and value, the reserved `aws:` prefix) are the shared helper's, applied
+/// to each resource's own tags.
+fn fleet_and_instance_tags(
+    specifications: Option<&[TagSpecification]>,
+    fleet_type: &str,
+    operation: &str,
+) -> Result<(Vec<Tag>, ::std::collections::BTreeMap<String, String>), CreateFleetError> {
+    use crate::scaffolded::Scaffolded;
+    use crate::state::{
+        INSTANT_FLEET_TAGGABLE_RESOURCES, RESOURCE_TYPE_FLEET, RESOURCE_TYPE_INSTANCE,
+        tags_from_specifications,
+    };
+
+    let taggable: &[&str] = if fleet_type == crate::state::FLEET_TYPE_INSTANT {
+        INSTANT_FLEET_TAGGABLE_RESOURCES
+    } else {
+        &[RESOURCE_TYPE_FLEET]
+    };
+    let mut fleet_specifications: Vec<TagSpecification> = Vec::new();
+    let mut instance_specifications: Vec<TagSpecification> = Vec::new();
+    for specification in specifications.unwrap_or_default() {
+        let Some(resource_type) = specification.resource_type.as_deref() else {
+            return Err(Scaffolded::missing_parameter(
+                "Tag specification resource type must have a value",
+            ));
+        };
+        if !taggable.contains(&resource_type) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "'{resource_type}' is not a valid resource type for tagging on {operation} \
+                 for a fleet of type '{fleet_type}'"
+            )));
+        }
+        if resource_type == RESOURCE_TYPE_FLEET {
+            fleet_specifications.push(specification.clone());
+        } else if resource_type == RESOURCE_TYPE_INSTANCE {
+            instance_specifications.push(specification.clone());
+        }
+    }
+    let fleet_tags =
+        tags_from_specifications(Some(&fleet_specifications), RESOURCE_TYPE_FLEET, operation)?;
+    let instance_tags = tags_from_specifications(
+        Some(&instance_specifications),
+        RESOURCE_TYPE_INSTANCE,
+        operation,
+    )?;
+    Ok((
+        fleet_tags,
+        instance_tags
+            .into_iter()
+            .filter_map(|tag| {
+                tag.key
+                    .map(|key| (key, tag.value.unwrap_or_default()))
+            })
+            .collect(),
+    ))
+}
+
+/// This operation's result for the fleet the store holds under `fleet_id`.
+///
+/// Read back out of the STORE rather than built from the request, so the create answers
+/// exactly what a describe in the same instant reports — and a `ClientToken` replay answers
+/// the same body the first call did, off the same record. "Information about the instances
+/// that were launched by the fleet … Supported only for fleets of type `instant`"
+/// (`CreateFleetResult$Instances` and `$Errors`), so a fleet of any other type reports
+/// neither: its instances are read through `DescribeFleetInstances`.
+fn fleet_created(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    fleet_id: &str,
+    zones: &[crate::state::AvailabilityZoneRecord],
+) -> Result<CreateFleetOutput, CreateFleetError> {
+    let Some(record) = store.fleets.get(fleet_id) else {
+        return Err(crate::scaffolded::Scaffolded::internal_error(format!(
+            "the newly created EC2 Fleet '{fleet_id}' could not be read back"
+        )));
+    };
+    let instant = record.fleet_type() == crate::state::FLEET_TYPE_INSTANT;
+    let instances = instant.then(|| {
+        store
+            .fleet_instance_groups(record)
+            .into_iter()
+            .map(|group| CreateFleetInstance {
+                launch_template_and_overrides: group.launch_template_and_overrides,
+                lifecycle: group.lifecycle,
+                instance_ids: Some(group.instance_ids),
+                instance_type: group.instance_type,
+                platform: group.platform,
+                // "The ID of the Availability Zone in which the instance was launched"
+                // (`$AvailabilityZoneId`): the id the Region gives the zone the instance is
+                // in, so the two spellings of one zone cannot disagree.
+                availability_zone_id: group
+                    .availability_zone
+                    .as_deref()
+                    .and_then(|name| zones.iter().find(|zone| zone.zone_name == name))
+                    .map(|zone| zone.zone_id.clone()),
+                availability_zone: group.availability_zone,
+                subnet_id: group.subnet_id,
+            })
+            .collect()
+    });
+    Ok(CreateFleetOutput {
+        fleet_id: record.fleet.fleet_id.clone(),
+        // "Information about the instances that could not be launched by the fleet.
+        // Supported only for fleets of type `instant`" (`CreateFleetResult$Errors`): a pool
+        // the fleet could not place every instance of, by the one derivation of that. An
+        // `instant` fleet that launched its whole target reports an EMPTY error set rather
+        // than none: EC2's ec2Query XML carries the set element for an empty list, so a
+        // client reading it finds it where it expects it.
+        errors: instant.then(|| {
+            store
+                .fleet_launch_errors(record)
+                .into_iter()
+                .map(|failed| CreateFleetError2 {
+                    launch_template_and_overrides: failed.launch_template_and_overrides,
+                    lifecycle: failed.lifecycle,
+                    error_code: failed.error_code,
+                    error_message: failed.error_message,
+                })
+                .collect()
+        }),
+        instances,
+    })
+}
+
+/// The caller-chosen bytes this request would make the store retain: the fleet's own record
+/// and every instance its pools would place.
+///
+/// Asked BEFORE anything is written, the way every create of this crate asks, so a request
+/// that would cross [`crate::state::MAX_STORED_BYTES`] places nothing at all. The fleet's
+/// own charge is re-made exactly by [`crate::state::fleet_payload_bytes`] when the record is
+/// stored; this is the same charge plus the instances, which is what makes the ceiling cover
+/// a fleet that launches many of them.
+fn requested_payload_bytes(
+    input: &CreateFleetInput,
+    fleet_tags: &[Tag],
+    instance_tags: &::std::collections::BTreeMap<String, String>,
+    pools: &[crate::state::FleetPoolPlacement],
+) -> usize {
+    use crate::state::{STORED_RECORD_OVERHEAD_BYTES, tag_bytes, tag_list_bytes};
+
+    let text = |value: Option<&String>| value.map_or(0, String::len);
+    let instance_bytes = tag_bytes(instance_tags);
+    let pool_bytes = pools
+        .iter()
+        .map(|pool| {
+            let per_instance = STORED_RECORD_OVERHEAD_BYTES
+                .saturating_add(text(pool.launch.image_id.as_ref()))
+                .saturating_add(text(pool.launch.instance_type.as_ref()))
+                .saturating_add(text(pool.launch.key_name.as_ref()))
+                .saturating_add(text(pool.launch.subnet_id.as_ref()))
+                .saturating_add(text(pool.launch.user_data.as_ref()))
+                .saturating_add(instance_bytes);
+            pool.view
+                .payload_bytes()
+                .saturating_add(per_instance.saturating_mul(pool.count))
+        })
+        .fold(0usize, usize::saturating_add);
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(text(input.client_token.as_ref()))
+        .saturating_add(text(input.context.as_ref()))
+        .saturating_add(tag_list_bytes(fleet_tags))
+        .saturating_add(pool_bytes)
 }
