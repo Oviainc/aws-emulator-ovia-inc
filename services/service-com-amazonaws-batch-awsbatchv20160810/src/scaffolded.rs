@@ -203,6 +203,20 @@ pub const TAGGING_REFUSAL_CODE: &str = "BadRequestException";
 /// declares [`TAGGING_REFUSAL_CODE`].
 pub const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
 
+/// The HTTP status a tag MUTATION of this service answers a success with.
+///
+/// The tag frontend reports the success of a mutation it accepted with the status alone: the
+/// output structures the model declares for `TagResource` and `UntagResource` carry no
+/// member, so there is nothing for a caller to parse, and AWS answers such a success
+/// `204 No Content` with no entity body — not the `200` the protocol defaults an
+/// unstated `@http` code to, which is what this service's OWN operations answer at, their
+/// empty output document included. One status for both mutations of that surface, beside the
+/// codes it refuses with ([`TAGGING_REFUSAL_CODE`], [`TAGGING_NOT_FOUND_CODE`]), so the two
+/// handlers cannot drift; the framing of the body such an answer does not carry is
+/// `service_common`'s ([`crate::service`]).
+pub const TAGGING_NO_CONTENT_STATUS: u16 =
+    ::service_common::no_content_responses::NO_CONTENT_STATUS;
+
 /// The HTTP status [`TAGGING_REFUSAL_CODE`] carries: a request the tag layer will not
 /// accept, like every other client refusal of this service.
 const TAGGING_REFUSAL_STATUS: u16 = 400;

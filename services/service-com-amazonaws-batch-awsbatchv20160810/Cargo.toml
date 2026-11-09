@@ -27,6 +27,10 @@ sha2 = { workspace = true }
 # Opaque, URL-safe encoding for the pagination cursors this service vends, and for the
 # hex groups of those ids.
 hex = { workspace = true }
+# The shared framing of a response that carries no content: the status such an answer
+# carries and the correction that empties the body a serializer rendered for it
+# (`service_common::no_content_responses`), which this service's tag mutations answer at.
+service-common = { path = "../common" }
 # The AWS SDK for EventBridge, driven over the in-process callback
 # (`OperationContext::callback`): AWS Batch publishes a `Batch Job State Change`
 # event onto the account's default event bus as a job moves through its statuses

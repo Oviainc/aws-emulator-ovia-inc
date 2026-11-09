@@ -32,6 +32,10 @@
 //!   than stored;
 //! * a list is a REPORTING call: two lists at the same instant answer identically and a
 //!   list leaves the resource untagged if it was untagged.
+//!
+//! The STATUS an accepted mutation is reported with — no content at all, where the reader
+//! answers a document — is its own rule, asserted in `tag_mutation_no_content`, whose
+//! constant the success assertions here read.
 
 use std::collections::BTreeMap;
 
@@ -47,6 +51,7 @@ use crate::job_lifecycle::{
     job_queue, Batch,
 };
 use crate::refusal_classification::TAG_SET_LIMIT_DETAIL;
+use crate::tag_mutation_no_content::NO_CONTENT_STATUS;
 
 /// The wire error code a `batch` client reads off a tagging call whose `resourceArn` is
 /// not an ARN, and the detail that comes with it.
@@ -100,6 +105,15 @@ pub(crate) fn tags_uri(resource_arn: &str) -> String {
     format!("/v1/tags/{}", percent_encode(resource_arn))
 }
 
+/// The query one `tagKeys` parameter per key makes, as an SDK client binds an
+/// `@httpQuery` list.
+pub(crate) fn tag_keys_query(keys: &[String]) -> String {
+    keys.iter()
+        .map(|key| format!("tagKeys={}", percent_encode(key)))
+        .collect::<Vec<String>>()
+        .join("&")
+}
+
 /// `TagResource`: `POST /v1/tags/{resourceArn}` with the `tags` map in the body.
 pub(crate) async fn tag(batch: &Batch, resource_arn: &str, tags: Value) -> (u16, Value) {
     batch
@@ -115,13 +129,12 @@ async fn list(batch: &Batch, resource_arn: &str) -> (u16, Value) {
 /// `UntagResource`: `DELETE /v1/tags/{resourceArn}?tagKeys=…`, one `tagKeys` parameter
 /// per key (the `@httpQuery` binding of a list member).
 async fn untag(batch: &Batch, resource_arn: &str, keys: &[String]) -> (u16, Value) {
-    let query = keys
-        .iter()
-        .map(|key| format!("tagKeys={}", percent_encode(key)))
-        .collect::<Vec<String>>()
-        .join("&");
     batch
-        .send("DELETE", &format!("{}?{query}", tags_uri(resource_arn)), None)
+        .send(
+            "DELETE",
+            &format!("{}?{}", tags_uri(resource_arn), tag_keys_query(keys)),
+            None,
+        )
         .await
 }
 
@@ -339,8 +352,9 @@ async fn tagging_merges_into_the_stored_map_of_every_taggable_resource_kind() {
             let (status, answered) =
                 tag(&batch, &resource_arn, tags_body(&request.pairs)).await;
             assert_eq!(
-                status, 200,
-                "case {case:?}: expected 200 from TagResource, got {status} {answered}"
+                status, NO_CONTENT_STATUS,
+                "case {case:?}: expected HTTP {NO_CONTENT_STATUS} from TagResource, got \
+                 {status} {answered}"
             );
             expected.extend(request.pairs.iter().cloned());
             let actual = listed(&batch, &case, &resource_arn).await;
@@ -357,8 +371,9 @@ async fn tagging_merges_into_the_stored_map_of_every_taggable_resource_kind() {
         let before = expected.len();
         let (status, answered) = tag(&batch, &resource_arn, json!({"team": "platform"})).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected 200 from TagResource, got {status} {answered}"
+            status, NO_CONTENT_STATUS,
+            "case {case:?}: expected HTTP {NO_CONTENT_STATUS} from TagResource, got {status} \
+             {answered}"
         );
         expected.insert("team".to_string(), "platform".to_string());
         let actual = listed(&batch, &case, &resource_arn).await;
@@ -376,8 +391,9 @@ async fn tagging_merges_into_the_stored_map_of_every_taggable_resource_kind() {
         let case = format!("{kind}: untagging one key");
         let (status, answered) = untag(&batch, &resource_arn, &["team".to_string()]).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected 200 from UntagResource, got {status} {answered}"
+            status, NO_CONTENT_STATUS,
+            "case {case:?}: expected HTTP {NO_CONTENT_STATUS} from UntagResource, got {status} \
+             {answered}"
         );
         expected.remove("team");
         let actual = listed(&batch, &case, &resource_arn).await;
@@ -391,8 +407,9 @@ async fn tagging_merges_into_the_stored_map_of_every_taggable_resource_kind() {
         let case = format!("{kind}: untagging a key the resource does not hold");
         let (status, answered) = untag(&batch, &resource_arn, &["team".to_string()]).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected 200 from a repeated UntagResource, got {status} {answered}"
+            status, NO_CONTENT_STATUS,
+            "case {case:?}: expected HTTP {NO_CONTENT_STATUS} from a repeated UntagResource, got \
+             {status} {answered}"
         );
         let actual = listed(&batch, &case, &resource_arn).await;
         assert_eq!(
@@ -406,8 +423,9 @@ async fn tagging_merges_into_the_stored_map_of_every_taggable_resource_kind() {
         let remaining: Vec<String> = expected.keys().cloned().collect();
         let (status, answered) = untag(&batch, &resource_arn, &remaining).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected 200 from UntagResource, got {status} {answered}"
+            status, NO_CONTENT_STATUS,
+            "case {case:?}: expected HTTP {NO_CONTENT_STATUS} from UntagResource, got {status} \
+             {answered}"
         );
         let actual = listed(&batch, &case, &resource_arn).await;
         assert!(
@@ -491,8 +509,9 @@ async fn the_tags_tagresource_writes_are_the_map_every_reader_reports() {
         )
         .await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected 200 from TagResource, got {status} {answered}"
+            status, NO_CONTENT_STATUS,
+            "case {case:?}: expected HTTP {NO_CONTENT_STATUS} from TagResource, got {status} \
+             {answered}"
         );
 
         let described = batch.ok(reader.route, reader.request.clone()).await;
@@ -506,8 +525,9 @@ async fn the_tags_tagresource_writes_are_the_map_every_reader_reports() {
         let (status, answered) =
             untag(&batch, &reader.resource_arn, &["owner".to_string()]).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected 200 from UntagResource, got {status} {answered}"
+            status, NO_CONTENT_STATUS,
+            "case {case:?}: expected HTTP {NO_CONTENT_STATUS} from UntagResource, got {status} \
+             {answered}"
         );
         let described = batch.ok(reader.route, reader.request).await;
         assert_eq!(
@@ -704,7 +724,7 @@ async fn the_published_tag_bounds_are_honoured_at_the_bound_and_refused_past_it(
     for (case, tags) in at_bound {
         let (status, answered) = tag(&batch, &environment, tags).await;
         assert_eq!(
-            status, 200,
+            status, NO_CONTENT_STATUS,
             "case {case:?}: a tag at the published bound is accepted, got {status} {answered}"
         );
     }
@@ -780,7 +800,7 @@ async fn the_published_tag_bounds_are_honoured_at_the_bound_and_refused_past_it(
         .collect();
     let (status, answered) = tag(&batch, &queue, tags_body(&full)).await;
     assert_eq!(
-        status, 200,
+        status, NO_CONTENT_STATUS,
         "case the ceiling: {} tags fit on one resource, got {status} {answered}",
         limits::MAX_TAGS_PER_RESOURCE
     );
@@ -819,8 +839,9 @@ async fn the_published_tag_bounds_are_honoured_at_the_bound_and_refused_past_it(
     // At the ceiling a REPLACEMENT still works: it adds no key.
     let (status, answered) = tag(&batch, &queue, json!({"key-0": "replaced"})).await;
     assert_eq!(
-        status, 200,
-        "case replacing at the ceiling: expected 200, got {status} {answered}"
+        status, NO_CONTENT_STATUS,
+        "case replacing at the ceiling: expected HTTP {NO_CONTENT_STATUS}, got {status} \
+         {answered}"
     );
     let replaced = listed(&batch, "replacing at the ceiling", &queue).await;
     assert_eq!(
@@ -856,8 +877,9 @@ async fn listing_tags_changes_nothing_a_later_caller_sees() {
 
     let (status, answered) = tag(&batch, &environment, json!({"team": "batch", "env": "dev"})).await;
     assert_eq!(
-        status, 200,
-        "case tag then read twice: expected 200 from TagResource, got {status} {answered}"
+        status, NO_CONTENT_STATUS,
+        "case tag then read twice: expected HTTP {NO_CONTENT_STATUS} from TagResource, got \
+         {status} {answered}"
     );
     let first = listed(&batch, "tag then read twice", &environment).await;
     let second = listed(&batch, "tag then read twice, again", &environment).await;

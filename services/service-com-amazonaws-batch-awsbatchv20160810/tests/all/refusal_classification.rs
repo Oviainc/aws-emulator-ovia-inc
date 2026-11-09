@@ -38,6 +38,7 @@ use service_com_amazonaws_batch_awsbatchv20160810::state::{self, limits};
 use crate::job_lifecycle::{arn, compute_environment, error_code, error_message, job_queue, Batch};
 use crate::refusal_contract::enveloped;
 use crate::resource_tags::{tag, tags_body};
+use crate::tag_mutation_no_content::NO_CONTENT_STATUS;
 
 /// The modelled error code every client refusal of this service's own operations carries.
 /// Source: `smithy_query(query="operation", …)` — every Batch operation declares exactly
@@ -200,7 +201,7 @@ async fn a_resultant_tag_set_past_the_ceiling_is_refused_with_the_one_tag_set_se
         );
         let (status, answered) = tag(&batch, &queue, first).await;
         assert_eq!(
-            status, 200,
+            status, NO_CONTENT_STATUS,
             "case {case:?}: the tags held first must be accepted, got {status} {answered}"
         );
         let more = tags_body(

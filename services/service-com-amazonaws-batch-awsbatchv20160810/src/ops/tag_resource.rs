@@ -147,7 +147,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// A success of this mutation is reported by the status alone: `TagResourceResponse`
+    /// declares no member, so the tag frontend answers it with no content at all
+    /// ([`crate::scaffolded::TAGGING_NO_CONTENT_STATUS`]) rather than with the `200` the
+    /// model leaves its `@http` code defaulted to. The body that status cannot carry is
+    /// dropped where every response of this service is serialized ([`crate::service`]).
+    const SUCCESS_STATUS: u16 = crate::scaffolded::TAGGING_NO_CONTENT_STATUS;
 
     async fn handle(
         &self,

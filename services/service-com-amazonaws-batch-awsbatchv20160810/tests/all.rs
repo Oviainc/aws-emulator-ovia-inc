@@ -101,5 +101,9 @@ mod service_job_submission;
 mod service_job_termination;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_mutation_no_content.rs"]
+mod tag_mutation_no_content;
+#[path = "all/tag_mutation_wire_probe.rs"]
+mod tag_mutation_wire_probe;
 #[path = "all/teardown_and_quota_shares.rs"]
 mod teardown_and_quota_shares;

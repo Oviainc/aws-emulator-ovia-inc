@@ -35,6 +35,10 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! A sixth seam, `override_protocol`, chooses the protocol every modelled answer is
+//! serialized in. This service takes it for one framing rule only — an answer that carries
+//! NO CONTENT carries no body — which lives in [`no_content`].
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
@@ -56,6 +60,7 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+pub mod no_content;
 pub mod request_id_header;
 
 use request_id_header::RequestIdHeaderOperation;
@@ -147,6 +152,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // table, and the default error renderers — lives in the generated entry.
         // The router reads it through this one accessor. Do not edit the entry.
         &self.entry
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // Every response a modelled operation of this service produces is serialized by the
+        // protocol returned here: the model's own `restJson1`, with the one framing
+        // correction [`no_content`] states — an answer at the no-content status carries no
+        // body, where the serializer renders the empty JSON object for an output structure
+        // that declares no member. The tag mutations are the operations that answer at that
+        // status; every other answer of this service passes through untouched.
+        Some(self)
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
