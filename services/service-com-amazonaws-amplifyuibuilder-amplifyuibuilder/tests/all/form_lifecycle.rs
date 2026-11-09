@@ -394,10 +394,19 @@ async fn a_created_form_is_read_back_from_what_was_stored() {
             );
         }
 
+        // A form's tag set is a map: a create that supplied none leaves the form carrying
+        // the empty one, which is the set `ListTagsForResource` reports for it too.
+        assert_eq!(
+            at(&read.body, "/tags"),
+            data.get("tags").cloned().unwrap_or_else(|| json!({})),
+            "case {case:?}: tags must come back as the set the create stored, got {:?}",
+            at(&read.body, "/tags")
+        );
+
         // An optional member the create did not carry is reported as an absence, not as an
-        // invented value: `CreateFormData`'s `cta`, `tags` and `labelDecorator` are each
-        // optional on `Form` too.
-        for member in ["cta", "tags", "labelDecorator"] {
+        // invented value: `CreateFormData`'s `cta` and `labelDecorator` are each optional
+        // on `Form` too.
+        for member in ["cta", "labelDecorator"] {
             if !data.as_object().is_some_and(|data| data.contains_key(member)) {
                 assert_eq!(
                     at(&read.body, &format!("/{member}")),

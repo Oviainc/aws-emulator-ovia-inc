@@ -504,10 +504,11 @@ pub struct StoredForm {
     pub fields: HashMap<String, FieldConfig>,
     pub sectional_elements: HashMap<String, SectionalElement>,
     pub schema_version: String,
-    /// `Form$tags` is optional on both `CreateFormData` and `Form`, so the
-    /// absence of tags is held as an absence rather than as an empty map: a form
-    /// created without them reports no `tags` member at all.
-    pub tags: Option<HashMap<String, String>>,
+    /// `Form$tags` is reported for every form, so the tags a create supplied are
+    /// held as a map rather than as an absence: a form created with no tags
+    /// carries an empty one and reports `{}`, exactly as a component, a theme and
+    /// a codegen job do.
+    pub tags: HashMap<String, String>,
     pub cta: Option<FormCTA>,
     pub label_decorator: Option<String>,
     /// The position this form holds in its environment's creation order.
@@ -534,7 +535,7 @@ impl StoredForm {
             fields: self.fields.clone(),
             sectional_elements: self.sectional_elements.clone(),
             schema_version: self.schema_version.clone(),
-            tags: self.tags.clone(),
+            tags: Some(self.tags.clone()),
             cta: self.cta.clone(),
             label_decorator: self.label_decorator.clone(),
         }
@@ -2087,11 +2088,7 @@ pub fn resource_tags(
         TaggedKind::Component => state
             .component(app, environment, id)
             .map(|component| component.tags.clone()),
-        TaggedKind::Form => state
-            .form(app, environment, id)
-            // `Form$tags` is optional, so a form carrying none holds an absence
-            // rather than an empty map; the tag SET it carries is empty either way.
-            .map(|form| form.tags.clone().unwrap_or_default()),
+        TaggedKind::Form => state.form(app, environment, id).map(|form| form.tags.clone()),
         TaggedKind::Theme => state
             .theme(app, environment, id)
             .map(|theme| theme.tags.clone()),
@@ -2120,17 +2117,9 @@ pub fn with_resource_tags_mut<R>(
         TaggedKind::Component => state
             .component_mut(app, environment, id)
             .map(|component| change(&mut component.tags)),
-        TaggedKind::Form => state.form_mut(app, environment, id).map(|form| {
-            // A form carrying no tags reports no `tags` member at all
-            // ([`StoredForm::tags`]), so a write that leaves such a form with no
-            // tag keeps that absence rather than turning it into an empty map;
-            // every other write stores the set it leaves behind, empty or not.
-            let was_absent = form.tags.is_none();
-            let mut tags = form.tags.take().unwrap_or_default();
-            let answered = change(&mut tags);
-            form.tags = (!was_absent || !tags.is_empty()).then_some(tags);
-            answered
-        }),
+        TaggedKind::Form => state
+            .form_mut(app, environment, id)
+            .map(|form| change(&mut form.tags)),
         TaggedKind::Theme => state
             .theme_mut(app, environment, id)
             .map(|theme| change(&mut theme.tags)),

@@ -106,14 +106,12 @@ impl Answer {
             .unwrap_or_default()
     }
 
-    /// The tag set the answer reports: the `tags` member, read as the empty map when the
-    /// wire omits it — `Form$tags` is optional, so a form carrying no tag reports no
-    /// member at all, which is the same SET as an empty map.
+    /// The tag set the answer reports: the `tags` member as the wire carries it. Every
+    /// tagged record of this service holds its tag set as a map, so a reader that reports
+    /// the resource reports the member — `Value::Null` here is a missing member, which is
+    /// a disagreement with `ListTagsForResource` rather than the empty set.
     fn tags(&self) -> Value {
-        match self.body.get("tags") {
-            Some(Value::Object(map)) => Value::Object(map.clone()),
-            _ => json!({}),
-        }
+        self.body.get("tags").cloned().unwrap_or(Value::Null)
     }
 }
 

@@ -223,7 +223,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             fields: data.fields,
             sectional_elements: data.sectional_elements,
             schema_version: data.schema_version,
-            tags: data.tags,
+            // A form's tag set is a map, not an absence: a create that supplied
+            // none leaves the form carrying the empty one, so the form's own
+            // reader and the tagging surface report the same set — the
+            // convention every other tagged record of this service follows.
+            tags: data.tags.unwrap_or_default(),
             cta: data.cta,
             label_decorator: data.label_decorator,
             cursor,

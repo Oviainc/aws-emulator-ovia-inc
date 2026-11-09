@@ -92,6 +92,9 @@ mod shared_page_walk;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/tag_member_shape.rs"]
+mod tag_member_shape;
+
 #[path = "all/theme_deletion.rs"]
 mod theme_deletion;
 
