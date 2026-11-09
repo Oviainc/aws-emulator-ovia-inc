@@ -265,6 +265,10 @@ mod resource_untagging;
 mod response_members;
 #[path = "all/schema_registry.rs"]
 mod schema_registry;
+#[path = "all/schema_version_by_definition.rs"]
+mod schema_version_by_definition;
+#[path = "all/schema_version_compatibility.rs"]
+mod schema_version_compatibility;
 #[path = "all/schema_version_deletion.rs"]
 mod schema_version_deletion;
 #[path = "all/schema_version_registration.rs"]

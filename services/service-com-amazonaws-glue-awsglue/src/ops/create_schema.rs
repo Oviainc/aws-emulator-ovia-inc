@@ -356,7 +356,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "When the schema set is created, a version checkpoint will be set to the first
         // version" — so the checkpoint is the version this create registered, and a
-        // create that registered none has no checkpointed version yet.
+        // create that registered none has no checkpointed version yet. "Validation of
+        // compatibility settings will be applied only from the second version onwards when
+        // the RegisterSchemaVersion API is used", so the version a create registers is
+        // stored as available whatever mode the create recorded.
         let versions: Vec<crate::state::SchemaVersionEntry> = input
             .schema_definition
             .clone()
@@ -364,6 +367,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 vec![crate::state::SchemaVersionEntry::new(
                     crate::state::FIRST_SCHEMA_VERSION,
                     definition,
+                    crate::state::SCHEMA_VERSION_STATUS_AVAILABLE,
                     now,
                 )]
             })

@@ -53,6 +53,11 @@ csv = "1.3"
 # Decodes the base64 a text-format table writes a binary column's value as, so the lengths
 # a run reports for that column are the value's rather than the encoding's.
 base64 = "0.22"
+# Parses an Avro schema document and decides, by Avro's own schema-resolution rules,
+# whether a reader schema can read data written with a writer schema — the question the
+# schema registry's compatibility modes ask of two versions of a schema set. Only the
+# schema algebra is used; no codec feature is enabled.
+apache-avro = { version = "0.17", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

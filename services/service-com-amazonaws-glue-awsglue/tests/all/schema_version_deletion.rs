@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
     ComAmazonawsGlueAwsglueState, RegistryEntry, SchemaEntry, SchemaVersionEntry,
     DEFAULT_COMPATIBILITY, DEFAULT_REGISTRY_NAME, NO_SCHEMA_VERSION, SCHEMA_STATUS_AVAILABLE,
+    SCHEMA_VERSION_STATUS_AVAILABLE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -59,9 +60,9 @@ fn definition(version_number: i64) -> String {
 /// in it, carrying one version per entry of `version_numbers` and check-pointed at
 /// `checkpoint`.
 ///
-/// The versions are seeded straight into the store because `RegisterSchemaVersion` is not
-/// implemented yet: this suite is about the DELETE, so it arranges the history it deletes
-/// from rather than depending on an operation that has its own issue.
+/// The versions are seeded straight into the store because this suite is about the DELETE:
+/// it arranges the history it deletes from rather than driving the registration of each
+/// version, which has its own suite.
 fn emulator_holding(
     version_numbers: &[i64],
     checkpoint: i64,
@@ -88,7 +89,12 @@ fn emulator_holding(
                 versions: version_numbers
                     .iter()
                     .map(|number| {
-                        SchemaVersionEntry::new(*number, definition(*number), SystemTime::now())
+                        SchemaVersionEntry::new(
+                            *number,
+                            definition(*number),
+                            SCHEMA_VERSION_STATUS_AVAILABLE,
+                            SystemTime::now(),
+                        )
                     })
                     .collect(),
             },

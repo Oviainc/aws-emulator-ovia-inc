@@ -21,8 +21,12 @@
 //! the set already holds a version of registers nothing either and reports THAT version —
 //! "if the same schema definition is already stored in Schema Registry as a version, the
 //! schema ID of the existing schema is returned to the caller". Otherwise the version is
-//! minted: a fresh `SchemaVersionId`, the set's next `VersionNumber`, and the status every
-//! stored version carries.
+//! minted: a fresh `SchemaVersionId`, the set's next `VersionNumber`, and the
+//! `SchemaVersionStatus` its COMPATIBILITY CHECK gives it — the comparisons the mode asks
+//! for against the versions already held
+//! ([`crate::state::SchemaEntry::register_checked_version`]), so a definition that "does
+//! not meet the compatibility requirements of the schema set" is stored and reported as
+//! [`crate::state::SCHEMA_VERSION_STATUS_FAILURE`] rather than as available.
 //!
 //! ## Shape of an operation
 //!
@@ -258,21 +262,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Nothing here is provisioned asynchronously — the definition is stored by the time
-        // this call answers — so the version is readable at once and reports the status
-        // every stored version carries rather than passing through `PENDING`.
-        let registered = schema.register_version(input.schema_definition.clone(), now);
+        // this call answers — so the version is readable at once rather than passing
+        // through `PENDING`, and it carries the status its compatibility check gives it:
+        // "Returns an error if new version of schema does not meet the compatibility
+        // requirements of the schema set", which this operation reports as the version's
+        // own `FAILURE` status rather than by refusing the call.
+        let compatibility = schema.compatibility.clone();
+        let (registered, failure) =
+            schema.register_checked_version(input.schema_definition.clone(), now);
         let output = RegisterSchemaVersionOutput {
             schema_version_id: Some(registered.version_id.clone()),
             version_number: Some(registered.version_number),
             status: Some(registered.status.clone()),
         };
-        ::tracing::info!(
-            operation = "RegisterSchemaVersion",
-            registry = %registry_name,
-            schema = %schema_name,
-            version = registered.version_number,
-            "registered a version of a Glue schema set"
-        );
+        match &failure {
+            Some(failure) => ::tracing::info!(
+                operation = "RegisterSchemaVersion",
+                registry = %registry_name,
+                schema = %schema_name,
+                version = registered.version_number,
+                compatibility = %compatibility,
+                compared_with = failure.version_number,
+                registered_definition_reads = failure.as_reader,
+                detail = %failure.detail,
+                "registered a version of a Glue schema set that failed its compatibility check"
+            ),
+            None => ::tracing::info!(
+                operation = "RegisterSchemaVersion",
+                registry = %registry_name,
+                schema = %schema_name,
+                version = registered.version_number,
+                compatibility = %compatibility,
+                "registered a version of a Glue schema set"
+            ),
+        }
         Ok(output)
     }
 }

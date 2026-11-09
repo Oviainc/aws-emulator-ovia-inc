@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSchemaByDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSchemaByDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSchemaByDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Reports the version of a schema set whose stored `SchemaDefinition` is the one asked
+//! about: the `SchemaId` is resolved to the schema set the way every schema-registry
+//! operation resolves one, and the definition is looked for among the versions THAT set
+//! holds in [`crate::state::ComAmazonawsGlueAwsglueState::registries`] — so what
+//! `CreateSchema` and `RegisterSchemaVersion` wrote is what this read answers from.
+//!
+//! "If the hash is matched within the scope of the SchemaName or ARN (or the default
+//! registry, if none is supplied), that schema's metadata is returned. Otherwise, a 404 or
+//! NotFound error is returned": a schema set this endpoint holds none of, and a definition
+//! no version of it carries, are both refused with `EntityNotFoundException`. A version a
+//! delete removed is no longer held at all, which is what makes "schema versions in Deleted
+//! statuses will not be included in the results" hold here.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +166,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSchemaByDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSchemaByDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSchemaByDefinition"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(GetSchemaByDefinitionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue schema registry store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // The schema set the definition is looked for in is resolved first, by the ONE
+        // resolution every schema-registry operation shares: a `SchemaId` may name it by
+        // name or by ARN, and one naming neither is a bad parameter rather than a miss.
+        let reference = match crate::state::schema_reference(&input.schema_id, &region) {
+            Ok(reference) => reference,
+            Err(message) => return Err(invalid_input(message)),
+        };
+        // A schema ARN of another account or another Region names a schema of an estate
+        // this endpoint does not serve, so it names none here whatever this store holds
+        // under that name.
+        let (registry_name, schema_name) = match reference {
+            crate::state::Reference::Local(names) => names,
+            crate::state::Reference::Elsewhere(_) => return Err(schema_not_found()),
+        };
+
+        // Reporting only: the stored version is projected out and nothing is written.
+        let store = state.lock();
+        let Some(schema) = store.schema(&registry_name, &schema_name) else {
+            return Err(schema_not_found());
+        };
+        // The lookup is "within the scope of the SchemaName or ARN": a definition held by a
+        // version of ANOTHER schema set is no answer for this one.
+        let Some(version) = schema.version_with_definition(&input.schema_definition) else {
+            return Err(version_not_found());
+        };
+
+        Ok(GetSchemaByDefinitionOutput {
+            schema_version_id: Some(version.version_id.clone()),
+            // The format and the ARN belong to the schema SET the version was registered
+            // against, and the ARN is minted for the Region the call is served in, the way
+            // every other schema-registry read mints it.
+            data_format: Some(schema.data_format.clone()),
+            schema_arn: Some(crate::state::schema_arn(
+                &region,
+                &schema.registry_name,
+                &schema.name,
+            )),
+            status: Some(version.status.clone()),
+            created_time: Some(crate::state::to_timestamp_string(version.created_time)),
+        })
     }
+}
+
+/// This operation's modelled refusal for a request it cannot act on: "The input provided
+/// was not valid."
+fn invalid_input(message: String) -> GetSchemaByDefinitionError {
+    GetSchemaByDefinitionErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// This operation's modelled refusal for a `SchemaId` that resolves to a schema set this
+/// endpoint holds none of — the same wording every schema-registry miss answers.
+fn schema_not_found() -> GetSchemaByDefinitionError {
+    GetSchemaByDefinitionErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(crate::state::messages::SCHEMA_NOT_FOUND.to_string()),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// The same for a schema set that holds no version of the definition asked about — the
+/// wording every schema-registry version miss answers.
+fn version_not_found() -> GetSchemaByDefinitionError {
+    GetSchemaByDefinitionErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(crate::state::messages::SCHEMA_VERSION_NOT_FOUND.to_string()),
+        from_federation_source: None,
+    })
+    .into()
 }

@@ -48,8 +48,12 @@ pub const REGISTRY_STATUS_DELETING: &str = "DELETING";
 /// passing through `PENDING`.
 pub const SCHEMA_STATUS_AVAILABLE: &str = "AVAILABLE";
 
-/// `SchemaVersionStatus` for a stored schema version, for the same reason as
-/// [`SCHEMA_STATUS_AVAILABLE`].
+/// `SchemaVersionStatus` for a stored schema version that may be used, for the same reason
+/// as [`SCHEMA_STATUS_AVAILABLE`]: a version is stored by the time its registration
+/// answers, so it is readable at once rather than passing through `PENDING`.
+///
+/// A version whose compatibility check did not hold is stored as
+/// [`SCHEMA_VERSION_STATUS_FAILURE`] instead.
 pub const SCHEMA_VERSION_STATUS_AVAILABLE: &str = "AVAILABLE";
 
 /// The `Compatibility` mode recorded for a schema created without one.
@@ -493,8 +497,8 @@ impl SchemaEntry {
             && self.next_schema_version() <= MAX_SCHEMA_VERSION_NUMBER
     }
 
-    /// Register `definition` as this schema set's next version, at `now`, and report the
-    /// version stored.
+    /// Register `definition` as this schema set's next version, at `now`, with
+    /// `status` as its `SchemaVersionStatus`, and report the version stored.
     ///
     /// The ONE write that adds a version, so a registration and a create cannot disagree
     /// about what one is: the number is [`Self::next_schema_version`] and the version is
@@ -502,13 +506,17 @@ impl SchemaEntry {
     /// `UpdatedTime` moves with it, because the set now holds something it did not. Its
     /// `SchemaCheckpoint` does NOT: that records "the last time the compatibility mode was
     /// changed", which a registration does not change.
+    ///
+    /// Which status a registration carries is decided by its compatibility check, so the
+    /// caller is [`Self::register_checked_version`] rather than a handler.
     pub fn register_version(
         &mut self,
         definition: String,
+        status: &str,
         now: SystemTime,
     ) -> SchemaVersionEntry {
         let version_number = self.next_schema_version();
-        let registered = SchemaVersionEntry::new(version_number, definition, now);
+        let registered = SchemaVersionEntry::new(version_number, definition, status, now);
         self.versions.push(registered.clone());
         self.updated_time = now;
         registered
@@ -560,13 +568,19 @@ pub struct SchemaVersionEntry {
 }
 
 impl SchemaVersionEntry {
-    /// The version `version_number` of a schema set, registered at `now` with `definition`.
-    pub fn new(version_number: i64, definition: String, now: SystemTime) -> Self {
+    /// The version `version_number` of a schema set, registered at `now` with `definition`
+    /// and the `SchemaVersionStatus` `status`.
+    pub fn new(
+        version_number: i64,
+        definition: String,
+        status: &str,
+        now: SystemTime,
+    ) -> Self {
         Self {
             version_id: new_schema_version_id(),
             version_number,
             definition,
-            status: SCHEMA_VERSION_STATUS_AVAILABLE.to_string(),
+            status: status.to_string(),
             created_time: now,
         }
     }
