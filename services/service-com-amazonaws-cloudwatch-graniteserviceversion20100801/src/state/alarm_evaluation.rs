@@ -15,9 +15,11 @@
 //!   the period — "CloudWatch aggregates all data points with time stamps that fall within
 //!   each one-hour period" — so which period a datapoint belongs to is decided by its own time
 //!   stamp and not by the instant the evaluation runs, while WHICH of those periods an
-//!   evaluation grades is decided by its evaluated range, a rolling one that "advances each
-//!   time the alarm is evaluated" (`SlidingWindow`) rather than one aligned to the calendar
-//!   boundaries of the data ([`newest_graded_period`]);
+//!   evaluation grades is decided by its evaluated range — the range of the window the alarm's
+//!   `EvaluationWindow` names ([`EvaluationGrid`]): a rolling one that "advances each time the
+//!   alarm is evaluated" (`SlidingWindow`), which is also the window an alarm naming none uses,
+//!   or one aligned to the clock boundaries the alarm's period repeats at, which grades only
+//!   the periods that have CLOSED (`WallClockWindow`);
 //! * each window yields one datapoint — the alarm's `Statistic` or `ExtendedStatistic` over
 //!   the datapoints in it — or no datapoint at all when the window holds none;
 //! * the evaluation looks over a RANGE of windows wider than `EvaluationPeriods`, and
@@ -107,6 +109,13 @@ use crate::ops::types::{
     AlarmHistoryItem, AnomalyDetector, MetricAlarm, MetricDataQuery, STATISTIC_VALUES,
 };
 
+/// The grid of period windows an alarm's evaluation grades its series over: where the
+/// boundaries between those periods fall, and whether the period the clock is IN may be graded
+/// before it closes — the whole of what an alarm's `EvaluationWindow` decides.
+pub mod evaluation_window;
+
+pub use evaluation_window::{AlignmentZone, EvaluationGrid};
+
 /// How long after the write that configured an alarm its FIRST evaluation is owed, and how
 /// long after an evaluation the NEXT one is owed.
 ///
@@ -152,7 +161,7 @@ const MAX_EVALUATED_PERIODS: usize = 1_440;
 /// bounded too.
 ///
 /// The periods are anchored at multiples of the period and the newest of them is the one the end
-/// of the rolling range falls in ([`newest_graded_period`]), so the range reaches further back
+/// of the rolling range falls in ([`EvaluationGrid::newest_graded_period`]), so the range reaches further back
 /// than a span measured from the evaluation instant would, which is why this factor leaves room
 /// for more periods than the look-back plus the sparse-series margin.
 const EVALUATION_RANGE_FACTOR: usize = 3;
@@ -588,21 +597,21 @@ fn band_bounds<'resolved>(
 }
 
 /// One resolved series folded into the windows an evaluation grades, newest first — index 0
-/// being the window the end of the evaluation's rolling range fell in
-/// ([`newest_graded_period`]).
+/// being the window the end of the evaluation's range fell in
+/// ([`EvaluationGrid::newest_graded_period`]).
 ///
-/// Which window a point belongs to is decided by its own time stamp, the same anchoring an
-/// alarm over one metric folds its datapoints by, and a point past the end of this evaluation's
-/// range is left to a later evaluation; where a series carries several points inside one window
-/// — a series spaced finer than the period it is graded in — the window takes the NEWEST of
-/// them.
+/// Which window a point belongs to is decided by its own time stamp against the alarm's own
+/// grid, the same anchoring an alarm over one metric folds its datapoints by, and a point past
+/// the end of this evaluation's range is left to a later evaluation; where a series carries
+/// several points inside one window — a series spaced finer than the period it is graded in —
+/// the window takes the NEWEST of them.
 fn graded_windows(
     points: &[(f64, f64)],
+    grid: EvaluationGrid,
     period: f64,
     range_periods: usize,
     now_secs: f64,
 ) -> Vec<Option<GradedDatapoint>> {
-    let newest_window = newest_graded_period(now_secs, period);
     let mut windows: Vec<Option<(f64, GradedDatapoint)>> = vec![None; range_periods];
     for (timestamp, value) in points {
         // A point the arithmetic produced no finite number for is not a value the alarm can
@@ -610,12 +619,9 @@ fn graded_windows(
         if !value.is_finite() {
             continue;
         }
-        let periods_back = newest_window - (timestamp / period).floor();
-        if periods_back < 0.0 {
+        let Some(index) = grid.periods_back(now_secs, *timestamp, period) else {
             continue;
-        }
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let index = periods_back as usize;
+        };
         let Some(slot) = windows.get_mut(index) else {
             continue;
         };
@@ -660,7 +666,7 @@ fn evaluated_periods(alarm: &MetricAlarm) -> Option<usize> {
 /// range reaching back LESS far than that span lets a datapoint published late in its span fall
 /// out of the range before any evaluation has graded it — nothing would ever grade a breach a
 /// client really published — so the range reaches back at least one whole storage span plus the
-/// lag the end of the range runs behind this instant ([`evaluation_lag_secs`]). That is the
+/// lag the end of the range runs behind this instant ([`EvaluationGrid::lag_secs`]). That is the
 /// width at which every stored datapoint is graded by the evaluations running while it is the
 /// newest one the series holds.
 ///
@@ -673,11 +679,13 @@ fn evaluation_range_periods(
     evaluation_periods: usize,
     period: Option<f64>,
     stored_span: f64,
+    grid: EvaluationGrid,
+    now_secs: f64,
 ) -> usize {
     let covering_one_storage_span = period
         .filter(|period| *period >= 1.0 && stored_span > 0.0)
         .map_or(0, |period| {
-            let covering = (stored_span + evaluation_lag_secs(period)) / period;
+            let covering = (stored_span + grid.lag_secs(now_secs, period)) / period;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let covering = covering.ceil() as usize;
             covering.min(MAX_EVALUATED_PERIODS)
@@ -687,10 +695,12 @@ fn evaluation_range_periods(
         .max(covering_one_storage_span)
 }
 
-/// How long the end of the range an evaluation grades LAGS the instant that evaluation runs,
-/// for an alarm whose periods are `period` seconds wide: one evaluation cadence, which is the
-/// alarm's own period for a high-resolution alarm and the store's scheduled pass
-/// ([`SCHEDULED_EVALUATION_SECS`]) for a longer one.
+/// How long the end of the ROLLING range an evaluation grades LAGS the instant that evaluation
+/// runs, for an alarm whose periods are `period` seconds wide: one evaluation cadence, which is
+/// the alarm's own period for a high-resolution alarm and the store's scheduled pass
+/// ([`SCHEDULED_EVALUATION_SECS`]) for a longer one. An alarm graded on an ALIGNED grid lags by
+/// however long the period the clock is in has been open instead
+/// ([`EvaluationGrid::lag_secs`]).
 ///
 /// An alarm's evaluated range "advances each time the alarm is evaluated, forming a rolling time
 /// window" (`SlidingWindow`, the window "the alarm uses" when its configuration names none —
@@ -708,40 +718,6 @@ fn evaluation_range_periods(
 /// function of the stored datapoints and the clock.
 fn evaluation_lag_secs(period: f64) -> f64 {
     period.min(SCHEDULED_EVALUATION_SECS)
-}
-
-/// The newest `period`-second window an evaluation running at `now_secs` GRADES, as a count of
-/// whole periods since the epoch: the window the END of its rolling range falls in
-/// ([`evaluation_lag_secs`]).
-///
-/// A metric is aggregated into periods anchored at multiples of the period — "CloudWatch
-/// aggregates all data points with time stamps that fall within each one-hour period" — so which
-/// period a datapoint belongs to is decided by its own time stamp. WHICH of those periods an
-/// evaluation grades is decided by its range, and an alarm's range is a rolling one that
-/// "advances each time the alarm is evaluated" (`SlidingWindow`) rather than one aligned to the
-/// calendar boundaries of the data: so the newest period an evaluation grades is the period the
-/// clock is IN once that period has been open for a whole evaluation cadence, and the period
-/// before it until then. A datapoint is therefore graded within a cadence of the write that
-/// stored it, whatever the width of the periods it is aggregated into.
-///
-/// For an alarm whose period is no wider than that cadence — a high-resolution alarm — the lag
-/// is the period itself, so such an alarm grades only periods that have CLOSED and its own
-/// instant is never earlier than the END of the newest window it graded: a client reconciling
-/// its decision against the metric data reads the instant it queried the series at as the
-/// watermark of the data it had.
-fn newest_graded_period(now_secs: f64, period: f64) -> f64 {
-    ((now_secs - evaluation_lag_secs(period)) / period).floor()
-}
-
-/// The instant the range an evaluation running at `now_secs` grades ENDS at, for windows
-/// `period` seconds wide: the end of the newest period that evaluation grades
-/// ([`newest_graded_period`]), the range being half-open on it.
-///
-/// One definition of that end, so the range the query array of an alarm is resolved over
-/// ([`State::resolved_query_array`]) and the watermark a datapoint is measured against to say
-/// whether an evaluation has REACHED it ([`State::metric_alarm_evaluation`]) cannot drift.
-fn graded_range_end(now_secs: f64, period: f64) -> f64 {
-    (newest_graded_period(now_secs, period) + 1.0) * period
 }
 
 /// The names of `alarms` in the order their evaluations came DUE: oldest first, and by name
@@ -827,11 +803,15 @@ struct GradedSeries<'alarm> {
     /// The statistic the series was folded by, for an alarm that names one; `None` for a
     /// series a query array computed, which no single statistic describes.
     statistic: Option<AlarmStatistic<'alarm>>,
+    /// The grid those windows lie on: where their boundaries fall, and whether the period the
+    /// clock is in was graded at all ([`EvaluationGrid`]). Carried beside them so the
+    /// explanation names the instants the SAME grid put them at.
+    grid: EvaluationGrid,
     /// How wide one window is, in seconds.
     period: f64,
     /// What each window of the evaluation range took, newest first — index 0 being the window
-    /// the end of the evaluation's rolling range fell in ([`newest_graded_period`]) — and
-    /// `None` for a window the series has no value for.
+    /// the end of the evaluation's range fell in ([`EvaluationGrid::newest_graded_period`]) —
+    /// and `None` for a window the series has no value for.
     windows: Vec<Option<GradedDatapoint>>,
 }
 
@@ -859,8 +839,8 @@ struct GradedAgainst<'alarm> {
 #[derive(Debug, Clone, Copy)]
 struct Evaluated {
     /// Which window of the evaluation range the datapoint came from, counting back from the
-    /// window the end of the evaluation's rolling range fell in ([`newest_graded_period`]);
-    /// `None` for a slot no real datapoint filled.
+    /// window the end of the evaluation's range fell in
+    /// ([`EvaluationGrid::newest_graded_period`]); `None` for a slot no real datapoint filled.
     window: Option<usize>,
     /// The statistic over that window, for a real datapoint.
     value: Option<f64>,
@@ -1175,10 +1155,14 @@ impl State {
         }
         let operator = alarm.comparison_operator.as_deref()?;
         let evaluation_periods = evaluated_periods(alarm)?;
+        // The grid this alarm's periods lie on, and whether the period the clock is IN is one
+        // this evaluation may grade at all: the whole of what its `EvaluationWindow` decides
+        // ([`EvaluationGrid`]).
+        let grid = EvaluationGrid::of(alarm, now_secs);
         // The windows of the EVALUATION RANGE: window 0 is the newest period this evaluation
-        // grades ([`newest_graded_period`]), window i the period before it, and the range
-        // reaches further back than the look-back ([`evaluation_range_periods`]) — how much
-        // further depends on how wide this alarm's windows are and on the granularity the
+        // grades ([`EvaluationGrid::newest_graded_period`]), window i the period before it, and
+        // the range reaches further back than the look-back ([`evaluation_range_periods`]) — how
+        // much further depends on how wide this alarm's windows are and on the granularity the
         // series it grades is STORED at, so both are resolved from the same places the grading
         // itself reads them from ([`graded_window_secs`], [`Self::watched_data`]).
         let watched = self.watched_data(alarm, now_secs, budget);
@@ -1186,6 +1170,8 @@ impl State {
             evaluation_periods,
             graded_window_secs(alarm),
             watched.storage_span,
+            grid,
+            now_secs,
         );
         // The series this alarm GRADES, as the value each of those windows took, and what it
         // compares each of them against: the one number the alarm is configured with, or the
@@ -1194,14 +1180,20 @@ impl State {
             Some(threshold_id) => {
                 let bound = band_bound_of(operator)?;
                 let queries = alarm.metrics.as_deref()?;
-                let (graded, bands) =
-                    self.graded_against_band(queries, threshold_id, range_periods, now_secs, budget)?;
+                let (graded, bands) = self.graded_against_band(
+                    queries,
+                    threshold_id,
+                    range_periods,
+                    grid,
+                    now_secs,
+                    budget,
+                )?;
                 (graded, Predicate::Band { bound, bands })
             }
             None => {
                 let comparison = comparison_of(operator)?;
                 let threshold = alarm.threshold?;
-                let graded = self.graded_series(alarm, range_periods, now_secs, budget)?;
+                let graded = self.graded_series(alarm, range_periods, grid, now_secs, budget)?;
                 (
                     graded,
                     Predicate::Static {
@@ -1280,18 +1272,20 @@ impl State {
         // An evaluation that graded NO datapoint at all, while the series this alarm reads hold
         // one its range has not reached yet, has not graded this alarm's series: the periods it
         // covered are not periods the series has no datapoint for — the datapoint belongs to a
-        // period NEWER than the end of this evaluation's rolling range
-        // ([`newest_graded_period`]) — so no arm of the missing-data treatment stands in for
-        // anything, and the alarm keeps the state it has until the evaluation whose range
-        // reaches that datapoint grades it. Without this an alarm would reach a decided state
-        // from the treatment alone, over an EMPTY window, while a client was publishing into
-        // the very series it watches.
+        // period NEWER than the end of this evaluation's range
+        // ([`EvaluationGrid::newest_graded_period`]) — so no arm of the missing-data treatment
+        // stands in for anything, and the alarm keeps the state it has until the evaluation
+        // whose range reaches that datapoint grades it. Without this an alarm would reach a
+        // decided state from the treatment alone, over an EMPTY window, while a client was
+        // publishing into the very series it watches.
         //
-        // The wait is at most ONE evaluation cadence, so a period the series really holds no
-        // datapoint for is still decided by the treatment: the datapoint is already in the
-        // past, and the period it belongs to enters the range a cadence after that period
-        // opened ([`evaluation_lag_secs`]).
-        let range_end = graded_range_end(now_secs, graded.period);
+        // On the rolling grid the wait is at most ONE evaluation cadence, so a period the series
+        // really holds no datapoint for is still decided by the treatment: the datapoint is
+        // already in the past, and the period it belongs to enters the range a cadence after
+        // that period opened ([`evaluation_lag_secs`]). On an ALIGNED grid the wait is until the
+        // boundary the period the datapoint was published into ends at, which is exactly what an
+        // aligned window asks for: no verdict over a period that has not closed.
+        let range_end = grid.range_end(now_secs, graded.period);
         if evaluated.is_empty() && watched.newest_instant.is_some_and(|at| at >= range_end) {
             return None;
         }
@@ -1375,12 +1369,15 @@ impl State {
         &self,
         alarm: &'alarm MetricAlarm,
         range_periods: usize,
+        grid: EvaluationGrid,
         now_secs: f64,
         budget: &mut EvaluationBudget,
     ) -> Option<GradedSeries<'alarm>> {
         match alarm.metrics.as_deref() {
-            Some(queries) => self.graded_query_array(queries, range_periods, now_secs, budget),
-            None => self.graded_metric(alarm, range_periods, now_secs, budget),
+            Some(queries) => {
+                self.graded_query_array(queries, range_periods, grid, now_secs, budget)
+            }
+            None => self.graded_metric(alarm, range_periods, grid, now_secs, budget),
         }
     }
 
@@ -1389,6 +1386,7 @@ impl State {
         &self,
         alarm: &'alarm MetricAlarm,
         range_periods: usize,
+        grid: EvaluationGrid,
         now_secs: f64,
         budget: &mut EvaluationBudget,
     ) -> Option<GradedSeries<'alarm>> {
@@ -1404,9 +1402,6 @@ impl State {
         // One pass over the series fills every window of the evaluation range.
         let mut windows: Vec<Vec<&StoredDatum>> = vec![Vec::new(); range_periods];
         let series = self.metrics.get(&key);
-        // The newest period this evaluation grades, as a count of whole periods since the
-        // epoch: the anchor every datapoint's window is measured against.
-        let newest_window = newest_graded_period(now_secs, period);
         // The datapoints this fold is about to visit, charged before it visits them: this is
         // the factor that multiplies with the number of alarms one request evaluates.
         budget.charge_datapoints(series.map_or(0, Vec::len));
@@ -1424,17 +1419,12 @@ impl State {
         // alarm shows.
         //
         // A datapoint of a period NEWER than the newest one this evaluation grades — one
-        // stamped past the end of its rolling range, or up to two hours ahead of this instant
+        // stamped past the end of its range, or up to two hours ahead of this instant
         // ("as much as 2 hours after the current day and time", `PutMetricData`) — is graded by
         // a later evaluation, whose range has advanced over it, and not by this one.
         let graded_window = |datum: &StoredDatum| -> Option<usize> {
-            let periods_back = newest_window - (datum.aggregated_instant() / period).floor();
-            if periods_back < 0.0 {
-                return None;
-            }
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let index = periods_back as usize;
-            (index < range_periods).then_some(index)
+            grid.periods_back(now_secs, datum.aggregated_instant(), period)
+                .filter(|index| *index < range_periods)
         };
         for datum in series.into_iter().flatten() {
             // "If you specify a unit, the operation returns only data that was collected with
@@ -1451,6 +1441,7 @@ impl State {
         Some(GradedSeries {
             // The statistic the alarm folded its windows by, which its decision record names.
             statistic: Some(statistic),
+            grid,
             period,
             windows: windows
                 .iter()
@@ -1478,19 +1469,22 @@ impl State {
         &self,
         queries: &[MetricDataQuery],
         range_periods: usize,
+        grid: EvaluationGrid,
         now_secs: f64,
         budget: &mut EvaluationBudget,
     ) -> Option<GradedSeries<'static>> {
         let graded = watched_query(queries, None)?;
         let (resolution, period) =
-            self.resolved_query_array(queries, graded, range_periods, now_secs, budget)?;
+            self.resolved_query_array(queries, graded, range_periods, grid, now_secs, budget)?;
         Some(GradedSeries {
             // No single statistic describes a series a query array computed, so its decision
             // record names none.
             statistic: None,
+            grid,
             period,
             windows: graded_windows(
                 single_series(&resolution, &graded.id)?,
+                grid,
                 period,
                 range_periods,
                 now_secs,
@@ -1517,21 +1511,23 @@ impl State {
         queries: &[MetricDataQuery],
         threshold_id: &str,
         range_periods: usize,
+        grid: EvaluationGrid,
         now_secs: f64,
         budget: &mut EvaluationBudget,
     ) -> Option<(GradedSeries<'static>, Vec<Option<Band>>)> {
         let graded = watched_query(queries, Some(threshold_id))?;
         let (resolution, period) =
-            self.resolved_query_array(queries, graded, range_periods, now_secs, budget)?;
+            self.resolved_query_array(queries, graded, range_periods, grid, now_secs, budget)?;
         let watched = graded_windows(
             single_series(&resolution, &graded.id)?,
+            grid,
             period,
             range_periods,
             now_secs,
         );
         let (lower, upper) = band_bounds(&resolution, threshold_id)?;
-        let lower = graded_windows(lower, period, range_periods, now_secs);
-        let upper = graded_windows(upper, period, range_periods, now_secs);
+        let lower = graded_windows(lower, grid, period, range_periods, now_secs);
+        let upper = graded_windows(upper, grid, period, range_periods, now_secs);
         // A period is inside the band only where BOTH bounds have a value for it: a model
         // reports its band as the two series together, so half of one is no band.
         let bands = lower
@@ -1548,6 +1544,7 @@ impl State {
         Some((
             GradedSeries {
                 statistic: None,
+                grid,
                 period,
                 windows: watched,
             },
@@ -1567,18 +1564,17 @@ impl State {
         queries: &[MetricDataQuery],
         graded: &MetricDataQuery,
         range_periods: usize,
+        grid: EvaluationGrid,
         now_secs: f64,
         budget: &mut EvaluationBudget,
     ) -> Option<(super::metric_query::Resolution, f64)> {
         let period = graded_period(queries, graded);
         // The range the array is resolved over is exactly the windows the evaluation grades:
-        // anchored at multiples of the period, the newest being the one the end of this
-        // evaluation's rolling range falls in ([`newest_graded_period`]), so the range ends
-        // where that window ends.
-        let newest_window = newest_graded_period(now_secs, period);
-        #[allow(clippy::cast_precision_loss)]
-        let start = (newest_window - (range_periods.saturating_sub(1) as f64)) * period;
-        let end = graded_range_end(now_secs, period);
+        // laid on the alarm's own grid, the newest being the one the end of this evaluation's
+        // range falls in ([`EvaluationGrid::newest_graded_period`]), so the range ends where
+        // that window ends.
+        let start = grid.window_start(now_secs, range_periods.saturating_sub(1), period);
+        let end = grid.range_end(now_secs, period);
 
         // How much work this array asks for is bounded BEFORE anything is parsed or folded:
         // the queries of the array and the windows of the range are the factors of every walk
@@ -1658,6 +1654,9 @@ impl State {
             treat_missing,
         } = against;
         let period = graded.period;
+        // The grid the windows were laid on, so the instants the explanation names are the ones
+        // the grading itself graded ([`EvaluationGrid`]).
+        let grid = graded.grid;
         // What the missing-data treatment fills the slots no real datapoint filled with: a
         // substituted datapoint under `breaching` and `notBreaching`, and nothing at all
         // under `missing` and `ignore`, which leave the evaluation with fewer datapoints. A
@@ -1766,10 +1765,11 @@ impl State {
                 missing_data_arm(treat_missing),
                 phrase,
                 &thresholds,
-                &cited_datapoints(&evaluated, now_secs, period),
+                &cited_datapoints(&evaluated, grid, now_secs, period),
             ),
             reason_data: state_reason_data(
                 graded.statistic.as_ref(),
+                grid,
                 period,
                 predicate.fixed_threshold(),
                 now_secs,
@@ -2286,13 +2286,18 @@ const MAX_CITED_DATAPOINT_CHARS: usize = 700;
 /// treatment substituted stands for a window that held nothing, so there is no measured value
 /// to name for it — which is also why the list is prefixed with its own space and can be
 /// dropped from the sentence without leaving a gap.
-fn cited_datapoints(evaluated: &[Evaluated], now_secs: f64, period: f64) -> String {
+fn cited_datapoints(
+    evaluated: &[Evaluated],
+    grid: EvaluationGrid,
+    now_secs: f64,
+    period: f64,
+) -> String {
     let mut cited = String::new();
     for slot in evaluated {
         let (Some(index), Some(value)) = (slot.window, slot.value) else {
             continue;
         };
-        let entry = match reason_instant(window_start(now_secs, index, period)) {
+        let entry = match reason_instant(grid.window_start(now_secs, index, period)) {
             Some(at) => format!("{} ({at})", decimal_text(value)),
             None => decimal_text(value),
         };
@@ -2308,20 +2313,6 @@ fn cited_datapoints(evaluated: &[Evaluated], now_secs: f64, period: f64) -> Stri
         return cited;
     }
     format!(" [{cited}]")
-}
-
-/// The instant the `index`th period back from the newest one the evaluation GRADES begins, which
-/// is the time stamp a datapoint aggregated out of that period carries.
-///
-/// The periods are the ones this store's readers fold a series into, so the start of one is
-/// the shared [`super::window_start`] measured from the newest period the evaluation grades
-/// ([`newest_graded_period`]): one definition of a period's start serves the alarm evaluator
-/// and the metric readers.
-fn window_start(now_secs: f64, index: usize, period: f64) -> f64 {
-    let newest_window_start = newest_graded_period(now_secs, period) * period;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let periods_back = index as i64;
-    super::window_start(newest_window_start, -periods_back, period)
 }
 
 /// The instant a graded datapoint is named by, in the form an alarm explanation writes one:
@@ -2376,8 +2367,13 @@ fn decimal_text(value: f64) -> String {
 /// `statistic` member whichever of the two members the alarm configured it on, so a series a
 /// query array computed — which no single statistic describes — contributes no statistic
 /// member at all.
+///
+/// Every instant it names is the start of the period it belongs to on the grid the evaluation
+/// graded ([`EvaluationGrid::window_start`]), so an alarm with an aligned window reports the
+/// clock boundaries its range was aligned to.
 fn state_reason_data(
     statistic: Option<&AlarmStatistic<'_>>,
+    grid: EvaluationGrid,
     period: f64,
     threshold: Option<f64>,
     now_secs: f64,
@@ -2391,7 +2387,8 @@ fn state_reason_data(
     // written in the form this service's JSON documents stamp an instant with
     // ([`super::document_instant`]). The query instant is at or after the END of the newest
     // period the document reports for a high-resolution alarm, whose rolling range lags the
-    // clock by its own period ([`newest_graded_period`]).
+    // clock by its own period, and for every alarm with an ALIGNED window, which grades only
+    // periods that have closed ([`EvaluationGrid::newest_graded_period`]).
     if let Some(at) = super::document_instant(now_secs) {
         document.insert("queryDate".to_string(), Value::from(at));
     }
@@ -2399,7 +2396,7 @@ fn state_reason_data(
         .iter()
         .filter_map(|slot| slot.window)
         .max()
-        .and_then(|index| super::document_instant(window_start(now_secs, index, period)))
+        .and_then(|index| super::document_instant(grid.window_start(now_secs, index, period)))
     {
         document.insert("startDate".to_string(), Value::from(at));
     }
@@ -2440,7 +2437,9 @@ fn state_reason_data(
             let mut entry = Map::new();
             if let Some(at) = slot
                 .window
-                .and_then(|index| super::document_instant(window_start(now_secs, index, period)))
+                .and_then(|index| {
+                    super::document_instant(grid.window_start(now_secs, index, period))
+                })
             {
                 entry.insert("timestamp".to_string(), Value::from(at));
             }

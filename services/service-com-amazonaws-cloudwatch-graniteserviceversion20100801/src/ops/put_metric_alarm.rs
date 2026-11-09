@@ -22,7 +22,10 @@
 //! The alarm this write stores is then EVALUATED from the datapoints `PutMetricData` stored
 //! ([`crate::state::alarm_evaluation`]), whether its configuration names one metric or a
 //! `Metrics` query array — a metric-math alarm's state is the verdict over the series that
-//! array's returning query computes.
+//! array's returning query computes — and over the range its `EvaluationWindow` selects: the
+//! rolling one by default, or, for an alarm naming a wall clock window, the periods that have
+//! closed on the clock boundaries its own `Period` repeats at in that window's time zone
+//! ([`crate::state::alarm_evaluation::EvaluationGrid`]).
 //!
 //! ## Shape of an operation
 //!
@@ -402,6 +405,10 @@ const WALL_CLOCK_PERIODS: [i32; 5] = [60, 300, 3_600, 86_400, 604_800];
 const WALL_CLOCK_PERIOD_REFUSAL: &str =
     "Wall Clock evaluation period must be 1 minute, 5 minutes, 1 hour, 1 day or 1 week.";
 
+/// The request member path a refusal of an aligned window's time zone names, as this service
+/// names a member inside a nested structure ([`crate::state::value_is_invalid_message`]).
+const WALL_CLOCK_TIMEZONE_PARAMETER: &str = "EvaluationWindow.WallClockWindow.Timezone";
+
 /// The metric math function an alarm's expression may not call at all, and CloudWatch's own
 /// refusal for it: a search returns every series its query matches, and an alarm watches one
 /// time series ("Any expression used in a `PutMetricAlarm` operation must return a single time
@@ -482,6 +489,21 @@ fn configuration_refusal(input: &PutMetricAlarmInput) -> Option<String> {
             ALARM_WRITE,
             crate::state::ONLY_ONE_STATISTIC,
         ));
+    }
+    // An aligned window lays its boundaries on the CLOCK of the zone it names ("You can specify
+    // an IANA time zone name […], a fixed UTC offset […], or an offset-prefixed identifier […].
+    // The offset must be aligned to a multiple of 5 minutes.",
+    // `smithy_query(query="shape",shape="WallClockWindow")`), so a value naming no such zone
+    // names no boundary either and no alarm can be created from it. Read through the one reading
+    // of that member this service has, the one the evaluation lays those boundaries by.
+    if let Some(EvaluationWindow::WallClockWindow(window)) = input.evaluation_window.as_ref() {
+        let timezone = window.timezone.as_deref();
+        if crate::state::alarm_evaluation::AlignmentZone::of(timezone).is_none() {
+            return Some(crate::state::value_is_invalid_message(
+                timezone.unwrap_or_default(),
+                WALL_CLOCK_TIMEZONE_PARAMETER,
+            ));
+        }
     }
     if let Some(period) = input.period {
         if !is_alarm_period(period) {

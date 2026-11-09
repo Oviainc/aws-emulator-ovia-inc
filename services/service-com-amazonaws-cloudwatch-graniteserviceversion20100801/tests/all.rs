@@ -37,6 +37,8 @@ mod alarm_delete_semantics;
 mod alarm_document_timestamps;
 #[path = "all/alarm_evaluation.rs"]
 mod alarm_evaluation;
+#[path = "all/alarm_evaluation_windows.rs"]
+mod alarm_evaluation_windows;
 #[path = "all/alarm_history.rs"]
 mod alarm_history;
 #[path = "all/alarm_history_data.rs"]
