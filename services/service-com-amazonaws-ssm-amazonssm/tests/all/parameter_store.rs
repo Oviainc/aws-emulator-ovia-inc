@@ -225,6 +225,17 @@ pub(crate) fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// The message a refusal carries. A modelled error of this service renders it as
+/// `Message` (the model's own member name) and the front-door `ValidationException` as
+/// `message`, so one accessor reads either.
+pub(crate) fn error_message(body: &Value) -> String {
+    body["Message"]
+        .as_str()
+        .or_else(|| body["message"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
 async fn put(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
     call(router, "PutParameter", body).await
 }

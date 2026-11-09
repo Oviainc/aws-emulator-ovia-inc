@@ -27,7 +27,9 @@ use service_com_amazonaws_ssm_amazonssm::state::service_settings::{
     STATUS_CUSTOMIZED, STATUS_DEFAULT, UNSET_VALUE,
 };
 
-use super::parameter_store::{call, call_in_region, error_code, router, ACCOUNT, REGION};
+use super::parameter_store::{
+    call, call_in_region, error_code, error_message as message, router, ACCOUNT, REGION,
+};
 
 /// The sentence `ServiceSettingNotFound` carries, spelled out here as the error shape's
 /// own documentation words it
@@ -101,17 +103,6 @@ async fn update(router: &MultiServiceRouter, id: &str, value: &str) -> (u16, Val
 /// `ResetServiceSetting`, returning `(status, body)`.
 async fn reset(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "ResetServiceSetting", &json!({ "SettingId": id })).await
-}
-
-/// The message a refusal carries. A modelled error of this service renders it as
-/// `Message` (the model's own member name) and the front-door `ValidationException` as
-/// `message`, so one accessor reads either.
-fn message(body: &Value) -> String {
-    body["Message"]
-        .as_str()
-        .or_else(|| body["message"].as_str())
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// Every setting the service teams provision reports its provisioned reading, takes the

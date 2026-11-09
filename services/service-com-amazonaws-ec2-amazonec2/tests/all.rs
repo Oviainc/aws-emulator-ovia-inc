@@ -1663,7 +1663,6 @@ mod launch_instance_type_catalog;
 // The PUBLIC key an `ImportKeyPair` carries: the `KeyType` and `KeyFingerprint` that
 // material decides for each algorithm and length, both public-key forms the import
 // requirements name, the pair read back through `DescribeKeyPairs`, and what the import
-// refuses.
 #[path = "all/import_key_pair.rs"]
 mod import_key_pair;
 // Three suites that stood here — `ebs_direct_api_snapshots`,
@@ -1706,7 +1705,6 @@ mod create_fleet;
 // the store into, and what it refuses. Declared beside `prefix_lists` for the reason the note
 #[path = "all/describe_fleets.rs"]
 mod describe_fleets;
-// Appended at the END of this file, for the reason the header gives. What
 // `CreateTransitGatewayPeeringAttachment` records between two DISTINCT transit gateways, the
 // refusal a request that names one gateway as both ends of the peering earns before either end
 // is resolved, and what `DescribeTransitGatewayPeeringAttachments` then reads back.

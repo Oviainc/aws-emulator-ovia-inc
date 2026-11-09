@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::parameter_store::{call, error_code, router};
+use crate::parameter_store::{call, error_code, error_message, router};
 
 /// The transient window a version spends in `Creating`/`Updating`
 /// (`crate::state::DOCUMENT_TRANSITION_DELAY`), which the service stores as a due instant
@@ -419,6 +419,17 @@ async fn content_a_version_already_holds_is_refused() {
             (400, "DuplicateDocumentContent"),
             "case {case}: content version {} already holds is refused, got {status} {response}",
             duplicated + 1
+        );
+        // The refusal names the document the update was aimed at — the request's own
+        // `Name`, which differs from row to row — around text that is otherwise fixed.
+        let message = error_message(&response);
+        assert_eq!(
+            message,
+            format!(
+                "Document to be updated with name {name} has the same metadata and content \
+                 as document version provided in request"
+            ),
+            "case {case}: the duplicate-content refusal names {name}, got {message:?}"
         );
         // Nothing was appended: the latest version is still the one the updates left.
         let described = describe_ok(&router, case, name, Some("$LATEST")).await;

@@ -321,20 +321,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         })?;
 
-        // "The content of the association document matches another document. Change the
-        // content of the document and try again." — content a version of this document
-        // already holds is not a new version of it, so the update is refused rather than
-        // appending a version that differs in nothing. The refusal is the sentence the
-        // service states for this error class.
+        // Content a version of this document already holds is not a new version of it, so
+        // the update is refused rather than appending a version that differs in nothing.
+        // The sentence Systems Manager states for THIS operation's duplicate content names
+        // the document the update was aimed at — the request's own `Name` — and says the
+        // content matches a version of that same document, rather than reporting a
+        // collision with some other document.
         let hash = crate::state::document_content_hash(&input.content);
         if record.version_with_hash(&hash).is_some() {
             return Err(UpdateDocumentErrorModeled::DuplicateDocumentContent(
                 DuplicateDocumentContent {
-                    message: Some(
-                        "The content of the association document matches another document. \
-                         Change the content of the document and try again."
-                            .to_string(),
-                    ),
+                    message: Some(format!(
+                        "Document to be updated with name {} has the same metadata and \
+                         content as document version provided in request",
+                        input.name
+                    )),
                 },
             )
             .into());
