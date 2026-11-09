@@ -247,20 +247,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .user_storage_key(&destination_value)
             .ok_or_else(user_not_found)?;
 
-        // A source identity links to ONE local profile, so an identity that
-        // already carries a link is refused — whether the request re-points it
-        // at another profile or names the profile it already links to. The
-        // caller deactivates the link it holds ("AdminDisableProviderForUser")
-        // before linking that identity again.
+        // A source identity links to ONE local profile, so an identity the pool
+        // already holds a link for links no further profile — and WHICH refusal
+        // says so follows from what that identity now resolves to. A request
+        // naming the profile the link already points at asks for the link the
+        // pool holds, and is told so. For any other destination, the identity
+        // resolves to a local profile, and a profile that holds a password is a
+        // user pool user who signs in with a username and a password: such a
+        // user "may not be passed in as a SourceUser", exactly as the native
+        // provider is refused above. A profile that holds no password is no
+        // such user, so what the refusal reports is that the identity is
+        // already spoken for — the alias collision this operation models, which
+        // is also what a profile whose native sign-in was deactivated leaves
+        // behind (`AdminDisableProviderForUser`).
         if let Some(linked_key) = pool.linked_user_key(&source) {
-            return Err(invalid_parameter(
-                if linked_key == destination_key {
-                    crate::state::SOURCE_USER_ALREADY_LINKED_MESSAGE
-                } else {
-                    crate::state::SOURCE_USER_LINKED_TO_ANOTHER_USER_MESSAGE
-                }
-                .to_string(),
-            ));
+            if linked_key == destination_key {
+                return Err(invalid_parameter(
+                    crate::state::SOURCE_USER_ALREADY_LINKED_MESSAGE.to_string(),
+                ));
+            }
+            let signs_in_with_password = pool
+                .users
+                .get(&linked_key)
+                .is_some_and(|linked| linked.password.is_some());
+            return Err(if signs_in_with_password {
+                invalid_parameter(crate::state::INVALID_SOURCE_USER_MESSAGE.to_string())
+            } else {
+                alias_exists()
+            });
         }
 
         let user = pool
@@ -332,6 +346,17 @@ fn invalid_parameter(message: String) -> AdminLinkProviderForUserError {
         // further classification Amazon Cognito reports only for some refusals;
         // none applies to a provider link, so none is invented.
         reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `AliasExistsException` for a `SourceUser` identity another
+/// local profile already answers for. Carries the fixed message of
+/// [`crate::state::SOURCE_USER_LINKED_TO_ANOTHER_USER_MESSAGE`], which names
+/// neither profile.
+fn alias_exists() -> AdminLinkProviderForUserError {
+    AdminLinkProviderForUserErrorModeled::AliasExistsException(AliasExistsException {
+        message: Some(crate::state::SOURCE_USER_LINKED_TO_ANOTHER_USER_MESSAGE.to_string()),
     })
     .into()
 }

@@ -637,43 +637,54 @@ pub const ACCOUNT_NOT_LINKED_MESSAGE: &str =
 pub const MAX_LINKED_PROVIDER_IDENTITIES: usize = 5;
 
 /// The message `AdminLinkProviderForUser`'s `InvalidParameterException` carries
-/// for a `SourceUser` that already carries a link.
+/// for a `SourceUser` that already links to the very `DestinationUser` the
+/// request names.
 ///
 /// A federated identity links to ONE local profile — the operation "links an
 /// existing user account ... to an identity from an external IdP" and the link
-/// is what lets that identity sign in as the profile — so an identity the pool
-/// already holds a link for is not one a further call can link, whichever
-/// destination it names. One fixed sentence that names the two MEMBERS of the
-/// request rather than the provider, the identity or the profile they carried,
-/// so the refusal echoes nothing the caller submitted.
+/// is what lets that identity sign in as the profile — so a call that asks for
+/// the link the pool already holds is told so: the caller deactivates that link
+/// before linking the identity again. One fixed sentence that names the two
+/// MEMBERS of the request rather than the provider, the identity or the profile
+/// they carried, so the refusal echoes nothing the caller submitted. A request
+/// that points the identity at ANOTHER profile is refused for what that
+/// identity resolves to instead: [`INVALID_SOURCE_USER_MESSAGE`] for a profile
+/// that signs in with a username and a password, and
+/// [`SOURCE_USER_LINKED_TO_ANOTHER_USER_MESSAGE`] for one that does not.
 pub const SOURCE_USER_ALREADY_LINKED_MESSAGE: &str =
     "SourceUser is already linked to DestinationUser";
 
-/// The message `AdminLinkProviderForUser`'s `InvalidParameterException` carries
-/// for a `SourceUser` that already links to a DIFFERENT local profile than the
-/// `DestinationUser` the request names.
+/// The message `AdminLinkProviderForUser`'s `AliasExistsException` carries for a
+/// `SourceUser` identity another local profile already answers for.
 ///
-/// A federated identity links to ONE local profile, so a request that re-points
-/// a linked identity at another profile is refused: the identity is spoken for.
-/// One fixed sentence that names the MEMBER whose value was already linked
-/// rather than the provider, the identity or either profile, so the refusal
-/// echoes nothing the caller submitted. A repeat of the link the identity
-/// already holds carries [`SOURCE_USER_ALREADY_LINKED_MESSAGE`] instead: that
-/// request names the profile the link already points at.
+/// A federated identity links to ONE local profile, so an identity that already
+/// links to another profile is one this pool has given out: handing it to a
+/// second profile is the alias collision `AliasExistsException` reports, "an
+/// ... alias for a different user profile" (that error in this service's
+/// model). It is the refusal left when the identity resolves to a profile that
+/// is NOT a user pool user with a username and a password — one that holds no
+/// password — because such a profile is not what
+/// [`INVALID_SOURCE_USER_MESSAGE`] reports. One fixed sentence that names the
+/// MEMBER whose value was already linked rather than the provider, the identity
+/// or either profile, so the refusal echoes nothing the caller submitted.
 pub const SOURCE_USER_LINKED_TO_ANOTHER_USER_MESSAGE: &str =
     "SourceUser with the specified attribute value is already linked to another user";
 
 /// The message `AdminLinkProviderForUser`'s `InvalidParameterException` carries
-/// for a `SourceUser` that names one of the pool's OWN users rather than an
-/// external identity.
+/// for a `SourceUser` that resolves to one of the pool's OWN local profiles
+/// rather than to an external identity.
 ///
 /// `SourceUser` is "an external IdP account for a user who doesn't exist yet in
 /// the user pool. This user must be a federated user (for example, a SAML or
 /// Facebook user), not another native user"
 /// (`smithy_query(query="doc",shape="AdminLinkProviderForUserRequest",member="SourceUser")`),
 /// so an identifier that resolves to a user pool user who signs in with a
-/// username and password identifies no external account to link. One fixed
-/// sentence, which names neither the identifier nor the user it resolved to.
+/// username and password identifies no external account to link — whether it
+/// names the native provider outright, or names a federated identity a live
+/// link has already made such a profile's. An identity linked to a profile that
+/// holds no password resolves to no such user, and carries
+/// [`SOURCE_USER_LINKED_TO_ANOTHER_USER_MESSAGE`] instead. One fixed sentence,
+/// which names neither the identifier nor the user it resolved to.
 pub const INVALID_SOURCE_USER_MESSAGE: &str =
     "Invalid SourceUser: Cognito users with a username/password may not be passed in as a \
      SourceUser, only as a DestinationUser";

@@ -13,8 +13,11 @@
 //!    refresh of a revoked refresh token is refused the same way. The tokens of
 //!    another user, and tokens issued after the sign-out, are untouched.
 //! 2. A federated identity links to ONE local profile: an identity the pool already
-//!    holds a link for is refused with `InvalidParameterException`, whichever
-//!    destination the request names.
+//!    holds a link for is refused — as the link it already holds when the request names
+//!    that same profile, and as an invalid `SourceUser` when it points the identity at
+//!    another profile, because the link makes the identity resolve to a local profile
+//!    that signs in with a username and a password. Deactivating the identity removes the
+//!    link, so it links again.
 //! 3. A pool that REQUIRES MFA cannot complete the sign-in of a user that has
 //!    activated no factor: the sign-in answers the `MFA_SETUP` challenge, with a
 //!    session and the methods the pool offers for setting one up, and mints no
@@ -69,10 +72,13 @@ const REFRESH_TOKEN_REVOKED: &str = "Refresh Token has been revoked";
 /// re-points the identity at the profile it ALREADY links to.
 const ALREADY_LINKED: &str = "SourceUser is already linked to DestinationUser";
 
-/// The sentence a second link of one federated identity is refused with when it
-/// re-points the identity at ANOTHER profile of the pool.
-const LINKED_TO_ANOTHER_USER: &str =
-    "SourceUser with the specified attribute value is already linked to another user";
+/// The sentence a `SourceUser` that resolves to one of the pool's own local profiles
+/// is refused with — which a live link to a profile that signs in with a password makes
+/// a federated identity
+/// (`smithy_query(query="doc",shape="AdminLinkProviderForUserRequest",member="SourceUser")`:
+/// the source "must be a federated user ..., not another native user").
+const INVALID_SOURCE_USER: &str = "Invalid SourceUser: Cognito users with a username/password \
+     may not be passed in as a SourceUser, only as a DestinationUser";
 
 /// The `ChallengeNameType` value a user that must set up an MFA factor before it can
 /// sign in is answered with.
@@ -538,12 +544,13 @@ async fn a_source_identity_links_to_one_profile_only() {
         );
 
         let destination = if row.same_destination { "ada" } else { "grace" };
-        // A linked identity is spoken for either way, and the refusal says which
-        // of the two the second call asked for.
+        // A linked identity is spoken for either way: the call that names the
+        // profile it already links to is told so, and the one that points it at
+        // another profile submits an identity the live link has made local.
         let expected = if row.same_destination {
             ALREADY_LINKED
         } else {
-            LINKED_TO_ANOTHER_USER
+            INVALID_SOURCE_USER
         };
         let (status, payload) =
             dispatch(&emulator, "AdminLinkProviderForUser", &link(destination), true).await;
@@ -568,6 +575,15 @@ async fn a_source_identity_links_to_one_profile_only() {
         assert_eq!(
             status, 400,
             "case {case:?}: the identity holds no second link, got {status} with {payload}"
+        );
+
+        // The deactivation removed the LINK, so the identity resolves to no local
+        // profile and links where the next call points it.
+        let (status, payload) =
+            dispatch(&emulator, "AdminLinkProviderForUser", &link("grace"), true).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a de-linked identity links again, got {status} with {payload}"
         );
     }
 }

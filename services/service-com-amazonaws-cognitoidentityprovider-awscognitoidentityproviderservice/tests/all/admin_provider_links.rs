@@ -954,6 +954,11 @@ async fn an_identity_links_to_one_profile() {
     let user_pool_id = pool(&router, "one-profile-pool").await;
     for username in ["gina", "hal"] {
         user(&router, &user_pool_id, username).await;
+        // A profile that signs in with a username and a password is what a
+        // `SourceUser` "may not be passed in as" — the class the refusal of a
+        // second destination reports once the link makes the identity resolve
+        // to this profile.
+        set_password(&router, &user_pool_id, username).await;
     }
     provider(&router, &user_pool_id, "CorpSAML", "SAML").await;
     let source = identity("CorpSAML", "email", "gina@example.com");

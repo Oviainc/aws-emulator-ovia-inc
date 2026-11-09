@@ -123,11 +123,6 @@ const INVALID_SOURCE_USER: &str = "Invalid SourceUser: Cognito users with a user
                                    may not be passed in as a SourceUser, only as a \
                                    DestinationUser";
 
-/// The sentence a second link of one federated identity onto ANOTHER profile is refused
-/// with.
-const LINKED_TO_ANOTHER_USER: &str =
-    "SourceUser with the specified attribute value is already linked to another user";
-
 /// The sentence a repeat of the link an identity already holds is refused with.
 const ALREADY_LINKED: &str = "SourceUser is already linked to DestinationUser";
 
@@ -1337,9 +1332,10 @@ async fn the_account_status_decides_the_refusal_whatever_the_credential() {
     }
 }
 
-/// RULE: `AdminLinkProviderForUser` links an EXTERNAL identity, so a `SourceUser` naming
-/// the provider a pool's own users sign in under is refused as the native user it names,
-/// and an external identity already linked is refused for the profile it is linked to.
+/// RULE: `AdminLinkProviderForUser` links an EXTERNAL identity, so a `SourceUser` that
+/// resolves to one of the pool's own local profiles is refused as the native user it
+/// names — the native provider outright, and a federated identity a live link has made a
+/// local profile's — while a repeat of the link an identity already holds says so.
 #[tokio::test]
 async fn a_source_user_of_the_native_provider_is_not_an_external_identity() {
     let router = router();
@@ -1411,8 +1407,9 @@ async fn a_source_user_of_the_native_provider_is_not_an_external_identity() {
         );
     }
 
-    // An EXTERNAL identity is what this member is for, and it links to one profile: the
-    // refusal of a second link says which profile the identity already answers for.
+    // An EXTERNAL identity is what this member is for, and it links to one profile: a
+    // call that points the identity at another profile submits an identity the live link
+    // has made local, and a repeat of the link it already holds is told so.
     let source = identity("CorpSAML", "email", "ada@example.test");
     ok(
         &router,
@@ -1424,7 +1421,7 @@ async fn a_source_user_of_the_native_provider_is_not_an_external_identity() {
         (
             "the linked identity re-pointed at another profile",
             "grace",
-            LINKED_TO_ANOTHER_USER,
+            INVALID_SOURCE_USER,
         ),
         (
             "the linked identity linked again to the profile it answers for",

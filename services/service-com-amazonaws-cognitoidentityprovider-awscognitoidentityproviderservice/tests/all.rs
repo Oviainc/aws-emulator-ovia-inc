@@ -177,6 +177,8 @@ mod pool_configuration_refusal_wire;
 mod pool_plan_and_csv_header;
 #[path = "all/post_confirmation_trigger.rs"]
 mod post_confirmation_trigger;
+#[path = "all/provider_link_source_user_claim.rs"]
+mod provider_link_source_user_claim;
 #[path = "all/provisioned_limits.rs"]
 mod provisioned_limits;
 #[path = "all/public_user_not_found_message.rs"]
