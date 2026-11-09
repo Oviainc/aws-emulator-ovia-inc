@@ -576,6 +576,27 @@ async fn customizing_and_resetting_notification_settings_is_read_after_write() {
     assert_settings("teardown", &deleted, &[None, None]);
 }
 
+/// The instant a rendered `date-time` member carries, as the (seconds, nanoseconds) pair
+/// two instants can be ORDERED by.
+///
+/// The rendering trims the trailing zeros of the fractional second, so two renderings do
+/// not sort as the instants they stand for; parsing is what makes the comparison an
+/// ordering. Parsed the way the rest of this workspace parses a modelled `date-time`
+/// member: `aws_smithy_types::DateTime::from_str` with `Format::DateTime`.
+fn instant_of(case: &str, path: &str, member: &str, value: &Value) -> (i64, u32) {
+    let text = value.as_str().unwrap_or_else(|| {
+        panic!("case {case:?}: {path} must report {member} as a date-time string, got {value:?}")
+    });
+    let parsed = ::aws_smithy_types::DateTime::from_str(
+        text,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .unwrap_or_else(|error| {
+        panic!("case {case:?}: {path} must report {member} as a date-time, got {text:?}: {error}")
+    });
+    (parsed.secs(), parsed.subsec_nanos())
+}
+
 /// `UpdateTrustAnchor` persists what it was given: a later read, the list projection and
 /// the delete echo all report the written name and source, a member the request omitted
 /// keeps its stored value, and `updatedAt` moves while `createdAt` does not.
@@ -662,9 +683,13 @@ async fn update_trust_anchor_persists_the_members_it_carries() {
                 "case {case:?}: {path} must not move createdAt, got {anchor:?}"
             );
             let updated_at = anchor.get("updatedAt").cloned().unwrap_or(Value::Null);
+            // Both members are rendered `date-time` instants, whose fractional second is
+            // written without its trailing zeros, so comparing the two RENDERINGS as
+            // strings is not an ordering of the two instants ("…:01.5Z" sorts after
+            // "…:01.55Z"). They are parsed and compared as instants instead.
             assert!(
-                updated_at.is_string()
-                    && updated_at.as_str() >= created_at.as_str(),
+                instant_of(case, path, "updatedAt", &updated_at)
+                    >= instant_of(case, path, "createdAt", &created_at),
                 "case {case:?}: {path} must report an updatedAt at or after createdAt \
                  {created_at:?}, got {updated_at:?}"
             );

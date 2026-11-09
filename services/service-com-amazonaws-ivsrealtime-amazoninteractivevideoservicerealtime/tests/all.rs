@@ -169,6 +169,8 @@ mod storage_configurations;
 mod taggable_resource_kinds;
 #[path = "all/tagging.rs"]
 mod tagging;
+#[path = "all/thumbnail_interval_recording_mode.rs"]
+mod thumbnail_interval_recording_mode;
 #[path = "all/update_ingest_configuration.rs"]
 mod update_ingest_configuration;
 #[path = "all/update_stage_recording_active.rs"]

@@ -1586,6 +1586,10 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
                 "thumbnailConfiguration": {
                     "targetIntervalSeconds": 86_400,
                     "storage": ["SEQUENTIAL", "LATEST"],
+                    // The interval is "configurable only if `recordingMode` is
+                    // `INTERVAL`", so a row that configures one names the mode it is
+                    // configurable in; the rows above cover the member left out.
+                    "recordingMode": "INTERVAL",
                 },
             }),
             json!({
@@ -1596,7 +1600,7 @@ async fn the_recording_configuration_fills_in_the_modeled_default_for_every_memb
                 "thumbnailConfiguration": {
                     "targetIntervalSeconds": 86_400,
                     "storage": ["SEQUENTIAL", "LATEST"],
-                    "recordingMode": "DISABLED",
+                    "recordingMode": "INTERVAL",
                 },
                 "hlsConfiguration": { "targetSegmentDurationSeconds": 6 },
             }),

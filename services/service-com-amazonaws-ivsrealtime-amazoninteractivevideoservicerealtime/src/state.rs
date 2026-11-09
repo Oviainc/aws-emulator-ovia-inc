@@ -135,6 +135,70 @@ pub const DEFAULT_THUMBNAIL_STORAGE: &str = "SEQUENTIAL";
 /// mode. Default: `DISABLED`."
 pub const DEFAULT_THUMBNAIL_RECORDING_MODE: &str = "DISABLED";
 
+/// The one thumbnail recording mode a thumbnail-generation INTERVAL may be configured in.
+///
+/// Documented on `ParticipantThumbnailConfiguration$targetIntervalSeconds`: "The targeted
+/// thumbnail-generation interval in seconds. This is configurable only if `recordingMode`
+/// is `INTERVAL`." The model carries no trait for that pairing — the interval's only
+/// constraint is `@range 1..86400` and neither member constrains the other — so the seam
+/// that resolves a stage's recording configuration enforces it
+/// ([`check_thumbnail_interval_mode`]), the way `CreateIngestConfiguration` enforces the
+/// documented pairing of its own two members.
+pub const INTERVAL_THUMBNAIL_RECORDING_MODE: &str = "INTERVAL";
+
+/// The dotted path of the member that carries a stage's thumbnail-generation interval, as
+/// the wire spells it — what a refusal of that member names.
+pub const RECORDING_THUMBNAIL_INTERVAL_MEMBER: &str =
+    "autoParticipantRecordingConfiguration.thumbnailConfiguration.targetIntervalSeconds";
+
+/// The requirement a refusal of the thumbnail interval states, inside the
+/// member-constraint envelope ([`member_constraint_message`]): the mode the interval is
+/// configurable in, and the mode this request's configuration is actually in.
+fn thumbnail_interval_mode_requirement(mode: &str) -> String {
+    format!(
+        "targetIntervalSeconds is configurable only when recordingMode is \
+         {INTERVAL_THUMBNAIL_RECORDING_MODE}, found {mode}"
+    )
+}
+
+/// The DECISION [`thumbnail_interval_mode_requirement`] words: a thumbnail configuration
+/// that CONFIGURES `targetIntervalSeconds` must be in the one mode the member is
+/// documented as configurable in, and one that configures it in any other mode is refused
+/// instead of persisting a value the model says cannot be set.
+///
+/// `requested` is the thumbnail configuration the request carried, which is `None` exactly
+/// when it carried none; the interval is "configured" exactly when the request sent it, so
+/// a configuration that leaves the member out is accepted in every mode and reports
+/// [`DEFAULT_THUMBNAIL_INTERVAL_SECONDS`]. The mode the pairing is read against is the
+/// EFFECTIVE one — what the request sent, else the documented
+/// [`DEFAULT_THUMBNAIL_RECORDING_MODE`] — so an omitted `recordingMode` decides the
+/// outcome exactly as the value it defaults to would.
+///
+/// `Err` is the sentence to put on the calling operation's `ValidationException`, the way
+/// [`check_at_most_one_member`] and the other member checks of this service hand theirs
+/// back.
+pub fn check_thumbnail_interval_mode(
+    requested: Option<&ParticipantThumbnailConfiguration>,
+) -> Result<(), String> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    if requested.target_interval_seconds.is_none() {
+        return Ok(());
+    }
+    let mode = requested
+        .recording_mode
+        .as_deref()
+        .unwrap_or(DEFAULT_THUMBNAIL_RECORDING_MODE);
+    if mode == INTERVAL_THUMBNAIL_RECORDING_MODE {
+        return Ok(());
+    }
+    Err(member_constraint_message(
+        RECORDING_THUMBNAIL_INTERVAL_MEMBER,
+        &thumbnail_interval_mode_requirement(mode),
+    ))
+}
+
 /// Target duration of a recorded HLS segment, when the HLS configuration does not set one.
 ///
 /// Documented on `ParticipantRecordingHlsConfiguration$targetSegmentDurationSeconds`:
@@ -168,6 +232,10 @@ pub fn default_thumbnail_storage() -> Vec<String> {
 
 /// The thumbnail configuration a stage reports, with each member the caller left out
 /// filled in from the model's documented default for it.
+///
+/// Reached only for a configuration that already satisfies the pairing its own
+/// documentation carries ([`check_thumbnail_interval_mode`]), so an interval this fills in
+/// from the request is one the request was allowed to configure.
 pub fn effective_thumbnail_configuration(
     requested: Option<ParticipantThumbnailConfiguration>,
 ) -> ParticipantThumbnailConfiguration {
@@ -288,8 +356,14 @@ const STORAGE_CONFIGURATION_RESOURCE: &str = "storage configuration";
 
 /// The recording configuration a stage holds, given what its create or update request
 /// supplied AND the storage configurations this account actually holds: the ONE place a
-/// supplied configuration is both defaulted ([`effective_recording_configuration`]) and
-/// resolved, so a create and an update accept and refuse the same request.
+/// supplied configuration is checked ([`check_thumbnail_interval_mode`]), defaulted
+/// ([`effective_recording_configuration`]) and resolved, so a create and an update accept
+/// and refuse the same request.
+///
+/// A member the model documents as configurable only while a SIBLING member carries a
+/// particular value is refused where the request configures it in any other —
+/// [`check_thumbnail_interval_mode`] is that check for the thumbnail interval, the only
+/// member of this configuration whose documentation carries such a pairing.
 ///
 /// A non-empty `storageConfigurationArn` is a REFERENCE to a storage configuration of
 /// this same service ("ARN of the StorageConfiguration resource to use for individual
@@ -313,6 +387,15 @@ pub fn resolved_recording_configuration(
     requested: Option<AutoParticipantRecordingConfiguration>,
     region: &str,
 ) -> Result<AutoParticipantRecordingConfiguration, String> {
+    // The one pairing the thumbnail configuration's own documentation carries, read off the
+    // request as it arrived — before any default is filled in or any member is reset — so
+    // what the request CONFIGURES decides the outcome and a value the model says cannot be
+    // set is never persisted ([`check_thumbnail_interval_mode`]).
+    check_thumbnail_interval_mode(
+        requested
+            .as_ref()
+            .and_then(|configuration| configuration.thumbnail_configuration.as_ref()),
+    )?;
     let configuration = effective_recording_configuration(requested);
     let arn = configuration.storage_configuration_arn.as_str();
     if !arn.is_empty() && state.storage_configuration_in(region, arn).is_none() {
