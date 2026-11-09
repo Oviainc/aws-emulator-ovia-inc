@@ -337,7 +337,9 @@ async fn remove_flow_media_stream_refuses_what_it_cannot_remove() {
             media_stream_name: "ms-1".to_string(),
             status: 404,
             code: "NotFoundException",
-            not_found_identifier: Some("not-a-flow-arn".to_string()),
+            // The label is no flow ARN, so it reached no flow lookup: the envelope carries
+            // the generic reason rather than the caller's own text.
+            not_found_identifier: Some(mc::UNRESOLVED_PATH_NOT_FOUND_REASON.to_string()),
         },
     ];
 

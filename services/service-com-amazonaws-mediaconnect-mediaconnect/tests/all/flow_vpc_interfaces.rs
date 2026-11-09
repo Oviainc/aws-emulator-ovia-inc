@@ -481,8 +481,9 @@ async fn add_flow_vpc_interfaces_refuses_what_it_cannot_add() {
         if expected_status == 404 {
             assert_eq!(
                 message,
-                mc::not_found_message(&target),
-                "case {case:?}: the refusal names what resolved nothing, got {body}"
+                mc::flow_not_found_message(&target),
+                "case {case:?}: the refusal names what resolved nothing: the flow ARN, or \
+                 the generic reason for a label that is no flow ARN, got {body}"
             );
         } else {
             assert!(

@@ -211,17 +211,18 @@ pub(crate) fn seed_reservation(
         mc::StoredReservation {
             reservation_arn: reservation_arn.clone(),
             reservation_name: case.name.to_string(),
-            // The offering a reservation was bought from: an ARN of this service, like
-            // every other one it mints.
-            offering_arn: engine::emulator_arn(
-                mc::SERVICE_NAMESPACE,
+            // The offering a reservation was bought from, in the form this service
+            // publishes its catalogue in: an offering ARN carries no account-id field.
+            offering_arn: mc::offering_arn(
                 REGION,
-                &format!("offering:1-{suffix:08x}"),
+                &mc::offering_resource_fragment(
+                    case.reserved_bitrate.unwrap_or_default(),
+                    case.duration,
+                ),
             ),
-            offering_description: format!(
-                "{} Mbps outbound bandwidth for {} months",
+            offering_description: mc::offering_description(
                 case.reserved_bitrate.unwrap_or_default(),
-                case.duration
+                case.price_per_unit,
             ),
             currency_code: CURRENCY_CODE.to_string(),
             price_per_unit: case.price_per_unit.to_string(),
@@ -463,14 +464,13 @@ async fn listed_instants_are_rendered_in_the_documented_format() {
             mc::StoredReservation {
                 reservation_arn: reservation_arn.clone(),
                 reservation_name: "res-documented-instants".to_string(),
-                offering_arn: engine::emulator_arn(
-                    mc::SERVICE_NAMESPACE,
+                offering_arn: mc::offering_arn(
                     REGION,
-                    &format!("offering:1-{suffix:08x}"),
+                    &mc::offering_resource_fragment(100, 1),
                 ),
-                offering_description: "100 Mbps outbound bandwidth for 1 month".to_string(),
+                offering_description: mc::offering_description(100, "0.150"),
                 currency_code: CURRENCY_CODE.to_string(),
-                price_per_unit: "0.1500".to_string(),
+                price_per_unit: "0.150".to_string(),
                 price_units: PRICE_UNITS.to_string(),
                 duration: 1,
                 duration_units: DURATION_UNITS.to_string(),

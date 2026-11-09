@@ -64,7 +64,9 @@ pub(crate) fn listed_arns(body: &Value) -> Vec<String> {
 ///
 /// The check runs through the crate's own encoding of that form — the same function
 /// ListOfferings validates a pagination token with — and then re-asserts, field by field,
-/// the parts the form fixes, so a bug in that function cannot hide here.
+/// the parts the form fixes, so a bug in that function cannot hide here: an offering ARN
+/// carries NO account-id field (the catalogue belongs to the service, not to one account)
+/// and ends in a numeric offering id.
 ///
 /// `pub(crate)` because the DescribeOffering suite asserts the same form of the ARNs it
 /// addresses.
@@ -76,11 +78,11 @@ pub(crate) fn assert_minted_offering_arn(case: &str, arn: &str, region: &str) {
     let segments: Vec<&str> = arn.split(':').collect();
     assert_eq!(
         segments.len(),
-        7,
-        "case {case:?}: an offering ARN has 7 colon-separated segments, got {arn:?}"
+        6,
+        "case {case:?}: an offering ARN has 6 colon-separated fields, got {arn:?}"
     );
     assert_eq!(
-        (segments[0], segments[2], segments[3], segments[5]),
+        (segments[0], segments[2], segments[3], segments[4]),
         ("arn", "mediaconnect", region, "offering"),
         "case {case:?}: ARN prefix, service, Region and resource type, got {arn:?}"
     );
@@ -89,29 +91,29 @@ pub(crate) fn assert_minted_offering_arn(case: &str, arn: &str, region: &str) {
         "case {case:?}: the partition is an aws partition, got {arn:?}"
     );
     assert!(
-        segments[4].len() == 12 && segments[4].bytes().all(|b| b.is_ascii_digit()),
-        "case {case:?}: the account id is 12 digits, got {arn:?}"
+        !segments[5].is_empty() && segments[5].bytes().all(|b| b.is_ascii_digit()),
+        "case {case:?}: the last field is a numeric offering id, got {arn:?}"
     );
     assert!(
-        !segments[6].is_empty(),
-        "case {case:?}: the last segment is the offering id, got {arn:?}"
+        !arn.contains(&format!(":{}:", engine::emulator_account_id())),
+        "case {case:?}: an offering ARN carries no account-id field, got {arn:?}"
     );
 }
 
-/// `Offering$PricePerUnit` as an integer count of ten-thousandths of a dollar, which is
-/// what a rate quoted to four decimal places is.
+/// `Offering$PricePerUnit` as an integer count of thousandths of a dollar, which is what a
+/// rate quoted to three decimal places is.
 ///
 /// The parse is also the assertion on the member's FORM: a price is a decimal string, and
 /// the catalogue quotes every one of them to the same precision, so a reader can compare
 /// two rates without knowing the tier.
-fn price_in_ten_thousandths(case: &str, price_per_unit: &str) -> i64 {
+fn price_in_thousandths(case: &str, price_per_unit: &str) -> i64 {
     let (dollars, fraction) = price_per_unit.split_once('.').unwrap_or_else(|| {
         panic!("case {case:?}: a price is a decimal string, got {price_per_unit:?}")
     });
     assert_eq!(
         fraction.len(),
-        4,
-        "case {case:?}: a price is quoted to four decimal places, got {price_per_unit:?}"
+        3,
+        "case {case:?}: a price is quoted to three decimal places, got {price_per_unit:?}"
     );
     let parsed: Result<(i64, i64), _> = dollars
         .parse::<i64>()
@@ -119,7 +121,7 @@ fn price_in_ten_thousandths(case: &str, price_per_unit: &str) -> i64 {
     let (dollars, fraction) = parsed.unwrap_or_else(|_| {
         panic!("case {case:?}: a price holds only digits and one point, got {price_per_unit:?}")
     });
-    dollars * 10_000 + fraction
+    dollars * 1_000 + fraction
 }
 
 /// ListOfferings reports the published catalogue: every entry exactly once, with the terms
@@ -140,7 +142,7 @@ async fn list_reports_every_published_offering_with_the_terms_of_its_tier() {
     let offerings = listed(&body);
     assert_eq!(
         offerings.len(),
-        mc::OFFERING_RESERVED_BITRATES.len(),
+        mc::OFFERING_CATALOGUE.len(),
         "every published offering is listed exactly once, got {body}"
     );
 
@@ -154,9 +156,9 @@ async fn list_reports_every_published_offering_with_the_terms_of_its_tier() {
                 .unwrap_or_default()
         })
         .collect();
-    let published_bitrates: Vec<i64> = mc::OFFERING_RESERVED_BITRATES
+    let published_bitrates: Vec<i64> = mc::OFFERING_CATALOGUE
         .iter()
-        .map(|&bitrate| i64::from(bitrate))
+        .map(|entry| i64::from(entry.reserved_bitrate))
         .collect();
     let mut sorted = listed_bitrates.clone();
     sorted.sort_unstable();
@@ -167,20 +169,9 @@ async fn list_reports_every_published_offering_with_the_terms_of_its_tier() {
         "the listing covers the published bandwidth ladder exactly once each, got {body}"
     );
 
-    // The rate is per Mbps of reserved bandwidth, so the price of every tier is the same
-    // rate times its bitrate: a price fixed in the handler, or one tier priced off the
-    // ladder, breaks this without any tier's number being written down here.
-    let reference = &offerings[0];
-    let reference_case = "the first listed offering";
-    let reference_price = price_in_ten_thousandths(
-        reference_case,
-        reference["pricePerUnit"].as_str().unwrap_or_default(),
-    );
-    let reference_bitrate = listed_bitrates[0];
-    assert!(
-        reference_price > 0 && reference_bitrate > 0,
-        "{reference_case} reserves bandwidth at a positive rate, got {reference}"
-    );
+    // Every entry's price, paired with the bandwidth it reserves, so the catalogue's own
+    // invariants can be asserted across the whole ladder below.
+    let mut priced: Vec<(i64, i64)> = Vec::new();
 
     for (offering, bitrate) in offerings.iter().zip(&listed_bitrates) {
         let case = format!("the {bitrate} Mbps offering");
@@ -208,20 +199,46 @@ async fn list_reports_every_published_offering_with_the_terms_of_its_tier() {
             duration > 0,
             "case {case:?}: an offering runs for a positive number of months, got {offering}"
         );
-        let price =
-            price_in_ten_thousandths(case, offering["pricePerUnit"].as_str().unwrap_or_default());
-        assert_eq!(
-            price * reference_bitrate,
-            reference_price * bitrate,
-            "case {case:?}: every tier is priced at the same rate per Mbps, got {offering}"
-        );
-        // "A description of the offering" — the terms it is made of, so a reader can tell
-        // two entries of the ladder apart from it.
-        let description = offering["offeringDescription"].as_str().unwrap_or_default();
+        let price_per_unit = offering["pricePerUnit"].as_str().unwrap_or_default();
+        let price = price_in_thousandths(case, price_per_unit);
         assert!(
-            description.contains(&bitrate.to_string())
-                && description.contains(&duration.to_string()),
-            "case {case:?}: the description states the terms of this entry, got {offering}"
+            price > 0 && *bitrate > 0,
+            "case {case:?}: an offering reserves bandwidth at a positive price, got {offering}"
+        );
+        priced.push((*bitrate, price));
+        // "A description of the offering": the wording the service publishes a reservation
+        // offering under, with the bandwidth and the price of THIS entry in it — both read
+        // back out of the entry's own members, so a description quoting another entry's
+        // terms, or a wording of its own, fails here.
+        assert_eq!(
+            offering["offeringDescription"].as_str(),
+            Some(
+                format!("Reserved outbound bandwidth of {bitrate}Mbps at ${price_per_unit}/hour")
+                    .as_str()
+            ),
+            "case {case:?}: the description states this entry's own terms, got {offering}"
+        );
+    }
+
+    // What a published reservation price list fixes about its entries: a larger
+    // commitment costs more in total, and never more per Mbps than a smaller one — so no
+    // entry can be priced off the ladder, in either direction, without a number being
+    // written down here.
+    priced.sort_unstable();
+    for pair in priced.windows(2) {
+        let [(smaller, cheaper), (larger, dearer)] = pair else {
+            continue;
+        };
+        let case = format!("the {smaller} Mbps and {larger} Mbps offerings");
+        assert!(
+            dearer > cheaper,
+            "case {case:?}: reserving more bandwidth costs more per hour, got \
+             {cheaper} and {dearer} thousandths"
+        );
+        assert!(
+            dearer * smaller <= cheaper * larger,
+            "case {case:?}: the rate per Mbps does not rise with the amount reserved, got \
+             {cheaper} thousandths for {smaller} Mbps and {dearer} for {larger}"
         );
     }
 
@@ -256,7 +273,7 @@ async fn the_catalogue_is_listed_in_the_region_the_request_was_signed_for() {
         let arns = listed_arns(&body);
         assert_eq!(
             arns.len(),
-            mc::OFFERING_RESERVED_BITRATES.len(),
+            mc::OFFERING_CATALOGUE.len(),
             "case {region:?}: the whole catalogue is listed, got {body}"
         );
         for arn in &arns {
@@ -628,9 +645,9 @@ async fn refusals_name_the_modelled_error() {
         },
         // A `NextToken` is the offering ARN the listing resumes at, so a token the service
         // could not have minted is refused. The rows are the ways a token can fail that
-        // form: not an ARN at all, another service's ARN, an account id that is not 12
-        // digits, the wrong resource type, an empty offering id, and an id carrying a
-        // further ARN segment.
+        // form: not an ARN at all, another service's ARN, an account-id field the published
+        // form does not carry, the wrong resource type, an empty offering id, an offering
+        // id that is not numeric, and an id carrying a further ARN segment.
         RefusalCase {
             case: "a nextToken that is not an ARN",
             query: "?nextToken=not-a-token".to_string(),
@@ -639,35 +656,38 @@ async fn refusals_name_the_modelled_error() {
         },
         RefusalCase {
             case: "a nextToken from another service",
-            query: "?nextToken=arn:aws:medialive:us-east-1:000000000000:offering:1-000100mbps-12months"
-                .to_string(),
+            query: "?nextToken=arn:aws:medialive:us-east-1:offering:12000100".to_string(),
             status: 400,
             code: "BadRequestException",
         },
         RefusalCase {
-            case: "a nextToken whose account id is not 12 digits",
-            query: "?nextToken=arn:aws:mediaconnect:us-east-1:12345:offering:1-000100mbps-12months"
+            case: "a nextToken carrying an account-id field",
+            query: "?nextToken=arn:aws:mediaconnect:us-east-1:000000000000:offering:12000100"
                 .to_string(),
             status: 400,
             code: "BadRequestException",
         },
         RefusalCase {
             case: "a nextToken naming another resource type",
-            query: "?nextToken=arn:aws:mediaconnect:us-east-1:000000000000:flow:1-deadbeef:res"
-                .to_string(),
+            query: "?nextToken=arn:aws:mediaconnect:us-east-1:flow:12000100".to_string(),
             status: 400,
             code: "BadRequestException",
         },
         RefusalCase {
             case: "a nextToken with an empty offering id",
-            query: "?nextToken=arn:aws:mediaconnect:us-east-1:000000000000:offering:".to_string(),
+            query: "?nextToken=arn:aws:mediaconnect:us-east-1:offering:".to_string(),
+            status: 400,
+            code: "BadRequestException",
+        },
+        RefusalCase {
+            case: "a nextToken whose offering id is not numeric",
+            query: "?nextToken=arn:aws:mediaconnect:us-east-1:offering:1-deadbeef".to_string(),
             status: 400,
             code: "BadRequestException",
         },
         RefusalCase {
             case: "a nextToken carrying a further ARN segment",
-            query: "?nextToken=arn:aws:mediaconnect:us-east-1:000000000000:offering:1-deadbeef:more"
-                .to_string(),
+            query: "?nextToken=arn:aws:mediaconnect:us-east-1:offering:12000100:more".to_string(),
             status: 400,
             code: "BadRequestException",
         },
@@ -696,7 +716,7 @@ async fn refusals_name_the_modelled_error() {
     // A token the service COULD have minted is accepted even when the catalogue holds no
     // such entry: paging is a walk from a key, not a lookup. This one sorts past every
     // published ARN, so nothing is left to report.
-    let unknown = "arn:aws:mediaconnect:us-east-1:000000000000:offering:1-zzzzzzzz";
+    let unknown = "arn:aws:mediaconnect:us-east-1:offering:99999999";
     let (status, code, body) = list_offerings(&emulator, &format!("?nextToken={unknown}")).await;
     assert_eq!(
         (status, code.as_deref()),

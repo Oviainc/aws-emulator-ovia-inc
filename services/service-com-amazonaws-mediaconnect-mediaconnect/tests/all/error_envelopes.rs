@@ -110,30 +110,45 @@ fn flow_calls() -> Vec<FlowCall> {
 /// (`smithy_query(query="shape",shape="FlowArn")`:
 /// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:flow:[a-zA-Z0-9-]+:[a-zA-Z0-9_-]+$`)
 /// refuses, while the pattern each flow member declares for itself
-/// (`^arn:.+:mediaconnect.+:flow:.+$`) admits all but the first. The rows differ along
-/// what the rule generalises over: not an ARN at all, then one segment of the ARN at a
-/// time — partition, account, resource id, resource name.
-fn labels_outside_the_shape_pattern() -> Vec<(&'static str, String)> {
+/// (`^arn:.+:mediaconnect.+:flow:.+$`) admits all but the first — each paired with the
+/// identifier the service's not-found envelope names for it. The rows differ along what the
+/// rule generalises over: not an ARN at all, then one segment of the ARN at a time —
+/// partition, account, resource id, resource name.
+///
+/// A label the member's own pattern admits reached the flow lookup and resolved nothing, so
+/// the envelope names that ARN; a label it does not admit is no flow ARN, so it reached no
+/// lookup and the envelope carries the generic reason instead of the caller's text.
+fn labels_outside_the_shape_pattern() -> Vec<(&'static str, String, String)> {
+    let generic = mc::UNRESOLVED_PATH_NOT_FOUND_REASON.to_string();
     vec![
-        ("not an ARN at all", "not-a-valid-flow-arn".to_string()),
+        (
+            "not an ARN at all",
+            "not-a-valid-flow-arn".to_string(),
+            generic,
+        ),
         (
             "another partition, and an account segment that is not twelve digits",
+            "arn:aws-cn:mediaconnect:cn-north-1:acct:flow:1-00000001:f1".to_string(),
             "arn:aws-cn:mediaconnect:cn-north-1:acct:flow:1-00000001:f1".to_string(),
         ),
         (
             "an eleven-digit account id",
             format!("arn:aws:mediaconnect:{REGION}:11112222333:flow:1-0000beef:f"),
+            format!("arn:aws:mediaconnect:{REGION}:11112222333:flow:1-0000beef:f"),
         ),
         (
             "a flow id outside the shape's [a-zA-Z0-9-]+ class",
+            format!("arn:aws:mediaconnect:{REGION}:{ACCOUNT}:flow:1_0000beef:f"),
             format!("arn:aws:mediaconnect:{REGION}:{ACCOUNT}:flow:1_0000beef:f"),
         ),
         (
             "a flow name outside the shape's [a-zA-Z0-9_-]+ class",
             format!("arn:aws:mediaconnect:{REGION}:{ACCOUNT}:flow:1-0000beef:f.1"),
+            format!("arn:aws:mediaconnect:{REGION}:{ACCOUNT}:flow:1-0000beef:f.1"),
         ),
         (
             "an ARN of the shape's own form that names no flow",
+            format!("arn:aws:mediaconnect:{REGION}:{ACCOUNT}:flow:1-0000dead:never-minted"),
             format!("arn:aws:mediaconnect:{REGION}:{ACCOUNT}:flow:1-0000dead:never-minted"),
         ),
     ]
@@ -161,13 +176,13 @@ async fn create_flow(emulator: &Emulator, case: &str, name: &str) -> String {
 /// A flow ARN label resolves against the STORE, whatever its form: every flow operation
 /// answers `NotFoundException` (404) for a label it does not hold — including labels the
 /// `FlowArn` shape's narrower pattern refuses but each member's own pattern admits, and a
-/// label that is no ARN at all — and the message is the request's own label in this
-/// service's not-found envelope.
+/// label that is no ARN at all — and the message is that label in this service's not-found
+/// envelope when the label is a flow ARN, and the generic reason when it is not.
 #[tokio::test]
 async fn a_flow_arn_label_is_resolved_by_the_store_whatever_its_form() {
     let emulator = Emulator::new();
 
-    for (case, label) in labels_outside_the_shape_pattern() {
+    for (case, label, identifier) in labels_outside_the_shape_pattern() {
         for FlowCall {
             operation,
             method,
@@ -190,9 +205,9 @@ async fn a_flow_arn_label_is_resolved_by_the_store_whatever_its_form() {
             );
             assert_eq!(
                 response["message"].as_str(),
-                Some(mc::not_found_message(&label).as_str()),
+                Some(mc::not_found_message(&identifier).as_str()),
                 "case {case:?} / {operation}: expected {:?}, got {response}",
-                mc::not_found_message(&label)
+                mc::not_found_message(&identifier)
             );
         }
     }
@@ -213,72 +228,76 @@ async fn a_flow_arn_label_is_resolved_by_the_store_whatever_its_form() {
     );
 }
 
-/// One hostile `{FlowArn}` label: what it is made of, and the label as it travels in the
-/// request line (percent-encoded where the URI grammar requires it) beside the value the
-/// service receives after decoding.
+/// One hostile `{FlowArn}` label: what it is made of, the label as it travels in the
+/// request line (percent-encoded where the URI grammar requires it), and the identifier the
+/// service's not-found envelope names for it.
 struct HostileLabel {
     case: &'static str,
     /// The label as written in the request line.
     encoded: String,
-    /// What the service receives once the path label is decoded, or `None` when the test
-    /// asserts only the envelope's prefix.
-    decoded: Option<String>,
+    /// The identifier the envelope names: the decoded label when the label is a flow ARN,
+    /// the generic reason when it is not, or `None` when the test asserts only the
+    /// envelope's prefix.
+    identifier: Option<String>,
 }
 
 /// Handing the `{FlowArn}` label to the handler unjudged (Cause 1) means an arbitrary
 /// caller-supplied byte string reaches handler code, so every consumer of that value must
 /// be TOTAL: the store lookup (a `BTreeMap::get`), the message envelope
-/// (`crate::state::not_found_message`, one `format!`) and the restJson1 error serializer.
-/// This drives labels built to break a consumer that parses, slices or indexes — a long
-/// one, multi-byte text, quotes and braces and backslashes, a traversal attempt, an
-/// ARN-shaped label with an empty last segment — and asserts each is answered, not
-/// crashed: 404 `NotFoundException` whose message is the service's envelope.
+/// (`crate::state::flow_not_found_message`, a pattern walk and one `format!`) and the
+/// restJson1 error serializer. This drives labels built to break a consumer that parses,
+/// slices or indexes — a long one, multi-byte text, quotes and braces and backslashes, a
+/// traversal attempt, an ARN-shaped label with an empty last segment — and asserts each is
+/// answered, not crashed: 404 `NotFoundException` whose message is the service's envelope.
 #[tokio::test]
 async fn a_hostile_flow_arn_label_is_answered_not_crashed() {
     let emulator = Emulator::new();
     let long_name = "n".repeat(2_000);
+    // A label that is no flow ARN reached no flow lookup, so the envelope carries the
+    // generic reason rather than the caller's own bytes.
+    let generic = mc::UNRESOLVED_PATH_NOT_FOUND_REASON.to_string();
 
     let labels = vec![
         HostileLabel {
             case: "a two-thousand-character label",
             encoded: long_name.clone(),
-            decoded: Some(long_name.clone()),
+            identifier: Some(generic.clone()),
         },
         HostileLabel {
             case: "multi-byte text, percent-encoded in the request line",
             // "流-名前" — three-byte code points, so a consumer that indexed bytes would
             // split a character.
             encoded: "%E6%B5%81-%E5%90%8D%E5%89%8D".to_string(),
-            decoded: Some("流-名前".to_string()),
+            identifier: Some(generic.clone()),
         },
         HostileLabel {
             case: "quotes, braces and a backslash, which the JSON envelope must escape",
             encoded: "a%22b%5Cc%7Bd%7D".to_string(),
-            decoded: Some("a\"b\\c{d}".to_string()),
+            identifier: Some(generic.clone()),
         },
         HostileLabel {
             case: "a path-traversal attempt, percent-encoded so it stays one label",
             encoded: "..%2F..%2Fetc%2Fpasswd".to_string(),
-            decoded: Some("../../etc/passwd".to_string()),
+            identifier: Some(generic.clone()),
         },
         HostileLabel {
             case: "an ARN-shaped label whose last segment is empty",
             encoded: format!("arn:aws:mediaconnect:{REGION}:{ACCOUNT}:flow:1-0000beef:"),
-            decoded: Some(format!(
+            identifier: Some(format!(
                 "arn:aws:mediaconnect:{REGION}:{ACCOUNT}:flow:1-0000beef:"
             )),
         },
         HostileLabel {
             case: "a label that is one colon",
             encoded: "%3A".to_string(),
-            decoded: Some(":".to_string()),
+            identifier: Some(generic.clone()),
         },
     ];
 
     for HostileLabel {
         case,
         encoded,
-        decoded,
+        identifier,
     } in labels
     {
         for (operation, method, uri) in [
@@ -299,11 +318,11 @@ async fn a_hostile_flow_arn_label_is_answered_not_crashed() {
                 "case {case:?} / {operation}: the message carries the envelope, got \
                  {message:?}"
             );
-            if let Some(decoded) = decoded.as_deref() {
+            if let Some(identifier) = identifier.as_deref() {
                 assert_eq!(
                     message,
-                    mc::not_found_message(decoded),
-                    "case {case:?} / {operation}: the message is the decoded label in the \
+                    mc::not_found_message(identifier),
+                    "case {case:?} / {operation}: the message is that identifier in the \
                      envelope, got {message:?}"
                 );
             }
@@ -322,11 +341,13 @@ struct NotFoundCase {
     identifier: String,
 }
 
-/// Every `NotFoundException` this service answers carries `Not found: <the identifier the
-/// request named>` and nothing else — across resource kinds (flow, gateway, tagged
+/// Every `NotFoundException` this service answers carries `Not found: <the identifier that
+/// resolved nothing>` and nothing else — across resource kinds (flow, gateway, tagged
 /// resource), across the ways an identifier can address nothing (never minted, deleted,
 /// another resource type, another service, not an ARN), and whether the identifier arrived
-/// as a flow label or as a tagging `ResourceArn`.
+/// as a flow label or as a tagging `ResourceArn`. A flow label that is not a flow ARN at
+/// all reached no flow lookup, so the identifier it names is the generic reason rather than
+/// the caller's text.
 #[tokio::test]
 async fn every_not_found_message_is_the_requested_identifier_in_the_services_envelope() {
     let emulator = Emulator::new();
@@ -370,7 +391,7 @@ async fn every_not_found_message_is_the_requested_identifier_in_the_services_env
             method: "DELETE",
             uri: "/v1/flows/not-a-valid-flow-arn".to_string(),
             body: None,
-            identifier: "not-a-valid-flow-arn".to_string(),
+            identifier: mc::UNRESOLVED_PATH_NOT_FOUND_REASON.to_string(),
         },
         NotFoundCase {
             case: "a flow ARN this service never minted",

@@ -65,23 +65,23 @@ async fn published_catalogue(emulator: &Emulator) -> Vec<Value> {
     let offerings = listed(&body);
     assert_eq!(
         offerings.len(),
-        mc::OFFERING_RESERVED_BITRATES.len(),
+        mc::OFFERING_CATALOGUE.len(),
         "the listing must carry the whole published catalogue, got {body}"
     );
     offerings
 }
 
-/// `Offering$PricePerUnit` as an integer count of ten-thousandths of a dollar, which is what
-/// a rate quoted to four decimal places is — and an assertion on the member's form while it
+/// `Offering$PricePerUnit` as an integer count of thousandths of a dollar, which is what a
+/// rate quoted to three decimal places is — and an assertion on the member's form while it
 /// parses it.
-fn price_in_ten_thousandths(case: &str, price_per_unit: &str) -> i64 {
+fn price_in_thousandths(case: &str, price_per_unit: &str) -> i64 {
     let (dollars, fraction) = price_per_unit.split_once('.').unwrap_or_else(|| {
         panic!("case {case:?}: a price is a decimal string, got {price_per_unit:?}")
     });
     assert_eq!(
         fraction.len(),
-        4,
-        "case {case:?}: a price is quoted to four decimal places, got {price_per_unit:?}"
+        3,
+        "case {case:?}: a price is quoted to three decimal places, got {price_per_unit:?}"
     );
     let parsed: Result<(i64, i64), _> = dollars
         .parse::<i64>()
@@ -89,7 +89,7 @@ fn price_in_ten_thousandths(case: &str, price_per_unit: &str) -> i64 {
     let (dollars, fraction) = parsed.unwrap_or_else(|_| {
         panic!("case {case:?}: a price holds only digits and one point, got {price_per_unit:?}")
     });
-    dollars * 10_000 + fraction
+    dollars * 1_000 + fraction
 }
 
 /// The `offering` member of a DescribeOffering response.
@@ -99,17 +99,11 @@ fn described(body: &Value) -> Value {
 
 /// DescribeOffering answers, for every tier the catalogue publishes, exactly the entry the
 /// ARN names: the described offering is the listed one member for member, its terms are the
-/// values the modelled enums carry, and its price is the same rate per reserved Mbps as
-/// every other tier's.
+/// values the modelled enums carry, and its description states its own bandwidth and price.
 #[tokio::test]
 async fn every_published_offering_is_described_as_it_is_listed() {
     let emulator = Emulator::new();
     let catalogue = published_catalogue(&emulator).await;
-
-    // The rate the whole ladder is priced at, taken from the first tier described: no
-    // tier's price is written down here, so a price fixed in the handler, or one tier
-    // priced off the ladder, fails below.
-    let mut reference: Option<(i64, i64)> = None;
 
     for listed_offering in &catalogue {
         let bitrate = listed_offering["resourceSpecification"]["reservedBitrate"]
@@ -161,27 +155,22 @@ async fn every_published_offering_is_described_as_it_is_listed() {
             bitrate > 0,
             "case {case:?}: an offering reserves a positive amount of bandwidth, got {body}"
         );
-        let description = offering["offeringDescription"].as_str().unwrap_or_default();
+        let price_per_unit = offering["pricePerUnit"].as_str().unwrap_or_default();
+        let price = price_in_thousandths(case, price_per_unit);
         assert!(
-            description.contains(&bitrate.to_string()) && description.contains(&duration.to_string()),
-            "case {case:?}: the description states the terms of this entry, got {body}"
+            price > 0,
+            "case {case:?}: a reservation is priced above nothing, got {body}"
         );
-        let price =
-            price_in_ten_thousandths(case, offering["pricePerUnit"].as_str().unwrap_or_default());
-        match reference {
-            None => {
-                assert!(
-                    price > 0,
-                    "case {case:?}: a reservation is priced above nothing, got {body}"
-                );
-                reference = Some((price, bitrate));
-            }
-            Some((reference_price, reference_bitrate)) => assert_eq!(
-                price * reference_bitrate,
-                reference_price * bitrate,
-                "case {case:?}: every tier is priced at the same rate per Mbps, got {body}"
+        // The description is the wording this service publishes an offering under, with
+        // the bandwidth and the price of THIS entry read back out of its own members.
+        assert_eq!(
+            offering["offeringDescription"].as_str(),
+            Some(
+                format!("Reserved outbound bandwidth of {bitrate}Mbps at ${price_per_unit}/hour")
+                    .as_str()
             ),
-        }
+            "case {case:?}: the description states this entry's own terms, got {body}"
+        );
     }
 
     // Every entry was addressed by a DIFFERENT ARN: the catalogue's ARNs are distinct, so
@@ -367,9 +356,9 @@ struct MissingCase {
 /// modelled `NotFoundException` (404) — never with a 501, never with a success and never
 /// with another offering. The rows are the ways an identifier can resolve nothing: an
 /// amount of bandwidth and a term the ladder does not offer, an offering id of another
-/// form, another account's ARN, another service's, another resource type of this service,
-/// an ARN with a segment appended or a character changed, and a string that is no ARN at
-/// all.
+/// form, an ARN carrying an account-id field the published form does not have, another
+/// service's ARN, another resource type of this service, an ARN with a segment appended or
+/// a character changed, and a string that is no ARN at all.
 #[tokio::test]
 async fn an_unpublished_offering_is_refused_as_not_found() {
     let emulator = Emulator::new();
@@ -391,9 +380,7 @@ async fn an_unpublished_offering_is_refused_as_not_found() {
     let unoffered_bitrate = i32::try_from(published_bitrate - 1).unwrap_or_default();
     let offered_duration = i32::try_from(published_duration).unwrap_or_default();
 
-    let offering_arn_of = |fragment: String| {
-        engine::emulator_arn(mc::SERVICE_NAMESPACE, REGION, &fragment)
-    };
+    let offering_arn_of = |fragment: String| mc::offering_arn(REGION, &fragment);
     let missing = vec![
         MissingCase {
             case: "an amount of bandwidth the catalogue does not offer",
@@ -414,8 +401,15 @@ async fn an_unpublished_offering_is_refused_as_not_found() {
             arn: offering_arn_of("offering:1-deadbeef".to_string()),
         },
         MissingCase {
-            case: "an offering ARN of another account",
-            arn: published_arn.replace(":000000000000:", ":999999999999:"),
+            case: "an offering ARN carrying an account-id field",
+            arn: published_arn.replace(
+                &format!(":{}:", mc::SERVICE_NAMESPACE),
+                &format!(
+                    ":{}:{}:",
+                    mc::SERVICE_NAMESPACE,
+                    engine::emulator_account_id()
+                ),
+            ),
         },
         MissingCase {
             case: "another service's ARN",

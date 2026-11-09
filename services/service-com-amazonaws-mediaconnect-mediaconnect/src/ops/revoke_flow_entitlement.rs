@@ -75,16 +75,27 @@
 use super::types::*;
 
 /// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
-/// in the request does not exist in the system" — the flow or the entitlement
-/// `identifier` addressed, in this service's not-found envelope
+/// in the request does not exist in the system" — the entitlement `identifier` addressed,
+/// in this service's not-found envelope
 /// ([`crate::state::not_found_message`]).
 ///
-/// The identifier is whichever of the request's two ARNs resolved nothing, so a caller can
-/// tell a flow this service does not hold from an entitlement that flow does not carry —
-/// the same wording RemoveFlowOutput and UpdateFlowEntitlement answer with.
+/// A caller can tell an entitlement the addressed flow does not carry from a flow this
+/// service does not hold ([`flow_not_found`]) — the same wording RemoveFlowOutput and
+/// UpdateFlowEntitlement answer with.
 fn not_found(identifier: &str) -> RevokeFlowEntitlementError {
     RevokeFlowEntitlementErrorModeled::NotFoundException(NotFoundException {
         message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404) for a `{FlowArn}` label that
+/// resolved no flow, worded by [`crate::state::flow_not_found_message`]: the one wording
+/// every flow operation refuses an unresolvable flow label with, which names the ARN that
+/// resolved nothing only when the label was a flow ARN at all.
+fn flow_not_found(flow_arn: &str) -> RevokeFlowEntitlementError {
+    RevokeFlowEntitlementErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::flow_not_found_message(flow_arn),
     })
     .into()
 }
@@ -192,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the entitlement's own ARN. Either one naming nothing is "one or more of the
         // resources in the request does not exist".
         let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
-            return Err(not_found(&input.flow_arn));
+            return Err(flow_not_found(&input.flow_arn));
         };
 
         // `Entitlement.EntitlementArn` is unique per entitlement, so at most one position

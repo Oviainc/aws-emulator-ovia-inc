@@ -426,14 +426,16 @@ async fn remove_flow_vpc_interface_refuses_what_it_cannot_remove() {
             (404, Some("NotFoundException")),
             "case {case:?}: expected 404 NotFoundException, got {status} {code:?}: {body}"
         );
-        let identifier = if target_flow == flow_arn {
-            vpc_interface_name.clone()
+        let expected = if target_flow == flow_arn {
+            mc::not_found_message(&vpc_interface_name)
         } else {
-            target_flow.clone()
+            // The flow label resolved nothing: the envelope names that ARN, or the generic
+            // reason when the label is no flow ARN at all.
+            mc::flow_not_found_message(&target_flow)
         };
         assert_eq!(
             body["message"].as_str(),
-            Some(mc::not_found_message(&identifier).as_str()),
+            Some(expected.as_str()),
             "case {case:?}: the refusal names what resolved nothing, got {body}"
         );
 

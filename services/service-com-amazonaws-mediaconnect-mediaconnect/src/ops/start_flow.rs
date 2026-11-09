@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
             return Err(StartFlowErrorModeled::NotFoundException(NotFoundException {
-                message: crate::state::not_found_message(&input.flow_arn),
+                message: crate::state::flow_not_found_message(&input.flow_arn),
             })
             .into());
         };

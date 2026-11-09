@@ -251,3 +251,7 @@ mod router_input_configuration_consistency;
 mod add_bridge_outputs_bridge_retirement;
 #[path = "all/tag_removal_without_tag_keys.rs"]
 mod tag_removal_without_tag_keys;
+#[path = "all/published_offering_form.rs"]
+mod published_offering_form;
+#[path = "all/flow_label_not_found_wording.rs"]
+mod flow_label_not_found_wording;

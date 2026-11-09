@@ -97,11 +97,14 @@ fn bad_request(detail: impl Into<String>) -> AddFlowOutputsError {
 }
 
 /// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
-/// in the request does not exist in the system" — the flow `identifier` addressed, in this
-/// service's not-found envelope ([`crate::state::not_found_message`]).
-fn not_found(identifier: &str) -> AddFlowOutputsError {
+/// in the request does not exist in the system" — the flow the `{FlowArn}` label
+/// addressed, in this service's not-found envelope, worded by
+/// [`crate::state::flow_not_found_message`]: the one wording every flow operation refuses
+/// an unresolvable flow label with, which names the ARN that resolved nothing only when
+/// the label was a flow ARN at all.
+fn not_found(flow_arn: &str) -> AddFlowOutputsError {
     AddFlowOutputsErrorModeled::NotFoundException(NotFoundException {
-        message: crate::state::not_found_message(identifier),
+        message: crate::state::flow_not_found_message(flow_arn),
     })
     .into()
 }

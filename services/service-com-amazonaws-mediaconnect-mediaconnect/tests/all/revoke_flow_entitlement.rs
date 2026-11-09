@@ -320,7 +320,9 @@ async fn revoke_flow_entitlement_refuses_what_it_cannot_revoke() {
             entitlement_arn: held_entitlement.clone(),
             status: 404,
             code: "NotFoundException",
-            not_found_identifier: Some("not-an-arn".to_string()),
+            // No flow ARN, so no flow lookup was reached: the envelope carries the generic
+            // reason rather than the caller's own text.
+            not_found_identifier: Some(mc::UNRESOLVED_PATH_NOT_FOUND_REASON.to_string()),
         },
         RefusalCase {
             case: "an entitlement ARN this service never minted",

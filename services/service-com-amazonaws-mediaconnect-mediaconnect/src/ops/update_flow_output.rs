@@ -163,11 +163,22 @@ fn bad_request(detail: impl Into<String>) -> UpdateFlowOutputError {
 }
 
 /// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
-/// in the request does not exist in the system" — the flow or the output `identifier`
-/// addressed, in this service's not-found envelope ([`crate::state::not_found_message`]).
+/// in the request does not exist in the system" — the output `identifier` addressed, in
+/// this service's not-found envelope ([`crate::state::not_found_message`]).
 fn not_found(identifier: &str) -> UpdateFlowOutputError {
     UpdateFlowOutputErrorModeled::NotFoundException(NotFoundException {
         message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404) for a `{FlowArn}` label that
+/// resolved no flow, worded by [`crate::state::flow_not_found_message`]: the one wording
+/// every flow operation refuses an unresolvable flow label with, which names the ARN that
+/// resolved nothing only when the label was a flow ARN at all.
+fn flow_not_found(flow_arn: &str) -> UpdateFlowOutputError {
+    UpdateFlowOutputErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::flow_not_found_message(flow_arn),
     })
     .into()
 }
@@ -361,7 +372,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ARN — the flow first, so a flow the store does not hold is answered for the
         // flow it named rather than for the output.
         let Some(flow) = store.flows.get(&input.flow_arn) else {
-            return Err(not_found(&input.flow_arn));
+            return Err(flow_not_found(&input.flow_arn));
         };
         let Some(position) = flow
             .outputs

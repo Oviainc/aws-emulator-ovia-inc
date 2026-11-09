@@ -213,11 +213,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this operation's member declares no pattern of its own, so the narrow `FlowArn`
         // shape pattern is the only one the model states for it and the boundary walk has
         // already refused a label outside that form — see the note on `DescribeFlowInput`
-        // in `super::types` (`describe_flow_types.rs`).
+        // in `super::types` (`describe_flow_types.rs`). The refusal is worded by
+        // `crate::state::flow_not_found_message`, the one wording every flow operation
+        // refuses an unresolvable flow label with.
         let Some(flow) = store.flows.get(&input.flow_arn) else {
             return Err(
                 DescribeFlowSourceMetadataErrorModeled::NotFoundException(NotFoundException {
-                    message: crate::state::not_found_message(&input.flow_arn),
+                    message: crate::state::flow_not_found_message(&input.flow_arn),
                 })
                 .into(),
             );

@@ -170,10 +170,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store does not hold (one never minted, one whose flow was deleted, or one that
         // is not an ARN at all) addresses no flow and is refused `NotFoundException`
         // rather than judged against the `FlowArn` shape's pattern. See the note on
-        // `DescribeFlowInput` in `super::types` (`describe_flow_types.rs`).
+        // `DescribeFlowInput` in `super::types` (`describe_flow_types.rs`). The refusal is
+        // worded by `crate::state::flow_not_found_message`, which names the ARN that
+        // resolved nothing only when the label was a flow ARN at all.
         let Some(flow) = store.flows.get(&input.flow_arn) else {
             return Err(DescribeFlowErrorModeled::NotFoundException(NotFoundException {
-                message: crate::state::not_found_message(&input.flow_arn),
+                message: crate::state::flow_not_found_message(&input.flow_arn),
             })
             .into());
         };
