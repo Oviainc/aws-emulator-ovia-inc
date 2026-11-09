@@ -688,33 +688,19 @@ const AMAZON_VPC_QUALIFIER: &str = " (Amazon VPC)";
 /// `RIProductDescription` enum, as [`platform_of`] reads it.
 const WINDOWS_PLATFORM: &str = "Windows";
 
-/// The micro-dollars one vCPU of an instance costs for one hour at the On-Demand rate.
-///
-/// CHOSEN, with [`MICROS_PER_GIB_HOUR`] and [`WINDOWS_LICENCE_MICROS_PER_VCPU_HOUR`]: AWS's
-/// price list is published outside the model, and neither the model nor a request carries it.
-/// What a caller can rely on is the RULE — a price is a function of the instance type's
-/// published vCPUs and memory and of the platform's licence premium, so a larger size of one
-/// family costs more than a smaller one and a Windows price is above the Linux price of the
-/// same type — not these rates.
-const MICROS_PER_VCPU_HOUR: u64 = 21_000;
-
-/// The micro-dollars one GiB of an instance's memory costs for one hour at the On-Demand
-/// rate. CHOSEN, see [`MICROS_PER_VCPU_HOUR`].
-const MICROS_PER_GIB_HOUR: u64 = 5_000;
-
-/// The micro-dollars per vCPU-hour a `Windows` platform adds to the On-Demand rate: the
-/// licence premium AWS charges on top of the compute. CHOSEN, see [`MICROS_PER_VCPU_HOUR`].
-const WINDOWS_LICENCE_MICROS_PER_VCPU_HOUR: u64 = 46_000;
-
-/// The MiB in one GiB, for reading an instance type's memory (which the catalog publishes in
-/// MiB) at the per-GiB rate.
-const MIB_PER_GIB: u64 = 1_024;
+// The rates an hour is priced from — per vCPU, per GiB and the Windows licence premium — are
+// this crate's ONE On-Demand basis (`crate::state::MICROS_PER_VCPU_HOUR` and its neighbours,
+// read through `crate::state::on_demand_hour_micros`), so a Spot price and a Reserved
+// Instance offering are shares of the same rate rather than of two. They are CHOSEN there,
+// for the reason that constant gives: AWS's price list is published outside the model, and
+// what a caller can rely on is the RULE — a price is a function of the instance type's
+// published vCPUs and memory and of the platform's licence premium — not the rates.
 
 /// The lowest percentage of the On-Demand rate a Spot price falls to, and the highest. A
 /// Spot price is the On-Demand rate discounted into that band, which is what keeps every
 /// reported price below the On-Demand rate and above zero.
 ///
-/// CHOSEN, see [`MICROS_PER_VCPU_HOUR`]: AWS publishes the discount as varying with supply
+/// CHOSEN, like the rates themselves: AWS publishes the discount as varying with supply
 /// and demand, which this emulator holds no data for.
 const SPOT_FLOOR_PERCENT: u64 = 30;
 
@@ -738,19 +724,11 @@ const ZONE_SHARE_OFFSET_PERCENT: u64 = 13;
 const PRICE_QUANTUM_MICROS: u64 = 100;
 
 /// What one hour of `record`'s instance type costs On-Demand on `platform`, in
-/// micro-dollars: its vCPUs and its memory at the rates above, plus the platform's licence
-/// premium per vCPU.
+/// micro-dollars: the crate's one On-Demand hour
+/// (`crate::state::on_demand_hour_micros`), told whether the platform priced carries a
+/// licence premium — which is this operation's own reading of its own `platform` member.
 fn on_demand_micros(record: &crate::state::InstanceTypeRecord, platform: &str) -> u64 {
-    let vcpus = u64::from(record.default_vcpus.unsigned_abs());
-    let memory_mib = record.memory_mib.unsigned_abs();
-    let compute = vcpus.saturating_mul(MICROS_PER_VCPU_HOUR);
-    let memory = memory_mib.saturating_mul(MICROS_PER_GIB_HOUR) / MIB_PER_GIB;
-    let licence = if platform == WINDOWS_PLATFORM {
-        vcpus.saturating_mul(WINDOWS_LICENCE_MICROS_PER_VCPU_HOUR)
-    } else {
-        0
-    };
-    compute.saturating_add(memory).saturating_add(licence)
+    crate::state::on_demand_hour_micros(record, platform == WINDOWS_PLATFORM)
 }
 
 /// The share of the On-Demand rate the Spot price of the Region's `zone_index`-th

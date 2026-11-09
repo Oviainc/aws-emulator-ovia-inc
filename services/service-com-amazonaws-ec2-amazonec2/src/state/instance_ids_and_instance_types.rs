@@ -1889,6 +1889,55 @@ impl InstanceTypeRecord {
     }
 }
 
+/// The micro-dollars one vCPU of an instance costs for one hour at the On-Demand rate.
+///
+/// CHOSEN, with [`MICROS_PER_GIB_HOUR`] and [`WINDOWS_LICENCE_MICROS_PER_VCPU_HOUR`]: AWS's
+/// price list is published outside the model, and neither the model nor a request carries
+/// it. What a caller can rely on is the RULE — an hour is priced on the instance type's own
+/// published vCPUs and memory and on the platform's licence premium, so a larger size of one
+/// family costs more than a smaller one and a Windows price is above the Linux price of the
+/// same type — not these rates.
+pub const MICROS_PER_VCPU_HOUR: u64 = 21_000;
+
+/// The micro-dollars one GiB of an instance's memory costs for one hour at the On-Demand
+/// rate. CHOSEN, see [`MICROS_PER_VCPU_HOUR`].
+pub const MICROS_PER_GIB_HOUR: u64 = 5_000;
+
+/// The micro-dollars per vCPU-hour a Windows platform adds to the On-Demand rate: the licence
+/// premium AWS charges on top of the compute. CHOSEN, see [`MICROS_PER_VCPU_HOUR`].
+pub const WINDOWS_LICENCE_MICROS_PER_VCPU_HOUR: u64 = 46_000;
+
+/// The micro-dollars in one dollar, for reading a priced hour as the currency amount a
+/// response carries.
+pub const MICROS_PER_DOLLAR: u64 = 1_000_000;
+
+/// The MiB in one GiB, for reading an instance type's memory (which the catalog publishes in
+/// MiB) at the per-GiB rate.
+const MIB_PER_GIB: u64 = 1_024;
+
+/// What one hour of `record`'s instance type costs at the On-Demand rate, in micro-dollars:
+/// its vCPUs and its memory at the rates above, plus the licence premium per vCPU when
+/// `windows_licence` says the platform priced carries one.
+///
+/// The ONE On-Demand hour of this service, beside the instance-type facts it is derived from,
+/// so every operation that prices an instance hour prices it from the same basis: a Spot price
+/// is a share of this rate (`DescribeSpotPriceHistory`), and a Reserved Instance offering's
+/// purchase and usage prices are this rate discounted for the term and split by the payment
+/// option (`DescribeReservedInstancesOfferings`). Which platform strings carry a licence is
+/// the operation's own reading of its own member, so it is passed in rather than parsed here.
+pub fn on_demand_hour_micros(record: &InstanceTypeRecord, windows_licence: bool) -> u64 {
+    let vcpus = u64::from(record.default_vcpus.unsigned_abs());
+    let memory_mib = record.memory_mib.unsigned_abs();
+    let compute = vcpus.saturating_mul(MICROS_PER_VCPU_HOUR);
+    let memory = memory_mib.saturating_mul(MICROS_PER_GIB_HOUR) / MIB_PER_GIB;
+    let licence = if windows_licence {
+        vcpus.saturating_mul(WINDOWS_LICENCE_MICROS_PER_VCPU_HOUR)
+    } else {
+        0
+    };
+    compute.saturating_add(memory).saturating_add(licence)
+}
+
 /// Everything this emulator knows about the instance type `instance_type`, or `None`
 /// when it is not one of the offered types ([`offered_instance_types`]).
 pub fn instance_type_record(instance_type: &str) -> Option<InstanceTypeRecord> {

@@ -1624,6 +1624,14 @@ mod account_wide_read_authorization;
 // reported it, and every sibling left as resolvable as it was. Declared beside
 #[path = "all/delete_launch_template_resolution.rs"]
 mod delete_launch_template_resolution;
+// Which Reserved Instance offerings the service publishes for a Region — the product of the
+// places one can be used, the product descriptions, the offering classes, the payment options
+// and the terms — how each is priced from its own terms, how the narrowing members, the
+// documented filters, the offering ids and the pages select from it, and that the describe is a
+// read whose ids the exchange operations resolve. Declared at the tail of this file, which is
+// where every new ec2 suite inserts its lines.
+#[path = "all/describe_reserved_instances_offerings.rs"]
+mod describe_reserved_instances_offerings;
 // The tag filter family on the describes of a taggable resource: `tag:<key>`, `tag-key` and
 // `tag-value` over the tags a Capacity Reservation and a Capacity Reservation Fleet really
 // hold, and the names outside the documented set and the family that are still refused.

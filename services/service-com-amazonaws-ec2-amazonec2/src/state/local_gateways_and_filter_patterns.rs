@@ -691,6 +691,36 @@ pub fn filter_timestamp_values(
         .collect()
 }
 
+/// A PRICE as a filter value compares against it: both spellings of the amount the wire
+/// carries.
+///
+/// The wire carries a `Float` as Rust renders it, so a whole number of dollars reaches the
+/// client as `9800` — while the values AWS's own documentation writes for the `fixed-price` and
+/// `usage-price` filters are `9800.0` and `0.84`, the same amount with its fractional part
+/// spelled out. Both are the same price, and a caller may write either, so a candidate holds
+/// both as values of the filter; anything else would refuse to match a price the way it is
+/// documented or the way it is reported. A member that is not set carries no value for the
+/// filter to match, like any other absent attribute.
+///
+/// Beside [`matches_every_filter`] and [`filter_timestamp_values`] because every describe that
+/// filters on a price needs exactly this rendering — the report of the Reserved Instances an
+/// account holds and the report of the offerings it may buy both do — and two copies of it
+/// could drift.
+pub fn price_filter_values(price: Option<f32>) -> Vec<Cow<'static, str>> {
+    let Some(price) = price else {
+        return Vec::new();
+    };
+    let reported = price.to_string();
+    let with_fraction = if reported.contains('.') {
+        None
+    } else {
+        Some(format!("{reported}.0"))
+    };
+    ::std::iter::once(Cow::Owned(reported))
+        .chain(with_fraction.map(Cow::Owned))
+        .collect()
+}
+
 /// The tag filter whose values are the KEYS a resource carries, rather than one key's
 /// value: "`tag-key` - The key of a tag assigned to the … Use this filter to find all …
 /// that have a tag with a specific key, regardless of the tag value"

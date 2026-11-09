@@ -390,29 +390,6 @@ fn selects(asked: Option<&str>, held: Option<&str>) -> bool {
     asked.is_none_or(|asked| held == Some(asked))
 }
 
-/// A price as a filter value compares against it.
-///
-/// The wire carries a `Float` as Rust renders it, so a whole number of dollars reaches the
-/// client as `9800` — while the values AWS's own documentation writes for these two filters are
-/// `9800.0` and `0.84`, the same amount with its fractional part spelled out. Both are the same
-/// price, and a caller may write either, so a purchase holds both as values of the filter;
-/// anything else would refuse to match a price the way it is documented or the way it is
-/// reported.
-fn price_filter_values(price: Option<f32>) -> Vec<Cow<'static, str>> {
-    let Some(price) = price else {
-        return Vec::new();
-    };
-    let reported = price.to_string();
-    let with_fraction = if reported.contains('.') {
-        None
-    } else {
-        Some(format!("{reported}.0"))
-    };
-    ::std::iter::once(Cow::Owned(reported))
-        .chain(with_fraction.map(Cow::Owned))
-        .collect()
-}
-
 /// The values the EC2 filter `name` compares against this Reserved Instance.
 ///
 /// A filter naming an attribute the purchase does not carry compares against NO values, so it
@@ -443,7 +420,7 @@ fn filter_values<'a>(purchase: &'a ReservedInstances, name: &str) -> Vec<Cow<'a,
             .into_iter()
             .collect(),
         "end" => crate::state::filter_timestamp_values(purchase.end),
-        "fixed-price" => price_filter_values(purchase.fixed_price),
+        "fixed-price" => crate::state::price_filter_values(purchase.fixed_price),
         "instance-type" => text(purchase.instance_type.as_deref()),
         // The two filters the recorded contract accepts beside the documented list, each
         // selecting on the member of the same name this report already carries.
@@ -460,7 +437,7 @@ fn filter_values<'a>(purchase: &'a ReservedInstances, name: &str) -> Vec<Cow<'a,
             .flatten()
             .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
             .collect(),
-        "usage-price" => price_filter_values(purchase.usage_price),
+        "usage-price" => crate::state::price_filter_values(purchase.usage_price),
         // Unreachable: [`is_documented_filter`] has already refused every other name. An
         // attribute nothing is stored for compares against nothing, so it could never widen a
         // result even if that check were bypassed.
