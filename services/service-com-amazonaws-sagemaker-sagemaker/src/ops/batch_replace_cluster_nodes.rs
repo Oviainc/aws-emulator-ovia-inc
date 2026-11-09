@@ -299,10 +299,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for node in cluster.nodes.values_mut() {
             node.settle_status(now);
         }
+        // A cluster being torn down takes no node change: its instances are going away
+        // with it, so no node is replaced and the request is refused for the cluster's
+        // status rather than reporting hardware that will never come up.
+        if !cluster.accepts_node_changes() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::cluster_rejects_node_change(&cluster.arn, &cluster.status),
+            ));
+        }
 
         // Both lists are walked IN REQUEST ORDER and answered in that order: the response
         // lists carry the identifiers the request listed, so a caller can line its request
         // up against the answer without re-sorting it.
+        //
+        // A node the Slurm workload manager runs on is settled FIRST, for the whole batch:
+        // the constraint is on the request ("you cannot replace instances that are
+        // configured as Slurm controller nodes"), so a batch naming one replaces nothing at
+        // all rather than taking the rest of its identifiers with it.
+        let controller = node_ids
+            .iter()
+            .filter_map(|node_id| cluster.logical_id_of_instance(node_id))
+            .chain(logical_ids.iter().cloned())
+            .any(|logical_id| cluster.is_slurm_controller_node(&logical_id));
+        if controller {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::SLURM_CONTROLLER_NOT_REPLACEABLE,
+            ));
+        }
+
         let mut successful: Vec<String> = Vec::new();
         let mut failed: Vec<BatchReplaceClusterNodesError2> = Vec::new();
         // How many of the request's identifiers named no node of this cluster at all,

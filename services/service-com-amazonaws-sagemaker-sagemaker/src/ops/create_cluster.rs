@@ -305,7 +305,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 orchestrator: input.orchestrator,
                 node_recovery: input.node_recovery,
                 tiered_storage_config: input.tiered_storage_config,
-                node_provisioning_mode: input.node_provisioning_mode,
+                // The mode the cluster provisions its nodes in: the one the request named,
+                // and otherwise the service's own mode, so a reader always learns how this
+                // cluster provisions nodes (see `state::default_node_provisioning_mode`).
+                node_provisioning_mode: input
+                    .node_provisioning_mode
+                    .or_else(crate::state::default_node_provisioning_mode),
                 cluster_role: input.cluster_role,
                 auto_scaling: input.auto_scaling,
                 tags: input.tags.unwrap_or_default(),

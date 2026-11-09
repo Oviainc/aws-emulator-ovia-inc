@@ -45,6 +45,8 @@ mod cluster_scheduler_config_lifecycle;
 mod code_repositories;
 #[path = "all/code_repository_deletion.rs"]
 mod code_repository_deletion;
+#[path = "all/code_repository_updates.rs"]
+mod code_repository_updates;
 #[path = "all/compute_quota_lifecycle.rs"]
 mod compute_quota_lifecycle;
 #[path = "all/control_plane_preconditions.rs"]
@@ -95,8 +97,12 @@ mod hyperpod_cluster_audit_record;
 mod hyperpod_cluster_listing;
 #[path = "all/inference_deployment_lifecycle.rs"]
 mod inference_deployment_lifecycle;
+#[path = "all/inference_recommendation_refusals.rs"]
+mod inference_recommendation_refusals;
 #[path = "all/inference_recommendations_jobs.rs"]
 mod inference_recommendations_jobs;
+#[path = "all/job_experiment_tracking.rs"]
+mod job_experiment_tracking;
 #[path = "all/lineage_action_lifecycle.rs"]
 mod lineage_action_lifecycle;
 #[path = "all/lineage_and_config_updates.rs"]
@@ -223,6 +229,8 @@ mod state_roundtrip;
 mod studio_app_lifecycle;
 #[path = "all/training_job_admission.rs"]
 mod training_job_admission;
+#[path = "all/training_job_algorithm_reference.rs"]
+mod training_job_algorithm_reference;
 #[path = "all/training_job_constraint_admission.rs"]
 mod training_job_constraint_admission;
 #[path = "all/training_job_execution.rs"]

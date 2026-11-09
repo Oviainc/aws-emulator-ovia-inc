@@ -179,6 +179,10 @@ const MESSAGE_INVALID_STATUS: &str = "The node is in a state that does not allow
 /// See [`MESSAGE_NOT_FOUND`]: the one condition both batch node operations describe,
 /// worded from `crate::state` so neither words it on its own.
 const MESSAGE_IN_USE: &str = crate::state::NODE_OPERATION_IN_FLIGHT_MESSAGE;
+/// See [`MESSAGE_NOT_FOUND`]: the Slurm workload manager's own node, which no state of it
+/// makes removable — worded from `crate::state`, where the constraint both batch node
+/// operations state is kept.
+const MESSAGE_SLURM_CONTROLLER: &str = crate::state::SLURM_CONTROLLER_NOT_REMOVABLE;
 
 /// What this call did with the node one identifier named.
 enum Outcome {
@@ -190,6 +194,8 @@ enum Outcome {
     InUse,
     /// The node is mid-change, so it cannot be deleted right now.
     InvalidStatus,
+    /// The node runs the cluster's Slurm workload manager, so it is not removable at all.
+    SlurmController,
 }
 
 /// Delete the node `logical_id` names, when its state admits it, and answer what this call
@@ -201,6 +207,12 @@ fn delete(cluster: &mut crate::state::Cluster, logical_id: Option<String>) -> Ou
     let Some(logical_id) = logical_id else {
         return Outcome::NotFound;
     };
+    // The Slurm controller group's nodes are not removable: "For SageMaker HyperPod
+    // clusters using the Slurm workload manager, you cannot remove instances that are
+    // configured as Slurm controller nodes" (`NodeIds`'s own doc).
+    if cluster.is_slurm_controller_node(&logical_id) {
+        return Outcome::SlurmController;
+    }
     match cluster.nodes.get(&logical_id) {
         None => Outcome::NotFound,
         Some(node) if node.is_replacing() => Outcome::InUse,
@@ -290,6 +302,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for node in cluster.nodes.values_mut() {
             node.settle_status(now);
         }
+        // A cluster being torn down takes no node change: its instances are going away
+        // with it, so nothing is deleted and the request is refused for the cluster's
+        // status rather than reporting a deletion the teardown was doing anyway.
+        if !cluster.accepts_node_changes() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::cluster_rejects_node_change(&cluster.arn, &cluster.status),
+            ));
+        }
 
         // Both lists are walked IN REQUEST ORDER and answered in that order: the response
         // lists carry the identifiers the request listed, so a caller can line its request
@@ -308,6 +328,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Outcome::NotFound => (ERROR_INSTANCE_ID_NOT_FOUND, MESSAGE_NOT_FOUND),
                 Outcome::InUse => (ERROR_INSTANCE_ID_IN_USE, MESSAGE_IN_USE),
                 Outcome::InvalidStatus => (ERROR_INVALID_INSTANCE_STATUS, MESSAGE_INVALID_STATUS),
+                Outcome::SlurmController => {
+                    (ERROR_INVALID_INSTANCE_STATUS, MESSAGE_SLURM_CONTROLLER)
+                }
             };
             failed.push(BatchDeleteClusterNodesError2 {
                 node_id: node_id.clone(),
@@ -329,6 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Outcome::NotFound => (ERROR_NODE_LOGICAL_ID_NOT_FOUND, MESSAGE_NOT_FOUND),
                 Outcome::InUse => (ERROR_NODE_ID_IN_USE, MESSAGE_IN_USE),
                 Outcome::InvalidStatus => (ERROR_INVALID_NODE_STATUS, MESSAGE_INVALID_STATUS),
+                Outcome::SlurmController => (ERROR_INVALID_NODE_STATUS, MESSAGE_SLURM_CONTROLLER),
             };
             failed_logical.push(BatchDeleteClusterNodeLogicalIdsError {
                 node_logical_id: logical_id.clone(),
@@ -337,17 +361,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // Whether this call changed the cluster at all: a batch whose every identifier
-        // landed in a failure list deleted nothing.
-        //
-        // Such a batch is still a 200 with per-entry failures, not a refusal: this
-        // operation models a `Failed`/`FailedNodeLogicalIds` entry for every node it
-        // could not delete, and nothing recorded shows it refusing a request whose
-        // identifiers all name missing nodes. (Its sibling `BatchReplaceClusterNodes`
-        // DOES refuse that shape, on the recorded refusal quoted in its own handler; the
-        // two are worded as each operation's own evidence words them rather than made
-        // uniform on a guess.)
+        // A request NONE of whose identifiers could be deleted asked for nothing this call
+        // can do, so it is refused as a whole rather than answered with a 200 whose every
+        // entry is a failure — the sentence naming the three conditions an identifier has
+        // to satisfy to be deletable, which is the recorded refusal for it. Nothing was
+        // removed on the way here, since every identifier landed in a failure list. (Its
+        // sibling `BatchReplaceClusterNodes` refuses the same shape, in that operation's
+        // own words.)
         let deleted = !successful.is_empty() || !successful_logical.is_empty();
+        if !deleted {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::ALL_NODES_FAILED_VALIDATION,
+            ));
+        }
         let answer = BatchDeleteClusterNodesOutput {
             // Every one of the four lists is modelled from a minimum length of one, so a
             // call that has nothing of that kind to report carries no list rather than an

@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 
 use service_com_amazonaws_sagemaker_sagemaker::state::{
-    self, DEFAULT_LINEAGE_GROUP, EMPTY_RESOURCE_POLICY,
+    self, default_lineage_group_name, EMPTY_RESOURCE_POLICY,
 };
 
 use super::inference_deployment_lifecycle::{
@@ -96,7 +96,7 @@ async fn reports_the_policy_document_the_addressed_group_holds() {
         (
             "default-group-no-statements",
             "us-east-1",
-            DEFAULT_LINEAGE_GROUP.to_string(),
+            default_lineage_group_name("us-east-1"),
             "{\"Version\":\"2012-10-17\",\"Statement\":[]}".to_string(),
         ),
         (
@@ -201,7 +201,7 @@ async fn a_group_nobody_has_shared_carries_the_empty_document() {
     // Rows: every name shape and Region a group is materialised under — the document is
     // the group's, not one particular group's.
     let seeded: Vec<(&str, String)> = vec![
-        ("us-east-1", DEFAULT_LINEAGE_GROUP.to_string()),
+        ("us-east-1", default_lineage_group_name("us-east-1")),
         ("eu-west-2", "a".to_string()),
         ("ap-southeast-1", "123".to_string()),
         ("us-west-2", "my-lineage-group-2".to_string()),
@@ -273,13 +273,21 @@ async fn a_group_nobody_has_shared_carries_the_empty_document() {
     ];
 
     for (case, region, target, body) in &created {
-        // A fresh emulator per row: the group must be materialised by THIS create.
+        // A fresh emulator per row: the Region already holds its default group, so its
+        // policy — the empty document, since nothing has shared it — reads before and
+        // after the create alike.
         let emulator = Emulator::new();
-        let (absent_status, absent) = get_policy(&emulator, region, DEFAULT_LINEAGE_GROUP).await;
+        let group_name = default_lineage_group_name(region);
+        let (before_status, before) = get_policy(&emulator, region, &group_name).await;
         assert_eq!(
-            absent_status, 400,
-            "case {case}: before any lineage entity the group must be absent, got \
-             {absent_status} with {absent}"
+            before_status, 200,
+            "case {case}: the Region's default group must be readable from the start, got \
+             {before_status} with {before}"
+        );
+        assert_eq!(
+            str_field(&before, "ResourcePolicy"),
+            EMPTY_RESOURCE_POLICY,
+            "case {case}: ResourcePolicy before the create, got {before:?}"
         );
 
         let (created_status, created_body) = emulator.call_in(region, target, body).await;
@@ -288,7 +296,7 @@ async fn a_group_nobody_has_shared_carries_the_empty_document() {
             "case {case}: {target}, got {created_status} with {created_body}"
         );
 
-        let (status, policy_body) = get_policy(&emulator, region, DEFAULT_LINEAGE_GROUP).await;
+        let (status, policy_body) = get_policy(&emulator, region, &group_name).await;
         assert_eq!(
             status, 200,
             "case {case}: the materialised group must be read, got {status} with \
@@ -301,7 +309,7 @@ async fn a_group_nobody_has_shared_carries_the_empty_document() {
         );
         assert_eq!(
             str_field(&policy_body, "LineageGroupArn"),
-            group_arn(region, DEFAULT_LINEAGE_GROUP),
+            group_arn(region, &group_name),
             "case {case}: LineageGroupArn, got {policy_body:?}"
         );
     }
@@ -314,9 +322,9 @@ async fn a_group_nobody_has_shared_carries_the_empty_document() {
 async fn a_group_the_region_does_not_hold_is_refused_and_nothing_is_minted() {
     let emulator = Emulator::new();
 
-    // On a store that has materialised nothing, EVERY name is absent — including the name
-    // AWS gives the group it materialises for an account that has lineage entities.
-    for name in [DEFAULT_LINEAGE_GROUP, "absent", "a"] {
+    // On a store that has materialised nothing, every name is absent EXCEPT the Region's
+    // own default group, which the account holds with no call creating it.
+    for name in ["absent", "a"] {
         let (status, body) = get_policy(&emulator, "us-east-1", name).await;
         assert_eq!(
             status, 400,
@@ -351,29 +359,41 @@ async fn a_group_the_region_does_not_hold_is_refused_and_nothing_is_minted() {
              {described_status} with {described}"
         );
         let listed = emulator.ok("ListLineageGroups", &json!({})).await;
+        let listed_names: Vec<&str> = listed
+            .get("LineageGroupSummaries")
+            .and_then(Value::as_array)
+            .map(|summaries| {
+                summaries
+                    .iter()
+                    .filter_map(|summary| {
+                        summary.get("LineageGroupName").and_then(Value::as_str)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         assert_eq!(
-            listed
-                .get("LineageGroupSummaries")
-                .and_then(Value::as_array)
-                .map(Vec::len),
-            Some(0),
-            "case empty-store/{name}: the read must put no group in the listing, \
-             got {listed:?}"
+            listed_names,
+            vec![default_lineage_group_name("us-east-1")],
+            "case empty-store/{name}: the read must put no group in the listing beside \
+             the Region's own, got {listed:?}"
         );
     }
 
-    // A lineage group is REGIONAL, so a group materialised in one Region — document and
-    // all — is not this caller's in another: the policy is answered at home and refused
-    // everywhere else.
+    // A lineage group is REGIONAL, so a policy attached in one Region is not this
+    // caller's in another: the document is answered at home, while every other Region
+    // answers its OWN default group — which nothing has shared, so the empty document.
     let home = "us-east-1";
+    let home_group = default_lineage_group_name(home);
     let policy = "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+    // The document lives on the group's record, so the home Region's default group is
+    // materialised in the store before one is attached to it.
     assert!(
-        materialise(&emulator, home, DEFAULT_LINEAGE_GROUP, at()).is_some(),
+        materialise(&emulator, home, &home_group, at()).is_some(),
         "the home Region must materialise the group"
     );
-    attach_policy(&emulator, home, DEFAULT_LINEAGE_GROUP, policy);
+    attach_policy(&emulator, home, &home_group, policy);
 
-    let (home_status, home_body) = get_policy(&emulator, home, DEFAULT_LINEAGE_GROUP).await;
+    let (home_status, home_body) = get_policy(&emulator, home, &home_group).await;
     assert_eq!(
         home_status, 200,
         "case {home}: expected HTTP 200, got {home_status} with {home_body}"
@@ -385,21 +405,22 @@ async fn a_group_the_region_does_not_hold_is_refused_and_nothing_is_minted() {
     );
 
     for region in ["eu-west-2", "ap-southeast-1", "us-west-2", "eu-central-1"] {
-        let (status, body) = get_policy(&emulator, region, DEFAULT_LINEAGE_GROUP).await;
+        let its_group = default_lineage_group_name(region);
+        let (status, body) = get_policy(&emulator, region, &its_group).await;
         assert_eq!(
-            status, 400,
-            "case {region}: a group materialised in {home} must not be read in {region}, \
-             got {status} with {body}"
+            status, 200,
+            "case {region}: that Region's own default group must be read, got {status} \
+             with {body}"
         );
         assert_eq!(
-            error_code(&body),
-            "ResourceNotFound",
-            "case {region}: error code, got {body:?}"
+            str_field(&body, "ResourcePolicy"),
+            EMPTY_RESOURCE_POLICY,
+            "case {region}: a document attached in {home} is not this Region's, got {body:?}"
         );
-        assert!(
-            message(&body).contains(&group_arn(region, DEFAULT_LINEAGE_GROUP)),
-            "case {region}: the refusal must name the ARN the request resolves to in \
-             THIS Region, got {body:?}"
+        assert_eq!(
+            str_field(&body, "LineageGroupArn"),
+            group_arn(region, &its_group),
+            "case {region}: the ARN must name THIS Region's group, got {body:?}"
         );
     }
 }
@@ -416,7 +437,7 @@ async fn a_group_is_addressable_by_its_name_or_by_its_own_arn() {
 
     // Rows: the name shapes the member admits, each addressed both ways.
     let names = vec![
-        DEFAULT_LINEAGE_GROUP.to_string(),
+        default_lineage_group_name(region),
         "a".to_string(),
         "123".to_string(),
         "my-lineage-group-2".to_string(),
@@ -451,7 +472,8 @@ async fn a_group_is_addressable_by_its_name_or_by_its_own_arn() {
 
     // An ARN this service did not mint names no group here, whatever local record shares
     // its trailing name: another Region, another account, another partition.
-    let name = DEFAULT_LINEAGE_GROUP;
+    let name = default_lineage_group_name(region);
+    let name = name.as_str();
     let foreign: Vec<(&str, String)> = vec![
         ("another-region", group_arn("eu-west-2", name)),
         (
@@ -511,7 +533,10 @@ async fn an_identifier_outside_the_modelled_constraints_is_refused_at_the_bounda
         ("space", "my group".to_string()),
         (
             "another-resource-kind",
-            format!("arn:aws:sagemaker:us-east-1:{ACCOUNT}:context/{DEFAULT_LINEAGE_GROUP}"),
+            format!(
+                "arn:aws:sagemaker:us-east-1:{ACCOUNT}:context/{}",
+                default_lineage_group_name("us-east-1")
+            ),
         ),
     ];
 

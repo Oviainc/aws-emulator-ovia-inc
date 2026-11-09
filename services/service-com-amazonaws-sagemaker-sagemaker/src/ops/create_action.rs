@@ -191,7 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lineage-group bound: this call is about the action (`ensure_lineage_group`
         // warns about that bound itself, for every caller).
         let materialised_group =
-            store.ensure_lineage_group(&region, crate::state::DEFAULT_LINEAGE_GROUP, now);
+            store.ensure_lineage_group(
+                &region,
+                &crate::state::default_lineage_group_name(&region),
+                now,
+            );
         store.actions.insert(
             arn.clone(),
             crate::state::Action {

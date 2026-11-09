@@ -6,17 +6,20 @@
 //! `awsJson1_1`) through the same `MultiServiceRouter` the production router uses, so
 //! what these tests exercise is what a real SDK client gets.
 //!
-//! SageMaker models no `CreateLineageGroup`: the service materialises a lineage group when
-//! the account's lineage entities put something in it, which in this crate is
-//! `ComAmazonawsSagemakerSagemakerState::ensure_lineage_group` — the hook every
+//! SageMaker models no `CreateLineageGroup`: an account HOLDS one lineage group per
+//! Region from the start — the default group, which this crate answers from
+//! `ComAmazonawsSagemakerSagemakerState::default_lineage_group` — and any other group is
+//! materialised when the account's lineage entities put something in it, which in this
+//! crate is `ComAmazonawsSagemakerSagemakerState::ensure_lineage_group`, the hook every
 //! lineage-entity create calls. So one suite below does the whole round trip over the wire
 //! (`CreateContext` / `CreateArtifact` / `CreateAction` -> `ListLineageGroups`), and the
 //! ordering, filtering and paging suites materialise groups through that same state API,
 //! which is how they reach the names, Regions and stored instants no single create can
 //! produce. `lineage_group_reporting.rs` does the same for `DescribeLineageGroup`.
 //!
-//! The tests assert RULES over a TABLE of inputs rather than one recorded call: a group a
-//! lineage entity materialised is listed in its own Region only; a summary replays the
+//! The tests assert RULES over a TABLE of inputs rather than one recorded call: every
+//! Region lists its default group, and a group a lineage entity materialised is listed in
+//! its own Region only; a summary replays the
 //! stored name, ARN, display name and instants; every `SortBy` x `SortOrder` pair orders
 //! the result; the `CreatedAfter` / `CreatedBefore` bounds select inclusively; `MaxResults`
 //! pages the ordered result exactly once, at its documented default of 10 when absent; and
@@ -28,7 +31,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_sagemaker_sagemaker::state::{self, DEFAULT_LINEAGE_GROUP};
+use service_com_amazonaws_sagemaker_sagemaker::state::{self, default_lineage_group_name};
 
 use super::inference_deployment_lifecycle::{
     epoch_seconds, error_code, materialise_lineage_group, Emulator, ACCOUNT,
@@ -75,7 +78,9 @@ fn listed_names(body: &Value) -> Vec<String> {
 
 /// The fixture every ordering and filtering case shares: names whose alphabetical order is
 /// the REVERSE of their creation order, plus two groups materialised in the same instant so
-/// the tie-break is observable. Returns each name with its `CreationTime` in epoch seconds.
+/// the tie-break is observable. Every row is anchored well before "now", so the Region's
+/// own default group — which the account has held since its state began — is the LAST of
+/// them in creation order. Returns each name with its `CreationTime` in epoch seconds.
 fn seed_fixture(emulator: &Emulator) -> Vec<(&'static str, f64)> {
     let rows: Vec<(&'static str, u64)> = vec![
         ("alpha-group", 300),
@@ -92,9 +97,126 @@ fn seed_fixture(emulator: &Emulator) -> Vec<(&'static str, f64)> {
         .collect()
 }
 
-/// RULE: the listing reports the lineage groups the caller's Region holds — groups come
-/// into being with the account's lineage entities, so a store no entity has written to
-/// lists nothing — and listing them changes nothing a later caller sees.
+/// RULE: an account HOLDS one lineage group per Region from the start — SageMaker models
+/// no `CreateLineageGroup` — so a Region nothing has put an entity in still lists its
+/// default group, with that Region's ARN, and the listing is stable across reads.
+#[tokio::test]
+async fn every_region_holds_its_default_lineage_group_from_the_start() {
+    // Rows differ along the Region the request signs for, including the emulator's
+    // default one and an unsigned request (which falls back to it).
+    let regions = [
+        "us-east-1",
+        "us-west-2",
+        "eu-west-2",
+        "ap-southeast-1",
+        "ca-central-1",
+    ];
+
+    for region in regions {
+        // A fresh emulator per row: nothing has created a lineage entity anywhere.
+        let emulator = Emulator::new();
+        let group_name = default_lineage_group_name(region);
+        let listed = {
+            let (status, parsed) = emulator.call_in(region, "ListLineageGroups", &json!({})).await;
+            assert_eq!(
+                status, 200,
+                "case {region}: expected HTTP 200, got {status} with {parsed}"
+            );
+            parsed
+        };
+        assert_eq!(
+            listed_names(&listed),
+            vec![group_name.clone()],
+            "case {region}: a fresh Region lists its default group, got {listed:?}"
+        );
+        let summary = summaries(&listed).first().cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            summary.get("LineageGroupArn").and_then(Value::as_str),
+            Some(
+                format!("arn:aws:sagemaker:{region}:{ACCOUNT}:lineage-group/{group_name}").as_str()
+            ),
+            "case {region}: LineageGroupArn, got {summary:?}"
+        );
+        assert_eq!(
+            summary.get("DisplayName").and_then(Value::as_str),
+            Some(group_name.as_str()),
+            "case {region}: nothing supplies a display name for the account's own group, \
+             so its name is displayed, got {summary:?}"
+        );
+
+        // The group is addressable: the describe and the policy reader both answer it.
+        let described = {
+            let (status, parsed) = emulator
+                .call_in(
+                    region,
+                    "DescribeLineageGroup",
+                    &json!({ "LineageGroupName": &group_name }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {region}: DescribeLineageGroup, got {status} with {parsed}"
+            );
+            parsed
+        };
+        assert_eq!(
+            described.get("LineageGroupArn").and_then(Value::as_str),
+            summary.get("LineageGroupArn").and_then(Value::as_str),
+            "case {region}: the describe and the listing must report one ARN, \
+             got {described:?}"
+        );
+        let (policy_status, policy) = emulator
+            .call_in(
+                region,
+                "GetLineageGroupPolicy",
+                &json!({ "LineageGroupName": &group_name }),
+            )
+            .await;
+        assert_eq!(
+            policy_status, 200,
+            "case {region}: GetLineageGroupPolicy, got {policy_status} with {policy}"
+        );
+
+        // A read changes nothing a later caller sees: the instants are the same ones.
+        let again = {
+            let (status, parsed) = emulator.call_in(region, "ListLineageGroups", &json!({})).await;
+            assert_eq!(
+                status, 200,
+                "case {region}: expected HTTP 200, got {status} with {parsed}"
+            );
+            parsed
+        };
+        assert_eq!(
+            again, listed,
+            "case {region}: the listing must be stable across reads, got {again:?}"
+        );
+    }
+
+    // An unsigned request names no Region, so it lists the default Region's group.
+    let emulator = Emulator::new();
+    let (status, parsed) = emulator.call_unsigned("ListLineageGroups", &json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case unsigned: expected HTTP 200, got {status} with {parsed}"
+    );
+    let summary = summaries(&parsed).first().cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        summary.get("LineageGroupArn").and_then(Value::as_str),
+        Some(
+            format!(
+                "arn:aws:sagemaker:{}:{ACCOUNT}:lineage-group/{}",
+                state::DEFAULT_REGION,
+                default_lineage_group_name(state::DEFAULT_REGION)
+            )
+            .as_str()
+        ),
+        "case unsigned: the default Region's group must be listed, got {parsed:?}"
+    );
+}
+
+/// RULE: the listing reports the lineage groups the caller's Region holds — its default
+/// group, which the account holds from the start, plus every group a lineage entity has
+/// materialised there — and listing them changes nothing a later caller sees.
 #[tokio::test]
 async fn creating_a_lineage_entity_makes_its_region_default_group_listable() {
     // Rows differ along the lineage-entity create that materialises the group (every one
@@ -133,9 +255,11 @@ async fn creating_a_lineage_entity_makes_its_region_default_group_listable() {
     ];
 
     for (case, region, target, body) in cases {
-        // A fresh emulator per row: the group must be materialised by THIS create, in the
-        // Region this request signed for.
+        // A fresh emulator per row: the Region already holds its DEFAULT group — the
+        // account has one per Region, with no call creating it — and the create below
+        // leaves it the Region's only group.
         let emulator = Emulator::new();
+        let group_name = default_lineage_group_name(region);
         let (empty_status, empty) = emulator.call_in(region, "ListLineageGroups", &json!({})).await;
         assert_eq!(
             empty_status, 200,
@@ -143,8 +267,9 @@ async fn creating_a_lineage_entity_makes_its_region_default_group_listable() {
         );
         assert_eq!(
             listed_names(&empty),
-            Vec::<String>::new(),
-            "case {case}: before any lineage entity the Region holds no group, got {empty:?}"
+            vec![group_name.clone()],
+            "case {case}: a Region holds its default lineage group from the start, \
+             got {empty:?}"
         );
         assert!(
             empty.get("NextToken").is_none(),
@@ -167,15 +292,14 @@ async fn creating_a_lineage_entity_makes_its_region_default_group_listable() {
         };
         assert_eq!(
             listed_names(&listed),
-            vec![DEFAULT_LINEAGE_GROUP.to_string()],
+            vec![group_name.clone()],
             "case {case}: the entity's own group must be the whole listing, got {listed:?}"
         );
         let summary = summaries(&listed).first().cloned().unwrap_or(Value::Null);
         assert_eq!(
             summary.get("LineageGroupArn").and_then(Value::as_str),
             Some(
-                format!("arn:aws:sagemaker:{region}:{ACCOUNT}:lineage-group/{DEFAULT_LINEAGE_GROUP}")
-                    .as_str()
+                format!("arn:aws:sagemaker:{region}:{ACCOUNT}:lineage-group/{group_name}").as_str()
             ),
             "case {case}: LineageGroupArn, got {summary:?}"
         );
@@ -200,6 +324,7 @@ async fn creating_a_lineage_entity_makes_its_region_default_group_listable() {
             "case {case}: the listing must be stable across reads, got {again:?}"
         );
         for elsewhere in ["us-west-2", "eu-central-1"] {
+            let its_group = default_lineage_group_name(elsewhere);
             let (status, parsed) = emulator
                 .call_in(elsewhere, "ListLineageGroups", &json!({}))
                 .await;
@@ -209,9 +334,21 @@ async fn creating_a_lineage_entity_makes_its_region_default_group_listable() {
             );
             assert_eq!(
                 listed_names(&parsed),
-                Vec::<String>::new(),
-                "case {case}/{elsewhere}: a group materialised in {region} is not listed \
-                 in {elsewhere}, got {parsed:?}"
+                vec![its_group.clone()],
+                "case {case}/{elsewhere}: another Region lists its OWN default group and \
+                 nothing the create in {region} materialised, got {parsed:?}"
+            );
+            let summary = summaries(&parsed).first().cloned().unwrap_or(Value::Null);
+            assert_eq!(
+                summary.get("LineageGroupArn").and_then(Value::as_str),
+                Some(
+                    format!(
+                        "arn:aws:sagemaker:{elsewhere}:{ACCOUNT}:lineage-group/{its_group}"
+                    )
+                    .as_str()
+                ),
+                "case {case}/{elsewhere}: the default group's ARN names that Region, \
+                 got {summary:?}"
             );
         }
     }
@@ -225,13 +362,24 @@ async fn a_listing_reports_the_groups_of_the_region_the_request_signed_for() {
     let emulator = Emulator::new();
 
     // Rows: the emulator's default Region, two other Regions a client may sign for, each
-    // holding its OWN groups, plus one Region that holds none.
-    let regions: Vec<(&str, Vec<&str>)> = vec![
-        ("us-east-1", vec![DEFAULT_LINEAGE_GROUP, "east-only-group"]),
-        ("eu-west-2", vec!["eu-group"]),
+    // holding its OWN groups, plus one Region nothing has materialised a group in, which
+    // still holds its default one.
+    let regions: Vec<(&str, Vec<String>)> = vec![
+        (
+            "us-east-1",
+            vec![
+                default_lineage_group_name("us-east-1"),
+                "east-only-group".to_string(),
+            ],
+        ),
+        ("eu-west-2", vec!["eu-group".to_string()]),
         (
             "ap-southeast-1",
-            vec![DEFAULT_LINEAGE_GROUP, "ap-group-a", "ap-group-b"],
+            vec![
+                default_lineage_group_name("ap-southeast-1"),
+                "ap-group-a".to_string(),
+                "ap-group-b".to_string(),
+            ],
         ),
         ("us-west-2", vec![]),
     ];
@@ -249,7 +397,12 @@ async fn a_listing_reports_the_groups_of_the_region_the_request_signed_for() {
             status, 200,
             "case {region}: expected HTTP 200, got {status} with {parsed}"
         );
-        let mut expected: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        let mut expected: Vec<String> = names.clone();
+        // Every Region holds its default group whether or not a row materialised one.
+        let default_name = default_lineage_group_name(region);
+        if !expected.contains(&default_name) {
+            expected.push(default_name);
+        }
         expected.sort();
         assert_eq!(
             listed_names(&parsed),
@@ -284,8 +437,12 @@ async fn a_listing_reports_the_groups_of_the_region_the_request_signed_for() {
     let mut expected: Vec<String> = regions
         .iter()
         .find(|(region, _)| *region == state::DEFAULT_REGION)
-        .map(|(_, names)| names.iter().map(|name| name.to_string()).collect())
+        .map(|(_, names)| names.clone())
         .unwrap_or_default();
+    let default_name = default_lineage_group_name(state::DEFAULT_REGION);
+    if !expected.contains(&default_name) {
+        expected.push(default_name);
+    }
     expected.sort();
     assert_eq!(
         listed_names(&parsed),
@@ -311,7 +468,7 @@ async fn a_summary_replays_the_stored_members() {
         ("a".to_string(), 10),
         ("mixed-Case-group-7".to_string(), 20),
         ("9lives".to_string(), 30),
-        (DEFAULT_LINEAGE_GROUP.to_string(), 35),
+        (default_lineage_group_name("us-east-1"), 35),
         (max_length_name.clone(), 40),
     ];
     for (name, offset) in &rows {
@@ -366,30 +523,36 @@ async fn every_sort_key_and_order_pair_orders_the_result() {
     // Rows: the full cross-product of the `SortLineageGroupsBy` and `SortOrder` members
     // (smithy_query shape=SortLineageGroupsBy / SortOrder), plus the requests that send
     // neither or only one, which must equal the documented defaults. `epsilon-group` and
-    // `zeta-group` share a creation instant, so the name tie-break shows in both orders.
+    // `zeta-group` share a creation instant, so the name tie-break shows in both orders,
+    // and the Region's default group is in every row: the account has held it since its
+    // state began, which is AFTER every seeded fixture instant.
+    let default_group = default_lineage_group_name("us-east-1");
     let by_name_ascending = vec![
-        "alpha-group",
-        "beta-group",
-        "demo-group",
-        "epsilon-group",
-        "zeta-group",
+        "alpha-group".to_string(),
+        "beta-group".to_string(),
+        "demo-group".to_string(),
+        "epsilon-group".to_string(),
+        default_group.clone(),
+        "zeta-group".to_string(),
     ];
-    let by_name_descending: Vec<&str> = by_name_ascending.iter().rev().copied().collect();
+    let by_name_descending: Vec<String> = by_name_ascending.iter().rev().cloned().collect();
     let by_time_ascending = vec![
-        "demo-group",
-        "beta-group",
-        "alpha-group",
-        "epsilon-group",
-        "zeta-group",
+        "demo-group".to_string(),
+        "beta-group".to_string(),
+        "alpha-group".to_string(),
+        "epsilon-group".to_string(),
+        "zeta-group".to_string(),
+        default_group.clone(),
     ];
     let by_time_descending = vec![
-        "epsilon-group",
-        "zeta-group",
-        "alpha-group",
-        "beta-group",
-        "demo-group",
+        default_group,
+        "epsilon-group".to_string(),
+        "zeta-group".to_string(),
+        "alpha-group".to_string(),
+        "beta-group".to_string(),
+        "demo-group".to_string(),
     ];
-    let cases: Vec<(&str, Value, Vec<&str>)> = vec![
+    let cases: Vec<(&str, Value, Vec<String>)> = vec![
         (
             "name-ascending",
             json!({ "SortBy": "Name", "SortOrder": "Ascending" }),
@@ -451,26 +614,30 @@ async fn the_created_after_and_created_before_bounds_select_inclusively() {
     let alpha = created_at("alpha-group");
     let tied = created_at("zeta-group");
 
-    let cases: Vec<(&str, Value, Vec<&str>)> = vec![
+    let cases: Vec<(&str, Value, Vec<String>)> = vec![
         (
             "after-is-inclusive-of-the-bound-itself",
             json!({ "CreatedAfter": alpha, "CreatedBefore": alpha }),
-            vec!["alpha-group"],
+            vec!["alpha-group".to_string()],
         ),
         (
             "before-the-earliest",
             json!({ "CreatedBefore": demo }),
-            vec!["demo-group"],
+            vec!["demo-group".to_string()],
         ),
         (
             "between-two-bounds",
             json!({ "CreatedAfter": demo, "CreatedBefore": alpha }),
-            vec!["demo-group", "beta-group", "alpha-group"],
+            vec![
+                "demo-group".to_string(),
+                "beta-group".to_string(),
+                "alpha-group".to_string(),
+            ],
         ),
         (
             "a-bound-that-admits-the-tied-pair",
             json!({ "CreatedAfter": tied, "CreatedBefore": tied }),
-            vec!["epsilon-group", "zeta-group"],
+            vec!["epsilon-group".to_string(), "zeta-group".to_string()],
         ),
         (
             "bounds-that-exclude-everything-below",
@@ -480,7 +647,9 @@ async fn the_created_after_and_created_before_bounds_select_inclusively() {
         (
             "bounds-that-exclude-everything-above",
             json!({ "CreatedAfter": tied + 1.0 }),
-            vec![],
+            // Every seeded fixture is below the bound; the Region's default group, held
+            // since the account's state began, is above it.
+            vec![default_lineage_group_name("us-east-1")],
         ),
     ];
 
@@ -515,7 +684,10 @@ async fn paging_walks_the_whole_result_exactly_once() {
             fixture_instant(index),
         );
     }
-    let ordered: Vec<String> = (0..SEEDED).map(|index| format!("group-{index:03}")).collect();
+    // In `Name` order the Region's own default group — held since the account's state
+    // began — follows every `group-NNN` of the fixture.
+    let mut ordered: Vec<String> = (0..SEEDED).map(|index| format!("group-{index:03}")).collect();
+    ordered.push(default_lineage_group_name("us-east-1"));
 
     // Rows: the published minimum of `MaxResults` (range 1..100), sizes around the result
     // length, the published maximum, and the request that sends none.
@@ -602,7 +774,8 @@ async fn the_page_is_capped_server_side_even_when_the_caller_asks_for_more() {
             fixture_instant(index as u64),
         );
     }
-    let ordered: Vec<String> = (0..seeded).map(|index| format!("group-{index:03}")).collect();
+    let mut ordered: Vec<String> = (0..seeded).map(|index| format!("group-{index:03}")).collect();
+    ordered.push(default_lineage_group_name("us-east-1"));
 
     // Rows: no `MaxResults` at all (the documented default of 10), the modelled maximum
     // (above the ceiling), the ceiling itself, and a value below it, which still wins

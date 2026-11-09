@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInferenceRecommendationsJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInferenceRecommendationsJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInferenceRecommendationsJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the Inference Recommender jobs `crate::state` holds, materialising
+//! each one's clock-owed move out of `PENDING` first, filtered by the request's name,
+//! status, model, model-package and creation/last-modified bounds, ordered by `SortBy` /
+//! `SortOrder` and paged by `MaxResults` / `NextToken`. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -143,6 +139,15 @@ impl<Eng> ListInferenceRecommendationsJobs<Eng> {
     }
 }
 
+/// `ListInferenceRecommendationsJobsSortBy`'s members this handler orders by name and by
+/// status; the third, `CreationTime`, is the fall-through. Named here so the comparison
+/// does not test a bare string literal — the accepted SET is the generated
+/// `LIST_INFERENCE_RECOMMENDATIONS_JOBS_SORT_BY_VALUES` slice, so the refusal stays in
+/// step with the model.
+const SORT_BY_NAME: &str = "Name";
+/// See [`SORT_BY_NAME`].
+const SORT_BY_STATUS: &str = "Status";
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListInferenceRecommendationsJobs<Eng>
 {
@@ -160,18 +165,201 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInferenceRecommendationsJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInferenceRecommendationsJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInferenceRecommendationsJobs"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // Each enum member set is the generated slice, so a refusal stays in step with the
+        // model rather than with a transcription of it. This operation documents no
+        // default for either, so the service's own are used — the ones every other listing
+        // of this crate applies.
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_BY);
+        if !LIST_INFERENCE_RECOMMENDATIONS_JOBS_SORT_BY_VALUES.contains(&sort_by) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                LIST_INFERENCE_RECOMMENDATIONS_JOBS_SORT_BY_VALUES.join(", ")
+            )));
+        }
+        let sort_order = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_ORDER);
+        if !SORT_ORDER_VALUES.contains(&sort_order) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}; got \"{sort_order}\".",
+                SORT_ORDER_VALUES.join(", ")
+            )));
+        }
+        if let Some(status) = input.status_equals.as_deref() {
+            if !RECOMMENDATION_JOB_STATUS_VALUES.contains(&status) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "StatusEquals must be one of {}; got \"{status}\".",
+                    RECOMMENDATION_JOB_STATUS_VALUES.join(", ")
+                )));
+            }
+        }
+        let descending = sort_order == crate::state::ORDER_DESCENDING;
+
+        let created_after = input.creation_time_after.map(crate::state::timestamp_key);
+        let created_before = input.creation_time_before.map(crate::state::timestamp_key);
+        let modified_after = input
+            .last_modified_time_after
+            .map(crate::state::timestamp_key);
+        let modified_before = input
+            .last_modified_time_before
+            .map(crate::state::timestamp_key);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write a reporting call makes: the moves out of `PENDING` the clock
+        // already owed. Each was due at the job's stored instant whether or not anybody
+        // listed it, so a `StatusEquals` filter selects the status a describe would report
+        // at the same instant rather than a stale one.
+        let settled: Vec<String> = store
+            .inference_recommendations_jobs
+            .values_mut()
+            .filter_map(|job| job.settle_status(now).then(|| job.arn.clone()))
+            .collect();
+
+        let mut matching: Vec<&crate::state::InferenceRecommendationsJob> = store
+            .inference_recommendations_jobs
+            .values()
+            .filter(|job| {
+                // "A string in the job name": a substring of the name, as every other
+                // `NameContains` filter of this service applies it.
+                input
+                    .name_contains
+                    .as_deref()
+                    .is_none_or(|needle| job.name.contains(needle))
+            })
+            .filter(|job| {
+                input
+                    .status_equals
+                    .as_deref()
+                    .is_none_or(|status| job.status == status)
+            })
+            .filter(|job| {
+                // "only jobs that were created for this model" / "for this versioned
+                // model package": both are members of the job's own `InputConfig`, so the
+                // filter reads what the create stored rather than a value derived here.
+                input.model_name_equals.as_deref().is_none_or(|model| {
+                    job.input_config.model_name.as_deref() == Some(model)
+                }) && input
+                    .model_package_version_arn_equals
+                    .as_deref()
+                    .is_none_or(|package| {
+                        job.input_config.model_package_version_arn.as_deref() == Some(package)
+                    })
+            })
+            .filter(|job| {
+                // Every bound of both ranges is inclusive, as `ListModels`'
+                // `CreationTimeAfter` doc states it ("greater than or equal to the
+                // specified time"), so a bound landing on a stored instant still selects
+                // the job carrying it.
+                let created =
+                    crate::state::timestamp_key(crate::state::timestamp(job.creation_time));
+                let modified =
+                    crate::state::timestamp_key(crate::state::timestamp(job.last_modified_time));
+                created_after.is_none_or(|bound| created >= bound)
+                    && created_before.is_none_or(|bound| created <= bound)
+                    && modified_after.is_none_or(|bound| modified >= bound)
+                    && modified_before.is_none_or(|bound| modified <= bound)
+            })
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays `JobName` ascending
+        // in both directions — the name is unique in the account — so two jobs sharing a
+        // sort key keep one order whichever way the page is sorted, and a `NextToken`
+        // resolved against a freshly computed result set lands on the same boundary.
+        matching.sort_by(|left, right| {
+            let by_key = match sort_by {
+                SORT_BY_NAME => left.name.cmp(&right.name),
+                SORT_BY_STATUS => left.status.cmp(&right.status),
+                // The remaining member is `CreationTime`.
+                _ => crate::state::timestamp_key(crate::state::timestamp(left.creation_time)).cmp(
+                    &crate::state::timestamp_key(crate::state::timestamp(right.creation_time)),
+                ),
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.name.cmp(&right.name))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|name| matching.iter().position(|job| job.name == name))
+                    .ok_or_else(|| {
+                        // The crate's one wording for a token it cannot resolve, so every
+                        // paginated listing of this service refuses alike.
+                        crate::scaffolded::Scaffolded::validation(crate::state::STALE_PAGE_TOKEN)
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // This operation documents no `MaxResults` default, so an absent one takes the
+        // service's own page ceiling, which also caps an explicit one: no single call can
+        // serialise the whole store. The token below is emitted whenever anything is left,
+        // so a paginating client walks the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < matching.len() => Some(crate::state::encode_page_token(&last.name)),
+            _ => None,
+        };
+
+        let answer = ListInferenceRecommendationsJobsOutput {
+            inference_recommendations_jobs: page
+                .iter()
+                .map(|job| InferenceRecommendationsJob {
+                    job_name: job.name.clone(),
+                    // `JobDescription` is a required member of the summary, so a job the
+                    // create carried none for reports the empty description (`len 0..128`)
+                    // rather than a value this listing invents.
+                    job_description: job.job_description.clone().unwrap_or_default(),
+                    job_type: job.job_type.clone(),
+                    job_arn: job.arn.clone(),
+                    status: job.status.clone(),
+                    creation_time: crate::state::timestamp(job.creation_time),
+                    completion_time: job.completion_time.map(crate::state::timestamp),
+                    role_arn: job.role_arn.clone(),
+                    last_modified_time: crate::state::timestamp(job.last_modified_time),
+                    failure_reason: job.failure_reason.clone(),
+                    // The three members the summary reports off the job's own
+                    // `InputConfig`, so a listing replays what the create stored.
+                    model_name: job.input_config.model_name.clone(),
+                    sample_payload_url: job
+                        .input_config
+                        .container_config
+                        .as_ref()
+                        .and_then(|container| container.payload_config.as_ref())
+                        .and_then(|payload| payload.sample_payload_url.clone()),
+                    model_package_version_arn: job
+                        .input_config
+                        .model_package_version_arn
+                        .clone(),
+                })
+                .collect(),
+            next_token,
+        };
+        drop(store);
+
+        // Each transition is a state change, so it leaves the same record a create does
+        // rather than happening unobservably on a read path.
+        for arn in &settled {
+            crate::state::record_state_change(Self::NAME, arn, ctx);
+        }
+        Ok(answer)
     }
 }

@@ -422,6 +422,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `TrainingImage`; the two are independent optional members the model cannot make
         // exclusive, so "exactly one" is this operation's own rule.
         //
+        // The component the job's `ExperimentConfig` brings into being, set inside the
+        // store block below and recorded once the guard is released.
+        let tracked_component: Option<String>;
         // The store guard lives in a BLOCK of its own: the job's run is awaited below, and
         // no state guard is ever held across an await.
         {
@@ -434,9 +437,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // classified as a conflict between two members. `AlgorithmName` is modelled
             // `ArnOrName`, so either form resolves to the one stored record and the refusal
             // reports the ARN it resolved to.
+            //
+            // The resolved ARN is what the JOB records: a job keeps the identity of the
+            // algorithm it ran, not the spelling the request happened to use, so the
+            // reference survives the algorithm's deletion and a reader can still re-resolve
+            // it. Applied below, once the borrow of the specification has ended.
+            let mut resolved_algorithm_arn = None;
             if let Some(named) = specification.algorithm_name.as_deref() {
                 let key = crate::state::name_from_arn_or_name(named);
-                if !store.algorithms.contains_key(key) {
+                let Some(algorithm) = store.algorithms.get(key) else {
                     let algorithm_arn = crate::state::resource_arn(
                         &region,
                         crate::state::ALGORITHM_ARN_KIND,
@@ -446,7 +455,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::ALGORITHM_ENTITY,
                         &algorithm_arn,
                     )));
-                }
+                };
+                resolved_algorithm_arn = Some(algorithm.arn.clone());
             }
             match (
                 specification.algorithm_name.is_some(),
@@ -508,6 +518,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `crate::state::retained_hyper_parameters`.
             input.hyper_parameters =
                 crate::state::retained_hyper_parameters(input.hyper_parameters);
+            // The algorithm reference as the service resolved it, so the stored job — and
+            // every reader of it — identifies the algorithm by its ARN.
+            if let (Some(algorithm_arn), Some(specification)) = (
+                resolved_algorithm_arn,
+                input.algorithm_specification.as_mut(),
+            ) {
+                specification.algorithm_name = Some(algorithm_arn);
+            }
             // The service's own defaulting step, applied ONCE here so the record is the
             // materialised job rather than the bare request.
             materialise_job(&mut input);
@@ -550,8 +568,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     request: input.clone(),
                 },
             );
+
+            // "Associates a SageMaker job as a trial component with an experiment and
+            // trial" (`ExperimentConfig`'s doc): the configuration does not merely travel
+            // with the job — the service creates the component for it, so a
+            // source-keyed listing of the job's ARN reports one and the named trial holds
+            // it. Recorded through the ONE writer of a job's component, so every
+            // `ExperimentConfig`-carrying create records it alike.
+            tracked_component = input.experiment_config.as_ref().and_then(|config| {
+                store.record_job_trial_component(
+                    &region,
+                    crate::state::TrackedJob {
+                        kind: crate::state::TRAINING_JOB_TRACKING,
+                        name: &input.training_job_name,
+                        arn: &arn,
+                    },
+                    config,
+                    crate::state::caller_user_context(ctx),
+                    now,
+                )
+            });
         }
 
+        // The component the configuration brought into being is a resource of its own, so
+        // it leaves the same record the job does.
+        if let Some(component_arn) = tracked_component {
+            crate::state::record_state_change(Self::NAME, &component_arn, ctx);
+        }
         // From here on the job exists, so whatever its run does — including this handler
         // never getting to report it — is recorded against the record by the recorder's
         // `Drop`. The outcome is RECORDED, not revealed: the terminal status is owed by the

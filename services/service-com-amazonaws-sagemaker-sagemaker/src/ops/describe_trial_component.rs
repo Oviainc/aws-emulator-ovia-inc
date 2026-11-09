@@ -204,14 +204,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             trial_component_name: Some(component.name.clone()),
             trial_component_arn: Some(component.arn.clone()),
             display_name: Some(component.display_name.clone()),
-            // `Source`/`Sources` carry the ARN of the JOB that produced the component;
-            // one created through this API has no source job, so AWS reports none — and
-            // `Sources`, being the LIST of them, is the empty list rather than a missing
-            // member, as is `Metrics`: metrics are emitted by a running job through
-            // SageMaker Metrics, and nothing has reported any for this component.
-            source: None,
-            sources: Some(Vec::new()),
-            status: component.status.clone(),
+            // `Source`/`Sources` carry the ARN of the JOB that produced the component: the
+            // one the service recorded when the job was submitted with an
+            // `ExperimentConfig`. A component created through `CreateTrialComponent` has
+            // no source job, so AWS reports none — and `Sources`, being the LIST of them,
+            // holds the component's source when it has one, as `Metrics` does not: metrics
+            // are emitted by a running job through SageMaker Metrics, and nothing has
+            // reported any for this component.
+            source: component.source.clone(),
+            sources: Some(component.source.clone().into_iter().collect()),
+            status: store.trial_component_status(component),
             start_time: component.start_time,
             end_time: component.end_time,
             creation_time: Some(crate::state::timestamp(component.creation_time)),

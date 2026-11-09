@@ -806,9 +806,10 @@ fn trial_entity(
             trial_component_arn: Some(component.arn.clone()),
             creation_time: Some(crate::state::timestamp(component.creation_time)),
             created_by: Some(component.created_by.clone()),
-            // The source is the JOB that produced the component; one created through
+            // The source is the JOB that produced the component, recorded when that job
+            // was submitted with an `ExperimentConfig`; one created through
             // `CreateTrialComponent` has none.
-            trial_component_source: None,
+            trial_component_source: component.source.clone(),
         })
         .collect();
     Trial {
@@ -836,13 +837,17 @@ fn trial_entity(
 }
 
 /// The trial component as `SearchRecord$TrialComponent` carries it, exactly as
-/// `DescribeTrialComponent` reports the same record.
-fn trial_component_entity(component: &crate::state::TrialComponent) -> TrialComponent {
+/// `DescribeTrialComponent` reports the same record — its status included, which for a
+/// component the service created for a job is that job's (hence the store).
+fn trial_component_entity(
+    component: &crate::state::TrialComponent,
+    store: &crate::state::ComAmazonawsSagemakerSagemakerState,
+) -> TrialComponent {
     TrialComponent {
         trial_component_name: Some(component.name.clone()),
         trial_component_arn: Some(component.arn.clone()),
         display_name: Some(component.display_name.clone()),
-        status: component.status.clone(),
+        status: store.trial_component_status(component),
         start_time: component.start_time,
         end_time: component.end_time,
         creation_time: Some(crate::state::timestamp(component.creation_time)),
@@ -855,9 +860,11 @@ fn trial_component_entity(component: &crate::state::TrialComponent) -> TrialComp
         metadata_properties: component.metadata_properties.clone(),
         lineage_group_arn: Some(crate::state::lineage_group_arn(&component.region)),
         tags: tag_list(&component.tags),
-        // A source, a metric and a parent trial run of a job; a component created through
-        // `CreateTrialComponent` has no source job and no metric, and its trial
-        // memberships are reported by `ListTrialComponents`.
+        // The source job the service recorded for a component it created for a job; one
+        // created through `CreateTrialComponent` has none.
+        source: component.source.clone(),
+        // A metric and a parent trial run of a job: nothing has reported a metric for this
+        // component, and its trial memberships are reported by `ListTrialComponents`.
         ..Default::default()
     }
 }
@@ -1267,7 +1274,7 @@ fn candidates(
         }
         "ExperimentTrialComponent" => {
             for component in store.trial_components.values() {
-                let entity = trial_component_entity(component);
+                let entity = trial_component_entity(component, store);
                 candidates.push(Candidate {
                     key: component.arn.clone(),
                     document: rendered(TRIAL_COMPONENT_SCHEMA, &entity)?,

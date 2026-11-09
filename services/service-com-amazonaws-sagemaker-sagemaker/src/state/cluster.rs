@@ -293,6 +293,33 @@ pub const CLUSTER_STATUS_FAILED: &str = "Failed";
 /// See [`MODEL_QUOTA`]; bounds the cluster store, and is released by `DeleteCluster`.
 pub const CLUSTER_QUOTA: usize = 1_000;
 
+/// How every node operation states that the cluster it was asked to change cannot take
+/// the change: the cluster's ARN and the status it is in.
+///
+/// Stated once here so `BatchAddClusterNodes`, `BatchDeleteClusterNodes`,
+/// `BatchReplaceClusterNodes` and `AttachClusterNodeVolume` cannot word the one fact
+/// differently, and in the shape `DeleteCluster` words its own conflict in. None of these
+/// operations models an error for it — each models `ResourceNotFound`, which a cluster a
+/// describe still reports is not — so they answer the 400 `ValidationException` the
+/// refusal channel provides.
+pub fn cluster_rejects_node_change(arn: &str, status: &str) -> String {
+    format!("Cluster \"{arn}\" cannot be changed while it is in {status} status.")
+}
+
+/// The node provisioning mode a HyperPod cluster runs in when the create named none.
+///
+/// `DescribeCluster` reports "the mode used for provisioning nodes in the cluster"
+/// (`DescribeClusterResponse$NodeProvisioningMode`) for every cluster, not only for one
+/// whose create spelled the member out: a cluster always provisions its nodes in SOME
+/// mode. The modelled `ClusterNodeProvisioningMode` enum carries exactly ONE member, so
+/// that member is the mode the service reports, and it is read from the generated value
+/// slice rather than transcribed, so this stays in step with the model if the enum grows.
+pub fn default_node_provisioning_mode() -> Option<String> {
+    crate::ops::types::CLUSTER_NODE_PROVISIONING_MODE_VALUES
+        .first()
+        .map(|mode| (*mode).to_string())
+}
+
 /// `ClusterSortBy`'s documented default ("The field by which to sort results. The
 /// default value is `CREATION_TIME`." — `ListClusters`' member doc). `ListClusters` has
 /// its own default and its own enum tokens, which is why it does not share
@@ -381,6 +408,19 @@ impl Cluster {
     /// `Deleting` and on its way out.
     pub fn is_deleting(&self) -> bool {
         self.removal_due_at.is_some()
+    }
+
+    /// Whether this cluster takes a change to its NODES.
+    ///
+    /// A cluster whose deletion has begun does not: its instances are going away with it,
+    /// so adding, deleting, replacing or attaching storage to one is work the service
+    /// cannot do, and the node operations refuse it with
+    /// [`cluster_rejects_node_change`] rather than reporting a change they did not make.
+    /// Every other status does — the nodes a cluster holds are reported from the instant
+    /// it reaches `InService`, and a request against a cluster that is still provisioning
+    /// is answered against the state a describe reports at the same instant.
+    pub fn accepts_node_changes(&self) -> bool {
+        !self.is_deleting()
     }
 
     /// Whether the deletion the clock owed has completed, i.e. the cluster is gone.
@@ -510,7 +550,64 @@ impl Cluster {
         }
         arns
     }
+
+    /// Whether the node `logical_id` names runs in an instance group this cluster declared
+    /// as its Slurm CONTROLLER, i.e. a node the Slurm workload manager runs on.
+    ///
+    /// Such a node cannot be taken out from under the workload manager: both
+    /// `BatchDeleteClusterNodes$NodeIds` ("you cannot remove instances that are configured
+    /// as Slurm controller nodes") and `BatchReplaceClusterNodes$NodeIds` ("you cannot
+    /// replace instances that are configured as Slurm controller nodes") state it, so the
+    /// membership is read off the group's own `SlurmConfig$NodeType` here, once, for both.
+    ///
+    /// `false` for a node of a group that declares no `SlurmConfig` — an EKS-orchestrated
+    /// cluster has no Slurm controller at all — and for an identifier this cluster holds no
+    /// node for, which its own not-found answer reports.
+    pub fn is_slurm_controller_node(&self, logical_id: &str) -> bool {
+        let Some(node) = self.nodes.get(logical_id) else {
+            return false;
+        };
+        self.instance_groups
+            .iter()
+            .filter(|group| group.instance_group_name == node.instance_group_name)
+            .any(|group| {
+                group
+                    .slurm_config
+                    .as_ref()
+                    .is_some_and(|slurm| slurm.node_type == SLURM_NODE_TYPE_CONTROLLER)
+            })
+    }
 }
+
+/// The `ClusterSlurmNodeType` member naming the instance group the Slurm workload manager
+/// itself runs in. Named once here so the two node operations that refuse a change to such
+/// a node do not compare a bare string literal.
+pub const SLURM_NODE_TYPE_CONTROLLER: &str = "Controller";
+
+/// How `BatchDeleteClusterNodes` states that an identifier names a Slurm controller node,
+/// in the model's own words for the constraint
+/// (`BatchDeleteClusterNodes$NodeIds`: "For SageMaker HyperPod clusters using the Slurm
+/// workload manager, you cannot remove instances that are configured as Slurm controller
+/// nodes.").
+pub const SLURM_CONTROLLER_NOT_REMOVABLE: &str =
+    "You cannot remove instances that are configured as Slurm controller nodes.";
+
+/// How `BatchReplaceClusterNodes` states the same constraint, in that operation's own
+/// words for it (`BatchReplaceClusterNodes$NodeIds`: "you cannot replace instances that
+/// are configured as Slurm controller nodes").
+pub const SLURM_CONTROLLER_NOT_REPLACEABLE: &str =
+    "You cannot replace instances that are configured as Slurm controller nodes.";
+
+/// How `BatchDeleteClusterNodes` refuses a request NONE of whose identifiers names a
+/// deletable node: the sentence names the three conditions an identifier has to satisfy,
+/// which are exactly the three per-node failures the call can report — the node exists, it
+/// is not one of the Slurm controller group's, and its state admits deletion.
+///
+/// Entirely fixed text: the request's own identifiers are not named, because the refusal
+/// is about the request as a whole rather than about any one of them.
+pub const ALL_NODES_FAILED_VALIDATION: &str =
+    "All provided nodes failed validation. Please ensure the nodes exist, are not part of \
+     the controller group for the Slurm cluster, and are in a removable state.";
 
 /// The instance types an instance group admits: the one its specification names, or the
 /// list its `InstanceRequirements` names.

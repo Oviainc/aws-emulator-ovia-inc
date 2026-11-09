@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 
 use service_com_amazonaws_sagemaker_sagemaker::state::{
-    DEFAULT_LINEAGE_GROUP, LINEAGE_GROUP_QUOTA,
+    default_lineage_group_name, LINEAGE_GROUP_QUOTA,
 };
 
 use super::inference_deployment_lifecycle::{
@@ -60,7 +60,7 @@ async fn describe_lineage_group_reports_the_stored_record() {
     let cases: Vec<(&str, String, Duration)> = vec![
         (
             "us-east-1",
-            DEFAULT_LINEAGE_GROUP.to_string(),
+            default_lineage_group_name("us-east-1"),
             Duration::from_secs(1_700_000_000),
         ),
         (
@@ -165,17 +165,17 @@ async fn describe_lineage_group_reports_the_stored_record() {
     );
 }
 
-/// RULE: a lineage group belongs to the Region the entity that materialised it was created
-/// in — `state::lineage_group_arn`'s own doc calls it "the ARN of the Region's default
-/// lineage group" — so a caller signing for another Region does not find it, and each
-/// Region's group carries its own ARN and its own stored instants.
+/// RULE: a lineage group is REGIONAL — `state::lineage_group_arn`'s own doc calls it "the
+/// ARN of the Region's default lineage group" — so every Region answers its OWN default
+/// group, with its own ARN, while a group an entity materialised in one Region is not
+/// reported in another.
 #[tokio::test]
 async fn a_lineage_group_belongs_to_the_region_it_was_materialised_in() {
     let emulator = Emulator::new();
     let home = "us-east-1";
     let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     assert!(
-        materialise(&emulator, home, DEFAULT_LINEAGE_GROUP, at).is_some(),
+        materialise(&emulator, home, "home-only-group", at).is_some(),
         "the home Region must materialise the group"
     );
 
@@ -187,7 +187,7 @@ async fn a_lineage_group_belongs_to_the_region_it_was_materialised_in() {
             .call_in(
                 region,
                 "DescribeLineageGroup",
-                &json!({ "LineageGroupName": DEFAULT_LINEAGE_GROUP }),
+                &json!({ "LineageGroupName": "home-only-group" }),
             )
             .await;
         assert_eq!(
@@ -200,13 +200,23 @@ async fn a_lineage_group_belongs_to_the_region_it_was_materialised_in() {
             "ResourceNotFound",
             "case {region}: error code, got {body:?}"
         );
+
+        // That Region's OWN default group is reported, carrying that Region's ARN: the
+        // account holds one per Region.
+        let its_name = default_lineage_group_name(region);
+        let its_own = describe_ok(&emulator, region, &its_name).await;
+        assert_eq!(
+            str_field(&its_own, "LineageGroupArn"),
+            format!("arn:aws:sagemaker:{region}:{ACCOUNT}:lineage-group/{its_name}"),
+            "case {region}: the default group's ARN must name that Region, got {its_own:?}"
+        );
     }
 
-    // The home Region still reports it, with its own ARN.
-    let described = describe_ok(&emulator, home, DEFAULT_LINEAGE_GROUP).await;
+    // The home Region still reports its own group, with its own ARN.
+    let described = describe_ok(&emulator, home, "home-only-group").await;
     assert_eq!(
         str_field(&described, "LineageGroupArn"),
-        format!("arn:aws:sagemaker:{home}:{ACCOUNT}:lineage-group/{DEFAULT_LINEAGE_GROUP}"),
+        format!("arn:aws:sagemaker:{home}:{ACCOUNT}:lineage-group/home-only-group"),
         "case {home}: LineageGroupArn, got {described:?}"
     );
 
@@ -215,16 +225,16 @@ async fn a_lineage_group_belongs_to_the_region_it_was_materialised_in() {
     let elsewhere = "eu-west-2";
     let later = at + Duration::from_secs(3_600);
     assert_eq!(
-        materialise(&emulator, elsewhere, DEFAULT_LINEAGE_GROUP, later),
+        materialise(&emulator, elsewhere, "home-only-group", later),
         Some(format!(
-            "arn:aws:sagemaker:{elsewhere}:{ACCOUNT}:lineage-group/{DEFAULT_LINEAGE_GROUP}"
+            "arn:aws:sagemaker:{elsewhere}:{ACCOUNT}:lineage-group/home-only-group"
         )),
         "case {elsewhere}: a second Region materialises its own group"
     );
-    let there = describe_ok(&emulator, elsewhere, DEFAULT_LINEAGE_GROUP).await;
+    let there = describe_ok(&emulator, elsewhere, "home-only-group").await;
     assert_eq!(
         str_field(&there, "LineageGroupArn"),
-        format!("arn:aws:sagemaker:{elsewhere}:{ACCOUNT}:lineage-group/{DEFAULT_LINEAGE_GROUP}"),
+        format!("arn:aws:sagemaker:{elsewhere}:{ACCOUNT}:lineage-group/home-only-group"),
         "case {elsewhere}: LineageGroupArn, got {there:?}"
     );
     assert!(
@@ -232,7 +242,7 @@ async fn a_lineage_group_belongs_to_the_region_it_was_materialised_in() {
         "case {elsewhere}: CreationTime must be this Region's own instant, got {there:?}"
     );
     assert_eq!(
-        describe_ok(&emulator, home, DEFAULT_LINEAGE_GROUP).await,
+        describe_ok(&emulator, home, "home-only-group").await,
         described,
         "case {home}: another Region's group must not change this one's record"
     );
@@ -359,20 +369,21 @@ async fn creating_a_lineage_entity_makes_the_default_group_reportable() {
     ];
 
     for (case, region, target, arn_member, kind, body, second_body) in cases {
-        // A fresh emulator per row: the group must be materialised by THIS create, in the
-        // region this request signed for.
+        // A fresh emulator per row: the Region already holds its default group — the
+        // account has one per Region — and the create below puts its entity in it.
         let emulator = Emulator::new();
-        let (absent_status, absent) = emulator
+        let group_name = default_lineage_group_name(region);
+        let (before_status, before) = emulator
             .call_in(
                 region,
                 "DescribeLineageGroup",
-                &json!({ "LineageGroupName": DEFAULT_LINEAGE_GROUP }),
+                &json!({ "LineageGroupName": &group_name }),
             )
             .await;
         assert_eq!(
-            absent_status, 400,
-            "case {case}: before any lineage entity the group must be absent, \
-             got {absent_status} with {absent}"
+            before_status, 200,
+            "case {case}: the Region's default group must be reportable from the start, \
+             got {before_status} with {before}"
         );
 
         let (created_status, created) = emulator.call_in(region, target, &body).await;
@@ -386,15 +397,15 @@ async fn creating_a_lineage_entity_makes_the_default_group_reportable() {
             "case {case}: {arn_member}, got {created:?}"
         );
 
-        let described = describe_ok(&emulator, region, DEFAULT_LINEAGE_GROUP).await;
+        let described = describe_ok(&emulator, region, &group_name).await;
         assert_eq!(
             str_field(&described, "LineageGroupName"),
-            DEFAULT_LINEAGE_GROUP,
+            group_name,
             "case {case}: LineageGroupName, got {described:?}"
         );
         assert_eq!(
             str_field(&described, "LineageGroupArn"),
-            format!("arn:aws:sagemaker:{region}:{ACCOUNT}:lineage-group/{DEFAULT_LINEAGE_GROUP}"),
+            format!("arn:aws:sagemaker:{region}:{ACCOUNT}:lineage-group/{group_name}"),
             "case {case}: LineageGroupArn, got {described:?}"
         );
         assert!(
@@ -410,7 +421,7 @@ async fn creating_a_lineage_entity_makes_the_default_group_reportable() {
             "case {case}: the second {target}, got {second_status} with {second}"
         );
         assert_eq!(
-            describe_ok(&emulator, region, DEFAULT_LINEAGE_GROUP).await,
+            describe_ok(&emulator, region, &group_name).await,
             described,
             "case {case}: a second lineage entity must leave the group's record unchanged"
         );
@@ -435,16 +446,16 @@ async fn creating_a_lineage_entity_makes_the_default_group_reportable() {
     }
 }
 
-/// RULE: a lineage group the store does not hold is refused with HTTP 400
-/// `ResourceNotFound` naming the ARN the requested name would have — never a 200 with
-/// empty members, and never the scaffold's 501.
+/// RULE: a lineage group neither the account holds by default nor anything has
+/// materialised is refused with HTTP 400 `ResourceNotFound` naming the ARN the requested
+/// name would have — never a 200 with empty members, and never the scaffold's 501.
 #[tokio::test]
 async fn an_unmaterialised_lineage_group_is_refused_with_resource_not_found() {
     let emulator = Emulator::new();
 
-    // On a store that has materialised nothing, EVERY name is absent — including the
-    // name AWS gives the group it materialises for an account that has lineage entities.
-    for name in [DEFAULT_LINEAGE_GROUP, "absent", "a"] {
+    // On a store that has materialised nothing, every name is absent EXCEPT the Region's
+    // default group, which the account holds with no call creating it.
+    for name in ["absent", "a"] {
         let (status, body) = emulator
             .call("DescribeLineageGroup", &json!({ "LineageGroupName": name }))
             .await;
@@ -464,6 +475,17 @@ async fn an_unmaterialised_lineage_group_is_refused_with_resource_not_found() {
         );
     }
 
+    // The Region's default group answers on that same store, so the refusals above are
+    // about the name and not about an empty store.
+    let default_name = default_lineage_group_name("us-east-1");
+    let default_group = describe_ok(&emulator, "us-east-1", &default_name).await;
+    assert_eq!(
+        str_field(&default_group, "LineageGroupName"),
+        default_name,
+        "case empty-store/default: the account's own group must be reported, \
+         got {default_group:?}"
+    );
+
     // With one group materialised, every name that is not EXACTLY it is still absent:
     // the lookup is by the whole name, case-sensitively, not by prefix or suffix.
     let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
@@ -480,7 +502,6 @@ async fn an_unmaterialised_lineage_group_is_refused_with_resource_not_found() {
         "lineage",
         "lineage-alpha2",
         "alpha",
-        DEFAULT_LINEAGE_GROUP,
     ] {
         let (status, body) = emulator
             .call("DescribeLineageGroup", &json!({ "LineageGroupName": name }))
@@ -526,7 +547,10 @@ async fn a_name_outside_the_modelled_constraints_is_refused_at_the_boundary() {
         ("slash", "my/group".to_string()),
         (
             "an-arn-rather-than-a-name",
-            format!("arn:aws:sagemaker:us-east-1:{ACCOUNT}:lineage-group/{DEFAULT_LINEAGE_GROUP}"),
+            format!(
+                "arn:aws:sagemaker:us-east-1:{ACCOUNT}:lineage-group/{}",
+                default_lineage_group_name("us-east-1")
+            ),
         ),
     ];
 

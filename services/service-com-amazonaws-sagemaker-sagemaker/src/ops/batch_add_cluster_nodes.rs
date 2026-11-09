@@ -239,6 +239,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for node in cluster.nodes.values_mut() {
             node.settle_status(now);
         }
+        // A cluster being torn down takes no node change: its instances are going away
+        // with it, so nothing is added and the request is refused for the cluster's
+        // status rather than answered with nodes that cannot come up.
+        if !cluster.accepts_node_changes() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::cluster_rejects_node_change(&cluster.arn, &cluster.status),
+            ));
+        }
 
         // `ClientToken` is the operation's idempotency token: a token this cluster
         // remembers answers what the first call carrying it answered, and adds nothing.

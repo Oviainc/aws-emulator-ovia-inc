@@ -191,7 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // left exactly as it is, and the create is never refused for the lineage-group
         // bound: this call is about the context.
         let materialised_group =
-            store.ensure_lineage_group(&region, crate::state::DEFAULT_LINEAGE_GROUP, now);
+            store.ensure_lineage_group(
+                &region,
+                &crate::state::default_lineage_group_name(&region),
+                now,
+            );
         store.contexts.insert(
             arn.clone(),
             crate::state::Context {

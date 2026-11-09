@@ -296,6 +296,88 @@ async fn every_minted_cluster_id_is_distinct() {
     }
 }
 
+/// RULE: `DescribeCluster` reports the mode the cluster provisions its nodes in for every
+/// cluster — the one the create named, and otherwise the service's own mode, which is the
+/// one member the modelled `ClusterNodeProvisioningMode` enum carries.
+#[tokio::test]
+async fn a_cluster_reports_the_node_provisioning_mode_it_runs_in() {
+    // The modelled value set, read from the model rather than transcribed
+    // (`smithy_query(query="shape",shape="ClusterNodeProvisioningMode")`, mirrored by the
+    // generated `types::CLUSTER_NODE_PROVISIONING_MODE_VALUES`).
+    const MODES: &[&str] = &["Continuous"];
+    let default_mode = MODES.first().copied().expect("one modelled mode");
+
+    // Rows differ along what the rule generalises over: whether the create names the mode
+    // at all, the orchestrator (none, EKS, Slurm), the number of instance groups and the
+    // Region signed for.
+    let rows: Vec<(&str, &str, Value, Option<&str>)> = vec![
+        ("no mode, no orchestrator", "us-east-1", one_group_body(), None),
+        (
+            "no mode, an EKS orchestrator",
+            "eu-west-2",
+            json!({
+                "InstanceGroups": [instance_group("workers", 1, "ml.m5.large", json!({}))],
+                "Orchestrator": { "Eks": { "ClusterArn": EKS_CLUSTER_ARN } },
+            }),
+            None,
+        ),
+        (
+            "no mode, a Slurm orchestrator and two groups",
+            "ap-southeast-1",
+            json!({
+                "InstanceGroups": [
+                    instance_group("controller", 1, "ml.m5.large", json!({})),
+                    instance_group("compute", 2, "ml.c5.large", json!({})),
+                ],
+                "Orchestrator": { "Slurm": { "SlurmConfigStrategy": "Managed" } },
+            }),
+            None,
+        ),
+        (
+            "the mode named explicitly",
+            "us-east-1",
+            json!({
+                "InstanceGroups": [instance_group("workers", 1, "ml.m5.large", json!({}))],
+                "Orchestrator": { "Eks": { "ClusterArn": EKS_CLUSTER_ARN } },
+                "NodeProvisioningMode": "Continuous",
+            }),
+            Some("Continuous"),
+        ),
+    ];
+
+    for (index, (case, region, body, named_mode)) in rows.iter().enumerate() {
+        let emulator = Emulator::new();
+        let name = format!("provisioning-{index}");
+        let (status, created) = emulator
+            .call_in(region, "CreateCluster", &named(&name, body))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateCluster, got {status} with {created}"
+        );
+
+        // Reported while the cluster is still provisioning and once it is `InService`:
+        // the mode is a property of the cluster, not of its status.
+        for stage in ["while provisioning", "once in service"] {
+            let (status, described) = emulator
+                .call_in(region, "DescribeCluster", &json!({ "ClusterName": &name }))
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} {stage}: DescribeCluster, got {status} with {described}"
+            );
+            assert_eq!(
+                described.get("NodeProvisioningMode").and_then(Value::as_str),
+                Some(named_mode.unwrap_or(default_mode)),
+                "case {case:?} {stage}: NodeProvisioningMode, got {described:?}"
+            );
+            if stage == "while provisioning" {
+                tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
+            }
+        }
+    }
+}
+
 /// One row of the create/describe round trip: a request, the members the reader must
 /// report, and the members it must leave out.
 struct RoundTrip {
@@ -319,6 +401,10 @@ async fn describe_cluster_replays_what_create_cluster_stored() {
             request: one_group_body(),
             expected: vec![
                 ("ClusterStatus", json!("InService")),
+                // The create named no `NodeProvisioningMode`, so the cluster runs in — and
+                // reports — the service's own mode (the one member the modelled
+                // `ClusterNodeProvisioningMode` carries).
+                ("NodeProvisioningMode", json!("Continuous")),
                 ("InstanceGroups.0.InstanceGroupName", json!("workers")),
                 ("InstanceGroups.0.InstanceType", json!("ml.m5.large")),
                 ("InstanceGroups.0.ExecutionRole", json!(EXECUTION_ROLE)),
@@ -333,7 +419,6 @@ async fn describe_cluster_replays_what_create_cluster_stored() {
                 "AutoScaling",
                 "ClusterRole",
                 "NodeRecovery",
-                "NodeProvisioningMode",
                 "TieredStorageConfig",
                 "RestrictedInstanceGroups",
                 "RestrictedInstanceGroupsConfig",

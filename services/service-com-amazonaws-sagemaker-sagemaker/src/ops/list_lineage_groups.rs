@@ -200,16 +200,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
 
         // A read: the guard is taken, the matching records are copied out and NOTHING is
-        // written back, so a listing never materialises a group. A lineage group enters
-        // the store only through `ensure_lineage_group`, which the lineage-entity creates
-        // call (see `crate::state`), so an account whose entities put nothing in a Region
-        // has nothing to list there.
+        // written back, so a listing never materialises a group. Beside the groups a
+        // lineage entity put in the store through `ensure_lineage_group` (see
+        // `crate::state`), the Region's DEFAULT group is always reported: SageMaker gives
+        // every account one lineage group per Region, with no call creating it, so a
+        // Region whose entities have put nothing in it still has that one group.
         let store = state.lock();
+        let groups = store.lineage_groups_in(&region);
         // Each record's creation key is computed ONCE, here, and carried beside the record:
         // the bounds below and the sort further down both read it, rather than converting
         // the stored instant again on every comparison.
-        let mut matching: Vec<((i64, u32), &crate::state::LineageGroup)> = store
-            .lineage_groups_in(&region)
+        let mut matching: Vec<((i64, u32), &crate::state::LineageGroup)> = groups
+            .iter()
             .filter_map(|group| {
                 // Both bounds are inclusive, so a timestamp copied straight out of a
                 // prior response's `CreationTime` still selects that group.

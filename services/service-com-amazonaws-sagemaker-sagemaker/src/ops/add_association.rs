@@ -3,8 +3,9 @@
 //! @op AddAssociation
 //! IMPLEMENTED: records the lineage edge `SourceArn` -> `DestinationArn` in
 //! `crate::state`, after refusing an ARN that names no lineage entity this service holds
-//! with the modelled `ResourceNotFound`, and an edge from an entity to itself with a
-//! `ValidationException`. This is the ONLY file to touch for this operation.
+//! with the modelled `ResourceNotFound`. An edge whose two ends name the SAME entity is
+//! recorded like any other: neither member carries a "must differ" constraint. This is
+//! the ONLY file to touch for this operation.
 //!
 //! The SCAFFOLDED marker line this file used to carry is gone, because the stub census
 //! (the grep over those lines) must not count this operation as unwritten any more.
@@ -176,21 +177,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // An association is an EDGE between two lineage entities: every modelled edge
-        // type ("the source contributed to the destination", "the source generated the
-        // destination", ...) relates two DIFFERENT entities. An entity pointing at itself
-        // is a request-level defect rather than a missing resource, and this operation
-        // models no error for it, so it answers the 400 `ValidationException` the
-        // framework's refusal channel gives. It is settled BEFORE either end is resolved,
-        // so the answer does not turn on whether the entity named twice happens to exist.
-        if input.source_arn == input.destination_arn {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "The source and the destination of an association must be different \
-                 entities; both were \"{}\".",
-                input.source_arn
-            )));
-        }
-
+        // NO inequality rule between the two ends: `SourceArn` and `DestinationArn` carry
+        // no "must differ" constraint, this operation models only `ResourceLimitExceeded`
+        // and `ResourceNotFound`, and SageMaker records a self-referencing edge like any
+        // other — so an entity named at both ends is a legal lineage write, answered with
+        // both ARNs, rather than a refusal.
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 

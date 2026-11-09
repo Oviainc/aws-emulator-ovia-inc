@@ -540,18 +540,42 @@ pub const NO_INFERENCE_BENCHMARK_REASON: &str =
     "This emulator runs no model inference container and generates no benchmark traffic, so \
      no load test was performed and no inference recommendation was measured.";
 
-/// How every operation that cannot resolve the Inference Recommender job a request names
-/// states it: the entity as the service words it, the `JobName` the request carried, and
+/// How the recommendation surfaces OVER a job state that the job itself is not there:
+/// the entity as the service words it, the `JobName` the request carried, and
 /// `was not found.`
 ///
 /// A recommendation job is addressed by NAME only
 /// (`RecommendationJobName`/`InferenceRecommendationsJobName`), so the identifier is the
 /// one the caller sent — unquoted — and a consumer correlates the refusal with its own
-/// input. Stated once here so the reader and the recommendation surfaces over a job cannot
-/// word the same fact differently.
+/// input. Stated once here so the surfaces that report over a job cannot word the same
+/// fact differently. The job's own READER words it differently, and says so:
+/// [`inference_recommendations_job_not_found_for_account`].
 pub fn inference_recommendations_job_not_found(job_name: &str) -> String {
     format!("Inference recommendations job {job_name} was not found.")
 }
+
+/// How `DescribeInferenceRecommendationsJob` states that the job it was asked to report
+/// is not there: the same entity and the requested `JobName`, qualified by the ACCOUNT
+/// the lookup was made in — a recommendation job is an account-scoped resource, and the
+/// reader of the job itself names the account it looked in.
+///
+/// The account is the emulator's own canonical account id, the one every ARN this service
+/// mints carries, so the sentence names the account the caller's request really resolved
+/// against rather than one taken from the request.
+pub fn inference_recommendations_job_not_found_for_account(job_name: &str) -> String {
+    format!(
+        "Inference recommendations job {job_name} for {} not found.",
+        ::emulator_server::emulator_account_id()
+    )
+}
+
+/// How `GetScalingConfigurationRecommendation` states that a request picked no
+/// recommendation within the job it resolved: neither `RecommendationId` nor
+/// `EndpointName` was given, so there is nothing to compute a scaling configuration from,
+/// and the sentence names both members the caller may supply instead.
+pub const NEITHER_RECOMMENDATION_ID_NOR_ENDPOINT_NAME: &str =
+    "Neither RecommendationId or EndpointName were provided in the input. Please provide a \
+     RecommendationId or EndpointName in the request.";
 
 /// An Inference Recommender job created by `CreateInferenceRecommendationsJob`, as
 /// `DescribeInferenceRecommendationsJob` replays it.

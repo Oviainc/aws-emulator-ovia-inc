@@ -236,12 +236,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (Some(trial), _, _) => Some(store.trial_component_keys_in_trial(trial)),
             (_, Some(experiment), _) => Some(store.trial_component_keys_in_experiment(experiment)),
             // "only components that have the specified source ARN": a component's source
-            // is the JOB that produced it, and a job is the only thing that gives a
-            // component one. Every component this store holds came from
-            // `CreateTrialComponent`, which models no source — so, as
-            // `DescribeTrialComponent` reports no `Source` for them, none carries a source
-            // ARN this filter could match.
-            (_, _, Some(_)) => Some(::std::collections::BTreeSet::new()),
+            // is the JOB that produced it, which the service records when a job is
+            // submitted with an `ExperimentConfig`
+            // (`state::record_job_trial_component`). A component `CreateTrialComponent`
+            // made carries no source, so no source ARN selects it.
+            (_, _, Some(source_arn)) => Some(store.trial_component_keys_with_source(source_arn)),
             _ => None,
         };
 
@@ -334,11 +333,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         trial_component_name: Some(component.name.clone()),
                         trial_component_arn: Some(component.arn.clone()),
                         display_name: Some(component.display_name.clone()),
-                        // The source job of a component a job produced. One created
-                        // through this API has none, which is what
+                        // The source job of a component the service created FOR a job. One
+                        // created through `CreateTrialComponent` has none, which is what
                         // `DescribeTrialComponent` reports for the same component.
-                        trial_component_source: None,
-                        status: component.status.clone(),
+                        trial_component_source: component.source.clone(),
+                        status: store.trial_component_status(component),
                         start_time: component.start_time,
                         end_time: component.end_time,
                         creation_time: Some(crate::state::timestamp(component.creation_time)),

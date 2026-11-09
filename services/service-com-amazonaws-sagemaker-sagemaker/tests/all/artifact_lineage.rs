@@ -22,8 +22,12 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The canonical account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
-/// The lineage group every artifact belongs to (`state::DEFAULT_LINEAGE_GROUP`).
-const DEFAULT_LINEAGE_GROUP: &str = "sagemaker-default-lineage-group";
+/// The name of the lineage group every artifact of a Region belongs to, read from the
+/// crate's own derivation so the suite pins the name the SERVICE computes for it rather
+/// than a second spelling of it.
+fn default_lineage_group(region: &str) -> String {
+    service_com_amazonaws_sagemaker_sagemaker::state::default_lineage_group_name(region)
+}
 
 /// One emulator: the shared engine plus the SageMaker service mounted on the router.
 struct Emulator {
@@ -462,7 +466,8 @@ async fn describe_artifact_replays_exactly_what_create_artifact_stored() {
             described.get("LineageGroupArn").and_then(Value::as_str),
             Some(
                 format!(
-                    "arn:aws:sagemaker:us-east-1:{ACCOUNT}:lineage-group/{DEFAULT_LINEAGE_GROUP}"
+                    "arn:aws:sagemaker:us-east-1:{ACCOUNT}:lineage-group/{}",
+                    default_lineage_group("us-east-1")
                 )
                 .as_str()
             ),

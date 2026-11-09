@@ -247,10 +247,17 @@ fn statement(effect: &str, actions: Value, resources: Value) -> Value {
     })
 }
 
+/// The name of the Region's one default lineage group, which every lineage entity belongs
+/// to, read from the crate's own derivation of it.
+fn lineage_group_name() -> String {
+    service_com_amazonaws_sagemaker_sagemaker::state::default_lineage_group_name(REGION)
+}
+
 /// The ARN of the Region's one default lineage group, which every lineage entity belongs to.
 fn lineage_group_arn() -> String {
     format!(
-        "arn:aws:sagemaker:{REGION}:{ACCOUNT}:lineage-group/sagemaker-default-lineage-group"
+        "arn:aws:sagemaker:{REGION}:{ACCOUNT}:lineage-group/{}",
+        lineage_group_name()
     )
 }
 
@@ -326,12 +333,12 @@ async fn a_lineage_read_is_refused_to_a_principal_iam_does_not_allow() {
         },
         Read {
             operation: "DescribeLineageGroup",
-            body: json!({ "LineageGroupName": "sagemaker-default-lineage-group" }),
+            body: json!({ "LineageGroupName": lineage_group_name() }),
             resource: lineage_group_arn(),
         },
         Read {
             operation: "GetLineageGroupPolicy",
-            body: json!({ "LineageGroupName": "sagemaker-default-lineage-group" }),
+            body: json!({ "LineageGroupName": lineage_group_name() }),
             resource: lineage_group_arn(),
         },
         // A listing names no resource of its own, so it is judged against the resource IAM

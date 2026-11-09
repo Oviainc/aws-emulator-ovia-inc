@@ -292,16 +292,25 @@ pub const DEFAULT_PRESIGNED_URL_EXPIRES_IN_SECONDS: i32 = 300;
 /// the longest.
 pub const DEFAULT_PRESIGNED_URL_SESSION_SECONDS: i32 = 1800;
 
-/// The lineage group every lineage entity this account creates belongs to.
+/// The name of the lineage group every lineage entity of this account in `region`
+/// belongs to.
 ///
-/// SageMaker ML Lineage Tracking gives an account one lineage group per Region,
-/// `sagemaker-default-lineage-group`, and reports its ARN as the `LineageGroupArn` of
-/// each entity in it; this emulator models no other lineage group, so every artifact
-/// reports this one. It is also the group the lineage-entity creates materialise through
+/// SageMaker ML Lineage Tracking gives an ACCOUNT one lineage group per Region, with no
+/// call creating it, and reports its ARN as the `LineageGroupArn` of each entity in it.
+/// Its name is that account and that Region: `sagemaker-<region>-<account>`, computed
+/// here from the Region the request signed for and the account every ARN this service
+/// mints carries, so two Regions have two groups and neither name is a literal this
+/// crate chose. The form satisfies `ExperimentEntityName`
+/// (`^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,119}$`), so the group is addressable by name wherever
+/// a reader takes one.
+///
+/// This is also the group the lineage-entity creates materialise through
 /// [`ComAmazonawsSagemakerSagemakerState::ensure_lineage_group`], so that
 /// `DescribeLineageGroup` reports the group those entities are in and
 /// `ListLineageGroups` lists it.
-pub const DEFAULT_LINEAGE_GROUP: &str = "sagemaker-default-lineage-group";
+pub fn default_lineage_group_name(region: &str) -> String {
+    format!("sagemaker-{region}-{}", ::emulator_server::emulator_account_id())
+}
 
 /// See [`MODEL_QUOTA`]. `DeleteHyperParameterTuningJob` is still a stub, so no call
 /// releases a tuning-job record yet; the bound is what keeps the store finite in the
@@ -2537,6 +2546,29 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// [`MODEL_PACKAGE_CLIENT_TOKEN_HISTORY`], so a caller registering package after
     /// package cannot grow the store without end.
     pub model_package_client_tokens: Vec<SpentModelPackageToken>,
+    /// The instant this account's SageMaker state came into being, i.e. when the store was
+    /// constructed.
+    ///
+    /// What the resources an ACCOUNT holds without any call creating them report as their
+    /// creation instant — today the Region's default lineage group
+    /// ([`Self::default_lineage_group`]), which SageMaker gives every account and which no
+    /// operation creates. Read on every report of such a resource rather than taken from
+    /// the clock there, so the value is stable across reads.
+    pub store_created_at: StoreEpoch,
+}
+
+/// The instant a [`ComAmazonawsSagemakerSagemakerState`] came into being.
+///
+/// Its own type because the store is `Default`-constructed by the engine: a bare
+/// `SystemTime` field would default to the UNIX epoch, which is not when this account's
+/// state began.
+#[derive(Debug, Clone, Copy)]
+pub struct StoreEpoch(pub SystemTime);
+
+impl Default for StoreEpoch {
+    fn default() -> Self {
+        Self(SystemTime::now())
+    }
 }
 
 /// One `CreateModelPackage` idempotency token this account has spent: the token, the
@@ -3685,10 +3717,10 @@ pub fn named_lineage_group_arn(region: &str, name: &str) -> String {
     resource_arn(region, LINEAGE_GROUP_KIND, name)
 }
 
-/// The ARN of the Region's default lineage group (see [`DEFAULT_LINEAGE_GROUP`]), as
+/// The ARN of the Region's default lineage group (see [`default_lineage_group_name`]), as
 /// `LineageGroupArn` carries it for an entity that belongs to no other group.
 pub fn lineage_group_arn(region: &str) -> String {
-    named_lineage_group_arn(region, DEFAULT_LINEAGE_GROUP)
+    named_lineage_group_arn(region, &default_lineage_group_name(region))
 }
 
 /// Mint the opaque id an ARN carries for a resource whose ARN does NOT contain the

@@ -663,10 +663,11 @@ async fn an_unknown_partner_app_is_refused_with_the_fixed_sentence() {
 // Inference Recommender jobs: addressed by name, reported by name.
 // ---------------------------------------------------------------------------
 
-/// RULE: every operation that cannot resolve the Inference Recommender job a request names
-/// refuses it with the modelled `ResourceNotFound` and the message
-/// `Inference recommendations job <JobName> was not found.` — the name the request carried,
-/// unquoted.
+/// RULE: an operation that cannot resolve the Inference Recommender job a request names
+/// refuses it with the modelled `ResourceNotFound`, naming the job by the name the request
+/// carried, unquoted — the job's own reader qualifying it by the account it looked in
+/// (`Inference recommendations job <JobName> for <account> not found.`) and a surface that
+/// reports OVER a job stating it as `Inference recommendations job <JobName> was not found.`
 #[tokio::test]
 async fn an_unknown_recommendations_job_is_refused_naming_the_requested_name() {
     let emulator = Emulator::new();
@@ -684,10 +685,11 @@ async fn an_unknown_recommendations_job_is_refused_naming_the_requested_name() {
     ];
 
     for (case, name) in rows {
-        let operations: [(&str, Value); 2] = [
+        let operations: [(&str, Value, String); 2] = [
             (
                 "DescribeInferenceRecommendationsJob",
                 json!({ "JobName": name }),
+                format!("Inference recommendations job {name} for {ACCOUNT} not found."),
             ),
             (
                 "GetScalingConfigurationRecommendation",
@@ -695,12 +697,12 @@ async fn an_unknown_recommendations_job_is_refused_naming_the_requested_name() {
                     "InferenceRecommendationsJobName": name,
                     "EndpointName": "a-benchmarked-endpoint",
                 }),
+                format!("Inference recommendations job {name} was not found."),
             ),
         ];
-        for (operation, body) in operations {
+        for (operation, body, expected) in operations {
             let case = format!("{case}/{operation}");
             let (status, refused) = emulator.call(operation, &body).await;
-            let expected = format!("Inference recommendations job {name} was not found.");
             assert_refusal(&case, status, &refused, "ResourceNotFound", &expected);
         }
     }

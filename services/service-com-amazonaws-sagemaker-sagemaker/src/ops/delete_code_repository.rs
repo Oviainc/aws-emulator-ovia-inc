@@ -144,8 +144,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
+        let region = crate::state::request_region(ctx);
         let arn = crate::state::resource_arn(
-            &crate::state::request_region(ctx),
+            &region,
             crate::state::CODE_REPOSITORY_ARN_KIND,
             &input.code_repository_name,
         );

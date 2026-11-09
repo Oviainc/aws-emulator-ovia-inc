@@ -228,10 +228,18 @@ async fn describe_context_replays_exactly_what_create_context_stored() {
             );
         }
         // Every lineage entity belongs to its Region's one default lineage group
-        // (`crate::state::DEFAULT_LINEAGE_GROUP`), whose ARN this member carries.
+        // (`crate::state::default_lineage_group_name`), whose ARN this member carries.
         assert_eq!(
             described.get("LineageGroupArn").and_then(Value::as_str),
-            Some(format!("arn:aws:sagemaker:us-east-1:{ACCOUNT}:lineage-group/sagemaker-default-lineage-group").as_str()),
+            Some(
+                format!(
+                    "arn:aws:sagemaker:us-east-1:{ACCOUNT}:lineage-group/{}",
+                    service_com_amazonaws_sagemaker_sagemaker::state::default_lineage_group_name(
+                        "us-east-1"
+                    )
+                )
+                .as_str()
+            ),
             "case {case}: LineageGroupArn must name the Region's default lineage group, \
              got {described:?}"
         );
@@ -829,7 +837,8 @@ async fn a_context_name_is_unique_per_region_not_across_regions() {
         assert_eq!(
             str_field(&body, "LineageGroupArn"),
             format!(
-                "arn:aws:sagemaker:{region}:{ACCOUNT}:lineage-group/sagemaker-default-lineage-group"
+                "arn:aws:sagemaker:{region}:{ACCOUNT}:lineage-group/{}",
+                service_com_amazonaws_sagemaker_sagemaker::state::default_lineage_group_name(region)
             ),
             "case region={region}: LineageGroupArn must name that Region's group, got {body:?}"
         );

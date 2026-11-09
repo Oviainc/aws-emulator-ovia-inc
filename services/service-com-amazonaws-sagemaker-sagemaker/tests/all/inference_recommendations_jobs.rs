@@ -750,3 +750,227 @@ async fn a_job_naming_a_resource_the_account_does_not_hold_is_refused() {
         );
     }
 }
+
+/// The `JobName`s `ListInferenceRecommendationsJobs` reports for `filter`, in the order
+/// the listing answered them.
+async fn listed(emulator: &Emulator, filter: &Value) -> Vec<String> {
+    let listed = emulator
+        .ok("ListInferenceRecommendationsJobs", filter)
+        .await;
+    listed
+        .get("InferenceRecommendationsJobs")
+        .and_then(Value::as_array)
+        .map(|jobs| {
+            jobs.iter()
+                .filter_map(|job| job.get("JobName").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// RULE: `ListInferenceRecommendationsJobs` reports the jobs this account holds — the
+/// members each one's create stored, and the status the clock owes it — selected by the
+/// request's filters, ordered by `SortBy`/`SortOrder` and paged by `MaxResults`/`NextToken`.
+#[tokio::test]
+async fn the_listing_reports_the_jobs_the_account_holds() {
+    let emulator = Emulator::new();
+    seed_model(&emulator, "us-east-1").await;
+
+    // Three jobs, created in a known order, so a creation-time sort is unambiguous: the
+    // names sort the OPPOSITE way, which is what makes the two sort keys distinguishable.
+    let created = ["zulu-job", "mike-job", "alpha-job"];
+    for name in created {
+        emulator
+            .ok("CreateInferenceRecommendationsJob", &minimal_create(name))
+            .await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Every job reports what its create stored, and the terminal status the clock owes it
+    // once the span is past — the same status its own reader reports.
+    tokio::time::sleep(PAST_JOB_END_DUE).await;
+    let page = emulator
+        .ok("ListInferenceRecommendationsJobs", &json!({}))
+        .await;
+    let summary = page
+        .get("InferenceRecommendationsJobs")
+        .and_then(Value::as_array)
+        .and_then(|jobs| {
+            jobs.iter()
+                .find(|job| job.get("JobName").and_then(Value::as_str) == Some("mike-job"))
+                .cloned()
+        })
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        summary.get("JobArn").and_then(Value::as_str),
+        Some(
+            format!("arn:aws:sagemaker:us-east-1:{ACCOUNT}:inference-recommendations-job/mike-job")
+                .as_str()
+        ),
+        "JobArn, got {summary:?}"
+    );
+    assert_eq!(
+        summary.get("JobType").and_then(Value::as_str),
+        Some("Default"),
+        "JobType, got {summary:?}"
+    );
+    assert_eq!(
+        summary.get("RoleArn").and_then(Value::as_str),
+        Some(ROLE_ARN),
+        "RoleArn, got {summary:?}"
+    );
+    assert_eq!(
+        summary.get("ModelName").and_then(Value::as_str),
+        Some(MODEL),
+        "ModelName must be the one the job's InputConfig named, got {summary:?}"
+    );
+    let (_, described) = describe(&emulator, "mike-job").await;
+    assert_eq!(
+        summary.get("Status").and_then(Value::as_str),
+        described.get("Status").and_then(Value::as_str),
+        "the listing and the reader must report one status, got {summary:?} and {described:?}"
+    );
+
+    // Rows differ along what the rule generalises over: the sort key, the sort order, each
+    // filter the request may carry, and the page size.
+    let status = described
+        .get("Status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let cases: Vec<(&str, Value, Vec<&str>)> = vec![
+        (
+            "by name ascending",
+            json!({ "SortBy": "Name", "SortOrder": "Ascending" }),
+            vec!["alpha-job", "mike-job", "zulu-job"],
+        ),
+        (
+            "by name descending",
+            json!({ "SortBy": "Name", "SortOrder": "Descending" }),
+            vec!["zulu-job", "mike-job", "alpha-job"],
+        ),
+        (
+            "by creation time ascending",
+            json!({ "SortBy": "CreationTime", "SortOrder": "Ascending" }),
+            vec!["zulu-job", "mike-job", "alpha-job"],
+        ),
+        (
+            "name contains",
+            json!({ "SortBy": "Name", "SortOrder": "Ascending", "NameContains": "ike" }),
+            vec!["mike-job"],
+        ),
+        (
+            "the status every job reached",
+            json!({ "SortBy": "Name", "SortOrder": "Ascending", "StatusEquals": status }),
+            vec!["alpha-job", "mike-job", "zulu-job"],
+        ),
+        (
+            "a status none of them is in",
+            json!({ "StatusEquals": "STOPPED" }),
+            vec![],
+        ),
+        (
+            "the model every job named",
+            json!({ "SortBy": "Name", "SortOrder": "Ascending", "ModelNameEquals": MODEL }),
+            vec!["alpha-job", "mike-job", "zulu-job"],
+        ),
+        (
+            "a model none of them named",
+            json!({ "ModelNameEquals": "another-model" }),
+            vec![],
+        ),
+        (
+            "a model package none of them named",
+            json!({ "ModelPackageVersionArnEquals": MODEL_PACKAGE_VERSION_ARN }),
+            vec![],
+        ),
+        (
+            "created before the first of them",
+            json!({ "CreationTimeBefore": 1.0 }),
+            vec![],
+        ),
+    ];
+    for (case, filter, expected) in cases {
+        assert_eq!(
+            listed(&emulator, &filter).await,
+            expected
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<String>>(),
+            "case {case}: the listing's selection and order"
+        );
+    }
+
+    // `MaxResults` caps the page and `NextToken` resumes immediately after it, so a
+    // paginating client walks the whole ordered result exactly once.
+    let mut seen: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut body = json!({ "SortBy": "Name", "SortOrder": "Ascending", "MaxResults": 2 });
+        if let Some(ref value) = token {
+            body["NextToken"] = Value::String(value.clone());
+        }
+        let page = emulator
+            .ok("ListInferenceRecommendationsJobs", &body)
+            .await;
+        let names: Vec<String> = page
+            .get("InferenceRecommendationsJobs")
+            .and_then(Value::as_array)
+            .map(|jobs| {
+                jobs.iter()
+                    .filter_map(|job| {
+                        job.get("JobName").and_then(Value::as_str).map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            names.len() <= 2,
+            "a page must never exceed MaxResults, got {names:?}"
+        );
+        seen.extend(names);
+        assert!(
+            seen.len() <= created.len(),
+            "paging did not terminate, saw {seen:?}"
+        );
+        match page.get("NextToken").and_then(Value::as_str) {
+            Some(next) => token = Some(next.to_string()),
+            None => break,
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![
+            "alpha-job".to_string(),
+            "mike-job".to_string(),
+            "zulu-job".to_string()
+        ],
+        "paging must walk the whole result exactly once"
+    );
+
+    // A request outside the enums or naming no page boundary is refused, never served
+    // with a silently re-sorted or restarted listing.
+    for (case, body) in [
+        ("sort-by outside the enum", json!({ "SortBy": "Nmae" })),
+        ("sort-order outside the enum", json!({ "SortOrder": "ascending" })),
+        ("status outside the enum", json!({ "StatusEquals": "Completed" })),
+        ("a token naming no boundary", json!({ "NextToken": "not-a-token" })),
+    ] {
+        let (status, refused) = emulator
+            .call("ListInferenceRecommendationsJobs", &body)
+            .await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (400, "ValidationException"),
+            "case {case}: expected 400 ValidationException, got {status} with {refused}"
+        );
+    }
+
+    // An account that holds no job lists none rather than refusing.
+    let empty = Emulator::new();
+    assert_eq!(
+        listed(&empty, &json!({})).await,
+        Vec::<String>::new(),
+        "an account with no recommendation job must list none"
+    );
+}

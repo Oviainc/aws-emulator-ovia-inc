@@ -337,7 +337,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 data_capture_config: input.data_capture_config,
                 transform_resources: input.transform_resources,
                 data_processing: input.data_processing,
-                experiment_config: input.experiment_config,
+                experiment_config: input.experiment_config.clone(),
                 tags: input.tags.unwrap_or_default(),
                 creation_time: now,
                 last_modified_time: now,
@@ -345,8 +345,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ends_at: now + crate::state::TRANSFORM_JOB_SETTLES_AFTER,
             },
         );
+        // "Associates a SageMaker job as a trial component with an experiment and trial"
+        // (`ExperimentConfig`'s doc): the service creates the component for the job, so a
+        // source-keyed listing of this job's ARN reports one and the named trial holds it.
+        // Recorded through the ONE writer of a job's component, so every
+        // `ExperimentConfig`-carrying create records it alike.
+        let tracked_component = input.experiment_config.as_ref().and_then(|config| {
+            store.record_job_trial_component(
+                &region,
+                crate::state::TrackedJob {
+                    kind: crate::state::TRANSFORM_JOB_TRACKING,
+                    name: &input.transform_job_name,
+                    arn: &arn,
+                },
+                config,
+                crate::state::caller_user_context(ctx),
+                now,
+            )
+        });
         drop(store);
 
+        // The component the configuration brought into being is a resource of its own, so
+        // it leaves the same record the job does.
+        if let Some(component_arn) = tracked_component {
+            crate::state::record_state_change(Self::NAME, &component_arn, ctx);
+        }
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(CreateTransformJobOutput {
             transform_job_arn: arn,

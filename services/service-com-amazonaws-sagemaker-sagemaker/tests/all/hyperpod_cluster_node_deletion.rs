@@ -233,12 +233,12 @@ async fn a_call_drops_exactly_the_nodes_its_identifiers_name() {
 /// coded for the instance (`InstanceIdNotFound`, `InstanceIdInUse`) and a logical id's for
 /// the node (`NodeLogicalIdNotFound`, `NodeIdInUse`, `InvalidNodeStatus`) — and leaves
 /// every other identifier of the same batch deleted: a batch operation reports per-entry
-/// outcomes instead of failing whole.
+/// outcomes instead of failing whole, as long as SOME identifier of it could be deleted.
 #[tokio::test]
 async fn an_identifier_that_names_no_deletable_node_is_reported_in_the_failure_list() {
     let emulator = Emulator::new();
     let cluster = "delete-nodes-failures";
-    let nodes = in_service_cluster(&emulator, cluster, &[("pool", "ml.c5.large", 4)])
+    let nodes = in_service_cluster(&emulator, cluster, &[("pool", "ml.c5.large", 6)])
         .await
         .1;
 
@@ -304,14 +304,15 @@ async fn an_identifier_that_names_no_deletable_node_is_reported_in_the_failure_l
             }]),
         ),
         (
-            // The SAME node as the row above, named by the other identifier kind: the
-            // condition is one node's, so only the code's vocabulary changes with it.
+            // The SAME node as the row above, named by the other identifier kind, beside a
+            // deletable one: the condition is one node's, so only the code's vocabulary
+            // changes with the identifier that named it.
             "mid-change-node-named-by-its-instance-id",
             json!({
                 "ClusterName": cluster,
-                "NodeIds": [nodes[3].instance_id.clone()],
+                "NodeIds": [nodes[3].instance_id.clone(), nodes[4].instance_id.clone()],
             }),
-            vec![],
+            vec![nodes[4].instance_id.clone()],
             vec![],
             json!([{
                 "NodeId": nodes[3].instance_id.clone(),
@@ -323,9 +324,12 @@ async fn an_identifier_that_names_no_deletable_node_is_reported_in_the_failure_l
         (
             // A shorter instance id (`^i-[a-f0-9]{8}(?:[a-f0-9]{9})?$` admits 8 or 17 hex
             // characters), so the code does not follow the identifier's length.
-            "every-identifier-unknown",
-            json!({ "ClusterName": cluster, "NodeIds": ["i-abcdef01"] }),
-            vec![],
+            "unknown-short-instance-id-beside-a-known-one",
+            json!({
+                "ClusterName": cluster,
+                "NodeIds": ["i-abcdef01", nodes[5].instance_id.clone()],
+            }),
+            vec![nodes[5].instance_id.clone()],
             vec![],
             json!([{
                 "NodeId": "i-abcdef01",
@@ -418,20 +422,69 @@ async fn an_identifier_that_names_no_deletable_node_is_reported_in_the_failure_l
         "NodeLogicalId",
     );
     let refused = emulator
-        .ok(
+        .call(
             "BatchDeleteClusterNodes",
             &json!({ "ClusterName": cluster, "NodeLogicalIds": [provisioning.clone()] }),
         )
         .await;
+    // Nothing in the batch could be deleted, so the whole request is refused rather than
+    // answered with a 200 whose every entry is a failure.
     assert_eq!(
-        refused.get("FailedNodeLogicalIds"),
+        (refused.0, error_code(&refused.1).as_str()),
+        (400, "ValidationException"),
+        "case provisioning: a node that has not finished coming up cannot be deleted, got \
+         {refused:?}"
+    );
+    assert_eq!(
+        message(&refused.1),
+        "All provided nodes failed validation. Please ensure the nodes exist, are not part \
+         of the controller group for the Slurm cluster, and are in a removable state.",
+        "case provisioning: refusal message, got {refused:?}"
+    );
+    // And once it has come up, the same identifier deletes — while a node added beside it
+    // and still coming up is reported as a per-node failure, because this batch has an
+    // identifier it CAN delete.
+    tokio::time::sleep(PAST_SETTLE_DUE).await;
+    let added_again = emulator
+        .ok(
+            "BatchAddClusterNodes",
+            &json!({
+                "ClusterName": cluster,
+                "NodesToAdd": [{ "InstanceGroupName": "pool", "IncrementTargetCountBy": 1 }],
+            }),
+        )
+        .await;
+    let still_coming_up = str_field(
+        added_again
+            .get("Successful")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.first())
+            .unwrap_or_else(|| panic!("expected an added node in {added_again}")),
+        "NodeLogicalId",
+    );
+    let answered = emulator
+        .ok(
+            "BatchDeleteClusterNodes",
+            &json!({
+                "ClusterName": cluster,
+                "NodeLogicalIds": [provisioning.clone(), still_coming_up.clone()],
+            }),
+        )
+        .await;
+    assert_eq!(
+        string_list(&answered, "SuccessfulNodeLogicalIds").unwrap_or_default(),
+        vec![provisioning],
+        "case provisioning-settled: a node that has come up deletes, got {answered}"
+    );
+    assert_eq!(
+        answered.get("FailedNodeLogicalIds"),
         Some(&json!([{
-            "NodeLogicalId": provisioning,
+            "NodeLogicalId": still_coming_up,
             "Code": "InvalidNodeStatus",
             "Message": INVALID_STATUS,
         }])),
-        "case provisioning: a node that has not finished coming up cannot be deleted, got \
-         {refused}"
+        "case provisioning-beside-a-deletable-node: the node still coming up is reported \
+         as a per-node failure, got {answered}"
     );
 }
 
@@ -516,5 +569,270 @@ async fn a_request_that_cannot_name_the_nodes_to_delete_is_refused() {
         after,
         vec![node],
         "case refusals: a refused request deletes nothing, got {after:?}"
+    );
+}
+
+/// RULE: a node the Slurm workload manager runs on cannot be taken out from under it, so
+/// it is never deletable: a batch naming only such nodes is refused as a whole — none of
+/// its identifiers could be deleted — while a batch that also names a deletable node
+/// deletes that one and reports the controller node in the failure list.
+#[tokio::test]
+async fn a_slurm_controller_node_cannot_be_deleted() {
+    let emulator = Emulator::new();
+    let cluster = "slurm-controller-cluster";
+    let created = emulator
+        .ok(
+            "CreateCluster",
+            &json!({
+                "ClusterName": cluster,
+                "Orchestrator": { "Slurm": { "SlurmConfigStrategy": "Managed" } },
+                "InstanceGroups": [
+                    {
+                        "InstanceGroupName": "controller",
+                        "InstanceCount": 1,
+                        "InstanceType": "ml.m5.large",
+                        "ExecutionRole": format!("arn:aws:iam::{ACCOUNT}:role/hyperpod-controller"),
+                        // `ClusterSlurmNodeType`'s members are Controller | Login | Compute
+                        // (smithy_query shape=ClusterSlurmNodeType).
+                        "SlurmConfig": { "NodeType": "Controller" },
+                    },
+                    {
+                        "InstanceGroupName": "compute",
+                        "InstanceCount": 2,
+                        "InstanceType": "ml.c5.large",
+                        "ExecutionRole": format!("arn:aws:iam::{ACCOUNT}:role/hyperpod-compute"),
+                        "SlurmConfig": { "NodeType": "Compute" },
+                    },
+                ],
+            }),
+        )
+        .await;
+    assert!(
+        !str_field(&created, "ClusterArn").is_empty(),
+        "CreateCluster must mint an ARN, got {created:?}"
+    );
+    tokio::time::sleep(PAST_SETTLE_DUE).await;
+    let nodes = nodes_of(&emulator, cluster).await;
+    let controller = nodes
+        .iter()
+        .find(|node| node.instance_group == "controller")
+        .cloned()
+        .unwrap_or_else(|| panic!("expected a controller node, got {nodes:?}"));
+    let compute: Vec<Node> = nodes
+        .iter()
+        .filter(|node| node.instance_group == "compute")
+        .cloned()
+        .collect();
+
+    // Rows differ along how the controller node is named — by its instance id and by its
+    // logical id. Each batch names ONLY controller nodes, so none of its identifiers could
+    // be deleted and the request is refused as a whole.
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "by instance id",
+            json!({ "NodeIds": [controller.instance_id.clone()] }),
+        ),
+        (
+            "by logical id",
+            json!({ "NodeLogicalIds": [controller.logical_id.clone()] }),
+        ),
+    ];
+    for (case, extra) in &rows {
+        let mut body = json!({ "ClusterName": cluster });
+        for (member, value) in extra.as_object().expect("a JSON object of members") {
+            body[member] = value.clone();
+        }
+        let (status, refused) = emulator.call("BatchDeleteClusterNodes", &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a controller node must not be deletable, got {status} \
+             with {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ValidationException",
+            "case {case:?}: error code, got {refused:?}"
+        );
+        assert_eq!(
+            message(&refused),
+            "All provided nodes failed validation. Please ensure the nodes exist, are not \
+             part of the controller group for the Slurm cluster, and are in a removable \
+             state.",
+            "case {case:?}: refusal message, got {refused:?}"
+        );
+        // Nothing was deleted.
+        assert_eq!(
+            nodes_of(&emulator, cluster).await,
+            nodes,
+            "case {case:?}: a refused batch must delete nothing"
+        );
+    }
+
+    // A batch that also names a deletable node deletes that one and reports the controller
+    // node beside it: the per-node failure is what a batch operation answers whenever
+    // SOME identifier of it could be deleted.
+    let mixed = emulator
+        .ok(
+            "BatchDeleteClusterNodes",
+            &json!({
+                "ClusterName": cluster,
+                "NodeIds": [compute[0].instance_id.clone(), controller.instance_id.clone()],
+            }),
+        )
+        .await;
+    assert_eq!(
+        mixed.get("Successful"),
+        Some(&json!([compute[0].instance_id.clone()])),
+        "case mixed: the deletable node must be deleted, got {mixed:?}"
+    );
+    assert_eq!(
+        mixed.get("Failed"),
+        Some(&json!([{
+            "NodeId": controller.instance_id.clone(),
+            "Code": "InvalidInstanceStatus",
+            "Message": "You cannot remove instances that are configured as Slurm controller \
+                        nodes.",
+        }])),
+        "case mixed: the controller node must be reported as a per-node failure, \
+         got {mixed:?}"
+    );
+    assert!(
+        nodes_of(&emulator, cluster)
+            .await
+            .iter()
+            .any(|node| node.logical_id == controller.logical_id),
+        "case mixed: the controller node must still be held"
+    );
+
+    // A replacement of a controller node is refused in that operation's own words.
+    let (status, refused) = emulator
+        .call(
+            "BatchReplaceClusterNodes",
+            &json!({ "ClusterName": cluster, "NodeIds": [controller.instance_id.clone()] }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&refused).as_str()),
+        (400, "ValidationException"),
+        "case replace: a controller node must not be replaceable, got {status} with {refused}"
+    );
+    assert_eq!(
+        message(&refused),
+        "You cannot replace instances that are configured as Slurm controller nodes.",
+        "case replace: refusal message, got {refused:?}"
+    );
+
+    // The compute node the mixed batch did not delete still deletes, so the refusals above
+    // are about the controller node and not about the operation.
+    let remaining: Vec<String> = nodes_of(&emulator, cluster)
+        .await
+        .iter()
+        .filter(|node| node.instance_group == "compute")
+        .map(|node| node.instance_id.clone())
+        .collect();
+    let served = emulator
+        .ok(
+            "BatchDeleteClusterNodes",
+            &json!({ "ClusterName": cluster, "NodeIds": remaining.clone() }),
+        )
+        .await;
+    assert_eq!(
+        served
+            .get("Successful")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(remaining.len()),
+        "case compute: the non-controller nodes must delete, got {served:?}"
+    );
+}
+
+/// RULE: a cluster whose deletion has begun takes no node change, so every node operation
+/// against it is refused — naming the cluster and the status it is in — and the nodes it
+/// still holds are untouched.
+#[tokio::test]
+async fn a_cluster_being_deleted_takes_no_node_change() {
+    let emulator = Emulator::new();
+    let cluster = "deleting-cluster";
+    let (arn, nodes) = in_service_cluster(&emulator, cluster, &[("pool", "ml.c5.large", 2)]).await;
+    let node = nodes[0].clone();
+
+    let deleted = emulator
+        .ok("DeleteCluster", &json!({ "ClusterName": cluster }))
+        .await;
+    assert_eq!(
+        str_field(&deleted, "ClusterArn"),
+        arn,
+        "DeleteCluster must answer the cluster's ARN, got {deleted:?}"
+    );
+    // The cluster is observably `Deleting` until the clock completes the teardown, so the
+    // rows below run against a cluster every reader still reports.
+    let described = emulator
+        .ok("DescribeCluster", &json!({ "ClusterName": cluster }))
+        .await;
+    assert_eq!(
+        str_field(&described, "ClusterStatus"),
+        "Deleting",
+        "the cluster must be observably Deleting, got {described:?}"
+    );
+    let expected_message = format!("Cluster \"{arn}\" cannot be changed while it is in Deleting status.");
+
+    // Rows: every node operation that CHANGES the cluster's nodes, each naming the cluster
+    // by name and by ARN.
+    let requests: Vec<(&str, &str, Value)> = vec![
+        (
+            "a delete by instance id",
+            "BatchDeleteClusterNodes",
+            json!({ "NodeIds": [node.instance_id.clone()] }),
+        ),
+        (
+            "a delete by logical id",
+            "BatchDeleteClusterNodes",
+            json!({ "NodeLogicalIds": [node.logical_id.clone()] }),
+        ),
+        (
+            "a replacement",
+            "BatchReplaceClusterNodes",
+            json!({ "NodeIds": [node.instance_id.clone()] }),
+        ),
+        (
+            "an addition",
+            "BatchAddClusterNodes",
+            json!({
+                "NodesToAdd": [{ "InstanceGroupName": "pool", "IncrementTargetCountBy": 1 }],
+            }),
+        ),
+    ];
+    for (label, target, extra) in &requests {
+        for identifier in [cluster.to_string(), arn.clone()] {
+            let case = format!("{label} naming {identifier}");
+            let mut body = json!({ "ClusterName": identifier });
+            for (member, value) in extra.as_object().expect("a JSON object of members") {
+                body[member] = value.clone();
+            }
+            let (status, refused) = emulator.call(target, &body).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a cluster being deleted must refuse the change, got \
+                 {status} with {refused}"
+            );
+            assert_eq!(
+                error_code(&refused),
+                "ValidationException",
+                "case {case:?}: error code, got {refused:?}"
+            );
+            assert_eq!(
+                message(&refused),
+                expected_message,
+                "case {case:?}: the refusal must name the cluster and its status, \
+                 got {refused:?}"
+            );
+        }
+    }
+
+    // Nothing changed: the cluster still holds both nodes it held.
+    let after = nodes_of(&emulator, cluster).await;
+    assert_eq!(
+        after, nodes,
+        "case deleting: a refused node change must leave every node as it was, got {after:?}"
     );
 }

@@ -15,7 +15,8 @@
 //! * an end naming no stored entity — an ARN nothing created, an entity kind whose
 //!   create is not implemented, another Region, account or partition, a deleted entity —
 //!   is refused with the modelled `ResourceNotFound` and stores nothing;
-//! * an entity cannot be the source and the destination of one association;
+//! * an entity CAN be the source and the destination of one association: neither end
+//!   carries a "must differ" constraint, so a self-loop is recorded like any other edge;
 //! * `AssociationType`, when sent, is one member of the modelled `AssociationEdgeType`
 //!   enum; and
 //! * the pair is the association's identity, so adding it twice leaves ONE edge.
@@ -529,13 +530,14 @@ async fn an_end_that_names_no_stored_lineage_entity_is_refused_with_resource_not
 }
 
 #[tokio::test]
-async fn an_entity_cannot_be_the_source_and_the_destination_of_one_association() {
+async fn an_entity_can_be_the_source_and_the_destination_of_one_association() {
     let emulator = Emulator::new();
 
-    // Rows differ along the entity kind and along whether the entity exists at all: the
-    // rule is about the two ends being the same entity, so it holds either way.
-    let mut cases: Vec<(String, String)> = Vec::new();
-    for kind in IMPLEMENTED_KINDS {
+    // Rows differ along the entity kind of the self-referencing end, and along the
+    // `AssociationType` the request carries (absent, plus a modelled member cycled over
+    // the kinds): the two ends carry no "must differ" constraint, so a self-loop is an
+    // edge like any other — whatever kind it is between, and whatever type it carries.
+    for (row, kind) in IMPLEMENTED_KINDS.iter().enumerate() {
         let arn = create_entity(
             &emulator,
             "us-east-1",
@@ -543,18 +545,55 @@ async fn an_entity_cannot_be_the_source_and_the_destination_of_one_association()
             &format!("self{}", kind.replace('-', "")),
         )
         .await;
-        cases.push((format!("stored-{kind}"), arn));
-    }
-    cases.push((
-        "never-created-artifact".to_string(),
-        unused_arn("us-east-1", "artifact", &"5".repeat(32)),
-    ));
-    cases.push((
-        "kind-with-no-create".to_string(),
-        unused_arn("us-east-1", "context", "selfcontext"),
-    ));
+        let association_type = if row == 0 {
+            None
+        } else {
+            Some(EDGE_TYPES[row % EDGE_TYPES.len()])
+        };
+        let case = format!("stored-{kind}/type={association_type:?}");
 
-    for (case, arn) in cases {
+        let mut body = json!({ "SourceArn": arn, "DestinationArn": arn });
+        if let Some(association_type) = association_type {
+            body["AssociationType"] = json!(association_type);
+        }
+        let (status, parsed) = emulator.call("AddAssociation", &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a self-referencing edge must be recorded, got {status} with \
+             {parsed}"
+        );
+        assert_eq!(
+            (
+                parsed.get("SourceArn").and_then(Value::as_str),
+                parsed.get("DestinationArn").and_then(Value::as_str),
+            ),
+            (Some(arn.as_str()), Some(arn.as_str())),
+            "case {case:?}: both ends must answer the entity's own ARN, got {parsed:?}"
+        );
+
+        // The edge is really stored: the only reader of one this crate implements
+        // releases it with a 200, and finds nothing the second time.
+        let (status, released) = delete_association(&emulator, "us-east-1", &arn, &arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the stored self-association must be releasable, got {status} \
+             with {released}"
+        );
+        assert_no_association(&emulator, "us-east-1", &arn, &arn, &case).await;
+    }
+
+    // An end that names no stored entity is still refused, self-referencing or not: the
+    // rule that was removed is the inequality one, not the existence one.
+    for (case, arn) in [
+        (
+            "never-created-artifact",
+            unused_arn("us-east-1", "artifact", &"5".repeat(32)),
+        ),
+        (
+            "never-created-context",
+            unused_arn("us-east-1", "context", "uncreatedcontext"),
+        ),
+    ] {
         let (status, parsed) = emulator
             .call(
                 "AddAssociation",
@@ -563,15 +602,20 @@ async fn an_entity_cannot_be_the_source_and_the_destination_of_one_association()
             .await;
         assert_eq!(
             status, 400,
-            "case {case:?}: an entity associated with itself must be refused, got {status} \
+            "case {case:?}: an end naming no stored entity must be refused, got {status} \
              with {parsed}"
         );
         assert_eq!(
             error_code(&parsed),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got {parsed:?}"
+            "ResourceNotFound",
+            "case {case:?}: expected ResourceNotFound, got {parsed:?}"
         );
-        assert_no_association(&emulator, "us-east-1", &arn, &arn, &case).await;
+        assert_eq!(
+            message(&parsed),
+            format!("Resource '{arn}' does not exist."),
+            "case {case:?}: refusal message, got {parsed:?}"
+        );
+        assert_no_association(&emulator, "us-east-1", &arn, &arn, case).await;
     }
 }
 

@@ -254,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stopping_condition: input.stopping_condition,
                 environment: input.environment,
                 network_config: input.network_config,
-                experiment_config: input.experiment_config,
+                experiment_config: input.experiment_config.clone(),
                 tags: input.tags.unwrap_or_default(),
                 // AWS returns an accepted processing job in `InProgress`, so the move out
                 // of it is owed by the clock rather than taken on this call.
@@ -266,8 +266,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ends_at: now + crate::state::PROCESSING_JOB_ENDS_AFTER,
             },
         );
+        // "Associates a SageMaker job as a trial component with an experiment and trial"
+        // (`ExperimentConfig`'s doc): the service creates the component for the job, so a
+        // source-keyed listing of this job's ARN reports one and the named trial holds it.
+        // Recorded through the ONE writer of a job's component, so every
+        // `ExperimentConfig`-carrying create records it alike.
+        let tracked_component = input.experiment_config.as_ref().and_then(|config| {
+            store.record_job_trial_component(
+                &region,
+                crate::state::TrackedJob {
+                    kind: crate::state::PROCESSING_JOB_TRACKING,
+                    name: &input.processing_job_name,
+                    arn: &arn,
+                },
+                config,
+                crate::state::caller_user_context(ctx),
+                now,
+            )
+        });
         drop(store);
 
+        // The component the configuration brought into being is a resource of its own, so
+        // it leaves the same record the job does.
+        if let Some(component_arn) = tracked_component {
+            crate::state::record_state_change(Self::NAME, &component_arn, ctx);
+        }
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(CreateProcessingJobOutput { processing_job_arn: arn })
     }

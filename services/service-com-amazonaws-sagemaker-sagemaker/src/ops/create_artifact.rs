@@ -194,7 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // never refused for the lineage-group bound: this call is about the artifact
         // (`ensure_lineage_group` warns about that bound itself, for every caller).
         let materialised_group =
-            store.ensure_lineage_group(&region, crate::state::DEFAULT_LINEAGE_GROUP, now);
+            store.ensure_lineage_group(
+                &region,
+                &crate::state::default_lineage_group_name(&region),
+                now,
+            );
 
         // The id is the server's: a lineage entity is named by its ARN and the request
         // carries no identifier to derive one from.

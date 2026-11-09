@@ -208,7 +208,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the Region already holds is left exactly as it is, and the create is never
         // refused for the lineage-group bound: this call is about the component.
         let materialised_group =
-            store.ensure_lineage_group(&region, crate::state::DEFAULT_LINEAGE_GROUP, now);
+            store.ensure_lineage_group(
+                &region,
+                &crate::state::default_lineage_group_name(&region),
+                now,
+            );
         store.trial_components.insert(
             key,
             crate::state::TrialComponent {
@@ -244,6 +248,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Nothing has modified the component yet, so it was last modified when
                 // it was created.
                 last_modified_time: now,
+                // `CreateTrialComponent` models no source: only a component the service
+                // created FOR a job tracks one.
+                source: None,
             },
         );
         drop(store);

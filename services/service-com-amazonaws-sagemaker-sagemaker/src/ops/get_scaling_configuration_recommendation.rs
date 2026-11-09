@@ -185,14 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The model says of `RecommendationId` "Specify either this field or the
         // EndpointName field", and the same of `EndpointName`: exactly one of them picks
-        // the recommendation. That is a rule about the REQUEST, needing no state, so it
-        // is judged before anything is looked up — a request that names neither (or
-        // both) is malformed whether or not the job it names exists. The operation models
-        // no error for it, so it is a 400 `ValidationException`.
+        // the recommendation. That is a rule about the REQUEST, needing no state, so it is
+        // judged before anything is looked up — a request that names neither cannot pick a
+        // recommendation whether or not the job it names exists. The operation models no
+        // error for it, so it is a 400 `ValidationException`, worded as the service words
+        // it: naming both members the caller may supply instead.
         match (&input.recommendation_id, &input.endpoint_name) {
             (None, None) => {
                 return Err(crate::scaffolded::Scaffolded::validation(
-                    "Specify either RecommendationId or EndpointName.",
+                    crate::state::NEITHER_RECOMMENDATION_ID_NOR_ENDPOINT_NAME,
                 ));
             }
             (Some(_), Some(_)) => {
