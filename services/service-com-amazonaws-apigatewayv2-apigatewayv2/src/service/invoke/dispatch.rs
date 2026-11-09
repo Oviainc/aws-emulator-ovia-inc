@@ -16,9 +16,11 @@
 //!   modelled `Invoke` over the in-process transport `OperationContext::callback` hands a
 //!   handler, and its answer is read back as the response that format defines
 //!   ([`super::proxy_response`]);
-//! * `AWS_PROXY` naming an `IntegrationSubtype` is a first-class SERVICE action ("Specifies
-//!   the AWS service action to invoke"), which is not a function to run and is not
-//!   performed here;
+//! * `AWS_PROXY` naming an `IntegrationSubtype` is a first-class SERVICE ACTION ("Specifies
+//!   the AWS service action to invoke"), which is not a function to run: the gateway itself
+//!   calls that action, with the parameters the integration's `RequestParameters` map out of
+//!   the request and under the role its `CredentialsArn` names
+//!   ([`super::service_action`]);
 //! * `HTTP_PROXY` is "for integrating the route or method request with an HTTP endpoint,
 //!   with the client request passed through as-is". The endpoint is a URI the CALLER can
 //!   reach, and this emulator forwards no request to a destination its own configuration
@@ -45,6 +47,10 @@
 //!   milliseconds for HTTP APIs" — which is a different class from one that answered badly
 //!   and is why the deadline is applied to the run itself.
 //!
+//! * the ANSWER OF THE SERVICE for a first-class service action that service refused — its
+//!   own status, the error shape it named and the text it stated, relayed: such an
+//!   integration is the caller reaching that service through the api, so a refusal it earned
+//!   is told to it as the service stated it ([`super::service_action`]);
 //! * `429` `{"message":"Too Many Requests"}` for a request the serving stage's
 //!   `RouteSettings` throttle ([`crate::state::route_throttle`]);
 //! * the `307` above for an `HTTP_PROXY` upstream, which is the caller's to reach.
@@ -66,6 +72,7 @@ use super::lambda::{self, Unreached};
 use super::proxy_event::{self, Invocation, ProxyRequest};
 use super::proxy_response;
 use super::request_authorizer::{self, Outcome};
+use super::service_action::{self, Unperformed};
 use super::{redirect, INTERNAL_MESSAGE};
 use crate::state::route_throttle::Limits;
 use crate::state::{Authorizer, Integration};
@@ -144,6 +151,14 @@ pub async fn perform<Eng: Send + Sync + 'static>(
     // reached.
     if let Some(refusal) = throttle_refusal(engine, &dispatch) {
         return refusal;
+    }
+    // A first-class service action names what it invokes ITSELF, so it is reached before a
+    // backend URI is resolved: such an integration carries none at all.
+    if let Some(subtype) = crate::state::service_action_subtype(
+        &integration.integration_type,
+        integration.integration_subtype.as_deref(),
+    ) {
+        return service_action(engine, ctx, &dispatch, &integration, subtype).await;
     }
     let Some(upstream) = resolved_uri(&dispatch, &integration) else {
         return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
@@ -354,6 +369,75 @@ async fn lambda_proxy(
                 reason = %malformed.reason,
                 "this route's function answered something this payload format cannot be \
                  read as, so the integration produced no response"
+            );
+            json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None)
+        }
+    }
+}
+
+/// Serve the route with its first-class service-action integration: the mapped parameters
+/// in, the action called under the integration's role, its own answer out
+/// ([`super::service_action`]).
+///
+/// The classes an unperformed action falls into are the ones every other integration has,
+/// plus the one only a called SERVICE can report: an action that was called and did not
+/// answer within the integration's own deadline is the timeout; one that service ANSWERED a
+/// refusal for is that answer, relayed, because the call was served and its answer is what
+/// the gateway has to report; and everything else — a subtype this emulator cannot perform,
+/// a mapping the action cannot be called with, a call that reached no service — is the
+/// "produced no response" class. The reason is logged, never told to the caller.
+async fn service_action<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &OperationContext<'_>,
+    dispatch: &Dispatch,
+    integration: &Integration,
+    subtype: &str,
+) -> RtResponse {
+    let performed = service_action::perform(
+        engine,
+        ctx,
+        dispatch,
+        integration,
+        subtype,
+        deadline(integration),
+    )
+    .await;
+    let unperformed = match performed {
+        Ok(answered) => return answered,
+        Err(unperformed) => unperformed,
+    };
+    let reason = unperformed.reason();
+    match &unperformed {
+        Unperformed::TimedOut(_) => {
+            ::tracing::info!(
+                api_id = %dispatch.request.api_id,
+                route_key = %dispatch.route_key,
+                integration_subtype = %subtype,
+                reason = %reason,
+                "refusing an invoke: this route's service-action integration did not answer \
+                 within its timeout"
+            );
+            json_response(UNAVAILABLE_STATUS, UNAVAILABLE_MESSAGE, None)
+        }
+        Unperformed::Answered(answered) => {
+            ::tracing::info!(
+                api_id = %dispatch.request.api_id,
+                route_key = %dispatch.route_key,
+                integration_subtype = %subtype,
+                reason = %reason,
+                "the service serving this route's integration refused the action, so its own \
+                 answer is what the caller is told"
+            );
+            answered.relayed()
+        }
+        Unperformed::NotPerformed(_) => {
+            ::tracing::warn!(
+                api_id = %dispatch.request.api_id,
+                route_key = %dispatch.route_key,
+                integration_subtype = %subtype,
+                reason = %reason,
+                "refusing an invoke: this route's service-action integration produced no \
+                 response"
             );
             json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None)
         }

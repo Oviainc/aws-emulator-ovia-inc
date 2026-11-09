@@ -885,6 +885,26 @@ pub fn is_lambda_proxy_integration(
     integration_type == AWS_PROXY_INTEGRATION_TYPE && integration_subtype.is_none()
 }
 
+/// The AWS SERVICE ACTION this type and subtype name, or `None` when they name none.
+///
+/// The other half of the pair [`is_lambda_proxy_integration`] reads: `AWS_PROXY` naming an
+/// `IntegrationSubtype` "specifies the AWS service action to invoke"
+/// (`CreateIntegration$IntegrationSubtype`), so such an integration is performed by invoking
+/// that action rather than by running a function. The subtype is reported TRIMMED, because a
+/// stored value surrounded by whitespace names the same action, and a value that is only
+/// whitespace names none.
+pub fn service_action_subtype<'a>(
+    integration_type: &str,
+    integration_subtype: Option<&'a str>,
+) -> Option<&'a str> {
+    if integration_type != AWS_PROXY_INTEGRATION_TYPE {
+        return None;
+    }
+    integration_subtype
+        .map(str::trim)
+        .filter(|subtype| !subtype.is_empty())
+}
+
 /// The `TimeoutInMillis` an integration of an HTTP API gets when the request names
 /// none: "The default timeout is … 30 seconds for HTTP APIs"
 /// (`CreateIntegration$TimeoutInMillis`).

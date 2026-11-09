@@ -105,6 +105,8 @@ mod http_api_request_authorizer;
 mod http_api_route_precedence;
 #[path = "all/http_api_servable_stage.rs"]
 mod http_api_servable_stage;
+#[path = "all/http_api_service_action_integration.rs"]
+mod http_api_service_action_integration;
 #[path = "all/http_api_signed_invoke.rs"]
 mod http_api_signed_invoke;
 #[path = "all/integration_deletion.rs"]

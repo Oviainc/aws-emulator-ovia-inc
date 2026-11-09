@@ -144,6 +144,7 @@ mod lambda;
 pub(crate) mod proxy_event;
 mod proxy_response;
 mod request_authorizer;
+mod service_action;
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
