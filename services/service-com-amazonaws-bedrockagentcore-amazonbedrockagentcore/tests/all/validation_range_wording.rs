@@ -8,8 +8,10 @@
 //! `1 validation error detected: Value at '<member>' failed to satisfy constraint: Member
 //! must have value greater than or equal to <min>` (and `less than or equal to <max>` on
 //! the other side). It is a property of the SERVICE, not of one operation, so every
-//! operation whose model declares such a bound is stated the same way; a refusal of any
-//! other class keeps the wording the framework states.
+//! operation whose model declares such a bound is stated the same way; a refusal of a class
+//! this service states with its value (a `@length` bound) keeps the wording the framework
+//! states. The `@pattern` and enum classes, which this service also states without the
+//! value, are in `validation_constraint_wording`.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -152,34 +154,25 @@ async fn a_violated_numeric_range_is_stated_without_the_rejected_value() {
 }
 
 /// A refusal of another class keeps the framework's wording, value and all: the rule
-/// above is about a numeric range, so it must not quietly strip the value from a
-/// `@pattern` or `@length` refusal — which still names the value AWS echoes there.
+/// above is about the classes this service states without a value (a numeric range, a
+/// `@pattern`, an enum's value set), so it must not quietly strip the value from a
+/// `@length` refusal — which still names the value the framework echoes there.
 #[tokio::test]
 async fn a_refusal_of_another_class_still_states_its_value() {
     let router = emulator();
 
-    // `ABTestName` is ^[a-zA-Z][a-zA-Z0-9_]{0,47}$, so a name starting with a digit is a
-    // `@pattern` refusal rather than a range one.
+    // `MemoryRecordId` is `@length` 40..50 and `^mem-[a-zA-Z0-9-_]*$`, so a short id that
+    // satisfies the expression is a `@length` refusal rather than a pattern one.
     let (status, refused) = send(
         &router,
-        "POST",
-        "/ab-tests",
-        Some(json!({
-            "name": "1_leading_digit",
-            "gatewayArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/demo-gateway-0a1b2c3d4e",
-            "roleArn": "arn:aws:iam::123456789012:role/AgentCoreABTest",
-            "variants": [
-                {"name": "C", "weight": 50, "variantConfiguration": {"target": {"name": "control"}}},
-                {"name": "T1", "weight": 50, "variantConfiguration": {"target": {"name": "treatment"}}},
-            ],
-            "evaluationConfig": {"onlineEvaluationConfigArn":
-                "arn:aws:bedrock-agentcore:us-east-1:123456789012:online-evaluation-config/quality-0a1b2c3d4e"},
-        })),
+        "DELETE",
+        "/memories/demo-memory-0123456789/memoryRecords/mem-short",
+        None,
     )
     .await;
     assert_eq!(
         status, 400,
-        "expected HTTP 400 for a name outside its pattern, got {status} with {refused:?}"
+        "expected HTTP 400 for an id shorter than its length minimum, got {status} with {refused:?}"
     );
     assert_eq!(
         error_code(&refused),
@@ -187,8 +180,10 @@ async fn a_refusal_of_another_class_still_states_its_value() {
         "expected ValidationException, got {refused:?}"
     );
     let message = error_message(&refused);
-    assert!(
-        message.contains("'1_leading_digit'") && message.contains("at 'name'"),
-        "expected a pattern refusal to echo the value it rejected, got {message:?}"
+    assert_eq!(
+        message,
+        "1 validation error detected: Value 'mem-short' at 'memoryRecordId' failed to satisfy \
+         constraint: Member must have length greater than or equal to 40",
+        "expected a length refusal to echo the value it rejected, got {message:?}"
     );
 }

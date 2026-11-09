@@ -998,8 +998,10 @@ async fn an_unknown_path_is_a_resource_not_found() {
     // Another memory id matching `MemoryId`'s pattern that no event was stored under.
     let other_memory = "other-memory-9876543210";
 
-    // Rows: each step of the path, wrong in turn. `ListEvents` names no event, so its
-    // listing is only expected to 404 on the rows that break the session path.
+    // Rows: each step of the path, wrong in turn. `ListEvents` names no event and neither
+    // an actor nor a session is addressable on its own, so its listing is only expected to
+    // 404 on the row whose MEMORY does not exist; the rows that break only the grouping are
+    // an empty page, which the suite's listing test pins.
     let cases: Vec<(&str, &str, &str, &str, &str, bool)> = vec![
         (
             "unknown-memory",
@@ -1009,11 +1011,18 @@ async fn an_unknown_path_is_a_resource_not_found() {
             &known,
             true,
         ),
-        ("unknown-actor", MEMORY, "actor-404", "sess1", &known, true),
-        ("unknown-session", MEMORY, "actor-1", "sess404", &known, true),
+        ("unknown-actor", MEMORY, "actor-404", "sess1", &known, false),
+        (
+            "unknown-session",
+            MEMORY,
+            "actor-1",
+            "sess404",
+            &known,
+            false,
+        ),
         ("unknown-event", MEMORY, "actor-1", "sess1", "1#abcdef", false),
     ];
-    for (case, memory, actor, session, event, session_path_broken) in cases {
+    for (case, memory, actor, session, event, memory_missing) in cases {
         let mut answers = vec![
             {
                 let (status, body) = get_event(&router, memory, actor, session, event).await;
@@ -1024,7 +1033,7 @@ async fn an_unknown_path_is_a_resource_not_found() {
                 ("DeleteEvent", status, body)
             },
         ];
-        if session_path_broken {
+        if memory_missing {
             let (status, body) = list_events(&router, memory, actor, session, json!({})).await;
             answers.push(("ListEvents", status, body));
         }

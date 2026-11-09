@@ -216,18 +216,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|filter| filter.event_filter.as_deref())
             == Some("HAS_EVENTS");
 
-        let store = state.lock();
-        let memory = store.resolve_memory(&input.memory_id).map_err(|message| {
-            ListSessionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(message),
-            })
-        })?;
+        // The same pre-condition `GetEvent` keeps, for the same reason: a Memory container
+        // is created through the CONTROL plane, so its existence is resolved against the
+        // component that owns it, before this service's own store is taken.
+        crate::state::memory_container_resolved(&*self.engine, &input.memory_id).map_err(
+            |missing| match missing {
+                Some(message) => {
+                    ListSessionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                        message: Some(message),
+                    })
+                }
+                None => ListSessionsErrorModeled::ServiceException(ServiceException {
+                    message: "the shared engine does not carry the AgentCore resource inventory"
+                        .to_string(),
+                }),
+            },
+        )?;
 
-        // An actor with no events in this memory simply has no sessions; the memory is
-        // the addressed resource, and it exists.
-        let mut sessions: Vec<&crate::state::SessionStore> = memory
-            .actors
-            .get(&input.actor_id)
+        let store = state.lock();
+
+        // An actor with no events in this memory simply has no sessions, and so has a
+        // container nothing has been written into at all: the memory is the addressed
+        // resource, and it exists.
+        let mut sessions: Vec<&crate::state::SessionStore> = store
+            .memory_index(&input.memory_id)
+            .and_then(|memory| memory.actors.get(&input.actor_id))
             .map(|actor| {
                 actor
                     .sessions

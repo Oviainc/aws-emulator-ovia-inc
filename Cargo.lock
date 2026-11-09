@@ -9199,6 +9199,7 @@ dependencies = [
  "hex",
  "http",
  "percent-encoding",
+ "regex",
  "rquickjs",
  "serde_json",
  "service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol",

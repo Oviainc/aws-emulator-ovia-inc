@@ -179,6 +179,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let memory_id = crate::state::normalize_memory_id(&input.memory_id);
         let now = ::std::time::SystemTime::now();
 
+        // `MemoryRecordMetadataMap`'s key shape and the union its values target declare
+        // constraints the centralized request walk does not reach (it treats a map key as
+        // a path segment and does not descend into an entry's value), so every entry of
+        // every record is checked here, before anything is persisted. The path names the
+        // record's position in the request, as the walk spells one.
+        for (at, record) in input.records.iter().enumerate() {
+            let Some(metadata) = record.metadata.as_ref() else {
+                continue;
+            };
+            if let Some(message) = crate::service::map_entry_constraints::record_metadata_refusal(
+                &format!("records.{}.member.metadata", at + 1),
+                metadata,
+            ) {
+                return Err(BatchCreateMemoryRecordsErrorModeled::ValidationException(
+                    ValidationException {
+                        message,
+                        reason: crate::service::validation::FIELD_VALIDATION_FAILED.to_string(),
+                        field_list: None,
+                    },
+                )
+                .into());
+            }
+        }
+
         // The same pre-condition `CreateEvent` keeps, for the same reason: a Memory
         // container is created through the CONTROL plane, so records cannot be written
         // into one that does not exist. The inventory is read and released before this

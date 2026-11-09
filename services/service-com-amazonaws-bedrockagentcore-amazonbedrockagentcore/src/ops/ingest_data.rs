@@ -192,6 +192,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let memory_id = crate::state::normalize_memory_id(&input.memory_id);
 
+        // The same constraints `CreateEvent` applies to its `metadata`, for the same
+        // reason: `MetadataMap`'s key shape and the union its values target declare
+        // constraints the centralized request walk does not reach, so they are applied
+        // here, before the container is resolved and before anything is persisted.
+        if let Some(metadata) = input.metadata.as_ref() {
+            if let Some(message) =
+                crate::service::map_entry_constraints::metadata_refusal("metadata", metadata)
+            {
+                return Err(IngestDataErrorModeled::ValidationException(
+                    ValidationException {
+                        message,
+                        reason: crate::service::validation::FIELD_VALIDATION_FAILED.to_string(),
+                        field_list: None,
+                    },
+                )
+                .into());
+            }
+        }
+
         // The same pre-condition `CreateEvent` keeps, for the same reason: a Memory
         // container is created through the CONTROL plane, so content cannot be ingested
         // into one that does not exist. The inventory is read and released before this

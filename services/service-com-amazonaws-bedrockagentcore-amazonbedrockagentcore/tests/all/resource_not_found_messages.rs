@@ -3,21 +3,25 @@
 //! How this service REFUSES a lookup that finds nothing.
 //!
 //! THE RULE: a `ResourceNotFoundException` (`@httpError 404`, one `message` member —
-//! `smithy_query(query="shape",shape="ResourceNotFoundException")`) words its message as
-//! the capitalised label of the resource that did not resolve, then `": "`, then THAT
-//! resource's identifier exactly as the request spelled it — and nothing else, so no
-//! identifier of an enclosing resource that DID resolve appears in it. A path-addressed
-//! resource is resolved outside-in, so the label and identifier belong to the OUTERMOST
-//! step of the path that does not exist.
+//! `smithy_query(query="shape",shape="ResourceNotFoundException")`) names the resource that
+//! did not resolve and THAT resource's identifier exactly as the request spelled it — and
+//! nothing else, so no identifier of an enclosing resource that DID resolve appears in it. A
+//! path-addressed resource is resolved outside-in, so the resource named is the OUTERMOST
+//! step of the path that does not exist. Each resource has ONE fixed sentence per
+//! operation that refuses: a missing EVENT is `Unable to find event with id <eventId>` on
+//! a READ and `Event not found with id: <eventId>` on a DELETE, and every other resource is
+//! its capitalised label, `": "`, then its identifier.
 //!
 //! The rows span what the rule generalises over:
 //!
 //! * which OPERATION refuses (`ListSessions`, `ListEvents`, `GetEvent`, `DeleteEvent` in
 //!   the Memory event plane, `GetCodeInterpreterSession` in the tools plane, `Evaluate` in
-//!   the evaluation plane), since the wording is the service's and not one handler's;
+//!   the evaluation plane), since the resource named is the service's and not one handler's
+//!   — and, for the event, which of the two sentences the refusing operation words;
 //! * which RESOURCE of the path is missing (the memory container, the session, the event),
 //!   including a path whose inner identifiers are also unknown — the memory is still what
-//!   is reported;
+//!   is reported — and an event that exists in a SIBLING session of the same actor, which
+//!   is as absent from the session addressed as one never written;
 //! * which FORM the identifier arrived in: `MemoryId`'s pattern admits both the bare id
 //!   and the `arn:…:memory/<id>` spelling, and whichever one was sent is the one echoed.
 //!
@@ -47,6 +51,10 @@ const GHOST_MEMORY_ARN: &str =
 /// The actor and session the stored event belongs to.
 const ACTOR: &str = "actor-1";
 const SESSION: &str = "sess1";
+
+/// A second session of the SAME actor, which holds an event of its own: an event of one
+/// session is not addressable through another.
+const SIBLING_SESSION: &str = "sess2";
 
 /// An actor id and a session id of the modelled shape that hold nothing.
 const GHOST_ACTOR: &str = "actor-404";
@@ -114,7 +122,8 @@ async fn send(
     (status, parsed)
 }
 
-/// The resource label a row expects the refusal to name.
+/// The resource label a row expects the refusal to name, and how the operation that
+/// refuses words it.
 ///
 /// Spelled out here on purpose: the expectation must be independent of the emulator's
 /// own `state::NotFoundResource`, or the assertion would only re-state whatever string
@@ -123,7 +132,10 @@ async fn send(
 enum Resource {
     Memory,
     Session,
-    Event,
+    /// An event as a READ of it reports it missing.
+    EventRead,
+    /// An event as a DELETE of it reports it missing.
+    EventDelete,
     Evaluator,
 }
 
@@ -132,8 +144,17 @@ impl Resource {
         match self {
             Self::Memory => "Memory",
             Self::Session => "Session",
-            Self::Event => "Event",
+            Self::EventRead | Self::EventDelete => "Event",
             Self::Evaluator => "Evaluator",
+        }
+    }
+
+    /// The whole message a row expects, for the resource that did not resolve.
+    fn message(self, identifier: &str) -> String {
+        match self {
+            Self::EventRead => format!("Unable to find event with id {identifier}"),
+            Self::EventDelete => format!("Event not found with id: {identifier}"),
+            _ => format!("{} not found: {identifier}", self.label()),
         }
     }
 }
@@ -348,13 +369,18 @@ fn message(body: &Value) -> &str {
 /// Store one event, so the suite has a memory container, an actor, a session and an
 /// event that DO resolve, and return the `eventId` it minted.
 async fn store_one_event(router: &MultiServiceRouter) -> String {
+    store_one_event_in(router, SESSION).await
+}
+
+/// Store one event in `session` of the same actor, and return the `eventId` it minted.
+async fn store_one_event_in(router: &MultiServiceRouter, session: &str) -> String {
     let (status, created) = send(
         router,
         "POST",
         &format!("/memories/{}/events", label(MEMORY)),
         Some(json!({
             "actorId": ACTOR,
-            "sessionId": SESSION,
+            "sessionId": session,
             "eventTimestamp": 1_700_000_000,
             "payload": [{"conversational": {"role": "USER", "content": {"text": "hello"}}}],
         })),
@@ -396,6 +422,7 @@ async fn start_one_code_interpreter_session(router: &MultiServiceRouter) -> Stri
 async fn a_lookup_that_misses_is_refused_with_the_resources_own_label_and_identifier() {
     let router = emulator();
     let event = store_one_event(&router).await;
+    let sibling_event = store_one_event_in(&router, SIBLING_SESSION).await;
     let code_session = start_one_code_interpreter_session(&router).await;
 
     // Rows: the operation that refuses × which step of the path is missing × the form the
@@ -440,26 +467,6 @@ async fn a_lookup_that_misses_is_refused_with_the_resources_own_label_and_identi
             GHOST_MEMORY.to_string(),
         ),
         (
-            "list-events-unknown-session",
-            Call::ListEvents {
-                memory: MEMORY.to_string(),
-                actor: ACTOR.to_string(),
-                session: GHOST_SESSION.to_string(),
-            },
-            Resource::Session,
-            GHOST_SESSION.to_string(),
-        ),
-        (
-            "list-events-unknown-actor",
-            Call::ListEvents {
-                memory: MEMORY.to_string(),
-                actor: GHOST_ACTOR.to_string(),
-                session: SESSION.to_string(),
-            },
-            Resource::Session,
-            SESSION.to_string(),
-        ),
-        (
             "get-event-unknown-memory",
             Call::GetEvent {
                 memory: GHOST_MEMORY.to_string(),
@@ -500,7 +507,7 @@ async fn a_lookup_that_misses_is_refused_with_the_resources_own_label_and_identi
                 session: SESSION.to_string(),
                 event: GHOST_EVENT.to_string(),
             },
-            Resource::Event,
+            Resource::EventRead,
             GHOST_EVENT.to_string(),
         ),
         (
@@ -533,8 +540,30 @@ async fn a_lookup_that_misses_is_refused_with_the_resources_own_label_and_identi
                 session: SESSION.to_string(),
                 event: GHOST_EVENT.to_string(),
             },
-            Resource::Event,
+            Resource::EventDelete,
             GHOST_EVENT.to_string(),
+        ),
+        (
+            "get-event-of-a-sibling-session-of-the-same-actor",
+            Call::GetEvent {
+                memory: MEMORY.to_string(),
+                actor: ACTOR.to_string(),
+                session: SESSION.to_string(),
+                event: sibling_event.clone(),
+            },
+            Resource::EventRead,
+            sibling_event.clone(),
+        ),
+        (
+            "delete-event-of-a-sibling-session-of-the-same-actor",
+            Call::DeleteEvent {
+                memory: MEMORY.to_string(),
+                actor: ACTOR.to_string(),
+                session: SIBLING_SESSION.to_string(),
+                event: event.clone(),
+            },
+            Resource::EventDelete,
+            event.clone(),
         ),
         (
             "code-interpreter-unknown-session",
@@ -576,7 +605,7 @@ async fn a_lookup_that_misses_is_refused_with_the_resources_own_label_and_identi
             RESOURCE_NOT_FOUND,
             "case {case:?} on {operation}: expected {RESOURCE_NOT_FOUND}, got {body:?}"
         );
-        let expected = format!("{} not found: {identifier}", resource.label());
+        let expected = resource.message(&identifier);
         assert_eq!(
             message(&body),
             expected,
@@ -618,11 +647,12 @@ async fn a_lookup_that_misses_is_refused_with_the_resources_own_label_and_identi
     );
 }
 
-/// An actor is not a resource addressable on its own in the Memory event plane: a
-/// listing for an actor with nothing stored is an empty page, so a request whose actor is
-/// unknown is refused for the SESSION it names, never for the actor.
+/// Neither an ACTOR nor a SESSION is a resource addressable on its own in the Memory
+/// event plane: both are groupings derived from the events written into a container, so a
+/// listing for one that holds nothing is an EMPTY page and never a refusal. Only the
+/// container (owned by the control plane) and an addressed EVENT are reported missing.
 #[tokio::test]
-async fn an_unknown_actor_is_an_empty_listing_not_a_refusal() {
+async fn an_unknown_actor_or_session_is_an_empty_listing_not_a_refusal() {
     let router = emulator();
     let _event = store_one_event(&router).await;
 
@@ -647,6 +677,32 @@ async fn an_unknown_actor_is_an_empty_listing_not_a_refusal() {
             body["sessionSummaries"],
             json!([]),
             "case {case:?}: expected no session summaries, got {body:?}"
+        );
+    }
+
+    // The same for `ListEvents`, over every way the grouping it names can hold nothing:
+    // an unknown session of a known actor, a known session of an unknown actor, and both
+    // unknown at once.
+    for (case, actor, session) in [
+        ("unknown-session", ACTOR, GHOST_SESSION),
+        ("unknown-actor", GHOST_ACTOR, SESSION),
+        ("unknown-actor-and-session", GHOST_ACTOR, GHOST_SESSION),
+    ] {
+        let (status, body) = Call::ListEvents {
+            memory: MEMORY.to_string(),
+            actor: actor.to_string(),
+            session: session.to_string(),
+        }
+        .send(&router)
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a grouping that holds nothing is an empty page, got {status} with {body:?}"
+        );
+        assert_eq!(
+            body["events"],
+            json!([]),
+            "case {case:?}: expected no events, got {body:?}"
         );
     }
 

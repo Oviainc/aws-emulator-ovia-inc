@@ -47,8 +47,13 @@ use crate::ops::invoke_code_interpreter::InvokeCodeInterpreter;
 use service_common::event_stream::EventStreamRoute;
 
 /// The WORDS this service states a boundary refusal with — its own concern, kept out of
-/// the seams below.
-mod validation;
+/// the seams below. `pub(crate)` because a handler that applies a constraint the request
+/// boundary cannot report states it with the same words.
+pub(crate) mod validation;
+
+/// The modelled constraints that boundary cannot reach — a map's KEY, and a leaf inside a
+/// map entry's VALUE — which the handlers whose input declares such a map apply themselves.
+pub(crate) mod map_entry_constraints;
 
 /// The host-style endpoint this service is addressed by:
 /// `bedrock-agentcore.<region>.amazonaws.com`.
@@ -172,10 +177,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this service
         // reword it.
         //
-        // This service states a violated numeric `@range` bound WITHOUT the value that
-        // violated it, and keeps the framework's own wording for every other class —
-        // the one choice a service makes here, which [`validation`] owns so the
-        // sentence and the classes it covers live in one place.
+        // This service states a refusal of a value outside a modelled `@pattern`, a
+        // modelled `@range` bound or an enumerated type's value set WITHOUT the value
+        // that violated it, and keeps the framework's own wording for every other class —
+        // the one choice a service makes here, which [`validation`] owns so the sentence
+        // and the classes it covers live in one place.
         validation::refused(refusal)
     }
 

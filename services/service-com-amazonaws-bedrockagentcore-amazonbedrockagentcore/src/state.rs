@@ -376,39 +376,42 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
         self.resolve_session(memory_id, actor_id, session_id).ok()
     }
 
-    /// The memory container a request addressed, or the message naming it as the
-    /// missing resource. `memory_id` is the identifier as the REQUEST spelled it (either
-    /// spelling [`normalize_memory_id`] accepts), so the message echoes what the caller
-    /// sent.
-    pub fn resolve_memory(&self, memory_id: &str) -> Result<&MemoryStore, String> {
-        self.memories
-            .get(&normalize_memory_id(memory_id))
-            .ok_or_else(|| resource_not_found_message(NotFoundResource::Memory, memory_id))
+    /// This plane's INDEX of what has been written into the memory container `memory_id`
+    /// names (either spelling [`normalize_memory_id`] accepts), or `None` when nothing has
+    /// been written into it yet.
+    ///
+    /// NOT a claim about whether the CONTAINER exists: a container is created through the
+    /// CONTROL plane, so whether the account holds one is answered by the shared inventory
+    /// ([`memory_container_resolved`]), which every operation addressing something inside a
+    /// container asks FIRST. An empty index therefore means the container holds nothing,
+    /// not that it is absent.
+    pub fn memory_index(&self, memory_id: &str) -> Option<&MemoryStore> {
+        self.memories.get(&normalize_memory_id(memory_id))
     }
 
-    /// The session a request addressed, resolved OUTSIDE-IN along the path: the
-    /// enclosing memory container first, the session inside it second, so the resource
-    /// reported missing is the OUTERMOST step of the path that does not exist.
+    /// The session a request addressed inside a container the caller has ALREADY resolved
+    /// ([`memory_container_resolved`]), or the message naming the session as the missing
+    /// resource.
     ///
     /// A session is identified by its actor as well as its `sessionId`, and an actor is
     /// not addressable on its own in this plane (it has no read of its own, and a listing
     /// for an actor with nothing stored is an empty page rather than a refusal), so an
-    /// absent actor is an absent session.
+    /// absent actor is an absent session — and so is a container nothing has been written
+    /// into, whose index is this plane's record of its contents rather than its existence.
     pub fn resolve_session(
         &self,
         memory_id: &str,
         actor_id: &str,
         session_id: &str,
     ) -> Result<&SessionStore, String> {
-        self.resolve_memory(memory_id)?
-            .actors
-            .get(actor_id)
+        self.memory_index(memory_id)
+            .and_then(|memory| memory.actors.get(actor_id))
             .and_then(|actor| actor.sessions.get(session_id))
             .ok_or_else(|| resource_not_found_message(NotFoundResource::Session, session_id))
     }
 
-    /// The event a request addressed, resolved outside-in the same way: memory, then
-    /// session, then the event inside it.
+    /// The event a request addressed, resolved inside out the same way: the session inside
+    /// the already-resolved container, then the event inside that session.
     pub fn resolve_event(
         &self,
         memory_id: &str,
@@ -420,11 +423,11 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
             .events
             .iter()
             .find(|event| event.event_id == event_id)
-            .ok_or_else(|| resource_not_found_message(NotFoundResource::Event, event_id))
+            .ok_or_else(|| resource_not_found_message(NotFoundResource::EventRead, event_id))
     }
 
-    /// The session a WRITING operation addressed: the same two-step walk as
-    /// [`Self::resolve_session`], and the same two messages from the shared builder, taken
+    /// The session a WRITING operation addressed: the same walk as
+    /// [`Self::resolve_session`], and the same message from the shared builder, taken
     /// mutably. Rust's borrow rules make this a second walk rather than a reuse of the
     /// read-only one; the wording and the order it reports are still the builder's.
     pub fn resolve_session_mut(
@@ -433,20 +436,16 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
         actor_id: &str,
         session_id: &str,
     ) -> Result<&mut SessionStore, String> {
-        let memory = self
-            .memories
+        self.memories
             .get_mut(&normalize_memory_id(memory_id))
-            .ok_or_else(|| resource_not_found_message(NotFoundResource::Memory, memory_id))?;
-        memory
-            .actors
-            .get_mut(actor_id)
+            .and_then(|memory| memory.actors.get_mut(actor_id))
             .and_then(|actor| actor.sessions.get_mut(session_id))
             .ok_or_else(|| resource_not_found_message(NotFoundResource::Session, session_id))
     }
 
-    /// Remove the event a request addressed and hand it back, resolving the path
-    /// OUTSIDE-IN exactly as [`Self::resolve_event`] does, so a delete refuses with the
-    /// outermost missing step of the path.
+    /// Remove the event a request addressed and hand it back, resolving the path exactly
+    /// as [`Self::resolve_event`] does, so a delete refuses with the same resource a read
+    /// of the same path refuses with.
     ///
     /// The bookkeeping `insert_event` wrote goes with the event: the `clientToken` record
     /// that points at it has nothing left to replay, and the whole-store ring drops its
@@ -459,8 +458,8 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
         session_id: &str,
         event_id: &str,
     ) -> Result<StoredEvent, String> {
-        // Memory and session are reported by the resolver; the event by the step below,
-        // which is also what decides that anything is removed at all.
+        // The session is reported by the resolver; the event by the step below, which is
+        // also what decides that anything is removed at all.
         let session = self.resolve_session_mut(memory_id, actor_id, session_id)?;
         let at = session
             .events
@@ -468,7 +467,7 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
             .position(|event| event.event_id == event_id);
         let removed = at
             .and_then(|at| session.events.remove(at))
-            .ok_or_else(|| resource_not_found_message(NotFoundResource::Event, event_id))?;
+            .ok_or_else(|| resource_not_found_message(NotFoundResource::EventDelete, event_id))?;
         // The session borrow ends here, so the container's own bookkeeping follows.
         if let Some(memory) = self.memories.get_mut(&normalize_memory_id(memory_id)) {
             memory
@@ -1827,13 +1826,15 @@ fn accounted_file_bytes(key: &str, size: usize) -> usize {
         .saturating_add(SESSION_FILE_ENTRY_OVERHEAD_BYTES)
 }
 
-/// A resource this service's `ResourceNotFoundException` can name, with the label AWS
+/// A resource this service's `ResourceNotFoundException` can name, with the SENTENCE AWS
 /// words that message with.
 ///
 /// The exception carries one `message` member (source: smithy_query query="shape"
-/// shape="ResourceNotFoundException"), and the service words it as the capitalised
-/// resource label, `": "`, then the identifier that did not resolve — so the label is
-/// the resource's own name, not the input member's spelling.
+/// shape="ResourceNotFoundException"), and the identifier that did not resolve is the
+/// message's only variable part. Most of this service's resources are named by the
+/// capitalised resource label, `": "`, then that identifier — so the label is the
+/// resource's own name, not the input member's spelling — and one, the EVENT, is named by
+/// a sentence of its own ([`Self::message`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotFoundResource {
     /// An AgentCore Memory container, addressed by `memoryId`.
@@ -1843,8 +1844,13 @@ pub enum NotFoundResource {
     /// A session: one of an actor's sessions in a memory container, or one of a code
     /// interpreter's sessions, both addressed by `sessionId`.
     Session,
-    /// One event of a session, addressed by `eventId`.
-    Event,
+    /// One event of a session, addressed by `eventId`, as a READ of that event reports it
+    /// missing.
+    EventRead,
+    /// One event of a session as a DELETE of that event reports it missing: AgentCore
+    /// words the two refusals differently, so the resource carries both sentences
+    /// ([`NotFoundResource::message`]).
+    EventDelete,
     /// An evaluator, addressed by `evaluatorId`.
     Evaluator,
     /// A browser, addressed by `browserIdentifier`: the tool the service provides or a
@@ -1860,21 +1866,41 @@ impl NotFoundResource {
             Self::Memory => "Memory",
             Self::CodeInterpreter => "Code Interpreter",
             Self::Session => "Session",
-            Self::Event => "Event",
+            Self::EventRead | Self::EventDelete => "Event",
             Self::Evaluator => "Evaluator",
             Self::Browser => "Browser",
         }
     }
+
+    /// The whole `ResourceNotFoundException` message for a lookup of this resource that
+    /// missed, naming `identifier` — the identifier the request spelled for THIS resource,
+    /// and the message's only variable part.
+    ///
+    /// An EVENT is worded by the operation that refuses: a READ states `Unable to find
+    /// event with id <eventId>` and a DELETE states `Event not found with id: <eventId>`.
+    /// Either way the sentence is fixed and the identifier is its only variable part,
+    /// whatever step of the path made the event missing — an event of another session of
+    /// the same actor included, which is not found for exactly the same reason as one that
+    /// was never written. Every other resource is stated as its label, `": "`, then its
+    /// identifier.
+    #[must_use]
+    pub fn message(self, identifier: &str) -> String {
+        match self {
+            Self::EventRead => format!("Unable to find event with id {identifier}"),
+            Self::EventDelete => format!("{} not found with id: {identifier}", self.label()),
+            _ => format!("{} not found: {identifier}", self.label()),
+        }
+    }
 }
 
-/// The `ResourceNotFoundException` message for a lookup that missed: the resource's
-/// label, `": "`, then the identifier the request spelled for it.
+/// The `ResourceNotFoundException` message for a lookup that missed, as the resource that
+/// did not resolve words one ([`NotFoundResource::message`]).
 ///
 /// The identifier is the ONLY variable part, and it is the one that failed to resolve:
 /// an identifier of an enclosing resource that *did* resolve is not part of the message.
 #[must_use]
 pub fn resource_not_found_message(resource: NotFoundResource, identifier: &str) -> String {
-    format!("{} not found: {identifier}", resource.label())
+    resource.message(identifier)
 }
 
 /// The key a `memoryId` is stored under.
@@ -2140,6 +2166,30 @@ pub fn holds_memory<Eng: Send + Sync + 'static>(engine: &Eng, memory_id: &str) -
     let inventory = resource_inventory(engine)?;
     let held = inventory.lock().holds_memory(memory_id);
     Some(held)
+}
+
+/// The pre-condition every call ADDRESSING something inside a memory container keeps,
+/// whether it writes or only reports: a container is created through the CONTROL plane, so
+/// its existence is resolved against the component that OWNS it ([`holds_memory`]) and
+/// never against this plane's own index of what has been written into it — a container
+/// nothing has been written into yet exists and holds nothing.
+///
+/// `Ok(())` when the account holds it. `Err(Some(message))` is the
+/// `ResourceNotFoundException` message naming the container, with the identifier exactly as
+/// the request spelled it; `Err(None)` says the shared engine does not carry the inventory
+/// at all, which a handler answers with a modelled server error.
+pub fn memory_container_resolved<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    memory_id: &str,
+) -> Result<(), Option<String>> {
+    match holds_memory(engine, memory_id) {
+        None => Err(None),
+        Some(false) => Err(Some(resource_not_found_message(
+            NotFoundResource::Memory,
+            memory_id,
+        ))),
+        Some(true) => Ok(()),
+    }
 }
 
 /// Whether the account can reach the code interpreter `code_interpreter_identifier` names:

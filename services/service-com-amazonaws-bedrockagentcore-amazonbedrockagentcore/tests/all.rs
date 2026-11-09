@@ -43,6 +43,8 @@ mod resource_not_found_messages;
 mod service_claim;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_constraint_wording.rs"]
+mod validation_constraint_wording;
 #[path = "all/validation_range_wording.rs"]
 mod validation_range_wording;
 #[path = "all/workload_access_tokens.rs"]

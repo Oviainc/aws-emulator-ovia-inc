@@ -8,6 +8,11 @@
 //! `filter` narrows the events by branch and by event metadata, and the page is
 //! bounded by `maxResults` with an opaque `nextToken` resuming after it.
 //!
+//! The memory container is the one addressed resource on the path — it is created through
+//! the CONTROL plane, so a container the account does not hold is a
+//! `ResourceNotFoundException` (404) — while an actor or a session with nothing stored is
+//! an empty page: both are groupings derived from the events written into the container.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -346,14 +351,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
         }
 
+        // The same pre-condition `GetEvent` keeps, for the same reason: a Memory container
+        // is created through the CONTROL plane, so the outermost step of this path is
+        // resolved against the component that owns it, before this service's own store is
+        // taken.
+        crate::state::memory_container_resolved(&*self.engine, &input.memory_id).map_err(
+            |missing| match missing {
+                Some(message) => {
+                    ListEventsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                        message: Some(message),
+                    })
+                }
+                None => ListEventsErrorModeled::ServiceException(ServiceException {
+                    message: "the shared engine does not carry the AgentCore resource inventory"
+                        .to_string(),
+                }),
+            },
+        )?;
+
         let store = state.lock();
-        let session = store
-            .resolve_session(&input.memory_id, &input.actor_id, &input.session_id)
-            .map_err(|message| {
-                ListEventsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(message),
-                })
-            })?;
+        // A SESSION and an ACTOR are not addressable resources in this plane: both are
+        // groupings derived from the events written into the container, so a listing for
+        // one that holds nothing is an EMPTY page rather than a refusal — the same answer
+        // `ListSessions` gives for an actor with nothing stored. The one addressed resource
+        // on this path is the container, resolved above.
+        let no_events: VecDeque<StoredEvent> = VecDeque::new();
+        let held = store
+            .session(&input.memory_id, &input.actor_id, &input.session_id)
+            .map_or(&no_events, |session| &session.events);
 
         // Selecting and sorting walk one session's events, which the store bounds at
         // `crate::state::MAX_EVENTS_PER_SESSION`, and `expressions` is bounded above,
@@ -362,9 +387,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter
             .as_ref()
             .and_then(|filter| filter.branch.as_ref())
-            .map(|filter| branch_scope(&session.events, filter));
-        let mut selected: Vec<&StoredEvent> = session
-            .events
+            .map(|filter| branch_scope(held, filter));
+        let mut selected: Vec<&StoredEvent> = held
             .iter()
             .filter(|event| scope.as_ref().is_none_or(|scope| on_branch(event, scope)))
             // Several expressions narrow together: an event must satisfy every one.

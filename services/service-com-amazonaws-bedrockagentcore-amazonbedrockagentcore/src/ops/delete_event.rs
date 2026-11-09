@@ -184,10 +184,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The same pre-condition `GetEvent` keeps, for the same reason: a Memory container
+        // is created through the CONTROL plane, so the outermost step of this path is
+        // resolved against the component that owns it, before this service's own store is
+        // taken.
+        crate::state::memory_container_resolved(&*self.engine, &input.memory_id).map_err(
+            |missing| match missing {
+                Some(message) => {
+                    DeleteEventErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                        message: Some(message),
+                    })
+                }
+                None => DeleteEventErrorModeled::ServiceException(ServiceException {
+                    message: "the shared engine does not carry the AgentCore resource inventory"
+                        .to_string(),
+                }),
+            },
+        )?;
+
         let mut store = state.lock();
-        // The store resolves the path outside-in (memory, then session, then event) and
-        // words every refusal, so the resource reported missing is the outermost step of
-        // the path that does not exist, and the bookkeeping of the removal is the store's.
+        // The store resolves the rest of the path (the session, then the event) and words
+        // every refusal, so the resource reported missing is the outermost step of the path
+        // that does not exist, and the bookkeeping of the removal is the store's.
         let event = store
             .remove_event(
                 &input.memory_id,

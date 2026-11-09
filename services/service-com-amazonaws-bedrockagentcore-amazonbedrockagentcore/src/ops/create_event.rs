@@ -197,6 +197,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let memory_id = crate::state::normalize_memory_id(&input.memory_id);
 
+        // `MetadataMap`'s key shape and the union its values target both declare
+        // constraints the centralized request walk does not reach (it treats a map key as
+        // a path segment and does not descend into an entry's value), so they are applied
+        // HERE — before the container is resolved and before anything is persisted, which
+        // is where the request boundary would have refused the call.
+        if let Some(metadata) = input.metadata.as_ref() {
+            if let Some(message) =
+                crate::service::map_entry_constraints::metadata_refusal("metadata", metadata)
+            {
+                return Err(CreateEventErrorModeled::ValidationException(
+                    ValidationException {
+                        message,
+                        // `ValidationExceptionReason`'s value for a member whose value
+                        // broke what its shape declares (source: smithy_query
+                        // query="shape" shape="ValidationExceptionReason").
+                        reason: crate::service::validation::FIELD_VALIDATION_FAILED.to_string(),
+                        field_list: None,
+                    },
+                )
+                .into());
+            }
+        }
+
         // A Memory container is created through the CONTROL plane, so this write resolves
         // the container BEFORE it persists anything: an event cannot be stored in a
         // container that does not exist, and answering 201 for one would tell the caller

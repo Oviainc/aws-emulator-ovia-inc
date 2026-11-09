@@ -173,6 +173,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // A Memory container is created through the CONTROL plane, so the OUTERMOST step of
+        // this path is resolved against the component that owns it rather than against this
+        // plane's index of what has been written into the container: a container that
+        // exists and holds nothing is not a missing container. The inventory is read and
+        // released before this service's own store is taken, which is the lock order every
+        // reader of it keeps.
+        crate::state::memory_container_resolved(&*self.engine, &input.memory_id).map_err(
+            |missing| match missing {
+                Some(message) => {
+                    GetEventErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                        message: Some(message),
+                    })
+                }
+                None => GetEventErrorModeled::ServiceException(ServiceException {
+                    message: "the shared engine does not carry the AgentCore resource inventory"
+                        .to_string(),
+                }),
+            },
+        )?;
+
         let store = state.lock();
         let event = store
             .resolve_event(

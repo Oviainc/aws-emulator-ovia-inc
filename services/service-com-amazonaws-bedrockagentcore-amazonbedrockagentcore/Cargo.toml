@@ -26,6 +26,10 @@ tokio = { workspace = true, features = ["sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# `regex`: runs a modelled `@pattern` against a value the request boundary's own walk does
+# not reach (a map's key, a leaf inside a map entry's value) — see
+# `src/service/map_entry_constraints.rs`.
+regex = "1.13"
 tracing = { workspace = true }
 # `rquickjs`: the QuickJS JavaScript engine, embedded in this process, which is what
 # actually RUNS the JavaScript a caller submits to `InvokeCodeInterpreter`'s
