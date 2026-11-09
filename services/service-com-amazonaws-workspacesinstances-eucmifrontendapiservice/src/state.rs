@@ -277,24 +277,19 @@ pub const CATALOG_BILLING_MODES: &[&str] = BILLING_MODE_VALUES;
 
 /// Every platform type the model declares
 /// (`smithy_query(query="shape",shape="PlatformTypeEnum")`), as the generated constant.
-/// The families whose rows name this list run every WorkSpaces platform image.
-pub const ALL_PLATFORM_TYPES: &[&str] = PLATFORM_TYPE_ENUM_VALUES;
-
-/// The platform types this catalog records for the GPU families.
 ///
-/// A subset of [`ALL_PLATFORM_TYPES`], in that list's order. WHICH platforms a GPU
-/// family carries images for is published by AWS in prose (its "supported instance
-/// types" / bundle documentation for the WorkSpaces family — refresh the subset from
-/// there), not in the model, so the subset itself is this emulator's catalog data: its
-/// purpose is that `InstanceConfigurationFilter` genuinely selects — a platform a
-/// family has no image for reports the families that do, rather than every row of the
-/// catalog.
-pub const GPU_PLATFORM_TYPES: &[&str] = &[
-    "Linux/UNIX",
-    "Ubuntu Pro Linux",
-    "Windows",
-    "Windows BYOL",
-];
+/// This is the platform set EVERY catalogued instance type carries, because a reported
+/// entry lists "all valid combinations of tenancy, platform type, and billing mode
+/// supported for the specific WorkSpace Instance type" and "contains the COMPLETE SET
+/// of configuration options available for this instance type"
+/// (`smithy_query(query="doc",shape="InstanceTypeInfo",member="SupportedInstanceConfigurations")`):
+/// a WorkSpaces platform image is an x86-64 image, so an instance type this service
+/// can launch at all can be launched from any of them, and no narrower per-family
+/// platform set is published anywhere. A family row that named a subset would publish
+/// an entry missing combinations the service accepts, and would make
+/// `InstanceConfigurationFilter` hide instance types that do support the requested
+/// combination.
+pub const ALL_PLATFORM_TYPES: &[&str] = PLATFORM_TYPE_ENUM_VALUES;
 
 /// The `InstanceConfigurationTenancyEnum` value for a multi-tenant instance
 /// (`smithy_query(query="shape",shape="InstanceConfigurationTenancyEnum")`).
@@ -330,8 +325,8 @@ pub fn configuration_tenancy(placement_tenancy: &str) -> &'static str {
 pub const SHARED_AND_DEDICATED_TENANCY: &[&str] = INSTANCE_CONFIGURATION_TENANCY_ENUM_VALUES;
 
 /// Shared tenancy only: the tenancy set this catalog records for the burstable
-/// (`t`-prefixed) families, which it does not offer on dedicated hardware. Like
-/// [`GPU_PLATFORM_TYPES`] this is catalog data, not a modelled fact.
+/// (`t`-prefixed) families, which EC2 does not offer on dedicated hardware. Like the
+/// membership of [`INSTANCE_TYPE_FAMILIES`] this is catalog data, not a modelled fact.
 pub const SHARED_TENANCY_ONLY: &[&str] = &[TENANCY_SHARED];
 
 /// One row of the instance-type catalog: an instance type, and the dimensions along
@@ -410,8 +405,13 @@ impl InstanceTypeSpec {
 
     /// Every configuration combination this instance type supports, as the modelled
     /// `SupportedInstanceConfigurations`: the cross product of the row's platform
-    /// types, its tenancies and [`CATALOG_BILLING_MODES`], in that nesting order so
-    /// the list is stable across calls.
+    /// types, its tenancies and [`CATALOG_BILLING_MODES`].
+    ///
+    /// The member is documented as a SET — "all valid combinations … the complete set
+    /// of configuration options available for this instance type" — so what it must
+    /// carry is every combination the row supports and nothing else; the model orders
+    /// the list no way, and this nesting is only what makes the serialisation stable
+    /// across calls.
     pub fn supported_configurations(&self) -> Vec<SupportedInstanceConfiguration> {
         let mut configurations = Vec::with_capacity(
             self.platform_types.len() * self.tenancies.len() * CATALOG_BILLING_MODES.len(),
@@ -446,9 +446,12 @@ impl InstanceTypeSpec {
 // this emulator — decides which `<family>.<size>` names exist: `c5` is offered at
 // `9xlarge` and `18xlarge` where `m5` is offered at `8xlarge` and `16xlarge`, a
 // `-flex` family stops at `16xlarge`, and a burstable family starts at `nano`. SOURCE:
-// the published EC2 instance-type names of each family (the same ladders the EC2 API's
-// own `InstanceType` enumeration carries). Families offered at identical sizes share a
-// ladder, so a family row below names one of these rather than repeating a list.
+// the published EC2 instance-type names of each family — the same ladders the EC2 API's
+// own `InstanceType` enumeration carries, which this workspace ships as the generated
+// `INSTANCE_TYPE_VALUES` of the EC2 service crate, bare-metal sizes excluded (a
+// WorkSpace Instance is a managed EC2 instance, not a dedicated host). Families offered
+// at identical sizes share a ladder, so a family row below names one of these rather
+// than repeating a list.
 // ---------------------------------------------------------------------------
 
 /// The burstable (`t`) ladder: `t2`, `t3`, `t3a`.
@@ -1027,42 +1030,42 @@ pub const INSTANCE_TYPE_FAMILIES: &[InstanceFamilySpec] = &[
         platform_types: ALL_PLATFORM_TYPES,
         tenancies: SHARED_AND_DEDICATED_TENANCY,
     },
-    // Graphics. These carry the GPU platform images only — see
-    // [`GPU_PLATFORM_TYPES`].
+    // Graphics. A graphics family runs the same WorkSpaces platform images as the rest
+    // of the catalog — see [`ALL_PLATFORM_TYPES`].
     InstanceFamilySpec {
         family: "g4ad",
         sizes: SIZES_G4AD,
-        platform_types: GPU_PLATFORM_TYPES,
+        platform_types: ALL_PLATFORM_TYPES,
         tenancies: SHARED_AND_DEDICATED_TENANCY,
     },
     InstanceFamilySpec {
         family: "g4dn",
         sizes: SIZES_G4DN,
-        platform_types: GPU_PLATFORM_TYPES,
+        platform_types: ALL_PLATFORM_TYPES,
         tenancies: SHARED_AND_DEDICATED_TENANCY,
     },
     InstanceFamilySpec {
         family: "g5",
         sizes: SIZES_GPU,
-        platform_types: GPU_PLATFORM_TYPES,
+        platform_types: ALL_PLATFORM_TYPES,
         tenancies: SHARED_AND_DEDICATED_TENANCY,
     },
     InstanceFamilySpec {
         family: "g6",
         sizes: SIZES_GPU,
-        platform_types: GPU_PLATFORM_TYPES,
+        platform_types: ALL_PLATFORM_TYPES,
         tenancies: SHARED_AND_DEDICATED_TENANCY,
     },
     InstanceFamilySpec {
         family: "g6e",
         sizes: SIZES_GPU,
-        platform_types: GPU_PLATFORM_TYPES,
+        platform_types: ALL_PLATFORM_TYPES,
         tenancies: SHARED_AND_DEDICATED_TENANCY,
     },
     InstanceFamilySpec {
         family: "gr6",
         sizes: SIZES_GR6,
-        platform_types: GPU_PLATFORM_TYPES,
+        platform_types: ALL_PLATFORM_TYPES,
         tenancies: SHARED_AND_DEDICATED_TENANCY,
     },
 ];

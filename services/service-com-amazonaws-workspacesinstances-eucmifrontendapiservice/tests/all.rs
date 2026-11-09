@@ -31,6 +31,8 @@ mod instance_placement_zone;
 mod instance_token_parameter_mismatch;
 #[path = "all/instance_type_catalog.rs"]
 mod instance_type_catalog;
+#[path = "all/instance_type_configuration_completeness.rs"]
+mod instance_type_configuration_completeness;
 #[path = "all/list_pagination_resume_points.rs"]
 mod list_pagination_resume_points;
 #[path = "all/next_token_canonical_spelling.rs"]

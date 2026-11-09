@@ -48,3 +48,27 @@ Boot the emulator from this checkout and point a botocore 'workspaces-instances'
 2. Pick any non-GPU type from the answer and observe its SupportedInstanceConfigurations is the nested cross product platform -> tenancy -> billing (first element MONTHLY/Windows/SHARED) rather than the service's sequence.
 3. Pick a graphics type (g4dn.xlarge, g5.xlarge, g6.xlarge, gr6.4xlarge) and observe only 16 combinations over the 4 platform types Linux/UNIX, Ubuntu Pro Linux, Windows and Windows BYOL — 'Red Hat Enterprise Linux', 'Red Hat BYOL Linux' and 'SUSE Linux' are absent — and that client.list_instance_types(InstanceConfigurationFilter={'BillingMode': 'HOURLY', 'PlatformType': 'SUSE Linux', 'Tenancy': 'SHARED'}) therefore reports no graphics instance type.
 Equivalently, re-replay the wire fixture step named in Issue-Trace/Issue-Step: workspaces-instances-catalog-list-instance-types#task#1.
+
+## Resolution
+
+FIXED: the configuration SET of every entry the catalog reports. `GPU_PLATFORM_TYPES` — a
+locally invented four-value subset of `PlatformTypeEnum` — is gone, and every row of
+`INSTANCE_TYPE_FAMILIES` names the whole modelled platform list, because
+`InstanceTypeInfo$SupportedInstanceConfigurations` is documented as "all valid combinations …
+the complete set of configuration options available for this instance type". A graphics entry
+now carries its 28 combinations rather than 16, and `InstanceConfigurationFilter` on the Red
+Hat Enterprise Linux, Red Hat BYOL Linux and SUSE Linux images reports the graphics types too.
+Covered by `tests/all/instance_type_configuration_completeness.rs`.
+
+RESIDUAL, declined — the replay key `workspaces-instances|ListInstanceTypes|2xx->2xx|$.InstanceTypes[*]`
+still diverges, so do NOT read this file as that key passing:
+
+1. The SEQUENCE the combinations are serialised in. The member is a set, the model attaches no
+   ordering to it, and the recorded permutation follows no rule AWS publishes; reproducing it
+   would mean pasting one run's recorded sequence into the catalog. The served sequence is
+   deterministic and stable across calls.
+2. The entry COUNT: the recording holds 597 names, this catalog holds 588. Membership follows
+   the rule "the documented supported families × each family's published EC2 size ladder, bare
+   metal excluded", and every ladder matches the EC2 API's own modelled instance-type
+   enumeration; which further names the service's catalog holds is service data that no model
+   or published list in this checkout enumerates.

@@ -515,8 +515,8 @@ async fn the_catalog_rows_are_modelled_names_in_a_stable_order() {
     assert!(
         instance_type_catalog()
             .iter()
-            .any(|spec| spec.platform_types.len() < PLATFORM_TYPE_ENUM_VALUES.len()),
-        "the catalog must hold at least one instance type that carries only some platforms"
+            .all(|spec| spec.platform_types.len() == PLATFORM_TYPE_ENUM_VALUES.len()),
+        "every catalogued instance type carries every modelled platform type"
     );
 
     // `InstanceType`: `len 1..64`, `^([a-z0-9-]+)\.([a-z0-9]+)$`
@@ -551,8 +551,8 @@ async fn the_catalog_rows_are_modelled_names_in_a_stable_order() {
 
     // Literal expectations for rows the issue did not cite, so the computed cases
     // above cannot pass against an invented catalog. Source: the catalog's own
-    // documented dimensions in `state.rs` (GPU families carry no Red Hat or SUSE
-    // image; the burstable `t3` family is shared-tenancy only).
+    // documented dimensions in `state.rs` (every instance type carries every modelled
+    // platform image; the burstable `t3` family is shared-tenancy only).
     let row = |name: &str| {
         instance_type_catalog()
             .iter()
@@ -561,7 +561,7 @@ async fn the_catalog_rows_are_modelled_names_in_a_stable_order() {
     };
     for (name, platform_type, tenancy, expected) in [
         ("g6.xlarge", "Ubuntu Pro Linux", "DEDICATED", true),
-        ("g6.xlarge", "SUSE Linux", "SHARED", false),
+        ("g6.xlarge", "SUSE Linux", "SHARED", true),
         ("g4dn.2xlarge", "Windows BYOL", "SHARED", true),
         ("t3.small", "Red Hat Enterprise Linux", "SHARED", true),
         ("t3.small", "Red Hat Enterprise Linux", "DEDICATED", false),
