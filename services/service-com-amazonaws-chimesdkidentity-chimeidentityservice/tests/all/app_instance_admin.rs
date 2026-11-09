@@ -131,11 +131,13 @@ async fn an_app_instance_admin_is_promoted_and_read_back() {
                 "case {:?}: wrong refusal Code, body {body:?}",
                 case.label
             );
-            // A refused promotion is not recorded, so nothing reads it back.
+            // A refused promotion is not recorded, so nothing reads it back: the read of
+            // a grant this service holds no record of is the permanent refusal.
             let (described, described_body) =
                 describe_admin(&emulator, &app_instance_arn, &admin_arn).await;
             assert_eq!(
-                described, 400,
+                (described, described_body["Code"].as_str()),
+                (403, Some("Forbidden")),
                 "case {:?}: a refused promotion must not be readable, got {described} {described_body:?}",
                 case.label
             );

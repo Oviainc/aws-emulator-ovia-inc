@@ -233,18 +233,22 @@ async fn demoting_an_app_instance_admin_drops_only_its_promotion() {
         }
 
         if case.expected_code.is_none() {
-            // The promotion is gone, so the reader no longer finds one.
+            // The promotion is gone, so the reader no longer finds one: a grant this
+            // service holds no record of is refused as a request the caller may not make.
             let (described, described_body) =
                 describe_admin(&emulator, &app_instance_arn, &admin_arn).await;
             assert_eq!(
-                described, 400,
+                described, 403,
                 "case {:?}: a demoted identity must not be readable as an admin, got {described} {described_body:?}",
                 case.label
             );
             assert_eq!(
-                described_body["Code"].as_str(),
-                Some("NotFound"),
-                "case {:?}: wrong Code reading a demoted admin, body {described_body:?}",
+                (
+                    described_body["Code"].as_str(),
+                    described_body["Message"].as_str()
+                ),
+                (Some("Forbidden"), Some(FORBIDDEN_MESSAGE)),
+                "case {:?}: wrong refusal reading a demoted admin, body {described_body:?}",
                 case.label
             );
         }

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/app_instance_admin.rs"]
 mod app_instance_admin;
+#[path = "all/app_instance_admin_absent_grant.rs"]
+mod app_instance_admin_absent_grant;
 #[path = "all/app_instance_admin_demotion.rs"]
 mod app_instance_admin_demotion;
 #[path = "all/app_instance_admin_listing.rs"]

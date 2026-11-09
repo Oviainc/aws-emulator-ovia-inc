@@ -400,6 +400,9 @@ struct AddressedCall {
 ///
 /// `DescribeAppInstanceBot` is not here: it answers the permanent refusal for ANY bot ARN
 /// it holds no record for, so it cannot tell the two cases below apart.
+/// `DescribeAppInstanceAdmin` is out for the same reason: the grant it addresses is the
+/// resource it resolves, so it answers the permanent refusal for any pair of ARNs it
+/// holds no promotion for.
 fn calls_addressed_to(instance: &str, user: &str, bot: &str) -> Vec<AddressedCall> {
     let call = |label: &str, method: &'static str, path: String, body: Option<Value>| {
         AddressedCall {
@@ -466,16 +469,6 @@ fn calls_addressed_to(instance: &str, user: &str, bot: &str) -> Vec<AddressedCal
             "POST",
             format!("/app-instances/{}/admins", uri_encode(instance)),
             Some(json!({ "AppInstanceAdminArn": user })),
-        ),
-        call(
-            "DescribeAppInstanceAdmin",
-            "GET",
-            format!(
-                "/app-instances/{}/admins/{}",
-                uri_encode(instance),
-                uri_encode(user)
-            ),
-            None,
         ),
         call(
             "DescribeAppInstanceUser",

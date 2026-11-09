@@ -183,20 +183,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A reporting operation: it reads the recorded promotion and writes nothing.
+        //
+        // Resolving the promotion is an ACCESS decision, not a lookup that reports
+        // absence: the grant this pair of ARNs names IS the resource the read addresses,
+        // and holding no grant for it means this caller administers nothing here, so the
+        // answer is the modelled permanent 403 refusal carrying the service's one
+        // forbidden sentence — never a malformed-input refusal, and it discloses nothing
+        // about whether either ARN names anything. Every way the grant can be missing is
+        // the same answer: never promoted, demoted again, or named over an app instance
+        // this service does not hold.
         let record = directory
             .lock()
             .record(&input.app_instance_arn, &input.app_instance_admin_arn)
             .cloned()
             .ok_or_else(|| {
-                // This operation models no 404 shape, so an ARN this service holds no
-                // promotion for is refused with the modelled `BadRequestException`
-                // carrying the `NotFound` error code, as the rest of this service does.
-                DescribeAppInstanceAdminErrorModeled::BadRequestException(BadRequestException {
-                    code: Some("NotFound".to_string()),
-                    message: Some(format!(
-                        "{} is not an administrator of AppInstance {}",
-                        input.app_instance_admin_arn, input.app_instance_arn
-                    )),
+                DescribeAppInstanceAdminErrorModeled::ForbiddenException(ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
                 })
             })?;
         // The administering identity's NAME is held by the identity's own record, not by
