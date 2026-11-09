@@ -24,7 +24,8 @@
 //! not a JSON policy document or — unless `bypassPolicyLockoutSafetyCheck` is set
 //! — one that would leave nobody able to replace it
 //! (`state::validate_cluster_policy`, the check `PutClusterPolicy` applies to the
-//! same document).
+//! same document) — or one granting to an identity this account's IAM does not hold
+//! (`state::unresolved_policy_principal`, the same).
 //!
 //! ## Shape of an operation
 //!
@@ -231,65 +232,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
-        let mut state = state.lock();
-        state.settle(now);
 
-        // A multi-Region configuration's WITNESS Region cannot be the cluster's own
-        // Region (this operation's documented constraint), and the cluster this call
-        // mints belongs to the request's Region — so a request naming that Region as
-        // the witness is refused with the modelled 400 and nothing is created, ahead
-        // of the idempotency ledger and the quota check, which decide what to do with
-        // a request whose input is valid in the first place.
-        if let Err(invalid) = crate::state::validate_witness_region(
-            input.multi_region_properties.as_ref(),
-            &region,
-        ) {
-            return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
-        }
+        // The request's own members are read against the store while it is held; the
+        // store is RELEASED again before the document's principals are resolved
+        // below, which is a call out to this account's IAM.
+        let (identifier, arn) = {
+            let mut state = state.lock();
+            state.settle(now);
 
-        // The peer clusters a configuration names are held on the cluster record
-        // and walked whenever a peering is resolved, so the member is bounded:
-        // a configuration naming more peers than one multi-Region cluster is
-        // formed from is refused before any cluster is minted.
-        if let Err(invalid) =
-            crate::state::validate_multi_region_peers(input.multi_region_properties.as_ref())
-        {
-            return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
-        }
-
-        // The `tags` a create carries are written exactly as `TagResource` writes
-        // them, so they are held to the same rule: a key under the prefix AWS
-        // reserves for its own tags is not the caller's to write, and the request is
-        // refused with the modelled 400 before any cluster is minted.
-        if let Err(invalid) = crate::state::validate_tag_keys(
-            crate::state::TAGS_MEMBER,
-            input
-                .tags
-                .iter()
-                .flat_map(|tags| tags.keys().map(String::as_str)),
-        ) {
-            return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
-        }
-
-        // A `policy` supplied here is persisted as the cluster's own policy record
-        // and reported by `GetClusterPolicy` exactly as one `PutClusterPolicy`
-        // attached, so the document is held to the same rule: it has to parse, and
-        // unless the caller sets `bypassPolicyLockoutSafetyCheck` it may not leave
-        // nobody able to replace it. The cluster the document would be attached to
-        // is the one this call mints, so its identifier — and the ARN the
-        // document's `Resource` set is read against — is drawn first; nothing is
-        // created when the check refuses.
-        let identifier = state.mint_cluster_identifier();
-        let arn = crate::state::cluster_arn(&region, &identifier);
-        if let Some(document) = input.policy.as_deref() {
-            if let Err(invalid) = crate::state::validate_cluster_policy(
-                document,
-                &arn,
-                input.bypass_policy_lockout_safety_check,
+            // A multi-Region configuration's WITNESS Region cannot be the cluster's own
+            // Region (this operation's documented constraint), and the cluster this call
+            // mints belongs to the request's Region — so a request naming that Region as
+            // the witness is refused with the modelled 400 and nothing is created, ahead
+            // of the idempotency ledger and the quota check, which decide what to do with
+            // a request whose input is valid in the first place.
+            if let Err(invalid) = crate::state::validate_witness_region(
+                input.multi_region_properties.as_ref(),
+                &region,
             ) {
                 return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
             }
+
+            // The peer clusters a configuration names are held on the cluster record
+            // and walked whenever a peering is resolved, so the member is bounded:
+            // a configuration naming more peers than one multi-Region cluster is
+            // formed from is refused before any cluster is minted.
+            if let Err(invalid) =
+                crate::state::validate_multi_region_peers(input.multi_region_properties.as_ref())
+            {
+                return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
+            }
+
+            // The `tags` a create carries are written exactly as `TagResource` writes
+            // them, so they are held to the same rule: a key under the prefix AWS
+            // reserves for its own tags is not the caller's to write, and the request is
+            // refused with the modelled 400 before any cluster is minted.
+            if let Err(invalid) = crate::state::validate_tag_keys(
+                crate::state::TAGS_MEMBER,
+                input
+                    .tags
+                    .iter()
+                    .flat_map(|tags| tags.keys().map(String::as_str)),
+            ) {
+                return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
+            }
+
+            // A `policy` supplied here is persisted as the cluster's own policy record
+            // and reported by `GetClusterPolicy` exactly as one `PutClusterPolicy`
+            // attached, so the document is held to the same rule: it has to parse, and
+            // unless the caller sets `bypassPolicyLockoutSafetyCheck` it may not leave
+            // nobody able to replace it. The cluster the document would be attached to
+            // is the one this call mints, so its identifier — and the ARN the
+            // document's `Resource` set is read against — is drawn first; nothing is
+            // created when the check refuses.
+            let identifier = state.mint_cluster_identifier();
+            let arn = crate::state::cluster_arn(&region, &identifier);
+            if let Some(document) = input.policy.as_deref() {
+                if let Err(invalid) = crate::state::validate_cluster_policy(
+                    document,
+                    &arn,
+                    input.bypass_policy_lockout_safety_check,
+                ) {
+                    return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
+                }
+            }
+            (identifier, arn)
+        };
+
+        // The same rule the other entry point applies to a document it attaches: a
+        // resource-based policy states WHO it grants to, so the identities an inline
+        // `policy` names are resolved against this account's IAM before anything is
+        // written, and a document granting to an identity IAM does not hold is
+        // refused — minting no cluster at all.
+        if let Some(document) = input.policy.as_deref() {
+            if let Some(invalid) =
+                crate::state::unresolved_policy_principal(ctx, &region, document).await
+            {
+                return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
+            }
         }
+
+        let mut state = state.lock();
 
         // `@idempotencyToken`: a repeat of the SAME request returns the result of
         // the original call and has no additional effect; the same token with

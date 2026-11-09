@@ -3,7 +3,9 @@
 //! @op PutClusterPolicy
 //!
 //! Attaches a resource-based policy document to a cluster and answers with the
-//! `policyVersion` token it was stored under. Unless the caller sets
+//! `policyVersion` token it was stored under. A document granting to an identity
+//! this account's IAM does not hold is refused, because such a grant is a grant to
+//! nobody. Unless the caller sets
 //! `bypassPolicyLockoutSafetyCheck`, a document that would leave nobody able to
 //! replace it is refused; an `expectedPolicyVersion` that does not name the
 //! version currently attached is refused too, so two concurrent writers cannot
@@ -183,42 +185,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
-        let mut state = state.lock();
-        state.settle(now);
 
-        // The ARN of the cluster the policy is being attached to: the resource the
-        // document's `Resource` set is read against below.
-        let Some(cluster_arn) = state
-            .clusters
-            .get(&input.identifier)
-            .map(|cluster| cluster.arn.clone())
-        else {
-            return Err(PutClusterPolicyErrorModeled::ResourceNotFoundException(
-                crate::state::cluster_not_found(&region, &input.identifier),
-            )
-            .into());
-        };
+        // The cluster is resolved and the document read against it while the store
+        // is held; the store is RELEASED again before the document's principals are
+        // resolved below, which is a call out to this account's IAM.
+        {
+            let mut state = state.lock();
+            state.settle(now);
 
-        // The document this request would attach has to be one this service may
-        // hold: it has to parse, and unless the caller accepts the risk itself it
-        // may not leave nobody able to replace it. The check is the one every
-        // operation that writes a cluster's policy shares, read against the ARN of
-        // the cluster the document would be attached to, and nothing is attached
-        // when it refuses.
-        //
-        // Decided ahead of the idempotency ledger below, which decides what to do
-        // with a request whose input is valid in the first place: a `clientToken`
-        // another request already used does not turn this refusal into a conflict,
-        // and the verdict on a document belongs to the document rather than to the
-        // tokens the caller happened to spend — so both entry points that write a
-        // cluster's policy answer the same document identically.
-        if let Err(invalid) = crate::state::validate_cluster_policy(
-            &input.policy,
-            &cluster_arn,
-            input.bypass_policy_lockout_safety_check,
-        ) {
+            // The ARN of the cluster the policy is being attached to: the resource
+            // the document's `Resource` set is read against below.
+            let Some(cluster_arn) = state
+                .clusters
+                .get(&input.identifier)
+                .map(|cluster| cluster.arn.clone())
+            else {
+                return Err(PutClusterPolicyErrorModeled::ResourceNotFoundException(
+                    crate::state::cluster_not_found(&region, &input.identifier),
+                )
+                .into());
+            };
+
+            // The document this request would attach has to be one this service may
+            // hold: it has to parse, and unless the caller accepts the risk itself
+            // it may not leave nobody able to replace it. The check is the one every
+            // operation that writes a cluster's policy shares, read against the ARN
+            // of the cluster the document would be attached to, and nothing is
+            // attached when it refuses.
+            //
+            // Decided ahead of the idempotency ledger below, which decides what to
+            // do with a request whose input is valid in the first place: a
+            // `clientToken` another request already used does not turn this refusal
+            // into a conflict, and the verdict on a document belongs to the document
+            // rather than to the tokens the caller happened to spend — so both entry
+            // points that write a cluster's policy answer the same document
+            // identically.
+            if let Err(invalid) = crate::state::validate_cluster_policy(
+                &input.policy,
+                &cluster_arn,
+                input.bypass_policy_lockout_safety_check,
+            ) {
+                return Err(PutClusterPolicyErrorModeled::ValidationException(invalid).into());
+            }
+        }
+
+        // A resource-based policy states WHO it grants to, so the identities the
+        // document names are resolved against this account's IAM before anything is
+        // written: a document granting to an identity IAM does not hold is refused,
+        // and the policy the cluster already carries — and the version it carries it
+        // under — stays exactly as it was. The same check both entry points that
+        // write a cluster's policy share.
+        if let Some(invalid) =
+            crate::state::unresolved_policy_principal(ctx, &region, &input.policy).await
+        {
             return Err(PutClusterPolicyErrorModeled::ValidationException(invalid).into());
         }
+
+        let mut state = state.lock();
 
         // `@idempotencyToken`: a repeat of the SAME request answers with the
         // version the first call ISSUED — kept with the token, because the

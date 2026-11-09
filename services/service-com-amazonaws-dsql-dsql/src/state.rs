@@ -46,7 +46,11 @@
 //! ([`validate_cluster_policy`]) — it has to parse, and unless the caller bypasses
 //! the safety check it may not leave nobody able to replace it — are one
 //! implementation both of them call, as the witness-Region, peer-list and tag-key
-//! checks already are. The check that a cluster or stream identifier is an
+//! checks already are. The identities such a document GRANTS TO are resolved
+//! against this account's IAM on the same terms
+//! ([`unresolved_policy_principal`], over the principals
+//! [`policy_principals`] reads out of it), because a document one entry point would
+//! refuse as granting to nobody cannot be reachable through the other. The check that a cluster or stream identifier is an
 //! identifier of this service at all ([`is_resource_identifier`], refused by
 //! [`validate_cluster_identifier`] / [`validate_stream_identifier`]) lives here on
 //! the same terms: eleven routes carry such an identifier, and all of them have to
@@ -2464,6 +2468,85 @@ fn unreadable_member_message(member: &str, form: &str) -> String {
     format!(
         "Aurora DSQL can't process the request because the {member} that you specified \
          isn't valid. Provide the {member} in {form} and try again."
+    )
+}
+
+/// Every identity the statements of the policy `document` GRANT TO: the values of
+/// their `Principal` elements — the element a resource-based policy states its
+/// grantees in — flattened out of the bare string, the list or the
+/// principal-type block each of them may be written as ([`principal_entries`]), in
+/// the order the document names them and without repeats, because the same identity
+/// named twice is one identity to resolve.
+///
+/// `NotPrincipal` states the principals a statement EXEMPTS rather than the ones it
+/// grants to, so nothing is resolved out of it: a statement that exempts an identity
+/// nobody holds still grants to everyone else.
+///
+/// A value that is no policy document names nobody rather than failing here: what
+/// makes a document unusable is stated by [`validate_cluster_policy`], once.
+pub fn policy_principals(document: &str) -> Vec<String> {
+    let Some(parsed) = parse_policy(document) else {
+        return Vec::new();
+    };
+    let statements = statements(&parsed);
+    let mut named: Vec<String> = Vec::new();
+    for principal in statements
+        .iter()
+        .filter_map(|statement| statement.get("Principal"))
+        .flat_map(principal_entries)
+    {
+        if !named.contains(&principal) {
+            named.push(principal);
+        }
+    }
+    named
+}
+
+/// The refusal a policy document earns when one of the identities it GRANTS TO is
+/// not there, or `None` when every identity it names resolves.
+///
+/// A resource-based policy states who a permission is granted to, so the identities
+/// a submitted document names are resolved against this account's IAM before the
+/// document is stored — a grant to an identity that does not exist is a grant to
+/// nobody — and every operation that writes a cluster's policy refuses such a
+/// document with the modelled `ValidationException`, leaving the policy the cluster
+/// already carries, and the version it carries it under, exactly as they were.
+///
+/// The resolution itself is [`::service_common::iam_principal::identity_is_absent`],
+/// the tree's one reading of a policy principal against IAM, so a refusal is
+/// grounded in what IAM ANSWERED: a principal that names no IAM role or user of this
+/// account — the wildcard, an account or its root, a service or federated principal,
+/// an identity of another account whose IAM this emulator is not the one to ask — is
+/// resolved by nothing here and refuses nothing.
+pub async fn unresolved_policy_principal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    document: &str,
+) -> Option<ValidationException> {
+    for principal in policy_principals(document) {
+        if ::service_common::iam_principal::identity_is_absent(ctx, region, &principal).await {
+            return Some(ValidationException {
+                message: inapplicable_policy_message(POLICY_MEMBER),
+                reason: VALIDATION_REASON_OTHER.to_string(),
+                field_list: None,
+            });
+        }
+    }
+    None
+}
+
+/// Aurora DSQL's sentence for a policy document it cannot apply: it names the member
+/// the document arrived in and the elements a document it can apply carries, and
+/// echoes nothing of the document itself.
+///
+/// The one place that refusal is worded, so both operations that write a cluster's
+/// policy state it identically.
+fn inapplicable_policy_message(member: &str) -> String {
+    format!(
+        "Invalid input for '{member}'. Aurora DSQL can't apply the policy because the \
+         policy document isn't valid. Make sure your policy includes all required \
+         elements (Version, Statement, Principal, Action, and Resource) in valid JSON \
+         format and try again."
     )
 }
 
