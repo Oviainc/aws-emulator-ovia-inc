@@ -51,6 +51,11 @@ pub mod replication;
 // the caller's behalf — lives in `state/sse_kms.rs`.
 pub mod sse_kms;
 
+// Whether the IAM role a metadata configuration names for its ANNOTATION table lets S3
+// Metadata read annotations through it — the question every call that provisions that table
+// asks before it does — lives in `state/metadata_annotation_role.rs`.
+pub mod metadata_annotation_role;
+
 /// The Region a general purpose bucket is created in when the request names no
 /// `CreateBucketConfiguration.LocationConstraint`.
 ///
@@ -3971,11 +3976,16 @@ pub const METADATA_TABLE_BUCKET_TYPE: &str = "aws";
 /// about them.
 pub const METADATA_TABLE_BUCKET_NAME: &str = "aws-s3";
 
-/// The namespace inside that table bucket a bucket's metadata tables live in — "the
-/// namespace in the table bucket where the metadata tables for a metadata configuration
-/// are stored" (`smithy_query(query="doc",shape="DestinationResult",
-/// member="TableNamespace")`), which S3 Metadata names `aws_s3_metadata`.
-pub const METADATA_TABLE_NAMESPACE: &str = "aws_s3_metadata";
+/// What the namespace holding ONE general purpose bucket's metadata tables begins with —
+/// "the namespace in the table bucket where the metadata tables for a metadata
+/// configuration are stored" (`smithy_query(query="doc",shape="DestinationResult",
+/// member="TableNamespace")`).
+///
+/// Every general purpose bucket's metadata tables live in a namespace OF THEIR OWN inside
+/// the managed table bucket, named for the bucket they describe
+/// ([`metadata_table_namespace`]) — which is what lets the tables inside it be named for
+/// nothing but which of the three they are ([`METADATA_JOURNAL_TABLE_NAME`]).
+pub const METADATA_TABLE_NAMESPACE_PREFIX: &str = "b_";
 
 /// The service namespace of a metadata table's (and its table bucket's) ARN, so one reads
 /// `arn:aws:s3tables:<region>:<account>:bucket/<bucket>` and a table's
@@ -3983,20 +3993,33 @@ pub const METADATA_TABLE_NAMESPACE: &str = "aws_s3_metadata";
 /// pattern for.
 const METADATA_TABLE_ARN_SERVICE: &str = "s3tables";
 
-/// What a metadata table's name ends in, per table: the journal table, the inventory
-/// table and the annotation table of one general purpose bucket are three tables in one
-/// namespace, so the suffix is what tells them apart.
-pub const METADATA_JOURNAL_TABLE_SUFFIX: &str = "_journal";
-/// See [`METADATA_JOURNAL_TABLE_SUFFIX`].
-pub const METADATA_INVENTORY_TABLE_SUFFIX: &str = "_inventory";
-/// See [`METADATA_JOURNAL_TABLE_SUFFIX`].
-pub const METADATA_ANNOTATION_TABLE_SUFFIX: &str = "_annotation";
+/// The name of the JOURNAL table of a metadata configuration
+/// (`JournalTableConfigurationResult$TableName`).
+///
+/// The tables of a V2 configuration are S3-MANAGED: the caller names none of them, and each
+/// general purpose bucket's three tables are alone in a namespace of their own
+/// ([`metadata_table_namespace`]), so a table's name says which of the three it is and
+/// nothing else — the coordinates a client builds a table reference from are that namespace
+/// plus this name.
+pub const METADATA_JOURNAL_TABLE_NAME: &str = "journal";
+/// See [`METADATA_JOURNAL_TABLE_NAME`] — the INVENTORY table's name
+/// (`InventoryTableConfigurationResult$TableName`).
+pub const METADATA_INVENTORY_TABLE_NAME: &str = "inventory";
+/// See [`METADATA_JOURNAL_TABLE_NAME`] — the ANNOTATION table's name
+/// (`AnnotationTableConfigurationResult$TableName`).
+pub const METADATA_ANNOTATION_TABLE_NAME: &str = "annotation";
 
 /// The `ConfigurationState` value that asks for a table to be created, for both the
 /// inventory table (`InventoryConfigurationState`) and the annotation table
 /// (`AnnotationConfigurationState`) — each enum publishes `ENABLED` and `DISABLED`
 /// (`smithy_query(query="shape",shape="InventoryConfigurationState,AnnotationConfigurationState")`).
 pub const METADATA_CONFIGURATION_STATE_ENABLED: &str = "ENABLED";
+
+/// The other value those two enums publish: the state of a table a configuration does NOT
+/// ask for, which is what a reader reports for a table the configuration never named — the
+/// `ConfigurationState` of every optional table result is required, so the container is
+/// reported whatever state the table is in.
+pub const METADATA_CONFIGURATION_STATE_DISABLED: &str = "DISABLED";
 
 /// The `TableSseAlgorithm` value that encrypts a metadata table with a Key Management
 /// Service key, and so the one value that needs a key ARN beside it: the other value that
@@ -4119,6 +4142,21 @@ pub fn metadata_inventory_table_failure(
     }
 }
 
+/// What taking the S3 Metadata configuration of a general purpose bucket away did — the
+/// outcomes the caller of
+/// [`ComAmazonawsS3Amazons3State::delete_metadata_configuration`] answers differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataConfigurationDeletion {
+    /// The bucket carried a configuration and carries none now.
+    Deleted,
+    /// This store holds no such general purpose bucket.
+    NoSuchBucket,
+    /// The bucket is there and carried NO metadata configuration, so there was none to
+    /// delete: the condition this family names for itself
+    /// ([`METADATA_CONFIGURATION_NOT_FOUND_CODE`]).
+    NoConfiguration,
+}
+
 /// What enabling or disabling the inventory table of a bucket's metadata configuration did —
 /// the outcomes the caller of
 /// [`ComAmazonawsS3Amazons3State::update_metadata_inventory_table`] answers differently.
@@ -4149,9 +4187,13 @@ pub enum MetadataInventoryTableUpdate {
 /// ([`Self::status_at`]).
 #[derive(Debug, Clone)]
 pub struct MetadataTable {
-    /// The table's name in [`METADATA_TABLE_NAMESPACE`], as
-    /// [`metadata_table_name`] derived it from the general purpose bucket's name.
+    /// Which of the configuration's three tables this is: one of
+    /// [`METADATA_JOURNAL_TABLE_NAME`], [`METADATA_INVENTORY_TABLE_NAME`] and
+    /// [`METADATA_ANNOTATION_TABLE_NAME`].
     pub name: String,
+    /// The namespace of the managed table bucket the table was created in — the general
+    /// purpose bucket's own ([`metadata_table_namespace`]).
+    pub namespace: String,
     /// When the table falls due to be in service — the instant it stops being reported as
     /// `CREATING`, [`METADATA_TABLE_ACTIVATION_DELAY`] after the call that asked for it.
     pub active_at: SystemTime,
@@ -4179,23 +4221,36 @@ pub struct MetadataTableFailure {
 }
 
 impl MetadataTable {
-    /// The table `name`, as the call that asked for it at `created_at` records it: being
-    /// created now, in service a span later.
-    pub fn creating(name: String, created_at: SystemTime) -> Self {
+    /// The table `name` of the namespace `namespace`, as the call that asked for it at
+    /// `created_at` records it: being created now, in service a span later.
+    pub fn creating(namespace: &str, name: &str, created_at: SystemTime) -> Self {
         Self {
-            name,
+            name: name.to_string(),
+            namespace: namespace.to_string(),
             active_at: created_at + METADATA_TABLE_ACTIVATION_DELAY,
             failure: None,
         }
     }
 
-    /// The table `name` that could not be created, with `failure` saying why: reported
+    /// The same table that could not be created, with `failure` saying why: reported
     /// `FAILED` from the create onwards rather than ever falling due.
-    pub fn failed(name: String, created_at: SystemTime, failure: MetadataTableFailure) -> Self {
+    pub fn failed(
+        namespace: &str,
+        name: &str,
+        created_at: SystemTime,
+        failure: MetadataTableFailure,
+    ) -> Self {
         Self {
             failure: Some(failure),
-            ..Self::creating(name, created_at)
+            ..Self::creating(namespace, name, created_at)
         }
+    }
+
+    /// The table's name QUALIFIED by the namespace it lives in
+    /// ([`metadata_qualified_table_name`]) — what identifies it inside the managed table
+    /// bucket, since the three table names repeat in every bucket's namespace.
+    pub fn qualified_name(&self) -> String {
+        metadata_qualified_table_name(&self.namespace, &self.name)
     }
 
     /// The `TableStatus` the table is in at `instant`: `FAILED` for a table that could not
@@ -4273,6 +4328,7 @@ fn set_optional_metadata_table_state(
     slot: &mut Option<MetadataTableConfiguration>,
     configuration_state: String,
     role: Option<String>,
+    namespace: &str,
     table_name: &str,
     failure: Option<MetadataTableFailure>,
     now: SystemTime,
@@ -4284,8 +4340,8 @@ fn set_optional_metadata_table_state(
         configuration_state,
         table: enabled.then(|| {
             carried_table.unwrap_or_else(|| match failure {
-                Some(failure) => MetadataTable::failed(table_name.to_string(), now, failure),
-                None => MetadataTable::creating(table_name.to_string(), now),
+                Some(failure) => MetadataTable::failed(namespace, table_name, now, failure),
+                None => MetadataTable::creating(namespace, table_name, now),
             })
         }),
         role: role.or_else(|| carried.and_then(|table| table.role)),
@@ -4319,6 +4375,16 @@ pub struct BucketMetadataConfiguration {
 }
 
 impl BucketMetadataConfiguration {
+    /// The namespace of the managed table bucket this configuration's tables live in — the
+    /// general purpose bucket's own ([`metadata_table_namespace`]), which
+    /// `DestinationResult$TableNamespace` reports.
+    ///
+    /// Read off the JOURNAL table, which every configuration has, so what is reported is the
+    /// namespace the tables were really created in rather than a second copy of the rule.
+    pub fn table_namespace(&self) -> &str {
+        &self.journal.namespace
+    }
+
     /// Every table this configuration has: the journal table, which it always has, and the
     /// optional inventory and annotation tables while their state has one behind it.
     ///
@@ -4340,20 +4406,34 @@ impl BucketMetadataConfiguration {
     }
 }
 
-/// The name of one metadata table of the general purpose bucket `bucket`: its name, folded
-/// to the character set an S3 Tables table name is written in, and `suffix` naming which of
-/// the configuration's tables it is.
+/// The namespace of the managed table bucket that holds the metadata tables of the general
+/// purpose bucket `bucket`: [`METADATA_TABLE_NAMESPACE_PREFIX`] and the bucket's own name.
 ///
-/// A general purpose bucket's name may carry dots and hyphens, which a table name may not
-/// (every S3 Tables request publishes `[a-zA-Z0-9-_]{1,255}` for the table portion of a
-/// table ARN, and S3 Tables table names are written in lowercase letters, digits and
-/// underscores), so each character outside that set becomes an underscore. Derived from the
-/// bucket's own name rather than minted, so the table a reader reports for one bucket is
-/// the same on every read — and two bucket names that differ only in the characters this
-/// folds (a dot where another has a hyphen) name the same table, which is what the
-/// `*AlreadyExists` provisioning failures report.
-pub fn metadata_table_name(bucket: &str, suffix: &str) -> String {
-    let stem: String = bucket
+/// Derived from the bucket's own name rather than minted, so the namespace a reader reports
+/// for one bucket is the same on every read, and one bucket's tables are never in another's
+/// namespace.
+pub fn metadata_table_namespace(bucket: &str) -> String {
+    format!("{METADATA_TABLE_NAMESPACE_PREFIX}{bucket}")
+}
+
+/// The name `table` of the namespace `namespace`, as one value — what identifies one
+/// metadata table inside the managed table bucket.
+///
+/// The three table names ([`METADATA_JOURNAL_TABLE_NAME`] and the other two) are the same in
+/// every bucket's namespace, so a name alone does not tell two buckets' journal tables
+/// apart: what does is the namespace it is in. This is the one place that joins the two, so
+/// the record of which tables the managed table bucket holds
+/// ([`ComAmazonawsS3Amazons3State::metadata_namespace_holds`]) and the id a table's ARN
+/// carries cannot drift apart.
+///
+/// Written in the character set an S3 Tables name is written in — every S3 Tables request
+/// publishes `^[0-9a-z_]*$` for a `NamespaceName` and a `TableName`, and
+/// `[a-zA-Z0-9-_]{1,255}` for the table portion of a table ARN — so each character of the
+/// general purpose bucket's name outside that set becomes an underscore. Two bucket names
+/// that differ only in the characters this folds (a dot where another has a hyphen) therefore
+/// identify the same table, which is what the `*AlreadyExists` provisioning failures report.
+pub fn metadata_qualified_table_name(namespace: &str, table: &str) -> String {
+    format!("{namespace}_{table}")
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() {
@@ -4362,8 +4442,7 @@ pub fn metadata_table_name(bucket: &str, suffix: &str) -> String {
                 '_'
             }
         })
-        .collect();
-    format!("{stem}{suffix}")
+        .collect()
 }
 
 /// The ARN of the managed table bucket a metadata configuration's tables live in, in
@@ -4376,14 +4455,22 @@ pub fn metadata_table_bucket_arn(region: &str) -> String {
     )
 }
 
-/// The ARN of the metadata table `table` in `region`: the table bucket's own ARN above with
-/// the table's name appended, which is the form every S3 Tables request publishes for a
-/// table ARN.
-pub fn metadata_table_arn(region: &str, table: &str) -> String {
+/// The ARN of the metadata table `table` of the namespace `namespace` in `region`: the table
+/// bucket's own ARN above with the table's id appended, which is the form every S3 Tables
+/// request publishes for a table ARN.
+///
+/// The id is the table's name qualified by its namespace
+/// ([`metadata_qualified_table_name`]), because a table ARN identifies ONE table of the
+/// table bucket: the last segment of an S3 Tables table ARN is the table's own id rather
+/// than its name, and the bare name repeats in every bucket's namespace.
+pub fn metadata_table_arn(region: &str, namespace: &str, table: &str) -> String {
     ::engine::emulator_arn(
         METADATA_TABLE_ARN_SERVICE,
         region,
-        &format!("bucket/{METADATA_TABLE_BUCKET_NAME}/table/{table}"),
+        &format!(
+            "bucket/{METADATA_TABLE_BUCKET_NAME}/table/{}",
+            metadata_qualified_table_name(namespace, table)
+        ),
     )
 }
 

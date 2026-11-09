@@ -1243,8 +1243,8 @@ impl Bucket {
     }
 
     /// Record `configuration_state` as the inventory table state of the bucket's S3 Metadata
-    /// configuration, with `table_name` the name an inventory table this creates is created
-    /// under and `failure` why such a table could not be created — reporting whether the
+    /// configuration, with `namespace` the namespace an inventory table this creates is
+    /// created in and `failure` why such a table could not be created — reporting whether the
     /// bucket carries a configuration to record it on.
     ///
     /// What `UpdateBucketMetadataInventoryTableConfiguration` does: it "enables or disables a
@@ -1266,7 +1266,7 @@ impl Bucket {
     pub(super) fn update_metadata_inventory_table(
         &mut self,
         configuration_state: String,
-        table_name: &str,
+        namespace: &str,
         failure: Option<MetadataTableFailure>,
         now: SystemTime,
     ) -> bool {
@@ -1279,7 +1279,8 @@ impl Bucket {
             // `InventoryTableConfigurationUpdates` carries no `Role`: only the annotation
             // table is managed by an IAM role.
             None,
-            table_name,
+            namespace,
+            METADATA_INVENTORY_TABLE_NAME,
             failure,
             now,
         );
@@ -1287,9 +1288,10 @@ impl Bucket {
     }
 
     /// Record `configuration_state` as the annotation table state of the bucket's S3 Metadata
-    /// configuration and `role` as the IAM role that manages it, with `table_name` the name an
-    /// annotation table this creates is created under — reporting whether the bucket carries a
-    /// configuration to record them on.
+    /// configuration and `role` as the IAM role that manages it, with `namespace` the
+    /// namespace an annotation table this creates is created in and `failure` why such a
+    /// table could not be created — reporting whether the bucket carries a configuration to
+    /// record them on.
     ///
     /// What `UpdateBucketMetadataAnnotationTableConfiguration` does: it is used "to enable or
     /// disable the annotation table, or to update its associated IAM role" (that operation's
@@ -1309,7 +1311,8 @@ impl Bucket {
         &mut self,
         configuration_state: String,
         role: Option<String>,
-        table_name: &str,
+        namespace: &str,
+        failure: Option<MetadataTableFailure>,
         now: SystemTime,
     ) -> bool {
         let Some(configuration) = self.metadata_configuration.as_mut() else {
@@ -1319,12 +1322,13 @@ impl Bucket {
             &mut configuration.annotation,
             configuration_state,
             role,
-            table_name,
-            // No provisioning failure is reportable for an ANNOTATION table: the published V2
-            // list of `ErrorDetails$ErrorCode` values names none for one, so there is no code
-            // or sentence to report it with — which is where the create that provisions the
-            // same table leaves it too.
-            None,
+            namespace,
+            METADATA_ANNOTATION_TABLE_NAME,
+            // `failure` is why a table this call CREATES could not be created: the role it
+            // would be filled through does not grant S3 Metadata what reading annotations
+            // needs ([`crate::state::metadata_annotation_role`]), which is the one rule the
+            // create that provisions the same table is judged by too.
+            failure,
             now,
         );
         true

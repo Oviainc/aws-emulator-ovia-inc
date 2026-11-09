@@ -42,7 +42,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::bucket_lifecycle::{create_bucket, router, send, Answer};
 use super::bucket_metadata_configuration::{
     create_metadata_configuration, get_metadata_configuration, inside, table_arn, text,
-    wait_for_the_tables, ANNOTATION_ROLE, KMS_KEY_ARN, NOT_THE_OWNER, XMLNS,
+    wait_for_the_tables, ANNOTATION_ROLE, INVENTORY_TABLE, KMS_KEY_ARN, NOT_THE_OWNER, XMLNS,
 };
 
 /// `PUT /<bucket>?metadataInventoryTable` — `UpdateBucketMetadataInventoryTableConfiguration`,
@@ -127,10 +127,13 @@ struct Case {
     /// The `SseAlgorithm` the update's encryption configuration names, when it carries one;
     /// the KMS algorithm is named beside the key ARN.
     encryption: Option<&'static str>,
-    /// The inventory table's name after the update, when the update leaves one behind —
-    /// spelled out, so the folding of the bucket's name into a table name is pinned by hand
-    /// rather than by the code under test.
-    table: Option<&'static str>,
+    /// Whether the update leaves an inventory table behind — the table is then the one S3
+    /// Metadata names every configuration's inventory table.
+    table: bool,
+    /// The namespace the row's tables live in, as a table ARN's id carries it (the bucket's
+    /// name written in the character set an S3 Tables name is written in) — spelled out, so
+    /// what the id is made of is pinned by hand rather than by the code under test.
+    namespace: &'static str,
     /// The `TableStatus` the read reports straight after the update, when it leaves a table
     /// behind: `CREATING` for a table this update created, and `ACTIVE` for one the create
     /// already brought into service and the update left alone.
@@ -139,8 +142,8 @@ struct Case {
 
 /// Every row: they differ along the state the configuration started in (none named, disabled,
 /// enabled), the state the update names, whether the update carries an encryption
-/// configuration and which algorithm it names, and the FORM of the bucket's name the table
-/// name is folded from.
+/// configuration and which algorithm it names, and the FORM of the bucket's name the
+/// namespace is folded from.
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -149,7 +152,8 @@ fn cases() -> Vec<Case> {
             start: None,
             update: "ENABLED",
             encryption: None,
-            table: Some("inventory_update_unnamed_enable_inventory"),
+            table: true,
+            namespace: "b_inventory_update_unnamed_enable",
             status_after_the_update: Some("CREATING"),
         },
         Case {
@@ -158,7 +162,8 @@ fn cases() -> Vec<Case> {
             start: Some("DISABLED"),
             update: "ENABLED",
             encryption: Some("AES256"),
-            table: Some("inventory_update_disabled_enable_inventory"),
+            table: true,
+            namespace: "b_inventory_update_disabled_enable",
             status_after_the_update: Some("CREATING"),
         },
         Case {
@@ -167,7 +172,8 @@ fn cases() -> Vec<Case> {
             start: Some("ENABLED"),
             update: "DISABLED",
             encryption: None,
-            table: None,
+            table: false,
+            namespace: "b_inventory_update_enabled_disable",
             status_after_the_update: None,
         },
         Case {
@@ -176,7 +182,8 @@ fn cases() -> Vec<Case> {
             start: Some("ENABLED"),
             update: "ENABLED",
             encryption: Some("aws:kms"),
-            table: Some("inventory_update_enabled_again_inventory"),
+            table: true,
+            namespace: "b_inventory_update_enabled_again",
             // The table the create brought into service is left exactly as it is, so a
             // repeated enable does not put it back into `CREATING`.
             status_after_the_update: Some("ACTIVE"),
@@ -187,7 +194,8 @@ fn cases() -> Vec<Case> {
             start: None,
             update: "DISABLED",
             encryption: None,
-            table: None,
+            table: false,
+            namespace: "b_inventory_update_unnamed_disable",
             status_after_the_update: None,
         },
         Case {
@@ -196,7 +204,8 @@ fn cases() -> Vec<Case> {
             start: Some("DISABLED"),
             update: "ENABLED",
             encryption: None,
-            table: Some("inventory_update_2026_inventory"),
+            table: true,
+            namespace: "b_inventory_update_2026",
             status_after_the_update: Some("CREATING"),
         },
     ]
@@ -220,20 +229,20 @@ fn assert_inventory(case: &Case, body: &str, expected_status: Option<&str>) {
         case.update,
         text(container, "ConfigurationState")
     );
+    let expected_name = case.table.then_some(INVENTORY_TABLE);
     assert_eq!(
         text(container, "TableName").as_deref(),
-        case.table,
-        "case {:?}: expected TableName {:?}, got {:?}",
+        expected_name,
+        "case {:?}: expected TableName {expected_name:?}, got {:?}",
         case.name,
-        case.table,
         text(container, "TableName")
     );
     assert_eq!(
         text(container, "TableArn"),
-        case.table.map(table_arn),
+        expected_name.map(|table| table_arn(case.namespace, table)),
         "case {:?}: expected TableArn {:?}, got {:?}",
         case.name,
-        case.table.map(table_arn),
+        expected_name.map(|table| table_arn(case.namespace, table)),
         text(container, "TableArn")
     );
     assert_eq!(
@@ -337,7 +346,7 @@ async fn an_update_enables_or_disables_the_inventory_table_and_nothing_else() {
     for case in cases() {
         let reading = get_metadata_configuration(&router, case.bucket, &[]).await;
         let after = String::from_utf8_lossy(&reading.body).to_string();
-        assert_inventory(&case, &after, case.table.map(|_| "ACTIVE"));
+        assert_inventory(&case, &after, case.table.then_some("ACTIVE"));
     }
 }
 

@@ -190,9 +190,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Everything this write needs is in its deserialized input: the expected owner and
-        // the configuration updates travel as members, not as raw headers.
-        let _ = ctx;
+        // Everything this write needs beyond its deserialized input is the IAM answer about
+        // the annotation role below, which is asked through `ctx`.
 
         // "The account ID of the expected bucket owner"
         // (`UpdateBucketMetadataAnnotationTableConfigurationRequest$ExpectedBucketOwner`),
@@ -261,12 +260,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // either. That is where every other bucket-subresource write in this crate leaves
         // them.
         let now = ::std::time::SystemTime::now();
-        let table_name = crate::state::metadata_table_name(
-            &input.bucket,
-            crate::state::METADATA_ANNOTATION_TABLE_SUFFIX,
-        );
+        let namespace = crate::state::metadata_table_namespace(&input.bucket);
         let enabling =
             updates.configuration_state == crate::state::METADATA_CONFIGURATION_STATE_ENABLED;
+
+        // The role an enable would fill the table through: the one this request names ("the
+        // new IAM role ARN to apply", `AnnotationTableConfigurationUpdates$Role`), or failing
+        // that the one the configuration already carries. Read under a guard of its own, which
+        // is released before the hop into IAM below, so this service's state is never locked
+        // across it.
+        let role_for_the_table = updates.role.clone().or_else(|| {
+            state
+                .lock()
+                .bucket(&input.bucket)
+                .and_then(crate::state::Bucket::metadata_configuration)
+                .and_then(|configuration| configuration.annotation.as_ref())
+                .and_then(|annotation| annotation.role.clone())
+        });
+        // Whether a table this call provisions can be filled through that role
+        // ([`crate::state::metadata_annotation_role`], the one rule the create that provisions
+        // the same table is judged by too). A DISABLE provisions nothing, so it asks nothing.
+        let annotation_failure = match enabling {
+            true => {
+                crate::state::metadata_annotation_role::provisioning_failure(
+                    ctx,
+                    role_for_the_table.as_deref(),
+                )
+                .await
+            }
+            false => None,
+        };
 
         // The bucket is looked up FIRST, so a request naming a bucket this emulator does not
         // hold answers that rather than reporting whatever is wrong with the state of a
@@ -348,7 +371,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !bucket.update_metadata_annotation_table(
             updates.configuration_state.clone(),
             updates.role.clone(),
-            &table_name,
+            &namespace,
+            annotation_failure,
             now,
         ) {
             // Unreachable: the configuration was read above under this same guard.

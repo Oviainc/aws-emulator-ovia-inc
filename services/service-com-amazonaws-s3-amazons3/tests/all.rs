@@ -59,6 +59,8 @@ mod bucket_lifecycle_configuration;
 mod bucket_location;
 #[path = "all/bucket_logging.rs"]
 mod bucket_logging;
+#[path = "all/bucket_metadata_annotation_role_permissions.rs"]
+mod bucket_metadata_annotation_role_permissions;
 #[path = "all/bucket_metadata_annotation_table_update.rs"]
 mod bucket_metadata_annotation_table_update;
 #[path = "all/bucket_metadata_configuration.rs"]

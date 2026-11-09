@@ -11,8 +11,9 @@
 //! 1. `DeleteBucketMetadataConfiguration` "deletes an S3 Metadata configuration from a
 //!    general purpose bucket" (that operation's own documentation): it answers the modelled
 //!    204 with an empty body, a later `GetBucketMetadataConfiguration` reports
-//!    `MetadataConfigurationNotFound` (404), and the call is idempotent — a bucket carrying no
-//!    configuration is already in the asked-for state. A bucket this emulator does not hold
+//!    `MetadataConfigurationNotFound` (404), and a SECOND delete answers that same condition
+//!    — a bucket carrying no configuration has none to delete, so the delete is not
+//!    idempotent. A bucket this emulator does not hold
 //!    is `NoSuchBucket` (404) and an `x-amz-expected-bucket-owner` that is not the account's
 //!    is `AccessDenied` (403).
 //! 2. The delete takes ONLY the configuration: the tables it provisioned stay in the managed
@@ -150,7 +151,7 @@ pub(crate) async fn bucket_with_an_active_configuration(
 }
 
 #[tokio::test]
-async fn a_deleted_configuration_is_gone_and_the_delete_is_idempotent() {
+async fn a_deleted_configuration_is_gone_and_a_second_delete_says_there_is_none() {
     let router = router();
     bucket_with_an_active_configuration(&router, "metadata-delete", false, false).await;
 
@@ -198,14 +199,31 @@ async fn a_deleted_configuration_is_gone_and_the_delete_is_idempotent() {
         absent.error_code()
     );
 
-    // Idempotent: the bucket is already in the asked-for state, so a second delete succeeds
-    // and still leaves no configuration.
+    // NOT idempotent: there is no configuration left to delete, so a second delete answers
+    // the metadata configuration's own not-there condition, the one a read answers.
     let again = delete_metadata_configuration(&router, "metadata-delete", &[]).await;
     assert_eq!(
-        again.status, 204,
-        "a second delete must still answer 204, got {} with body {:?}",
+        again.status, 404,
+        "a second delete must answer 404, got {} with body {:?}",
         again.status,
         text(&again)
+    );
+    assert_eq!(
+        again.error_code(),
+        "MetadataConfigurationNotFound",
+        "a second delete must name the configuration that is not there, got {:?}",
+        again.error_code()
+    );
+    assert_eq!(
+        again.error_message(),
+        "The metadata configuration was not found",
+        "the refusal carries the text S3 sends for that code"
+    );
+    assert_eq!(
+        again.element("BucketName").as_deref(),
+        Some("metadata-delete"),
+        "the refusal names the bucket whose configuration is not there, got {:?}",
+        again.element("BucketName")
     );
     assert_eq!(
         get_metadata_configuration(&router, "metadata-delete", &[])

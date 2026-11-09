@@ -65,7 +65,8 @@ const ANNOTATION: &str = "AnnotationTableConfigurationResult";
 enum Away {
     /// `DeleteBucketMetadataConfiguration` once.
     ConfigurationDeleted,
-    /// The same delete twice: the second one is the idempotent no-op, which must free no more
+    /// The same delete twice: the second one finds no configuration to delete and is
+    /// refused, which must free no more
     /// and no less than the first did.
     ConfigurationDeletedTwice,
     /// The general purpose bucket itself deleted — with the configuration still on it — and
@@ -116,7 +117,7 @@ fn rows() -> Vec<Row> {
             second: (true, false),
         },
         Row {
-            case: "every table of the configuration, after an idempotent second delete",
+            case: "every table of the configuration, after a refused second delete",
             first_bucket: "unprovisioned-annotation",
             first: (true, true),
             came_into_service: false,
@@ -297,9 +298,16 @@ async fn a_configuration_taken_away_before_its_tables_came_into_service_frees_th
                 };
                 for attempt in 1..=deletes {
                     let deleted = delete_metadata_configuration(&router, first_bucket, &[]).await;
+                    // Only the FIRST delete finds a configuration to take away; a second one
+                    // is refused with the configuration's own not-there condition, and must
+                    // release no more than the first one did.
+                    let expected = match attempt {
+                        1 => 204,
+                        _ => 404,
+                    };
                     assert_eq!(
-                        deleted.status, 204,
-                        "case {case:?}: delete {attempt} must answer the modelled 204, got {} \
+                        deleted.status, expected,
+                        "case {case:?}: delete {attempt} must answer {expected}, got {} \
                          with body {:?}",
                         deleted.status,
                         text(&deleted)

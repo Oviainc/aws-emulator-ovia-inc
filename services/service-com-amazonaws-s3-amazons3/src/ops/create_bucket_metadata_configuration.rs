@@ -4,9 +4,20 @@
 //! IMPLEMENTED: records the S3 Metadata configuration the request carries on the general
 //! purpose bucket it names, and creates the tables that configuration asks for — the
 //! journal table always, the inventory and annotation tables when their
-//! `ConfigurationState` is `ENABLED`. Each table is reported as `CREATING` until it falls
+//! `ConfigurationState` is `ENABLED`. The tables are S3-MANAGED: each is created in the
+//! bucket's own namespace of the managed table bucket
+//! ([`crate::state::metadata_table_namespace`]) under the name that says which of the three
+//! it is ([`crate::state::METADATA_JOURNAL_TABLE_NAME`]). Each table is reported as
+//! `CREATING` until it falls
 //! due to be in service ([`crate::state::METADATA_TABLE_ACTIVATION_DELAY`]) and `ACTIVE`
 //! from then on, which `GetBucketMetadataConfiguration` reports.
+//!
+//! A table that could not be created is recorded `FAILED` carrying the published
+//! `ErrorDetails` for why, which that same read reports: a journal or inventory table whose
+//! name the managed table bucket already holds, an inventory table whose journal table
+//! failed, and an annotation table the IAM role the configuration names does not let S3
+//! Metadata read annotations through
+//! ([`crate::state::metadata_annotation_role`]).
 //!
 //! A bucket already carrying a metadata configuration is refused with
 //! [`crate::state::METADATA_CONFIGURATION_ALREADY_EXISTS_CODE`] (HTTP 409) and nothing is
@@ -203,9 +214,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Everything this write needs is in its deserialized input: the expected owner and
-        // the configuration travel as members, not as raw headers.
-        let _ = ctx;
+        // Everything this write needs beyond its deserialized input is the IAM answer about
+        // the annotation role below, which is asked through `ctx`.
 
         // "The expected owner of the general purpose bucket that corresponds to your
         // metadata configuration" (`CreateBucketMetadataConfigurationRequest$ExpectedBucketOwner`),
@@ -314,6 +324,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // Whether the annotation table this create would provision can be filled through the
+        // role the configuration names it — asked of IAM BEFORE this service's guard is
+        // taken, so no lock is held across the hop, and only for a configuration that asks
+        // for that table at all ([`crate::state::metadata_annotation_role`], the one rule the
+        // update that enables the same table is judged by too).
+        let annotation = configuration.annotation_table_configuration.as_ref();
+        let annotation_failure = match annotation.filter(|table| {
+            table.configuration_state == crate::state::METADATA_CONFIGURATION_STATE_ENABLED
+        }) {
+            Some(table) => {
+                crate::state::metadata_annotation_role::provisioning_failure(
+                    ctx,
+                    table.role.as_deref(),
+                )
+                .await
+            }
+            None => None,
+        };
+
         // The bucket is looked up FIRST, so a request naming a bucket this emulator does
         // not hold answers that rather than reporting whatever is wrong with the state of a
         // bucket that does not exist (the order every other bucket-subresource write in
@@ -348,15 +377,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller that reads the configuration straight afterwards still sees `CREATING`;
         // nothing waits for the instant here.
         //
-        // A table whose NAME the managed table bucket's namespace already holds is one S3
-        // cannot create: "A journal table already exists in the Amazon Web Services managed
-        // table bucket's namespace" (`ErrorDetails$ErrorCode`, the V2 list), which is a
-        // provisioning failure rather than a refusal of the create — the configuration is
-        // recorded and the table reports `FAILED` with those `ErrorDetails`. The namespace is
-        // one per Region and a table name is derived from the general purpose bucket's name
-        // ([`crate::state::metadata_table_name`]), so that is the state a create is in when a
-        // table that came into service is still there under that name: one ANOTHER bucket
-        // whose name folds to the same table name provisioned, or one this bucket's own
+        // A table whose NAME the managed table bucket already holds is one S3 cannot create:
+        // "A journal table already exists in the Amazon Web Services managed table bucket's
+        // namespace" (`ErrorDetails$ErrorCode`, the V2 list), which is a provisioning failure
+        // rather than a refusal of the create — the configuration is recorded and the table
+        // reports `FAILED` with those `ErrorDetails`. The tables are S3-managed and named for
+        // which of the three they are ([`crate::state::METADATA_JOURNAL_TABLE_NAME`]) inside
+        // the general purpose bucket's own namespace
+        // ([`crate::state::metadata_table_namespace`]), so that is the state a create is in
+        // when a table that came into service is still there in that namespace: one ANOTHER
+        // bucket whose name folds to the same namespace provisioned, or one this bucket's own
         // earlier configuration did ([`crate::state::ComAmazonawsS3Amazons3State::delete_metadata_configuration`]
         // releases only the names of tables that never came into service).
         //
@@ -366,22 +396,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // either. That is where every other bucket-subresource write in this crate leaves
         // them.
         let now = ::std::time::SystemTime::now();
-        let journal_name =
-            crate::state::metadata_table_name(&input.bucket, crate::state::METADATA_JOURNAL_TABLE_SUFFIX);
-        let inventory_name = crate::state::metadata_table_name(
-            &input.bucket,
-            crate::state::METADATA_INVENTORY_TABLE_SUFFIX,
-        );
-        let annotation_name = crate::state::metadata_table_name(
-            &input.bucket,
-            crate::state::METADATA_ANNOTATION_TABLE_SUFFIX,
-        );
-        let journal_taken = store.metadata_namespace_holds(&journal_name);
-        let inventory_taken = store.metadata_namespace_holds(&inventory_name);
+        let namespace = crate::state::metadata_table_namespace(&input.bucket);
+        let qualified = |table: &str| crate::state::metadata_qualified_table_name(&namespace, table);
+        let journal_taken =
+            store.metadata_namespace_holds(&qualified(crate::state::METADATA_JOURNAL_TABLE_NAME));
+        let inventory_taken =
+            store.metadata_namespace_holds(&qualified(crate::state::METADATA_INVENTORY_TABLE_NAME));
         let journal = match journal_taken {
-            false => crate::state::MetadataTable::creating(journal_name.clone(), now),
+            false => crate::state::MetadataTable::creating(
+                &namespace,
+                crate::state::METADATA_JOURNAL_TABLE_NAME,
+                now,
+            ),
             true => crate::state::MetadataTable::failed(
-                journal_name.clone(),
+                &namespace,
+                crate::state::METADATA_JOURNAL_TABLE_NAME,
                 now,
                 crate::state::MetadataTableFailure {
                     code: crate::state::METADATA_JOURNAL_TABLE_EXISTS_CODE,
@@ -399,22 +428,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::metadata_inventory_table_failure`]); on this create the journal
         // table failed exactly when its own name was taken.
         //
-        // The ANNOTATION table is left to be created: the published list of V2 provisioning
-        // error codes names no failure for it, so there is no code or sentence to report one
-        // with.
+        // The ANNOTATION table fails when the role it would be filled through does not grant
+        // S3 Metadata what reading annotations needs, resolved above.
         let inventory_failure =
             crate::state::metadata_inventory_table_failure(inventory_taken, journal_taken);
-        let table = |suffix: &str| {
-            crate::state::MetadataTable::creating(
-                crate::state::metadata_table_name(&input.bucket, suffix),
-                now,
-            )
-        };
         // A table is created exactly when its `ConfigurationState` asks for it: a disabled
         // inventory or annotation configuration is recorded with no table behind it, which
         // is why `InventoryTableConfigurationResult` requires only its `ConfigurationState`.
-        let optional_table = |state: &str, suffix: &str| {
-            (state == crate::state::METADATA_CONFIGURATION_STATE_ENABLED).then(|| table(suffix))
+        let optional_table = |state: &str,
+                              name: &str,
+                              failure: Option<crate::state::MetadataTableFailure>| {
+            (state == crate::state::METADATA_CONFIGURATION_STATE_ENABLED).then(|| match failure {
+                Some(failure) => {
+                    crate::state::MetadataTable::failed(&namespace, name, now, failure)
+                }
+                None => crate::state::MetadataTable::creating(&namespace, name, now),
+            })
         };
         let recorded = crate::state::BucketMetadataConfiguration {
             // `MetadataConfiguration$JournalTableConfiguration` is REQUIRED, so every
@@ -429,29 +458,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     configuration_state: inventory.configuration_state.clone(),
                     table: optional_table(
                         &inventory.configuration_state,
-                        crate::state::METADATA_INVENTORY_TABLE_SUFFIX,
-                    )
-                    .map(|table| match inventory_failure.clone() {
-                        Some(failure) => {
-                            crate::state::MetadataTable::failed(table.name, now, failure)
-                        }
-                        None => table,
-                    }),
+                        crate::state::METADATA_INVENTORY_TABLE_NAME,
+                        inventory_failure.clone(),
+                    ),
                     // `InventoryTableConfiguration` carries no `Role` member; only the
                     // annotation table is managed by an IAM role.
                     role: None,
                 },
             ),
-            annotation: configuration.annotation_table_configuration.as_ref().map(
-                |annotation| crate::state::MetadataTableConfiguration {
-                    configuration_state: annotation.configuration_state.clone(),
-                    table: optional_table(
-                        &annotation.configuration_state,
-                        crate::state::METADATA_ANNOTATION_TABLE_SUFFIX,
-                    ),
-                    role: annotation.role.clone(),
-                },
-            ),
+            annotation: annotation.map(|annotation| crate::state::MetadataTableConfiguration {
+                configuration_state: annotation.configuration_state.clone(),
+                table: optional_table(
+                    &annotation.configuration_state,
+                    crate::state::METADATA_ANNOTATION_TABLE_NAME,
+                    annotation_failure.clone(),
+                ),
+                role: annotation.role.clone(),
+            }),
         };
 
         // Every table this create really provisions joins the managed table bucket's
@@ -459,25 +482,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that came into service OUTLIVES the configuration that created it, which is what
         // makes a create whose table name such a table holds report the failure above, whether
         // that name was taken by another bucket's configuration or by this bucket's own
-        // earlier one. A table that FAILED to be created adds nothing: the name was already
-        // taken by the table that is there.
-        let created: Vec<String> = [
-            (!journal_taken).then(|| journal_name.clone()),
-            recorded
-                .inventory
-                .as_ref()
-                .and_then(|inventory| inventory.table.as_ref())
-                .filter(|table| table.failure.is_none())
-                .map(|_| inventory_name.clone()),
-            recorded
-                .annotation
-                .as_ref()
-                .and_then(|annotation| annotation.table.as_ref())
-                .map(|_| annotation_name.clone()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        // earlier one. A table that FAILED to be created adds nothing: either the name was
+        // already taken by the table that is there, or no table was created under it.
+        let created: Vec<String> = recorded
+            .tables()
+            .filter(|table| table.failure.is_none())
+            .map(crate::state::MetadataTable::qualified_name)
+            .collect();
         // The namespace is bounded ([`crate::state::MAX_METADATA_NAMESPACE_TABLES`]): only a
         // configuration carried away before its tables came into service releases their names,
         // so a caller creating configurations for bucket after bucket would grow the record

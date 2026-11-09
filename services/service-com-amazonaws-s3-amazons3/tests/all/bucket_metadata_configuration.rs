@@ -19,10 +19,14 @@
 //!   (`MetadataConfiguration$JournalTableConfiguration` is required), the inventory and
 //!   annotation tables only while their `ConfigurationState` is `ENABLED` — which is why
 //!   `InventoryTableConfigurationResult` requires its `ConfigurationState` and leaves its
-//!   `TableName`, `TableStatus` and `TableArn` optional.
-//! * A table's name is derived from the general purpose bucket's name, folded to the
-//!   character set a table name is written in, plus the suffix naming which table it is;
-//!   its ARN is that name inside the managed table bucket's own ARN.
+//!   `TableName`, `TableStatus` and `TableArn` optional. All three table containers are
+//!   REPORTED whatever state their tables are in: a table the configuration never named is
+//!   reported as the `DISABLED` state it is in, with no table beside it.
+//! * The tables are S3-managed, so their coordinates are the service's: each table is named
+//!   for which of the three it is (`journal`, `inventory`, `annotation`) inside the general
+//!   purpose bucket's OWN namespace of the managed table bucket, `b_` and the bucket's name;
+//!   a table's ARN carries the id that identifies that one table of the table bucket, its
+//!   namespace and name written in the character set an S3 Tables name is written in.
 //! * `TableStatus` is "`CREATING` - the journal table is in the process of being created"
 //!   until the table falls due to be in service, and "`ACTIVE` - the journal table has
 //!   been created successfully" from then on
@@ -67,6 +71,16 @@ pub(crate) const ANNOTATION_ROLE: &str = "arn:aws:iam::000000000000:role/s3-meta
 /// A customer-managed KMS key ARN, as `MetadataTableEncryptionConfiguration$KmsKeyArn`
 /// takes one.
 pub(crate) const KMS_KEY_ARN: &str = "arn:aws:kms:us-east-1:000000000000:key/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+/// The name S3 Metadata gives the JOURNAL table of a V2 configuration, spelled out here
+/// rather than read from the code under test.
+pub(crate) const JOURNAL_TABLE: &str = "journal";
+
+/// See [`JOURNAL_TABLE`] — the INVENTORY table's name.
+pub(crate) const INVENTORY_TABLE: &str = "inventory";
+
+/// See [`JOURNAL_TABLE`] — the ANNOTATION table's name.
+pub(crate) const ANNOTATION_TABLE: &str = "annotation";
 
 /// How long a row waits for a table to fall due: the span the store records plus slack for
 /// a loaded machine.
@@ -181,14 +195,13 @@ struct Case {
     /// The `SseAlgorithm` the journal table's encryption configuration names, when the row
     /// carries one; a KMS algorithm is named beside [`KMS_KEY_ARN`].
     journal_encryption: Option<&'static str>,
-    /// The journal table's name this row must read back — spelled out, so the folding of
-    /// the bucket's name into a table name is pinned by hand rather than by the code under
-    /// test.
-    journal_table: &'static str,
-    /// The inventory table's name, when the row creates one.
-    inventory_table: Option<&'static str>,
-    /// The annotation table's name, when the row creates one.
-    annotation_table: Option<&'static str>,
+    /// The namespace this row's tables must read back as living in — spelled out, so what the
+    /// namespace is made of is pinned by hand rather than by the code under test.
+    namespace: &'static str,
+    /// That namespace as a table ARN's id carries it: written in the character set an S3
+    /// Tables name is written in, so each character of the bucket's name outside it is an
+    /// underscore — spelled out here too.
+    namespace_id: &'static str,
 }
 
 /// The `MetadataConfiguration` container this case carries, naming the members it names and
@@ -248,16 +261,17 @@ pub(crate) fn table_bucket_arn() -> String {
     String::from("arn:aws:s3tables:us-east-1:000000000000:bucket/aws-s3")
 }
 
-/// See [`table_bucket_arn`].
-pub(crate) fn table_arn(table: &str) -> String {
-    format!("{}/table/{table}", table_bucket_arn())
+/// See [`table_bucket_arn`] — the ARN of the table `table` of the namespace whose folded
+/// form is `namespace_id`, whose last segment identifies that one table of the table bucket.
+pub(crate) fn table_arn(namespace_id: &str, table: &str) -> String {
+    format!("{}/table/{namespace_id}_{table}", table_bucket_arn())
 }
 
 /// Every row of the create-and-read-back table: the rows differ along the expiration state,
 /// the day count (including both published bounds), which of the optional tables the
 /// configuration names and in which state, whether an IAM role is named, whether an
-/// encryption configuration is named, and the FORM of the bucket's name the table names are
-/// folded from.
+/// encryption configuration is named, and the FORM of the bucket's name the namespace and the
+/// table ids are built from.
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -269,9 +283,8 @@ fn cases() -> Vec<Case> {
             annotation: TableAsked::Unnamed,
             role: None,
             journal_encryption: None,
-            journal_table: "metadata_journal_minimum_journal",
-            inventory_table: None,
-            annotation_table: None,
+            namespace: "b_metadata-journal-minimum",
+            namespace_id: "b_metadata_journal_minimum",
         },
         Case {
             name: "journal and inventory, a year of records",
@@ -282,9 +295,8 @@ fn cases() -> Vec<Case> {
             annotation: TableAsked::Unnamed,
             role: None,
             journal_encryption: Some("AES256"),
-            journal_table: "metadata_year_of_records_journal",
-            inventory_table: Some("metadata_year_of_records_inventory"),
-            annotation_table: None,
+            namespace: "b_metadata-year-of-records",
+            namespace_id: "b_metadata_year_of_records",
         },
         Case {
             name: "every table, at the published maximum day count",
@@ -295,9 +307,8 @@ fn cases() -> Vec<Case> {
             annotation: TableAsked::Enabled,
             role: Some(ANNOTATION_ROLE),
             journal_encryption: Some("aws:kms"),
-            journal_table: "metadata_every_table_journal",
-            inventory_table: None,
-            annotation_table: Some("metadata_every_table_annotation"),
+            namespace: "b_metadata.every-table",
+            namespace_id: "b_metadata_every_table",
         },
         Case {
             name: "record expiration disabled, so no day count",
@@ -308,9 +319,8 @@ fn cases() -> Vec<Case> {
             annotation: TableAsked::Disabled,
             role: None,
             journal_encryption: None,
-            journal_table: "metadata_no_expiration_journal",
-            inventory_table: Some("metadata_no_expiration_inventory"),
-            annotation_table: None,
+            namespace: "b_metadata-no-expiration",
+            namespace_id: "b_metadata_no_expiration",
         },
         Case {
             name: "a bucket name carrying dots and digits",
@@ -321,37 +331,32 @@ fn cases() -> Vec<Case> {
             annotation: TableAsked::Enabled,
             role: Some(ANNOTATION_ROLE),
             journal_encryption: None,
-            journal_table: "metadata_tables_2026_journal",
-            inventory_table: Some("metadata_tables_2026_inventory"),
-            annotation_table: Some("metadata_tables_2026_annotation"),
+            namespace: "b_metadata.tables.2026",
+            namespace_id: "b_metadata_tables_2026",
         },
     ]
 }
 
 /// What a read reports for one table container, as a row expects it.
+///
+/// The container is there WHATEVER the row asked for, because `ConfigurationState` is a
+/// required member of both optional results: a row that named no such table configuration
+/// reads back the `DISABLED` state it is in, with no table name, status or ARN beside it.
 fn assert_table(
     case: &Case,
     container: Option<&str>,
     asked: TableAsked,
-    expected_name: Option<&str>,
+    table: &str,
     expected_status: &str,
 ) {
-    let Some(state) = asked.state() else {
-        assert!(
-            container.is_none(),
-            "case {:?}: the payload named no such table configuration, so the read must \
-             report none, got {container:?}",
-            case.name
-        );
-        return;
-    };
     let container = container.unwrap_or_else(|| {
         panic!(
-            "case {:?}: the payload named a table configuration in state {state}, so the \
-             read must report it",
+            "case {:?}: every optional table result is reported whatever state its table is \
+             in, so the read must report this one",
             case.name
         )
     });
+    let state = asked.state().unwrap_or("DISABLED");
     assert_eq!(
         text(container, "ConfigurationState").as_deref(),
         Some(state),
@@ -359,6 +364,7 @@ fn assert_table(
         case.name,
         text(container, "ConfigurationState")
     );
+    let expected_name = asked.creates_a_table().then_some(table);
     assert_eq!(
         text(container, "TableName").as_deref(),
         expected_name,
@@ -366,12 +372,13 @@ fn assert_table(
         case.name,
         text(container, "TableName")
     );
+    let expected_arn = expected_name.map(|table| table_arn(case.namespace_id, table));
     assert_eq!(
-        text(container, "TableArn").as_deref(),
-        expected_name.map(table_arn).as_deref(),
+        text(container, "TableArn"),
+        expected_arn,
         "case {:?}: expected TableArn {:?}, got {:?}",
         case.name,
-        expected_name.map(table_arn),
+        expected_name.map(|table| table_arn(case.namespace_id, table)),
         text(container, "TableArn")
     );
     let status = asked.creates_a_table().then_some(expected_status);
@@ -410,9 +417,10 @@ fn assert_reported(case: &Case, body: &str, expected_status: &str) {
     );
     assert_eq!(
         text(destination, "TableNamespace").as_deref(),
-        Some("aws_s3_metadata"),
-        "case {:?}: expected the metadata table namespace, got {:?}",
+        Some(case.namespace),
+        "case {:?}: expected the bucket's own table namespace {:?}, got {:?}",
         case.name,
+        case.namespace,
         text(destination, "TableNamespace")
     );
 
@@ -425,18 +433,17 @@ fn assert_reported(case: &Case, body: &str, expected_status: &str) {
     });
     assert_eq!(
         text(journal, "TableName").as_deref(),
-        Some(case.journal_table),
-        "case {:?}: expected journal TableName {:?}, got {:?}",
+        Some(JOURNAL_TABLE),
+        "case {:?}: expected journal TableName {JOURNAL_TABLE:?}, got {:?}",
         case.name,
-        case.journal_table,
         text(journal, "TableName")
     );
     assert_eq!(
         text(journal, "TableArn"),
-        Some(table_arn(case.journal_table)),
+        Some(table_arn(case.namespace_id, JOURNAL_TABLE)),
         "case {:?}: expected journal TableArn {:?}, got {:?}",
         case.name,
-        table_arn(case.journal_table),
+        table_arn(case.namespace_id, JOURNAL_TABLE),
         text(journal, "TableArn")
     );
     assert_eq!(
@@ -474,14 +481,14 @@ fn assert_reported(case: &Case, body: &str, expected_status: &str) {
         case,
         inside(body, "InventoryTableConfigurationResult"),
         case.inventory,
-        case.inventory_table,
+        INVENTORY_TABLE,
         expected_status,
     );
     assert_table(
         case,
         inside(body, "AnnotationTableConfigurationResult"),
         case.annotation,
-        case.annotation_table,
+        ANNOTATION_TABLE,
         expected_status,
     );
     let annotation = inside(body, "AnnotationTableConfigurationResult");

@@ -4,6 +4,11 @@
 //! Deletes the S3 Metadata configuration a general purpose bucket carries.
 //! Implemented here — this is the ONLY file to touch for this operation.
 //!
+//! A bucket carrying NO metadata configuration has none to delete and answers
+//! [`crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE`] (HTTP 404), one this emulator does
+//! not hold `NoSuchBucket` (HTTP 404), and an `x-amz-expected-bucket-owner` that is not this
+//! account's HTTP 403 `AccessDenied`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -193,9 +198,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // "Deletes an S3 Metadata configuration from a general purpose bucket" (this
         // operation's own documentation): the whole subresource goes, so
-        // `GetBucketMetadataConfiguration` reports none again. Idempotent, like every other
-        // subresource delete in this crate: a bucket carrying no configuration is already in
-        // the asked-for state, so the call still succeeds.
+        // `GetBucketMetadataConfiguration` reports none again. There is no configuration to
+        // delete on a bucket carrying none, so this delete is NOT idempotent: it answers the
+        // metadata configuration's own not-there condition
+        // ([`crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE`], HTTP 404) — the same one
+        // a read and every update of the subresource answer — rather than a success that
+        // removed nothing.
         //
         // The TABLES the configuration provisioned and that came into service stay where they
         // are: they are tables of the AWS-managed table bucket's namespace, and the published
@@ -210,20 +218,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under is free again and the next create provisions afresh under it — the instant
         // this call is made is what decides which of the two a table is in
         // ([`crate::state::MetadataTable::creating_at`]).
-        //
-        // `false` is the bucket this emulator does not hold: the model declares no error for
-        // this operation, so it is reported through the unmodelled channel with the code and
-        // status every other bucket-subresource call in this crate answers it with.
-        if !store.delete_metadata_configuration(&input.bucket, ::std::time::SystemTime::now()) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::NO_SUCH_BUCKET_CODE,
-                NO_SUCH_BUCKET_STATUS,
-                crate::state::NO_SUCH_BUCKET_MESSAGE,
-            )
-            // The refusal names the bucket it is about, the way the reader and the updates
-            // of this same subresource name it — see
-            // [`crate::scaffolded::Scaffolded::naming`].
-            .naming_bucket(&input.bucket));
+        match store.delete_metadata_configuration(&input.bucket, ::std::time::SystemTime::now()) {
+            crate::state::MetadataConfigurationDeletion::Deleted => {}
+            // The bucket this emulator does not hold: the model declares no error for this
+            // operation, so it is reported through the unmodelled channel with the code and
+            // status every other bucket-subresource call in this crate answers it with.
+            crate::state::MetadataConfigurationDeletion::NoSuchBucket => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NO_SUCH_BUCKET_CODE,
+                    NO_SUCH_BUCKET_STATUS,
+                    crate::state::NO_SUCH_BUCKET_MESSAGE,
+                )
+                // The refusal names the bucket it is about, the way the reader and the
+                // updates of this same subresource name it — see
+                // [`crate::scaffolded::Scaffolded::naming`].
+                .naming_bucket(&input.bucket));
+            }
+            crate::state::MetadataConfigurationDeletion::NoConfiguration => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE,
+                    crate::state::METADATA_CONFIGURATION_NOT_FOUND_STATUS,
+                    crate::state::METADATA_CONFIGURATION_NOT_FOUND_MESSAGE,
+                )
+                // The code and the message are fixed text for this condition; the bucket
+                // whose configuration is not there is the variable part of the envelope.
+                .naming_bucket(&input.bucket));
+            }
         }
 
         // `Unit` output: success is the modelled 204 and an empty body.

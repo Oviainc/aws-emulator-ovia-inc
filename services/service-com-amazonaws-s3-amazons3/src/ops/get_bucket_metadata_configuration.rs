@@ -2,11 +2,15 @@
 
 //! @op GetBucketMetadataConfiguration
 //! IMPLEMENTED: reports the S3 Metadata configuration a general purpose bucket carries —
-//! the destination its tables live in, the journal table with the record expiration
-//! settings the configuration names, and the inventory and annotation table
-//! configurations when the create named them. Each table's `TableStatus` is COMPUTED from
+//! the destination its tables live in (the managed table bucket and the bucket's OWN
+//! namespace inside it), the journal table with the record expiration settings the
+//! configuration names, and the inventory and annotation table configurations. All three
+//! table containers are reported whatever state their tables are in: one the configuration
+//! never asked for is reported as the `DISABLED` state it is in, with no table beside it.
+//! Each table's `TableStatus` is COMPUTED from
 //! the instant it falls due to be in service, so a read straight after the create reports
-//! `CREATING` and a later one `ACTIVE`.
+//! `CREATING` and a later one `ACTIVE`; a table that could not be created reports `FAILED`
+//! and the `ErrorDetails` of why.
 //!
 //! A bucket carrying no metadata configuration answers
 //! [`crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE`] (HTTP 404), one this emulator
@@ -225,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One renderer for the three tables, so what is reported about the inventory and
         // annotation tables cannot drift from what is reported about the journal one.
         let table_arn = |table: &crate::state::MetadataTable| {
-            crate::state::metadata_table_arn(&region, &table.name)
+            crate::state::metadata_table_arn(&region, &table.namespace, &table.name)
         };
         // "If the `CREATING` status is `FAILED`, the reason that the journal table couldn't
         // be created" (`JournalTableConfigurationResult$Error`): the `ErrorDetails` the
@@ -237,6 +241,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 error_message: Some(failure.message.to_string()),
             })
         };
+        // The state an optional table of the configuration is in: the one the configuration
+        // carries for it, and `DISABLED` for a table the configuration never named at all —
+        // the two enums of a result's `ConfigurationState` publish exactly those two values,
+        // and that member is REQUIRED, so there is one state to report whatever the
+        // configuration asked for.
+        let configuration_state = |table: Option<&crate::state::MetadataTableConfiguration>| {
+            table.map_or_else(
+                || crate::state::METADATA_CONFIGURATION_STATE_DISABLED.to_string(),
+                |table| table.configuration_state.clone(),
+            )
+        };
+        // The table behind such a container, which is there exactly while its state asks for
+        // one: a disabled table has none to report a status, a name or an ARN for, which is
+        // why those three members are optional where `ConfigurationState` is required.
+        let inventory = configuration.inventory.as_ref();
+        let inventory_table = inventory.and_then(|inventory| inventory.table.as_ref());
+        let annotation = configuration.annotation.as_ref();
+        let annotation_table = annotation.and_then(|annotation| annotation.table.as_ref());
 
         Ok(GetBucketMetadataConfigurationOutput {
             get_bucket_metadata_configuration_result: Some(GetBucketMetadataConfigurationResult {
@@ -249,9 +271,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             crate::state::METADATA_TABLE_BUCKET_TYPE.to_string(),
                         ),
                         table_bucket_arn: Some(crate::state::metadata_table_bucket_arn(&region)),
-                        table_namespace: Some(
-                            crate::state::METADATA_TABLE_NAMESPACE.to_string(),
-                        ),
+                        // The namespace this bucket's tables were created in — its own
+                        // ([`crate::state::BucketMetadataConfiguration::table_namespace`]).
+                        table_namespace: Some(configuration.table_namespace().to_string()),
                     },
                     // Every configuration has a journal table, because
                     // `MetadataConfiguration$JournalTableConfiguration` is required on the
@@ -263,46 +285,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         table_arn: Some(table_arn(&configuration.journal)),
                         record_expiration: configuration.journal_record_expiration.clone(),
                     }),
-                    inventory_table_configuration_result: configuration
-                        .inventory
-                        .as_ref()
-                        .map(|inventory| InventoryTableConfigurationResult {
-                            configuration_state: inventory.configuration_state.clone(),
-                            // A table exists exactly while the configuration state asks for
-                            // one, which is why these three members are optional where
-                            // `ConfigurationState` is required: a disabled inventory
-                            // configuration has no table to report a status, a name or an
-                            // ARN for.
-                            table_status: inventory
-                                .table
-                                .as_ref()
+                    // The optional containers are reported WHATEVER state their tables are
+                    // in, a table the configuration never named as the `DISABLED` state it
+                    // is in: this result is the S3-managed table layout of the bucket, so a
+                    // client that reads the three result members to find its tables finds a
+                    // state for each of them rather than a gap.
+                    inventory_table_configuration_result: Some(InventoryTableConfigurationResult {
+                        configuration_state: configuration_state(inventory),
+                        table_status: inventory_table
+                            .map(|table| table.status_at(now).to_string()),
+                        error: inventory_table.and_then(table_error),
+                        table_name: inventory_table.map(|table| table.name.clone()),
+                        table_arn: inventory_table.map(table_arn),
+                    }),
+                    annotation_table_configuration_result: Some(
+                        AnnotationTableConfigurationResult {
+                            configuration_state: configuration_state(annotation),
+                            table_status: annotation_table
                                 .map(|table| table.status_at(now).to_string()),
-                            error: inventory.table.as_ref().and_then(table_error),
-                            table_name: inventory
-                                .table
-                                .as_ref()
-                                .map(|table| table.name.clone()),
-                            table_arn: inventory.table.as_ref().map(table_arn),
-                        }),
-                    annotation_table_configuration_result: configuration
-                        .annotation
-                        .as_ref()
-                        .map(|annotation| AnnotationTableConfigurationResult {
-                            configuration_state: annotation.configuration_state.clone(),
-                            table_status: annotation
-                                .table
-                                .as_ref()
-                                .map(|table| table.status_at(now).to_string()),
-                            error: annotation.table.as_ref().and_then(table_error),
-                            table_name: annotation
-                                .table
-                                .as_ref()
-                                .map(|table| table.name.clone()),
-                            table_arn: annotation.table.as_ref().map(table_arn),
+                            error: annotation_table.and_then(table_error),
+                            table_name: annotation_table.map(|table| table.name.clone()),
+                            table_arn: annotation_table.map(table_arn),
                             // "The ARN of the IAM role used to manage the annotation table"
                             // — reported exactly when the configuration names one.
-                            role: annotation.role.clone(),
-                        }),
+                            role: annotation.and_then(|annotation| annotation.role.clone()),
+                        },
+                    ),
                 },
             }),
         })

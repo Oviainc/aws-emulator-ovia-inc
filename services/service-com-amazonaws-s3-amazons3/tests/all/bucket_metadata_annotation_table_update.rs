@@ -52,7 +52,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::bucket_lifecycle::{create_bucket, router, send, Answer};
 use super::bucket_metadata_configuration::{
     create_metadata_configuration, get_metadata_configuration, inside, table_arn, text,
-    wait_for_the_tables, ANNOTATION_ROLE, KMS_KEY_ARN, NOT_THE_OWNER, XMLNS,
+    wait_for_the_tables, ANNOTATION_ROLE, ANNOTATION_TABLE, KMS_KEY_ARN, NOT_THE_OWNER, XMLNS,
 };
 
 /// A second IAM role ARN, of the same shape as [`ANNOTATION_ROLE`], so a row can re-point the
@@ -148,10 +148,13 @@ struct Case {
     /// The `SseAlgorithm` the update's encryption configuration names, when it carries one;
     /// the KMS algorithm is named beside the key ARN.
     encryption: Option<&'static str>,
-    /// The annotation table's name after the update, when the update leaves one behind —
-    /// spelled out, so the folding of the bucket's name into a table name is pinned by hand
-    /// rather than by the code under test.
-    table: Option<&'static str>,
+    /// Whether the update leaves an annotation table behind — the table is then the one S3
+    /// Metadata names every configuration's annotation table.
+    table: bool,
+    /// The namespace the row's tables live in, as a table ARN's id carries it (the bucket's
+    /// name written in the character set an S3 Tables name is written in) — spelled out, so
+    /// what the id is made of is pinned by hand rather than by the code under test.
+    namespace: &'static str,
     /// The `TableStatus` the read reports straight after the update, when it leaves a table
     /// behind: `CREATING` for a table this update created, and `ACTIVE` for one the create
     /// already brought into service and the update left alone.
@@ -165,7 +168,7 @@ struct Case {
 /// enabled) and the role it started with, the state the update names, whether the update
 /// names a role and whether that role is the one already in effect, whether it carries an
 /// encryption configuration and which algorithm it names, and the FORM of the bucket's name
-/// the table name is folded from.
+/// the namespace is folded from.
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -175,7 +178,8 @@ fn cases() -> Vec<Case> {
             update: "ENABLED",
             role: Some(ANNOTATION_ROLE),
             encryption: None,
-            table: Some("annotation_update_unnamed_enable_annotation"),
+            table: true,
+            namespace: "b_annotation_update_unnamed_enable",
             status_after_the_update: Some("CREATING"),
             expected_role: Some(ANNOTATION_ROLE),
         },
@@ -187,7 +191,8 @@ fn cases() -> Vec<Case> {
             update: "ENABLED",
             role: Some(ANOTHER_ANNOTATION_ROLE),
             encryption: Some("AES256"),
-            table: Some("annotation_update_disabled_enable_annotation"),
+            table: true,
+            namespace: "b_annotation_update_disabled_enable",
             status_after_the_update: Some("CREATING"),
             expected_role: Some(ANOTHER_ANNOTATION_ROLE),
         },
@@ -198,7 +203,8 @@ fn cases() -> Vec<Case> {
             update: "DISABLED",
             role: None,
             encryption: None,
-            table: None,
+            table: false,
+            namespace: "b_annotation_update_enabled_disable",
             status_after_the_update: None,
             // The update named no role, so the one the configuration carried is still the one
             // it reports.
@@ -211,7 +217,8 @@ fn cases() -> Vec<Case> {
             update: "ENABLED",
             role: None,
             encryption: None,
-            table: Some("annotation_update_enabled_again_annotation"),
+            table: true,
+            namespace: "b_annotation_update_enabled_again",
             // The table the create brought into service is left exactly as it is, so a
             // repeated enable does not put it back into `CREATING`.
             status_after_the_update: Some("ACTIVE"),
@@ -224,7 +231,8 @@ fn cases() -> Vec<Case> {
             update: "DISABLED",
             role: None,
             encryption: None,
-            table: None,
+            table: false,
+            namespace: "b_annotation_update_unnamed_disable",
             status_after_the_update: None,
             expected_role: None,
         },
@@ -235,7 +243,8 @@ fn cases() -> Vec<Case> {
             update: "ENABLED",
             role: Some(ANOTHER_ANNOTATION_ROLE),
             encryption: Some("aws:kms"),
-            table: Some("annotation_update_2026_annotation"),
+            table: true,
+            namespace: "b_annotation_update_2026",
             status_after_the_update: Some("CREATING"),
             expected_role: Some(ANOTHER_ANNOTATION_ROLE),
         },
@@ -268,20 +277,20 @@ fn assert_annotation(case: &Case, body: &str, expected_status: Option<&str>) {
         case.expected_role,
         text(container, "Role")
     );
+    let expected_name = case.table.then_some(ANNOTATION_TABLE);
     assert_eq!(
         text(container, "TableName").as_deref(),
-        case.table,
-        "case {:?}: expected TableName {:?}, got {:?}",
+        expected_name,
+        "case {:?}: expected TableName {expected_name:?}, got {:?}",
         case.name,
-        case.table,
         text(container, "TableName")
     );
     assert_eq!(
         text(container, "TableArn"),
-        case.table.map(table_arn),
+        expected_name.map(|table| table_arn(case.namespace, table)),
         "case {:?}: expected TableArn {:?}, got {:?}",
         case.name,
-        case.table.map(table_arn),
+        expected_name.map(|table| table_arn(case.namespace, table)),
         text(container, "TableArn")
     );
     assert_eq!(
@@ -390,7 +399,7 @@ async fn an_update_enables_or_disables_the_annotation_table_and_nothing_else() {
     for case in cases() {
         let reading = get_metadata_configuration(&router, case.bucket, &[]).await;
         let after = String::from_utf8_lossy(&reading.body).to_string();
-        assert_annotation(&case, &after, case.table.map(|_| "ACTIVE"));
+        assert_annotation(&case, &after, case.table.then_some("ACTIVE"));
     }
 }
 

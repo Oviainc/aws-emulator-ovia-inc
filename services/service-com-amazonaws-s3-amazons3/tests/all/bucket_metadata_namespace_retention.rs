@@ -63,8 +63,8 @@ use super::object_storage::delete_bucket;
 enum Between {
     /// `DeleteBucketMetadataConfiguration` once.
     ConfigurationDeleted,
-    /// The same delete twice: the second one is the idempotent no-op, which must release no
-    /// more than the first did.
+    /// The same delete twice: the second one finds no configuration to delete and is
+    /// refused, which must release no more than the first one did.
     ConfigurationDeletedTwice,
     /// The configuration deleted and then the general purpose bucket itself, which is created
     /// again under the same name — the bucket's own life does not reach into the table
@@ -132,7 +132,7 @@ fn rows() -> Vec<Row> {
             )),
         },
         Row {
-            case: "a journal and an annotation table, after an idempotent second delete",
+            case: "a journal and an annotation table, after a refused second delete",
             first_bucket: "namespace-annotation",
             first: (false, true),
             between: Between::ConfigurationDeletedTwice,
@@ -192,9 +192,9 @@ async fn a_table_outlives_the_configuration_that_provisioned_it() {
             Between::ConfigurationDeletedTwice => {
                 let again = delete_metadata_configuration(&router, first_bucket, &[]).await;
                 assert_eq!(
-                    again.status, 204,
-                    "case {case:?}: the idempotent second delete must succeed, got {} with \
-                     body {:?}",
+                    again.status, 404,
+                    "case {case:?}: a second delete finds no configuration to delete, got {} \
+                     with body {:?}",
                     again.status,
                     text(&again)
                 );
