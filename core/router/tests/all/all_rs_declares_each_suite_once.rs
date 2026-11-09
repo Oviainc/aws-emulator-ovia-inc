@@ -161,6 +161,88 @@ fn every_declaration_names_a_suite_file_that_exists() {
     );
 }
 
+/// The workspace root: this crate's manifest directory (`core/router`) sits two levels
+/// below it.
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("core/router lives two levels below the workspace root")
+        .to_path_buf()
+}
+
+/// Every integration-test declaration root in the workspace: one `tests/all.rs` per
+/// service crate that has one, plus this crate's own.
+///
+/// The rule the tests above pin belongs to the single-target layout rather than to this
+/// crate, and the crate that breaks it cannot pin it itself: a repeated `mod` makes that
+/// crate's own `all` target fail to compile, so no suite inside it is ever run to report
+/// the repetition. This target is the one that links every service crate, so it is where
+/// the rule can be checked for all of them.
+fn declaration_roots() -> Vec<PathBuf> {
+    let services = workspace_root().join("services");
+    let entries = fs::read_dir(&services)
+        .unwrap_or_else(|error| panic!("read {}: {error}", services.display()));
+    let mut roots = vec![tests_dir().join("all.rs")];
+    for entry in entries {
+        let entry = entry
+            .unwrap_or_else(|error| panic!("read an entry of {}: {error}", services.display()));
+        let candidate = entry.path().join("tests").join("all.rs");
+        if candidate.is_file() {
+            roots.push(candidate);
+        }
+    }
+    roots.sort();
+    roots
+}
+
+#[test]
+fn every_crate_in_the_workspace_declares_each_suite_once() {
+    let root = workspace_root();
+    let roots = declaration_roots();
+    assert!(
+        roots.len() > 100,
+        "expected one tests/all.rs per service crate under {}, read {} of them",
+        root.display(),
+        roots.len()
+    );
+
+    let mut reports = Vec::new();
+    for declaration_root in &roots {
+        let crate_root = declaration_root
+            .strip_prefix(&root)
+            .unwrap_or(declaration_root)
+            .display()
+            .to_string();
+        let source = fs::read_to_string(declaration_root)
+            .unwrap_or_else(|error| panic!("read {}: {error}", declaration_root.display()));
+        let declared = declarations(&source);
+        let tests = declaration_root
+            .parent()
+            .expect("a tests/all.rs has a tests/ parent");
+        if declared.is_empty() {
+            reports.push(format!(
+                "case {crate_root}: expected at least one declared suite, got none"
+            ));
+            continue;
+        }
+        for report in repeated_declarations(&declared)
+            .into_iter()
+            .chain(unreachable_declarations(tests, &declared))
+        {
+            reports.push(format!("case {crate_root}: {report}"));
+        }
+    }
+
+    assert!(
+        reports.is_empty(),
+        "expected each of the {} declaration roots to declare every suite once and to name \
+         a file that exists, got {} report(s): {reports:#?}",
+        roots.len(),
+        reports.len()
+    );
+}
+
 #[test]
 fn the_reader_reports_a_declaration_the_target_cannot_compile() {
     // One synthetic `all.rs` per way a declaration lands, with how many reports each half of

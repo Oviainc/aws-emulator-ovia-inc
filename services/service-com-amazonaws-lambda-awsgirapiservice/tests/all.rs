@@ -345,6 +345,8 @@ mod stream_mapping_iterator_age_series;
 mod synchronous_invoke_run;
 #[path = "all/tag_resource_arn_constraint.rs"]
 mod tag_resource_arn_constraint;
+#[path = "all/test_suite_declarations.rs"]
+mod test_suite_declarations;
 #[path = "all/untrusted_name_parsing.rs"]
 mod untrusted_name_parsing;
 #[path = "all/update_function_configuration.rs"]
