@@ -1527,12 +1527,34 @@ fn must_be_between(
 }
 
 /// The sentence for a rule no model can express: a set of otherwise-optional members of
-/// which a request must set at least one. The members are the only variable part, and the
-/// member the refusal names in its `fieldList` is the first of them.
+/// which a request must set at least one. The members are the only variable part — each
+/// quoted, as every sentence of this service quotes a member name — and the member the
+/// refusal names in its `fieldList` is the first of them.
 pub fn at_least_one_of(members: &[&str]) -> String {
     format!(
         "At least one of the following fields must be set: {}.",
-        members.join(", ")
+        quoted_list(members)
+    )
+}
+
+/// The sentence for the opposite rule, equally inexpressible: a set of members that are
+/// ALTERNATIVES, of which a request set more than one. The whole exclusive set is stated,
+/// not the subset the request happened to populate, because the set is a property of the
+/// shape the members belong to and is what a caller needs to pick one of.
+pub fn only_one_of(members: &[&str]) -> String {
+    format!(
+        "Only one of the following fields may be set: {}.",
+        quoted_list(members)
+    )
+}
+
+/// [`only_one_of`] for alternatives that are members of a nested structure rather than of
+/// the request itself: the container is named, so the member names read against the shape
+/// that declares them.
+pub fn only_one_of_within(container: &str, members: &[&str]) -> String {
+    format!(
+        "Only one of the following fields may be set within '{container}': {}.",
+        quoted_list(members)
     )
 }
 

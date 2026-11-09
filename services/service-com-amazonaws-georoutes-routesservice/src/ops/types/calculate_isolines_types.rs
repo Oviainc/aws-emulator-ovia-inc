@@ -211,13 +211,140 @@ pub struct CalculateIsolinesOutput {
     pub snapped_origin: Option<Vec<f64>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.georoutes#Isoline")]
+/// One reachable area, reporting the threshold it was computed for.
+///
+/// HAND-WRITTEN, schema and codec both, for one reason: `DistanceThreshold` is documented
+/// as the distance "used to calculate this isoline, IF distance-based thresholds were
+/// specified in the request" and `TimeThreshold` as the time "used to calculate this
+/// isoline, IF time-based thresholds were specified in the request", so the member of the
+/// kind the request did not ask for does not apply to this isoline and is ABSENT from it —
+/// presence of the member is how a caller tells a distance isoline from a time one. Both
+/// members carry `@default 0` and no `@required`, and `smithy_macros::smithy` holds such a
+/// member to a non-`Option` field it always writes, which would report every distance
+/// isoline as a 0-second time isoline as well. An `Option` field models the absence, which
+/// is why these impls are spelled out below rather than derived.
 #[derive(Debug, Clone, Default)]
 pub struct Isoline {
     pub connections: Vec<IsolineConnection>,
-    pub distance_threshold: i64,
+    pub distance_threshold: Option<i64>,
     pub geometries: Vec<IsolineShapeGeometry>,
-    pub time_threshold: i64,
+    pub time_threshold: Option<i64>,
+}
+
+/// One member schema of [`Isoline`], named and indexed as the model declares it.
+macro_rules! isoline_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.georoutes#Isoline$", $name),
+                Isoline::NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+impl Isoline {
+    const SHAPE_ID: &'static str = "com.amazonaws.georoutes#Isoline";
+    const NAMESPACE: &'static str = "com.amazonaws.georoutes";
+
+    pub const M_CONNECTIONS: ::aws_smithy_schema::Schema = isoline_member!("Connections", List, 0);
+    pub const M_DISTANCE_THRESHOLD: ::aws_smithy_schema::Schema =
+        isoline_member!("DistanceThreshold", Long, 1);
+    pub const M_GEOMETRIES: ::aws_smithy_schema::Schema = isoline_member!("Geometries", List, 2);
+    pub const M_TIME_THRESHOLD: ::aws_smithy_schema::Schema =
+        isoline_member!("TimeThreshold", Long, 3);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(Self::SHAPE_ID, Self::NAMESPACE, "Isoline"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_CONNECTIONS,
+            &Self::M_DISTANCE_THRESHOLD,
+            &Self::M_GEOMETRIES,
+            &Self::M_TIME_THRESHOLD,
+        ],
+    );
+}
+
+pub static ISOLINE_SCHEMA: &::aws_smithy_schema::Schema = &Isoline::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for Isoline {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_list(&Self::M_CONNECTIONS, &|sl| {
+            for connection in self.connections.iter() {
+                sl.write_struct(&IsolineConnection::SCHEMA, connection)?;
+            }
+            Ok(())
+        })?;
+        // The threshold of the kind the request asked for; the other one does not apply to
+        // this isoline and is not written at all.
+        if let Some(metres) = self.distance_threshold {
+            s.write_long(&Self::M_DISTANCE_THRESHOLD, metres)?;
+        }
+        s.write_list(&Self::M_GEOMETRIES, &|sl| {
+            for geometry in self.geometries.iter() {
+                sl.write_struct(&IsolineShapeGeometry::SCHEMA, geometry)?;
+            }
+            Ok(())
+        })?;
+        if let Some(seconds) = self.time_threshold {
+            s.write_long(&Self::M_TIME_THRESHOLD, seconds)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for Isoline {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut connections: Option<Vec<IsolineConnection>> = None;
+        let mut distance_threshold: Option<i64> = None;
+        let mut geometries: Option<Vec<IsolineShapeGeometry>> = None;
+        let mut time_threshold: Option<i64> = None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => {
+                    let mut read: Vec<IsolineConnection> = Vec::new();
+                    d.read_list(&Self::M_CONNECTIONS, &mut |dl| {
+                        read.push(<IsolineConnection as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(dl)?);
+                        Ok(())
+                    })?;
+                    connections = Some(read);
+                }
+                Some(1) => distance_threshold = Some(d.read_long(&Self::M_DISTANCE_THRESHOLD)?),
+                Some(2) => {
+                    let mut read: Vec<IsolineShapeGeometry> = Vec::new();
+                    d.read_list(&Self::M_GEOMETRIES, &mut |dl| {
+                        read.push(<IsolineShapeGeometry as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(dl)?);
+                        Ok(())
+                    })?;
+                    geometries = Some(read);
+                }
+                Some(3) => time_threshold = Some(d.read_long(&Self::M_TIME_THRESHOLD)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        // `Connections` and `Geometries` are `@required`, so their absence is an error
+        // rather than an empty list — the asymmetry with the two threshold members, which
+        // are absent exactly when they do not apply, is the model's own.
+        Ok(Self {
+            connections: connections
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("Connections"))?,
+            distance_threshold,
+            geometries: geometries
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("Geometries"))?,
+            time_threshold,
+        })
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.georoutes#IsolineConnection")]

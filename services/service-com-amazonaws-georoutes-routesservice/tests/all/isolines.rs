@@ -431,6 +431,108 @@ async fn the_isolines_answer_the_requested_thresholds_one_for_one_and_in_order()
     }
 }
 
+/// An isoline reports the threshold it WAS computed for and nothing about the kind of
+/// threshold the request never asked for: `DistanceThreshold` is the distance "used to
+/// calculate this isoline, if distance-based thresholds were specified in the request" and
+/// `TimeThreshold` the time "used to calculate this isoline, if time-based thresholds were
+/// specified in the request"
+/// (`smithy_query(query="shape",shape="Isoline",
+/// model_path="services/service-com-amazonaws-georoutes-routesservice/smithy-model/com-amazonaws-georoutes-routesservice.json")`),
+/// so the member of the other kind does not apply and is ABSENT from the isoline object —
+/// presence of the member is how a caller tells a distance isoline from a time one.
+///
+/// Rows differ along what the rule generalises over: which kind the request bounds the area
+/// by, the threshold values and how many of them, whether the area is measured from an
+/// origin or towards a destination, and the geometry format the answer is rendered in.
+#[tokio::test]
+async fn an_isoline_carries_only_the_threshold_member_of_the_kind_the_request_asked_for() {
+    let router = routes_service();
+    // case, anchor member, kind, the thresholds the request lists, the geometry format it
+    // asks for (`None` leaves the documented default).
+    type Case = (&'static str, &'static str, Kind, Vec<i64>, Option<&'static str>);
+    let cases: [Case; 6] = [
+        ("one distance threshold", "Origin", Kind::Distance, vec![2_000], Some("Simple")),
+        (
+            "two distance thresholds, default format",
+            "Origin",
+            Kind::Distance,
+            vec![1_000, 2_000],
+            None,
+        ),
+        ("one time threshold", "Origin", Kind::Time, vec![600], Some("Simple")),
+        (
+            "three time thresholds, default format",
+            "Origin",
+            Kind::Time,
+            vec![300, 600, 1_200],
+            None,
+        ),
+        (
+            "five distance thresholds towards a destination",
+            "Destination",
+            Kind::Distance,
+            vec![1_000, 2_000, 3_000, 4_000, 5_000],
+            Some("Simple"),
+        ),
+        (
+            "a time threshold towards a destination",
+            "Destination",
+            Kind::Time,
+            vec![900],
+            None,
+        ),
+    ];
+
+    for (case, anchor_member, kind, thresholds, format) in cases {
+        let mut body = isoline_request(anchor_member, GOOD, kind, &thresholds);
+        match format {
+            Some(format) => body["IsolineGeometryFormat"] = json!(format),
+            // `isoline_request` asks for `Simple`; removing it leaves the default.
+            None => {
+                body.as_object_mut()
+                    .expect("a request body is an object")
+                    .remove("IsolineGeometryFormat");
+            }
+        }
+        let (status, answer, _) = post(&router, ISOLINES, &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} with {answer:?}"
+        );
+        let isolines = answer["Isolines"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: Isolines is required, got {answer:?}"));
+        assert_eq!(
+            isolines.len(),
+            thresholds.len(),
+            "case {case:?}: one isoline per requested threshold, got {isolines:?}"
+        );
+        let inapplicable = match kind {
+            Kind::Distance => Kind::Time,
+            Kind::Time => Kind::Distance,
+        };
+        for (index, threshold) in thresholds.iter().enumerate() {
+            let isoline = isolines[index]
+                .as_object()
+                .unwrap_or_else(|| panic!("case {case:?}: an isoline is an object, got {isolines:?}"));
+            let reported = isoline.get(kind.response_member());
+            assert_eq!(
+                reported.and_then(Value::as_i64),
+                Some(*threshold),
+                "case {case:?}: isoline {index} reports {} = {threshold}, got {reported:?}",
+                kind.response_member()
+            );
+            assert!(
+                !isoline.contains_key(inapplicable.response_member()),
+                "case {case:?}: isoline {index} was not computed for a {inapplicable:?} \
+                 threshold, so {} must be absent, got {:?}",
+                inapplicable.response_member(),
+                isoline.get(inapplicable.response_member())
+            );
+        }
+    }
+}
+
 /// How many points a boundary carries is what `IsolineGranularity` asks for: `MaxPoints`
 /// caps them, a finer `MaxResolution` asks for more of them, and neither drops a ring below
 /// the fewest points a caller may ask for.
@@ -669,13 +771,13 @@ async fn a_request_that_does_not_name_one_anchor_and_one_threshold_type_is_refus
     // case, body, the member the refusal names and the sentence it states — `None` where the
     // request must be served instead.
     type Case = (&'static str, Value, Option<(&'static str, &'static str)>);
-    let cases: [Case; 10] = [
+    let cases: [Case; 12] = [
         (
             "neither an origin nor a destination",
             json!({ "Thresholds": { "Time": [600] } }),
             Some((
                 "Origin",
-                "At least one of the following fields must be set: Origin, Destination.",
+                "At least one of the following fields must be set: 'Origin', 'Destination'.",
             )),
         ),
         (
@@ -687,7 +789,7 @@ async fn a_request_that_does_not_name_one_anchor_and_one_threshold_type_is_refus
             }),
             Some((
                 "Destination",
-                "'Destination' must not be set when 'Origin' is set.",
+                "Only one of the following fields may be set: 'Origin', 'Destination'.",
             )),
         ),
         (
@@ -695,7 +797,8 @@ async fn a_request_that_does_not_name_one_anchor_and_one_threshold_type_is_refus
             json!({ "Origin": GOOD, "Thresholds": {} }),
             Some((
                 "Thresholds.Distance",
-                "At least one of the following fields must be set: Thresholds.Distance, Thresholds.Time.",
+                "At least one of the following fields must be set: 'Thresholds.Distance', \
+                 'Thresholds.Time'.",
             )),
         ),
         (
@@ -705,8 +808,38 @@ async fn a_request_that_does_not_name_one_anchor_and_one_threshold_type_is_refus
                 "Thresholds": { "Distance": [1_000], "Time": [600] }
             }),
             Some((
-                "Thresholds.Time",
-                "'Thresholds.Time' must not be set when 'Thresholds.Distance' is set.",
+                "Thresholds",
+                "Only one of the following fields may be set within 'Thresholds': 'Consumption', \
+                 'Distance', 'Time'.",
+            )),
+        ),
+        (
+            // The exclusive set belongs to the container, so the sentence does not change
+            // with which kinds the request populated, how many values each carries, or the
+            // order they arrive in.
+            "thresholds of both types, several values each, time first",
+            json!({
+                "Destination": GOOD,
+                "Thresholds": { "Time": [300, 600, 900], "Distance": [1_000, 2_000] }
+            }),
+            Some((
+                "Thresholds",
+                "Only one of the following fields may be set within 'Thresholds': 'Consumption', \
+                 'Distance', 'Time'.",
+            )),
+        ),
+        (
+            // The same rule between the two anchors, which are members of the request
+            // itself rather than of a nested structure, so there is no container to name.
+            "both a destination and an origin, with distance thresholds",
+            json!({
+                "Destination": GOOD,
+                "Origin": SEATTLE,
+                "Thresholds": { "Distance": [2_000] }
+            }),
+            Some((
+                "Destination",
+                "Only one of the following fields may be set: 'Origin', 'Destination'.",
             )),
         ),
         (

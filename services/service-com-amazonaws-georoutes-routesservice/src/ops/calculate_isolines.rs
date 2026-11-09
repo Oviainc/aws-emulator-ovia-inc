@@ -476,7 +476,7 @@ impl Anchor {
             )),
             (Some(_), Some(_)) => Err(invalid(
                 DESTINATION_MEMBER,
-                must_not_be_set_with(DESTINATION_MEMBER, ORIGIN_MEMBER),
+                state::only_one_of(&ANCHOR_MEMBERS),
             )),
             (Some(origin), None) => Ok(Self {
                 position: state::validate_position(origin).map_err(|message| invalid(ORIGIN_MEMBER, message))?,
@@ -501,13 +501,16 @@ const DESTINATION_MEMBER: &str = ANCHOR_MEMBERS[1];
 /// The two members a threshold can be given under, in the order the model declares them.
 const THRESHOLD_MEMBERS: [&str; 2] = ["Thresholds.Distance", "Thresholds.Time"];
 
-/// The sentence for a member that may not be set ALONGSIDE another, which is how this
-/// service words a rule between two members that cannot hold together: the member at fault
-/// and the member that excludes it are the only variable parts, and no request value is
-/// quoted into it.
-fn must_not_be_set_with(member: &str, excluded_by: &str) -> String {
-    format!("'{member}' must not be set when '{excluded_by}' is set.")
-}
+/// The member a request carries its thresholds under: the container whose members are the
+/// alternatives, which is what a refusal of more than one of them at once names.
+const THRESHOLDS_MEMBER: &str = "Thresholds";
+
+/// Every threshold kind the thresholds container holds, in the order this service
+/// enumerates them. The set belongs to the CONTAINER rather than to the request, so a
+/// refusal states all of them — including the consumption kind this revision of the
+/// structure does not declare — and a caller discovering the rule from the refusal learns
+/// the whole set it must pick exactly one of.
+const THRESHOLD_KINDS: [&str; 3] = ["Consumption", "Distance", "Time"];
 
 /// Which clock the request pinned the calculation to.
 #[derive(Debug, Clone, Copy)]
@@ -623,20 +626,22 @@ impl Threshold {
         }
     }
 
-    /// `Isoline$DistanceThreshold`: the distance this isoline was computed for, and the
-    /// member's `@default` of 0 for a time-based one.
-    fn distance_threshold(self) -> i64 {
+    /// `Isoline$DistanceThreshold`: the distance this isoline was computed for, and NONE
+    /// for a time-based one — the member reports the distance "used to calculate this
+    /// isoline, if distance-based thresholds were specified in the request", so it does not
+    /// apply to an isoline computed for a time and is absent from it.
+    fn distance_threshold(self) -> Option<i64> {
         match self {
-            Self::Distance(metres) => metres,
-            Self::Time(_) => 0,
+            Self::Distance(metres) => Some(metres),
+            Self::Time(_) => None,
         }
     }
 
     /// `Isoline$TimeThreshold`, the mirror of [`Self::distance_threshold`].
-    fn time_threshold(self) -> i64 {
+    fn time_threshold(self) -> Option<i64> {
         match self {
-            Self::Distance(_) => 0,
-            Self::Time(seconds) => seconds,
+            Self::Distance(_) => None,
+            Self::Time(seconds) => Some(seconds),
         }
     }
 }
@@ -652,8 +657,8 @@ fn resolve_thresholds(thresholds: &IsolineThresholds) -> Result<Vec<Threshold>, 
     let time = thresholds.time.as_deref().unwrap_or_default();
     if !distance.is_empty() && !time.is_empty() {
         return Err(invalid(
-            THRESHOLD_MEMBERS[1],
-            must_not_be_set_with(THRESHOLD_MEMBERS[1], THRESHOLD_MEMBERS[0]),
+            THRESHOLDS_MEMBER,
+            state::only_one_of_within(THRESHOLDS_MEMBER, &THRESHOLD_KINDS),
         ));
     }
     if distance.is_empty() && time.is_empty() {
