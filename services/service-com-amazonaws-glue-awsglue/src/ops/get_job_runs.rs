@@ -179,6 +179,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
+        // A run of this job that is still owed its script's ONE execution — one a trigger's
+        // firing or an event delivery began — is performed here, with no store guard held,
+        // before the history is read: the execution was owed the instant the run began, so
+        // what this read reports is what that execution came to rather than a run nothing is
+        // running. A run whose script has already been performed is never performed again
+        // (the claim is taken under the store's guard), so this read moves no run that was
+        // not already owed the move.
+        //
+        // The script is compiled and run INSIDE this process by the embedded Python
+        // interpreter ([`crate::state::job_script`]): nothing is spawned, no shell is
+        // involved, no host path is resolved, and the script reaches no host socket,
+        // process, library, file or environment variable — only this emulator, over the
+        // in-process callback. What this request spends is bounded before anything runs: at
+        // most [`crate::state::MAX_JOB_SCRIPT_RUNS_PER_CALL`] scripts, no further one
+        // started past [`crate::state::JOB_SCRIPT_CALL_CEILING`], one at a time out of
+        // [`crate::state::MAX_CONCURRENT_JOB_SCRIPT_RUNS`], and each script stopped at
+        // [`crate::state::JOB_SCRIPT_RUN_CEILING`].
+        crate::state::perform_owed_job_runs(
+            &*self.engine,
+            ctx,
+            &region,
+            ::std::slice::from_ref(&input.job_name),
+        )
+        .await;
         let mut store = state.lock();
         // `JobName` is `@required` with `length 1..255`, so an absent or over-long one is
         // refused at the boundary: reaching here, the only question is whether THIS Region

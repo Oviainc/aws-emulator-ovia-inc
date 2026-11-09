@@ -28,8 +28,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::messages::JOB_NOT_FOUND;
 use service_com_amazonaws_glue_awsglue::state::{
-    JOB_RUN_ID_PREFIX, JOB_RUN_NOT_EXECUTED_MESSAGE, JOB_RUN_STATE_FAILED, JOB_RUN_STATE_STARTING,
-    JOB_RUN_STATE_STOPPED, JOB_RUN_STATE_STOPPING, TERMINAL_JOB_RUN_STATES,
+    JOB_RUN_ID_PREFIX, JOB_RUN_STATE_FAILED, JOB_RUN_STATE_STARTING, JOB_RUN_STATE_STOPPED,
+    JOB_RUN_STATE_STOPPING, TERMINAL_JOB_RUN_STATES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -358,11 +358,7 @@ async fn a_submitted_stop_moves_each_named_run_to_stopped() {
                 "case {case:?}: a run no stop was submitted for settles into \
                  {JOB_RUN_STATE_FAILED}, got {run}"
             );
-            assert_eq!(
-                run.get("ErrorMessage").and_then(Value::as_str),
-                Some(JOB_RUN_NOT_EXECUTED_MESSAGE),
-                "case {case:?}: that run carries the reason it never ran, got {run}"
-            );
+            crate::job_runs::assert_script_was_unreadable(case, &run);
         }
     }
 

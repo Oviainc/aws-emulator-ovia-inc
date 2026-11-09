@@ -464,65 +464,88 @@ impl JobEntry {
             .max(DEFAULT_MAX_CONCURRENT_RUNS)
     }
 
-    /// Give every run of this job the state the CLOCK already owed it at `now`, and record
-    /// the retries those states left owed.
+    /// Give every run of this job the state the CLOCK already owed it at `now`.
     ///
     /// This is the one write a reporting operation performs: a run's next state was due
     /// at [`JobRunEntry::settles_at`] whether or not anybody called, so materialising it
     /// on read reports the state the clock had already reached. It never moves a run
     /// because something was read.
-    ///
-    /// A retry is owed on exactly the same terms. "The maximum number of times to retry
-    /// this job after a JobRun fails" (`Job$MaxRetries`) is a policy of the JOB, so the
-    /// SERVICE — not the caller — runs the next attempt of a run that ended in the failure
-    /// state while the job still has retry budget: a further run of the same job under the
-    /// same configuration, carrying the next `Attempt` and naming the attempt it retries in
-    /// its `PreviousRunId` ([`JobRunEntry::retry`]). That attempt was due the instant the
-    /// failure was, so it is materialised here rather than slept for, and it is recorded
-    /// once: a run another attempt already retries is retried by nothing further, so two
-    /// reads of the same chain report the same runs.
     pub fn settle_due_runs(&mut self, now: SystemTime) {
-        // A retry can itself fail and be retried, so what the clock owes is materialised in
-        // passes: each settles the states that fell due and records at most one further
-        // attempt. The passes are bounded by the runs one job can hold
-        // ([`MAX_RUNS_PER_JOB`]), each pass but the last adding one.
-        for _ in 0..=MAX_RUNS_PER_JOB {
-            for run in &mut self.runs {
-                run.settle_if_due(now);
-            }
-            let Some(retry) = self.owed_retry() else {
-                return;
-            };
-            self.record_run(retry);
+        for run in &mut self.runs {
+            run.settle_if_due(now);
         }
     }
 
-    /// The next attempt this job's stored runs leave owed, or `None` when they leave none.
+    /// CLAIM the one script execution a run of this job is still owed, and answer which run
+    /// it was — oldest first, or `None` when every run of this job has been performed.
     ///
-    /// The run it retries is one that ended in the failure state — a run ended any other
-    /// way (a submitted stop) failed at nothing and is retried by nothing — whose `Attempt`
-    /// is still below the job's `MaxRetries`, so the chain one start begins is one original
-    /// attempt plus at most that many retries, and which no other run already names as the
-    /// attempt it retries, so a chain never forks.
+    /// A run begins owing one execution of its job's script
+    /// ([`JobRunEntry::awaiting_script`]), so this is what the execution path asks for to
+    /// find the work the service already owes ([`super::perform_owed_job_runs`]). The claim
+    /// is taken HERE, under the store's guard, and the script then runs without it — so two
+    /// calls that find the same run owed its script cannot both run it, and the run's effects
+    /// happen once. A claim whose execution never happened is given back
+    /// ([`JobEntry::release_script_claim`]), so nothing is left owed by nobody. The walk is
+    /// bounded by the runs one job holds ([`MAX_RUNS_PER_JOB`]).
+    pub fn claim_run_awaiting_script(&mut self) -> Option<String> {
+        let run = self.runs.iter_mut().find(|run| run.awaiting_script)?;
+        run.awaiting_script = false;
+        Some(run.id.clone())
+    }
+
+    /// Give back the claim on the run `run_id`'s script execution, for a claim nothing ran.
     ///
-    /// The attempt it answers is not in flight yet: it takes the slot the failed attempt
-    /// released, so materialising it can never put more runs in flight than
-    /// `ExecutionProperty$MaxConcurrentRuns` admitted starts.
-    pub(super) fn owed_retry(&self) -> Option<JobRunEntry> {
+    /// The run owes its script an execution again, so a later call performs it rather than
+    /// this emulator reporting an outcome no execution produced. A run that has come to rest
+    /// in the meantime owes nothing.
+    pub fn release_script_claim(&mut self, run_id: &str) {
+        if let Some(run) = self.run_mut(run_id) {
+            if !run.is_terminal() && run.settles_to != JOB_RUN_STATE_STOPPED {
+                run.awaiting_script = true;
+            }
+        }
+    }
+
+    /// Record the next ATTEMPT every run of this job that FAILED leaves owed.
+    ///
+    /// "The maximum number of times to retry this job after a JobRun fails"
+    /// (`Job$MaxRetries`) is a policy of the JOB, so the SERVICE — not the caller — runs the
+    /// next attempt of a run that ended in the failure state while the job still has retry
+    /// budget: a further run of the same job under the same configuration, carrying the next
+    /// `Attempt` and naming the attempt it retries in its `PreviousRunId`
+    /// ([`JobRunEntry::retry`]). Like any other run that attempt owes its job's script ONE
+    /// execution, which the execution path performs for it
+    /// ([`super::perform_owed_job_runs`]) — so what an attempt comes to rest in is what its
+    /// OWN execution came to and not what the attempt it retries came to.
+    ///
+    /// A retry is owed only by a run that has COME TO REST in the failure state, so the
+    /// chain advances one attempt per span the clock owes: a caller polling it observes each
+    /// attempt in flight before the next one exists, and a run a submitted stop brought to
+    /// rest — which failed at nothing — buys no attempt at all. A run another attempt
+    /// already retries is retried by nothing further, so a chain never forks and the chain
+    /// one start begins is one original attempt plus at most `MaxRetries` further runs.
+    pub fn record_owed_attempts(&mut self) {
         if self.max_retries <= 0 {
-            return None;
+            return;
         }
         let retried: BTreeSet<&str> = self
             .runs
             .iter()
             .filter_map(|run| run.previous_run_id.as_deref())
             .collect();
-        let failed = self.runs.iter().find(|run| {
-            run.state == JOB_RUN_STATE_FAILED
-                && run.attempt < self.max_retries
-                && !retried.contains(run.id.as_str())
-        })?;
-        Some(failed.retry(new_job_run_id()))
+        let recorded: Vec<JobRunEntry> = self
+            .runs
+            .iter()
+            .filter(|run| {
+                run.state == JOB_RUN_STATE_FAILED
+                    && run.attempt < self.max_retries
+                    && !retried.contains(run.id.as_str())
+            })
+            .map(|failed| failed.retry(new_job_run_id()))
+            .collect();
+        for attempt in recorded {
+            self.record_run(attempt);
+        }
     }
 
     /// The stored run with this `Id`, or `None` when this job has no such run.
@@ -549,9 +572,9 @@ impl JobEntry {
     /// This is also where the job's BOOKMARK is written: a bookmark is the point a job
     /// resumes processing at, which a run is what establishes — so the first run of a job
     /// gives it one ([`JobBookmarkState::record_run`]) and every later run advances it,
-    /// including an attempt the job's retry policy owed ([`JobEntry::owed_retry`]), which is
-    /// a further run of the job and not a re-read of an earlier one. Nothing else writes it
-    /// except a reset, so a bookmark never moves because something was read.
+    /// including an attempt the job's retry policy owed ([`JobEntry::record_owed_attempts`]),
+    /// which is a further run of the job and not a re-read of an earlier one. Nothing else
+    /// writes it except a reset, so a bookmark never moves because something was read.
     pub fn record_run(&mut self, run: JobRunEntry) {
         self.bookmark
             .get_or_insert_with(JobBookmarkState::default)
@@ -805,15 +828,9 @@ pub const TERMINAL_JOB_RUN_STATES: [&str; 6] = [
 /// materialised by whichever later call reads it; nothing sleeps.
 pub const JOB_RUN_SETTLES_AFTER: Duration = Duration::from_millis(500);
 
-/// `JobRun$ErrorMessage` for the terminal state the clock owes every run.
-///
-/// This emulator is the Glue control plane: it records a run faithfully, but it runs no
-/// job script, so a run can never reach `SUCCEEDED` — it ends in the modelled failure
-/// state carrying a reason that says exactly that, rather than reporting a result nothing
-/// computed.
-pub const JOB_RUN_NOT_EXECUTED_MESSAGE: &str =
-    "This emulator records job runs but executes no job script, so the job run ended \
-     without running.";
+/// The `JobRunState` a run is in while its script is being executed, before the state that
+/// execution comes to. See [`JOB_RUN_STATE_STARTING`].
+pub const JOB_RUN_STATE_RUNNING: &str = "RUNNING";
 
 /// `JobRun$Attempt` of a run that is not a retry of an earlier one: "The number of the
 /// attempt to run this job", which for a first attempt is the model's own default of 0.
@@ -906,10 +923,25 @@ pub struct JobRunEntry {
     pub state: String,
     /// The instant the clock owes this run its next state; `None` once it has settled.
     pub settles_at: Option<SystemTime>,
-    /// The `JobRunState` the clock owes this run at [`JobRunEntry::settles_at`]: the
-    /// state a run nothing executed comes to rest in, and [`JOB_RUN_STATE_STOPPED`] once
-    /// a stop has been submitted for it.
+    /// The `JobRunState` the clock owes this run at [`JobRunEntry::settles_at`]:
+    /// [`JOB_RUN_STATE_RUNNING`] while the run's script is still owed an execution, the
+    /// state that execution came to once it has been performed
+    /// ([`JobRunEntry::record_execution`]), and [`JOB_RUN_STATE_STOPPED`] once a stop has
+    /// been submitted for it.
     pub settles_to: String,
+    /// `JobRun$ErrorMessage` the run carries once it has come to rest, and `None` for a run
+    /// that comes to rest having failed at nothing: the reason travels with the run from
+    /// the instant the execution answered until the clock settles it, so the message a run
+    /// reports is the one its own execution produced.
+    pub settles_error: Option<String>,
+    /// Whether this run still owes its job's script ONE execution.
+    ///
+    /// A run begins owing it, and the execution path clears this when the script has been
+    /// performed ([`JobRunEntry::record_execution`]) or when a submitted stop has brought
+    /// the run to rest before anything ran it — so no run is ever performed twice, and a
+    /// run nothing has performed yet is found by [`JobEntry::claim_run_awaiting_script`]
+    /// rather than reported as having come to any outcome.
+    pub awaiting_script: bool,
     /// The job's `DefaultArguments` with this run's `Arguments` applied over them, then
     /// the job's `NonOverridableArguments`: "For this job run, they replace the default
     /// arguments set in the job definition itself" (`StartJobRun$Arguments`), except for
@@ -996,9 +1028,13 @@ impl JobRunEntry {
             completed_on: None,
             state: JOB_RUN_STATE_STARTING.to_string(),
             settles_at: Some(now.checked_add(JOB_RUN_SETTLES_AFTER).unwrap_or(now)),
-            // Nothing executes the job script here, so the state the clock owes a run
-            // that nobody stops is the modelled failure state.
-            settles_to: JOB_RUN_STATE_FAILED.to_string(),
+            // The run's script has not been executed yet, so the state the clock owes a
+            // run that nobody stops is the one a run whose script is running is in; the
+            // state it comes to REST in is whatever that execution comes to
+            // ([`JobRunEntry::record_execution`]).
+            settles_to: JOB_RUN_STATE_RUNNING.to_string(),
+            settles_error: None,
+            awaiting_script: true,
             arguments,
             // Nothing has failed yet: a run carries an error message only once it has.
             error_message: None,
@@ -1026,7 +1062,40 @@ impl JobRunEntry {
         }
     }
 
-    /// Whether this run has finished, by [`TERMINAL_JOB_RUN_STATES`].
+    /// Record what ONE execution of this run's script came to, which is the state the run
+    /// comes to REST in: `SUCCEEDED` for a script that exited cleanly, the modelled failure
+    /// state carrying the script's own error for one that raised, and the state a run that
+    /// ran past its `Timeout` reports ([`super::JobRunOutcome`]).
+    ///
+    /// The state is owed from the instant the execution answered, but no earlier than the
+    /// span every run spends in the state its start put it in
+    /// ([`JOB_RUN_SETTLES_AFTER`]) — so a caller that polls straight after `StartJobRun`
+    /// still observes the run in flight however fast its script was, and a run whose script
+    /// took longer than that span comes to rest as soon as it answered.
+    ///
+    /// A run a stop has already been submitted for keeps the stop it was owed: a client
+    /// asked for that run to stop, and the script's own outcome does not undo it. Nor does
+    /// this move a run that has already come to rest.
+    pub fn record_execution(&mut self, outcome: &super::JobRunOutcome, now: SystemTime) {
+        // Whatever happens below, this run no longer owes its script an execution: it has
+        // had one.
+        self.awaiting_script = false;
+        if self.is_terminal()
+            || self.state == JOB_RUN_STATE_STOPPING
+            || self.settles_to == JOB_RUN_STATE_STOPPED
+        {
+            return;
+        }
+        let span_ends = self
+            .started_on
+            .checked_add(JOB_RUN_SETTLES_AFTER)
+            .unwrap_or(self.started_on);
+        self.settles_at = Some(span_ends.max(now));
+        self.settles_to = outcome.job_run_state().to_string();
+        self.settles_error = outcome.error_message();
+    }
+
+    /// Whether this stored run has finished, by [`TERMINAL_JOB_RUN_STATES`].
     pub fn is_terminal(&self) -> bool {
         TERMINAL_JOB_RUN_STATES.contains(&self.state.as_str())
     }
@@ -1044,8 +1113,8 @@ impl JobRunEntry {
     /// flight before the next one exists. Nothing has failed in the new attempt yet, so it
     /// carries no `ErrorMessage` of its own and no completion instant.
     ///
-    /// Scheduled by [`JobEntry::settle_due_runs`], which decides WHETHER an attempt is owed;
-    /// this builds the record of one. A retry of a run a TRIGGER began keeps that run's
+    /// Scheduled by [`JobEntry::record_owed_attempts`], which decides WHETHER an attempt is
+    /// owed; this builds the record of one. A retry of a run a TRIGGER began keeps that run's
     /// `TriggerName`, because the attempt is of the work that firing initiated; the workflow
     /// run that firing belongs to still reports the attempt IT recorded, since its actions
     /// name the run ids they began.
@@ -1064,9 +1133,12 @@ impl JobRunEntry {
                     .checked_add(JOB_RUN_SETTLES_AFTER)
                     .unwrap_or(started_on),
             ),
-            // Nothing executes the job script for this attempt either, so the state the
-            // clock owes it is the same modelled failure state.
-            settles_to: JOB_RUN_STATE_FAILED.to_string(),
+            // This attempt's script has not been executed yet either, so it owes one and
+            // the clock owes it the state a run whose script is running is in until that
+            // execution answers.
+            settles_to: JOB_RUN_STATE_RUNNING.to_string(),
+            settles_error: None,
+            awaiting_script: true,
             error_message: None,
             ..self.clone()
         }
@@ -1087,12 +1159,11 @@ impl JobRunEntry {
         self.settles_at = None;
         self.state = self.settles_to.clone();
         // `JobRun$ErrorMessage` is "the error message associated with this job run": the
-        // run that comes to rest in the failure state carries the reason it never ran,
-        // while one a submitted stop brought to rest failed at nothing and carries none.
-        if self.state == JOB_RUN_STATE_FAILED {
-            self.error_message = Some(JOB_RUN_NOT_EXECUTED_MESSAGE.to_string());
-        }
+        // run carries the reason its own execution answered with, and a run that comes to
+        // rest having failed at nothing — one that succeeded, and one a submitted stop
+        // brought to rest — carries none.
         if self.is_terminal() {
+            self.error_message = self.settles_error.take();
             self.completed_on = Some(due);
         }
         self.last_modified_on = due;
@@ -1118,6 +1189,11 @@ impl JobRunEntry {
         self.state = JOB_RUN_STATE_STOPPING.to_string();
         self.settles_at = Some(now.checked_add(JOB_RUN_SETTLES_AFTER).unwrap_or(now));
         self.settles_to = JOB_RUN_STATE_STOPPED.to_string();
+        // A run that is stopping is not run: a client asked for it to stop, so its script
+        // is no longer owed an execution, and the run comes to rest having failed at
+        // nothing.
+        self.awaiting_script = false;
+        self.settles_error = None;
         self.last_modified_on = now;
         true
     }
@@ -1168,14 +1244,15 @@ impl JobRunEntry {
             worker_type: self.worker_type.clone(),
             number_of_workers: self.number_of_workers,
             security_configuration: self.security_configuration.clone(),
-            // "The name of the log group for secure logging": no job script runs here, so
-            // nothing writes this run's output anywhere and there is no log group holding
-            // it to name.
+            // "The name of the log group for secure logging": a run's script writes its
+            // output into the run's own log here rather than into a log group of this
+            // account, so there is no group holding it to name.
             log_group_name: None,
             notification_property: self.notification_property.clone(),
             glue_version: Some(self.glue_version.clone()),
             // "The total time each executor ran during the lifecycle of a job run in
-            // seconds, multiplied by a DPU factor": no executor ran.
+            // seconds, multiplied by a DPU factor": the script runs in this process rather
+            // than on allocated DPUs, so no executor ran for a figure to be of.
             dpu_seconds: None,
             execution_class: self.execution_class.clone(),
             maintenance_window: self.maintenance_window.clone(),

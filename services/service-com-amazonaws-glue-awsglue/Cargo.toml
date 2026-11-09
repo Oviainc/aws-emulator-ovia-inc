@@ -58,6 +58,24 @@ base64 = "0.22"
 # schema registry's compatibility modes ask of two versions of a schema set. Only the
 # schema algebra is used; no codec feature is enabled.
 apache-avro = { version = "0.17", default-features = false }
+# The CONTAINED Python interpreter a Glue job run's own script is executed by, and the AWS
+# SDK modules that interpreter puts on a script's import path — both reached through the
+# Lambda service crate, which is where this workspace's ONE embedded Python execution
+# substrate lives (`state::execution::python`). Reused rather than stood up a second time
+# here, so a job script runs under exactly the containment and the bounds that engine
+# already enforces, and this crate adds no execution surface of its own: it supplies the
+# script's source, its command line and its ceilings
+# (`crate::state::job_script`) and nothing else.
+#
+# Capability class: an execution substrate. What it re-opens is answered by that engine and
+# by this crate's own module docs — the interpreter is built with the engine crate's
+# host-reaching features compiled out, its native modules are an allow-list that leaves
+# every socket, subprocess, memory-map and host-library module unregistered, the
+# operating-system modules a script can import are the workspace's own in-memory ones, and
+# every bound (wall clock, steps, memory, recursion, output size) lives in host code no
+# script can reach. It brings no build-time code of its own beyond the generated service
+# scaffolding every service crate here builds.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

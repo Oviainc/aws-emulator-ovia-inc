@@ -266,6 +266,7 @@ mod crawlers;
 mod data_assets;
 mod identity_center;
 mod integrations;
+mod job_script;
 mod jobs;
 mod lookups;
 mod ml_transforms;
@@ -288,6 +289,7 @@ pub use crawlers::*;
 pub use data_assets::*;
 pub use identity_center::*;
 pub use integrations::*;
+pub use job_script::*;
 pub use jobs::*;
 pub use lookups::*;
 pub use ml_transforms::*;
@@ -2354,6 +2356,22 @@ impl ComAmazonawsGlueAwsglueState {
         workflow_name: &str,
         now: SystemTime,
     ) {
+        for job_name in self.action_job_run_job_names(workflow_name) {
+            if let Some(job) = self.job_mut(region, &job_name) {
+                job.settle_due_runs(now);
+            }
+        }
+    }
+
+    /// The job definitions the runs of the workflow `workflow_name` began runs of, in name
+    /// order and without repetition.
+    ///
+    /// The jobs a read of one of those workflow runs reports the state of, which is also the
+    /// set whose owed SCRIPT executions such a read performs
+    /// ([`perform_owed_job_runs`]). The walk is over the runs this workflow's runs named,
+    /// bounded by [`MAX_RUNS_PER_WORKFLOW`] runs each naming the actions of one trigger.
+    #[must_use]
+    pub fn action_job_run_job_names(&self, workflow_name: &str) -> Vec<String> {
         let named: BTreeSet<String> = self
             .workflow(workflow_name)
             .into_iter()
@@ -2361,11 +2379,7 @@ impl ComAmazonawsGlueAwsglueState {
             .flat_map(|run| run.action_job_runs.iter())
             .map(|begun| begun.job_name.clone())
             .collect();
-        for job_name in named {
-            if let Some(job) = self.job_mut(region, &job_name) {
-                job.settle_due_runs(now);
-            }
-        }
+        named.into_iter().collect()
     }
 
     /// Record on the run `run_id` of the workflow `workflow_name` the job runs `begun` that

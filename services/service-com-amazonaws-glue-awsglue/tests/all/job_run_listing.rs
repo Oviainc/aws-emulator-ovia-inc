@@ -29,8 +29,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::messages::JOB_NOT_FOUND;
 use service_com_amazonaws_glue_awsglue::state::{
-    ComAmazonawsGlueAwsglueState, JOB_RUN_NOT_EXECUTED_MESSAGE, JOB_RUN_STATE_FAILED,
-    JOB_RUN_STATE_STARTING,
+    ComAmazonawsGlueAwsglueState, JOB_RUN_STATE_FAILED, JOB_RUN_STATE_STARTING,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -468,11 +467,7 @@ async fn listing_runs_reports_the_state_the_clock_owes_and_changes_nothing_else(
             Some(JOB_RUN_STATE_FAILED),
             "case \"the transition fell due\": expected the state the clock owed, got {run}"
         );
-        assert_eq!(
-            run["ErrorMessage"].as_str(),
-            Some(JOB_RUN_NOT_EXECUTED_MESSAGE),
-            "case \"the transition fell due\": expected the owed reason, got {run}"
-        );
+        crate::job_runs::assert_script_was_unreadable("the transition fell due", &run);
     }
 }
 

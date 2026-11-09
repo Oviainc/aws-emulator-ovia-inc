@@ -174,84 +174,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this start carries, so every check left is one the STORE answers.
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
-        // How many actions the workflow's entry point initiates, resolved before the
-        // workflow is borrowed to write to, together with the actions themselves: a run
-        // begins AT that entry point, so what it initiates is what that trigger initiates. A
-        // trigger is served only through the endpoint that created it, so the entry point is
-        // looked for in THIS Region.
-        let starting_trigger = store
-            .starting_trigger(&region, &input.name)
-            .map(|trigger| (trigger.name.clone(), trigger.actions.clone()));
+        // Everything this start writes is written under the store's guard, and the guard is
+        // released with the block: the scripts of the runs the entry point's actions began
+        // are caller-supplied code, and nothing of this store is held while they run.
+        let (run_id, begun_job_runs) = {
+            let mut store = state.lock();
+            // How many actions the workflow's entry point initiates, resolved before the
+            // workflow is borrowed to write to, together with the actions themselves: a run
+            // begins AT that entry point, so what it initiates is what that trigger
+            // initiates. A trigger is served only through the endpoint that created it, so
+            // the entry point is looked for in THIS Region.
+            let starting_trigger = store
+                .starting_trigger(&region, &input.name)
+                .map(|trigger| (trigger.name.clone(), trigger.actions.clone()));
 
-        let Some(workflow) = store.workflow_mut(&input.name) else {
-            return Err(StartWorkflowRunErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::WORKFLOW_NOT_FOUND.to_string()),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        };
-        // A workflow nothing can begin a run of has no entry point to start from, so the
-        // start is refused rather than recorded.
-        let Some((trigger_name, starting_actions)) = starting_trigger else {
-            return Err(StartWorkflowRunErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(crate::state::messages::no_starting_trigger(&input.name)),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        };
-        let total_actions = starting_actions.len();
+            let Some(workflow) = store.workflow_mut(&input.name) else {
+                return Err(StartWorkflowRunErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::WORKFLOW_NOT_FOUND.to_string()),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            // A workflow nothing can begin a run of has no entry point to start from, so the
+            // start is refused rather than recorded.
+            let Some((trigger_name, starting_actions)) = starting_trigger else {
+                return Err(StartWorkflowRunErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::messages::no_starting_trigger(&input.name)),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            let total_actions = starting_actions.len();
 
-        // Everything the clock already owed this workflow's runs is materialised before
-        // they are counted, and a run past the ceiling the workflow named is refused with
-        // this operation's own modelled error — both inside the one place a run of a
-        // workflow is recorded ([`crate::state::WorkflowEntry::begin_run`]), so a run a
-        // trigger begins is counted against the same ceiling as one a caller starts.
-        let run_id = match workflow.begin_run(
-            input.run_properties.as_ref(),
-            now,
-            i32::try_from(total_actions).unwrap_or(i32::MAX),
-        ) {
-            Ok(run_id) => run_id,
-            // "You can use this parameter to prevent unwanted multiple updates to data … If
-            // you leave this parameter blank, there is no limit to the number of concurrent
-            // workflow runs": a start past a ceiling the workflow named is refused with this
-            // operation's own modelled error.
-            Err(_ceiling) => {
-                return Err(
-                    StartWorkflowRunErrorModeled::ConcurrentRunsExceededException(
-                        ConcurrentRunsExceededException {
-                            message: Some(
-                                crate::state::messages::concurrent_workflow_runs_exceeded(
-                                    &input.name,
+            // Everything the clock already owed this workflow's runs is materialised before
+            // they are counted, and a run past the ceiling the workflow named is refused
+            // with this operation's own modelled error — both inside the one place a run of
+            // a workflow is recorded ([`crate::state::WorkflowEntry::begin_run`]), so a run
+            // a trigger begins is counted against the same ceiling as one a caller starts.
+            let run_id = match workflow.begin_run(
+                input.run_properties.as_ref(),
+                now,
+                i32::try_from(total_actions).unwrap_or(i32::MAX),
+            ) {
+                Ok(run_id) => run_id,
+                // "You can use this parameter to prevent unwanted multiple updates to data …
+                // If you leave this parameter blank, there is no limit to the number of
+                // concurrent workflow runs": a start past a ceiling the workflow named is
+                // refused with this operation's own modelled error.
+                Err(_ceiling) => {
+                    return Err(
+                        StartWorkflowRunErrorModeled::ConcurrentRunsExceededException(
+                            ConcurrentRunsExceededException {
+                                message: Some(
+                                    crate::state::messages::concurrent_workflow_runs_exceeded(
+                                        &input.name,
+                                    ),
                                 ),
-                            ),
-                        },
-                    )
-                    .into(),
-                );
-            }
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            };
+            // "The actions initiated by this trigger" (`Trigger$Actions`): the run begins at
+            // that entry point, so beginning it initiates those actions, and each one naming
+            // a job begins a run of that job exactly as the trigger's own start does.
+            let begun_job_runs =
+                store.initiate_trigger_actions(&region, &trigger_name, &starting_actions, now);
+            // Those runs are what this workflow run's actions amount to, so the run records
+            // them: a later read reports them under its graph's job nodes and counts them in
+            // its statistics.
+            store.record_workflow_run_job_runs(&input.name, &run_id, &begun_job_runs);
+            ::tracing::info!(
+                operation = "StartWorkflowRun",
+                workflow = %input.name,
+                run = %run_id,
+                job_runs = begun_job_runs.len(),
+                "started a Glue workflow run"
+            );
+            (run_id, begun_job_runs)
         };
-        // "The actions initiated by this trigger" (`Trigger$Actions`): the run begins at
-        // that entry point, so beginning it initiates those actions, and each one naming a
-        // job begins a run of that job exactly as the trigger's own start does.
-        let begun_job_runs =
-            store.initiate_trigger_actions(&region, &trigger_name, &starting_actions, now);
-        // Those runs are what this workflow run's actions amount to, so the run records
-        // them: a later read reports them under its graph's job nodes and counts them in
-        // its statistics.
-        store.record_workflow_run_job_runs(&input.name, &run_id, &begun_job_runs);
-        ::tracing::info!(
-            operation = "StartWorkflowRun",
-            workflow = %input.name,
-            run = %run_id,
-            job_runs = begun_job_runs.len(),
-            "started a Glue workflow run"
-        );
+
+        // Each run the entry point's actions began is one execution of that job's script,
+        // exactly as a run a caller started directly is: the script is compiled and run
+        // INSIDE this process by the embedded Python interpreter
+        // ([`crate::state::job_script`]) — nothing is spawned, no shell is involved, no host
+        // path is resolved, and the script reaches no host socket, process, library, file or
+        // environment variable, only this emulator over the in-process callback. What this
+        // request spends is bounded before anything runs: at most
+        // [`crate::state::MAX_JOB_SCRIPT_RUNS_PER_CALL`] scripts, no further one started
+        // past [`crate::state::JOB_SCRIPT_CALL_CEILING`], and each stopped at
+        // [`crate::state::JOB_SCRIPT_RUN_CEILING`].
+        let started_jobs: Vec<String> = begun_job_runs
+            .iter()
+            .map(|begun| begun.job_name.clone())
+            .collect();
+        crate::state::perform_owed_job_runs(&*self.engine, ctx, &region, &started_jobs).await;
 
         Ok(StartWorkflowRunOutput {
             // "An Id for the new run."

@@ -219,6 +219,8 @@ mod job_run_miss_message;
 mod job_run_retries;
 #[path = "all/job_runs.rs"]
 mod job_runs;
+#[path = "all/job_script_execution.rs"]
+mod job_script_execution;
 #[path = "all/job_updates.rs"]
 mod job_updates;
 #[path = "all/jobs.rs"]

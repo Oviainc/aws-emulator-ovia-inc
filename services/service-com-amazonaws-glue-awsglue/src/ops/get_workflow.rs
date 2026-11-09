@@ -159,6 +159,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock had already reached.
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
+        // A run this workflow's actions began owes its job's script ONE execution, which the
+        // service owed it the instant the run began — so it is performed here, with no store
+        // guard held, before this read reports the state those runs have reached. Nothing is
+        // performed twice: the claim on a run's execution is taken under the store's guard,
+        // so this read moves no run that was not already owed the move.
+        //
+        // The script is compiled and run INSIDE this process by the embedded Python
+        // interpreter ([`crate::state::job_script`]): nothing is spawned, no shell is
+        // involved, no host path is resolved, and the script reaches no host socket,
+        // process, library, file or environment variable — only this emulator, over the
+        // in-process callback. What this request spends is bounded before anything runs: at
+        // most [`crate::state::MAX_JOB_SCRIPT_RUNS_PER_CALL`] scripts over at most
+        // [`crate::state::MAX_JOBS_PER_SCRIPT_CALL`] jobs, no further one started past
+        // [`crate::state::JOB_SCRIPT_CALL_CEILING`], and each script stopped at
+        // [`crate::state::JOB_SCRIPT_RUN_CEILING`].
+        // A batch of events this workflow's EVENT trigger was holding fires on its own once
+        // its window has run out, and the run that firing begins is a run of this workflow
+        // like any other — so it is materialised FIRST, in a guard of its own, and the jobs
+        // whose runs this workflow's actions began are collected after it: a run the firing
+        // begins in this very request is then performed by the step below rather than being
+        // left owed to a later call.
+        let action_jobs = {
+            let mut store = state.lock();
+            store.settle_due_event_batches(&region, &input.name, now);
+            store.action_job_run_job_names(&input.name)
+        };
+        crate::state::perform_owed_job_runs(&*self.engine, ctx, &region, &action_jobs).await;
         let mut store = state.lock();
         // A batch of events this workflow's EVENT trigger was holding fires on its own once
         // its window has run out, and the run that firing begins is "the information about

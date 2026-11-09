@@ -451,9 +451,10 @@ async fn a_sync_task_over_glue_is_resolved_by_the_job_run_it_started() {
         }
 
         // The run ends, and what it ended as is the task's own outcome: the cause is
-        // GLUE's own report of that very run, carried as the JSON text of it, so the
-        // reason Glue gave is read out of the document rather than being the whole of
-        // it.
+        // GLUE's own report of that very run — the `JobRun` document `GetJobRun`
+        // answers with, which the integration reports rather than the wrapper around
+        // it — carried as the JSON text of it, so the reason Glue gave is read out of
+        // the document rather than being the whole of it.
         let settled_run = settled_job_run(&router, row.case, &job_name, &run_id).await;
         let reported_reason = settled_run
             .get("ErrorMessage")
@@ -483,21 +484,21 @@ async fn a_sync_task_over_glue_is_resolved_by_the_job_run_it_started() {
                     )
                 });
         assert_eq!(
-            cause
-                .get("JobRun")
-                .and_then(|run| run.get("ErrorMessage"))
-                .and_then(Value::as_str),
+            cause.get("ErrorMessage").and_then(Value::as_str),
             Some(reported_reason.as_str()),
             "case {:?}: expected Glue's own report of the run as the cause, got {cause:?}",
             row.case
         );
         assert_eq!(
-            cause
-                .get("JobRun")
-                .and_then(|run| run.get("JobRunState"))
-                .and_then(Value::as_str),
+            cause.get("JobRunState").and_then(Value::as_str),
             settled_run.get("JobRunState").and_then(Value::as_str),
             "case {:?}: expected the state Glue reports for the run in the cause, got {cause:?}",
+            row.case
+        );
+        assert_eq!(
+            cause.get("Id").and_then(Value::as_str),
+            Some(run_id.as_str()),
+            "case {:?}: expected the run's own id at the top level of the cause, got {cause:?}",
             row.case
         );
         let types = history_types(&router, &execution_arn).await;
@@ -512,6 +513,295 @@ async fn a_sync_task_over_glue_is_resolved_by_the_job_run_it_started() {
 
 /// One row of the stop table: the `error` and `cause` the stop carries.
 type StopRow = (&'static str, Option<&'static str>, Option<&'static str>);
+
+/// Step Functions, Glue AND Amazon S3 on one engine, for the rows whose job really
+/// RUNS its script: the script is an object of the emulated object store, and what the
+/// script writes is read back out of it.
+fn build_router_with_s3() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(service_com_amazonaws_glue_awsglue::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    router.register_service(service_com_amazonaws_sfn_awsstepfunctions::EmulatedService::new(
+        engine,
+    ));
+    router
+}
+
+/// The bucket the scripts and what they write live in.
+const SCRIPT_BUCKET: &str = "sim2real-sfn-glue-scripts";
+
+/// Make one Amazon S3 request (`restXml`, path-style) and answer `(status, body)`.
+async fn s3_request(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Bytes,
+) -> (u16, Bytes) {
+    let request = http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", format!("s3.{REGION}.amazonaws.com"))
+        .header("authorization", authorization("s3"))
+        .body(body)
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    (response.status().as_u16(), response.body().clone())
+}
+
+/// Create the bucket the scripts live in.
+///
+/// A regional endpoint takes the location constraint of its own Region, which is what
+/// `CreateBucket` refuses a request without.
+async fn create_script_bucket(router: &MultiServiceRouter) {
+    let configuration = format!(
+        "<CreateBucketConfiguration><LocationConstraint>{REGION}</LocationConstraint>\
+         </CreateBucketConfiguration>"
+    );
+    let (status, body) = s3_request(
+        router,
+        "PUT",
+        &format!("/{SCRIPT_BUCKET}"),
+        Bytes::from(configuration.into_bytes()),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "setup: the bucket must be created, got {status} with {body:?}"
+    );
+}
+
+/// Store `source` as the object `key` and answer the `s3://` location that names it.
+async fn stage_script(router: &MultiServiceRouter, key: &str, source: &str) -> String {
+    let (status, body) = s3_request(
+        router,
+        "PUT",
+        &format!("/{SCRIPT_BUCKET}/{key}"),
+        Bytes::from(source.as_bytes().to_vec()),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "setup: the script {key} must be stored, got {status} with {body:?}"
+    );
+    format!("s3://{SCRIPT_BUCKET}/{key}")
+}
+
+/// The text of one object, or `None` when the object store does not serve it.
+async fn object_text(router: &MultiServiceRouter, key: &str) -> Option<String> {
+    let (status, body) = s3_request(
+        router,
+        "GET",
+        &format!("/{SCRIPT_BUCKET}/{key}"),
+        Bytes::new(),
+    )
+    .await;
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    String::from_utf8(body.to_vec()).ok()
+}
+
+/// Create a Glue job whose `Command` names `location` as its script.
+async fn create_job_running(router: &MultiServiceRouter, name: &str, location: &str) {
+    let created = glue(
+        router,
+        "CreateJob",
+        &json!({
+            "Name": name,
+            "Role": format!("arn:aws:iam::{ACCOUNT}:role/GlueJobRole"),
+            "Command": {
+                "Name": "pythonshell",
+                "PythonVersion": "3.9",
+                "ScriptLocation": location
+            },
+            "MaxCapacity": 0.0625,
+            "Timeout": 5
+        }),
+    )
+    .await;
+    assert_eq!(
+        created.get("Name").and_then(Value::as_str),
+        Some(name),
+        "setup: CreateJob must answer with the name it stored, got {created:?}"
+    );
+}
+
+/// A `.sync` task over Glue ends as the job's own SCRIPT did, and reports the run's own
+/// document as the task's result.
+///
+/// This is the whole of what the recorded cross-service workflow depends on: the job's
+/// script is executed with the arguments the state built, so a script that writes an
+/// object and exits cleanly leaves the object behind AND succeeds the execution, while
+/// one that raises fails the task with the script's own error. The rows differ along
+/// what the script does and along the revision of the pattern the `Resource` asks for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sync_task_over_glue_ends_as_the_jobs_script_did() {
+    /// A script that writes the token its arguments name and exits cleanly.
+    const WRITES_ITS_TOKEN: &str = r#"
+import sys
+
+import boto3
+
+named = dict(zip(sys.argv[1::2], sys.argv[2::2]))
+boto3.client("s3").put_object(
+    Bucket=named["--bucket"],
+    Key=named["--key"],
+    Body=named["--token"].encode("utf-8"),
+)
+"#;
+
+    /// A script that raises instead.
+    const RAISES: &str = r#"
+raise ValueError("the partition this run was given is malformed")
+"#;
+
+    // (case, the revision asked for, the script, whether it succeeds, the reason a
+    //  failing task must carry)
+    let rows: [(&str, &str, &str, bool, &str); 3] = [
+        (
+            "a script that writes its object and exits cleanly",
+            ".sync",
+            WRITES_ITS_TOKEN,
+            true,
+            "",
+        ),
+        (
+            "the same script through the pattern's second revision",
+            ".sync:2",
+            WRITES_ITS_TOKEN,
+            true,
+            "",
+        ),
+        (
+            "a script that raises",
+            ".sync",
+            RAISES,
+            false,
+            "ValueError: the partition this run was given is malformed",
+        ),
+    ];
+
+    let router = build_router_with_s3();
+    create_script_bucket(&router).await;
+
+    for (index, (case, suffix, script, succeeds, reason)) in rows.into_iter().enumerate() {
+        let job_name = format!("sfn-glue-script-{index}");
+        let token_key = format!("tokens/{job_name}.txt");
+        let token = format!("token-{index}");
+        let location = stage_script(&router, &format!("{job_name}.py"), script).await;
+        create_job_running(&router, &job_name, &location).await;
+
+        let machine = create_machine(
+            &router,
+            &format!("sfn-glue-script-machine-{index}"),
+            &definition(
+                suffix,
+                json!({
+                    "JobName": job_name,
+                    "Arguments": {
+                        "--bucket": SCRIPT_BUCKET,
+                        "--key": token_key,
+                        "--token": token,
+                    },
+                }),
+            ),
+        )
+        .await;
+        let started = sfn(
+            &router,
+            "StartExecution",
+            &json!({ "stateMachineArn": machine, "name": format!("script-{index}") }),
+        )
+        .await;
+        let execution_arn = string(case, &started, "executionArn");
+        let run_id = submitted_job_run(&router, case, &execution_arn).await;
+        let run = settled_job_run(&router, case, &job_name, &run_id).await;
+        let settled = settled_execution(&router, case, &execution_arn).await;
+
+        if succeeds {
+            assert_eq!(
+                run.get("JobRunState").and_then(Value::as_str),
+                Some("SUCCEEDED"),
+                "case {case:?}: a script that exits cleanly makes the run succeed, got {run:?}"
+            );
+            assert_eq!(
+                run.get("ErrorMessage"),
+                None,
+                "case {case:?}: a run that failed at nothing carries no ErrorMessage, got {run:?}"
+            );
+            assert_eq!(
+                settled.get("status").and_then(Value::as_str),
+                Some("SUCCEEDED"),
+                "case {case:?}: the task is resolved by the run that succeeded, got {settled:?}"
+            );
+            // The task's result IS the run's own document, which is what a `ResultPath`
+            // of such a task addresses.
+            let output: Value = serde_json::from_str(
+                settled.get("output").and_then(Value::as_str).unwrap_or(""),
+            )
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: expected a JSON output, got {error} in {settled:?}")
+            });
+            assert_eq!(
+                (
+                    output.get("Id").and_then(Value::as_str),
+                    output.get("JobRunState").and_then(Value::as_str)
+                ),
+                (Some(run_id.as_str()), Some("SUCCEEDED")),
+                "case {case:?}: expected the run's own document as the task's result, got \
+                 {output:?}"
+            );
+            // And the script's own effect is really there: the object it wrote, with the
+            // token the state passed as its body.
+            let written = object_text(&router, &token_key).await;
+            assert_eq!(
+                written.as_deref(),
+                Some(token.as_str()),
+                "case {case:?}: expected the object the script wrote, got {written:?}"
+            );
+        } else {
+            assert_eq!(
+                run.get("JobRunState").and_then(Value::as_str),
+                Some("FAILED"),
+                "case {case:?}: a script that raised makes the run fail, got {run:?}"
+            );
+            assert_eq!(
+                run.get("ErrorMessage").and_then(Value::as_str),
+                Some(reason),
+                "case {case:?}: expected the script's own error on the run, got {run:?}"
+            );
+            assert_eq!(
+                (
+                    settled.get("status").and_then(Value::as_str),
+                    settled.get("error").and_then(Value::as_str)
+                ),
+                (Some("FAILED"), Some(TASK_FAILED)),
+                "case {case:?}: expected {TASK_FAILED}, got {settled:?}"
+            );
+            let cause: Value =
+                serde_json::from_str(settled.get("cause").and_then(Value::as_str).unwrap_or(""))
+                    .unwrap_or_else(|error| {
+                        panic!("case {case:?}: expected a JSON cause, got {error} in {settled:?}")
+                    });
+            assert_eq!(
+                cause.get("ErrorMessage").and_then(Value::as_str),
+                Some(reason),
+                "case {case:?}: expected the script's own error in the cause, got {cause:?}"
+            );
+            assert_eq!(
+                object_text(&router, &token_key).await,
+                None,
+                "case {case:?}: a script that raised before writing leaves no object"
+            );
+        }
+    }
+}
 
 /// Stopping an execution PARKED at a Glue job run stops that run too, and leaves the
 /// execution `ABORTED` with exactly the `error` and `cause` the caller passed.

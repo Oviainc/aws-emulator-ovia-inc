@@ -397,8 +397,9 @@ pub const STATEMENT_SETTLES_AFTER: Duration = SESSION_SETTLES_AFTER;
 /// This emulator is the Glue control plane: it records a statement faithfully, but it runs
 /// no Spark runtime, so a statement can never reach [`STATEMENT_STATE_AVAILABLE`] — it
 /// ends in the modelled error state carrying a reason that says exactly that, rather than
-/// reporting output nothing computed. The same reading as
-/// [`JOB_RUN_NOT_EXECUTED_MESSAGE`].
+/// reporting output nothing computed. A JOB RUN is not in that position: its script is
+/// really executed ([`super::job_script`]), so the state a run comes to rest in is the one
+/// its own execution came to.
 pub const STATEMENT_NOT_EXECUTED_MESSAGE: &str =
     "This emulator records statements but runs no Spark runtime, so the statement ended \
      without running.";

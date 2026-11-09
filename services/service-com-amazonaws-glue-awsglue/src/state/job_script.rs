@@ -1,0 +1,830 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! RUNNING the script of a Glue job run: where the script comes from, what it runs in, and
+//! what the run it belongs to comes to rest in.
+//!
+//! "Starts a job run using a job definition" (`StartJobRun`), and a job definition names
+//! the script it runs: `JobCommand$ScriptLocation` is "the Amazon Simple Storage Service
+//! (Amazon S3) path to a script that executes a job", and `StartJobRun$Arguments` are "the
+//! job arguments associated with this run … that your own job-execution script consumes".
+//! So a run of a job IS one execution of that script with those arguments, and the state
+//! the run comes to rest in is whatever that execution came to: `SUCCEEDED` for a script
+//! that exited cleanly, and the modelled failure state carrying the SCRIPT'S own error for
+//! one that raised.
+//!
+//! That is what this module does, and nothing about it is synthesised:
+//!
+//! * the script is READ from the emulator's own Amazon S3, over the framework's in-process
+//!   callback ([`smithy_server_runtime::OperationContext::callback`]) — the same transport a
+//!   client's own S3 request takes, so the bytes that run are the bytes that were uploaded;
+//! * it is EXECUTED by the contained Python interpreter this workspace already embeds (the
+//!   Lambda service crate's `state::execution::python`), with the AWS SDK modules that
+//!   runtime supplies on the import path — which is what a Glue job script finds in its own
+//!   environment — so a script's `boto3` call reaches this same emulator and its effects
+//!   (an object written to a bucket, a catalog write) are really made. No second interpreter
+//!   is stood up here, and no part of a script is interpreted by this crate;
+//! * what the run REPORTS is what that execution answered: the terminal `JobRunState` is
+//!   decided by the outcome ([`JobRunOutcome`]), `JobRun$ErrorMessage` of a failed run is the
+//!   exception the script raised, and a run that exited cleanly carries no error message at
+//!   all.
+//!
+//! # Where the script runs from, and when
+//!
+//! The execution is performed where a run is BEGUN — by `StartJobRun`, by a trigger's
+//! actions, or by a trigger whose batch window the clock ran out on — with no store guard
+//! held, exactly as a column statistics task run reads its table's data
+//! ([`super::compute_column_statistics`]). A run whose script has not been performed yet is
+//! marked [`JobRunEntry::awaiting_script`], so an operation that reads a job's runs performs
+//! what that run was already owed rather than reporting a run nothing is running: the
+//! execution was owed the instant the run began, whoever began it.
+//!
+//! # Bounds
+//!
+//! A script is caller-supplied code, so every bound is this emulator's and none of them is
+//! reachable from the script: how many scripts run at once
+//! ([`MAX_CONCURRENT_JOB_SCRIPT_RUNS`], with a bounded wait for a permit), how many one call
+//! performs ([`MAX_JOB_SCRIPT_RUNS_PER_CALL`]) and for how long
+//! ([`JOB_SCRIPT_CALL_CEILING`]), how long one script may run
+//! ([`JOB_SCRIPT_RUN_CEILING`], which also clamps the job's own `Timeout`), how large the
+//! script may be ([`MAX_JOB_SCRIPT_BYTES`], enforced by the ranged read), and the step,
+//! memory, recursion, log and answer ceilings the interpreter is given
+//! ([`job_script_budget`]).
+//!
+//! # What a script can and cannot reach
+//!
+//! NO PROCESS IS SPAWNED and no shell is involved: the script is compiled and executed
+//! inside this process by the embedded interpreter, on a thread of its own, and the only
+//! things it can reach are the ones that engine registers for it — the frozen standard
+//! library, the AWS SDK modules whose calls travel over this emulator's own in-process
+//! callback, and the operating-system modules this workspace supplies in place of the host's.
+//! No host path is resolved, no host process or socket is reachable, no host library is
+//! loaded, and the environment the script sees is empty rather than this process's. That
+//! containment — the native modules that are never registered, and the stop no guest call can
+//! clear — is the engine module's, which is why this module stands none of it up again.
+
+use ::std::collections::BTreeMap;
+use ::std::time::{Duration, SystemTime};
+
+use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::package::PackageModule;
+use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::python;
+use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::{
+    function_sdk_access, AwsAccess,
+};
+
+use super::*;
+
+/// How large a job script this emulator reads.
+///
+/// CHOSEN, not an AWS limit: the script is an object a caller uploaded, so what one run
+/// takes into this process is bounded here rather than by the object's own size. The bound
+/// is enforced by the RANGED read, so nothing larger is ever buffered.
+pub const MAX_JOB_SCRIPT_BYTES: usize = 1024 * 1024;
+
+/// The longest ONE execution of a job script may take, whatever the job's `Timeout` says.
+///
+/// CHOSEN, not an AWS duration: `Timeout` is stated in minutes and may be as long as seven
+/// days, and the execution happens inside the call that begins the run — so this is the
+/// wall clock this emulator gives a script, and the job's own `Timeout` is clamped DOWN to
+/// it before it bounds anything ([`job_script_budget`]). Because the shortest `Timeout` the
+/// model admits is one minute (`Timeout`'s `@range(min: 1)`), this ceiling is what binds
+/// every run today, and a script that runs past it is reported in the state `Job$Timeout`
+/// documents for a run that was terminated for taking too long.
+pub const JOB_SCRIPT_RUN_CEILING: Duration = Duration::from_secs(5);
+
+/// How long after its budget is spent a script's thread is still waited for.
+///
+/// The interpreter's stop lands at the next traced event, so the wait is the budget plus
+/// this, after which the run is reported on what the bound it ran past says rather than
+/// waiting for the thread.
+pub const JOB_SCRIPT_ABANDON_GRACE: Duration = Duration::from_secs(2);
+
+/// How many job scripts run at once in this process.
+///
+/// CHOSEN: a script runs per job run, so without this the bounds above would be multiplied
+/// by the number of runs an account starts. Two scripts run at a time and the rest wait for
+/// a permit.
+pub const MAX_CONCURRENT_JOB_SCRIPT_RUNS: usize = 2;
+
+/// How long a run waits for one of [`MAX_CONCURRENT_JOB_SCRIPT_RUNS`], at most.
+///
+/// CHOSEN: the wait is bounded, so the call that began the run answers either way, and it is
+/// narrowed further by what the CALL has left of [`JOB_SCRIPT_CALL_CEILING`] once the
+/// script's own ceiling is allowed for — so waiting for an interpreter cannot take a request
+/// past that span. A run that waited the whole wait has not been performed at all: it stays
+/// [`JobRunEntry::awaiting_script`], so a later call performs it rather than this one
+/// reporting an outcome nothing produced.
+pub const JOB_SCRIPT_PERMIT_WAIT: Duration = Duration::from_secs(5);
+
+/// The permits [`MAX_CONCURRENT_JOB_SCRIPT_RUNS`] hands out, for the whole process: the
+/// bound is on how many scripts this emulator runs at once, whichever job or caller asked.
+///
+/// Held as an owned permit MOVED INTO the thread that runs the script, so it is given back
+/// when that thread really ends — including a run the caller has already given up waiting
+/// for, which would otherwise take this bound past its count while its thread was still
+/// going.
+static JOB_SCRIPT_RUN_PERMITS: ::std::sync::LazyLock<::std::sync::Arc<::tokio::sync::Semaphore>> =
+    ::std::sync::LazyLock::new(|| {
+        ::std::sync::Arc::new(::tokio::sync::Semaphore::new(MAX_CONCURRENT_JOB_SCRIPT_RUNS))
+    });
+
+/// How many job scripts ONE call performs.
+///
+/// CHOSEN: a call that finds several runs awaiting their script performs this many and
+/// leaves the rest for the next call, so no single request can be made to run an unbounded
+/// number of scripts.
+pub const MAX_JOB_SCRIPT_RUNS_PER_CALL: usize = 8;
+
+/// How long ONE call spends performing owed scripts before it leaves the rest to the next
+/// call.
+///
+/// CHOSEN: the ceiling on what a REQUEST costs, beside the ceiling on what one script costs
+/// ([`JOB_SCRIPT_RUN_CEILING`]). A further script is started only while a whole one still
+/// fits inside this span, the wait for an interpreter is narrowed to what is left of it
+/// ([`JOB_SCRIPT_PERMIT_WAIT`]), and no script in flight is ever cancelled — so a run is
+/// never left claimed by an execution nobody is waiting for, and the longest a call can be
+/// held is this span plus the grace one script is given to stop
+/// ([`JOB_SCRIPT_ABANDON_GRACE`]) rather than the product of the per-script ceiling and
+/// [`MAX_JOB_SCRIPT_RUNS_PER_CALL`].
+pub const JOB_SCRIPT_CALL_CEILING: Duration = Duration::from_secs(10);
+
+/// How many jobs ONE call performs owed scripts for, for the same reason.
+pub const MAX_JOBS_PER_SCRIPT_CALL: usize = 8;
+
+/// The stack a script's thread is given: well above the interpreter's clamped recursion
+/// limit, so deep recursion in a script ends that run with the interpreter's own
+/// `RecursionError` rather than touching the thread's guard page.
+const JOB_SCRIPT_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// How many traced events one script may execute. CHOSEN: large enough for any ETL script a
+/// client runs here, small enough that a loop with no exit ends inside the ceiling above.
+const MAX_JOB_SCRIPT_STEPS: u64 = 20_000_000;
+
+/// How much memory one script may add to this process. CHOSEN, for the same reason.
+const MAX_JOB_SCRIPT_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// How deep one script may recurse. The interpreter's own default is below what the frozen
+/// standard library's import chain needs, so this is the limit a run is given; the call that
+/// would raise it is taken away by the engine before any script code runs.
+const MAX_JOB_SCRIPT_RECURSION: usize = 2_000;
+
+/// How much of a script's output is kept, and how large a value it may answer with.
+///
+/// Neither reaches the wire: a Glue job run reports no script output, so these only bound
+/// what one run holds in memory.
+const MAX_JOB_SCRIPT_LOG_BYTES: usize = 64 * 1024;
+/// See [`MAX_JOB_SCRIPT_LOG_BYTES`].
+const MAX_JOB_SCRIPT_ANSWER_BYTES: usize = 64 * 1024;
+
+/// The job argument naming the LANGUAGE a job's script is written in: "`--job-language` …
+/// the script programming language. This value must be either `scala` or `python`. If this
+/// parameter is not present, the default is `python`." (AWS Glue's special job parameters.)
+pub const JOB_LANGUAGE_ARGUMENT: &str = "--job-language";
+
+/// The `--job-language` value this emulator runs a script for: Python, which is also the
+/// default when a job names no language. A job whose script is in any other language is one
+/// no engine here runs, and its run says exactly that rather than reporting an outcome.
+pub const PYTHON_JOB_LANGUAGE: &str = "python";
+
+/// `JobRun$ErrorMessage` of a run whose job names no script to run.
+///
+/// Whole fixed text: `JobCommand$ScriptLocation` is the Amazon S3 path of the script a run
+/// executes, so a command that carries none names nothing for the run to execute. It states
+/// what was missing and claims nothing about work nobody ran.
+pub const JOB_RUN_NO_SCRIPT_LOCATION: &str =
+    "The job's Command names no ScriptLocation, so the job run had no script to execute.";
+
+/// The fixed words [`job_run_script_unreadable`] leads with, before the location of the
+/// script it is about.
+pub const JOB_RUN_SCRIPT_UNREADABLE_LEAD: &str = "Unable to download the job script from";
+
+/// `JobRun$ErrorMessage` of a run whose script could not be read from the location the job
+/// names.
+///
+/// The LOCATION comes from the stored job definition and the detail from what the object
+/// store answered, so the message says which script could not be read and why rather than
+/// repeating one run's values.
+#[must_use]
+pub fn job_run_script_unreadable(location: &str, detail: &str) -> String {
+    format!("{JOB_RUN_SCRIPT_UNREADABLE_LEAD} {location}: {detail}")
+}
+
+/// `JobRun$ErrorMessage` of a run whose script is in a language no engine of this emulator
+/// runs.
+///
+/// Glue runs a job's script in the language its `--job-language` argument names, and this
+/// emulator embeds an interpreter for [`PYTHON_JOB_LANGUAGE`] only — so a run of a job in
+/// another language reports that nothing ran it, rather than an outcome no engine produced.
+#[must_use]
+pub fn job_run_language_not_runnable(language: &str) -> String {
+    format!(
+        "The job's {JOB_LANGUAGE_ARGUMENT} is {language}, and this emulator runs a job script \
+         written in {PYTHON_JOB_LANGUAGE} only, so the job run's script was not executed."
+    )
+}
+
+/// `JobRun$ErrorMessage` of a run whose script ran past the wall clock this emulator gives
+/// a script ([`JOB_SCRIPT_RUN_CEILING`]).
+///
+/// The run reaches the state `JobRun$Timeout` documents — "terminated and enters `TIMEOUT`
+/// status" — and the message names the ceiling that stopped it rather than the job's own
+/// timeout, which is longer and was not reached.
+#[must_use]
+pub fn job_run_script_ceiling_reached() -> String {
+    format!(
+        "The job script was stopped after {} seconds, the longest this emulator runs a job \
+         script for.",
+        JOB_SCRIPT_RUN_CEILING.as_secs()
+    )
+}
+
+/// `JobRun$ErrorMessage` of a run whose script ran past one of the interpreter's own
+/// ceilings — its step budget, its memory ceiling or the size of the value it answered.
+#[must_use]
+pub fn job_run_script_bound_reached(bound: &str) -> String {
+    format!("The job script was stopped because it ran past {bound}.")
+}
+
+/// What ONE execution of a job's script came to, which is what the state the clock owes the
+/// run reports ([`JobRunEntry::record_execution`]).
+#[derive(Debug, Clone)]
+pub enum JobRunOutcome {
+    /// The script ran and exited cleanly, so the run comes to rest in
+    /// [`JOB_RUN_STATE_SUCCEEDED`] carrying no error message.
+    Succeeded,
+    /// The script raised, or there was no script to run: the run comes to rest in
+    /// [`JOB_RUN_STATE_FAILED`] carrying this reason — the exception the script itself
+    /// raised, where a script ran.
+    Failed(String),
+    /// The script ran past the run's own `Timeout`, which is the state that member
+    /// documents ([`JOB_RUN_STATE_TIMEOUT`]).
+    TimedOut(String),
+    /// The interpreter itself could not be built or driven. Not the script's failure, so it
+    /// is the state a run that ended on a service error reports ([`JOB_RUN_STATE_ERROR`]).
+    EndedInError(String),
+}
+
+impl JobRunOutcome {
+    /// The `JobRunState` a run that came to this comes to rest in.
+    #[must_use]
+    pub fn job_run_state(&self) -> &'static str {
+        match self {
+            Self::Succeeded => JOB_RUN_STATE_SUCCEEDED,
+            Self::Failed(_) => JOB_RUN_STATE_FAILED,
+            Self::TimedOut(_) => JOB_RUN_STATE_TIMEOUT,
+            Self::EndedInError(_) => JOB_RUN_STATE_ERROR,
+        }
+    }
+
+    /// `JobRun$ErrorMessage` the run carries once it has come to rest: "the error message
+    /// associated with this job run", which a run that exited cleanly has none of.
+    #[must_use]
+    pub fn error_message(&self) -> Option<String> {
+        match self {
+            Self::Succeeded => None,
+            Self::Failed(message) | Self::TimedOut(message) | Self::EndedInError(message) => {
+                Some(message.clone())
+            }
+        }
+    }
+}
+
+/// Everything one execution of a job's script needs, copied out of the store under its
+/// guard so the execution itself holds none.
+#[derive(Debug, Clone)]
+pub struct JobScriptPlan {
+    /// The job definition the run is a run of.
+    pub job_name: String,
+    /// The run whose script this is.
+    pub run_id: String,
+    /// `JobCommand$ScriptLocation`: the Amazon S3 path of the script to run.
+    pub script_location: Option<String>,
+    /// The run's own arguments — the job's `DefaultArguments` with the start's `Arguments`
+    /// over them — which the script reads off its command line.
+    pub arguments: BTreeMap<String, String>,
+    /// `JobRun$Timeout`, in minutes, as the run carries it.
+    pub timeout_minutes: i32,
+    /// The ARN of the role the run's own calls are made as: "the name or Amazon Resource
+    /// Name (ARN) of the IAM role associated with this job" (`Job$Role`), resolved by the
+    /// crate's one reading of that member ([`glue_role_reference`]).
+    pub role_arn: String,
+}
+
+impl JobScriptPlan {
+    /// The plan for the run `run_id` of `job`, or `None` when the job holds no such run.
+    #[must_use]
+    pub fn of(job: &JobEntry, run_id: &str) -> Option<Self> {
+        let run = job.run(run_id)?;
+        Some(Self {
+            job_name: job.name.clone(),
+            run_id: run.id.clone(),
+            script_location: job.command.script_location.clone(),
+            arguments: run
+                .arguments
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            timeout_minutes: run.timeout,
+            role_arn: glue_role_reference(&job.role).arn,
+        })
+    }
+
+    /// The `--job-language` the job's arguments name, else the documented default
+    /// ([`PYTHON_JOB_LANGUAGE`]), folded to lower case the way the values are written.
+    #[must_use]
+    pub fn job_language(&self) -> String {
+        self.arguments
+            .get(JOB_LANGUAGE_ARGUMENT)
+            .map(|language| language.trim().to_ascii_lowercase())
+            .filter(|language| !language.is_empty())
+            .unwrap_or_else(|| PYTHON_JOB_LANGUAGE.to_string())
+    }
+
+    /// The command line the script reads its arguments off.
+    ///
+    /// A job argument is named by the `--name` a script resolves it under, so the line is
+    /// the script's own path followed by each argument as `--name value` — in name order, so
+    /// one run's line does not depend on a map's iteration order. A stored name that does
+    /// not already carry the marker is given it, because that is the form a script resolves.
+    #[must_use]
+    pub fn command_line_arguments(&self) -> Vec<String> {
+        let mut line = Vec::with_capacity(self.arguments.len() * 2);
+        for (name, value) in &self.arguments {
+            let flagged = if name.starts_with("--") {
+                name.clone()
+            } else {
+                format!("--{name}")
+            };
+            line.push(flagged);
+            line.push(value.clone());
+        }
+        line
+    }
+}
+
+/// What one script run may spend: the job's own `Timeout` clamped DOWN to this emulator's
+/// own ceiling ([`JOB_SCRIPT_RUN_CEILING`]), beside the step, memory, recursion, log and
+/// answer ceilings every run here is given.
+///
+/// The clamp is what keeps a stored `Timeout` — up to the seven days `Job$Timeout` admits —
+/// from setting the lifetime of a thread of this process.
+#[must_use]
+pub fn job_script_budget(timeout_minutes: i32) -> python::Budget {
+    python::Budget {
+        wall_clock: configured_timeout(timeout_minutes).min(JOB_SCRIPT_RUN_CEILING),
+        steps: MAX_JOB_SCRIPT_STEPS,
+        memory_bytes: MAX_JOB_SCRIPT_MEMORY_BYTES,
+        log_bytes: MAX_JOB_SCRIPT_LOG_BYTES,
+        response_bytes: MAX_JOB_SCRIPT_ANSWER_BYTES,
+        recursion_limit: MAX_JOB_SCRIPT_RECURSION,
+    }
+}
+
+/// The run's own `Timeout` as a duration: "The `JobRun` timeout in minutes", held inside the
+/// range the model allows for it (`Timeout`'s `@range(min: 1)` and the documented ceiling of
+/// [`MAX_TIMEOUT_MINUTES`]) so a stored value outside that range bounds nothing.
+fn configured_timeout(timeout_minutes: i32) -> Duration {
+    let minutes = timeout_minutes.clamp(1, MAX_TIMEOUT_MINUTES);
+    Duration::from_secs(u64::from(minutes.unsigned_abs()) * 60)
+}
+
+/// Perform the script of every run of `job_names` that is still awaiting one, and record
+/// what each execution came to.
+///
+/// This is the ONE place a job run's script is run from, so a run begun by `StartJobRun`, by
+/// a trigger's actions and by a trigger whose batch window ran out are all executed the same
+/// way. Awaited with NO store guard held: the plan is copied out under the guard, the script
+/// runs without it, and the outcome is recorded under it again.
+///
+/// NOTHING IS SPAWNED: each script is compiled and executed inside this process by the
+/// embedded interpreter, contained and bounded as the module docs set out. What ONE call
+/// costs is bounded twice over — at most [`MAX_JOB_SCRIPT_RUNS_PER_CALL`] scripts, and a
+/// further one started only while a whole [`JOB_SCRIPT_RUN_CEILING`] still fits inside
+/// [`JOB_SCRIPT_CALL_CEILING`] — so a slow or looping script cannot hold the request that
+/// called this open beyond that span and the grace one script is given to stop, and the runs
+/// it did not reach stay owed rather than being reported as anything.
+///
+/// A run that FAILED and still has retry budget owes the service a further attempt
+/// (`Job$MaxRetries`), which is recorded once that run has come to rest and performed by
+/// this same path — the service runs a retry, not the caller — so a chain of attempts
+/// advances one attempt per span the clock owes each of them rather than one call running
+/// the whole chain.
+pub async fn perform_owed_job_runs<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    job_names: &[String],
+) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    let began = ::std::time::Instant::now();
+    let mut performed = 0usize;
+    for job_name in job_names.iter().take(MAX_JOBS_PER_SCRIPT_CALL) {
+        while performed < MAX_JOB_SCRIPT_RUNS_PER_CALL
+            && began.elapsed().saturating_add(JOB_SCRIPT_RUN_CEILING) <= JOB_SCRIPT_CALL_CEILING
+        {
+            // What the next owed execution is, resolved under the guard; the guard is
+            // released before anything is run.
+            let plan = {
+                let mut store = state.lock();
+                let Some(job) = store.job_mut(region, job_name) else {
+                    break;
+                };
+                // Everything the clock already owed this job's runs is materialised first,
+                // so a run that has already come to rest is not performed again — and the
+                // attempt the retry policy owes a run that came to rest in the failure
+                // state is recorded here, so it is performed like any other owed run.
+                job.settle_due_runs(SystemTime::now());
+                job.record_owed_attempts();
+                // The execution is CLAIMED under the guard, so two calls that find the same
+                // run owed its script cannot both run it.
+                let Some(run_id) = job.claim_run_awaiting_script() else {
+                    break;
+                };
+                match JobScriptPlan::of(job, &run_id) {
+                    Some(plan) => plan,
+                    None => break,
+                }
+            };
+
+            let Some(outcome) = perform_job_script(
+                engine,
+                ctx,
+                region,
+                &plan,
+                JOB_SCRIPT_CALL_CEILING.saturating_sub(began.elapsed()),
+            )
+            .await
+            else {
+                // Nothing ran: the claim goes back, so a later call performs the run rather
+                // than this one reporting an outcome no execution produced.
+                let mut store = state.lock();
+                if let Some(job) = store.job_mut(region, job_name) {
+                    job.release_script_claim(&plan.run_id);
+                }
+                break;
+            };
+            performed += 1;
+
+            let mut store = state.lock();
+            let Some(job) = store.job_mut(region, job_name) else {
+                break;
+            };
+            if let Some(run) = job.run_mut(&plan.run_id) {
+                run.record_execution(&outcome, SystemTime::now());
+            }
+            ::tracing::info!(
+                job = %plan.job_name,
+                run = %plan.run_id,
+                state = %outcome.job_run_state(),
+                "ran a Glue job run's script"
+            );
+        }
+    }
+}
+
+/// Run ONE job script and answer what it came to, or `None` when nothing ran it.
+///
+/// Every answer is grounded in what really happened: the object store's own refusal for a
+/// script it does not serve, the exception the script raised, or the bound the interpreter
+/// stopped it at.
+///
+/// `left_of_the_call` is what the CALL still has of [`JOB_SCRIPT_CALL_CEILING`], which caps
+/// the wait for a permit: the script's own ceiling plus that wait cannot then take the call
+/// past its own span, so the longest a request is held is that span plus the grace one
+/// script is given to stop.
+async fn perform_job_script<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    plan: &JobScriptPlan,
+    left_of_the_call: Duration,
+) -> Option<JobRunOutcome> {
+    let language = plan.job_language();
+    if language != PYTHON_JOB_LANGUAGE {
+        return Some(JobRunOutcome::Failed(job_run_language_not_runnable(
+            &language,
+        )));
+    }
+    let Some(location) = plan
+        .script_location
+        .as_deref()
+        .map(str::trim)
+        .filter(|location| !location.is_empty())
+    else {
+        return Some(JobRunOutcome::Failed(
+            JOB_RUN_NO_SCRIPT_LOCATION.to_string(),
+        ));
+    };
+    let Some((bucket, key)) = split_s3_location(location) else {
+        return Some(JobRunOutcome::Failed(job_run_script_unreadable(
+            location,
+            "the location does not name an Amazon S3 object",
+        )));
+    };
+    if key.is_empty() || key.ends_with('/') {
+        return Some(JobRunOutcome::Failed(job_run_script_unreadable(
+            location,
+            "the location does not name an Amazon S3 object",
+        )));
+    }
+    let source = match read_script(ctx, region, &bucket, &key).await {
+        Ok(source) => source,
+        Err(detail) => {
+            ::tracing::debug!(
+                job = %plan.job_name,
+                run = %plan.run_id,
+                location = ?location,
+                detail = %detail,
+                "a Glue job run's script could not be read"
+            );
+            return Some(JobRunOutcome::Failed(job_run_script_unreadable(
+                location, &detail,
+            )));
+        }
+    };
+
+    // How many scripts run at once is bounded, and the wait for a permit is bounded twice:
+    // by its own span and by what the CALL has left once the script's own ceiling is
+    // allowed for — so a request is never held past [`JOB_SCRIPT_CALL_CEILING`] waiting for
+    // an interpreter. A run that waited the whole wait has not been performed.
+    // The permit is OWNED and travels with the script's own thread, so it is given back when
+    // that thread ends rather than when this caller stops waiting for it.
+    let permit_wait = JOB_SCRIPT_PERMIT_WAIT.min(
+        left_of_the_call.saturating_sub(JOB_SCRIPT_RUN_CEILING),
+    );
+    let permit = match ::tokio::time::timeout(
+        permit_wait,
+        ::std::sync::Arc::clone(&JOB_SCRIPT_RUN_PERMITS).acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            ::tracing::debug!(
+                job = %plan.job_name,
+                run = %plan.run_id,
+                "a Glue job run found no free interpreter for its script, so it stays owed one"
+            );
+            return None;
+        }
+    };
+    // The calls the script itself makes are made as the role the job runs as, over the same
+    // in-process callback, and the script never sees the credential.
+    let access = function_sdk_access(engine, ctx, region, &plan.role_arn, &plan.job_name);
+    Some(run_script(plan, &source, &key, access, permit).await)
+}
+
+/// The script's own source, read from the object the job's `ScriptLocation` names.
+///
+/// The read is RANGED, so at most [`MAX_JOB_SCRIPT_BYTES`] plus the one byte that shows the
+/// object is past the bound is ever buffered, and a script that is not text is one no
+/// interpreter can compile.
+async fn read_script(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+    key: &str,
+) -> Result<String, String> {
+    let client = ::service_common::s3_client::s3_client(ctx.callback(), region);
+    let object = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .range(format!("bytes=0-{MAX_JOB_SCRIPT_BYTES}"))
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "the object store answered {:?}: {}",
+                error.code(),
+                ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+            )
+        })?;
+    let body = object
+        .body
+        .collect()
+        .await
+        .map_err(|error| format!("the script did not arrive in full: {error}"))?
+        .into_bytes();
+    if body.len() > MAX_JOB_SCRIPT_BYTES {
+        return Err(format!(
+            "the script is past the {MAX_JOB_SCRIPT_BYTES} bytes one job script may hold"
+        ));
+    }
+    String::from_utf8(body.to_vec()).map_err(|_| "the script is not text".to_string())
+}
+
+/// Run `source` as the job's script, on a thread of its own, and answer what it came to.
+///
+/// The interpreter is synchronous and CPU-bound, so it runs on a thread with a stack of its
+/// own rather than on the async runtime, and the caller's wait for it is bounded by the
+/// script's own budget plus [`JOB_SCRIPT_ABANDON_GRACE`].
+///
+/// `permit` is this run's share of [`MAX_CONCURRENT_JOB_SCRIPT_RUNS`] and is MOVED into that
+/// thread, so it is given back when the thread ends — a run the caller has given up waiting
+/// for still holds its share until it really stops, which is what keeps the count of
+/// scripts running at once inside the bound.
+async fn run_script(
+    plan: &JobScriptPlan,
+    source: &str,
+    key: &str,
+    access: Option<AwsAccess>,
+    permit: ::tokio::sync::OwnedSemaphorePermit,
+) -> JobRunOutcome {
+    let budget = job_script_budget(plan.timeout_minutes);
+    // Where the script is reported to run from: the path a job script is placed at on the
+    // worker that runs it, which is what its own traceback frames name.
+    let path = format!("/tmp/{}", key.split('/').next_back().unwrap_or(key));
+    let event = ::serde_json::json!({
+        "path": path,
+        "source": source,
+        "arguments": plan.command_line_arguments(),
+    })
+    .to_string();
+    let modules = vec![
+        PackageModule {
+            path: format!("{SCRIPT_ENTRY_MODULE}.py"),
+            source: SCRIPT_ENTRY_SOURCE.to_string(),
+        },
+        PackageModule {
+            path: "awsglue/__init__.py".to_string(),
+            source: AWSGLUE_SOURCE.to_string(),
+        },
+        PackageModule {
+            path: "awsglue/utils.py".to_string(),
+            source: AWSGLUE_UTILS_SOURCE.to_string(),
+        },
+    ];
+    let run_id = plan.run_id.clone();
+    let handler = format!("{SCRIPT_ENTRY_MODULE}.{SCRIPT_ENTRY_FUNCTION}");
+    let (sender, receiver) = ::tokio::sync::oneshot::channel();
+    let spawned = ::std::thread::Builder::new()
+        .name("glue-job-script".to_string())
+        .stack_size(JOB_SCRIPT_STACK_BYTES)
+        .spawn(move || {
+            // Held for as long as the script runs, whoever is still waiting for it.
+            let _permit = permit;
+            let finished = python::run(&python::Run {
+                modules: &modules,
+                handler: &handler,
+                // A Glue job script reads its parameters off its command line, so the run
+                // is given no environment of its own.
+                environment: &::std::collections::BTreeMap::new(),
+                event: Some(&event),
+                request_id: &run_id,
+                invoked_function_arn: "",
+                client_context: None,
+                tenant_id: None,
+                budget,
+                aws: access.as_ref(),
+            });
+            let _ = sender.send(finished);
+        });
+    if let Err(error) = spawned {
+        return JobRunOutcome::EndedInError(format!(
+            "the thread the job script runs on could not be started: {error}"
+        ));
+    }
+    let wait = budget
+        .wall_clock
+        .saturating_add(JOB_SCRIPT_ABANDON_GRACE);
+    match ::tokio::time::timeout(wait, receiver).await {
+        Ok(Ok(finished)) => read_outcome(&finished.completion),
+        Ok(Err(_)) => JobRunOutcome::EndedInError(
+            "the thread the job script ran on ended without reporting".to_string(),
+        ),
+        // The script is still going a grace period past its own budget: it is given up on,
+        // and what the run reports is the wall clock it ran past.
+        Err(_elapsed) => timed_out(),
+    }
+}
+
+/// What the run reports for a script the interpreter answered for.
+fn read_outcome(completion: &python::Completion) -> JobRunOutcome {
+    match completion {
+        // A Glue job script is a program rather than a function, so what it ANSWERED is not
+        // part of the run: a script that ran to its end exited cleanly.
+        python::Completion::Returned(_) | python::Completion::Streamed(_) => {
+            JobRunOutcome::Succeeded
+        }
+        python::Completion::Raised {
+            error_type,
+            error_message,
+            ..
+        } => JobRunOutcome::Failed(script_failure(error_type, error_message)),
+        python::Completion::Stopped(python::Stop::Deadline) => timed_out(),
+        python::Completion::Stopped(python::Stop::Steps) => JobRunOutcome::Failed(
+            job_run_script_bound_reached("the step budget this emulator gives a job script"),
+        ),
+        python::Completion::Stopped(python::Stop::Memory) => JobRunOutcome::Failed(
+            job_run_script_bound_reached("the memory ceiling this emulator gives a job script"),
+        ),
+        python::Completion::Stopped(python::Stop::Response) => JobRunOutcome::Failed(
+            job_run_script_bound_reached("the size of the value a job script may answer with"),
+        ),
+        python::Completion::Internal(detail) => JobRunOutcome::EndedInError(detail.clone()),
+    }
+}
+
+/// The reason a run whose script RAISED reports: the exception's own type and message, as
+/// the interpreter reported them, which is the script's own failure and not this emulator's
+/// words for it.
+fn script_failure(error_type: &str, error_message: &str) -> String {
+    if error_message.is_empty() {
+        return error_type.to_string();
+    }
+    format!("{error_type}: {error_message}")
+}
+
+/// What a run whose script ran past its wall clock reports: the modelled `TIMEOUT` state,
+/// carrying the ceiling that stopped it ([`job_run_script_ceiling_reached`]).
+fn timed_out() -> JobRunOutcome {
+    JobRunOutcome::TimedOut(job_run_script_ceiling_reached())
+}
+
+/// The module this emulator runs the job's own script FROM, and the function in it the
+/// engine calls.
+const SCRIPT_ENTRY_MODULE: &str = "__glue_job_script";
+/// See [`SCRIPT_ENTRY_MODULE`].
+const SCRIPT_ENTRY_FUNCTION: &str = "run";
+
+/// The Python source of that module: it runs the job's script the way a Python program is
+/// run — as the `__main__` module, with the job's arguments on `sys.argv` — and lets
+/// whatever the script raises travel out to the engine, which is what reports it.
+///
+/// Nothing here is a bound or a containment: both are the engine's, in host code no script
+/// can reach.
+const SCRIPT_ENTRY_SOURCE: &str = r#"
+"""Runs a Glue job's own script, as a Python program with the job's arguments."""
+
+import sys
+
+
+def run(event, context):
+    # The command line a job script resolves its arguments off: the script's own path
+    # followed by the job's arguments, which is what AWS Glue hands the script.
+    sys.argv = [event["path"]] + list(event["arguments"])
+    # A script is run as a program, so its globals are those of the main module and its
+    # `if __name__ == "__main__":` guard holds, exactly as on a Glue worker.
+    script_globals = {"__name__": "__main__", "__file__": event["path"]}
+    exec(compile(event["source"], event["path"], "exec"), script_globals)
+    return None
+"#;
+
+/// `awsglue`: the package AWS Glue ships on a job script's import path. Only the part this
+/// emulator can serve is here ([`AWSGLUE_UTILS_SOURCE`]); importing anything else of it
+/// raises, as it does in an environment that does not have it.
+const AWSGLUE_SOURCE: &str = r#"
+"""The `awsglue` package, as this emulator supplies it on a job script's import path."""
+"#;
+
+/// `awsglue.utils`: the argument resolution a Glue job script reads its parameters through.
+///
+/// "`getResolvedOptions(args, options)`" takes `sys.argv` and the names the script wants,
+/// and answers a dictionary of them — AWS documents it as the way "to retrieve the arguments
+/// that were passed", and a job argument is named on the command line as `--name value`. A
+/// name the line does not carry raises `GlueArgumentError`, because the script asked for a
+/// parameter the run was not given.
+const AWSGLUE_UTILS_SOURCE: &str = r#"
+"""Resolving a Glue job's own arguments off the command line it was run with."""
+
+
+class GlueArgumentError(Exception):
+    """A requested job argument the run was not given."""
+
+
+def _named_arguments(args):
+    """Every `--name value` (or `--name=value`) pair of a command line, by name."""
+    named = {}
+    index = 0
+    while index < len(args):
+        token = args[index]
+        index += 1
+        if not token.startswith("--"):
+            continue
+        name = token[2:]
+        if "=" in name:
+            name, value = name.split("=", 1)
+            named[name] = value
+            continue
+        if index < len(args) and not args[index].startswith("--"):
+            named[name] = args[index]
+            index += 1
+        else:
+            named[name] = ""
+    return named
+
+
+def getResolvedOptions(args, options):
+    """The job arguments `options` names, read off the command line `args`."""
+    named = _named_arguments(list(args))
+    resolved = {}
+    for option in options or []:
+        name = option[2:] if option.startswith("--") else option
+        if name not in named:
+            raise GlueArgumentError("argument --%s is required" % name)
+        resolved[name] = named[name]
+    return resolved
+"#;

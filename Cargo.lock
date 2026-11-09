@@ -12672,6 +12672,7 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-kms-trentservice",
+ "service-com-amazonaws-lambda-awsgirapiservice",
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-ssoadmin-swbexternalservice",
  "service-common",

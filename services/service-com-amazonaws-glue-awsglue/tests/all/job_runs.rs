@@ -30,7 +30,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
     ComAmazonawsGlueAwsglueState, JobRunEntry, FIRST_JOB_RUN_ATTEMPT, JOB_RUN_ID_PREFIX,
-    JOB_RUN_NOT_EXECUTED_MESSAGE, JOB_RUN_SETTLES_AFTER, JOB_RUN_STATE_FAILED,
+    JOB_RUN_SCRIPT_UNREADABLE_LEAD, JOB_RUN_SETTLES_AFTER, JOB_RUN_STATE_FAILED,
     JOB_RUN_STATE_STARTING, MAX_RUNS_PER_JOB, MAX_TIMEOUT_MINUTES, TERMINAL_JOB_RUN_STATES,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -141,6 +141,25 @@ pub(crate) fn far_future() -> SystemTime {
 /// An instant already past, so the next call settles what the clock owed.
 pub(crate) fn already_past() -> SystemTime {
     SystemTime::now() - Duration::from_secs(1)
+}
+
+/// Assert that `run` failed on the one thing a run of these suites' jobs fails on: its
+/// script could not be read.
+///
+/// A job of these suites points its `ScriptLocation` at an object no Amazon S3 serves —
+/// Glue is mounted on its own here — so the run's script is never read and the run comes to
+/// rest in the modelled failure state naming the script it could not download. What a run
+/// whose script this emulator DOES execute reports is pinned by the suite that stages a
+/// script in Amazon S3 (`crate::job_script_execution`).
+pub(crate) fn assert_script_was_unreadable(case: &str, run: &Value) {
+    let message = run
+        .get("ErrorMessage")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        message.starts_with(JOB_RUN_SCRIPT_UNREADABLE_LEAD),
+        "case {case:?}: a run whose script could not be read must say so, got {run}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -359,11 +378,7 @@ async fn a_started_run_is_read_back_through_get_job_run() {
             Some(JOB_RUN_STATE_FAILED),
             "case {case:?}: the state the clock owes is {JOB_RUN_STATE_FAILED}, got {settled}"
         );
-        assert_eq!(
-            settled.get("ErrorMessage").and_then(Value::as_str),
-            Some(JOB_RUN_NOT_EXECUTED_MESSAGE),
-            "case {case:?}: a run that did not run says so, got {settled}"
-        );
+        assert_script_was_unreadable(case, &settled);
         assert!(
             settled.get("CompletedOn").and_then(Value::as_f64).is_some(),
             "case {case:?}: a finished run reports when it finished, got {settled}"

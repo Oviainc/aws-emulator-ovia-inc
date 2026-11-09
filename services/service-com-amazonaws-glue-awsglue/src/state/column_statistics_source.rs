@@ -730,12 +730,15 @@ fn property(properties: Option<&HashMap<String, String>>, name: &str) -> Option<
         .cloned()
 }
 
-/// A `StorageDescriptor$Location` split into the bucket and the key prefix it names, or
-/// `None` for a location that names no Amazon S3 bucket.
+/// An Amazon S3 location split into the bucket and the key it names, or `None` for a value
+/// that names no Amazon S3 bucket.
 ///
 /// A table's location is a directory, so a value that does not end in the separator is
-/// still a prefix of the objects under it — which is what the listing asks for.
-fn split_s3_location(location: &str) -> Option<(String, String)> {
+/// still a prefix of the objects under it — which is what the listing asks for. The same
+/// reading resolves a job's `JobCommand$ScriptLocation`
+/// ([`super::job_script`]), which names one object rather than a prefix, so the two cannot
+/// read an `s3://` value two different ways.
+pub fn split_s3_location(location: &str) -> Option<(String, String)> {
     let rest = location
         .strip_prefix("s3://")
         .or_else(|| location.strip_prefix("s3a://"))

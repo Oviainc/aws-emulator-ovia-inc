@@ -29,8 +29,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    JOB_RUN_ID_PREFIX, JOB_RUN_NOT_EXECUTED_MESSAGE, JOB_RUN_STATE_FAILED,
-    JOB_RUN_STATE_STARTING,
+    JOB_RUN_ID_PREFIX, JOB_RUN_STATE_FAILED, JOB_RUN_STATE_STARTING,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -450,13 +449,10 @@ async fn a_firing_is_bounded_by_the_jobs_concurrency_ceiling() {
             "case {case:?}: the runs the clock finished come to rest in \
              {JOB_RUN_STATE_FAILED}, got {runs:?}"
         );
-        // Nothing executes a job script here, so a run that came to rest says exactly that.
+        // The jobs of this suite point at a script no Amazon S3 here serves, so a run that
+        // came to rest says exactly that.
         for run in settled {
-            assert_eq!(
-                run.get("ErrorMessage").and_then(Value::as_str),
-                Some(JOB_RUN_NOT_EXECUTED_MESSAGE),
-                "case {case:?}: a run nothing executed says so, got {run}"
-            );
+            crate::job_runs::assert_script_was_unreadable(case, run);
         }
     }
 }

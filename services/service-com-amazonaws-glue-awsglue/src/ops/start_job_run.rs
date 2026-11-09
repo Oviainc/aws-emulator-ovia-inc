@@ -7,19 +7,37 @@
 //! answers with. `GetJobRun` then reports the run until it reaches a terminal
 //! `JobRunState`.
 //!
-//! The run is recorded in `STARTING`, and the clock owes it its terminal state one span
+//! The run is recorded in `STARTING`, and the clock owes it its next state one span
 //! later ([`crate::state::JOB_RUN_SETTLES_AFTER`]) — so a caller that polls straight
 //! after this call still sees the run in flight, and a second start of a job already at
-//! its `MaxConcurrentRuns` is refused. Because this emulator runs no job script, the
-//! state the clock owes is the modelled failure state carrying
-//! [`crate::state::JOB_RUN_NOT_EXECUTED_MESSAGE`] rather than a result nothing computed.
+//! its `MaxConcurrentRuns` is refused.
 //!
-//! A job whose `MaxRetries` is above zero then owes that failed attempt a RETRY, which the
+//! The job's SCRIPT is then executed ([`crate::state::perform_owed_job_runs`]): a run of a
+//! job is one execution of the script its `JobCommand$ScriptLocation` names, with this
+//! request's `Arguments` on its command line, so the state the run comes to rest in is
+//! whatever that execution came to — `SUCCEEDED` for a script that exited cleanly, and the
+//! modelled failure state carrying the script's own error for one that raised.
+//!
+//! That execution happens IN THIS PROCESS and reaches nothing of the host: the script is
+//! compiled and run by the embedded Python interpreter ([`crate::state::job_script`]), so no
+//! process is spawned, no shell is involved, no host path is resolved, and the script can
+//! reach no host socket, process, library, file or environment variable — the one
+//! destination its AWS SDK calls have is this same emulator, over the framework's in-process
+//! callback. It is awaited with NO store guard held and bounded before anything runs: one
+//! script at a time out of [`crate::state::MAX_CONCURRENT_JOB_SCRIPT_RUNS`], at most
+//! [`crate::state::MAX_JOB_SCRIPT_RUNS_PER_CALL`] per call with nothing further started past
+//! [`crate::state::JOB_SCRIPT_CALL_CEILING`], each script stopped at
+//! [`crate::state::JOB_SCRIPT_RUN_CEILING`] (which clamps the job's own `Timeout` down), and
+//! inside the step, memory, recursion and output ceilings the interpreter is given.
+//!
+//! A job whose `MaxRetries` is above zero then owes a failed attempt a RETRY, which the
 //! service runs rather than the caller: one start of such a job settles into its original
-//! attempt plus up to `MaxRetries` further runs, each carrying the next `Attempt` and
-//! naming the attempt it retries in its `PreviousRunId`. Those attempts are owed by the
-//! clock exactly as a run's terminal state is, so they are materialised by
-//! [`crate::state::JobEntry::settle_due_runs`] and nothing here sleeps for them.
+//! attempt plus up to `MaxRetries` further runs, each carrying the next `Attempt`, naming
+//! the attempt it retries in its `PreviousRunId` and beginning the instant that attempt
+//! finished. An attempt is owed only once the attempt it retries has COME TO REST, and it is
+//! a further execution of the same script performed by the same path
+//! ([`crate::state::JobEntry::record_owed_attempts`]) — so this call runs one script, the
+//! chain advances one attempt per span the clock owes, and nothing here sleeps for them.
 //!
 //! ## Shape of an operation
 //!
@@ -266,105 +284,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
-        // A job definition exists only in the Region it was created in, so a request to
-        // another Region's endpoint names no job this endpoint can run. AWS words this
-        // refusal after the metadata the start could not read, not after the name.
-        let Some(job) = store.job_mut(&region, &input.job_name) else {
-            return Err(StartJobRunErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::JOB_METADATA_MISSING.to_string()),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        };
-
-        // "Only jobs with Glue version 3.0 and above and command type `glueetl` will be
-        // allowed to set `ExecutionClass` to `FLEX`": the restriction is over the command
-        // and the Glue version of the JOB being run, neither of which this request can
-        // change.
-        if input.execution_class.as_deref() == Some(crate::state::EXECUTION_CLASS_FLEX)
-            && !crate::state::admits_flex_execution_class(&job.command, &job.glue_version)
-        {
-            return Err(invalid_input(format!(
-                "ExecutionClass {} is allowed only on a {} job with Glue version {} or \
-                 above, not on a {:?} job with Glue version {}",
-                crate::state::EXECUTION_CLASS_FLEX,
-                crate::state::SPARK_ETL_COMMAND,
-                crate::state::MIN_FLEX_GLUE_VERSION,
-                job.command.name.as_deref().unwrap_or_default(),
-                job.glue_version
-            )));
-        }
-
-        // Everything the clock already owed this job's runs is materialised before they
-        // are counted, so a run the clock has already finished does not count as one in
-        // flight.
-        job.settle_due_runs(now);
-
-        // "The ID of a previous JobRun to retry": a request that names one names a run of
-        // THIS job, and the run started here is the next attempt of it.
-        let retries = match input.job_run_id.as_deref() {
-            Some(previous_run_id) => {
-                // A retry of a run the job does not hold is the same job-run miss
-                // `GetJobRun` refuses, so it carries the same fixed words and echoes back
-                // neither the id asked for nor the job name.
-                let Some(previous) = job.run(previous_run_id) else {
-                    return Err(StartJobRunErrorModeled::EntityNotFoundException(
-                        EntityNotFoundException {
-                            message: Some(
-                                crate::state::messages::JOB_RUN_NOT_FOUND.to_string(),
-                            ),
-                            from_federation_source: None,
-                        },
-                    )
-                    .into());
-                };
-                Some((previous.id.clone(), previous.attempt))
-            }
-            None => None,
-        };
-
-        // `ExecutionProperty$MaxConcurrentRuns` is "the maximum number of concurrent runs
-        // allowed for this job", so a start that would exceed it is refused with this
-        // operation's own modelled error ("Too many jobs are being run concurrently")
-        // rather than admitted.
-        let in_flight = job.runs_in_flight();
-        let allowed = job.max_concurrent_runs();
-        if in_flight >= usize::try_from(allowed).unwrap_or(usize::MAX) {
-            return Err(
-                StartJobRunErrorModeled::ConcurrentRunsExceededException(
-                    ConcurrentRunsExceededException {
-                        message: Some(format!(
-                            "Job {} already has {in_flight} of {allowed} concurrent runs in \
-                             flight",
-                            input.job_name
-                        )),
+        // The run is recorded under the store's guard, and the guard is released with the
+        // block: the script this start then runs is caller-supplied code, and nothing of
+        // this store is held while it runs.
+        let run_id = {
+            let mut store = state.lock();
+            // A job definition exists only in the Region it was created in, so a request to
+            // another Region's endpoint names no job this endpoint can run. AWS words this
+            // refusal after the metadata the start could not read, not after the name.
+            let Some(job) = store.job_mut(&region, &input.job_name) else {
+                return Err(StartJobRunErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::JOB_METADATA_MISSING.to_string()),
+                        from_federation_source: None,
                     },
                 )
-                .into(),
-            );
-        }
+                .into());
+            };
 
-        let run_id = crate::state::new_job_run_id();
-        let run = crate::state::JobRunEntry::start(
-            job,
-            &input,
-            run_id.clone(),
-            now,
-            retries,
-            // "The name of the trigger that started this job run": a caller started this
-            // one, so no trigger did.
-            None,
-        );
-        job.record_run(run);
-        ::tracing::info!(
-            operation = "StartJobRun",
-            job = %input.job_name,
-            run = %run_id,
-            "started a Glue job run"
-        );
+            // "Only jobs with Glue version 3.0 and above and command type `glueetl` will
+            // be allowed to set `ExecutionClass` to `FLEX`": the restriction is over the
+            // command and the Glue version of the JOB being run, neither of which this
+            // request can change.
+            if input.execution_class.as_deref() == Some(crate::state::EXECUTION_CLASS_FLEX)
+                && !crate::state::admits_flex_execution_class(&job.command, &job.glue_version)
+            {
+                return Err(invalid_input(format!(
+                    "ExecutionClass {} is allowed only on a {} job with Glue version {} or \
+                     above, not on a {:?} job with Glue version {}",
+                    crate::state::EXECUTION_CLASS_FLEX,
+                    crate::state::SPARK_ETL_COMMAND,
+                    crate::state::MIN_FLEX_GLUE_VERSION,
+                    job.command.name.as_deref().unwrap_or_default(),
+                    job.glue_version
+                )));
+            }
+
+            // Everything the clock already owed this job's runs is materialised before they
+            // are counted, so a run the clock has already finished does not count as one in
+            // flight.
+            job.settle_due_runs(now);
+
+            // "The ID of a previous JobRun to retry": a request that names one names a run
+            // of THIS job, and the run started here is the next attempt of it.
+            let retries = match input.job_run_id.as_deref() {
+                Some(previous_run_id) => {
+                    // A retry of a run the job does not hold is the same job-run miss
+                    // `GetJobRun` refuses, so it carries the same fixed words and echoes
+                    // back neither the id asked for nor the job name.
+                    let Some(previous) = job.run(previous_run_id) else {
+                        return Err(StartJobRunErrorModeled::EntityNotFoundException(
+                            EntityNotFoundException {
+                                message: Some(
+                                    crate::state::messages::JOB_RUN_NOT_FOUND.to_string(),
+                                ),
+                                from_federation_source: None,
+                            },
+                        )
+                        .into());
+                    };
+                    Some((previous.id.clone(), previous.attempt))
+                }
+                None => None,
+            };
+
+            // `ExecutionProperty$MaxConcurrentRuns` is "the maximum number of concurrent
+            // runs allowed for this job", so a start that would exceed it is refused with
+            // this operation's own modelled error ("Too many jobs are being run
+            // concurrently") rather than admitted.
+            let in_flight = job.runs_in_flight();
+            let allowed = job.max_concurrent_runs();
+            if in_flight >= usize::try_from(allowed).unwrap_or(usize::MAX) {
+                return Err(
+                    StartJobRunErrorModeled::ConcurrentRunsExceededException(
+                        ConcurrentRunsExceededException {
+                            message: Some(format!(
+                                "Job {} already has {in_flight} of {allowed} concurrent runs \
+                                 in flight",
+                                input.job_name
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            let run_id = crate::state::new_job_run_id();
+            let run = crate::state::JobRunEntry::start(
+                job,
+                &input,
+                run_id.clone(),
+                now,
+                retries,
+                // "The name of the trigger that started this job run": a caller started
+                // this one, so no trigger did.
+                None,
+            );
+            job.record_run(run);
+            ::tracing::info!(
+                operation = "StartJobRun",
+                job = %input.job_name,
+                run = %run_id,
+                "started a Glue job run"
+            );
+            run_id
+        };
+
+        // The run's own work: ONE execution of the job's script with this run's arguments.
+        // The script is compiled and run INSIDE this process by the embedded Python
+        // interpreter ([`crate::state::job_script`]) — no process is spawned, no shell is
+        // involved, no host path is resolved and the script can reach no host socket,
+        // process, library, file or environment variable: the only destination its AWS SDK
+        // calls have is this same emulator, over the in-process callback. What this request
+        // spends is bounded before anything runs: one script at a time out of
+        // [`crate::state::MAX_CONCURRENT_JOB_SCRIPT_RUNS`] with a bounded wait, at most
+        // [`crate::state::MAX_JOB_SCRIPT_RUNS_PER_CALL`] scripts and no further one started
+        // past [`crate::state::JOB_SCRIPT_CALL_CEILING`], each script stopped at
+        // [`crate::state::JOB_SCRIPT_RUN_CEILING`] (which clamps the job's own `Timeout`
+        // down) and inside the step, memory, recursion and output ceilings the interpreter
+        // is given. An attempt the job's retry policy owes this run is performed by a LATER
+        // call, once this attempt has come to rest, so one start runs one script.
+        //
+        // What each execution came to is recorded on the run it belongs to, which is what
+        // the state the clock owes that run then reports.
+        crate::state::perform_owed_job_runs(
+            &*self.engine,
+            ctx,
+            &region,
+            ::std::slice::from_ref(&input.job_name),
+        )
+        .await;
 
         Ok(StartJobRunOutput {
             // "The ID assigned to this job run."

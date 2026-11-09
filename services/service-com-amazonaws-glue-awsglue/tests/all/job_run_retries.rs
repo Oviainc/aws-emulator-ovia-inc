@@ -31,8 +31,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    FIRST_JOB_RUN_ATTEMPT, JOB_RUN_NOT_EXECUTED_MESSAGE, JOB_RUN_SETTLES_AFTER,
-    JOB_RUN_STATE_FAILED, JOB_RUN_STATE_STOPPED, TERMINAL_JOB_RUN_STATES,
+    FIRST_JOB_RUN_ATTEMPT, JOB_RUN_SETTLES_AFTER, JOB_RUN_STATE_FAILED, JOB_RUN_STATE_STOPPED,
+    MAX_RUNS_PER_JOB, TERMINAL_JOB_RUN_STATES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -64,16 +64,30 @@ async fn listed_runs(router: &MultiServiceRouter, case: &str, job_name: &str) ->
         .unwrap_or_else(|| panic!("case {case:?}: GetJobRuns must report JobRuns, got {page}"))
 }
 
-/// Make everything the clock owes this job's runs due, then read them back — the read
-/// materialises what was owed, so nothing here sleeps.
+/// Drive everything the clock owes this job's runs to completion, and read the chain back.
+///
+/// Each attempt of a chain is a further EXECUTION of the job's script, which the service
+/// performs once the attempt it retries has come to rest — so the chain advances one attempt
+/// per owed span, exactly as a client polling the job's runs observes it. Here the span is
+/// made due rather than slept for, and the runs are read back until the chain stops changing,
+/// which is the state a client that polled long enough would see. The number of turns is
+/// bounded by the runs one job can hold.
 async fn settled_runs(
     router: &MultiServiceRouter,
     engine: &std::sync::Arc<engine::InMemoryEngine>,
     case: &str,
     job_name: &str,
 ) -> Vec<Value> {
-    set_due_instant(engine, job_name, SystemTime::UNIX_EPOCH);
-    listed_runs(router, case, job_name).await
+    let mut runs: Vec<Value> = Vec::new();
+    for _ in 0..=MAX_RUNS_PER_JOB {
+        set_due_instant(engine, job_name, SystemTime::UNIX_EPOCH);
+        let listed = listed_runs(router, case, job_name).await;
+        if listed == runs {
+            return runs;
+        }
+        runs = listed;
+    }
+    panic!("case {case:?}: the chain of {job_name} never came to rest, got {runs:?}")
 }
 
 /// The listed runs keyed by the `Attempt` each reports, which must name them uniquely.
@@ -150,11 +164,7 @@ async fn assert_retry_chain(
             Some(JOB_RUN_STATE_FAILED),
             "case {case:?}: attempt {attempt} must report the state the clock owed it, got {run}"
         );
-        assert_eq!(
-            run["ErrorMessage"].as_str(),
-            Some(JOB_RUN_NOT_EXECUTED_MESSAGE),
-            "case {case:?}: attempt {attempt} must carry the reason it failed, got {run}"
-        );
+        crate::job_runs::assert_script_was_unreadable(case, run);
         assert_eq!(
             previous_run_id(run),
             expected_previous,

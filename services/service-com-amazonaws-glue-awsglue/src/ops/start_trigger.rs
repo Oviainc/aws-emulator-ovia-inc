@@ -15,12 +15,20 @@
 //! under that name, and with `ConcurrentRunsExceededException` when the run the firing
 //! would begin is past the concurrency ceiling its workflow named.
 //!
-//! Nothing here EXECUTES the job scripts and crawls those actions initiate, so each record
-//! the fire wrote comes to rest exactly as the one its own start operation writes does: a
-//! job run in the modelled failure state carrying
-//! [`crate::state::JOB_RUN_NOT_EXECUTED_MESSAGE`] and the workflow run in the modelled
-//! error status carrying [`crate::state::WORKFLOW_RUN_NOT_EXECUTED_MESSAGE`], rather than
-//! reporting a result nothing computed.
+//! Each job run a firing begins is EXECUTED here, exactly as a run a caller started
+//! directly is ([`crate::state::perform_owed_job_runs`]): the job's script runs with the
+//! action's arguments on its command line, and the run comes to rest in whatever that
+//! execution came to. That execution happens IN THIS PROCESS, in the embedded Python
+//! interpreter ([`crate::state::job_script`]) — nothing is spawned, no shell is involved, no
+//! host path is resolved, and the script reaches no host socket, process, library, file or
+//! environment variable, only this emulator over the in-process callback — and what one
+//! firing can spend is bounded before anything runs (at most
+//! [`crate::state::MAX_JOB_SCRIPT_RUNS_PER_CALL`] scripts, nothing further started past
+//! [`crate::state::JOB_SCRIPT_CALL_CEILING`], each stopped at
+//! [`crate::state::JOB_SCRIPT_RUN_CEILING`]). A CRAWL is not in that position — this crate
+//! records no crawl — and the workflow run the firing began still comes to rest in the
+//! modelled error status carrying [`crate::state::WORKFLOW_RUN_NOT_EXECUTED_MESSAGE`],
+//! rather than reporting a result nothing computed.
 //!
 //! ## Shape of an operation
 //!
@@ -177,100 +185,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this start carries, so every check left is one the STORE answers.
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
+        // Everything this start writes is written under the store's guard, and the guard is
+        // released with the block: the scripts of the runs a firing began are
+        // caller-supplied code, and nothing of this store is held while they run.
+        let begun_job_runs = {
+            let mut store = state.lock();
 
-        // A trigger is served only through the endpoint that created it, so a name no
-        // trigger of THIS Region has addresses no trigger this endpoint can start.
-        let Some(trigger) = store.trigger(&region, &input.name) else {
-            return Err(StartTriggerErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::messages::TRIGGER_NOT_FOUND.to_string()),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        };
-        // What starting this trigger initiates, read off the stored definition before
-        // anything is written: the workflow a fire begins a run of, the actions the fire
-        // initiates ("the actions initiated by this trigger when it fires"), and how many
-        // of them the run's entry point counts.
-        let fires_on_start = trigger.trigger_type == crate::state::TRIGGER_TYPE_ON_DEMAND;
-        let workflow_name = trigger.workflow_name.clone();
-        let actions = trigger.actions.clone();
-        let total_actions = i32::try_from(trigger.actions.len()).unwrap_or(i32::MAX);
+            // A trigger is served only through the endpoint that created it, so a name no
+            // trigger of THIS Region has addresses no trigger this endpoint can start.
+            let Some(trigger) = store.trigger(&region, &input.name) else {
+                return Err(StartTriggerErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::TRIGGER_NOT_FOUND.to_string()),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            // What starting this trigger initiates, read off the stored definition before
+            // anything is written: the workflow a fire begins a run of, the actions the fire
+            // initiates ("the actions initiated by this trigger when it fires"), and how
+            // many of them the run's entry point counts.
+            let fires_on_start = trigger.trigger_type == crate::state::TRIGGER_TYPE_ON_DEMAND;
+            let workflow_name = trigger.workflow_name.clone();
+            let actions = trigger.actions.clone();
+            let total_actions = i32::try_from(trigger.actions.len()).unwrap_or(i32::MAX);
 
-        // An on-demand trigger waits for nothing but a caller ("True is not supported for
-        // ON_DEMAND triggers" — `CreateTriggerRequest$StartOnCreation`), so starting it
-        // FIRES it now; every other modelled type waits for something outside the caller
-        // once started — its schedule, its predicate, or the events it batches — so
-        // starting one of those fires nothing here. A trigger that fires and belongs to a
-        // workflow begins a run of that workflow, which is the run a workflow read then
-        // reports.
-        let begun_run = match workflow_name.as_deref().filter(|_| fires_on_start) {
-            Some(workflow_name) => match store.workflow_mut(workflow_name) {
-                // The workflow a trigger names has to exist for the trigger to be created
-                // at all, so a trigger naming one that is gone begins no run rather than
-                // failing the start.
-                None => None,
-                Some(workflow) => match workflow.begin_run(None, now, total_actions) {
-                    Ok(run_id) => Some(run_id),
-                    // "You can use this parameter to prevent unwanted multiple updates to
-                    // data": the fire that would take the workflow past the ceiling it
-                    // named is refused with this operation's own modelled error, and the
-                    // trigger is left as it was.
-                    Err(_ceiling) => {
-                        return Err(
-                            StartTriggerErrorModeled::ConcurrentRunsExceededException(
-                                ConcurrentRunsExceededException {
-                                    message: Some(
-                                        crate::state::messages::concurrent_workflow_runs_exceeded(
-                                            workflow_name,
+            // An on-demand trigger waits for nothing but a caller ("True is not supported
+            // for ON_DEMAND triggers" — `CreateTriggerRequest$StartOnCreation`), so starting
+            // it FIRES it now; every other modelled type waits for something outside the
+            // caller once started — its schedule, its predicate, or the events it batches —
+            // so starting one of those fires nothing here. A trigger that fires and belongs
+            // to a workflow begins a run of that workflow, which is the run a workflow read
+            // then reports.
+            let begun_run = match workflow_name.as_deref().filter(|_| fires_on_start) {
+                Some(workflow_name) => match store.workflow_mut(workflow_name) {
+                    // The workflow a trigger names has to exist for the trigger to be
+                    // created at all, so a trigger naming one that is gone begins no run
+                    // rather than failing the start.
+                    None => None,
+                    Some(workflow) => match workflow.begin_run(None, now, total_actions) {
+                        Ok(run_id) => Some(run_id),
+                        // "You can use this parameter to prevent unwanted multiple updates
+                        // to data": the fire that would take the workflow past the ceiling
+                        // it named is refused with this operation's own modelled error, and
+                        // the trigger is left as it was.
+                        Err(_ceiling) => {
+                            return Err(
+                                StartTriggerErrorModeled::ConcurrentRunsExceededException(
+                                    ConcurrentRunsExceededException {
+                                        message: Some(
+                                            crate::state::messages::concurrent_workflow_runs_exceeded(
+                                                workflow_name,
+                                            ),
                                         ),
-                                    ),
-                                },
-                            )
-                            .into(),
-                        );
-                    }
+                                    },
+                                )
+                                .into(),
+                            );
+                        }
+                    },
                 },
-            },
-            None => None,
+                None => None,
+            };
+
+            // "The actions initiated by this trigger": a trigger that FIRED initiates them,
+            // whether or not it belongs to a workflow, so each action naming a job begins a
+            // run of that job here. A trigger that fires on something outside the caller
+            // initiates nothing until that happens.
+            let begun_job_runs = if fires_on_start {
+                store.initiate_trigger_actions(&region, &input.name, &actions, now)
+            } else {
+                Vec::new()
+            };
+            // When the firing also began a run of the trigger's workflow, those job runs are
+            // what that run's actions amount to, so the run records them: a later read
+            // reports them under its graph's job nodes and counts them in its statistics.
+            if let (Some(workflow_name), Some(run_id)) =
+                (workflow_name.as_deref(), begun_run.as_deref())
+            {
+                store.record_workflow_run_job_runs(workflow_name, run_id, &begun_job_runs);
+            }
+
+            // "Starts an existing trigger": the state the start leaves the trigger in is the
+            // state its TYPE is left in by a start ([`crate::state::TriggerEntry::start`]) —
+            // armed when it waits on something outside the caller, and the state it waits in
+            // when the start was a firing. The lock has been held since the trigger was
+            // read, so this write lands on the record that read reported.
+            if let Some(trigger) = store.trigger_mut(&region, &input.name) {
+                trigger.start();
+            }
+            ::tracing::info!(
+                operation = "StartTrigger",
+                trigger = %input.name,
+                region = %region,
+                workflow_run = begun_run.as_deref().unwrap_or("none"),
+                job_runs = begun_job_runs.len(),
+                "started a Glue trigger"
+            );
+            begun_job_runs
         };
 
-        // "The actions initiated by this trigger": a trigger that FIRED initiates them,
-        // whether or not it belongs to a workflow, so each action naming a job begins a run
-        // of that job here. A trigger that fires on something outside the caller initiates
-        // nothing until that happens.
-        let begun_job_runs = if fires_on_start {
-            store.initiate_trigger_actions(&region, &input.name, &actions, now)
-        } else {
-            Vec::new()
-        };
-        // When the firing also began a run of the trigger's workflow, those job runs are
-        // what that run's actions amount to, so the run records them: a later read reports
-        // them under its graph's job nodes and counts them in its statistics.
-        if let (Some(workflow_name), Some(run_id)) =
-            (workflow_name.as_deref(), begun_run.as_deref())
-        {
-            store.record_workflow_run_job_runs(workflow_name, run_id, &begun_job_runs);
-        }
-
-        // "Starts an existing trigger": the state the start leaves the trigger in is the
-        // state its TYPE is left in by a start ([`crate::state::TriggerEntry::start`]) —
-        // armed when it waits on something outside the caller, and the state it waits in
-        // when the start was a firing. The lock has been held since the trigger was read, so
-        // this write lands on the record that read reported.
-        if let Some(trigger) = store.trigger_mut(&region, &input.name) {
-            trigger.start();
-        }
-        ::tracing::info!(
-            operation = "StartTrigger",
-            trigger = %input.name,
-            region = %region,
-            workflow_run = begun_run.as_deref().unwrap_or("none"),
-            job_runs = begun_job_runs.len(),
-            "started a Glue trigger"
-        );
+        // Each run a firing began is one execution of that job's script, exactly as a run a
+        // caller started directly is: the script is compiled and run INSIDE this process by
+        // the embedded Python interpreter ([`crate::state::job_script`]) — nothing is
+        // spawned, no shell is involved, no host path is resolved, and the script reaches no
+        // host socket, process, library, file or environment variable, only this emulator
+        // over the in-process callback. What this request spends is bounded before anything
+        // runs: at most [`crate::state::MAX_JOB_SCRIPT_RUNS_PER_CALL`] scripts over at most
+        // [`crate::state::MAX_JOBS_PER_SCRIPT_CALL`] jobs, no further script started past
+        // [`crate::state::JOB_SCRIPT_CALL_CEILING`], one at a time out of
+        // [`crate::state::MAX_CONCURRENT_JOB_SCRIPT_RUNS`], and each script stopped at
+        // [`crate::state::JOB_SCRIPT_RUN_CEILING`] — so the actions of one trigger cannot
+        // hold this request open without bound, and a run this call did not reach stays owed
+        // its execution rather than being reported as anything.
+        let started_jobs: Vec<String> = begun_job_runs
+            .iter()
+            .map(|begun| begun.job_name.clone())
+            .collect();
+        crate::state::perform_owed_job_runs(&*self.engine, ctx, &region, &started_jobs).await;
 
         Ok(StartTriggerOutput {
             // "The name of the trigger that was started."

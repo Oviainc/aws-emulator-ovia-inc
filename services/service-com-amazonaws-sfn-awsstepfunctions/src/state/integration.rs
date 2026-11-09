@@ -1721,6 +1721,17 @@ pub struct RunAJob {
     pub describe_member: &'static str,
     /// Where the job's status sits in the reporting call's response.
     pub status_at: &'static [&'static str],
+    /// Where the document the TASK REPORTS sits in that same response: the member the
+    /// integration answers with, and empty for an integration that answers with the
+    /// whole response.
+    ///
+    /// Step Functions reports what the invoked service said about the job, and for an
+    /// operation whose answer WRAPS the job's own document — Glue's `GetJobRun`, whose
+    /// response carries the run under `JobRun` — what it reports is that document
+    /// rather than the wrapper, so a task's `ResultPath` and a `Catch` reading the
+    /// failure's cause address the job's own members (`Id`, `JobRunState`) directly.
+    /// An operation whose answer IS the job's document carries no wrapper to unwrap.
+    pub reports_at: &'static [&'static str],
     /// The status values that mean the job finished its work, and those that mean it
     /// ended without finishing it. A status in neither list is the job still running.
     pub succeeded: &'static [&'static str],
@@ -1825,18 +1836,29 @@ impl RunAJob {
         }
     }
 
-    /// The document the task reports as its result: the reporting call's own
-    /// response, with each document the job carries as JSON TEXT parsed in place for
-    /// the pattern's second revision.
+    /// The document the task reports as its result: what the reporting call said about
+    /// the job — the member of its response that carries the job's own document
+    /// ([`RunAJob::reports_at`]) — with each document the job carries as JSON TEXT
+    /// parsed in place for the pattern's second revision.
+    ///
+    /// A response the wrapper is absent from is reported whole: the task answers with
+    /// what the service said, so nothing is invented where the member it names is not
+    /// there.
     fn reported(&self, answer: &Value, parsed_output: bool) -> Value {
         let mut reported = answer.clone();
-        if !parsed_output {
-            return reported;
+        if parsed_output {
+            for path in self.json_text_at {
+                parse_in_place(&mut reported, path);
+            }
         }
-        for path in self.json_text_at {
-            parse_in_place(&mut reported, path);
+        let mut wrapped = &reported;
+        for member in self.reports_at {
+            match wrapped.get(*member) {
+                Some(inner) => wrapped = inner,
+                None => return reported,
+            }
         }
-        reported
+        wrapped.clone()
     }
 }
 
@@ -1881,6 +1903,9 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         describe: "DescribeExecution",
         describe_member: "executionArn",
         status_at: &["status"],
+        // `DescribeExecution`'s answer IS the execution's own document, so there is no
+        // wrapper to unwrap.
+        reports_at: &[],
         succeeded: &[super::EXECUTION_STATUS_SUCCEEDED],
         failed: &[
             super::EXECUTION_STATUS_FAILED,
@@ -1912,6 +1937,10 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         describe: "GetQueryExecution",
         describe_member: "QueryExecutionId",
         status_at: &["QueryExecution", "Status", "State"],
+        // `GetQueryExecution` answers `{"QueryExecution": …}`, which is the document
+        // this integration reports — the task's result carries the wrapper, as the
+        // service's own answer does.
+        reports_at: &[],
         succeeded: &["SUCCEEDED"],
         failed: &["FAILED", "CANCELLED"],
         json_text_at: &[],
@@ -1938,6 +1967,12 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         describe: "GetJobRun",
         describe_member: "RunId",
         status_at: &["JobRun", "JobRunState"],
+        // `GetJobRun` answers `{"JobRun": …}` and this integration reports the RUN
+        // itself: the task's result carries the run's own members (`Id`, `JobName`,
+        // `JobRunState`, `ErrorMessage`, the instants and the capacity) at its top
+        // level, which is what a `ResultPath` of such a task addresses and what the
+        // failure's cause carries for a run that ended without doing its work.
+        reports_at: &["JobRun"],
         succeeded: &["SUCCEEDED"],
         // The `JobRunState` values a run never moves out of again; `STARTING`,
         // `RUNNING`, `STOPPING` and `WAITING` each still owe a further state.

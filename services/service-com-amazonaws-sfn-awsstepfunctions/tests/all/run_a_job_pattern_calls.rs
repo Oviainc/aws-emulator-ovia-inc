@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use service_com_amazonaws_sfn_awsstepfunctions::state::integration::{
-    describing, read, stopping, Api, JobNaming, RunAJob, RUN_A_JOB,
+    describing, read, stopping, task_result, Api, JobNaming, RunAJob, RUN_A_JOB,
 };
 use service_com_amazonaws_sfn_awsstepfunctions::state::EVENT_TASK_SUBMITTED;
 
@@ -200,6 +200,117 @@ fn assert_members(label: &str, request: &Value, identifier: &str, naming: &JobNa
             Some(value.as_str()),
             "case {label:?}: expected {member:?} to name the job, got {request:?}"
         );
+    }
+}
+
+/// A member beside the job's status in the reporting call's answer, standing for the
+/// job's own members (its identity, its instants, its reason): what the tables assert
+/// is WHERE it ends up, never its text.
+const BESIDE_THE_STATUS: &str = "a member of the job's own document";
+
+/// The reporting answer of `entry` for a job in `status`: the status where that entry
+/// says it sits, with a member of the job's own document beside the job's document —
+/// that is, at the top level of whatever the entry says the task reports.
+fn describe_answer(entry: &RunAJob, status: &str) -> Value {
+    let (last, leading) = entry
+        .status_at
+        .split_last()
+        .unwrap_or_else(|| panic!("case {:?}: an entry must name where its status sits", entry.starts));
+    let mut document = json!({ *last: status });
+    for member in leading.iter().rev() {
+        document = json!({ *member: document });
+    }
+    // The marker goes where the job's own document is, so what a row asserts is that the
+    // task reports THAT document and not the wrapper around it.
+    let mut node = &mut document;
+    for member in entry.reports_at {
+        node = node
+            .get_mut(*member)
+            .unwrap_or_else(|| panic!("case {:?}: the answer must carry {member:?}", entry.starts));
+    }
+    if let Some(members) = node.as_object_mut() {
+        members.insert("Marker".to_string(), json!(BESIDE_THE_STATUS));
+    }
+    document
+}
+
+/// The document `path` names in `document`.
+fn value_at(document: &Value, path: &[&str]) -> Value {
+    let mut node = document;
+    for member in path {
+        node = node
+            .get(*member)
+            .unwrap_or_else(|| panic!("the answer must carry {member:?}, got {document:?}"));
+    }
+    node.clone()
+}
+
+/// What a `.sync` task reports is what the invoked service said about the JOB: the
+/// document that service's answer carries the job in, whether the job did its work (the
+/// task's result) or ended without doing it (the failure's cause).
+///
+/// The rows span the whole catalogue and, within each entry, every status that entry
+/// calls finished — so an integration whose answer wraps the job's document (Glue's
+/// `GetJobRun`, which carries the run under `JobRun`) reports the RUN's own members at
+/// the top level of the task's result, and one whose answer is the job's document
+/// reports it whole.
+#[test]
+fn a_sync_task_reports_the_document_the_service_carries_the_job_in() {
+    for entry in RUN_A_JOB {
+        // The pattern's second revision parses the job's own JSON text in place, so
+        // both revisions are a row: the unwrapping is the same either way.
+        for parsed_output in [false, true] {
+            for (status, finished_work) in entry
+                .succeeded
+                .iter()
+                .map(|status| (status, true))
+                .chain(entry.failed.iter().map(|status| (status, false)))
+            {
+                let label = format!(
+                    "{} reporting {status} with parsed_output={parsed_output}",
+                    entry.starts
+                );
+                let answer = describe_answer(entry, status);
+                let expected = value_at(&answer, entry.reports_at);
+                let outcome = entry
+                    .outcome_of(&answer, parsed_output)
+                    .unwrap_or_else(|| panic!("case {label:?}: {status} must end the job"));
+                let reported = match (outcome, finished_work) {
+                    (Ok(result), true) => (result, expected.clone()),
+                    // A failure's cause IS that same document, written in the
+                    // convention a service integration's result is read in
+                    // ([`task_result`]), because `cause` is a string a `Catch` reads.
+                    (Err(cause), false) => (
+                        serde_json::from_str::<Value>(&cause).unwrap_or_else(|_| {
+                            panic!(
+                                "case {label:?}: the cause must be the job's document, got \
+                                 {cause:?}"
+                            )
+                        }),
+                        task_result(&expected),
+                    ),
+                    (outcome, _) => panic!(
+                        "case {label:?}: {status} must end the task the way the catalogue says, \
+                         got {outcome:?}"
+                    ),
+                };
+                let (reported, expected) = reported;
+                assert_eq!(
+                    reported, expected,
+                    "case {label:?}: expected the document the answer carries the job in, got \
+                     {reported:?}"
+                );
+                // And the job's own members are at the TOP level of what the task
+                // reports, which is what a `ResultPath` or a `Catch` of such a task
+                // addresses.
+                assert_eq!(
+                    reported.get("Marker").and_then(Value::as_str),
+                    Some(BESIDE_THE_STATUS),
+                    "case {label:?}: the job's own members must be at the top level of the \
+                     reported document, got {reported:?}"
+                );
+            }
+        }
     }
 }
 
