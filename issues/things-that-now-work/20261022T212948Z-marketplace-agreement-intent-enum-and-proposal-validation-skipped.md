@@ -90,3 +90,39 @@ Cause 4 — UpdatePurchaseOrders stub:
   mpa.update_purchase_orders(purchaseOrders=entries)
   Observed: error code 'NotImplemented' (HTTP 501). Expected: a modeled outcome — ValidationException/ConflictException/ResourceNotFoundException or a successful UpdatePurchaseOrdersOutput.
   With range(87): correctly refused with ValidationException today.
+
+## Resolution
+
+* **Cause 1 (intent enum) — already enforced when this was fixed.** A value outside
+  `Intent` is refused 400 `ValidationException` (`INVALID_INTENT`, "Provided intent is
+  invalid.", one `fields` entry naming `intent`) at the boundary, before the handler's
+  cross-member rules. Pinned over the class by
+  `tests/all/intent_enum_values.rs`: every declared value served, seven values outside
+  the enum refused.
+* **Cause 3 (no IAM evaluation) — fixed.** `src/service/authorization.rs` evaluates the
+  calling principal's identity-based policies (capped by its permissions boundary) for
+  `aws-marketplace:<OperationName>` through the tree's one evaluation
+  (`service_common::iam_authorization`), and `src/service.rs` takes that decision in front
+  of EVERY one of the 25 operations, before the request's input is read and before the
+  store is touched — so the modelled `AccessDeniedException` (403) now precedes the
+  not-found lookup. Pinned by `tests/all/identity_authorization.rs` (documents x operation
+  classes, the 403-before-lookup precedence, a refused call changing nothing, and the
+  account's own credential staying unbounded). The recorded check
+  `describe-agreement-missing-permission-denied` still reports a divergence at its deny
+  leg: the emulator answers it 403 `AccessDeniedException` with IAM's sentence over every
+  character the check's report discloses, and the rest of the expected value is not
+  disclosed, so it could not be reconciled from the replay.
+* **Cause 4 (UpdatePurchaseOrders) — already implemented when this was fixed.** The
+  handler answers the modelled `ValidationException` carrying the published
+  `UNSUPPORTED_ACTION` reason; the scaffold path is gone.
+* **Cause 2 (agreementProposalIdentifier is not resolved) — NOT fixed, declined here.**
+  A well-formed identifier that names no proposal still mints a quote. No component of
+  this emulator publishes an agreement proposal this API can resolve: the component that
+  owns offers and mints the identifier is marketplace-discovery
+  (`GetOffer$agreementProposalId`, "An encoded string to be passed by the acceptor of the
+  terms when creating an agreement"), and the identifiers its published catalogue carries
+  (`ap-0001-analytics-annual`) do not satisfy this API's `AgreementProposalId`
+  `@pattern ^(at-|ap-)[A-Za-z0-9]+$`, so this service's boundary refuses them before any
+  handler. Refusing every unresolvable identifier without first minting resolvable ones in
+  the owning service would make the whole quote flow (create -> accept -> agreement)
+  unreachable, so this cause needs that two-service change and is still open.

@@ -57,6 +57,16 @@
 //! through [`crate::state::validation_exception_for`] — the same rendering the
 //! handlers' own refusals use, so one refused member reads alike wherever it was
 //! found. A request with no violation is handed to the generated walk unchanged.
+//!
+//! ## The authorization layer every operation runs under
+//!
+//! AWS decides authorization at the IAM layer, in FRONT of the service: a caller
+//! whose identity-based policies do not allow the action it asked for is refused
+//! before the request's own input is looked at and before anything is read or
+//! written. So that decision is taken for EVERY operation of this service, in
+//! [`Authorized`] — which fronts [`ModelledValidation`] in the one table
+//! [`Service::override_operation`] serves this service's operations through — and
+//! nowhere else. [`authorization`] holds the store lookups and the sentence.
 
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, Refusal, Refused, Service,
@@ -65,6 +75,10 @@ use smithy_server_runtime::{
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
+
+/// Whether IAM lets a request to this service perform the action it names: the
+/// decision [`Authorized`] takes in front of every operation.
+pub mod authorization;
 
 /// The wire error code (`__type`) and HTTP status this service's modelled
 /// `ValidationException` carries (`smithy_query(query="shape",
@@ -168,23 +182,90 @@ impl<Op: Operation> ErasedOperation for ModelledValidation<Op> {
     }
 }
 
-/// One [`ModelledValidation`] per modelled operation, keyed by the routing key
-/// the model names that operation by.
+/// One modelled operation, served behind the decision AWS takes in front of a
+/// handler: IAM's authorization of the action.
 ///
-/// EVERY operation is wrapped: `ValidationException` is a service-common error
-/// (`smithy_query(query="digest")` lists it under `common_errors`), so a refused
-/// input is stated in the modelled envelope whichever operation the request
-/// named — not only the ones whose refusals happen to have been observed.
+/// It carries a handle on the ONE shared engine, which is what the decision reads
+/// the caller's identity and its policies through ([`authorization`]), and the
+/// [`ModelledValidation`] front the request is handed to once IAM allows it — so
+/// an authorized request takes exactly the path it took before this layer
+/// existed, and a refused one reaches neither the boundary walk nor the handler.
+///
+/// WHY it is a layer and not a line in each handler: the decision is a property
+/// of the request's identity and the action it names rather than of what the
+/// handler does, so taking it once in front of every operation is what keeps any
+/// one handler from forgetting it — and it must be taken BEFORE the request's
+/// own input is read, which is where this wrapper sits.
+struct Authorized<Op, Eng> {
+    /// The validation front this wrapper hands an authorized request to. A
+    /// zero-sized value naming the operation type, like the one it fronts.
+    validated: ModelledValidation<Op>,
+    /// The shared engine, so the principal's policies are read from the one store
+    /// every service of this emulator shares.
+    engine: Arc<Eng>,
+}
+
+impl<Op: Operation, Eng> Authorized<Op, Eng> {
+    fn new(engine: Arc<Eng>) -> Self {
+        Self {
+            validated: ModelledValidation::new(),
+            engine,
+        }
+    }
+}
+
+impl<Op: Operation, Eng: Send + Sync + 'static> ErasedOperation for Authorized<Op, Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r smithy_server_runtime::OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // IAM's decision, taken before anything of the request's own input is
+            // read: the action is this operation's own name under this service's
+            // prefix. A refused request reaches neither the boundary walk nor the
+            // handler, so it reports nothing about what the account holds and
+            // changes nothing.
+            if let Err(denial) = authorization::authorize(&*self.engine, ctx, Op::NAME) {
+                return authorization::refusal_response(svc.definition().protocol(), &denial);
+            }
+            self.validated.run(svc, req, ctx).await
+        })
+    }
+
+    /// The schemes [`ModelledValidation`] answers with, which is the framework's
+    /// default for a wrapper and exactly what this service answered before this
+    /// layer existed: a request is signed (or not) as the MODEL says for the
+    /// operation it names, which the generated operation behind these wrappers
+    /// decides, so standing in front of it changes nothing about its signing.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.validated.auth_schemes()
+    }
+}
+
+/// One [`Authorized`] (fronting one [`ModelledValidation`]) per modelled
+/// operation, keyed by the routing key the model names that operation by.
+///
+/// EVERY operation is wrapped, for both layers' own reason:
+/// `ValidationException` and `AccessDeniedException` are service-common errors
+/// (`smithy_query(query="digest")` lists both under `common_errors`), so a
+/// refused input is stated in the modelled envelope and an unauthorized caller is
+/// refused whichever operation the request named — not only the ones whose
+/// refusals happen to have been observed.
 macro_rules! modelled_validation_table {
     ($($module:ident :: $operation:ident),* $(,)?) => {
-        fn modelled_validation_table<Eng: Send + Sync + 'static>()
-            -> HashMap<&'static str, Box<dyn ErasedOperation>>
+        fn modelled_validation_table<Eng: Send + Sync + 'static>(
+            engine: &Arc<Eng>,
+        ) -> HashMap<&'static str, Box<dyn ErasedOperation>>
         {
             let mut table: HashMap<&'static str, Box<dyn ErasedOperation>> = HashMap::new();
             $(
                 table.insert(
                     <crate::ops::$module::$operation<Eng> as Operation>::NAME,
-                    Box::new(ModelledValidation::<crate::ops::$module::$operation<Eng>>::new()),
+                    Box::new(Authorized::<crate::ops::$module::$operation<Eng>, Eng>::new(
+                        Arc::clone(engine),
+                    )),
                 );
             )*
             table
@@ -227,9 +308,9 @@ modelled_validation_table!(
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// States a refused input in this service's own modelled
-    /// `ValidationException`, one entry per modelled operation; see
-    /// [`ModelledValidation`].
+    /// Takes IAM's decision and then states a refused input in this service's own
+    /// modelled `ValidationException`, one entry per modelled operation; see
+    /// [`Authorized`] and [`ModelledValidation`].
     modelled_validation: HashMap<&'static str, Box<dyn ErasedOperation>>,
 }
 
@@ -239,8 +320,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            modelled_validation: modelled_validation_table::<Eng>(&engine),
             entry: crate::ServiceDefinition::new(engine),
-            modelled_validation: modelled_validation_table::<Eng>(),
         }
     }
 }
@@ -284,14 +365,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Every modelled operation is served through `ModelledValidation`, so a
-        // refused input is stated in this service's own modelled
-        // `ValidationException` — with the modelled `reason` and `fields` — rather
-        // than in the framework's generic refusal body. See that type for why it
-        // cannot be done from inside `handle`. The operation names come from the
-        // model (each operation's own `Operation::NAME`), and a request naming no
-        // modelled operation is left to the generated routing table, which refuses
-        // it.
+        // Every modelled operation is served through `Authorized` and the
+        // `ModelledValidation` it fronts, so a caller IAM does not allow is refused
+        // before anything is read, and a refused input is stated in this service's
+        // own modelled `ValidationException` — with the modelled `reason` and
+        // `fields` — rather than in the framework's generic refusal body. See those
+        // types for why neither can be done from inside `handle`. The operation
+        // names come from the model (each operation's own `Operation::NAME`), and a
+        // request naming no modelled operation is left to the generated routing
+        // table, which refuses it.
         let routing_key = self.definition().protocol().routing_key(req).ok()?;
         self.modelled_validation
             .get(routing_key)

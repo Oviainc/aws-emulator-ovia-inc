@@ -57,8 +57,12 @@ mod entitlement_resources;
 mod error_bodies;
 #[path = "all/idempotency_token_conflicts.rs"]
 mod idempotency_token_conflicts;
+#[path = "all/identity_authorization.rs"]
+mod identity_authorization;
 #[path = "all/inactive_agreement_refusals.rs"]
 mod inactive_agreement_refusals;
+#[path = "all/intent_enum_values.rs"]
+mod intent_enum_values;
 #[path = "all/invoice_adjustments.rs"]
 mod invoice_adjustments;
 #[path = "all/invoice_line_item_listing.rs"]
