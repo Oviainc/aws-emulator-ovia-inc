@@ -231,6 +231,8 @@ mod handler_s3_object_access;
 mod handler_sdk_error_classes;
 #[path = "all/handler_sdk_idempotency_token.rs"]
 mod handler_sdk_idempotency_token;
+#[path = "all/handler_sdk_service_inventory.rs"]
+mod handler_sdk_service_inventory;
 #[path = "all/handler_secret_sdk.rs"]
 mod handler_secret_sdk;
 #[path = "all/invocation_concurrency.rs"]
