@@ -47,7 +47,12 @@
 //! [`function_delivery_refusal`] and on a log-group target by
 //! [`log_group_grants`]; what such a refusal REPORTS is the answer that
 //! target's own service gives it, so a queue's names the resource while a topic's
-//! and a function's name the permission). What
+//! and a function's name the permission). A topic target that is ENCRYPTED with a
+//! customer managed key is decided by a second document as well — that key's own
+//! policy, since the publish has Amazon SNS generate a data key under it — so a
+//! key policy withholding `kms:GenerateDataKey` from this service is a delivery
+//! that fails however freely the topic's policy grants the publish
+//! ([`topic_key_refusal`]). What
 //! came of every handover is recorded in
 //! [`crate::state::ComAmazonawsEventbridgeAwseventsState::invocations`] (see
 //! [`deliver`]).
@@ -495,10 +500,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let iam = crate::state::iam_state(&*self.engine);
         let cloudwatch = crate::state::cloudwatch_state(&*self.engine);
         let glue = crate::state::glue_state(&*self.engine);
+        let kms = crate::state::topic_encryption::kms_state(&*self.engine);
         let stores = Stores {
             iam: iam.as_ref(),
             cloudwatch: cloudwatch.as_ref(),
             glue: glue.as_ref(),
+            kms: kms.as_ref(),
         };
 
         // Every pattern match is counted on the matched rule's own
@@ -1779,6 +1786,11 @@ pub(crate) struct Stores<'a> {
     pub(crate) cloudwatch: Option<&'a ::engine::ServiceState<crate::state::CloudWatchState>>,
     /// The Glue store a workflow target's event is counted in.
     pub(crate) glue: Option<&'a ::engine::ServiceState<crate::state::GlueState>>,
+    /// The KMS store holding the key an encrypted topic target is encrypted
+    /// with, whose own policy decides whether this service may have a data key
+    /// generated under it
+    /// ([`crate::state::topic_encryption::generate_data_key_denied`]).
+    pub(crate) kms: Option<&'a ::engine::ServiceState<crate::state::topic_encryption::KmsState>>,
 }
 
 /// Hand ONE routed event to the Glue workflow `arn` names, and answer what came
@@ -1917,8 +1929,7 @@ async fn dead_letter_refusal(
 /// The envelope is read back as a document HERE rather than carried into this
 /// pass as a parse tree, and only for a target that asked for a transformation:
 /// the cost of the parse is paid by the delivery that needs it. Text that is not
-/// one JSON document selects nothing, so every placeholder renders as JSON's
-/// empty value.
+/// one JSON document names no place at all, so every path selects nothing.
 ///
 /// `Err` is a transformation this emulator will not build — a path it does not
 /// evaluate, or a rendering past
@@ -2488,10 +2499,19 @@ impl TargetKind {
                 // One client for both calls this delivery makes on the topic,
                 // for the reason the queue branch above gives.
                 let client = clients.sns(callback, region).clone();
-                // The TOPIC's own access policy decides this delivery before
-                // anything is published ([`topic_delivery_refusal`]).
+                // The TOPIC's own configuration decides this delivery before
+                // anything is published: its access policy
+                // ([`topic_delivery_refusal`]) and, for an encrypted topic, the
+                // policy of the key its messages are encrypted under
+                // ([`topic_key_refusal`]).
+                let attributes = topic_attributes(&client, arn).await;
                 if let Some(refusal) =
-                    topic_delivery_refusal(&client, arn, self.action(), handover).await
+                    topic_delivery_refusal(attributes.as_ref(), arn, self.action(), handover)
+                {
+                    return refusal;
+                }
+                if let Some(refusal) =
+                    topic_key_refusal(stores.kms, attributes.as_ref(), region, arn, handover)
                 {
                     return refusal;
                 }
@@ -2506,11 +2526,13 @@ impl TargetKind {
                     // execution is NAMED after the event that started it: an
                     // execution name "must be unique for your Amazon Web
                     // Services account, Region, and state machine"
-                    // (`StartExecution$name`), and the event id is the one
-                    // identifier of this delivery that is unique already — so
-                    // one event delivered twice is one execution rather than
-                    // two, which is what makes the delivery idempotent.
-                    .name(handover.event_id)
+                    // (`StartExecution$name`), and EventBridge mints one per
+                    // INVOCATION from the event id and a UUID of its own
+                    // ([`state_machine_execution_name`]) — so the event id is
+                    // the join key between the event and its execution while two
+                    // targets naming two machines, and one event delivered
+                    // twice, each get an execution of their own.
+                    .name(state_machine_execution_name(handover.event_id))
                     .input(body)
                     .send()
                     .await,
@@ -2645,6 +2667,27 @@ impl TargetKind {
             Self::Queue | Self::Function | Self::Topic | Self::LogGroup => false,
         }
     }
+}
+
+/// The name EventBridge starts ONE state-machine target's execution under: the
+/// id of the event that started it, an underscore, and a UUID minted for this
+/// invocation.
+///
+/// The rule the service follows: a delivery to a state-machine target names its
+/// execution after the EVENT it delivers, with a per-invocation unique suffix —
+/// the event id is the join key between the published event and the execution it
+/// started, and the suffix is what makes the name unique, since an execution name
+/// "must be unique for your Amazon Web Services account, Region, and state
+/// machine" (`StartExecution$name`) and one event may be delivered to several
+/// state-machine targets and re-delivered to any of them.
+///
+/// The suffix is drawn fresh per call from the maintained `uuid` crate rather
+/// than derived from the event or the target: two deliveries of one event must
+/// not collide on a name, which is exactly what deriving it from either would do.
+/// `StartExecution$name` is modelled at 80 characters, which the two ids and the
+/// separator stay inside.
+fn state_machine_execution_name(event_id: &str) -> String {
+    format!("{event_id}_{}", ::uuid::Uuid::new_v4())
 }
 
 /// The partition key the record that carries `delivered` to a Kinesis data
@@ -3157,18 +3200,19 @@ async fn queue_policy(
 /// `AuthorizationError`, naming the principal and the action it was not allowed,
 /// where Amazon SQS answers one that does not say which it was.
 ///
-/// The policy is read through the topic's own `GetTopicAttributes`, so what
-/// decides a delivery is the document a client's last write left on the topic. A
-/// topic that does not ANSWER that read decides nothing here: the `Publish` that
-/// follows reports what such a topic answers, which is that service's own refusal
-/// rather than a verdict read off a policy this never saw.
-async fn topic_delivery_refusal(
-    client: &::aws_sdk_sns::Client,
+/// The policy is read through the topic's own `GetTopicAttributes`
+/// ([`topic_attributes`]), so what decides a delivery is the document a client's
+/// last write left on the topic. A topic that does not ANSWER that read decides
+/// nothing here: the `Publish` that follows reports what such a topic answers,
+/// which is that service's own refusal rather than a verdict read off a policy
+/// this never saw.
+fn topic_delivery_refusal(
+    attributes: Option<&TopicAttributes>,
     topic_arn: &str,
     action: &str,
     handover: &Handover<'_>,
 ) -> Option<crate::state::InvocationOutcome> {
-    let policy = topic_policy(client, topic_arn).await?;
+    let policy = attributes?.policy.clone();
     let attempt = crate::state::DeliveryAttempt {
         rule: handover.rule,
         target_id: &handover.target.id,
@@ -3188,35 +3232,51 @@ async fn topic_delivery_refusal(
     Some(crate::state::InvocationOutcome::Failed { code, message })
 }
 
-/// What the topic `topic_arn` names answered when its `Policy` attribute was
-/// read: `Some(Some(document))` for a topic carrying one, `Some(None)` for a
-/// topic that carries none, and `None` for a topic that did not answer the read
-/// at all — the three told apart for the reason [`queue_policy`] gives.
-async fn topic_policy(
+/// What the topic `topic_arn` names answered when its attributes were read, or
+/// `None` for a topic that did not answer the read at all — told apart from a
+/// topic that answered and carries neither attribute for the reason
+/// [`queue_policy`] gives.
+async fn topic_attributes(
     client: &::aws_sdk_sns::Client,
     topic_arn: &str,
-) -> Option<Option<String>> {
+) -> Option<TopicAttributes> {
     let answered = client
         .get_topic_attributes()
         .topic_arn(topic_arn)
         .send()
         .await;
     match answered {
-        Ok(answer) => Some(
-            answer
-                .attributes()
-                .and_then(|attributes| attributes.get(TOPIC_POLICY_ATTRIBUTE))
-                .cloned(),
-        ),
+        Ok(answer) => {
+            let read = |name: &str| {
+                answer
+                    .attributes()
+                    .and_then(|attributes| attributes.get(name))
+                    .cloned()
+            };
+            Some(TopicAttributes {
+                policy: read(TOPIC_POLICY_ATTRIBUTE),
+                kms_master_key_id: read(
+                    crate::state::topic_encryption::KMS_MASTER_KEY_ATTRIBUTE,
+                ),
+            })
+        }
         Err(error) => {
             ::tracing::warn!(
                 topic = %topic_arn,
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "an EventBridge target topic's access policy could not be read"
+                "an EventBridge target topic's attributes could not be read"
             );
             None
         }
     }
+}
+
+/// The attributes of a topic target that decide a delivery to it: its access
+/// policy, and the customer managed key its messages are encrypted under. Either
+/// is `None` for a topic that carries it not at all.
+struct TopicAttributes {
+    policy: Option<String>,
+    kms_master_key_id: Option<String>,
 }
 
 /// The attribute Amazon SNS reports a topic's access policy under
@@ -3273,6 +3333,109 @@ fn topic_publish_refusal(topic_arn: &str) -> (String, String) {
         ),
     )
 }
+
+/// Why the key the topic `topic_arn` names is encrypted with does not let this
+/// delivery be published, as the invocation outcome that records it — or `None`
+/// for a topic on no customer managed key and for one whose key admits this
+/// service.
+///
+/// The rule the services follow: a topic carrying `KmsMasterKeyId` has every
+/// message published to it encrypted under that key, and Amazon SNS performs that
+/// encryption by calling `kms:GenerateDataKey` — so the KEY's own policy is a
+/// SECOND document in force over a delivery to such a topic, beside the topic's
+/// own access policy, and a key policy that does not admit this service's
+/// principal is a publish that does not happen however freely the topic's policy
+/// grants `sns:Publish`. The decision is KMS's own, over the key record that
+/// service's handlers wrote
+/// ([`crate::state::topic_encryption::generate_data_key_denied`]), so
+/// `PutKeyPolicy` lets the deliveries resume with nothing else changed.
+///
+/// A refusal is the delivery FAILING rather than one nobody attempted, so it is
+/// dead-lettered and counted on `FailedInvocations` like any other, under the
+/// condition and the sentence the two services nest for it
+/// ([`topic_key_publish_refusal`]).
+fn topic_key_refusal(
+    kms: Option<&::engine::ServiceState<crate::state::topic_encryption::KmsState>>,
+    attributes: Option<&TopicAttributes>,
+    region: &str,
+    topic_arn: &str,
+    handover: &Handover<'_>,
+) -> Option<crate::state::InvocationOutcome> {
+    let identifier = attributes?.kms_master_key_id.as_deref()?;
+    if !crate::state::topic_encryption::generate_data_key_denied(
+        kms, region, identifier, topic_arn,
+    ) {
+        return None;
+    }
+    ::tracing::warn!(
+        topic = %topic_arn,
+        rule = %handover.rule,
+        "an EventBridge delivery was withheld: the key the target topic is encrypted with \
+         does not allow this service to generate a data key under it"
+    );
+    let (code, message) = topic_key_publish_refusal();
+    Some(crate::state::InvocationOutcome::Failed { code, message })
+}
+
+/// The service name AWS KMS's own error metadata carries.
+const KMS_SERVICE_NAME: &str = "AWSKMS";
+
+/// The error code AWS KMS answers a use of a key its policies do not permit, and
+/// the status that answer carries. `AccessDeniedException` is in no KMS model —
+/// the service answers an authorization failure with it regardless — and the
+/// status is the 400 every KMS client error carries.
+const KMS_ACCESS_DENIED_CODE: &str = "AccessDeniedException";
+const KMS_ACCESS_DENIED_STATUS: u16 = 400;
+
+/// The error code Amazon SNS answers a publish whose encryption key refused it
+/// (`KMSAccessDeniedException`'s `awsQueryError` code), and the status that answer
+/// carries:
+/// `smithy_query(query="shape", shape="KMSAccessDeniedException",
+/// model_path="services/service-com-amazonaws-sns-amazonsimplenotificationservice/smithy-model/com-amazonaws-sns-amazonsimplenotificationservice.json")`.
+const SNS_KMS_ACCESS_DENIED_CODE: &str = "KMSAccessDenied";
+const SNS_KMS_ACCESS_DENIED_STATUS: u16 = 400;
+
+/// The condition and the sentence EventBridge reports for an encrypted topic
+/// target it could not publish to, because the key its messages are encrypted
+/// under withheld the data key.
+///
+/// What the delivery SEES is Amazon SNS's refusal of the `sns:Publish` wrapping
+/// KMS's refusal of the `kms:GenerateDataKey`, each with the metadata block an AWS
+/// error carries — the service, the status, the error code and the id of the one
+/// refused call. The innermost sentence is KMS's OWN for a refusal that can report
+/// nothing about the resource
+/// (`service_com_amazonaws_kms_trentservice::state::unauthorized_resource_message`),
+/// so the two services cannot word the same denial differently. The condition
+/// names the PERMISSION ([`crate::state::NO_PERMISSIONS`]), as every refusal a
+/// target's own documents decide does.
+///
+/// Each request id is MINTED here, for the reason [`topic_publish_refusal`] gives:
+/// it identifies ONE refused call — there are two nested calls, so there are two
+/// ids — and is drawn fresh from the tree's one mint of an AWS request id rather
+/// than derived from the event or the target.
+fn topic_key_publish_refusal() -> (String, String) {
+    let kms_request_id = ::service_common::query_error_envelope::new_request_id();
+    let sns_request_id = ::service_common::query_error_envelope::new_request_id();
+    (
+        crate::state::NO_PERMISSIONS.to_string(),
+        format!(
+            "{} (Service: {KMS_SERVICE_NAME}; Status Code: {KMS_ACCESS_DENIED_STATUS}; \
+             Error Code: {KMS_ACCESS_DENIED_CODE}; Request ID: {kms_request_id}; Proxy: null) \
+             (Service: {SNS_SERVICE_NAME}; Status Code: {SNS_KMS_ACCESS_DENIED_STATUS}; \
+             Error Code: {SNS_KMS_ACCESS_DENIED_CODE}; Request ID: {sns_request_id}; \
+             Proxy: null)",
+            ::service_com_amazonaws_kms_trentservice::state::unauthorized_resource_message(
+                crate::state::SERVICE_PRINCIPAL,
+                KMS_GENERATE_DATA_KEY_OPERATION,
+            )
+        ),
+    )
+}
+
+/// The KMS operation encrypting one published message performs, as the refusal
+/// NAMES it: the action is `kms:GenerateDataKey` and KMS's own sentence supplies
+/// the namespace.
+const KMS_GENERATE_DATA_KEY_OPERATION: &str = "GenerateDataKey";
 
 /// Why the function `function_arn` names does not accept this delivery, as the
 /// invocation outcome that records it — or `None` when its own resource-based

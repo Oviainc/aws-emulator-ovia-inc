@@ -4930,8 +4930,9 @@ pub fn parse_event_envelope(event: &str) -> Result<::serde_json::Value, String> 
 /// path (`service_common::json_reference_path`), in its SELECTION form: a path
 /// may name one place (`$.detail.order`, `$.detail.items[0]`) or, through a
 /// trailing slice, the list of elements it spans (`$.detail.items[1:3]`). A path
-/// that names NO place in the event selects JSON's empty value, `null`, which is
-/// what the placeholder renders as.
+/// that names NO place of the event selects nothing, which an `InputTransformer`
+/// placeholder is filled with the EMPTY STRING for — told apart from a place
+/// that is there and holds `null`, which renders as `null`.
 pub mod input_transform;
 
 /// EventBridge's event-pattern language: validate a pattern, and decide whether
@@ -4970,6 +4971,12 @@ pub mod log_group_target;
 /// (`PutRule`), so nothing a client does makes such a rule fire: its own schedule
 /// does, which is what that module performs.
 pub mod schedule;
+
+/// The customer managed key an Amazon SNS TOPIC target is encrypted with, and
+/// whether this service may have a data key generated under it — the second
+/// document in force over a delivery to such a topic, beside the topic's own
+/// access policy.
+pub mod topic_encryption;
 
 
 

@@ -93,6 +93,9 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 # model — so the delivery writes the very store `GetWorkflowRuns` reads, exactly
 # as this service's own metrics are written into CloudWatch's.
 service-com-amazonaws-glue-awsglue = { workspace = true }
+# `uuid`: a state-machine target's execution is named `<event id>_<uuid>`, whose
+# suffix is a fresh v4 UUID per invocation (`ops::put_events`).
+uuid = { version = "1", features = ["v4"] }
 # The `cron(...)` half of a rule's `ScheduleExpression` is read by this maintained
 # parser rather than by a hand-written one, and `chrono` (which it is written in)
 # is what the instants it names are read as (`state::schedule`).

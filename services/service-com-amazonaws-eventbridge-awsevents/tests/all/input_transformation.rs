@@ -12,13 +12,21 @@
 //! `InputTemplate` with every `<key>` placeholder filled from
 //! `InputPathsMap` — the template being delivered as it renders, so one that is
 //! a JSON object carries its placeholders "in quotes or out" and one that is not
-//! is text whose own quoting survives (`InputTransformer$InputTemplate`). A path
-//! that names no place in the event selects JSON's empty value.
+//! is text whose own quoting survives (`InputTransformer$InputTemplate`). A
+//! placeholder standing as a JSON value carries the selected value's JSON text;
+//! one carrying CHARACTERS — inside the template's own string, or anywhere in a
+//! text template — carries what the value holds with no JSON string quoting at
+//! any level, so an array of strings reads `[a,b]`. A path
+//! that names no place in the event selects NOTHING, which an `InputTransformer`
+//! placeholder is filled with the empty string for — distinct from a place that
+//! IS there and holds `null`, which renders as the literal `null` where the
+//! placeholder stands as a value and as the characters `null` inside a string.
 //!
 //! The tables span the class rather than one recorded case: the rows differ along
 //! the KIND of place a path names (a member, a nested member, an array element,
-//! a slice of an array, a member the event does not carry), along WHERE the
-//! placeholder stands (a bare JSON value, inside a JSON string, in text), and
+//! a slice of an array, a member the event does not carry, an index past the end
+//! of an array, a slice spanning nothing, a member holding `null`), along WHERE
+//! the placeholder stands (a bare JSON value, inside a JSON string, in text), and
 //! along the FORM of the template (a JSON object, a JSON array, a quoted string,
 //! a sentence).
 
@@ -37,6 +45,7 @@ fn detail() -> Value {
         "amount": 7,
         "items": ["first", "second", "third"],
         "lines": [{ "sku": "s1" }, { "sku": "s2" }],
+        "nothing": null,
         "customer": { "name": "Ada", "quote": "she said \"go\"" },
     })
 }
@@ -154,7 +163,7 @@ async fn an_input_path_delivers_the_part_of_the_event_it_selects() {
 #[tokio::test]
 async fn an_input_transformer_delivers_its_rendered_template() {
     // (case, InputPathsMap, InputTemplate, the text the target receives)
-    let rows: [(&str, Value, &str, &str); 13] = [
+    let rows: [(&str, Value, &str, &str); 21] = [
         (
             "a bare placeholder in a JSON object carries the value's JSON text",
             json!({ "amount": "$.detail.amount" }),
@@ -214,19 +223,75 @@ async fn an_input_transformer_delivers_its_rendered_template() {
             "{\"s\": [\"s1\",\"s2\"]}",
         ),
         (
-            // The absent field renders as JSON's empty value, exactly.
+            // A path that selects no place of the event fills the placeholder
+            // with the EMPTY STRING: a consumer can tell "the event had no such
+            // place" from "the place was there and held null" (the rows below).
             "a path naming no place in the event",
             json!({ "missing": "$.detail.missing" }),
             "{\"m\": <missing>}",
-            "{\"m\": null}",
+            "{\"m\": \"\"}",
         ),
         (
-            // A slice that spans nothing selects nothing, which is the same
-            // empty value a path naming no place selects.
+            "a path naming no place, quoted",
+            json!({ "missing": "$.detail.missing" }),
+            "{\"m\": \"<missing>\"}",
+            "{\"m\": \"\"}",
+        ),
+        (
+            "an array index past the end of the array",
+            json!({ "beyond": "$.detail.items[7]" }),
+            "{\"b\": <beyond>}",
+            "{\"b\": \"\"}",
+        ),
+        (
+            "a member of an element the array does not have",
+            json!({ "beyond": "$.detail.lines[7].sku" }),
+            "{\"b\": <beyond>}",
+            "{\"b\": \"\"}",
+        ),
+        (
+            // A slice that spans nothing selects nothing, like a path naming no
+            // place at all.
             "a slice past the end of the array",
             json!({ "none": "$.detail.items[5:7]" }),
             "{\"i\": <none>}",
-            "{\"i\": null}",
+            "{\"i\": \"\"}",
+        ),
+        (
+            // A place that IS there and holds `null` renders as the literal.
+            "a member holding null",
+            json!({ "nul": "$.detail.nothing" }),
+            "{\"n\": <nul>}",
+            "{\"n\": null}",
+        ),
+        (
+            "a member holding null, quoted",
+            json!({ "nul": "$.detail.nothing" }),
+            "{\"n\": \"<nul>\"}",
+            "{\"n\": \"null\"}",
+        ),
+        (
+            // A placeholder standing INSIDE the template's own string carries
+            // the value's characters, where nothing of JSON's quoting of a
+            // string is part of them — however deep in the value it sits.
+            "a quoted placeholder carrying an array of strings",
+            json!({ "all": "$.detail.items[*]" }),
+            "{\"i\": \"<all>\"}",
+            "{\"i\": \"[first,second,third]\"}",
+        ),
+        (
+            "a quoted placeholder carrying a list of objects",
+            json!({ "lines": "$.detail.lines" }),
+            "{\"l\": \"<lines>\"}",
+            "{\"l\": \"[{sku:s1},{sku:s2}]\"}",
+        ),
+        (
+            // A bare placeholder stands as a JSON VALUE, so what it carries is
+            // that value's JSON text, quotes and all.
+            "a bare placeholder carrying an array of strings",
+            json!({ "all": "$.detail.items[*]" }),
+            "{\"i\": <all>}",
+            "{\"i\": [\"first\",\"second\",\"third\"]}",
         ),
         (
             // The quotes a selected value carries are escaped for the string the
@@ -268,8 +333,8 @@ async fn an_input_transformer_delivers_its_rendered_template() {
 
 /// A path form this emulator does not EVALUATE is a delivery that does not
 /// happen: the target receives nothing and the handover says the path was not
-/// understood, rather than the target being handed a payload built from JSON's
-/// empty value as if the path had merely selected nothing.
+/// understood, rather than the target being handed a payload built as if the path
+/// had merely selected nothing.
 ///
 /// The rows differ along the selector that puts the path outside the bounded
 /// reader: a wildcard member, a descendant, a union, a filter, a negative index,
@@ -338,6 +403,30 @@ async fn a_text_template_renders_values_as_text_and_leaves_unknown_keys_alone() 
             json!({ "order": "$.detail.orderId" }),
             "<aws.events.rule-name>/<order>",
             "transform/A-1",
+        ),
+        (
+            "an array of strings in a sentence",
+            json!({ "all": "$.detail.items[*]" }),
+            "items <all>",
+            "items [first,second,third]",
+        ),
+        (
+            "a list of objects in a sentence",
+            json!({ "lines": "$.detail.lines" }),
+            "lines <lines>",
+            "lines [{sku:s1},{sku:s2}]",
+        ),
+        (
+            "a member holding null in a sentence",
+            json!({ "nul": "$.detail.nothing" }),
+            "value <nul>",
+            "value null",
+        ),
+        (
+            "a path naming no place in a sentence",
+            json!({ "missing": "$.detail.missing" }),
+            "value <missing>.",
+            "value .",
         ),
         (
             "a placeholder nothing names",

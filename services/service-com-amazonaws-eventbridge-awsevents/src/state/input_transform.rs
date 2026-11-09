@@ -47,19 +47,34 @@ fn reserved(key: &str, event: &Value, delivery: &Delivery<'_>) -> Option<Value> 
     }
 }
 
-/// What `path` selects out of `event`, as an input transformation renders
-/// it: the value at the one place the path names, the list of what a slice
-/// or wildcard in it spans, and `null` for a path that selects NOTHING in
-/// this event — JSON's empty value, which is what a placeholder for an
-/// absent field carries.
+/// What a path selected, told apart the way a RENDERING has to tell it
+/// apart: the value standing at the place the path named, and the absence of
+/// any such place.
+///
+/// The two are different facts about the event — "the member is there and
+/// holds `null`" is not "the event has no such member" — and a placeholder
+/// stands for a different thing in each ([`render`]), so the selection
+/// carries which of them it was rather than collapsing both onto one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    /// The value at the one place the path named, or the list of what a slice
+    /// in it spans.
+    Value(Value),
+    /// The path named no place this event carries.
+    Nothing,
+}
+
+/// What `path` selects out of `event`: the value at the one place the path
+/// names, the list of what a slice or wildcard in it spans, or
+/// [`Selection::Nothing`] for a path that selects NO place of this event.
 ///
 /// `Err` is the path this service did NOT evaluate: a form the bounded
 /// reader does not read, or a selection past the places it selects. That is
-/// not a path that selected nothing, so it is never rendered as the empty
+/// not a path that selected nothing, so it is never rendered as an absent
 /// value — the caller refuses the delivery instead of handing the target a
 /// payload built from a path nobody evaluated. The message names the path,
 /// which is what a consumer of the invocation log has to see to fix it.
-pub fn selected(path: &str, event: &Value) -> Result<Value, String> {
+pub fn selection(path: &str, event: &Value) -> Result<Selection, String> {
     use ::service_common::json_reference_path::{select_many, selection_segments, Selected};
 
     let Some(named) = selection_segments(path) else {
@@ -68,13 +83,28 @@ pub fn selected(path: &str, event: &Value) -> Result<Value, String> {
         ));
     };
     match select_many(&named, event) {
-        Selected::Value(value) => Ok(value),
-        Selected::NoMatch => Ok(Value::Null),
+        Selected::Value(value) => Ok(Selection::Value(value)),
+        Selected::NoMatch => Ok(Selection::Nothing),
         Selected::NotSelected => Err(format!(
             "the path {path} names more places than the {} this emulator selects",
             ::service_common::json_reference_path::MAX_SELECTED_ELEMENTS
         )),
     }
+}
+
+/// [`selection`] as ONE value: a path that selects no place of the event
+/// selects JSON's empty value, `null`.
+///
+/// This is the reading a target carrying `InputPath` is handed ([`by_input_path`]),
+/// where what travels is the JSON TEXT of the selected part of the event and
+/// an absent part has no text of its own. It is NOT how a placeholder of an
+/// `InputTransformer` template is filled, which is a substitution rather than
+/// a value and is stated at [`render`].
+pub fn selected(path: &str, event: &Value) -> Result<Value, String> {
+    selection(path, event).map(|selection| match selection {
+        Selection::Value(value) => value,
+        Selection::Nothing => Value::Null,
+    })
 }
 
 /// What a target carrying `InputPath` receives: the JSON text of the one
@@ -94,10 +124,13 @@ pub fn by_input_path(path: &str, event: &Value) -> Result<String, String> {
 ///   its placeholders "in quotes or out"
 ///   (`InputTransformer$InputTemplate`), so a placeholder standing as a JSON
 ///   value carries the selected value's JSON text and one standing inside a
-///   string carries that value's characters, escaped for the string it lands
-///   in — `{"n": <n>}` renders a number and `{"n": "<n>"}` renders that
-///   number's digits as a string, and neither can break the template's own
-///   JSON;
+///   string carries that value's CHARACTERS ([`text`]), escaped for the string
+///   it lands in — `{"n": <n>}` renders a number and `{"n": "<n>"}` renders
+///   that number's digits as a string, and neither can break the template's
+///   own JSON;
+/// * any other template is TEXT (`"<instance> is in state <status>"`): every
+///   placeholder carries the value's characters and every character the
+///   template itself wrote is delivered as written.
 /// * any other template is TEXT (`"<instance> is in state <status>"`): every
 ///   placeholder carries the value's characters and every character the
 ///   template itself wrote is delivered as written.
@@ -105,6 +138,14 @@ pub fn by_input_path(path: &str, event: &Value) -> Result<String, String> {
 /// A key the map does not hold and the reserved namespace does not name is
 /// not a placeholder at all: the text is left exactly as the template wrote
 /// it, since nothing says what it stands for.
+///
+/// A placeholder whose path selects NO place of the event is filled with the
+/// EMPTY STRING, so `{"k": <absent>}` renders the JSON string `""` and
+/// `{"k": "<absent>"}` renders an empty string too — which is not what a
+/// placeholder for a place that IS there and holds `null` renders as (`null`
+/// unquoted, the characters `null` inside a string). The two are different
+/// facts about the event ([`Selection`]), so a consumer of the payload can
+/// tell "no such element" from "the element was null".
 ///
 /// `Err` is a transformation this service will not build: a path it did not
 /// evaluate ([`selected`]), or a rendering past [`MAX_RENDERED_BYTES`] — a
@@ -191,7 +232,16 @@ fn filling(
     delivery: &Delivery<'_>,
 ) -> Result<Option<Value>, String> {
     if let Some(path) = paths.get(key) {
-        return selected(path, event).map(Some);
+        return selection(path, event).map(|selection| {
+            Some(match selection {
+                Selection::Value(value) => value,
+                // Nothing was selected, so the placeholder stands for no
+                // characters at all: the empty string, which is a JSON string
+                // where the placeholder stands as a value and nothing where it
+                // stands inside one.
+                Selection::Nothing => Value::String(String::new()),
+            })
+        });
     }
     Ok(key
         .starts_with(RESERVED_KEY_PREFIX)
@@ -214,12 +264,42 @@ fn placeholder(text: &str) -> Option<(&str, &str)> {
     Some((key, &after[end + 1..]))
 }
 
-/// The characters a selected value contributes to text: a string's own, and
-/// any other value's compact JSON text — the value itself, never a form
-/// special to one kind of value.
+/// The characters a selected value contributes to TEXT: what the value holds,
+/// with no JSON string quoting at any level.
+///
+/// A string contributes its own characters, a number and a boolean their
+/// digits and words, `null` the four characters `null` — and a container the
+/// same reading applied to what it holds: `[` its elements, `,`-separated, `]`
+/// and `{` its members as `<name>:<value>`, `,`-separated, `}`. So an array of
+/// strings reads `[a,b]` rather than `["a","b"]`: where a placeholder carries
+/// CHARACTERS rather than a JSON value, nothing of JSON's own punctuation for
+/// quoting a string is part of them, however deep in the value the string sits.
+///
+/// This is the one reading of a selected value as text, so a sentence template
+/// and a placeholder standing inside a JSON template's own string (where it is
+/// escaped for that string, [`escaped_text`]) carry the same characters. A
+/// placeholder standing as a JSON VALUE carries the value's JSON text instead —
+/// that one is a value, not characters — which is where the quotes come back.
+///
+/// The walk descends one frame per level of the value, which is bounded by the
+/// nesting the event was admitted under: a `Detail` is charged against the
+/// published [`super::MAX_DETAIL_DEPTH`] BEFORE anything parses it
+/// ([`super::parse_detail`]), so no caller can present a value deeper than that
+/// here — the same bound `serde_json`'s own rendering of such a value relies on.
 fn text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
+        Value::Array(elements) => {
+            let read: Vec<String> = elements.iter().map(text).collect();
+            format!("[{}]", read.join(","))
+        }
+        Value::Object(members) => {
+            let read: Vec<String> = members
+                .iter()
+                .map(|(name, member)| format!("{name}:{}", text(member)))
+                .collect();
+            format!("{{{}}}", read.join(","))
+        }
         other => other.to_string(),
     }
 }
@@ -243,6 +323,7 @@ fn escaped_text(value: &Value) -> String {
 mod tests {
     use super::{render, selected, Delivery};
 
+
     use ::serde_json::json;
 
     /// The event every row below transforms.
@@ -256,6 +337,8 @@ mod tests {
                 "order": "A-1",
                 "amount": 7,
                 "items": ["a", "b", "c"],
+                "lines": [{ "sku": "s1" }, { "sku": "s2" }],
+                "nul": null,
                 "quoted": "he said \"hi\"",
             },
         })
@@ -331,7 +414,10 @@ mod tests {
             ("order", "$.detail.order"),
             ("amount", "$.detail.amount"),
             ("items", "$.detail.items[0:2]"),
+            ("lines", "$.detail.lines"),
             ("absent", "$.detail.nope"),
+            ("beyond", "$.detail.items[9]"),
+            ("nul", "$.detail.nul"),
             ("quoted", "$.detail.quoted"),
         ]
         .into_iter()
@@ -351,7 +437,29 @@ mod tests {
             ),
             ("a bare string", "{\"o\": <order>}", "{\"o\": \"A-1\"}"),
             ("a slice", "{\"i\": <items>}", "{\"i\": [\"a\",\"b\"]}"),
-            ("an absent path", "{\"a\": <absent>}", "{\"a\": null}"),
+            // A path that selects no place of the event fills the
+            // placeholder with the empty string, wherever it stands.
+            ("an absent path", "{\"a\": <absent>}", "{\"a\": \"\"}"),
+            (
+                "an absent path in a string",
+                "{\"a\": \"<absent>\"}",
+                "{\"a\": \"\"}",
+            ),
+            (
+                "an index past the array",
+                "{\"a\": <beyond>}",
+                "{\"a\": \"\"}",
+            ),
+            (
+                "an absent element in a sentence",
+                "before <absent> after",
+                "before  after",
+            ),
+            // A place that IS there and holds `null` is the other case the
+            // rendering keeps apart: the literal unquoted, its characters
+            // quoted.
+            ("a null path", "{\"n\": <nul>}", "{\"n\": null}"),
+            ("a null path in a string", "{\"n\": \"<nul>\"}", "{\"n\": \"null\"}"),
             (
                 // The quotes the selected value carries are escaped for the
                 // string the placeholder stands in, so the template stays
@@ -367,11 +475,21 @@ mod tests {
             ),
             (
                 // A selected list written inside the template's own string
-                // is escaped for it, so the rendering is still one JSON
-                // string rather than a string followed by an array.
+                // carries its CHARACTERS, where nothing of JSON's quoting of
+                // a string is part of them.
                 "a list inside the template's own string",
                 "\"<items>\"",
-                "\"[\\\"a\\\",\\\"b\\\"]\"",
+                "\"[a,b]\"",
+            ),
+            (
+                "a list in a sentence",
+                "items: <items>",
+                "items: [a,b]",
+            ),
+            (
+                "a list of objects in a sentence",
+                "lines: <lines>",
+                "lines: [{sku:s1},{sku:s2}]",
             ),
             (
                 "a sentence template",

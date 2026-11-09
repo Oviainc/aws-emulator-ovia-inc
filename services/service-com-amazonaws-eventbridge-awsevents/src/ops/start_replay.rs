@@ -379,10 +379,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The Glue store a workflow target's event is counted in, resolved once
         // for the whole replay as the other stores are.
         let glue = crate::state::glue_state(&*self.engine);
+        // The KMS store the key an encrypted topic target holds lives in,
+        // resolved once for the whole replay as the other stores are.
+        let kms = crate::state::topic_encryption::kms_state(&*self.engine);
         let stores = crate::ops::put_events::Stores {
             iam: iam.as_ref(),
             cloudwatch: cloudwatch.as_ref(),
             glue: glue.as_ref(),
+            kms: kms.as_ref(),
         };
         let mut budget = crate::ops::put_events::DeliveryBudget::new();
         let mut clients = crate::ops::put_events::Clients::default();

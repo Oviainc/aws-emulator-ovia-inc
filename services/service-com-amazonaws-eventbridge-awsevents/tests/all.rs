@@ -55,6 +55,8 @@ mod cross_region_bus_target;
 mod dead_letter_error_code;
 #[path = "all/encrypted_bus_key_state.rs"]
 mod encrypted_bus_key_state;
+#[path = "all/encrypted_topic_target_key_policy.rs"]
+mod encrypted_topic_target_key_policy;
 #[path = "all/entry_level_semantics.rs"]
 mod entry_level_semantics;
 #[path = "all/envelope_time_precision.rs"]

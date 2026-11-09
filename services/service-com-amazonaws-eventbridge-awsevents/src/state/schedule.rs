@@ -473,10 +473,12 @@ async fn fire<Eng: Send + Sync + 'static>(
     let iam = super::iam_state(engine);
     let cloudwatch = super::cloudwatch_state(engine);
     let glue = super::glue_state(engine);
+    let kms = super::topic_encryption::kms_state(engine);
     let stores = crate::ops::put_events::Stores {
         iam: iam.as_ref(),
         cloudwatch: cloudwatch.as_ref(),
         glue: glue.as_ref(),
+        kms: kms.as_ref(),
     };
     let mut clients = crate::ops::put_events::Clients::default();
     let mut budget = crate::ops::put_events::DeliveryBudget::new();
