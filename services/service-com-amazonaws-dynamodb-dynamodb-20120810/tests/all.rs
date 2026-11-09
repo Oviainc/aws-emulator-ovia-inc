@@ -25,6 +25,8 @@ mod batch_write_capacity_residue;
 mod batch_write_provisioned_budget;
 #[path = "all/billing_mode_and_table_class_summaries.rs"]
 mod billing_mode_and_table_class_summaries;
+#[path = "all/cmk_shared_by_several_tables.rs"]
+mod cmk_shared_by_several_tables;
 #[path = "all/collection_cap_constraint_reports.rs"]
 mod collection_cap_constraint_reports;
 #[path = "all/consumed_capacity_arms.rs"]
