@@ -83,6 +83,28 @@ const DELIVERY_ROLE: &str = "arn:aws:iam::000000000000:role/scheduled-query-deli
 /// The name the query under test is created under in every case.
 const NAME: &str = "orders-errors-hourly";
 
+/// Every log group the create and the rows name, in either identifier form. A scheduled-query
+/// write resolves each `logGroupIdentifiers` entry against the log groups the ACCOUNT holds, so
+/// each case creates these before the query that reads them.
+const GROUPS: [&str; 4] = [
+    "/aws/lambda/orders",
+    "/aws/lambda/payments",
+    "/aws/lambda/cart",
+    "/aws/lambda/search",
+];
+
+/// Those log groups, created over the wire like any client's call.
+async fn seed_log_groups(logs: &Logs) {
+    for group in GROUPS {
+        logs.ok("CreateLogGroup", &json!({"logGroupName": group})).await;
+    }
+}
+
+/// The end of a scheduled query's lookback window when the write states none: the offset in
+/// seconds a query that states no `endTimeOffset` resolves to, which every reader of the query
+/// reports.
+const DEFAULT_END_TIME_OFFSET: i64 = 0;
+
 /// Where a row delivers its results — the destinations the model's `DestinationConfiguration`
 /// carries: `s3Configuration` ("Configuration for delivering query results to Amazon S3"),
 /// `lookupTableConfiguration` ("Configuration for delivering query results to a lookup table")
@@ -516,11 +538,14 @@ fn assert_reports_update(
         "case {case:?} in {under}: the start offset is the update's, cleared where it stated \
          none, got {report}"
     );
+    // `endTimeOffset` has an effective value whether or not the update stated one, so a row
+    // stating none leaves the query at the offset it resolves to rather than at no offset.
+    let expected_end_offset = row.end_time_offset.unwrap_or(DEFAULT_END_TIME_OFFSET);
     assert_eq!(
         number(report, "endTimeOffset"),
-        row.end_time_offset,
-        "case {case:?} in {under}: the end offset is the update's, cleared where it stated none, \
-         got {report}"
+        Some(expected_end_offset),
+        "case {case:?} in {under}: the end offset is the update's, or {expected_end_offset} where \
+         it stated none, got {report}"
     );
     assert_eq!(
         number(report, "scheduleStartTime"),
@@ -574,6 +599,7 @@ async fn an_update_stores_exactly_what_it_states() {
     for row in rows() {
         // One account per row, so each row starts from the same fully populated query.
         let logs = Logs::new();
+        seed_log_groups(&logs).await;
         logs.ok(CREATE, &create_request(NAME)).await;
         let arn = scheduled_query_arn(REGION, NAME);
 
@@ -627,6 +653,7 @@ async fn an_update_touches_no_other_query() {
     let logs = Logs::new();
     const OTHER: &str = "payments-errors-hourly";
 
+    seed_log_groups(&logs).await;
     logs.ok(CREATE, &create_request(NAME)).await;
     logs.ok(CREATE, &create_request(OTHER)).await;
     let before = logs.ok(GET, &json!({"identifier": OTHER})).await;
@@ -667,6 +694,7 @@ async fn an_update_touches_no_other_query() {
 async fn an_update_keeps_the_tags_the_create_assigned() {
     let logs = Logs::new();
 
+    seed_log_groups(&logs).await;
     logs.ok(CREATE, &create_request(NAME)).await;
     logs.ok(
         UPDATE,
@@ -710,6 +738,7 @@ async fn an_update_keeps_the_tags_the_create_assigned() {
 async fn an_update_of_an_unknown_identifier_is_refused_and_writes_nothing() {
     let logs = Logs::new();
 
+    seed_log_groups(&logs).await;
     logs.ok(CREATE, &create_request(NAME)).await;
     let before = logs.ok(GET, &json!({"identifier": NAME})).await;
 

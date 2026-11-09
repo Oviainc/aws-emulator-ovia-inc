@@ -206,6 +206,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
+        // Every member the request states is held to its own constraint before anything is
+        // resolved against state: `executionRoleArn` is "The ARN of the IAM role that grants
+        // permissions to execute the query", so a value that is not an IAM role ARN fails the
+        // expression the service publishes for that member and is refused with the
+        // member-constraint sentence rather than stored.
+        if let Some(message) =
+            crate::state::execution_role_arn_refusal(&input.execution_role_arn)
+        {
+            return Err(
+                CreateScheduledQueryErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
         // "The name must be unique within your account and region": a create under a name the
         // account already holds a scheduled query under is refused as the conflict this
         // operation models ("This operation attempted to create a resource that already
@@ -244,6 +260,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // "An array of log group names or ARNs to query": a query reads the log groups it
+        // names, so each identifier is resolved against the groups the account holds and one it
+        // does not hold is refused ABOUT THAT LOG GROUP — the resource that is missing — rather
+        // than stored on a query that could never run.
+        if let Some(message) = crate::state::unheld_log_group_refusal(
+            &store,
+            input.log_group_identifiers.as_deref().unwrap_or_default(),
+        ) {
+            return Err(
+                CreateScheduledQueryErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let created_at = crate::state::now_ms();
         let arn = crate::state::scheduled_query_arn(&region, &input.name);
 
@@ -262,7 +296,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.log_group_identifiers = input.log_group_identifiers.clone().unwrap_or_default();
         record.timezone = input.timezone.clone();
         record.start_time_offset = input.start_time_offset;
-        record.end_time_offset = input.end_time_offset;
+        // "The time offset in seconds that defines the end of the lookback period for the
+        // query" has an effective value whether or not the create stated one, so the record
+        // carries the resolved offset and every reader of the query reports it.
+        record.end_time_offset = crate::state::effective_end_time_offset(input.end_time_offset);
         record.destination_configuration = input.destination_configuration.clone();
         record.schedule_start_time = input.schedule_start_time;
         record.schedule_end_time = input.schedule_end_time;

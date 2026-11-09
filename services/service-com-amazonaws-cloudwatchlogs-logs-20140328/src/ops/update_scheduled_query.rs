@@ -238,6 +238,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let updated_at = crate::state::now_ms();
 
+        // Every member the request states is held to its own constraint before anything is
+        // resolved against state: `executionRoleArn` is "The ARN of the IAM role that grants
+        // permissions to execute the query", so a value that is not an IAM role ARN fails the
+        // expression the service publishes for that member and is refused with the
+        // member-constraint sentence rather than written.
+        if let Some(message) = crate::state::execution_role_arn_refusal(&input.execution_role_arn) {
+            return Err(
+                UpdateScheduledQueryErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
         // "This operation uses PUT semantics": the stored configuration becomes exactly what
         // this request states, so every configuration member is written from it — a member the
         // request omits goes back to the value a query naming none holds rather than keeping
@@ -247,10 +261,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The log store's guard is taken and released here, before the alarm store is read
         // below, so the two services' stores are never locked at once.
-        let updated = state
-            .lock()
-            .scheduled_query_mut(&input.identifier)
-            .map(|record| {
+        let updated = {
+            let mut store = state.lock();
+
+            // "An array of log group names or ARNs to query": the log groups the request names
+            // are resolved against the groups the account holds BEFORE the scheduled query the
+            // identifier names is, so a request naming a log group that is not there is refused
+            // about that log group — the resource that is missing — whatever the identifier
+            // names.
+            if let Some(message) = crate::state::unheld_log_group_refusal(
+                &store,
+                input.log_group_identifiers.as_deref().unwrap_or_default(),
+            ) {
+                return Err(
+                    UpdateScheduledQueryErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            store.scheduled_query_mut(&input.identifier).map(|record| {
                 record.query_language = input.query_language.clone();
                 record.query_string = input.query_string.clone();
                 record.schedule_expression = input.schedule_expression.clone();
@@ -260,7 +293,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     input.log_group_identifiers.clone().unwrap_or_default();
                 record.timezone = input.timezone.clone();
                 record.start_time_offset = input.start_time_offset;
-                record.end_time_offset = input.end_time_offset;
+                // The end of the lookback period has an effective value whether or not the
+                // update stated one, so — under the same PUT semantics as every other optional
+                // member — the record carries the offset this request resolves to.
+                record.end_time_offset =
+                    crate::state::effective_end_time_offset(input.end_time_offset);
                 record.destination_configuration = input.destination_configuration.clone();
                 record.schedule_start_time = input.schedule_start_time;
                 record.schedule_end_time = input.schedule_end_time;
@@ -273,7 +310,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .unwrap_or_else(|| crate::state::SCHEDULED_QUERY_STATE_ENABLED.to_string());
                 record.last_updated_time_ms = Some(updated_at);
                 record.clone()
-            });
+            })
+        };
 
         let Some(query) = updated else {
             // The scheduled query CloudWatch manages for a log alarm is a query this account

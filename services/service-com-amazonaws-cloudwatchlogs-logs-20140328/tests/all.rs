@@ -221,6 +221,8 @@ mod retention_policy;
 mod s3_table_integration_sources;
 #[path = "all/scheduled_queries.rs"]
 mod scheduled_queries;
+#[path = "all/scheduled_query_configuration_rules.rs"]
+mod scheduled_query_configuration_rules;
 #[path = "all/scheduled_query_enumeration.rs"]
 mod scheduled_query_enumeration;
 #[path = "all/scheduled_query_insights_start.rs"]

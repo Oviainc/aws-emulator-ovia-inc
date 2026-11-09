@@ -74,6 +74,26 @@ const DELIVERY_ROLE: &str = "arn:aws:iam::000000000000:role/scheduled-query-deli
 /// before, between and after them as the rows vary its name.
 const KEPT: [&str; 2] = ["aaa-kept-query", "mmm-kept-query"];
 
+/// Every log group a row names, in either identifier form. A scheduled-query write resolves each
+/// `logGroupIdentifiers` entry against the log groups the ACCOUNT holds, so these are created
+/// before the queries that read them.
+const GROUPS: [&str; 3] = [
+    "/aws/lambda/orders",
+    "/aws/lambda/payments",
+    "/aws/apigateway/welcome",
+];
+
+/// Those log groups, created over the wire like any client's call.
+async fn seed_log_groups(logs: &Logs) {
+    for group in GROUPS {
+        logs.ok("CreateLogGroup", &json!({"logGroupName": group})).await;
+    }
+}
+
+/// The end of a scheduled query's lookback window when the create names none: the offset in
+/// seconds a query that names no `endTimeOffset` resolves to.
+const DEFAULT_END_TIME_OFFSET: i64 = 0;
+
 /// Where a row delivers its results — the destinations the model's `DestinationConfiguration`
 /// carries: `s3Configuration` ("Configuration for delivering query results to Amazon S3"),
 /// `lookupTableConfiguration` ("Configuration for delivering query results to a lookup table")
@@ -304,6 +324,7 @@ async fn a_delete_removes_exactly_the_query_it_names() {
     for row in rows() {
         let case = row.case;
         let logs = Logs::new();
+        seed_log_groups(&logs).await;
 
         for kept in KEPT {
             logs.ok(
@@ -419,7 +440,6 @@ async fn a_delete_removes_exactly_the_query_it_names() {
             "description",
             "timezone",
             "startTimeOffset",
-            "endTimeOffset",
             "scheduleStartTime",
             "scheduleEndTime",
             "destinationConfiguration",
@@ -432,6 +452,15 @@ async fn a_delete_removes_exactly_the_query_it_names() {
                  {member}, got {got:?}"
             );
         }
+        // `endTimeOffset` has an effective value whether or not a create names one, so the
+        // recreated query reports the offset it resolves to rather than the removed one's.
+        let end_offset = fresh.get("endTimeOffset").and_then(Value::as_i64);
+        assert_eq!(
+            end_offset,
+            Some(DEFAULT_END_TIME_OFFSET),
+            "case {case:?}: the recreated query carries its own end offset, expected \
+             {DEFAULT_END_TIME_OFFSET}, got {end_offset:?}"
+        );
     }
 }
 

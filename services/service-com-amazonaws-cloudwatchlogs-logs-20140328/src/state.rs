@@ -205,6 +205,11 @@ pub mod transformer;
 /// The scheduled query CloudWatch manages on a log alarm's behalf.
 pub mod log_alarm_queries;
 
+/// The rules a scheduled query's configuration is held to, shared by the create and the update
+/// that state one.
+mod scheduled_query_rules;
+pub use scheduled_query_rules::*;
+
 /// The log anomaly detectors this account holds, as they are stored.
 mod anomaly_detectors;
 pub use anomaly_detectors::*;

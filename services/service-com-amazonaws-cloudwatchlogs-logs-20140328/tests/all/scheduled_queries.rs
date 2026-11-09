@@ -62,6 +62,26 @@ const DISABLED: &str = "DISABLED";
 /// and deliver results."
 const ROLE: &str = "arn:aws:iam::000000000000:role/scheduled-query-execution";
 
+/// Every log group a row names, in either identifier form. A scheduled-query write resolves each
+/// `logGroupIdentifiers` entry against the log groups the ACCOUNT holds, so these are created
+/// before the queries that read them.
+const GROUPS: [&str; 3] = [
+    "/aws/lambda/orders",
+    "/aws/lambda/payments",
+    "/aws/lambda/search",
+];
+
+/// Those log groups, created over the wire like any client's call.
+async fn seed_log_groups(logs: &Logs) {
+    for group in GROUPS {
+        logs.ok("CreateLogGroup", &json!({"logGroupName": group})).await;
+    }
+}
+
+/// The end of a scheduled query's lookback window when the create states none: the offset in
+/// seconds a query that names no `endTimeOffset` resolves to, which every reader reports.
+const DEFAULT_END_TIME_OFFSET: i64 = 0;
+
 /// The role a destination delivers results under, which the model gives its own member.
 const DELIVERY_ROLE: &str = "arn:aws:iam::000000000000:role/scheduled-query-delivery";
 
@@ -454,11 +474,14 @@ fn assert_reports_row(read: &Value, row: &Row, arn: &str, created_at: i64, under
         "case {case:?} read by {under}: the start offset is reported only when the create named \
          one, got {read}"
     );
+    // `endTimeOffset` has an effective value whether or not the create named one, so a row
+    // naming none reports the offset it resolves to rather than no offset.
+    let expected_end_offset = row.end_time_offset.unwrap_or(DEFAULT_END_TIME_OFFSET);
     assert_eq!(
         number(read, "endTimeOffset"),
-        row.end_time_offset,
-        "case {case:?} read by {under}: the end offset is reported only when the create named \
-         one, got {read}"
+        Some(expected_end_offset),
+        "case {case:?} read by {under}: the end offset is the create's, or \
+         {expected_end_offset} where it named none, got {read}"
     );
     assert_eq!(
         number(read, "scheduleStartTime"),
@@ -538,6 +561,7 @@ fn assert_reports_row(read: &Value, row: &Row, arn: &str, created_at: i64, under
 #[tokio::test]
 async fn a_created_scheduled_query_is_reported_back_exactly() {
     let logs = Logs::new();
+    seed_log_groups(&logs).await;
 
     for row in rows() {
         let before = now_ms();
