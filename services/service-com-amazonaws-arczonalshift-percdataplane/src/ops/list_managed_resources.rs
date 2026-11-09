@@ -174,16 +174,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         )?;
 
+        // What the services that own their resources have registered with ARC, read
+        // BEFORE this store is locked, so the shared registry is never held while this
+        // store is.
+        let published = crate::state::published_resources(&*self.engine);
+
         let mut store = state.lock();
         // Reporting only: materialises the expiry the clock already made due, so a
         // summary never reports a shift that stopped being applied before this call.
         store.expire_due_shifts(SystemTime::now());
 
-        // `managed_resources` is a BTreeMap, so `keys()` ascends: the cursor
-        // comparison below and the token issued from the last key returned are both
+        // Every managed resource ARC holds: the ones this store was seeded with and the
+        // ones those services registered. A BTreeMap, so the walk ascends by ARN: the
+        // cursor comparison below and the token issued from the last key returned are both
         // well defined, and a walk neither skips nor repeats a resource.
-        let mut remaining = store
-            .managed_resources
+        let inventory = store.managed_resource_inventory(&published);
+        let mut remaining = inventory
             .values()
             .filter(|resource| {
                 page.after
@@ -202,7 +208,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 autoshifts: Some(resource.autoshifts.clone()),
                 zonal_autoshift_status: Some(resource.zonal_autoshift_status.as_wire().to_string()),
                 practice_run_status: Some(resource.practice_run_status().as_wire().to_string()),
-                applied_weights: Some(store.applied_weights(&resource.arn)),
+                applied_weights: Some(
+                    store.applied_weights(&resource.arn, &resource.availability_zones),
+                ),
                 zonal_shifts: Some(store.zonal_shifts_in_resource(&resource.arn)),
             });
             last_key = Some(resource.arn.clone());

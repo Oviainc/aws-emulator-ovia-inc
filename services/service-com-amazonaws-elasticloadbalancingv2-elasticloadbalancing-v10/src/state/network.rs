@@ -436,6 +436,48 @@ pub async fn subnets_by_id(
     }
 }
 
+/// The Availability Zone ID EC2 reports for each of `subnet_ids`, keyed by subnet id.
+///
+/// An Availability Zone has TWO identifiers — the account-scoped name (`us-west-2a`) and
+/// the account-independent ID (`usw2-az1`) — and only EC2 holds the pairing, so a service
+/// that has to name the zone a subnet puts a resource in by its ID reads it from EC2 rather
+/// than deriving it. A subnet EC2 does not report, or reports no zone ID for, is simply
+/// left out, and an answer that could not be obtained at all is an empty map: the caller
+/// then has only the zone NAME it already holds, which is what it falls back to.
+pub async fn zone_ids_of_subnets(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    subnet_ids: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    if subnet_ids.is_empty() {
+        return std::collections::BTreeMap::new();
+    }
+    let answer = ec2(ctx, region)
+        .describe_subnets()
+        .set_subnet_ids(Some(subnet_ids.to_vec()))
+        .send()
+        .await;
+    match answer {
+        Ok(output) => output
+            .subnets()
+            .iter()
+            .filter_map(|subnet| {
+                Some((
+                    subnet.subnet_id()?.to_string(),
+                    subnet.availability_zone_id()?.to_string(),
+                ))
+            })
+            .collect(),
+        Err(error) => {
+            ::tracing::debug!(
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the Availability Zone IDs of the subnets could not be resolved against EC2"
+            );
+            std::collections::BTreeMap::new()
+        }
+    }
+}
+
 /// Every subnet EC2 holds in `vpc_id`, or `None` when EC2 could not be asked.
 pub async fn subnets_of_vpc(
     ctx: &smithy_server_runtime::OperationContext<'_>,

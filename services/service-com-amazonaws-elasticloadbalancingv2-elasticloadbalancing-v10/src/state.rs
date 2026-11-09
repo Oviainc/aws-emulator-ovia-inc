@@ -16,10 +16,13 @@
 //! VPCs, subnets, security groups and instances. [`network`] resolves those against EC2,
 //! which owns them.
 //!
-//! And one fact this service's resources create is read by ANOTHER service: a
+//! And two facts this service's resources create are read by ANOTHER service: a
 //! TLS-terminating listener presents a certificate Certificate Manager holds, so which
 //! certificates a load balancer presents is recorded in the shared directory that service
-//! reads ([`certificate_consumers`]).
+//! reads ([`certificate_consumers`]); and a load balancer with zonal-shift integration
+//! enabled is a managed resource of Amazon Application Recovery Controller, which is
+//! recorded in the shared registry that service reads
+//! ([`zonal_shift_registration`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -31,6 +34,15 @@ pub mod network;
 mod certificate_consumers;
 
 pub use certificate_consumers::{certificate_association_directory, record_certificate_consumers};
+
+/// Whether a load balancer is a managed resource of Amazon Application Recovery
+/// Controller, recorded where the service that reports managed resources can read it.
+mod zonal_shift_registration;
+
+pub use zonal_shift_registration::{
+    managed_resource_registry, record_zonal_shift_registration, ZonalShiftRegistration,
+    ZonePlacement, ZONAL_SHIFT_ATTRIBUTE,
+};
 
 /// The unit tests of [`network`]'s pure half — where an address falls relative to a VPC.
 #[cfg(test)]

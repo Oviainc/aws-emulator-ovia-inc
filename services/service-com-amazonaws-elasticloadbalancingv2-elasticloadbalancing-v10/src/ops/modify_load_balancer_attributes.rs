@@ -18,6 +18,12 @@
 //! by that type (`crate::state::load_balancer_attribute_unsupported`); and an ARN this
 //! store holds no load balancer for is the modelled `LoadBalancerNotFoundException`.
 //!
+//! One attribute this write makes a fact about ANOTHER service:
+//! `zonal_shift.config.enabled` turns zonal-shift integration on for the load balancer,
+//! which makes it a managed resource of Amazon Application Recovery Controller — so a
+//! request that writes that key records what this store now holds in the shared registry
+//! that service reads (`crate::state::record_zonal_shift_registration`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -151,111 +157,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Only reachable on an engine that is not the shared `InMemoryEngine`,
             // which this service has no store on — so nothing is implemented for it.
             crate::scaffolded::Scaffolded::not_implemented("ModifyLoadBalancerAttributes")
         })?;
 
-        let mut guard = state.lock();
-        let Some(load_balancer) = guard.load_balancers.get(&input.load_balancer_arn) else {
-            return Err(
-                ModifyLoadBalancerAttributesErrorModeled::LoadBalancerNotFoundException(
-                    LoadBalancerNotFoundException {
-                        message: Some(crate::state::load_balancer_not_found_message(
-                            &input.load_balancer_arn,
-                        )),
-                    },
-                )
-                .into(),
-            );
-        };
-
-        // The whole request is checked before the first write, so a caller that sent one
-        // bad attribute beside three good ones can resend the corrected request without
-        // wondering which of them landed.
-        let mut writes: Vec<(String, String)> = Vec::with_capacity(input.attributes.len());
-        for attribute in &input.attributes {
-            let key = attribute.key.clone().unwrap_or_default();
-            // The value is stored exactly as the request wrote it, so a read reports the
-            // caller's own value rather than a re-rendered one.
-            let value = attribute.value.clone().unwrap_or_default();
-            let Some(spec) = crate::state::load_balancer_attribute(&key) else {
-                // A key this service defines no load balancer attribute under is a value
-                // the request has to fix rather than a configuration this load balancer
-                // cannot hold, so it answers under the code Elastic Load Balancing
-                // answers an unusable input with.
-                return Err(refuse(crate::state::unrecognized_attribute_key(
-                    crate::state::AttributeOwner::LoadBalancer,
-                    &key,
-                )));
+        // The store's lock lives in this block and is released with it: what follows reads
+        // ANOTHER service (the Availability Zone IDs are EC2's), and nothing holds this
+        // store while it does.
+        let (output, registration) = {
+            let mut guard = state.lock();
+            let Some(load_balancer) = guard.load_balancers.get(&input.load_balancer_arn) else {
+                return Err(
+                    ModifyLoadBalancerAttributesErrorModeled::LoadBalancerNotFoundException(
+                        LoadBalancerNotFoundException {
+                            message: Some(crate::state::load_balancer_not_found_message(
+                                &input.load_balancer_arn,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
             };
-            if !spec.applies_to(load_balancer) {
-                // Which attributes a load balancer carries is decided by its TYPE, which is
-                // what the refusal states beside the key the request named — and which
-                // CLASS of refusal it is is decided by that type too
-                // (`crate::state::load_balancer_attribute_unsupported`).
-                return Err(refuse(crate::state::load_balancer_attribute_unsupported(
-                    &key,
-                    load_balancer.family(),
-                )));
-            }
-            if let Err(refusal) =
-                spec.domain
-                    .check(crate::state::AttributeOwner::LoadBalancer, &key, &value)
-            {
-                // The VALUE is outside the domain the attribute's documentation states for
-                // it — a bound, or a type it is not written in — which is malformed input
-                // rather than a configuration this load balancer cannot hold, so it answers
-                // under the code this API answers an input it cannot accept with, in the
-                // words it refuses that class of value with.
-                return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
-            }
-            // An attribute the documentation fixes for this load balancer keeps that
-            // value: a write restating it changes nothing and is accepted, while a write of
-            // anything else asks for a value the attribute cannot take on a load balancer
-            // of this type — an input the request has to fix, like a value outside the
-            // attribute's domain above.
-            if let Some(fixed) = spec.fixed_for(load_balancer) {
-                if value != fixed {
-                    return Err(crate::scaffolded::Scaffolded::validation_error(
-                        crate::state::fixed_attribute_message(
-                            &key,
-                            &fixed,
-                            load_balancer.family(),
-                        ),
-                    ));
+
+            // The whole request is checked before the first write, so a caller that sent
+            // one bad attribute beside three good ones can resend the corrected request
+            // without wondering which of them landed.
+            let mut writes: Vec<(String, String)> = Vec::with_capacity(input.attributes.len());
+            for attribute in &input.attributes {
+                let key = attribute.key.clone().unwrap_or_default();
+                // The value is stored exactly as the request wrote it, so a read reports
+                // the caller's own value rather than a re-rendered one.
+                let value = attribute.value.clone().unwrap_or_default();
+                let Some(spec) = crate::state::load_balancer_attribute(&key) else {
+                    // A key this service defines no load balancer attribute under is a
+                    // value the request has to fix rather than a configuration this load
+                    // balancer cannot hold, so it answers under the code Elastic Load
+                    // Balancing answers an unusable input with.
+                    return Err(refuse(crate::state::unrecognized_attribute_key(
+                        crate::state::AttributeOwner::LoadBalancer,
+                        &key,
+                    )));
+                };
+                if !spec.applies_to(load_balancer) {
+                    // Which attributes a load balancer carries is decided by its TYPE,
+                    // which is what the refusal states beside the key the request named —
+                    // and which CLASS of refusal it is is decided by that type too
+                    // (`crate::state::load_balancer_attribute_unsupported`).
+                    return Err(refuse(crate::state::load_balancer_attribute_unsupported(
+                        &key,
+                        load_balancer.family(),
+                    )));
                 }
+                if let Err(refusal) =
+                    spec.domain
+                        .check(crate::state::AttributeOwner::LoadBalancer, &key, &value)
+                {
+                    // The VALUE is outside the domain the attribute's documentation states
+                    // for it — a bound, or a type it is not written in — which is malformed
+                    // input rather than a configuration this load balancer cannot hold, so
+                    // it answers under the code this API answers an input it cannot accept
+                    // with, in the words it refuses that class of value with.
+                    return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
+                }
+                // An attribute the documentation fixes for this load balancer keeps that
+                // value: a write restating it changes nothing and is accepted, while a
+                // write of anything else asks for a value the attribute cannot take on a
+                // load balancer of this type — an input the request has to fix, like a
+                // value outside the attribute's domain above.
+                if let Some(fixed) = spec.fixed_for(load_balancer) {
+                    if value != fixed {
+                        return Err(crate::scaffolded::Scaffolded::validation_error(
+                            crate::state::fixed_attribute_message(
+                                &key,
+                                &fixed,
+                                load_balancer.family(),
+                            ),
+                        ));
+                    }
+                }
+                writes.push((key, value));
             }
-            writes.push((key, value));
-        }
 
-        // The validated writes land under the SAME lock the lookup was made under, so
-        // the record is still there; the refusal below is the lookup's own, restated
-        // rather than assumed away.
-        let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) else {
-            return Err(
-                ModifyLoadBalancerAttributesErrorModeled::LoadBalancerNotFoundException(
-                    LoadBalancerNotFoundException {
-                        message: Some(crate::state::load_balancer_not_found_message(
-                            &input.load_balancer_arn,
-                        )),
-                    },
-                )
-                .into(),
-            );
+            // The validated writes land under the SAME lock the lookup was made under, so
+            // the record is still there; the refusal below is the lookup's own, restated
+            // rather than assumed away.
+            let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn)
+            else {
+                return Err(
+                    ModifyLoadBalancerAttributesErrorModeled::LoadBalancerNotFoundException(
+                        LoadBalancerNotFoundException {
+                            message: Some(crate::state::load_balancer_not_found_message(
+                                &input.load_balancer_arn,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            for (key, value) in &writes {
+                load_balancer.attributes.insert(key.clone(), value.clone());
+            }
+
+            // The load balancer's WHOLE attribute collection, as
+            // `DescribeLoadBalancerAttributes` reports it: a write answers with the
+            // resource's new state, not with the keys the request happened to name.
+            let output = ModifyLoadBalancerAttributesOutput {
+                attributes: Some(load_balancer.attribute_shapes()),
+            };
+
+            // Turning zonal-shift integration on or off for a load balancer is a fact
+            // about Amazon Application Recovery Controller, which reports the resources it
+            // manages and cannot see this store — so when the request wrote that
+            // attribute, what the store now holds is read here and recorded below in the
+            // shared registry that service reads.
+            let registration = writes
+                .iter()
+                .any(|(key, _)| key == crate::state::ZONAL_SHIFT_ATTRIBUTE)
+                .then(|| guard.zonal_shift_registration(&input.load_balancer_arn));
+            (output, registration)
         };
-        for (key, value) in &writes {
-            load_balancer.attributes.insert(key.clone(), value.clone());
+        if let Some(registration) = registration {
+            crate::state::record_zonal_shift_registration(&*self.engine, ctx, &registration).await;
         }
 
-        // The load balancer's WHOLE attribute collection, as
-        // `DescribeLoadBalancerAttributes` reports it: a write answers with the
-        // resource's new state, not with the keys the request happened to name.
-        Ok(ModifyLoadBalancerAttributesOutput {
-            attributes: Some(load_balancer.attribute_shapes()),
-        })
+        Ok(output)
     }
 }
 

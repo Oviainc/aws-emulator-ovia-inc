@@ -145,7 +145,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // Only reachable on an engine that is not the shared `InMemoryEngine`,
             // which this service has no store on — so nothing is implemented for it.
@@ -155,51 +154,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You can't delete a load balancer if deletion protection is enabled": the
         // refusal is answered before anything is removed, so a protected load balancer
         // and its listeners are left exactly as they were.
-        let mut guard = state.lock();
-        if guard
-            .load_balancers
-            .get(&input.load_balancer_arn)
-            .is_some_and(crate::state::LoadBalancerRecord::deletion_protection_enabled)
-        {
-            return Err(
-                DeleteLoadBalancerErrorModeled::OperationNotPermittedException(
-                    OperationNotPermittedException {
-                        message: Some(crate::state::deletion_protection_message(
-                            &input.load_balancer_arn,
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        // The model: deleting a load balancer that is not there succeeds, so the
-        // answer does not depend on whether this removed anything.
         //
-        // The interfaces it holds in the account's EC2 inventory carry its traffic, so they
-        // do not outlive it: they are read off the record before it goes and given back
-        // after ([`crate::state::service_interfaces`]).
-        let network_interface_ids = guard
-            .load_balancers
-            .get(&input.load_balancer_arn)
-            .map(|load_balancer| load_balancer.network_interface_ids.clone())
-            .unwrap_or_default();
-        guard.remove_load_balancer(&input.load_balancer_arn);
-        crate::state::release_load_balancer_interfaces(&*self.engine, &network_interface_ids);
-        // A load balancer that is gone presents no certificate, so every reference its
-        // listeners held is given up — the service holding those certificates reads that
-        // from the shared directory, and until the teardown falls due it still counts as
-        // in use.
-        crate::state::record_certificate_consumers(
-            &*self.engine,
-            &guard,
-            &input.load_balancer_arn,
-            ::std::time::SystemTime::now(),
-        );
+        // The store's lock lives in this block and is released with it, because what
+        // follows reads another service (the EC2-owned Availability Zone IDs) and nothing
+        // holds this store while it does.
+        let registration = {
+            let mut guard = state.lock();
+            if guard
+                .load_balancers
+                .get(&input.load_balancer_arn)
+                .is_some_and(crate::state::LoadBalancerRecord::deletion_protection_enabled)
+            {
+                return Err(
+                    DeleteLoadBalancerErrorModeled::OperationNotPermittedException(
+                        OperationNotPermittedException {
+                            message: Some(crate::state::deletion_protection_message(
+                                &input.load_balancer_arn,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // The managed-resource registration is read BEFORE the removal, so the only
+            // identifier that can reach the shared Amazon Application Recovery Controller
+            // registry is a load balancer ARN this store itself holds: the delete of a load
+            // balancer this store does not hold succeeds (the model: deleting one that is
+            // not there succeeds) and publishes nothing.
+            let registration = guard
+                .zonal_shift_registration(&input.load_balancer_arn)
+                .withdrawn();
+            // The model: deleting a load balancer that is not there succeeds, so the
+            // answer does not depend on whether this removed anything.
+            //
+            // The interfaces it holds in the account's EC2 inventory carry its traffic, so
+            // they do not outlive it: they are read off the record before it goes and given
+            // back after ([`crate::state::service_interfaces`]).
+            let network_interface_ids = guard
+                .load_balancers
+                .get(&input.load_balancer_arn)
+                .map(|load_balancer| load_balancer.network_interface_ids.clone())
+                .unwrap_or_default();
+            guard.remove_load_balancer(&input.load_balancer_arn);
+            crate::state::release_load_balancer_interfaces(&*self.engine, &network_interface_ids);
+            // A load balancer that is gone presents no certificate, so every reference its
+            // listeners held is given up — the service holding those certificates reads
+            // that from the shared directory, and until the teardown falls due it still
+            // counts as in use.
+            crate::state::record_certificate_consumers(
+                &*self.engine,
+                &guard,
+                &input.load_balancer_arn,
+                ::std::time::SystemTime::now(),
+            );
+            // And a load balancer that is gone is no managed resource of ARC, whatever its
+            // zonal-shift integration was set to.
+            registration
+        };
         // A load balancer that is gone checks no target group, so the host-count series of
         // every pair it was routing closes here ([`crate::state::host_counts`]).
-        drop(guard);
         crate::state::drive_host_count_metrics(&self.engine);
+        crate::state::record_zonal_shift_registration(&*self.engine, ctx, &registration).await;
 
         Ok(DeleteLoadBalancerOutput {})
     }

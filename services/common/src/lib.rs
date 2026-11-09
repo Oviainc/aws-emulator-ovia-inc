@@ -115,7 +115,12 @@
 //!   their data access on and off and sets their accounts' passwords, and read by the
 //!   Directory Service DATA plane, whose own API creates no directory and so can tell
 //!   neither a directory of this account from one that is not, nor the realm its objects
-//!   live in, nor which of its accounts hold a password.
+//!   live in, nor which of its accounts hold a password;
+//! * [`arc_managed_resources`], the resources registered with Amazon Application Recovery
+//!   Controller for zonal shift — written by the service that OWNS the resource, because
+//!   ARC models no operation that registers one, and read by ARC, which reports a managed
+//!   resource, its zones and the shifts in progress for it and cannot see the store that
+//!   resource lives in.
 //!
 //! # Why a shared rule
 //!
@@ -273,6 +278,11 @@ pub mod agentic_rft_jobs;
 /// and read by the AgentCore DATA plane, which creates neither and so cannot tell a
 /// resource of this account from one that was never created.
 pub mod agentcore_resources;
+/// The registry of which resources are registered with Amazon Application Recovery
+/// Controller for zonal shift, written by the service that OWNS the resource — ARC models
+/// no operation that registers one — and read by ARC, which reports a managed resource it
+/// cannot otherwise see.
+pub mod arc_managed_resources;
 pub mod arn;
 /// Serving an operation AUDITED: the ONE wrapper that records every call a service serves
 /// as a management event, so no operation has to record its own and none is forgotten.

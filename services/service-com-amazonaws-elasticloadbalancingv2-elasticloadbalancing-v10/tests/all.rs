@@ -119,3 +119,5 @@ mod trust_stores;
 mod web_acl_enforcement;
 #[path = "all/wire.rs"]
 mod wire;
+#[path = "all/zonal_shift_registration.rs"]
+mod zonal_shift_registration;

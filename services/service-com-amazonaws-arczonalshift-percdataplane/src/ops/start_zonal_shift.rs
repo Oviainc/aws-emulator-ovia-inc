@@ -215,6 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
+        // The resources the services that own them have registered with ARC, read before
+        // this store is locked: a resource registered through one of them is as much a
+        // target of a shift as one this store was seeded with.
+        let published = crate::state::published_resources(&*self.engine);
 
         let now = SystemTime::now();
         let mut store = state.lock();
@@ -227,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // 403 AccessDeniedException, disclosing nothing about what exists. One
         // helper takes this branch for every operation that acts on a target.
         let resource = store
-            .authorized_resource(&input.resource_identifier)
+            .authorized_resource(&published, &input.resource_identifier)
             .map_err(StartZonalShiftErrorModeled::AccessDeniedException)?;
 
         // Traffic can only be moved away from a zone the resource is deployed in.

@@ -6,9 +6,12 @@
 //! ARC Zonal Shift models no operation that creates a managed resource —
 //! "Resources are automatically registered with ARC by Amazon Web Services
 //! services" (the `StartZonalShift` documentation in this service's Smithy
-//! model) — so the managed resources this emulator serves are seeded here, at
-//! state init. Everything a read reports is then computed from this store: the
-//! zonal shifts a caller starts, and every value derived from them
+//! model) — so a managed resource reaches this store one of two ways: the
+//! resources this emulator starts with are seeded here, at state init, and the
+//! ones another service registers by turning zonal-shift integration on for them
+//! are read, per call, from the shared registry that service writes
+//! ([`published_resources`]). Everything a read reports is then computed from the
+//! two: the zonal shifts a caller starts, and every value derived from them
 //! (`appliedWeights`, `appliedStatus`, `practiceRunStatus`).
 
 use std::collections::{BTreeMap, HashMap};
@@ -17,6 +20,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     AccessDeniedException, AutoshiftInResource, PracticeRunConfiguration, ZonalShiftInResource,
 };
+
+/// The managed resources the services that OWN them have registered with ARC,
+/// read from the shared registry they write.
+mod published_resources;
+
+pub use published_resources::{managed_resource_registry, published_resources};
 
 /// The Amazon Web Services Region the seeded managed resources live in. The
 /// Availability Zone IDs they are deployed in (`use1-az*`) are this Region's, so
@@ -359,14 +368,18 @@ impl ComAmazonawsArczonalshiftPercdataplaneState {
     ///
     /// This is the ordering every such operation shares: the authorization
     /// decision on the named target is taken FIRST, so a `resourceIdentifier`
-    /// this store holds no resource for is refused with [`target_unavailable`]
+    /// ARC holds no resource for is refused with [`target_unavailable`]
     /// rather than reported as not found.
+    ///
+    /// `published` is what the services that own their resources have registered
+    /// ([`published_resources`]), so a resource registered through one of them is as
+    /// much a target of a mutation as one this store was seeded with.
     pub fn authorized_resource(
         &self,
+        published: &[::service_common::arc_managed_resources::RegisteredResource],
         resource_identifier: &str,
-    ) -> Result<&ManagedResource, AccessDeniedException> {
-        self.managed_resources
-            .get(resource_identifier)
+    ) -> Result<ManagedResource, AccessDeniedException> {
+        self.managed_resource(published, resource_identifier)
             .ok_or_else(target_unavailable)
     }
 
@@ -457,24 +470,29 @@ impl ComAmazonawsArczonalshiftPercdataplaneState {
             })
     }
 
-    /// `appliedWeights` for a resource: 0 for the Availability Zone the shift in
-    /// effect moves traffic away from, 1 for every other zone the resource is
-    /// deployed in.
+    /// `appliedWeights` for a resource deployed in `availability_zones`: 0 for the
+    /// Availability Zone the shift in effect moves traffic away from, 1 for every
+    /// other zone it is deployed in.
     ///
     /// From `ManagedResourceSummary$appliedWeights`: "A collection of key-value
     /// pairs that indicate whether resources are active in Availability Zones or
     /// not. The key name is the Availability Zone where the resource is
     /// deployed. The value is 1 or 0." Derived from the shifts in progress, so a
     /// shift that is canceled or has expired no longer moves any weight.
-    pub fn applied_weights(&self, resource_identifier: &str) -> HashMap<String, f32> {
-        let Some(resource) = self.managed_resources.get(resource_identifier) else {
-            return HashMap::new();
-        };
+    ///
+    /// The zones are the caller's, read off the managed resource ARC holds —
+    /// whether this store was seeded with it or the service that owns it registered
+    /// it ([`Self::managed_resource_inventory`]) — so one reading of the weights
+    /// serves both.
+    pub fn applied_weights(
+        &self,
+        resource_identifier: &str,
+        availability_zones: &[String],
+    ) -> HashMap<String, f32> {
         let away_from = self
             .applied_shift(resource_identifier)
             .map(|shift| shift.away_from.clone());
-        resource
-            .availability_zones
+        availability_zones
             .iter()
             .map(|az| {
                 let weight = if Some(az.as_str()) == away_from.as_deref() {

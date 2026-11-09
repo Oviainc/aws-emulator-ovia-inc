@@ -11,6 +11,11 @@
 //! than looked up; only an ARN-shaped identifier reaches the store, where a resource
 //! ARC holds no record of is `ResourceNotFoundException` (404).
 //!
+//! The store is merged with the shared registry the services that OWN their resources
+//! write (`crate::state::published_resources`), so a resource another service registered
+//! by turning zonal-shift integration on for it is one this operation reports: ARC models
+//! no operation that registers one.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -190,6 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
+        // What the services that own their resources have registered with ARC, read
+        // before this store is locked and merged with it for the length of this call:
+        // ARC models no operation that registers a managed resource.
+        let published = crate::state::published_resources(&*self.engine);
 
         let mut store = state.lock();
         // Reporting only: the one write here materialises the status change the clock
@@ -197,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // longer applied to the resource — which was owed whether or not anybody read.
         store.expire_due_shifts(SystemTime::now());
 
-        let Some(resource) = store.managed_resources.get(&input.resource_identifier) else {
+        let Some(resource) = store.managed_resource(&published, &input.resource_identifier) else {
             return Err(GetManagedResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: format!(
@@ -215,7 +224,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             autoshifts: Some(resource.autoshifts.clone()),
             practice_run_configuration: resource.practice_run_configuration.clone(),
             zonal_autoshift_status: Some(resource.zonal_autoshift_status.as_wire().to_string()),
-            applied_weights: store.applied_weights(&input.resource_identifier),
+            applied_weights: store
+                .applied_weights(&input.resource_identifier, &resource.availability_zones),
             zonal_shifts: store.zonal_shifts_in_resource(&input.resource_identifier),
         })
     }

@@ -354,49 +354,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resolved_subnets.as_deref(),
         );
 
-        let mut guard = state.lock();
-        // Looked up again because the lock was released for the EC2 read: the load
-        // balancer may have been deleted while it ran.
-        let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) else {
-            return Err(not_found(&input.load_balancer_arn));
-        };
-        load_balancer.availability_zones = zones;
-        load_balancer.ip_address_type = ip_address_type;
-        if let Some(prefix) = input.enable_prefix_for_ipv6_source_nat.clone() {
-            load_balancer.enable_prefix_for_ipv6_source_nat = Some(prefix);
-        }
-        // A load balancer holds one interface per subnet it is attached to, so the subnets
-        // this call left it with are the subnets its interfaces sit in: a subnet it still has
-        // keeps the interface already there, one it has left gives its interface back, and
-        // one it has just been given gets an interface of its own
-        // ([`crate::state::service_interfaces`]).
-        let held = ::std::mem::take(&mut load_balancer.network_interface_ids);
-        let record = load_balancer.clone();
-        let placed = crate::state::reconcile_load_balancer_interfaces(
-            &*self.engine,
-            &record,
-            &held,
-        );
-        let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) else {
-            return Err(not_found(&input.load_balancer_arn));
-        };
-        load_balancer.network_interface_ids = placed;
+        // The store's lock lives in this block and is released with it: the registration
+        // recorded below reads another service again (the Availability Zone IDs are
+        // EC2's), and nothing holds this store while it does.
+        let (output, registration) = {
+            let mut guard = state.lock();
+            // Looked up again because the lock was released for the EC2 read: the load
+            // balancer may have been deleted while it ran.
+            let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn)
+            else {
+                return Err(not_found(&input.load_balancer_arn));
+            };
+            load_balancer.availability_zones = zones;
+            load_balancer.ip_address_type = ip_address_type;
+            if let Some(prefix) = input.enable_prefix_for_ipv6_source_nat.clone() {
+                load_balancer.enable_prefix_for_ipv6_source_nat = Some(prefix);
+            }
+            // A load balancer holds one interface per subnet it is attached to, so the
+            // subnets this call left it with are the subnets its interfaces sit in: a
+            // subnet it still has keeps the interface already there, one it has left gives
+            // its interface back, and one it has just been given gets an interface of its
+            // own ([`crate::state::service_interfaces`]).
+            let held = ::std::mem::take(&mut load_balancer.network_interface_ids);
+            let record = load_balancer.clone();
+            let placed =
+                crate::state::reconcile_load_balancer_interfaces(&*self.engine, &record, &held);
+            let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn)
+            else {
+                return Err(not_found(&input.load_balancer_arn));
+            };
+            load_balancer.network_interface_ids = placed;
 
-        Ok(SetSubnetsOutput {
-            // Read back off the record rather than echoed from the request, so the answer
-            // is what a later `DescribeLoadBalancers` reports.
-            availability_zones: Some(
-                load_balancer
-                    .availability_zones
-                    .iter()
-                    .map(crate::state::AvailabilityZoneRecord::to_shape)
-                    .collect(),
-            ),
-            ip_address_type: Some(load_balancer.ip_address_type.clone()),
-            enable_prefix_for_ipv6_source_nat: load_balancer
-                .enable_prefix_for_ipv6_source_nat
-                .clone(),
-        })
+            let output = SetSubnetsOutput {
+                // Read back off the record rather than echoed from the request, so the
+                // answer is what a later `DescribeLoadBalancers` reports.
+                availability_zones: Some(
+                    load_balancer
+                        .availability_zones
+                        .iter()
+                        .map(crate::state::AvailabilityZoneRecord::to_shape)
+                        .collect(),
+                ),
+                ip_address_type: Some(load_balancer.ip_address_type.clone()),
+                enable_prefix_for_ipv6_source_nat: load_balancer
+                    .enable_prefix_for_ipv6_source_nat
+                    .clone(),
+            };
+
+            // The zones a load balancer spans ARE the key set of the applied weights
+            // Amazon Application Recovery Controller reports for a managed resource, so a
+            // load balancer with zonal-shift integration enabled is recorded again with
+            // the zones it now spans; one without it has no entry either way.
+            let registration = guard.zonal_shift_registration(&input.load_balancer_arn);
+            (output, registration)
+        };
+        crate::state::record_zonal_shift_registration(&*self.engine, ctx, &registration).await;
+
+        Ok(output)
     }
 }
 

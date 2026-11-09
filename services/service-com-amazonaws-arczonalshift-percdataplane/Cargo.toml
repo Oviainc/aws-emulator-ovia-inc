@@ -8,6 +8,11 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# `service-common` carries the ONE shared store this service reads: ARC models no
+# operation that registers a managed resource — the service that OWNS the resource turns
+# zonal-shift integration on for it — so which resources are registered lives in
+# `arc_managed_resources`, written by that service and read here.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

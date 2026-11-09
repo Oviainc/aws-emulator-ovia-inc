@@ -17,6 +17,8 @@ mod access_denied_precedence;
 mod autoshift_observer_notification;
 #[path = "all/refusal_message_rules.rs"]
 mod refusal_message_rules;
+#[path = "all/registered_managed_resources.rs"]
+mod registered_managed_resources;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/zonal_shift_lifecycle.rs"]
