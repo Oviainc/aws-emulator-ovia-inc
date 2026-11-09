@@ -560,4 +560,18 @@ impl ComAmazonawsEc2Amazonec2State {
         record.begin_disable(now);
         Some(record)
     }
+
+    /// Drop every pair of the snapshot `snapshot_id`, whichever zone it is in.
+    ///
+    /// For the snapshot's DELETION, not for a disable: a disable keeps the record because
+    /// `FastSnapshotRestoreStateCode` has a word for a pair whose restore was turned off
+    /// ([`FAST_SNAPSHOT_RESTORE_STATE_DISABLED`]), while a deleted snapshot leaves no pair at
+    /// all — a fast snapshot restore is a property of a (snapshot, Availability Zone) pair,
+    /// so one half of it being gone is not a state the pair can be in. A describe therefore
+    /// reports no pair for a snapshot that no longer exists, instead of one naming an id
+    /// nothing resolves.
+    pub fn forget_fast_snapshot_restores(&mut self, snapshot_id: &str) {
+        self.fast_snapshot_restores
+            .retain(|_, record| record.snapshot_id != snapshot_id);
+    }
 }

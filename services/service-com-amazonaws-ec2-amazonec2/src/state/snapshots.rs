@@ -26,6 +26,10 @@
 //! and it mints the id itself: a snapshot id is the service's to choose, never a caller's.
 //! `CreateSnapshot`, `CreateSnapshots` and `CopySnapshot` are the writers wired to it, and a
 //! reader resolves an id out of this store rather than keeping a second copy of it.
+//!
+//! [`ComAmazonawsEc2Amazonec2State::remove_snapshot`] is the one way one leaves it, which is
+//! what `DeleteSnapshot` does: the record is dropped, so the id stops resolving for every
+//! reader at once.
 
 use std::time::{Instant, SystemTime};
 
@@ -251,15 +255,17 @@ impl ComAmazonawsEc2Amazonec2State {
     /// The mirror of [`Self::insert_snapshot`]: the caller-chosen bytes the record was
     /// charged for are given back to the store's budget, and the fast snapshot restores of
     /// the snapshot go with it — a restore is a property of the (snapshot, zone) pair, so a
-    /// snapshot the account no longer holds can have none.
+    /// snapshot the account no longer holds can have none. That last rule lives in ONE place
+    /// ([`Self::forget_fast_snapshot_restores`]), because a snapshot the EBS direct APIs hold
+    /// has its pairs in THIS store and its record in theirs, so the same delete has to apply
+    /// it from the handler too.
     pub fn remove_snapshot(&mut self, snapshot_id: &str) -> Option<SnapshotRecord> {
         let record = self.snapshots.remove(snapshot_id)?;
         self.release_stored_bytes(snapshot_payload_bytes(
             record.view.tags.as_deref().unwrap_or_default(),
             record.view.description.as_deref(),
         ));
-        self.fast_snapshot_restores
-            .retain(|_, restore| restore.snapshot_id != snapshot_id);
+        self.forget_fast_snapshot_restores(snapshot_id);
         Some(record)
     }
 

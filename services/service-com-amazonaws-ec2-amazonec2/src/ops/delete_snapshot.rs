@@ -5,6 +5,11 @@
 //! that describe the account's snapshots minted it — so every later read of that id answers
 //! `InvalidSnapshot.NotFound` rather than reporting a snapshot that is no longer there.
 //!
+//! The pairs a fast snapshot restore was enabled on go with the snapshot too, wherever its
+//! record was held: they live in THIS service's store even for a snapshot the EBS direct APIs
+//! hold, so the delete applies that rule itself
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::forget_fast_snapshot_restores`]).
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -176,8 +181,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same two places. Taken under this store's guard, which is the lock order every
         // operation of this service keeps.
         let stored_here = store.snapshots.contains_key(&input.snapshot_id);
-        let stored_in_direct_api = !stored_here
-            && direct_api_snapshot_exists(&*self.engine, &input.snapshot_id);
+        let stored_in_direct_api =
+            !stored_here && direct_api_snapshot_exists(&*self.engine, &input.snapshot_id);
         if !stored_here && !stored_in_direct_api {
             return Err(unresolvable_snapshot_id(&input.snapshot_id));
         }
@@ -198,8 +203,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Each side removes its OWN record: `remove_snapshot` gives the stored bytes back to
-        // this store's budget and takes the snapshot's fast snapshot restores with it, and
-        // the direct-API delete removes the record that service keeps, along with its blocks.
+        // this store's budget, and the direct-API delete removes the record that service
+        // keeps, along with its blocks and the client token that minted it.
         let removed = if stored_here {
             store.remove_snapshot(&input.snapshot_id).is_some()
         } else {
@@ -210,6 +215,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the snapshot checked a moment ago could not be removed",
             ));
         }
+        // The fast snapshot restores of the snapshot go with it wherever its record lived: a
+        // restore is a property of the (snapshot, Availability Zone) pair, and the pairs of a
+        // snapshot the EBS direct APIs hold are kept in THIS store, so the rule is applied
+        // once here rather than only inside this store's own removal.
+        store.forget_fast_snapshot_restores(&input.snapshot_id);
         Ok(DeleteSnapshotOutput)
     }
 }
