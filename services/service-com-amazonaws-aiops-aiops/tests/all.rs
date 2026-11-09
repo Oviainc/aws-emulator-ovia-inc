@@ -65,5 +65,7 @@ mod tagging_frontend_errors;
 mod untag_resource_record_stamp;
 #[path = "all/update_investigation_group_identifier.rs"]
 mod update_investigation_group_identifier;
+#[path = "all/update_omitted_encryption_configuration.rs"]
+mod update_omitted_encryption_configuration;
 #[path = "all/write_configuration_rejection_chain.rs"]
 mod write_configuration_rejection_chain;

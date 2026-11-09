@@ -2,7 +2,9 @@
 
 //! @op UpdateInvestigationGroup
 //! Mutates the stored investigation group `{identifier}` names: every member the
-//! request carries replaces the stored one, every member it omits is left alone, and
+//! request carries replaces the stored one, a member whose own documentation states
+//! what the service does when the request OMITS the parameter is stored as that
+//! documented value, every other omitted member is left alone, and
 //! `lastModifiedBy`/`lastModifiedAt` record the change.
 //!
 //! A request that REPLACES the group's `roleArn` is held to the same role resolution the
@@ -259,24 +261,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // Each member the request carries replaces the stored value; each one it omits
-        // leaves the stored value untouched. `name` is not updatable — the model does
-        // not accept it here — so the group keeps the name it was created with.
+        // Each member the request carries replaces the stored value; a member the
+        // request omits keeps the stored value UNLESS the member's own documentation
+        // states what the service does when the parameter is omitted, in which case the
+        // write stores that documented value — the member says what an omission means,
+        // so an omission is an instruction like any other. `roleArn`,
+        // `tagKeyBoundaries`, `chatbotNotificationChannel`,
+        // `isCloudTrailEventHistoryEnabled` and `crossAccountConfigurations` each
+        // document only what naming them does, so omitting them changes nothing; the
+        // one member of this request that documents its omission is
+        // `encryptionConfiguration`, handled below. `name` is not updatable — the model
+        // does not accept it here — so the group keeps the name it was created with.
         if let Some(role_arn) = input.role_arn {
             group.role_arn = role_arn;
         }
-        // A configuration the request carries replaces the stored one through the same
-        // normalisation the create path stores through
-        // (`crate::state::stored_encryption_configuration`): the key it names is kept,
-        // and one that names no key at all asks for no customer managed key and so
-        // selects the documented Amazon Web Services owned key, which means the stored
-        // member keeps naming how this group's data is encrypted rather than going
-        // blank.
-        if input.encryption_configuration.is_some() {
-            group.encryption_configuration = Some(crate::state::stored_encryption_configuration(
-                input.encryption_configuration,
-            ));
-        }
+        // `encryptionConfiguration` is documented with what the service does when the
+        // request omits it — the investigation data is encrypted with an Amazon Web
+        // Services key — so EVERY write of this group stores what the single-homed rule
+        // returns for the configuration it was given, the omitted member included
+        // (`crate::state::stored_encryption_configuration`): the key a request names is
+        // kept, and a request naming no key at all — the member omitted, or a structure
+        // carrying neither member — asks for no customer managed key and so selects the
+        // documented Amazon Web Services owned key. The stored member therefore always
+        // names how this group's data is encrypted, and this writer and the create
+        // cannot disagree about what a configuration means.
+        group.encryption_configuration = Some(crate::state::stored_encryption_configuration(
+            input.encryption_configuration,
+        ));
         if let Some(tag_key_boundaries) = input.tag_key_boundaries {
             group.tag_key_boundaries = tag_key_boundaries;
         }

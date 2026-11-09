@@ -625,14 +625,17 @@ async fn an_omitted_encryption_configuration_reads_back_as_the_aws_owned_key() {
              in {group:?}"
         );
 
-        // A read does not change it, and an update that names other members leaves it
-        // where it was.
+        // A read does not change it.
         let again = get_ok(&router, region, &arn, case).await;
         assert_eq!(
             again.get("encryptionConfiguration"),
             Some(expected),
             "case {case:?}: a second read must report the same configuration, got {again:?}"
         );
+        // An update that omits the member is an update that names no key, and the
+        // member documents what the service does then: the Amazon Web Services owned
+        // key encrypts the data. So the group reports that key afterwards, whatever it
+        // carried before.
         let (status, answer) = update_in(
             &router,
             region,
@@ -647,9 +650,9 @@ async fn an_omitted_encryption_configuration_reads_back_as_the_aws_owned_key() {
         let after = get_ok(&router, region, &arn, case).await;
         assert_eq!(
             after.get("encryptionConfiguration"),
-            Some(expected),
-            "case {case:?}: an unrelated update must not change the configuration, \
-             got {after:?}"
+            Some(&json!({ "type": AWS_OWNED_KEY_TYPE })),
+            "case {case:?}: an update omitting encryptionConfiguration must store the \
+             Amazon Web Services owned key, got {after:?}"
         );
 
         // And an update that DOES name it replaces it.

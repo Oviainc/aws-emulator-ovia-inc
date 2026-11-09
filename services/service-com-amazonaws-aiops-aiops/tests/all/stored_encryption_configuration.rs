@@ -266,20 +266,19 @@ async fn a_create_stores_a_configuration_that_names_the_key_type() {
     }
 }
 
-/// An update that names the member stores the same configuration the create would have
-/// stored for it — so the key the request names survives the write, and a configuration
-/// naming no key replaces the stored one with the documented default rather than erasing
-/// what the group reports.
+/// An update stores the same configuration the create would have stored for the same
+/// request — so the key the request names survives the write, and a request naming no
+/// key at all replaces the stored one with the documented default rather than erasing
+/// what the group reports or keeping a key the request did not name.
 #[tokio::test]
-async fn an_update_naming_the_member_stores_a_configuration_that_names_the_key_type() {
+async fn an_update_stores_the_configuration_the_create_would_store() {
     let router = emulator();
     for (index, row) in rows("us-west-2").into_iter().enumerate() {
-        // Skip the omitted-member row here: an update that omits the member leaves the
-        // stored configuration alone, which `rows` does not describe. The rows that
-        // CARRY a structure are the update's own cases.
-        let Some(supplied) = row.supplied.clone() else {
-            continue;
-        };
+        // Every row is the update's case too, the omitted-member one included: the
+        // member documents what the service does when the request omits the parameter,
+        // so both writers store what the rule returns for the configuration they were
+        // given.
+        let supplied = row.supplied.clone();
         let region = region(index);
         // Create with the customer managed pair, so a configuration the update stores
         // is distinguishable from the one it replaced in every row.
@@ -293,18 +292,17 @@ async fn an_update_naming_the_member_stores_a_configuration_that_names_the_key_t
         )
         .await;
 
-        update_ok(
-            &router,
-            &region,
-            &arn,
-            &json!({ "encryptionConfiguration": supplied }),
-            row.case,
-        )
-        .await;
+        // The omitted-member row sends a body that carries no `encryptionConfiguration`
+        // key at all, which is what omitting the parameter means on the wire.
+        let mut patch = json!({});
+        if let Some(supplied) = supplied.clone() {
+            patch["encryptionConfiguration"] = supplied;
+        }
+        update_ok(&router, &region, &arn, &patch, row.case).await;
         let got = stored_configuration(&router, &region, &arn, row.case).await;
         assert_eq!(
             got, row.expected,
-            "case {:?}: update carrying {supplied:?} must store {}, got {got:?}",
+            "case {:?}: update carrying {patch:?} must store {}, got {got:?}",
             row.case, row.expected
         );
 
