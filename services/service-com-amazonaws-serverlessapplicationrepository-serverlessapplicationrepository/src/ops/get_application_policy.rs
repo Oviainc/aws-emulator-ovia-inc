@@ -147,7 +147,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // AWS decides a signed `serverlessrepo` call against the CALLER's identity-based
+        // policies BEFORE the operation reads anything, per the application the request
+        // addresses; see [`crate::state::authorization`].
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.application_id,
+        )?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetApplicationPolicyErrorModeled::InternalServerErrorException(
                 crate::state::internal_server_error("the service state is unavailable"),

@@ -149,7 +149,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The template is reached only through its own application's path, so nothing in
         // this operation depends on the request's region.
-        let _ = ctx;
+        //
+        // AWS decides a signed `serverlessrepo` call against the CALLER's identity-based
+        // policies BEFORE the operation writes anything, per the application the request
+        // addresses, so a refused call prepares nothing; see
+        // [`crate::state::authorization`].
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.application_id,
+        )?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateCloudFormationTemplateErrorModeled::InternalServerErrorException(
                 crate::state::internal_server_error("the service state is unavailable"),

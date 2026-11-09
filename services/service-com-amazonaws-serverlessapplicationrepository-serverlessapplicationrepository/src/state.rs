@@ -50,6 +50,10 @@ use crate::ops::types::{
 /// derives a template's members from.
 mod template_document;
 
+/// Whether IAM lets the principal a request speaks for perform the operation it asks for on
+/// the application it addresses. Every handler asks this before it reads or writes anything.
+pub mod authorization;
+
 /// The region an ARN carries when the request names none.
 ///
 /// A request's region is its SigV4 credential scope (see [`request_region`]); an

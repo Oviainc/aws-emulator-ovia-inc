@@ -191,6 +191,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AWS decides a signed `serverlessrepo` call against the CALLER's identity-based
+        // policies BEFORE the operation writes anything, so a refused create leaves no
+        // application behind. This call addresses no existing application —
+        // `serverlessrepo:CreateApplication` is an action AWS defines over no resource type
+        // — so the decision is made about
+        // [`crate::state::authorization::ANY_RESOURCE`].
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::state::authorization::ANY_RESOURCE,
+        )?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error("the service state is unavailable"));
         };

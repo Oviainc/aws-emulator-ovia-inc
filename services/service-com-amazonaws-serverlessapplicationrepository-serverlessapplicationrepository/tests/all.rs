@@ -31,6 +31,8 @@ mod deploy_refusal_messages;
 mod empty_response_framing;
 #[path = "all/error_bodies.rs"]
 mod error_bodies;
+#[path = "all/identity_authorization.rs"]
+mod identity_authorization;
 #[path = "all/presigned_locators.rs"]
 mod presigned_locators;
 #[path = "all/semantic_version_wording.rs"]
