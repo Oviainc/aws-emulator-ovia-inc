@@ -55,6 +55,8 @@ mod package_deletion;
 mod package_version_update;
 #[path = "all/package_versions.rs"]
 mod package_versions;
+#[path = "all/policy_attachments.rs"]
+mod policy_attachments;
 #[path = "all/policy_registry.rs"]
 mod policy_registry;
 #[path = "all/role_alias_deletion.rs"]

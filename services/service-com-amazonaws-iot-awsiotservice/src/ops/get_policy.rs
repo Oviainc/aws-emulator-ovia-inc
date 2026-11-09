@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let policy = store.policies.get(&input.policy_name).ok_or_else(|| {
             GetPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("Policy {} does not exist", input.policy_name)),
+                message: Some(crate::state::missing_policy_message(&input.policy_name)),
             })
         })?;
 

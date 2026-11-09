@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Detaching is the REMOVAL of a pair from the policy-attachment relation this
+//! service's state keeps (`crate::state::policy_attachments`), the same relation
+//! `AttachPolicy` records into and both attachment listings read.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +164,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachPolicy"))
+        // Every target this operation names was minted when its resource was created,
+        // so the write needs no request metadata of its own.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DetachPolicyErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // A target of no supported form names no resource at all, so there is nothing
+        // it could be detached from: the modelled `InvalidRequestException` (HTTP 400).
+        // Whether the resource EXISTS is not asked, and whether the pair was recorded is
+        // not reported: this operation models no `ResourceNotFoundException` at all
+        // (`smithy_query(query="operation",operation="DetachPolicy")`), so a detach of a
+        // pair the relation does not hold leaves it unchanged and still answers 200 —
+        // the state a caller asked for (the policy is not attached to that target) is
+        // the state that holds afterwards.
+        let target = match crate::state::parse_policy_target(&input.target) {
+            Ok(target) => target,
+            Err(refusal) => {
+                return Err(DetachPolicyErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(refusal.message().to_string()),
+                    },
+                )
+                .into());
+            }
+        };
+
+        state
+            .lock()
+            .policy_attachments
+            .detach(&target.key(), &input.policy_name);
+
+        // The operation's output shape is `Unit`: the removal is the whole effect, and
+        // the next `ListAttachedPolicies` / `ListTargetsForPolicy` no longer reports the
+        // pair.
+        Ok(DetachPolicyOutput)
     }
 }

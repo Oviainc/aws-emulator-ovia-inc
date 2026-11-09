@@ -92,6 +92,11 @@
 //! `DescribeRoleAlias` after `CreateRoleAlias` reports the created alias
 //! member-for-member (see [`role_aliases`]).
 //!
+//! It also holds which POLICIES are attached to which TARGET — a relation and not a
+//! member of either resource, because `ListAttachedPolicies` reads it from the target's
+//! end and `ListTargetsForPolicy` from the policy's, and `AttachPolicy` / `DetachPolicy`
+//! write it (see [`policy_attachments`]).
+//!
 //! It also holds the account's V2 LOGGING OPTIONS — one record and not a map, because
 //! neither `SetV2LoggingOptions` nor `GetV2LoggingOptions` names a resource, kept as an
 //! `Option` because an account nobody has set them for holds none and the reader refuses
@@ -710,6 +715,17 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// `CreatePolicy` refuses past, and [`MAX_POLICY_DOCUMENT_BYTES`] /
     /// [`MAX_POLICY_TAGS`] bound what ONE record may cost.
     pub policies: BTreeMap<String, RegisteredPolicy>,
+    /// Which policies are attached to which TARGET: the relation `AttachPolicy` and
+    /// `DetachPolicy` write and `ListAttachedPolicies` / `ListTargetsForPolicy` read
+    /// (see [`policy_attachments`]).
+    ///
+    /// It is a relation and not a member of either resource because it is read from
+    /// BOTH ends — one target's policies and one policy's targets — and keyed by the
+    /// resource a target names, so the same certificate named by two ARNs is one
+    /// target. A caller grows it, so it is bounded:
+    /// [`MAX_POLICIES_PER_TARGET`] and [`MAX_ATTACHED_TARGETS`] are the ceilings
+    /// `AttachPolicy` refuses past.
+    pub policy_attachments: PolicyAttachments,
     /// Every thing type that exists, keyed by `thingTypeName`.
     ///
     /// The name is the type's identity — the model binds it as the `@httpLabel` of
@@ -2735,6 +2751,20 @@ pub use certificates::{
     MintedKeysAndCertificate, RegisteredCertificate, CERTIFICATE_MODE_DEFAULT,
     CERTIFICATE_STATUS_ACTIVE, CERTIFICATE_STATUS_INACTIVE, FIRST_CERTIFICATE_CUSTOMER_VERSION,
     MAX_CERTIFICATES,
+};
+
+// WHICH POLICIES are attached to which target — what a policy target is, how one is
+// resolved against this account's state, and the relation `AttachPolicy`,
+// `DetachPolicy`, `ListAttachedPolicies` and `ListTargetsForPolicy` are four views of —
+// lives in `state/policy_attachments.rs`, beside the store accessor for the same reason
+// the rules engine does. Its names are re-exported here so a handler reaches them as
+// `crate::state::<name>`.
+pub mod policy_attachments;
+pub use policy_attachments::{
+    decode_page_marker, encode_page_marker, missing_certificate_target_message,
+    missing_policy_message, page_of, parse_policy_target, PolicyAttachmentLimit,
+    PolicyAttachments, PolicyTarget, PolicyTargetRefusal, ResolvedPolicyTarget,
+    MAX_ATTACHED_TARGETS, MAX_LIST_PAGE_SIZE, MAX_POLICIES_PER_TARGET,
 };
 
 // What a ROLE ALIAS is — the record one holds, the ARN minted for it and what every

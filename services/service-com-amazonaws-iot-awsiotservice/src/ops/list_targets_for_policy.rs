@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTargetsForPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTargetsForPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTargetsForPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The targets of one policy, read out of the policy-attachment relation this
+//! service's state keeps (`crate::state::policy_attachments`) — the same relation
+//! `AttachPolicy` records into and `ListAttachedPolicies` reads from the other end.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +149,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTargetsForPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTargetsForPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTargetsForPolicy"))
+        // Every target this listing reports was resolved to the ARN its resource
+        // carries when it was attached, so the read needs no request metadata of its
+        // own.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTargetsForPolicyErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // `pageSize` is "The maximum number of results to return at one time", modelled
+        // `range 1..250` and refused outside it before this handler runs; a request that
+        // names none gets the largest page the model admits. The clamp is defensive
+        // rather than load-bearing.
+        let page_size = input.page_size.map_or(crate::state::MAX_LIST_PAGE_SIZE, |size| {
+            size.clamp(1, crate::state::MAX_LIST_PAGE_SIZE)
+        }) as usize;
+
+        let store = state.lock();
+
+        // The policy is the resource the request names in its URI: a name the registry
+        // does not hold is the modelled `ResourceNotFoundException` (HTTP 404), never an
+        // empty list standing in for "no such policy".
+        if !store.policies.contains_key(&input.policy_name) {
+            return Err(ListTargetsForPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::missing_policy_message(&input.policy_name)),
+                },
+            )
+            .into());
+        }
+
+        // One row per target the policy is attached to, as the attachment recorded it,
+        // ordered — one total order, which is what makes the page boundary below
+        // meaningful.
+        let mut targets = store.policy_attachments.targets_of(&input.policy_name);
+        targets.sort();
+        targets.dedup();
+
+        // The page a `marker` resumes. A marker this listing never issued is the
+        // modelled `InvalidRequestException` (HTTP 400), never a page of a different
+        // listing.
+        let scope = input.policy_name.clone();
+        let resume_after = match input.marker.as_deref() {
+            Some(marker) => match crate::state::decode_page_marker(marker, &scope) {
+                Some(resume_after) => Some(resume_after),
+                None => {
+                    return Err(ListTargetsForPolicyErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(
+                                "marker is not a continuation token of this listing".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+            None => None,
+        };
+        let (page, next_marker) =
+            crate::state::page_of(targets, &scope, resume_after.as_deref(), page_size);
+
+        Ok(ListTargetsForPolicyOutput {
+            // `PolicyTargets` carries no length constraint, so a policy attached to
+            // nothing answers with an EMPTY list rather than an absent member.
+            targets: Some(page),
+            // "A marker used to get the next set of results", absent once there are no
+            // more.
+            next_marker,
+        })
     }
 }
