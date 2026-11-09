@@ -13,7 +13,7 @@
 //!   request that asked for it.
 //! * An update that states a `version` is accepted only when it is the version stored.
 //! * `ListNamedShadowsForThing` lists the thing's NAMED shadows in a stable order and
-//!   never the unnamed (classic) one.
+//!   never the unnamed (classic) one; with nothing to list it answers an empty listing.
 //! * A `Publish` with `retain=true` stores the message as the topic's retained
 //!   message, byte for byte; an empty retained payload clears it; a publish without
 //!   `retain` stores nothing.
@@ -953,20 +953,21 @@ async fn listing_named_shadows_pages_over_the_stored_names_and_never_the_classic
         "the classic shadow is not a named shadow, got {body}"
     );
 
-    // A thing with no shadow at all is not found.
+    // A thing with no shadow at all has nothing to list, which is an empty listing and
+    // not an absence.
     let answer = harness.list_named_shadows("absentThing", "").await;
     assert_eq!(
         answer.status,
-        404,
-        "expected 404 for a thing with no shadows, got {} with body {}",
+        200,
+        "expected 200 for a thing with no shadows, got {} with body {}",
         answer.status,
         String::from_utf8_lossy(&answer.body)
     );
+    let body = answer.json();
     assert_eq!(
-        answer.error_code(),
-        "ResourceNotFoundException",
-        "expected ResourceNotFoundException, got {}",
-        String::from_utf8_lossy(&answer.body)
+        body.get("results").and_then(Value::as_array).map(Vec::len),
+        Some(0),
+        "expected an empty listing for a thing with no shadows, got {body}"
     );
 }
 

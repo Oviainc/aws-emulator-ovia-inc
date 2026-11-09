@@ -206,19 +206,27 @@ async fn the_counter_keeps_climbing_over_repeated_delete_and_recreate_cycles() {
             expected += 1;
         }
 
-        // Listing a thing whose only shadow was deleted finds no shadow, even though the
-        // counter is still held.
+        // Listing a thing whose only shadow was deleted finds no named shadow, which is
+        // an empty listing, even though the counter is still held.
         let listed = harness.list_named_shadows("cycleThing", "").await;
-        if shadow.is_some() {
-            assert_eq!(
-                listed.status,
-                404,
-                "case {case:?}: expected a thing with no remaining document to be 404, got {} \
-                 with body {}",
-                listed.status,
-                String::from_utf8_lossy(&listed.body)
-            );
-        }
+        assert_eq!(
+            listed.status,
+            200,
+            "case {case:?}: expected a thing with no remaining document to list empty, got {} \
+             with body {}",
+            listed.status,
+            String::from_utf8_lossy(&listed.body)
+        );
+        assert_eq!(
+            listed
+                .json()
+                .get("results")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0),
+            "case {case:?}: expected no named shadows left, got body {}",
+            String::from_utf8_lossy(&listed.body)
+        );
 
         // And the next update resumes above every version the cycles consumed.
         let resumed = harness

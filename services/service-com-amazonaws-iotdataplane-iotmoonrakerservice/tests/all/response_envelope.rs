@@ -316,12 +316,6 @@ async fn every_modelled_failure_answers_in_the_service_message_and_trace_id_enve
             Harness::shadow_uri("stored-thing", Some("sensor-gone")),
             "sensor-gone",
         ),
-        not_found(
-            "listing the named shadows of a thing with no shadows",
-            "GET",
-            "/api/things/shadow/ListNamedShadowsForThing/probe-gamma".to_string(),
-            "probe-gamma",
-        ),
         retained_missing("a topic that never held a retained message", "metrics"),
         retained_missing("a single-character topic", "a"),
         retained_missing("a long dashed topic", "fleet-1-telemetry-aggregated"),

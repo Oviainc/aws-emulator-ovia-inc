@@ -17,6 +17,8 @@ mod boundary_refusal_code;
 mod connection_sessions;
 #[path = "all/list_retained_messages.rs"]
 mod list_retained_messages;
+#[path = "all/named_shadow_listing_emptiness.rs"]
+mod named_shadow_listing_emptiness;
 #[path = "all/publish_topic_and_payload_limits.rs"]
 mod publish_topic_and_payload_limits;
 #[path = "all/refusal_wording.rs"]

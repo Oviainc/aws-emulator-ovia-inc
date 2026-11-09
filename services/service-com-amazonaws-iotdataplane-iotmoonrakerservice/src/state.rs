@@ -788,15 +788,6 @@ pub struct ComAmazonawsIotdataplaneIotmoonrakerserviceState {
 }
 
 impl ComAmazonawsIotdataplaneIotmoonrakerserviceState {
-    /// Whether `thing_name` has any shadow DOCUMENT at all — named or classic. A slot
-    /// whose document was deleted is not a shadow: it is only the counter that outlived
-    /// one.
-    pub fn has_any_shadow(&self, thing_name: &str) -> bool {
-        self.shadows
-            .iter()
-            .any(|((thing, _), slot)| thing == thing_name && slot.document.is_some())
-    }
-
     /// The NAMED shadows of `thing_name` that hold a document, in stable key order. The
     /// classic shadow is not a named shadow, so it is never listed.
     pub fn named_shadows_for_thing(&self, thing_name: &str) -> Vec<String> {

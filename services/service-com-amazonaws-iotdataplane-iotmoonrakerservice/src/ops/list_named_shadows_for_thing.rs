@@ -3,7 +3,11 @@
 //! @op ListNamedShadowsForThing
 //! Answers with the NAMED shadows stored for the thing, in stable key order, paged by
 //! `pageSize` and `nextToken`. The unnamed (classic) shadow is not a named shadow, so
-//! it is never listed; a thing with no stored shadow at all is a 404.
+//! it is never listed. Having nothing to list is not an absence: a thing with no named
+//! shadow — never written to, holding only a classic shadow, or with every named shadow
+//! deleted — is answered with 200, an EMPTY `results`, no `nextToken` and the response
+//! `timestamp`. `ResourceNotFoundException` is reserved for a request that addresses a
+//! resource, which this listing never does.
 //!
 //! ## Shape of an operation
 //!
@@ -174,12 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
 
         let guard = state.lock();
-        if !guard.has_any_shadow(&input.thing_name) {
-            return Err(ListNamedShadowsForThingErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException::new(crate::state::no_shadow_exists(&input.thing_name)),
-            )
-            .into());
-        }
+        // Whatever the thing's shadow store holds — nothing at all, only the classic
+        // shadow, or named shadows whose documents were deleted — this is a listing, so
+        // the answer is the (possibly empty) page of the names that remain.
         let names = guard.named_shadows_for_thing(&input.thing_name);
         drop(guard);
 

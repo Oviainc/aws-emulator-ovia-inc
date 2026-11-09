@@ -361,13 +361,24 @@ async fn a_reserved_shadow_name_is_refused_on_every_path_that_addresses_a_shadow
         }
     }
 
-    // A refused update stores nothing, so the thing has no shadow at all.
+    // A refused update stores nothing, so the thing has no named shadow to list — an
+    // empty listing, not an absence.
     let listed = harness.list_named_shadows("reservedThing", "").await;
     assert_eq!(
         listed.status,
-        404,
-        "expected the thing to hold no shadow after the refused updates, got {} with body {}",
+        200,
+        "expected the empty listing of a thing holding no shadow, got {} with body {}",
         listed.status,
+        String::from_utf8_lossy(&listed.body)
+    );
+    assert_eq!(
+        listed
+            .json()
+            .get("results")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "expected no named shadows after the refused updates, got body {}",
         String::from_utf8_lossy(&listed.body)
     );
 }
