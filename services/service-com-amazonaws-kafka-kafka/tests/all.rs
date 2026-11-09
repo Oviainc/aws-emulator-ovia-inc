@@ -93,6 +93,8 @@ mod monitoring_update;
 mod node_listing;
 #[path = "all/placement_subnet_resolution.rs"]
 mod placement_subnet_resolution;
+#[path = "all/reference_only_replicator.rs"]
+mod reference_only_replicator;
 #[path = "all/refusal_text_fidelity.rs"]
 mod refusal_text_fidelity;
 #[path = "all/refusal_wording.rs"]
