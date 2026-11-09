@@ -116,7 +116,7 @@ fn date_time_text(body: &Value, member: &str, case: &str) -> String {
 /// Assert `value` is an identifier in the canonical hyphenated UUID form: it parses as a
 /// UUID AND is spelled the way that UUID renders itself, which a 32-character unhyphenated
 /// digest parses as but is not spelled as.
-fn assert_canonical_uuid(value: &str, what: &str, case: &str) {
+pub(crate) fn assert_canonical_uuid(value: &str, what: &str, case: &str) {
     let canonical = Uuid::parse_str(value)
         .ok()
         .map(|uuid| uuid.hyphenated().to_string());
@@ -127,7 +127,7 @@ fn assert_canonical_uuid(value: &str, what: &str, case: &str) {
 }
 
 /// The id segment of a table ARN: everything after `/table/`.
-fn table_id_of(table_arn: &str, case: &str) -> String {
+pub(crate) fn table_id_of(table_arn: &str, case: &str) -> String {
     table_arn
         .split_once("/table/")
         .unwrap_or_else(|| panic!("case {case:?}: {table_arn:?} carries no /table/ segment"))
@@ -136,7 +136,7 @@ fn table_id_of(table_arn: &str, case: &str) -> String {
 }
 
 /// One table's row in a `ListTables` page.
-fn summary_of<'a>(rows: &'a [Value], name: &str, case: &str) -> &'a Value {
+pub(crate) fn summary_of<'a>(rows: &'a [Value], name: &str, case: &str) -> &'a Value {
     rows.iter()
         .find(|row| row.get("name").and_then(Value::as_str) == Some(name))
         .unwrap_or_else(|| panic!("case {case:?}: the listing carries no row for {name:?}"))

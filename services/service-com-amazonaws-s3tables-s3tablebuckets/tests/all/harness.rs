@@ -553,6 +553,32 @@ impl Emulator {
         )
         .await
     }
+
+    /// `RenameTable`: the bucket's ARN, the namespace and the table's CURRENT
+    /// name are path labels, and the coordinates the table moves to —
+    /// `newNamespaceName`, `newName` — travel in the body with the caller's
+    /// `versionToken`.
+    pub async fn rename_table(
+        &self,
+        region: &str,
+        arn: &str,
+        namespace: &str,
+        name: &str,
+        request: &Value,
+    ) -> Reply {
+        self.call(
+            "PUT",
+            &format!(
+                "/tables/{}/{}/{}/rename",
+                encode(arn),
+                encode(namespace),
+                encode(name)
+            ),
+            region,
+            Some(request),
+        )
+        .await
+    }
 }
 
 impl Default for Emulator {

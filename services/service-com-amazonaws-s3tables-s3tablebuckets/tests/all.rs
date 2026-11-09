@@ -27,6 +27,8 @@ mod metrics_configuration_not_found_message;
 mod namespace_and_table_lifecycle;
 #[path = "all/record_expiration_configuration_reads.rs"]
 mod record_expiration_configuration_reads;
+#[path = "all/rename_table.rs"]
+mod rename_table;
 #[path = "all/replication_put_outcome.rs"]
 mod replication_put_outcome;
 #[path = "all/state_roundtrip.rs"]

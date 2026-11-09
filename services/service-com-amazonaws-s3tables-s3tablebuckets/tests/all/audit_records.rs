@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The audit record the state-changing replication, metrics and record-expiration
-//! operations emit.
+//! The audit record the state-changing replication, metrics, record-expiration and
+//! rename operations emit.
 //!
 //! The rule under test: a call that changes stored state leaves exactly ONE
 //! structured record on the service's audit target, naming the operation, the
@@ -29,7 +29,7 @@ use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
-use s3tables::state::AUDIT_TARGET;
+use s3tables::state::{OpenTableFormat, AUDIT_TARGET};
 
 use super::harness::{expected_bucket_arn, Emulator, PRESENTED_AKID};
 use super::table_record_expiration::{create_table, mark_managed};
@@ -236,6 +236,77 @@ fn assert_record(
         Some(outcome),
         "case {case:?} on {operation}: expected outcome {outcome:?}: {record:?}"
     );
+}
+
+#[tokio::test]
+async fn a_rename_accounts_for_the_table_it_moved() {
+    let emulator = Emulator::new();
+    let region = "us-east-1";
+    let bucket = "audited-rename-bucket";
+    let table = "audited_rename";
+    let namespace = format!("{table}_ns");
+    let table_arn = create_table(&emulator, region, bucket, table).await;
+    let bucket_arn = expected_bucket_arn(region, bucket);
+
+    // A second table in the same namespace, so a rename can be refused for a
+    // destination another table occupies.
+    let sibling = emulator
+        .create_table(
+            region,
+            &bucket_arn,
+            &namespace,
+            &json!({ "name": "audited_sibling", "format": OpenTableFormat::Iceberg.as_wire() }),
+        )
+        .await;
+    assert_eq!(
+        sibling.status, 200,
+        "case \"the sibling\": the create must succeed, got {status} {body}",
+        status = sibling.status,
+        body = sibling.body
+    );
+
+    // A refused rename moves nothing, so it accounts for nothing.
+    {
+        let (capture, _guard) = capture_events();
+        let refused = emulator
+            .rename_table(
+                region,
+                &bucket_arn,
+                &namespace,
+                table,
+                &json!({ "newName": "audited_sibling" }),
+            )
+            .await;
+        assert_eq!(
+            refused.status, 409,
+            "case \"an occupied destination\": the rename must be refused, got {status} {body}",
+            status = refused.status,
+            body = refused.body
+        );
+        capture.assert_silent("RenameTable", "an occupied destination");
+    }
+
+    // The rename that moves the table accounts for it, naming the table by the
+    // ARN the move leaves unchanged.
+    {
+        let (capture, _guard) = capture_events();
+        let renamed = emulator
+            .rename_table(
+                region,
+                &bucket_arn,
+                &namespace,
+                table,
+                &json!({ "newName": "audited_renamed" }),
+            )
+            .await;
+        assert_eq!(
+            renamed.status, 204,
+            "case \"the rename\": the rename must succeed, got {status} {body}",
+            status = renamed.status,
+            body = renamed.body
+        );
+        assert_record(&capture, "RenameTable", &table_arn, "renamed", "the rename");
+    }
 }
 
 /// A `TableBucketReplicationConfiguration` naming one destination.

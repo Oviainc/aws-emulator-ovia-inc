@@ -1211,6 +1211,14 @@ pub const BUCKET_NOT_EMPTY_MESSAGE: &str = "The bucket that you tried to delete 
 pub const NAMESPACE_NOT_EMPTY_MESSAGE: &str =
     "The namespace that you tried to delete is not empty.";
 
+/// How this service states a rename that names neither a new namespace nor a
+/// new table name: the client request error the model's `BadRequestException`
+/// (HTTP 400) names, since such a request describes no move at all. FIXED
+/// text — it names the two members that were both left out and takes nothing
+/// from the request.
+pub const NOTHING_TO_RENAME_MESSAGE: &str =
+    "Neither a new namespace name nor a new table name is specified.";
+
 /// How this service states a presented `versionToken` that is not the one the
 /// configuration it addresses currently carries: the conflict with a previous
 /// write the model's `ConflictException` (HTTP 409) names. FIXED text — the

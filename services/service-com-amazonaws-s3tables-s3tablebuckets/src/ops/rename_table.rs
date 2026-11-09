@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RenameTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RenameTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RenameTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -144,6 +135,36 @@ impl From<RenameTableErrorModeled> for RenameTableError {
     }
 }
 
+/// `NotFoundException` (HTTP 404) — a table bucket, a namespace or a table the
+/// request addresses is not in the store, so there is nothing to move or nowhere
+/// to move it to.
+fn not_found(message: &str) -> RenameTableError {
+    RenameTableErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// `BadRequestException` (HTTP 400) — the request does not describe a move at
+/// all: it names neither a new namespace nor a new name, so there is nothing
+/// for this operation to change.
+fn nothing_to_rename() -> RenameTableError {
+    RenameTableErrorModeled::BadRequestException(BadRequestException {
+        message: Some(crate::state::NOTHING_TO_RENAME_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// `ConflictException` (HTTP 409) — the move conflicts with a previous write:
+/// either the coordinates it would move the table to are occupied, or the
+/// caller's view of the table is stale.
+fn conflict(message: &str) -> RenameTableError {
+    RenameTableErrorModeled::ConflictException(ConflictException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
 /// The `RenameTable` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -180,18 +201,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RenameTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RenameTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RenameTableErrorModeled::InternalServerErrorException(InternalServerErrorException {
+                message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+            })
+        })?;
+
+        let account = ::engine::emulator_account_id().to_string();
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // Where the table is now: the bucket, the namespace it is keyed under
+        // and the record itself. Any of the three being absent is the
+        // `NotFoundException` the ARN- and name-addressed table operations
+        // model, stated by the fixed sentence for the class that is missing.
+        let bucket = store
+            .table_buckets
+            .get(&input.table_bucket_arn)
+            .ok_or_else(|| not_found(crate::state::BUCKET_NOT_FOUND_MESSAGE))?;
+        let bucket_arn = bucket.arn.clone();
+        let source = bucket
+            .namespaces
+            .get(&input.namespace)
+            .ok_or_else(|| not_found(crate::state::NAMESPACE_NOT_FOUND_MESSAGE))?;
+        let table = source
+            .tables
+            .get(&input.name)
+            .ok_or_else(|| not_found(crate::state::TABLE_NOT_FOUND_MESSAGE))?;
+
+        // A rename moves the table to a new namespace, a new name or both: a
+        // request that names neither describes no move, which is the client
+        // request error the model's `BadRequestException` (HTTP 400) names —
+        // nothing to retry and nothing to resolve, so it is not a conflict.
+        if input.new_namespace_name.is_none() && input.new_name.is_none() {
+            return Err(nothing_to_rename());
+        }
+
+        // Where the table is going: each coordinate the request leaves out
+        // keeps its current value, so a rename moves the name, the namespace or
+        // both.
+        let target_namespace_name = input
+            .new_namespace_name
+            .clone()
+            .unwrap_or_else(|| input.namespace.clone());
+        let target_name = input.new_name.clone().unwrap_or_else(|| input.name.clone());
+
+        // A table is moved INTO a namespace that already exists; this operation
+        // creates none.
+        let target = bucket
+            .namespaces
+            .get(&target_namespace_name)
+            .ok_or_else(|| not_found(crate::state::NAMESPACE_NOT_FOUND_MESSAGE))?;
+        let target_namespace_names = target.namespace.clone();
+        let target_namespace_id = target.namespace_id.clone();
+
+        // A table name is unique within its namespace — the rule `CreateTable`
+        // refuses a second create of a resident name under — so coordinates
+        // another table already occupies are the conflict with a previous write
+        // the model's `ConflictException` (HTTP 409) names. A request that moves
+        // the table nowhere addresses the coordinates the table itself occupies,
+        // so it is refused under the same rule and the record is left untouched.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RenameTable"))
+        // The destination is settled BEFORE the caller's `versionToken` is
+        // weighed: a move the destination rules out is refused as such whatever
+        // view of the source table the request carries, which is the order the
+        // recorded responses state these two conflicts in.
+        if target.tables.contains_key(&target_name) {
+            return Err(conflict(crate::state::TABLE_ALREADY_EXISTS_MESSAGE));
+        }
+
+        // `versionToken` is the caller's view of the table. One that is not the
+        // table's current token means the table was written since the caller
+        // read it, which is the conflict with a previous write the model's
+        // `ConflictException` (HTTP 409) names — the same rule `DeleteTable`
+        // applies to the same member.
+        if input
+            .version_token
+            .as_deref()
+            .is_some_and(|presented| presented != table.version_token)
+        {
+            return Err(conflict(
+                crate::state::TABLE_VERSION_TOKEN_MISMATCH_MESSAGE,
+            ));
+        }
+
+        // The move itself: the record is re-keyed under the target coordinates,
+        // carrying its identity — the table id, and so the `tableARN` and the
+        // warehouse location built from it — unchanged, since the id is what
+        // identifies the table for the life of the record whatever it is
+        // renamed to. Everything a mutation of a table settles is settled here:
+        // a fresh version token (so a caller holding the older one can tell its
+        // view is stale) and the instant and account the table was last
+        // modified at and by.
+        let mut moved = table.clone();
+        let table_arn = moved.table_arn.clone();
+        moved.name = target_name.clone();
+        moved.namespace = target_namespace_names;
+        moved.namespace_id = target_namespace_id;
+        moved.version_token = store.mint_version_token();
+        moved.modified_at = now;
+        moved.modified_by = account;
+
+        // The record is keyed under its destination BEFORE it is unkeyed from
+        // where it was, so the one table this store holds for it is never
+        // momentarily held nowhere. The destination differs from the source —
+        // coordinates the table itself occupies are the conflict refused above —
+        // so this is a move and not a second copy.
+        store
+            .table_buckets
+            .get_mut(&input.table_bucket_arn)
+            .and_then(|bucket| bucket.namespaces.get_mut(&target_namespace_name))
+            .ok_or_else(|| not_found(crate::state::NAMESPACE_NOT_FOUND_MESSAGE))?
+            .tables
+            .insert(target_name.clone(), moved);
+        store
+            .table_buckets
+            .get_mut(&input.table_bucket_arn)
+            .and_then(|bucket| bucket.namespaces.get_mut(&input.namespace))
+            .ok_or_else(|| not_found(crate::state::NAMESPACE_NOT_FOUND_MESSAGE))?
+            .tables
+            .remove(&input.name);
+        // The ARN index holds every live table's coordinates, and the ARN did
+        // not change: the entry now resolves to where the table went, so the
+        // ARN-addressed operations reach the record at its new name and the old
+        // name resolves to nothing.
+        store.tables_by_arn.insert(
+            table_arn.clone(),
+            crate::state::TableLocation {
+                table_bucket_arn: bucket_arn,
+                namespace: target_namespace_name,
+                name: target_name,
+            },
+        );
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+
+        // The access record for a state-changing operation: who, what, the
+        // resource it changed and the outcome. Metadata only — the resource is
+        // named by the table's ARN, which carries the server-minted id and no
+        // name the request supplied.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            resource = ?table_arn,
+            outcome = "renamed",
+            "table renamed",
+        );
+
+        Ok(RenameTableOutput)
     }
 }
