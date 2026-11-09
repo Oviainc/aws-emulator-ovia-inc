@@ -60,7 +60,11 @@ const DOCUMENT: &str =
 
 /// Every implemented operation that takes a `pullRequestId`, reporting ones and
 /// mutating ones alike: the rule is the service's, not one operation's.
-const PULL_REQUEST_ID_OPERATIONS: &[&str] = &[
+///
+/// `pub(crate)` here and on [`Fixture`], [`fixture_on`] and [`Fixture::request`]: the
+/// sibling `pull_request_does_not_exist_message` suite drives the same set of
+/// operations against the same fixture rather than keeping a second copy of either.
+pub(crate) const PULL_REQUEST_ID_OPERATIONS: &[&str] = &[
     "GetPullRequest",
     "GetPullRequestApprovalStates",
     "GetPullRequestOverrideState",
@@ -112,15 +116,21 @@ fn pull_request_ids() -> Vec<&'static str> {
 
 /// One emulator holding one pull request with one approval rule, and the revision id
 /// that pull request is currently at.
-struct Fixture {
-    router: MultiServiceRouter,
-    pr: PullRequest,
-    revision: String,
+pub(crate) struct Fixture {
+    pub(crate) router: MultiServiceRouter,
+    pub(crate) pr: PullRequest,
+    pub(crate) revision: String,
 }
 
 async fn fixture() -> Fixture {
+    fixture_on(REPOSITORY).await
+}
+
+/// The same fixture on a repository of the caller's naming, so a suite whose rows
+/// differ along the repository builds one per row.
+pub(crate) async fn fixture_on(repository: &str) -> Fixture {
     let router = emulator();
-    let pr = pull_request_on(&router, REPOSITORY).await;
+    let pr = pull_request_on(&router, repository).await;
     ok(
         &router,
         "CreatePullRequestApprovalRule",
@@ -149,7 +159,7 @@ impl Fixture {
     /// A request for `operation` that names this fixture's pull request and satisfies
     /// every other member the model requires of it, so the only thing a row changes
     /// is the identifier under test.
-    fn request(&self, operation: &str) -> Value {
+    pub(crate) fn request(&self, operation: &str) -> Value {
         let id = &self.pr.pull_request_id;
         let repository = &self.pr.repository;
         let revision = &self.revision;

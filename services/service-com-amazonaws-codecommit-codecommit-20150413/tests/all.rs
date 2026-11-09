@@ -157,6 +157,8 @@ mod pull_request_comment_reads;
 mod pull_request_comments;
 #[path = "all/pull_request_creation.rs"]
 mod pull_request_creation;
+#[path = "all/pull_request_does_not_exist_message.rs"]
+mod pull_request_does_not_exist_message;
 #[path = "all/pull_request_events.rs"]
 mod pull_request_events;
 #[path = "all/pull_request_identifier_refusals.rs"]
