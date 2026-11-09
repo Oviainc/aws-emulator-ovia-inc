@@ -18,6 +18,12 @@
 //! size up to past the result count, the published bounds of `MaxResults` and one past
 //! each, and the refusals — an unmodelled enum value, a `NextToken` this service did
 //! not mint, and an invoice id the registry does not hold.
+//!
+//! Every instant below is stated as the date it is, and every interval a row states is
+//! one the model documents the operation as answering about (see
+//! `tests/all/invoice_summary_period_rules.rs`, which is where those temporal rules
+//! themselves are asserted): the invoices are issued on dates from which a one-month
+//! window is enough to tell the bounds of an interval apart.
 
 use std::sync::Arc;
 
@@ -28,16 +34,13 @@ use service_com_amazonaws_invoicing_invoicing::ops::types::{
     Entity, InvoiceSummary, RECEIVER_ROLE_VALUES,
 };
 
-/// Midnight UTC of the four days the seeded invoices are issued on, as epoch seconds:
-/// 2024-01-15, 2024-02-15, 2024-03-15 and 2024-04-15.
-const JAN_15: i64 = 1_705_276_800;
-const FEB_15: i64 = 1_707_955_200;
-const MAR_15: i64 = 1_710_460_800;
-const APR_15: i64 = 1_713_139_200;
-/// Two further instants the `TimeInterval` rows use as bounds: 2024-01-01 and
-/// 2024-03-16.
-const JAN_01: i64 = 1_704_067_200;
-const MAR_16: i64 = 1_710_547_200;
+/// The epoch second an ISO-8601 instant names, so the dates below read as dates rather
+/// than as epoch counts.
+fn secs(instant: &str) -> i64 {
+    ::chrono::DateTime::parse_from_rfc3339(instant)
+        .unwrap_or_else(|error| panic!("case {instant:?}: a valid instant, got {error}"))
+        .timestamp()
+}
 
 /// The account every row calls `ListInvoiceSummaries` for unless it says otherwise.
 const ACCOUNT_A: &str = "111111111111";
@@ -57,7 +60,8 @@ struct Seed {
     invoice_id: &'static str,
     account_id: &'static str,
     bill_source_accounts: &'static [&'static str],
-    issued_at: i64,
+    /// The `IssuedDate`, as the ISO-8601 instant it is.
+    issued_at: &'static str,
     /// `(Month, Year)` of the invoice's `BillingPeriod`.
     billing_period: (i32, i32),
     invoicing_entity: &'static str,
@@ -70,7 +74,7 @@ impl Seed {
         InvoiceSummary {
             account_id: Some(self.account_id.to_string()),
             invoice_id: Some(self.invoice_id.to_string()),
-            issued_date: Some(::aws_smithy_types::DateTime::from_secs(self.issued_at)),
+            issued_date: Some(::aws_smithy_types::DateTime::from_secs(secs(self.issued_at))),
             bill_source_accounts: Some(
                 self.bill_source_accounts
                     .iter()
@@ -98,7 +102,8 @@ impl Seed {
 
 /// The invoices every test below seeds, differing along each dimension the rules
 /// generalise over: the account an invoice is issued to, the accounts it bills, the day
-/// it was issued, its billing period, its invoicing entity and its receiver role.
+/// it was issued, its billing period, its invoicing entity and its receiver role. One
+/// invoice a month, each issued inside the billing period it reports.
 ///
 /// The `ReceiverRole` values are the model's own
 /// (`smithy_query(query="shape", shape="ReceiverRole")` -> `SELLER`, `RESELLER`,
@@ -108,8 +113,8 @@ const SEEDS: &[Seed] = &[
         invoice_id: "INV-001",
         account_id: ACCOUNT_A,
         bill_source_accounts: &[],
-        issued_at: JAN_15,
-        billing_period: (1, 2024),
+        issued_at: "2025-07-15T00:00:00Z",
+        billing_period: (7, 2025),
         invoicing_entity: "Amazon Web Services, Inc.",
         receiver_role: "BUYER",
     },
@@ -117,8 +122,8 @@ const SEEDS: &[Seed] = &[
         invoice_id: "INV-002",
         account_id: ACCOUNT_A,
         bill_source_accounts: &[ACCOUNT_B],
-        issued_at: FEB_15,
-        billing_period: (2, 2024),
+        issued_at: "2025-08-15T00:00:00Z",
+        billing_period: (8, 2025),
         invoicing_entity: "Amazon Web Services EMEA SARL",
         receiver_role: "BUYER",
     },
@@ -126,8 +131,8 @@ const SEEDS: &[Seed] = &[
         invoice_id: "INV-003",
         account_id: ACCOUNT_C,
         bill_source_accounts: &[ACCOUNT_A],
-        issued_at: MAR_15,
-        billing_period: (3, 2024),
+        issued_at: "2025-09-15T00:00:00Z",
+        billing_period: (9, 2025),
         invoicing_entity: "Amazon Web Services, Inc.",
         receiver_role: "SELLER",
     },
@@ -135,8 +140,8 @@ const SEEDS: &[Seed] = &[
         invoice_id: "INV-004",
         account_id: ACCOUNT_D,
         bill_source_accounts: &[],
-        issued_at: APR_15,
-        billing_period: (4, 2024),
+        issued_at: "2025-10-15T00:00:00Z",
+        billing_period: (10, 2025),
         invoicing_entity: "Amazon Internet Services Pvt. Ltd",
         receiver_role: "RESELLER",
     },
@@ -336,11 +341,11 @@ async fn each_filter_member_narrows_the_answer() {
     // (the filter, the account asked about, the invoice ids it admits)
     let cases: &[(Value, &str, &[&str])] = &[
         // BillingPeriod: the invoice's own (Month, Year).
-        (json!({"BillingPeriod": {"Month": 1, "Year": 2024}}), ACCOUNT_A, &["INV-001"]),
-        (json!({"BillingPeriod": {"Month": 3, "Year": 2024}}), ACCOUNT_A, &["INV-003"]),
+        (json!({"BillingPeriod": {"Month": 7, "Year": 2025}}), ACCOUNT_A, &["INV-001"]),
+        (json!({"BillingPeriod": {"Month": 9, "Year": 2025}}), ACCOUNT_A, &["INV-003"]),
         // A period no seeded invoice covers, and the same month in another year.
-        (json!({"BillingPeriod": {"Month": 12, "Year": 2023}}), ACCOUNT_A, &[]),
-        (json!({"BillingPeriod": {"Month": 1, "Year": 2025}}), ACCOUNT_A, &[]),
+        (json!({"BillingPeriod": {"Month": 12, "Year": 2024}}), ACCOUNT_A, &[]),
+        (json!({"BillingPeriod": {"Month": 7, "Year": 2026}}), ACCOUNT_A, &[]),
         // InvoicingEntity: the invoice's Entity.InvoicingEntity.
         (
             json!({"InvoicingEntity": "Amazon Web Services, Inc."}),
@@ -364,19 +369,22 @@ async fn each_filter_member_narrows_the_answer() {
         (json!({"ReceiverRole": "RESELLER"}), ACCOUNT_D, &["INV-004"]),
         // Two members together: both have to hold.
         (
-            json!({"ReceiverRole": "BUYER", "BillingPeriod": {"Month": 2, "Year": 2024}}),
+            json!({"ReceiverRole": "BUYER", "BillingPeriod": {"Month": 8, "Year": 2025}}),
             ACCOUNT_A,
             &["INV-002"],
         ),
         (
-            json!({"ReceiverRole": "SELLER", "BillingPeriod": {"Month": 2, "Year": 2024}}),
+            json!({"ReceiverRole": "SELLER", "BillingPeriod": {"Month": 8, "Year": 2025}}),
             ACCOUNT_A,
             &[],
         ),
         (
             json!({
                 "ReceiverRole": "BUYER",
-                "TimeInterval": {"StartDate": JAN_15, "EndDate": MAR_16},
+                "TimeInterval": {
+                    "StartDate": secs("2025-07-15T00:00:00Z"),
+                    "EndDate": secs("2025-09-16T00:00:00Z"),
+                },
                 "InvoicingEntity": "Amazon Web Services, Inc.",
             }),
             ACCOUNT_A,
@@ -397,32 +405,35 @@ async fn each_filter_member_narrows_the_answer() {
 
 /// A `TimeInterval` admits an `IssuedDate` from `StartDate` INCLUSIVE up to `EndDate`
 /// EXCLUSIVE, which is what both members document.
+///
+/// Every row states an interval of at most one month, which is the bound the model gives
+/// an interval stated without a `ReceiverRole`.
 #[tokio::test]
 async fn a_time_interval_is_start_inclusive_and_end_exclusive() {
     let (router, engine) = emulator();
     seed(&engine, SEEDS);
 
     // (StartDate, EndDate, the invoice ids of account A it admits)
-    let cases: &[(i64, i64, &[&str])] = &[
+    let cases: &[(&str, &str, &[&str])] = &[
         // The start bound itself is in; the end bound itself is out.
-        (JAN_15, FEB_15, &["INV-001"]),
-        (JAN_15, MAR_16, &["INV-001", "INV-002", "INV-003"]),
-        (FEB_15, MAR_16, &["INV-002", "INV-003"]),
+        ("2025-07-15T00:00:00Z", "2025-08-15T00:00:00Z", &["INV-001"]),
+        ("2025-08-15T00:00:00Z", "2025-09-15T00:00:00Z", &["INV-002"]),
+        ("2025-09-15T00:00:00Z", "2025-10-15T00:00:00Z", &["INV-003"]),
         // One second past an issued date excludes it; one second before admits it.
-        (JAN_15 + 1, MAR_16, &["INV-002", "INV-003"]),
-        (JAN_01, JAN_15, &[]),
-        (JAN_01, JAN_15 + 1, &["INV-001"]),
+        ("2025-07-15T00:00:01Z", "2025-08-15T00:00:00Z", &[]),
+        ("2025-07-01T00:00:00Z", "2025-07-15T00:00:00Z", &[]),
+        ("2025-07-01T00:00:00Z", "2025-07-15T00:00:01Z", &["INV-001"]),
         // An empty interval admits nothing, and so does a reversed one.
-        (FEB_15, FEB_15, &[]),
-        (MAR_16, JAN_15, &[]),
+        ("2025-08-15T00:00:00Z", "2025-08-15T00:00:00Z", &[]),
+        ("2025-09-15T00:00:00Z", "2025-07-15T00:00:00Z", &[]),
         // A window past every issued date.
-        (APR_15 + 1, APR_15 + 2, &[]),
+        ("2025-11-01T00:00:00Z", "2025-11-02T00:00:00Z", &[]),
     ];
 
     for (start, end, expected) in cases {
         let body = json!({
             "Selector": selector("ACCOUNT_ID", ACCOUNT_A),
-            "Filter": {"TimeInterval": {"StartDate": start, "EndDate": end}},
+            "Filter": {"TimeInterval": {"StartDate": secs(start), "EndDate": secs(end)}},
         });
         let response = ok(&router, &body).await;
         let actual = invoice_ids(&response);

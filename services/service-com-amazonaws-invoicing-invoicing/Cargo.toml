@@ -27,6 +27,9 @@ hex = { workspace = true }
 # `crate::state::idempotent_request_digest`: the maintained digest an `@idempotent`
 # replay key mixes the request it is a record OF through, rather than one written here.
 sha2 = { workspace = true }
+# The calendar `ListInvoiceSummaries`' documented temporal rules are stated in: a
+# maintained proleptic Gregorian calendar, rather than month arithmetic written here.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

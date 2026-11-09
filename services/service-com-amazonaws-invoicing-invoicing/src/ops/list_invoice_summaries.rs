@@ -6,6 +6,12 @@
 //! `Filter` admits, one page of at most `MaxResults` at a time, with an opaque
 //! `NextToken` that resumes the walk where the page stopped.
 //!
+//! A `Filter` also has to state a period this operation ANSWERS about: the model documents
+//! the data a `ReceiverRole` query is answered out of as beginning on one date, and bounds
+//! a `TimeInterval` at five years with that filter and one month without it, so a request
+//! outside either is refused with the modelled `ValidationException` before the registry is
+//! read (see [`RECEIVER_ROLE_DATA_START`] and [`IntervalBound`]).
+//!
 //! The registry it reads is the one copy of the invoices this emulator holds
 //! ([`crate::state::ComAmazonawsInvoicingInvoicingState::invoices`]). An invoice is
 //! ISSUED by AWS out of a billing period's activity and no operation of this service's
@@ -192,6 +198,144 @@ fn linked_to_account(invoice: &InvoiceSummary, account_id: &str) -> bool {
             .any(|source| source == account_id)
 }
 
+/// The date the invoice data a `ReceiverRole` query is answered out of begins at, as the
+/// `(year, month, day)` the model documents it as (`smithy_query(query="doc",
+/// shape="InvoiceSummariesFilter", member="ReceiverRole")`: "Data is available starting
+/// 2025-06-01. Queries for periods before 2025-06-01 return a validation error").
+///
+/// A request that states a `ReceiverRole` is therefore answered only about periods from
+/// this date on: one that asks about an earlier period is asking about data the service
+/// does not hold for that filter, which is refused rather than answered out of the data it
+/// does hold.
+const RECEIVER_ROLE_DATA_START: (i32, u32, u32) = (2025, 6, 1);
+
+/// How long a `TimeInterval` a request may state.
+///
+/// The model bounds it by whether the request states a `ReceiverRole` (same documentation
+/// as [`RECEIVER_ROLE_DATA_START`]: "`TimeInterval` supports a time interval of up to 5
+/// years. Without `ReceiverRole`, `TimeInterval` is limited to one month"), so the two
+/// bounds below are the one rule with the two lengths the model gives it.
+#[derive(Debug, Clone, Copy)]
+struct IntervalBound {
+    /// The bound in CALENDAR months — a month is as long as the month the interval starts
+    /// in, and five years is sixty of them — applied as `EndDate` no further than that
+    /// after `StartDate`.
+    months: u32,
+    /// The bound as the model words it, for the sentence a refusal states.
+    stated: &'static str,
+    /// Whether this is the bound of a request that STATES a `ReceiverRole`, which the same
+    /// sentence names.
+    with_receiver_role: bool,
+}
+
+/// The bound a request that states a `ReceiverRole` is held to: five years.
+const WITH_RECEIVER_ROLE: IntervalBound = IntervalBound {
+    months: 5 * 12,
+    stated: "5 years",
+    with_receiver_role: true,
+};
+
+/// The bound a request that states none is held to: one month.
+const WITHOUT_RECEIVER_ROLE: IntervalBound = IntervalBound {
+    months: 1,
+    stated: "one month",
+    with_receiver_role: false,
+};
+
+/// [`RECEIVER_ROLE_DATA_START`] as the calendar date it names — `None` only for a
+/// `(year, month, day)` no calendar holds, which that constant is not.
+fn data_start_date() -> Option<::chrono::NaiveDate> {
+    let (year, month, day) = RECEIVER_ROLE_DATA_START;
+    ::chrono::NaiveDate::from_ymd_opt(year, month, day)
+}
+
+/// The same date as the instant it begins at, keyed the way every stored and requested
+/// instant of this service is ([`crate::state::instant_key`]), so a `TimeInterval`'s own
+/// instants compare against it.
+fn data_start_key() -> Option<i64> {
+    data_start_date().map(|date| {
+        date.and_time(::chrono::NaiveTime::MIN)
+            .and_utc()
+            .timestamp_millis()
+    })
+}
+
+/// The instant `months` CALENDAR months after the instant `start_key` keys, keyed the same
+/// way, or `None` when no calendar holds that instant: a `StartDate` travels as a JSON
+/// number, so a caller can name one so far outside the calendar that no interval from it
+/// can be measured in months at all.
+fn months_after(start_key: i64, months: u32) -> Option<i64> {
+    ::chrono::DateTime::from_timestamp_millis(start_key)?
+        .checked_add_months(::chrono::Months::new(months))
+        .map(|limit| limit.timestamp_millis())
+}
+
+/// Whether the period this request states BEGINS before the data a `ReceiverRole` query is
+/// answered out of does.
+///
+/// Both members by which a request states the period it asks about are tested, because the
+/// rule is about the period rather than about one member: the `TimeInterval` it asks over
+/// ("the date range for invoice summary retrieval") begins at its `StartDate`, and the
+/// `BillingPeriod` it asks about ("the billing period associated with the invoice
+/// documents") begins on the first day of the month it names. A request that states neither
+/// states no period, so there is nothing to refuse.
+fn states_period_before_data_start(
+    time_interval: Option<(i64, i64)>,
+    billing_period: Option<&BillingPeriod>,
+) -> bool {
+    let interval_begins_before = time_interval.is_some_and(|(start, _)| {
+        data_start_key().is_some_and(|data_start| start < data_start)
+    });
+    let period_begins_before = billing_period.is_some_and(|period| {
+        // The boundary walk has already held the two members to the ranges the model
+        // gives them (`Month` 1..12, `Year` 2005..2050), so this converts the month the
+        // request names rather than re-checking it; a month the calendar does not hold
+        // begins before nothing.
+        u32::try_from(period.month)
+            .ok()
+            .and_then(|month| ::chrono::NaiveDate::from_ymd_opt(period.year, month, 1))
+            .zip(data_start_date())
+            .is_some_and(|(begins_on, data_start)| begins_on < data_start)
+    });
+    interval_begins_before || period_begins_before
+}
+
+/// The 400 a request that states a `ReceiverRole` is refused with when the period it asks
+/// about begins before [`RECEIVER_ROLE_DATA_START`].
+fn period_before_data_start() -> ValidationException {
+    let (year, month, day) = RECEIVER_ROLE_DATA_START;
+    ValidationException {
+        message: Some(format!(
+            "Queries for periods before {year:04}-{month:02}-{day:02} are not supported when ReceiverRole is specified"
+        )),
+        // `invalidInput` is one of the model's `ValidationExceptionReason` values
+        // ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]): a named member of
+        // the request carries a period this operation does not answer about.
+        reason: Some("invalidInput".to_string()),
+        // The invoice-summaries plane keys its explanatory text the way the model names
+        // the member, as this operation's own `invalidNextToken` refusal does (see
+        // [`MessageKey`]).
+        message_key: MessageKey::ModelMemberName,
+        ..Default::default()
+    }
+}
+
+/// The 400 a request is refused with when its `TimeInterval` is longer than the bound the
+/// model gives it — which bound being decided by whether the request states a
+/// `ReceiverRole`, as the sentence states.
+fn interval_longer_than_bound(bound: IntervalBound) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "TimeInterval supports a time interval of up to {} when ReceiverRole is {}specified",
+            bound.stated,
+            if bound.with_receiver_role { "" } else { "not " }
+        )),
+        reason: Some("invalidInput".to_string()),
+        message_key: MessageKey::ModelMemberName,
+        ..Default::default()
+    }
+}
+
 /// The caller's `Filter`, decoded ONCE per request into what each member tests.
 ///
 /// Decoded up front so the walk over the registry costs one comparison per filter per
@@ -213,27 +357,59 @@ struct SummaryFilter<'f> {
 }
 
 impl<'f> SummaryFilter<'f> {
-    /// The filter a request carries. `ReceiverRole` targets an enum shape, so the
-    /// boundary walk has already held it to that shape's value set (see
-    /// [`Selected::new`]) by the time this reads it.
-    fn new(filter: Option<&'f InvoiceSummariesFilter>) -> Self {
+    /// The filter a request carries, or the modelled `ValidationException` for a filter
+    /// whose stated period is outside what the model documents this operation answers
+    /// about: a `ReceiverRole` query for a period before [`RECEIVER_ROLE_DATA_START`], or
+    /// a `TimeInterval` longer than the bound that filter carries ([`IntervalBound`]).
+    ///
+    /// Both are decided HERE, before the registry is read, so a request outside them is
+    /// refused rather than answered out of the invoices the registry happens to hold.
+    ///
+    /// `ReceiverRole` targets an enum shape, so the boundary walk has already held it to
+    /// that shape's value set (see [`Selected::new`]) by the time this reads it.
+    fn new(
+        filter: Option<&'f InvoiceSummariesFilter>,
+    ) -> Result<Self, ListInvoiceSummariesErrorModeled> {
         let Some(filter) = filter else {
-            return Self::default();
+            return Ok(Self::default());
         };
-        Self {
-            time_interval: filter.time_interval.as_ref().map(|interval| {
-                (
-                    crate::state::instant_key(&interval.start_date),
-                    crate::state::instant_key(&interval.end_date),
-                )
-            }),
+        let receiver_role = filter.receiver_role.as_deref();
+        let time_interval = filter.time_interval.as_ref().map(|interval| {
+            (
+                crate::state::instant_key(&interval.start_date),
+                crate::state::instant_key(&interval.end_date),
+            )
+        });
+        // Which interval bound this request is held to, and whether the data-start floor
+        // applies at all: both hang off whether it states a `ReceiverRole`.
+        let bound = if receiver_role.is_some() {
+            WITH_RECEIVER_ROLE
+        } else {
+            WITHOUT_RECEIVER_ROLE
+        };
+        if bound.with_receiver_role
+            && states_period_before_data_start(time_interval, filter.billing_period.as_ref())
+        {
+            return Err(ListInvoiceSummariesErrorModeled::ValidationException(
+                period_before_data_start(),
+            ));
+        }
+        if let Some((start, end)) = time_interval {
+            if months_after(start, bound.months).is_some_and(|limit| end > limit) {
+                return Err(ListInvoiceSummariesErrorModeled::ValidationException(
+                    interval_longer_than_bound(bound),
+                ));
+            }
+        }
+        Ok(Self {
+            time_interval,
             billing_period: filter
                 .billing_period
                 .as_ref()
                 .map(|period| (period.month, period.year)),
             invoicing_entity: filter.invoicing_entity.as_deref(),
-            receiver_role: filter.receiver_role.as_deref(),
-        }
+            receiver_role,
+        })
     }
 
     /// Whether `invoice` satisfies every filter member the caller supplied. Members of
@@ -310,7 +486,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         let selected = Selected::new(&input.selector);
-        let filter = SummaryFilter::new(input.filter.as_ref());
+        let filter = SummaryFilter::new(input.filter.as_ref())?;
         let resume_at = decode_next_token(input.next_token.as_deref())?;
         // The walk's maximum, and the page size this request resolves to inside it: the
         // rule every paginated listing of this service shares
