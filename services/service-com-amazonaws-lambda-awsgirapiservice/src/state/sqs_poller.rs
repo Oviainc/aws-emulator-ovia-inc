@@ -18,8 +18,11 @@
 //!   The hold covers the whole span this poller holds the batch — the window it gathers it
 //!   over plus the attempt it hands it to, which is the queue's own `VisibilityTimeout` or
 //!   the function's `Timeout`, whichever is longer, since one attempt cannot outlast the
-//!   function's — so no message is handed to a second consumer while the first attempt at it
-//!   may still be running (see [`invisible_for_seconds`]). A mapping carrying a
+//!   function's — and it is RENEWED while an attempt is still running ([`renew_hold`]),
+//!   because what an attempt costs this emulator is not bounded by those spans alone: an
+//!   invocation also waits for its share of the run capacity. So no message is handed to a
+//!   second consumer while the first attempt at it may still be running (see
+//!   [`invisible_for_seconds`]). A mapping carrying a
 //!   `MaximumBatchingWindowInSeconds` — "the maximum amount of time, in seconds, that Lambda
 //!   spends gathering records before invoking the function" — holds a batch it has not
 //!   filled for up to that long, taking up what arrives meanwhile, so its function is
@@ -105,6 +108,14 @@ use super::{
 /// It is deliberately non-zero, so the loop hands the runtime back between wake-ups instead
 /// of spinning, and short enough that a caller watching its queue sees the mapping consume.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often the hold on a batch an attempt is still running on is renewed, at the fastest.
+///
+/// An EMULATOR-CHOSEN floor, for the same reason as [`POLL_INTERVAL`]: a queue whose
+/// `VisibilityTimeout` is a second or two leaves no room to renew the hold at half its span,
+/// so the renewal is made on this floor instead of being skipped. It is well inside the
+/// smallest hold a delivery takes, so a renewed hold never has a gap in it.
+const MIN_HOLD_RENEWAL: Duration = Duration::from_millis(250);
 
 /// The most messages this emulator takes out of a queue in ONE batch, whatever `BatchSize`
 /// the mapping configures.
@@ -195,6 +206,9 @@ struct PollTarget {
 struct PolledMessage {
     /// The id the queue holds the message under, which is what a delete names it by.
     message_id: String,
+    /// The handle the delivery of this message minted, which is what the hold on it is
+    /// renewed under while the poller is still working on the batch (see [`renew_hold`]).
+    receipt_handle: String,
     /// The record envelope, as the function receives it.
     record: Value,
 }
@@ -352,7 +366,16 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
             session.gathering.remove(&target.uuid);
             continue;
         }
-        let polled = take_batch(&queues, &target, now, gathering_room(session, &target));
+        // How long one delivery of this queue's messages hides them for, which is also the
+        // span the hold on the batch is renewed by while the attempt runs.
+        let hold_seconds = batch_hold(&queues, &target);
+        let polled = take_batch(
+            &queues,
+            &target,
+            now,
+            gathering_room(session, &target),
+            hold_seconds,
+        );
         // What this mapping has to hand over NOW: what one poll found, or — for a mapping
         // with a batching window — what it has gathered over that window.
         let polled = match gathered(session, &target, polled, now) {
@@ -393,17 +416,28 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
             // for every report it could read, so the guard on an empty one is belt and
             // braces: it keeps this pass from recording a successful attempt that consumed
             // nothing, whatever a future reading answers.
-            let attempt = hand_over_batch(callback, session, &target, &payload, &invoking)
-                .await
-                .and_then(|processed| {
-                    if processed.is_empty() {
-                        return Err(format!(
-                            "{} processed no message of the batch it was handed",
-                            target.function_arn
-                        ));
-                    }
-                    Ok(processed)
-                });
+            let attempt = attempt_batch(
+                callback,
+                session,
+                &target,
+                &payload,
+                &invoking,
+                &HeldBatch {
+                    queues: &queues,
+                    messages: &polled,
+                    hold_seconds,
+                },
+            )
+            .await
+            .and_then(|processed| {
+                if processed.is_empty() {
+                    return Err(format!(
+                        "{} processed no message of the batch it was handed",
+                        target.function_arn
+                    ));
+                }
+                Ok(processed)
+            });
             match attempt {
                 Ok(processed) => {
                     // The messages the attempt PROCESSED leave the queue — that is what a
@@ -623,7 +657,8 @@ fn gathered(
 }
 
 /// Take the next batch out of `target`'s queue at `now`, as the records the function would
-/// be handed them as — at most `room` messages, which is what is left of its `BatchSize`.
+/// be handed them as — at most `room` messages, which is what is left of its `BatchSize`,
+/// each hidden from every other consumer for `hold_seconds` ([`batch_hold`]).
 ///
 /// Empty when the mapping names a queue this engine no longer holds, when the queue had
 /// nothing it could hand over, and when the batch being gathered is already full.
@@ -632,6 +667,7 @@ fn take_batch(
     target: &PollTarget,
     now: SystemTime,
     room: usize,
+    hold_seconds: i64,
 ) -> Vec<PolledMessage> {
     if room == 0 {
         return Vec::new();
@@ -640,14 +676,9 @@ fn take_batch(
     // Retention lapses, visibility timeouts and message movement tasks are owed by the
     // clock, so what the delivery below sees is what the queue may hand out.
     store.materialise_due(now);
-    let Some((region, name, visibility_timeout)) =
-        store.queue_by_arn(&target.queue_arn).map(|queue| {
-            (
-                queue.region.clone(),
-                queue.name.clone(),
-                queue.integer(sqs::state::VISIBILITY_TIMEOUT),
-            )
-        })
+    let Some((region, name)) = store
+        .queue_by_arn(&target.queue_arn)
+        .map(|queue| (queue.region.clone(), queue.name.clone()))
     else {
         return Vec::new();
     };
@@ -659,29 +690,87 @@ fn take_batch(
         return Vec::new();
     };
     // The batch is hidden for as long as this poller holds it: the window it is gathered
-    // over and the attempt it is then handed to; see `invisible_for_seconds`.
-    let handed = queue.hand_over(
-        now,
-        room,
-        sqs::state::after(
-            now,
-            invisible_for_seconds(
-                visibility_timeout,
-                target.function_timeout_seconds,
-                i64::try_from(target.batching_window.as_secs()).unwrap_or(i64::MAX),
-            ),
-        ),
-    );
+    // over and the attempt it is then handed to; see `invisible_for_seconds`, and
+    // [`renew_hold`] for the attempt that outlasts one span of it.
+    let handed = queue.hand_over(now, room, sqs::state::after(now, hold_seconds));
     handed
         .iter()
         .filter_map(|(index, delivered)| {
             let message = queue.messages.get(*index)?;
             Some(PolledMessage {
                 message_id: delivered.message_id.clone(),
+                receipt_handle: delivered.receipt_handle.clone(),
                 record: queue_record(message, &delivered.receipt_handle, &target.queue_arn, &region),
             })
         })
         .collect()
+}
+
+/// How long one delivery of `target`'s queue hides the messages it hands over for, in
+/// seconds: the span [`invisible_for_seconds`] states, read off the queue's OWN current
+/// `VisibilityTimeout`.
+///
+/// Zero for a queue this engine no longer holds — there is no batch of it to hold.
+fn batch_hold(
+    queues: &::engine::ServiceState<sqs::state::ComAmazonawsSqsAmazonsqsState>,
+    target: &PollTarget,
+) -> i64 {
+    let store = queues.lock();
+    let Some(queue) = store.queue_by_arn(&target.queue_arn) else {
+        return 0;
+    };
+    invisible_for_seconds(
+        queue.integer(sqs::state::VISIBILITY_TIMEOUT),
+        target.function_timeout_seconds,
+        i64::try_from(target.batching_window.as_secs()).unwrap_or(i64::MAX),
+    )
+}
+
+/// How often the hold on a batch an attempt is running on is renewed: twice per hold span,
+/// so the messages stay hidden at least half a span ahead of the attempt at every instant,
+/// and never less often than [`MIN_HOLD_RENEWAL`] — a hold of a second or two is renewed on
+/// that floor rather than not at all.
+fn hold_renewal(hold_seconds: i64) -> Duration {
+    let span = Duration::from_secs(u64::try_from(hold_seconds).unwrap_or(0));
+    (span / 2).max(MIN_HOLD_RENEWAL)
+}
+
+/// The batch a pass is HOLDING while it hands it over: the queue store the hold is renewed
+/// in, the messages it covers and the span it is renewed by ([`batch_hold`]).
+///
+/// One value rather than three parameters, because the three only ever travel together: a
+/// renewal is always of THIS pass's batch, in the store it came out of, for the span that
+/// store's queue hides one delivery for.
+struct HeldBatch<'batch> {
+    /// The Amazon SQS store the batch's queue lives in.
+    queues: &'batch ::engine::ServiceState<sqs::state::ComAmazonawsSqsAmazonsqsState>,
+    /// The messages this pass took out of that queue.
+    messages: &'batch [PolledMessage],
+    /// How long each renewal hides them for, in seconds.
+    hold_seconds: i64,
+}
+
+/// Renew the hold on `held`'s messages in `target`'s queue, hiding each of them for the hold
+/// span again, counted from `now`.
+///
+/// One delivery hides a message for one hold span, counted from that delivery; an ATTEMPT
+/// still running when that span is up belongs to a consumer that is still working on the
+/// batch, so the hold is extended through the queue's own visibility bookkeeping — the path a
+/// client's `ChangeMessageVisibility` takes — instead of being let lapse under a running
+/// attempt. The span an attempt really takes is not bounded by the function's `Timeout`
+/// alone: an invocation also waits for its share of this emulator's run capacity, so a hold
+/// computed from the configured spans can be up before the attempt it covers is decided.
+///
+/// Best effort per message: one the attempt has already had deleted, and one whose hold
+/// cannot be extended any further, keep whatever the queue says about them.
+fn renew_hold(target: &PollTarget, held: &HeldBatch<'_>, now: SystemTime) {
+    let mut store = held.queues.lock();
+    let Some(queue) = store.queue_by_arn_mut(&target.queue_arn) else {
+        return;
+    };
+    for message in held.messages {
+        let _ = queue.change_visibility(&message.receipt_handle, held.hold_seconds, now);
+    }
 }
 
 /// Split `polled` into the messages `target`'s filter criteria admit and the ones they
@@ -878,6 +967,38 @@ async fn hand_over_batch(
             target.function_arn
         )),
         report => Ok(processed_records(&report, invoking).unwrap_or_default()),
+    }
+}
+
+/// Hand one batch over ([`hand_over_batch`]) while KEEPING the hold on the messages `held`
+/// covers alive for as long as the attempt takes.
+///
+/// The attempt is raced against the renewal cadence [`hold_renewal`] states, so every time
+/// one hold span is about to run out under a running attempt the batch is hidden for another
+/// ([`renew_hold`]) — which is what makes the poller's promise true: no message is handed to
+/// a second consumer, this loop's own next pass included, while the first attempt at it is
+/// still being decided. Nothing is renewed once the attempt answers: the hold the last
+/// renewal left runs out on the queue's own bookkeeping, so a message the attempt did not
+/// process comes back for another delivery one hold span later.
+async fn attempt_batch(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    session: &mut PollSession,
+    target: &PollTarget,
+    payload: &Value,
+    invoking: &[String],
+    held: &HeldBatch<'_>,
+) -> Result<Vec<String>, String> {
+    let mut attempt = ::std::pin::pin!(hand_over_batch(
+        callback, session, target, payload, invoking
+    ));
+    let renew_every = hold_renewal(held.hold_seconds);
+    loop {
+        // No store is locked across the attempt: the renewal takes the queue store, finishes
+        // with it and releases it between two polls of the attempt.
+        match ::tokio::time::timeout(renew_every, &mut attempt).await {
+            Ok(outcome) => return outcome,
+            Err(_) => renew_hold(target, held, SystemTime::now()),
+        }
     }
 }
 
@@ -1470,6 +1591,7 @@ mod tests {
     fn polled(id: &str, body: &str) -> PolledMessage {
         PolledMessage {
             message_id: id.to_string(),
+            receipt_handle: RECEIPT_HANDLE.to_string(),
             record: json!({ "messageId": id, "body": body }),
         }
     }

@@ -21,6 +21,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_lambda_awsgirapiservice::state::execution::{
+    HOST_WAIT_CEILING, PERMIT_WAIT,
+};
 use service_com_amazonaws_lambda_awsgirapiservice::state::ACTIVATION_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -43,7 +46,16 @@ const KMS_KEY: &str = "arn:aws:kms:us-east-1:000000000000:key/durable-executions
 /// How long this suite waits for an accepted event to be delivered and the execution it
 /// drives to end. The delivery happens on the runtime's own time, so the wait is a poll
 /// rather than a single sleep.
-const SETTLE_CEILING: Duration = Duration::from_secs(20);
+///
+/// The bound is what the EMULATOR itself allows one invocation, rather than a span picked
+/// here: the wait for a share of the run capacity ([`PERMIT_WAIT`]) and the wait for the
+/// run's own answer ([`HOST_WAIT_CEILING`]), with a margin for the queueing either side of
+/// them. It is patience and not a weakened expectation — the assertions below are unchanged —
+/// and a whole-workspace test run shares its cores with every other suite, so a run really
+/// can wait for capacity before it starts.
+const SETTLE_CEILING: Duration = PERMIT_WAIT
+    .saturating_add(HOST_WAIT_CEILING)
+    .saturating_add(Duration::from_secs(10));
 
 /// How long one poll of the execution waits before asking again.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);

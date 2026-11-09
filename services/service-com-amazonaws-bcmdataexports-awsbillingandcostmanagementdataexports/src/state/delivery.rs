@@ -226,70 +226,142 @@ pub fn materialize_due_deliveries<Eng: Send + Sync + 'static>(engine: &Eng, now:
     }
 }
 
-/// How many delivery-clock tasks this process runs at once.
+/// How long the delivery clock waits between two passes.
 ///
-/// One request owes at most one delivery, so this is what bounds the tasks a caller making
-/// request after request can have in flight — the work each one does is bounded, but their
-/// NUMBER would otherwise follow the request rate. Past this many, no task is started and
-/// the delivery is applied by the next request to reach the store, which is the mechanism
-/// that would have applied it anyway.
-const MAX_DELIVERY_CLOCK_TASKS: usize = 64;
+/// An EMULATOR-CHOSEN span: nothing is published about how promptly a service applies its own
+/// schedule, only that it does. It is deliberately non-zero, so the loop hands the runtime
+/// back between passes instead of spinning, and well inside the spans the schedule itself is
+/// stated in ([`super::DELIVERY_INITIATION_DELAY`], [`super::DELIVERY_SETTLES_AFTER`]), so a
+/// client watching the destination bucket sees a delivery shortly after the instant that owed
+/// it.
+const DELIVERY_CLOCK_TICK: Duration = Duration::from_millis(100);
 
-/// How many of those tasks are in flight now.
-static DELIVERY_CLOCK_TASKS: ::std::sync::atomic::AtomicUsize =
-    ::std::sync::atomic::AtomicUsize::new(0);
-
-/// One task's place in [`MAX_DELIVERY_CLOCK_TASKS`], released when it is dropped — which a
-/// task that finished, panicked or was cancelled with its runtime all do, so a place cannot
-/// be lost and the bound cannot drift closed.
-struct DeliveryClockPermit;
-
-impl DeliveryClockPermit {
-    /// A place for one more task, or `None` when this process already runs its maximum.
-    fn take() -> Option<Self> {
-        use ::std::sync::atomic::Ordering;
-        DELIVERY_CLOCK_TASKS
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |running| {
-                (running < MAX_DELIVERY_CLOCK_TASKS).then_some(running + 1)
-            })
-            .ok()
-            .map(|_| Self)
-    }
-}
-
-impl Drop for DeliveryClockPermit {
-    fn drop(&mut self) {
-        DELIVERY_CLOCK_TASKS.fetch_sub(1, ::std::sync::atomic::Ordering::AcqRel);
-    }
-}
-
-/// Start the one short in-process task that applies what the clock owes this service's
-/// deliveries once `due_in` has passed.
+/// Start the ONE background loop that applies what the clock owes this store's deliveries,
+/// if one is not already running.
 ///
 /// A client that creates an export and then reads the destination bucket makes no further
 /// call to THIS service, so a delivery performed only by the next such call could be a
-/// delivery never performed — and the delivery is the service's own work, owed by the
-/// cadence rather than by anything the caller does. The task does not change WHEN a delivery
-/// happens: it only calls [`materialize_due_deliveries`], which applies what the stored
+/// delivery never performed — and the delivery is the service's own work, owed by the cadence
+/// rather than by anything the caller does. The loop does not change WHEN a delivery happens:
+/// every pass only calls [`materialize_due_deliveries`], which applies what the stored
 /// instants have already made due, so a client reading the destination before that instant
-/// still finds nothing and a delivery materialised earlier by another request is not
-/// performed twice. With no async runtime to spawn onto there is no task, and the next
-/// request applies it instead — as it also does past [`MAX_DELIVERY_CLOCK_TASKS`].
-pub fn drive_delivery_clock<Eng: Send + Sync + 'static>(engine: &Arc<Eng>, due_in: Duration) {
+/// still finds nothing and a delivery materialised by another request is not performed twice.
+///
+/// WHAT BOUNDS IT is the store it serves, not the request rate: at most one loop runs per
+/// store (the store carries the claim), each pass costs at most
+/// [`MAX_DELIVERIES_PER_PASS`] bounded deliveries, and the loop stands down as soon as the
+/// store owes none — so a caller making request after request arms the same single loop
+/// rather than a task per call, and no delivery is dropped because this process was already
+/// busy. The loop's task handle is KEPT on the store, so it can be stopped rather than merely
+/// forgotten. With no async runtime to spawn onto there is no loop, and the next request to
+/// reach the store applies what is due instead.
+pub fn drive_delivery_clock<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) {
+    let Some(state) = service_state(&**engine) else {
+        return;
+    };
     let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
         return;
     };
-    // The place is taken BEFORE the task is spawned, so the count bounds what is in flight
-    // rather than trailing it, and the task holds it until it is dropped.
-    let Some(permit) = DeliveryClockPermit::take() else {
+    let Some(generation) = claim_delivery_clock(&mut state.lock()) else {
         return;
     };
     let engine = Arc::clone(engine);
-    runtime.spawn(async move {
-        ::tokio::time::sleep(due_in).await;
-        materialize_due_deliveries(&*engine, SystemTime::now());
-        drop(permit);
+    let claimed = ::engine::ServiceState::clone(&state);
+    let handle = runtime.spawn(async move {
+        // The loop ends when the store owes no delivery any more, which it observes — and
+        // releases its claim in — inside one critical section.
+        while deliveries_owed_or_release(&mut state.lock(), generation) {
+            // Every pass waits first, which is what hands the runtime back between them. No
+            // lock is held across it.
+            ::tokio::time::sleep(DELIVERY_CLOCK_TICK).await;
+            materialize_due_deliveries(&*engine, SystemTime::now());
+        }
     });
+    set_delivery_clock(&mut claimed.lock(), generation, handle);
+}
+
+/// Claim the single delivery clock of this store: the claim's GENERATION when the caller may
+/// start one, `None` when one is really running.
+///
+/// The claim is taken over from a loop whose TASK HAS ALREADY ENDED while still holding it. A
+/// loop releases its claim itself on the one end it can see coming — the store owing no
+/// delivery — so a claim still held by a task that is over belongs to a loop that ended on
+/// something else: one pass panicked, or the task was cancelled. Without the take-over that
+/// claim is held for as long as this store lives, and because the claim is what stops a second
+/// loop from starting, no later call could ever start one again — which would re-open exactly
+/// the case this loop exists for: a delivery the service accepted and no client call will ever
+/// perform. A loop that is still RUNNING keeps its claim, so this never doubles the running
+/// loops for long: a take-over bumps the generation, and the losing starter's own task is
+/// stopped when it finds the generation moved on ([`set_delivery_clock`]).
+fn claim_delivery_clock(
+    store: &mut ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState,
+) -> Option<u64> {
+    let ended = store
+        .delivery_clock
+        .as_ref()
+        .is_some_and(::tokio::task::JoinHandle::is_finished);
+    if store.delivery_clock_running && !ended {
+        return None;
+    }
+    if ended {
+        ::tracing::warn!(
+            "the delivery clock this store holds the claim for has ended without releasing it; \
+             the claim is taken over so the deliveries it owes are still performed"
+        );
+    }
+    store.delivery_clock_running = true;
+    store.delivery_clock_generation = store.delivery_clock_generation.wrapping_add(1);
+    Some(store.delivery_clock_generation)
+}
+
+/// Keep the running loop's task handle, stopping the one it replaces.
+///
+/// Only while `generation` is still the CURRENT claim. A loop can end before its starter gets
+/// here (it releases its own claim as soon as the store owes no delivery), and a call that
+/// claimed the loop since then has stored a handle of its own: replacing that one would stop a
+/// live loop and leave its claim held for ever. So a stale starter installs nothing and stops
+/// its OWN task instead — the claim it was started under is gone, so nothing is waiting for
+/// it.
+fn set_delivery_clock(
+    store: &mut ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState,
+    generation: u64,
+    handle: ::tokio::task::JoinHandle<()>,
+) {
+    if store.delivery_clock_generation != generation {
+        handle.abort();
+        return;
+    }
+    if let Some(previous) = store.delivery_clock.replace(handle) {
+        previous.abort();
+    }
+}
+
+/// Whether this store still owes a delivery — one pending on an export, or one an execution
+/// has not reached its terminal status for — and, when it owes none, RELEASE the claim
+/// `generation` holds (and ONLY that one, so a loop standing down cannot clear a claim a loop
+/// started since is holding).
+///
+/// Observing "nothing is owed" and standing down happen in ONE critical section, which is
+/// what makes the hand-over race-free: a call that owes a delivery holds this same lock to
+/// store it BEFORE it tries to claim the loop, so either this call sees that delivery and the
+/// running loop keeps it, or the call's claim finds the flag cleared and starts a loop of its
+/// own.
+fn deliveries_owed_or_release(
+    store: &mut ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState,
+    generation: u64,
+) -> bool {
+    let owed = store
+        .exports
+        .values()
+        .any(|export| export.pending_delivery.is_some())
+        || store
+            .executions
+            .values()
+            .any(|execution| execution.completion_due_at.is_some());
+    if !owed && store.delivery_clock_generation == generation {
+        store.delivery_clock_running = false;
+    }
+    owed
 }
 
 impl ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState {

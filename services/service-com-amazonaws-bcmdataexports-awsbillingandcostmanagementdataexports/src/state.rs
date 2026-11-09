@@ -327,6 +327,16 @@ pub struct ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState
     /// contiguous range in one stable order, which is the order `ListExecutions` pages
     /// over.
     pub executions: BTreeMap<(String, String), StoredExecution>,
+    /// Whether the background loop that applies what the clock owes this store's deliveries
+    /// is running: the CLAIM that keeps one loop per store, taken and released inside this
+    /// store's own lock (see [`drive_delivery_clock`]). It is this emulator's own
+    /// bookkeeping and no part of what any operation reports.
+    pub(crate) delivery_clock_running: bool,
+    /// Which claim of that loop is the current one, so a loop standing down releases only its
+    /// own and a stale starter installs no handle.
+    pub(crate) delivery_clock_generation: u64,
+    /// The running loop's task, kept so it can be stopped rather than merely forgotten.
+    pub(crate) delivery_clock: Option<::tokio::task::JoinHandle<()>>,
 }
 
 impl ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState {

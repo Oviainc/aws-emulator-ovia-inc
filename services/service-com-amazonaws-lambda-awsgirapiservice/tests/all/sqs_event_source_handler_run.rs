@@ -35,6 +35,9 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
+use service_com_amazonaws_lambda_awsgirapiservice::state::execution::{
+    HOST_WAIT_CEILING, PERMIT_WAIT,
+};
 use service_com_amazonaws_lambda_awsgirapiservice::state::{
     LAST_PROCESSING_RESULT_OK, REPORT_BATCH_ITEM_FAILURES,
 };
@@ -70,7 +73,15 @@ const POISON: &str = "poison";
 /// given this much room, the longest of them deciding it; the waits for what the CONTROL
 /// plane owes — a function going `Active`, a mapping settling into its state — keep the
 /// shared harness's own budget, since none of them waits on a queue.
-const WATCH_BUDGET: Duration = Duration::from_secs(40);
+///
+/// The bound is PATIENCE, not a weakened expectation: every assertion below is unchanged.
+/// It is taken from what the EMULATOR itself allows ONE attempt rather than being picked
+/// here — the wait for a share of the run capacity ([`PERMIT_WAIT`]) and the wait for the
+/// run's own answer ([`HOST_WAIT_CEILING`]) — with room for the several passes a row waits
+/// for, because a whole-workspace test run shares its cores with every other suite.
+const WATCH_BUDGET: Duration = PERMIT_WAIT
+    .saturating_add(HOST_WAIT_CEILING)
+    .saturating_add(Duration::from_secs(30));
 
 /// The handler every row of the first suite runs, with the marker above bound to the name it
 /// reads it by — so there is ONE spelling of it on both sides of the interpreter.

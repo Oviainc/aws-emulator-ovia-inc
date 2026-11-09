@@ -25,6 +25,8 @@ mod catalog_schema_versions;
 mod data_query;
 #[path = "all/data_query_resolution.rs"]
 mod data_query_resolution;
+#[path = "all/delivery_clock_burst.rs"]
+mod delivery_clock_burst;
 #[path = "all/delivery_executions.rs"]
 mod delivery_executions;
 #[path = "all/delivery_grant.rs"]

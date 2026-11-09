@@ -318,12 +318,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         drop(store);
 
         // The delivery just owed is the SERVICE's work, so nothing a caller does has to make
-        // it happen: one short task applies it when the stored instants make it due. It does
-        // not change when that is — see `crate::state::drive_delivery_clock`.
-        crate::state::drive_delivery_clock(
-            &self.engine,
-            crate::state::DELIVERY_INITIATION_DELAY + crate::state::DELIVERY_SETTLES_AFTER,
-        );
+        // it happen: the store's own clock loop applies it when the stored instants make it
+        // due. It does not change when that is — see `crate::state::drive_delivery_clock`.
+        crate::state::drive_delivery_clock(&self.engine);
 
         Ok(UpdateExportOutput {
             export_arn: Some(input.export_arn),

@@ -265,7 +265,11 @@ async fn only_execution(case: &str, emulator: &Deliveries, export_arn: &str) -> 
 
 /// The keys the destination bucket holds under `prefix`, read through Amazon S3's own
 /// `ListObjectsV2` — so what this asserts on is what a client listing the bucket sees.
-async fn listed_keys(emulator: &Deliveries, bucket: &str, prefix: &str) -> Vec<String> {
+///
+/// `pub(crate)` so the suite that asserts on what the CLOCK ALONE delivers
+/// (`tests/all/delivery_clock_burst.rs`) reads the bucket through this ONE listing rather
+/// than a second copy of it.
+pub(crate) async fn listed_keys(emulator: &Deliveries, bucket: &str, prefix: &str) -> Vec<String> {
     let (status, body) = emulator
         .s3_request(
             "GET",

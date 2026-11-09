@@ -341,6 +341,8 @@ mod s3_package_source;
 mod signing_name_routing;
 #[path = "all/sqs_event_source_handler_run.rs"]
 mod sqs_event_source_handler_run;
+#[path = "all/sqs_event_source_hold.rs"]
+mod sqs_event_source_hold;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_mapping_iterator_age_series.rs"]
