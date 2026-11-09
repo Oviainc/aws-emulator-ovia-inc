@@ -23,6 +23,11 @@ mod cloudformation_fifo_resource_generated_names;
 #[path = "all/agent_registry_signing_name_routing.rs"]
 mod agent_registry_signing_name_routing;
 // Declared here, in this same head region, for the reason the entry above records: the
+// account's verified sending identity, which one SES surface records and the other
+// discovers.
+#[path = "all/ses_v1_discovers_a_verified_sending_identity.rs"]
+mod ses_v1_discovers_a_verified_sending_identity;
+// Declared here, in this same head region, for the reason the entry above records: the
 // secret a stack declares, which has to exist in AWS Secrets Manager under the ARN the
 // stack publishes for it.
 #[path = "all/cloudformation_provisions_secrets_manager_secrets.rs"]

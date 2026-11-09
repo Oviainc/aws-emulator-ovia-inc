@@ -131,6 +131,8 @@ mod ses_update_configuration_set_event_destination;
 mod ses_update_receipt_rule;
 #[path = "all/ses_validation_refusal_wording.rs"]
 mod ses_validation_refusal_wording;
+#[path = "all/ses_verified_identity_discovery.rs"]
+mod ses_verified_identity_discovery;
 #[path = "all/ses_verify_email_address.rs"]
 mod ses_verify_email_address;
 #[path = "all/state_roundtrip.rs"]
