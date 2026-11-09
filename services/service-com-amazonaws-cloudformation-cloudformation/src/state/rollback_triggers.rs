@@ -148,21 +148,29 @@ impl<'a> AlarmReference<'a> {
     }
 }
 
+/// The fixed text of the reason a rollback the triggers forced reports, which the alarms that
+/// were in `ALARM` follow.
+const TRIGGER_FAILURE_PREFIX: &str = "The following CloudWatch Alarms were in ALARM state: ";
+
 /// The `StackStatusReason` an operation reports when its ROLLBACK TRIGGERS are what rolled it
 /// back.
 ///
-/// One SUMMARY sentence naming the triggers that were in `ALARM`, in the shape
-/// CloudFormation words such a summary in: the fixed text around the comma-separated list of
-/// what the operation could not get past, ending with the separating space its follow-on
-/// clause about the stack goes after — exactly as
-/// [`super::resource_failure_summary`] words the same thing for resources. What it names is
-/// the trigger ARNs, which is what the caller declared the monitoring with.
-pub fn trigger_failure_summary<'a>(arns: impl IntoIterator<Item = &'a str>) -> String {
-    let named: Vec<&str> = arns.into_iter().collect();
-    format!(
-        "The following rollback trigger(s) went to ALARM state: [{}]. ",
-        named.join(", ")
-    )
+/// One SUMMARY sentence, in the shape CloudFormation words this failure in:
+/// [`TRIGGER_FAILURE_PREFIX`] and then the alarms that were in that state, comma-separated,
+/// with nothing around the list and nothing after it. What the sentence NAMES is each alarm's
+/// own name — `PutMetricAlarm$AlarmName`, which is also the name the trigger's ARN carries
+/// ([`AlarmReference`]) — and not the ARN the configuration declared the trigger with: a
+/// client reading this field to learn which alarm aborted the operation takes the name out of
+/// it and asks CloudWatch about that alarm (`DescribeAlarms$AlarmNames`), so the name is what
+/// it has to find there.
+///
+/// The sentence carries no trailing separator, unlike the resource summary
+/// ([`super::resource_failure_summary`]): a follow-on clause this service adds to a reason is
+/// worded onto the sentence it is given ([`super::rollback_requested`]), whether or not that
+/// sentence left room for one.
+pub fn trigger_failure_summary<'a>(alarm_names: impl IntoIterator<Item = &'a str>) -> String {
+    let named: Vec<&str> = alarm_names.into_iter().collect();
+    format!("{TRIGGER_FAILURE_PREFIX}{}", named.join(", "))
 }
 
 impl super::StoredStack {
@@ -188,8 +196,9 @@ impl super::StoredStack {
             .collect()
     }
 
-    /// Roll the operation in flight back because the triggers `fired` are in `ALARM`, and
-    /// answer the work that rollback leaves for the services that own the stack's resources.
+    /// Roll the operation in flight back because the alarms `fired` names — the alarms this
+    /// operation's triggers name, by alarm name — are in `ALARM`, and answer the work that
+    /// rollback leaves for the services that own the stack's resources.
     ///
     /// "CloudFormation rolls back the entire stack operation": the operation takes its failed
     /// status carrying [`trigger_failure_summary`] — nothing about the resources failed, so no
@@ -263,12 +272,15 @@ async fn alarm_state(
         .map(str::to_string)
 }
 
-/// Which of `triggers` name an alarm CloudWatch reports in [`ALARM_STATE`] right now, by ARN
-/// and in the order the configuration declared them.
+/// Which alarms of `triggers` CloudWatch reports in [`ALARM_STATE`] right now, by alarm NAME
+/// and in the order the configuration declared the triggers naming them.
+///
+/// The NAME, not the trigger's ARN, because the name is what the failure this read uncovers
+/// reports ([`trigger_failure_summary`]) and what CloudWatch itself is asked about.
 ///
 /// `stack_region` is the Region the stack's own calls are made in, which an alarm ARN
 /// carrying no Region field is read in.
-async fn triggers_in_alarm(
+async fn alarms_in_alarm(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     stack_region: &str,
     triggers: &[StoredRollbackTrigger],
@@ -284,7 +296,7 @@ async fn triggers_in_alarm(
             alarm.region
         };
         if alarm_state(ctx, region, alarm.name).await.as_deref() == Some(ALARM_STATE) {
-            fired.push(trigger.arn.clone());
+            fired.push(alarm.name.to_string());
         }
     }
     fired
@@ -339,7 +351,7 @@ pub(super) async fn settle_triggered_rollbacks(
             continue;
         }
         budget -= triggers.len();
-        let fired = triggers_in_alarm(ctx, region, &triggers).await;
+        let fired = alarms_in_alarm(ctx, region, &triggers).await;
         if fired.is_empty() {
             continue;
         }
@@ -459,31 +471,37 @@ mod tests {
         }
     }
 
-    /// The summary names every trigger that fired, in CloudFormation's own summary shape.
+    /// The summary names every alarm that was in `ALARM`, by NAME, in CloudFormation's own
+    /// wording for this failure.
     #[test]
-    fn the_summary_names_every_trigger_that_fired() {
-        for (case, arns, expected) in [
+    fn the_summary_names_every_alarm_that_was_in_alarm() {
+        for (case, names, expected) in [
             (
-                "one trigger",
-                vec!["arn:aws:cloudwatch:us-east-1:000000000000:alarm:a"],
-                "The following rollback trigger(s) went to ALARM state: \
-                 [arn:aws:cloudwatch:us-east-1:000000000000:alarm:a]. ",
+                "one alarm",
+                vec!["deploy-errors"],
+                "The following CloudWatch Alarms were in ALARM state: deploy-errors",
             ),
             (
-                "two triggers",
-                vec![
-                    "arn:aws:cloudwatch:us-east-1:000000000000:alarm:a",
-                    "arn:aws:cloudwatch:us-east-1:000000000000:alarm:b",
-                ],
-                "The following rollback trigger(s) went to ALARM state: \
-                 [arn:aws:cloudwatch:us-east-1:000000000000:alarm:a, \
-                 arn:aws:cloudwatch:us-east-1:000000000000:alarm:b]. ",
+                "two alarms",
+                vec!["deploy-errors", "deploy-latency"],
+                "The following CloudWatch Alarms were in ALARM state: deploy-errors, \
+                 deploy-latency",
+            ),
+            (
+                "an alarm name carrying a space and a colon",
+                vec!["tier:probe one"],
+                "The following CloudWatch Alarms were in ALARM state: tier:probe one",
             ),
         ] {
-            let actual = trigger_failure_summary(arns.iter().copied());
+            let actual = trigger_failure_summary(names.iter().copied());
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+            assert!(
+                !actual.contains('[') && !actual.ends_with('.') && !actual.ends_with(' '),
+                "case {case:?}: the sentence brackets nothing and ends with the last alarm \
+                 name, got {actual:?}"
             );
         }
     }

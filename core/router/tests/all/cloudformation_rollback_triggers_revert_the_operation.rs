@@ -9,8 +9,9 @@
 //! state during the stack operation or this monitoring period, CloudFormation rolls back the
 //! entire stack operation" — so the stack reaches its rolled-back terminal status
 //! (`ROLLBACK_COMPLETE` for a create, `UPDATE_ROLLBACK_COMPLETE` for an update) carrying the
-//! triggers that fired as its `StackStatusReason`, and the configuration the operation had
-//! already applied in the owning service is put back; a trigger whose alarm is in any other
+//! alarms that were in that state, by NAME, as its `StackStatusReason` and in the stack event
+//! the rollback is recorded in, and the configuration the operation had already applied in the
+//! owning service is put back; a trigger whose alarm is in any other
 //! state rolls nothing back and the operation completes, and a caller that asked for the
 //! failed state to be kept (`DisableRollback`) gets `UPDATE_FAILED` with the change left
 //! where it was.**
@@ -42,10 +43,26 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::query_wire::{decoded_entries, element, opt_element, physical_ids_of};
-use service_com_amazonaws_cloudformation_cloudformation::state::rollback_triggers::{
-    trigger_failure_summary, ALARM_STATE,
+use crate::query_wire::{
+    decoded_entries, element, elements, members_of, opt_element, physical_ids_of,
 };
+use service_com_amazonaws_cloudformation_cloudformation::state::rollback_triggers::ALARM_STATE;
+
+/// The reason an operation its rollback triggers aborted reports, spelled out HERE rather
+/// than taken from the service's own formatter, so this suite pins CloudFormation's wording
+/// instead of borrowing it from the code under test: the fixed text "The following CloudWatch
+/// Alarms were in ALARM state: " and then the alarms that were in that state, by NAME,
+/// comma-separated — nothing around the list and nothing after it. (Recorded behaviour: the
+/// model carries no stack-event reason strings.)
+///
+/// Called with no alarm at all, it is that fixed text alone, which is the sentinel a row
+/// asserting NO such failure was reported looks for.
+fn expected_reason(alarms: &[&str]) -> String {
+    format!(
+        "The following CloudWatch Alarms were in ALARM state: {}",
+        alarms.join(", ")
+    )
+}
 
 /// The Region every call below is signed for, and so the Region the stack, its topic and the
 /// alarms all live in.
@@ -538,12 +555,16 @@ async fn an_alarm_in_alarm_rolls_the_update_it_monitors_back() {
         let topic = format!("{}-topic", row.stack);
 
         // The triggers, each settled in the state its row says CloudWatch computes for it.
+        // The ARN is what the configuration declares a trigger with; the NAME is what the
+        // reason of a rollback those triggers force names, so both are kept, per trigger.
         let mut arns: Vec<String> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
         for (index, trigger) in row.triggers.iter().enumerate() {
             let child = format!("{}-alarm-{index}", row.stack);
             match trigger {
                 Trigger::Metric(treat_missing, _) => {
                     arns.push(given_metric_alarm(&router, case, &child, treat_missing).await);
+                    names.push(child.clone());
                     alarm_settles_in(&router, case, &child, trigger.state()).await;
                 }
                 Trigger::Composite(treat_missing, _) => {
@@ -551,6 +572,7 @@ async fn an_alarm_in_alarm_rolls_the_update_it_monitors_back() {
                     alarm_settles_in(&router, case, &child, trigger.state()).await;
                     let composite = format!("{}-composite-{index}", row.stack);
                     arns.push(given_composite_alarm(&router, case, &composite, &child).await);
+                    names.push(composite.clone());
                     alarm_settles_in(&router, case, &composite, trigger.state()).await;
                 }
             }
@@ -592,37 +614,7 @@ async fn an_alarm_in_alarm_rolls_the_update_it_monitors_back() {
         if row.disable_rollback {
             members.push(member("DisableRollback", "true"));
         }
-        match row.deploy {
-            Deploy::UpdateStack => {
-                let mut update = vec![member("StackName", row.stack)];
-                update.extend(members);
-                cfn_ok(&router, case, "UpdateStack", &update).await;
-            }
-            Deploy::ExecuteChangeSet => {
-                let change_set = format!("{}-change-set", row.stack);
-                let mut create = vec![
-                    member("StackName", row.stack),
-                    member("ChangeSetName", &change_set),
-                ];
-                create.extend(members);
-                cfn_ok(&router, case, "CreateChangeSet", &create).await;
-                let planned = planned_change_set(&router, case, row.stack, &change_set).await;
-                assert_eq!(
-                    planned, "AVAILABLE",
-                    "case {case:?}: the change set must be executable, got {planned:?}"
-                );
-                cfn_ok(
-                    &router,
-                    case,
-                    "ExecuteChangeSet",
-                    &[
-                        member("StackName", row.stack),
-                        member("ChangeSetName", &change_set),
-                    ],
-                )
-                .await;
-            }
-        }
+        deploy_revision(&router, case, row.stack, members, row.deploy).await;
 
         let settled = settled_stack(&router, case, row.stack).await;
         let status = opt_element(&settled, "StackStatus").unwrap_or_default();
@@ -632,26 +624,26 @@ async fn an_alarm_in_alarm_rolls_the_update_it_monitors_back() {
             row.expected_status
         );
 
-        // The reason names the triggers that fired, and only those.
+        // The reason names the alarms that were in ALARM, and only those.
         let fired: Vec<&str> = row
             .triggers
             .iter()
-            .zip(arns.iter())
+            .zip(names.iter())
             .filter(|(trigger, _)| trigger.state() == ALARM_STATE)
-            .map(|(_, arn)| arn.as_str())
+            .map(|(_, name)| name.as_str())
             .collect();
         let reason = opt_element(&settled, "StackStatusReason").unwrap_or_default();
         if fired.is_empty() {
             assert!(
-                !reason.contains("rollback trigger"),
+                !reason.contains(&expected_reason(&[])),
                 "case {case:?}: an operation no trigger fired on reports no trigger failure, \
                  got {reason:?}"
             );
         } else {
             assert_eq!(
                 reason,
-                trigger_failure_summary(fired.iter().copied()),
-                "case {case:?}: expected the reason to name the triggers that fired, got \
+                expected_reason(&fired),
+                "case {case:?}: expected the reason to name the alarms that were in ALARM, got \
                  {reason:?}"
             );
         }
@@ -693,6 +685,219 @@ async fn planned_change_set(
         tokio::time::sleep(LOOK_AGAIN).await;
     }
     panic!("case {case:?}: the change set {name} never settled within {DEADLINE:?}: {last}");
+}
+
+/// Deploy a revision onto the stack through the operation `deploy` names, with `members`
+/// carrying the template body and the rollback configuration that monitors it.
+///
+/// Written once, because every row of this suite deploys its revision one of these two ways
+/// and what the suite asserts is what became of the stack afterwards, not how the revision
+/// got there.
+async fn deploy_revision(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+    members: Vec<(String, String)>,
+    deploy: Deploy,
+) {
+    match deploy {
+        Deploy::UpdateStack => {
+            let mut update = vec![member("StackName", stack)];
+            update.extend(members);
+            cfn_ok(router, case, "UpdateStack", &update).await;
+        }
+        Deploy::ExecuteChangeSet => {
+            let change_set = format!("{stack}-change-set");
+            let mut create = vec![
+                member("StackName", stack),
+                member("ChangeSetName", &change_set),
+            ];
+            create.extend(members);
+            cfn_ok(router, case, "CreateChangeSet", &create).await;
+            let planned = planned_change_set(router, case, stack, &change_set).await;
+            assert_eq!(
+                planned, "AVAILABLE",
+                "case {case:?}: the change set must be executable, got {planned:?}"
+            );
+            cfn_ok(
+                router,
+                case,
+                "ExecuteChangeSet",
+                &[
+                    member("StackName", stack),
+                    member("ChangeSetName", &change_set),
+                ],
+            )
+            .await;
+        }
+    }
+}
+
+/// The `ResourceStatusReason` of every event the STACK itself recorded at `status`, in the
+/// order `DescribeStackEvents` reports them.
+///
+/// Only the stack's own events are read — `ResourceType` `AWS::CloudFormation::Stack`, the
+/// type a stack-level event carries — so a resource's event is never mistaken for the
+/// operation's own, and each event's two members are read out of the one `<member>` that
+/// carries both rather than by zipping two document-ordered lists.
+async fn stack_event_reasons_at(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+    status: &str,
+) -> Vec<String> {
+    let body = cfn_ok(
+        router,
+        case,
+        "DescribeStackEvents",
+        &[member("StackName", stack)],
+    )
+    .await;
+    members_of(&body)
+        .into_iter()
+        .filter(|event| {
+            elements(event, "ResourceType")
+                .first()
+                .is_some_and(|resource_type| resource_type.as_str() == "AWS::CloudFormation::Stack")
+                && elements(event, "ResourceStatus")
+                    .first()
+                    .is_some_and(|reported| reported.as_str() == status)
+        })
+        .map(|event| {
+            elements(event, "ResourceStatusReason")
+                .into_iter()
+                .next()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// One row of the triggered-rollback EVENT table: the alarms the revision is monitored by,
+/// each as the suffix its name carries and the trigger whose state CloudWatch settles it in,
+/// and the operation that deploys the revision.
+struct EventRow {
+    case: &'static str,
+    /// The stack name, which also seeds the topic and the alarm names.
+    stack: &'static str,
+    alarms: &'static [(&'static str, Trigger)],
+    deploy: Deploy,
+}
+
+/// The stack EVENT a rollback the triggers forced is recorded in names the alarms that were
+/// in `ALARM`, by NAME.
+///
+/// RULE under test: **the `UPDATE_ROLLBACK_IN_PROGRESS` event of an update its rollback
+/// triggers aborted carries one `ResourceStatusReason` — the fixed text "The following
+/// CloudWatch Alarms were in ALARM state: " and then the NAME of each alarm that was in that
+/// state, comma-separated, with nothing around the list and no punctuation after it.** (The
+/// wording is CloudFormation's recorded behaviour; the model carries no stack-event reason
+/// strings.) The alarm NAME is `PutMetricAlarm$AlarmName`, the name the trigger's ARN
+/// carries — never the ARN itself, which is what a client re-checking the alarm through
+/// `DescribeAlarms$AlarmNames` could not use.
+///
+/// The rows differ along what the rule generalises over: how many alarms the configuration
+/// monitors the revision with, how many of them are in that state, the shape of their names,
+/// and the operation that deploys the revision.
+#[tokio::test]
+async fn the_triggered_rollback_event_names_the_alarms_that_were_in_alarm() {
+    let rows: &[EventRow] = &[
+        EventRow {
+            case: "one alarm, deployed as a change set",
+            stack: "rbt-event-one",
+            alarms: &[("solo", FIRING)],
+            deploy: Deploy::ExecuteChangeSet,
+        },
+        EventRow {
+            case: "two alarms, both in ALARM",
+            stack: "rbt-event-both",
+            alarms: &[("first", FIRING), ("second", FIRING)],
+            deploy: Deploy::UpdateStack,
+        },
+        EventRow {
+            case: "one of two alarms in ALARM names only that one",
+            stack: "rbt-event-one-of-two",
+            alarms: &[("quiet", QUIET), ("loud", FIRING)],
+            deploy: Deploy::UpdateStack,
+        },
+        // An alarm name may carry characters an ARN's earlier fields never do, and the name
+        // is taken out of the ARN whole, so the sentence names it whole.
+        EventRow {
+            case: "an alarm whose name carries a colon and a dot",
+            stack: "rbt-event-named",
+            alarms: &[("tier:probe.one", FIRING)],
+            deploy: Deploy::UpdateStack,
+        },
+    ];
+
+    for row in rows {
+        let router = build_router();
+        let case = row.case;
+        let topic = format!("{}-topic", row.stack);
+
+        // The alarms, each settled in the state its trigger says CloudWatch computes for it.
+        let mut arns: Vec<String> = Vec::new();
+        let mut in_alarm: Vec<String> = Vec::new();
+        for (suffix, trigger) in row.alarms {
+            let Trigger::Metric(treat_missing, _) = trigger else {
+                unreachable!("every row of this table names a metric alarm")
+            };
+            let name = format!("{}-{suffix}", row.stack);
+            arns.push(given_metric_alarm(&router, case, &name, treat_missing).await);
+            alarm_settles_in(&router, case, &name, trigger.state()).await;
+            if trigger.state() == ALARM_STATE {
+                in_alarm.push(name);
+            }
+        }
+
+        cfn_ok(
+            &router,
+            case,
+            "CreateStack",
+            &[
+                member("StackName", row.stack),
+                member("TemplateBody", &template(&topic, BEFORE)),
+            ],
+        )
+        .await;
+        let created = settled_stack(&router, case, row.stack).await;
+        assert_eq!(
+            opt_element(&created, "StackStatus").as_deref(),
+            Some("CREATE_COMPLETE"),
+            "case {case:?}: the stack under test must be created, got {created}"
+        );
+
+        let mut members = vec![member("TemplateBody", &template(&topic, AFTER))];
+        members.extend(rollback_configuration(&arns, Some(1)));
+        deploy_revision(&router, case, row.stack, members, row.deploy).await;
+
+        let settled = settled_stack(&router, case, row.stack).await;
+        let status = opt_element(&settled, "StackStatus").unwrap_or_default();
+        assert_eq!(
+            status, "UPDATE_ROLLBACK_COMPLETE",
+            "case {case:?}: expected UPDATE_ROLLBACK_COMPLETE, got {status:?} in {settled}"
+        );
+
+        let firing: Vec<&str> = in_alarm.iter().map(String::as_str).collect();
+        let expected = expected_reason(&firing);
+        let reasons =
+            stack_event_reasons_at(&router, case, row.stack, "UPDATE_ROLLBACK_IN_PROGRESS").await;
+        assert_eq!(
+            reasons,
+            vec![expected.clone()],
+            "case {case:?}: expected exactly one rolled-back event reading {expected:?}, got \
+             {reasons:?}"
+        );
+        let reason = reasons.first().cloned().unwrap_or_default();
+        assert!(
+            !reason.contains("arn:") && !reason.contains('['),
+            "case {case:?}: the sentence names the alarms, never their ARNs and nothing \
+             around them, got {reason:?}"
+        );
+        assert!(
+            !reason.ends_with('.') && !reason.ends_with(' '),
+            "case {case:?}: the sentence ends with the last alarm name, got {reason:?}"
+        );
+    }
 }
 
 /// A CREATE is monitored by the same triggers, and the rollback of a create removes what it
@@ -748,8 +953,8 @@ async fn an_alarm_in_alarm_rolls_the_create_it_monitors_back() {
             let reason = opt_element(&settled, "StackStatusReason").unwrap_or_default();
             assert_eq!(
                 reason,
-                trigger_failure_summary([arn.as_str()]),
-                "case {case:?}: expected the reason to name the trigger that fired, got \
+                expected_reason(&[alarm.as_str()]),
+                "case {case:?}: expected the reason to name the alarm that was in ALARM, got \
                  {reason:?}"
             );
         }
