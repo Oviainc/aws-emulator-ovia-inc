@@ -229,15 +229,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You can't convert a public hosted zone into a private hosted zone":
         // a VPC association belongs to a private zone only, and the model
-        // carries a refusal of its own for exactly this request.
+        // carries a refusal of its own for exactly this request. The sentence
+        // names the two resources the refused association was between, each by
+        // its ID — the zone by the id the request addressed it by, as this
+        // service resolved it, and the VPC by the id the request body named —
+        // so a caller can correlate the refusal back to both without a further
+        // read.
         if !zone.private_zone {
             return Err(AssociateVPCWithHostedZoneErrorModeled::PublicZoneVPCAssociation(
                 PublicZoneVPCAssociation {
                     message: Some(format!(
-                        "You're trying to associate a VPC with a public hosted zone: {} is a \
-                         public hosted zone, and Route 53 doesn't support associating a VPC \
-                         with a public hosted zone.",
-                        zone.name
+                        "Attempting to associate public zone: {zone_id} with vpc: {vpc_id}"
                     )),
                 },
             )

@@ -106,6 +106,10 @@ mod hosted_zones_by_vpc;
 mod listing_page_size_echo;
 #[path = "all/reference_catalogs.rs"]
 mod reference_catalogs;
+// Declared beside the other refusal-wording suites: this one is the three
+// refusals whose message is a fixed form the other suites' tables do not cover.
+#[path = "all/refusal_message_forms.rs"]
+mod refusal_message_forms;
 #[path = "all/refusal_message_rules.rs"]
 mod refusal_message_rules;
 #[path = "all/record_name_canonical_form.rs"]

@@ -180,6 +180,15 @@ const SOA_RECORD_TTL: i64 = 900;
 /// a new zone's SOA record (same Developer Guide page).
 const SOA_RDATA_TAIL: &str = "awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400";
 
+/// The FIXED text of the `InvalidDomainName` (HTTP 400) refusal a hosted zone
+/// name the service reserves is answered with, appended to the requested name.
+///
+/// The whole message is the requested name followed by this suffix and nothing
+/// else: a reserved name is refused for being reserved, so the sentence states
+/// that one fact rather than the reason the name is in the reserved part of the
+/// namespace.
+const RESERVED_NAME_FIXED_TEXT: &str = " is reserved by AWS!";
+
 /// The default SOA record and NS record (carrying all four name servers) that
 /// Route 53 creates at a new hosted zone's apex.
 ///
@@ -315,14 +324,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // its name, whatever spelling it was created with.
         let name = canonical_dns_name(&input.name);
         // "You can't create a hosted zone for a top-level domain (TLD) such as
-        // .com." A zone name therefore needs at least two labels.
+        // .com." A zone name therefore needs at least two labels: a name that
+        // spells one label alone names a top-level domain, and that whole level
+        // of the namespace is reserved rather than delegable to an account — so
+        // the refusal reports the name as RESERVED, which is the rule it broke,
+        // rather than as a name the domain-name format rejects (it does not).
         if name.trim_end_matches('.').split('.').count() < 2 {
             return Err(CreateHostedZoneErrorModeled::InvalidDomainName(InvalidDomainName {
-                message: Some(format!(
-                    "{} is not a valid hosted zone name: a hosted zone cannot be created for a \
-                     top-level domain",
-                    input.name
-                )),
+                // REQUEST-DERIVED: the one variable part is the requested name,
+                // echoed exactly as the request wrote it rather than in the
+                // canonical form a created zone would be stored under, so the
+                // caller reads back the name it sent.
+                message: Some(format!("{}{RESERVED_NAME_FIXED_TEXT}", input.name)),
             })
             .into());
         }

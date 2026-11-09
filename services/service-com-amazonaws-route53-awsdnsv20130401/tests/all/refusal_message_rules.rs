@@ -449,10 +449,21 @@ struct DocumentRow {
 }
 
 /// The clause a document that declares no endpoint is refused with.
-const NO_ENDPOINT: &str = "At least one endpoint must be declared.";
+///
+/// `pub(crate)` so the sibling suite asserting the record-type clause's
+/// POSITION reads the clauses it is positioned against from here rather than
+/// growing a second copy of them.
+pub(crate) const NO_ENDPOINT: &str = "At least one endpoint must be declared.";
 
 /// The clause a document without exactly one entry point is refused with.
-const ENTRY_POINT: &str = "Either StartRule or StartEndpoint must be declared, but not both";
+pub(crate) const ENTRY_POINT: &str =
+    "Either StartRule or StartEndpoint must be declared, but not both";
+
+/// The ONE clause a document that declares no record type the service supports
+/// is refused with, reported after every other clause (`crate::state`'s
+/// `RECORD_TYPE_CLAUSE`; the suite `refusal_message_forms` is where that rule's
+/// own table lives, and it reads the clause from here).
+pub(crate) const RECORD_TYPE: &str = "Policy RecordType is missing or not supported.";
 
 #[tokio::test]
 async fn a_faulty_document_reports_every_constraint_it_violates() {
@@ -474,9 +485,9 @@ async fn a_faulty_document_reports_every_constraint_it_violates() {
             document: "{}".to_string(),
             clauses: vec![
                 "AWSPolicyFormatVersion must be declared.".to_string(),
-                "RecordType must be declared.".to_string(),
                 NO_ENDPOINT.to_string(),
                 ENTRY_POINT.to_string(),
+                RECORD_TYPE.to_string(),
             ],
         },
         DocumentRow {
@@ -491,12 +502,11 @@ async fn a_faulty_document_reports_every_constraint_it_violates() {
                      document format version, the supported version is \
                      {TRAFFIC_POLICY_FORMAT_VERSION}."
                 ),
-                "RecordType NOTATYPE is not a DNS record type a traffic policy can create."
-                    .to_string(),
                 NO_ENDPOINT.to_string(),
                 ENTRY_POINT.to_string(),
                 "StartEndpoint first does not reference a declared endpoint.".to_string(),
                 "StartRule second does not reference a declared rule.".to_string(),
+                RECORD_TYPE.to_string(),
             ],
         },
         DocumentRow {
@@ -508,7 +518,7 @@ async fn a_faulty_document_reports_every_constraint_it_violates() {
                  \"StartEndpoint\":\"only\",\
                  \"Endpoints\":{{\"only\":{{\"Type\":\"value\",\"Value\":\"192.0.2.1\"}}}}}}"
             ),
-            clauses: vec!["RecordType must be declared.".to_string()],
+            clauses: vec![RECORD_TYPE.to_string()],
         },
         DocumentRow {
             case: "an endpoint that is not a JSON object",

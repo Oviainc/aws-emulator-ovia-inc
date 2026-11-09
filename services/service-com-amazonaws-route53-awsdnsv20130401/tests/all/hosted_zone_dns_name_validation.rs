@@ -286,9 +286,13 @@ async fn a_name_at_each_published_bound_is_accepted() {
 #[tokio::test]
 async fn a_name_that_is_a_domain_name_but_no_zone_name_keeps_its_own_refusal() {
     // The format rule is not the only rule a zone's name has to satisfy: "you
-    // can't create a hosted zone for a top-level domain (TLD)", which is a
-    // different refusal under the same code — so a single-label name is refused
-    // for THAT reason rather than reported as a malformed domain name.
+    // can't create a hosted zone for a top-level domain (TLD)", and that whole
+    // level of the namespace is reserved rather than delegable — a different
+    // refusal under the same code, so a single-label name is refused as a
+    // RESERVED name rather than reported as a malformed domain name. The
+    // sentence itself is the subject of the `refusal_message_forms` suite, which
+    // spans the single-label class; here it is only what separates the two
+    // refusals.
     let router = router();
     for (index, name) in ["com", "test", "example"].iter().enumerate() {
         let reply = create_zone(&router, name, &format!("dns-name-tld-{index}")).await;
@@ -309,9 +313,11 @@ async fn a_name_that_is_a_domain_name_but_no_zone_name_keeps_its_own_refusal() {
             "case {name:?}: a well-formed domain name must not be reported as malformed, got \
              {got:?}"
         );
-        assert!(
-            got.contains("top-level domain"),
-            "case {name:?}: the refusal must state the rule a zone's name broke, got {got:?}"
+        let expected = format!("{name} is reserved by AWS!");
+        assert_eq!(
+            got, expected,
+            "case {name:?}: the refusal must state the rule a zone's name broke, expected \
+             {expected:?}, got {got:?}"
         );
     }
 }

@@ -2966,7 +2966,7 @@ pub fn zone_record_set_limit_message(requested_zone_id: &str, would_hold: usize)
 ///
 /// A document is checked against EVERY structural constraint of the format and
 /// the refusal enumerates every one it violates — one clause per violated
-/// constraint, in the order the format declares them, joined with `;` — so a
+/// constraint, in this service's own fixed clause order, joined with `;` — so a
 /// caller authoring a document learns all of its faults from one request
 /// instead of one fault per round trip. The ONE place this service words that
 /// refusal, so every operation that takes a document (the create, and the
@@ -2996,10 +2996,14 @@ pub fn invalid_traffic_policy_document(violations: &[String]) -> InvalidTrafficP
 /// first: a document can break several of these rules at once and a caller
 /// validating a document by submitting it has to learn about all of them.
 /// Each clause states the constraint that was broken (and, where a value was
-/// the problem, that value); the document itself is never quoted back. The two
-/// faults a document can have before anything else can be checked — it is not
-/// JSON, or it is JSON that is not an object — are the whole refusal on their
-/// own, because no constraint below them can be evaluated at all.
+/// the problem, that value); the document itself is never quoted back. The
+/// clause order is FIXED — it does not follow the order the members happen to
+/// appear in the document — and the record-type clause
+/// ([`RECORD_TYPE_CLAUSE`]) comes last, after the endpoint and entry-point
+/// clauses. The two faults a document can have before anything else can be
+/// checked — it is not JSON, or it is JSON that is not an object — are the whole
+/// refusal on their own, because no constraint below them can be evaluated at
+/// all.
 pub fn traffic_policy_record_type(document: &str) -> Result<String, Vec<String>> {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(document) else {
         return Err(vec![
@@ -3028,16 +3032,12 @@ pub fn traffic_policy_record_type(document: &str) -> Result<String, Vec<String>>
 
     let record_type = match root.get("RecordType").and_then(serde_json::Value::as_str) {
         Some(value) if R_R_TYPE_VALUES.contains(&value) => Some(value.to_string()),
-        Some(other) => {
-            violations.push(format!(
-                "RecordType {other} is not a DNS record type a traffic policy can create."
-            ));
-            None
-        }
-        None => {
-            violations.push("RecordType must be declared.".to_string());
-            None
-        }
+        // The record-type constraint is reported by ONE clause, at the END of
+        // the message: see [`RECORD_TYPE_CLAUSE`]. The clause is pushed after
+        // every other check has run, so the constraints a document breaks are
+        // reported in the order this service reports them in whichever
+        // combination they are broken.
+        _ => None,
     };
 
     // A document declares the endpoints it can route to in `Endpoints`, which
@@ -3114,12 +3114,31 @@ pub fn traffic_policy_record_type(document: &str) -> Result<String, Vec<String>>
     }
 
     match record_type {
-        // Every branch that leaves the record type unread pushes a clause of
-        // its own, so the `Err` arm always carries at least one.
+        // A document that declares a record type the service supports and
+        // breaks nothing else IS the policy's record type; anything else is the
+        // refusal, which always carries at least one clause — the record-type
+        // clause this last arm appends when the type itself is the fault.
         Some(record_type) if violations.is_empty() => Ok(record_type),
-        _ => Err(violations),
+        Some(_) => Err(violations),
+        None => {
+            // The record-type clause is the LAST one reported, whatever else
+            // the document breaks.
+            violations.push(RECORD_TYPE_CLAUSE.to_string());
+            Err(violations)
+        }
     }
 }
+
+/// The ONE clause a traffic policy document whose `RecordType` the format does
+/// not accept is refused with.
+///
+/// One clause for BOTH ways the constraint is broken — the member is absent, or
+/// it names something that is not a DNS record type a traffic policy can create
+/// — because the constraint is that the document declares a record type the
+/// service supports, and the sentence states exactly that; which of the two it
+/// was is visible in the document the caller submitted. It is reported after
+/// every other clause the document earns.
+const RECORD_TYPE_CLAUSE: &str = "Policy RecordType is missing or not supported.";
 
 /// The names of the entries of a traffic policy document's `Endpoints` or
 /// `Rules` block that are not themselves JSON objects: both blocks map a name
