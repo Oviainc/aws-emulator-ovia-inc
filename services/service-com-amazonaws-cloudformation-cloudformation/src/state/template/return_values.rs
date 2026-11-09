@@ -352,6 +352,39 @@ pub(super) fn return_values(
             attributes.insert("DeploymentId".to_string(), id.clone());
             (id, attributes)
         }
+        // "Ref returns the API key ID"; Fn::GetAtt: APIKeyId. API Gateway ASSIGNS the id —
+        // a template names the key but not its identifier — so the stand-in is of the form
+        // [`api_gateway_assigned_id`] describes and is REPLACED by the id `CreateApiKey`
+        // really minted, which is what [`identity_is_service_assigned`] names this type
+        // for.
+        APIGATEWAY_API_KEY => {
+            let id = api_gateway_assigned_id(APIGATEWAY_API_KEY_ID_SALT, name);
+            attributes.insert("APIKeyId".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the authorizer ID"; Fn::GetAtt: AuthorizerId. The same
+        // service-assigned shape, replaced by the id `CreateAuthorizer` mints.
+        APIGATEWAY_AUTHORIZER => {
+            let id = api_gateway_assigned_id(APIGATEWAY_AUTHORIZER_ID_SALT, name);
+            attributes.insert("AuthorizerId".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the usage plan ID"; Fn::GetAtt: Id. The same service-assigned shape,
+        // replaced by the id `CreateUsagePlan` mints.
+        APIGATEWAY_USAGE_PLAN => {
+            let id = api_gateway_assigned_id(APIGATEWAY_USAGE_PLAN_ID_SALT, name);
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
+        // "Ref returns the usage plan key ID"; Fn::GetAtt: Id. An association's id is the id
+        // of the API KEY it put in the plan, which only API Gateway produces either, so the
+        // stand-in takes the same shape and is replaced by what `CreateUsagePlanKey`
+        // answered.
+        APIGATEWAY_USAGE_PLAN_KEY => {
+            let id = api_gateway_assigned_id(APIGATEWAY_USAGE_PLAN_KEY_ID_SALT, name);
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
         // "Ref returns the API ID"; Fn::GetAtt: ApiEndpoint ("The default endpoint for an
         // API"). API Gateway v2 ASSIGNS the id — a template names the api but not its
         // identifier — so the id is of the form [`api_gateway_assigned_id`] describes and
@@ -1632,6 +1665,9 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         APIGATEWAY_REST_API => &["RestApiId", "RootResourceId"],
         APIGATEWAY_RESOURCE => &["ResourceId"],
         APIGATEWAY_DEPLOYMENT => &["DeploymentId"],
+        APIGATEWAY_API_KEY => &["APIKeyId"],
+        APIGATEWAY_AUTHORIZER => &["AuthorizerId"],
+        APIGATEWAY_USAGE_PLAN | APIGATEWAY_USAGE_PLAN_KEY => &["Id"],
         APIGATEWAYV2_API => &["ApiEndpoint"],
         APIGATEWAYV2_API_MAPPING => &["ApiMappingId"],
         APIGATEWAYV2_DOMAIN_NAME => &["DomainNameArn", "RegionalDomainName"],
@@ -1731,6 +1767,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == APIGATEWAY_REST_API
         || resource_type == APIGATEWAY_RESOURCE
         || resource_type == APIGATEWAY_DEPLOYMENT
+        // The four types that govern ACCESS to a REST API are four more, for the reason
+        // their own constants record ([`APIGATEWAY_API_KEY`] and its siblings): each
+        // create takes no identifier and answers the id API Gateway assigned, every call on
+        // one takes that id, and a template declares a name or an association's members
+        // rather than any of them.
+        || resource_type == APIGATEWAY_API_KEY
+        || resource_type == APIGATEWAY_AUTHORIZER
+        || resource_type == APIGATEWAY_USAGE_PLAN
+        || resource_type == APIGATEWAY_USAGE_PLAN_KEY
         // An Amazon EKS pod identity association is one more: that create takes no
         // identifier and answers the ARN and the id Amazon EKS minted for the association,
         // and "Ref returns the association ARN" — a template declares the cluster, the
@@ -2854,6 +2899,20 @@ pub const APIGATEWAY_REST_API: &str = "AWS::ApiGateway::RestApi";
 pub const APIGATEWAY_RESOURCE: &str = "AWS::ApiGateway::Resource";
 pub const APIGATEWAY_DEPLOYMENT: &str = "AWS::ApiGateway::Deployment";
 
+/// The Amazon API Gateway resource types that govern ACCESS to a REST API, whose published
+/// `Ref` is a SERVICE-ASSIGNED id in the same position: `CreateApiKey`, `CreateAuthorizer`
+/// and `CreateUsagePlan` each take no identifier and answer the `id` that service assigned —
+/// "Ref returns the API key ID", "Ref returns the authorizer ID", "Ref returns the usage
+/// plan ID" — and a `UsagePlanKey`'s own id is the id of the key its create put in the plan
+/// ("Ref returns the usage plan key ID"). A template declares a key's or a plan's NAME and
+/// an association's members, never any of those ids, and every call on one takes the minted
+/// id (`GetApiKey$apiKey`, `GetAuthorizer$authorizerId`, `GetUsagePlan$usagePlanId`), which
+/// is why [`identity_is_service_assigned`] names all four.
+pub const APIGATEWAY_API_KEY: &str = "AWS::ApiGateway::ApiKey";
+pub const APIGATEWAY_AUTHORIZER: &str = "AWS::ApiGateway::Authorizer";
+pub const APIGATEWAY_USAGE_PLAN: &str = "AWS::ApiGateway::UsagePlan";
+pub const APIGATEWAY_USAGE_PLAN_KEY: &str = "AWS::ApiGateway::UsagePlanKey";
+
 /// `AWS::ApiGateway::DomainName`: a custom domain name of the REST control plane, which a
 /// stack creates in API Gateway itself ([`super::provisioner`]).
 ///
@@ -2931,6 +2990,10 @@ pub(super) const APIGATEWAY_REST_API_ID_SALT: &str = "apigateway/rest-api-id";
 pub(super) const APIGATEWAY_ROOT_RESOURCE_ID_SALT: &str = "apigateway/root-resource-id";
 pub(super) const APIGATEWAY_RESOURCE_ID_SALT: &str = "apigateway/resource-id";
 pub(super) const APIGATEWAY_DEPLOYMENT_ID_SALT: &str = "apigateway/deployment-id";
+pub(super) const APIGATEWAY_API_KEY_ID_SALT: &str = "apigateway/api-key-id";
+pub(super) const APIGATEWAY_AUTHORIZER_ID_SALT: &str = "apigateway/authorizer-id";
+pub(super) const APIGATEWAY_USAGE_PLAN_ID_SALT: &str = "apigateway/usage-plan-id";
+pub(super) const APIGATEWAY_USAGE_PLAN_KEY_ID_SALT: &str = "apigateway/usage-plan-key-id";
 pub(super) const APIGATEWAYV2_API_ID_SALT: &str = "apigatewayv2/api-id";
 pub(super) const APIGATEWAYV2_API_MAPPING_ID_SALT: &str = "apigatewayv2/api-mapping-id";
 pub(super) const APIGATEWAYV2_DOMAIN_LABEL_SALT: &str = "apigatewayv2/regional-domain-label";

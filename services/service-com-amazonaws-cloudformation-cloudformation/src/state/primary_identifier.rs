@@ -79,6 +79,12 @@ fn identifying_return_value(resource_type: &str) -> Option<&'static str> {
         APIGATEWAY_REST_API => "RestApiId",
         APIGATEWAY_RESOURCE => "ResourceId",
         APIGATEWAY_DEPLOYMENT => "DeploymentId",
+        // The four types that govern access to a REST API: a key, an authorizer and a plan
+        // are each identified by the id their own create minted, and an association by the
+        // id of the key it put in the plan.
+        APIGATEWAY_API_KEY => "APIKeyId",
+        APIGATEWAY_AUTHORIZER => "AuthorizerId",
+        APIGATEWAY_USAGE_PLAN | APIGATEWAY_USAGE_PLAN_KEY => "Id",
         APIGATEWAYV2_API => "ApiId",
         APIGATEWAYV2_API_MAPPING => "ApiMappingId",
         // The AWS Transfer Family types, each identified by the ARN its create answers.

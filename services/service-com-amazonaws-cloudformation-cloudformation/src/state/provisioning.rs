@@ -713,10 +713,12 @@ pub(super) enum Owner {
     /// `AWS::StepFunctions::StateMachine`, whose arms are
     /// [`step_functions_state_machine`]'s.
     StepFunctionsStateMachine,
-    /// One of the five `AWS::ApiGateway::*` types a REST API is built out of, which
+    /// One of the `AWS::ApiGateway::*` types of that service's REST control plane, which
     /// [`apigateway_rest_api`] creates in Amazon API Gateway: the api, a resource of it, a
-    /// method on that resource, a deployment of them and the stage that serves it. Which of
-    /// them it is travels with the owner, as it does for the Amazon EC2 types above.
+    /// method on that resource, a deployment of them, the stage that serves it, and the four
+    /// that govern who reaches that stage — an authorizer, an api key, a usage plan and the
+    /// association that puts a key in a plan. Which of them it is travels with the owner, as
+    /// it does for the Amazon EC2 types above.
     ApiGatewayRestApi(apigateway_rest_api::Kind),
     /// One of the two `AWS::ApplicationAutoScaling::*` types
     /// [`application_auto_scaling`] registers in Application Auto Scaling: the scalable

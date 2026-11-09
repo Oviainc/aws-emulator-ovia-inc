@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The five `AWS::ApiGateway::*` types a REST API is built out of — the api itself, its
-//! resources, its methods, a deployment of them and the stage that serves it — created in
-//! Amazon API Gateway itself.
+//! The `AWS::ApiGateway::*` types of the REST control plane this emulator creates in Amazon
+//! API Gateway itself: the five a REST API is built out of — the api, its resources, its
+//! methods, a deployment of them and the stage that serves it — and, in
+//! [`access_control`], the four that govern who reaches that stage — the authorizer that
+//! decides a request, the api key a caller presents, the usage plan that meters a key and
+//! the association that puts a key in a plan.
 //!
 //! This is the per-type half of provisioning for those types, the half
 //! [`super::super::provisioner`] holds for every other type this emulator creates; it lives
@@ -70,6 +73,11 @@ use crate::state::provisioner::{
 use crate::state::template::{APIGATEWAY_DEPLOYMENT, APIGATEWAY_RESOURCE, APIGATEWAY_REST_API};
 use crate::state::StoredResource;
 
+/// The four types that govern ACCESS to a REST API rather than making one up, in a module of
+/// their own so that neither file grows past the length a change to this repository may
+/// touch. They are reached through the same [`Kind`] every arm here is.
+mod access_control;
+
 /// The two resource types this module provisions that the template module does not name: it
 /// names the three whose `Ref` and `Fn::GetAtt` return an identifier API Gateway assigns
 /// ([`APIGATEWAY_REST_API`], [`APIGATEWAY_RESOURCE`], [`APIGATEWAY_DEPLOYMENT`]), while a
@@ -96,7 +104,7 @@ const MISSING_PROPERTY: &str = "InvalidRequest";
 /// inside a JSON envelope.
 const DEFINITION_MEDIA_TYPE: &str = "application/json";
 
-/// Which of the five types one resource is.
+/// Which of these types one resource is.
 ///
 /// Visible to the whole of this service's state module, because it travels with
 /// [`super::Owner`]: the algorithm resolves a type's owner once and passes it back here.
@@ -112,18 +120,23 @@ pub(in crate::state) enum Kind {
     Deployment,
     /// `AWS::ApiGateway::Stage`.
     Stage,
+    /// One of the four types that govern ACCESS to a REST API, whose arms are
+    /// [`access_control`]'s. Which of them it is travels with the kind, as the kind itself
+    /// travels with [`super::Owner`].
+    AccessControl(access_control::Kind),
 }
 
 /// The kind `resource_type` names, or `None` for a type this module does not own.
 pub(super) fn kind_of(resource_type: &str) -> Option<Kind> {
-    match resource_type {
-        APIGATEWAY_REST_API => Some(Kind::RestApi),
-        APIGATEWAY_RESOURCE => Some(Kind::Resource),
-        APIGATEWAY_METHOD => Some(Kind::Method),
-        APIGATEWAY_DEPLOYMENT => Some(Kind::Deployment),
-        APIGATEWAY_STAGE => Some(Kind::Stage),
-        _ => None,
-    }
+    let kind = match resource_type {
+        APIGATEWAY_REST_API => Kind::RestApi,
+        APIGATEWAY_RESOURCE => Kind::Resource,
+        APIGATEWAY_METHOD => Kind::Method,
+        APIGATEWAY_DEPLOYMENT => Kind::Deployment,
+        APIGATEWAY_STAGE => Kind::Stage,
+        _ => return access_control::kind_of(resource_type).map(Kind::AccessControl),
+    };
+    Some(kind)
 }
 
 /// The property naming the api a resource, a method, a deployment or a stage belongs to,
@@ -146,6 +159,9 @@ pub(super) async fn create(
         Kind::Method => put_method(ctx, region, resource).await,
         Kind::Deployment => create_deployment(ctx, region, resource).await,
         Kind::Stage => create_stage(ctx, region, resource, propagated).await,
+        Kind::AccessControl(kind) => {
+            access_control::create(ctx, region, kind, resource, propagated).await
+        }
     }
 }
 
@@ -179,6 +195,9 @@ pub(super) async fn delete(
             &required(resource, REST_API_ID)?,
             &resource.physical_resource_id,
         ),
+        Kind::AccessControl(kind) => {
+            return access_control::delete(ctx, region, kind, resource).await
+        }
     };
     api_gateway_deleted(ctx, region, &uri).await
 }
@@ -237,6 +256,9 @@ pub(super) async fn actual_configuration(
                      back for drift detection"
                 ),
             })
+        }
+        Kind::AccessControl(kind) => {
+            return access_control::actual_configuration(ctx, region, kind, resource).await
         }
     };
     match call_rest_json(ctx, API_GATEWAY_SIGNING_NAME, region, "GET", &uri, None).await {

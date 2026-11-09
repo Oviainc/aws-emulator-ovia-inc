@@ -1175,6 +1175,11 @@ mod cloudformation_provisions_logs_log_groups;
 // the values Amazon EC2 itself reports for that instance.
 #[path = "all/cloudformation_ec2_instance_rollback.rs"]
 mod cloudformation_ec2_instance_rollback;
+// Declared in the appended tail, which is where every new suite inserts its lines: the API
+// Gateway resources that govern ACCESS to a REST API a stack created — an api key, an
+// authorizer, a usage plan and the association that puts a key in a plan.
+#[path = "all/cloudformation_apigateway_access_control.rs"]
+mod cloudformation_apigateway_access_control;
 // Several suites that stood in this tail were each ALREADY declared above, in the sorted head
 // or earlier in the tail, where their own entry records why they were placed there: two
 // concurrent changes appending one entry is a redefinition that stops this target from
