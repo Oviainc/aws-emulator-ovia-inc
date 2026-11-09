@@ -86,6 +86,29 @@ pub fn maximum_instance_count_below_minimum<E>() -> crate::scaffolded::Scaffolde
     invalid_parameter_value("Maximum instance count must not be smaller than minimum instance count")
 }
 
+/// How EC2 refuses a parameter whose value has to DIFFER from another parameter's: HTTP 400
+/// `InvalidParameterValue`, naming the value the request sent, the parameter it sent it for
+/// and the parameter whose value it may not repeat.
+///
+/// FIXED text apart from those three. Both names are the names the REQUEST uses for those
+/// members, so an operation whose pair is spelled another way is refused with its own names
+/// rather than with a pair written down here, and one definition serves every operation that
+/// publishes such a pair — two of them cannot word this refusal differently. The rule is
+/// about the request's own members, so a handler answers it before resolving either value
+/// against the store. The value is echoed through [`echoed_resource_id`], so naming it cannot
+/// amplify a request into an arbitrarily long response.
+pub fn parameter_must_differ_from<E>(
+    parameter: &str,
+    value: &str,
+    other_parameter: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "Invalid value {value} for {parameter}. The value of {parameter} needs to be \
+         different to {other_parameter}",
+        value = echoed_resource_id(value),
+    ))
+}
+
 /// How EC2 refuses an `attribute` parameter naming a value the action cannot act on: the
 /// value the request sent and the fixed sentence that says the service knows no such
 /// attribute.

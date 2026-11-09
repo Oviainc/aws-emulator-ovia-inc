@@ -1666,23 +1666,6 @@ mod launch_instance_type_catalog;
 // refuses.
 #[path = "all/import_key_pair.rs"]
 mod import_key_pair;
-// The ONE snapshot resource the EBS direct APIs and EC2 both describe: a snapshot
-// `ebs:StartSnapshot` minted reported and resolved on the EC2 side through its whole
-// lifecycle, the narrowings that select it, and the refusal that stays for an id nothing
-// holds. Declared beside `prefix_lists` for the reason the note above gives: the sorted
-#[path = "all/ebs_direct_api_snapshots.rs"]
-mod ebs_direct_api_snapshots;
-// Every SQL Server High Availability state an enabled instance HAS HELD, over the period the
-// request asks about.
-#[path = "all/instance_sql_ha_history_states.rs"]
-mod instance_sql_ha_history_states;
-// Which Reserved Instance offerings the service publishes for a Region — the product of the
-// places one can be used, the product descriptions, the offering classes, the payment options
-// and the terms — how each is priced from its own terms, how the narrowing members, the
-// documented filters, the offering ids and the pages select from it, and that the describe is a
-// read whose ids the exchange operations resolve. Declared at the tail of this file, which is
-#[path = "all/describe_reserved_instances_offerings.rs"]
-mod describe_reserved_instances_offerings;
 // How an idempotency conflict is WORDED: the Network Access Analyzer / Reachability Analyzer
 // actions answer that surface's own sentence beside `IdempotentParameterMismatch`, while the
 // older resource creates of this service answer theirs. Declared at the tail of this file,
@@ -1718,3 +1701,9 @@ mod create_fleet;
 // the store into, and what it refuses. Declared beside `prefix_lists` for the reason the note
 #[path = "all/describe_fleets.rs"]
 mod describe_fleets;
+// Appended at the END of this file, for the reason the header gives. What
+// `CreateTransitGatewayPeeringAttachment` records between two DISTINCT transit gateways, the
+// refusal a request that names one gateway as both ends of the peering earns before either end
+// is resolved, and what `DescribeTransitGatewayPeeringAttachments` then reads back.
+#[path = "all/create_transit_gateway_peering_attachment.rs"]
+mod create_transit_gateway_peering_attachment;

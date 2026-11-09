@@ -177,6 +177,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "Requests a transit gateway peering attachment BETWEEN the specified transit
+        // gateway (requester) and a PEER transit gateway (accepter)": a peering joins two
+        // gateways, so one gateway cannot be both ends of it. This is a rule about the
+        // request's own two members, so it is answered HERE, before either id is resolved —
+        // a request that names one id twice is refused for repeating it whether or not that
+        // id names a gateway this account holds.
+        if input.peer_transit_gateway_id == input.transit_gateway_id {
+            return Err(state::parameter_must_differ_from(
+                PEER_TRANSIT_GATEWAY_ID_PARAMETER,
+                &input.peer_transit_gateway_id,
+                TRANSIT_GATEWAY_ID_PARAMETER,
+            ));
+        }
+
         // "The tags to apply to the transit gateway peering attachment"
         // (`TagSpecifications`) — "you must specify the resource type to tag, otherwise the
         // request will fail" (`TagSpecification`), and the only type this action tags is the
@@ -225,17 +239,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "Invalid value '{transit_gateway_id}' for transitGatewayId. The transit \
                  gateway to request the peering from could not be found",
                 transit_gateway_id = input.transit_gateway_id,
-            )));
-        }
-
-        // "Requests a transit gateway peering attachment BETWEEN the specified transit
-        // gateway (requester) and a PEER transit gateway (accepter)": a peering joins two
-        // gateways, so one gateway cannot be both ends of it.
-        if input.peer_transit_gateway_id == input.transit_gateway_id {
-            return Err(state::invalid_parameter_value(format!(
-                "Invalid value '{peer}' for peerTransitGatewayId. A transit gateway cannot be \
-                 peered with itself",
-                peer = input.peer_transit_gateway_id,
             )));
         }
 
@@ -417,6 +420,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The parameter the requester end of the peering arrives in, named the way the REQUEST names
+/// it: the model puts no `xmlName` or `ec2QueryName` on either end's member of
+/// `CreateTransitGatewayPeeringAttachmentRequest`
+/// (`smithy_query(query="operation",operation="CreateTransitGatewayPeeringAttachment")`), so
+/// each parameter's wire name is its member name.
+const TRANSIT_GATEWAY_ID_PARAMETER: &str = "TransitGatewayId";
+
+/// The parameter the accepter (peer) end of the peering arrives in, named the way the REQUEST
+/// names it — see [`TRANSIT_GATEWAY_ID_PARAMETER`].
+const PEER_TRANSIT_GATEWAY_ID_PARAMETER: &str = "PeerTransitGatewayId";
 
 /// The number of digits an Amazon Web Services account id has, which `PeerAccountId` names
 /// one of.
