@@ -35,6 +35,8 @@ mod harness;
 mod layout_deletion;
 #[path = "all/layout_lifecycle.rs"]
 mod layout_lifecycle;
+#[path = "all/related_item_search.rs"]
+mod related_item_search;
 #[path = "all/related_items.rs"]
 mod related_items;
 #[path = "all/response_and_refusal_fidelity.rs"]

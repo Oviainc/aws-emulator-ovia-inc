@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchAllRelatedItems
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchAllRelatedItems`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchAllRelatedItems::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the related items of EVERY case of one domain from
+//! [`crate::state`], narrowed by the request's type filters, in the order its
+//! `sorts` ask for, one page at a time. It is the only file to touch for THIS
+//! operation's own behaviour; the projection and the filter comparisons every
+//! related-item reader shares live in `crate::state` beside the store.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +171,310 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchAllRelatedItems` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchAllRelatedItemsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SearchAllRelatedItemsErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        // @readonly: it resolves the domain, reports the associations that
+        // satisfy the search criteria, and writes nothing. An SLA's target
+        // instant and status are COMPUTED from the stored association and the
+        // clock on every read (`crate::state::Case::related_item_content`),
+        // never stored back.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchAllRelatedItems"))
+        // Every caller-chosen bound is re-checked BEFORE the store lock is
+        // taken, so no caller-sized work happens while every other request is
+        // blocked, and the scans below are bounded by this code rather than by
+        // the boundary validator alone.
+        let sorts = input.sorts.unwrap_or_default();
+        if let Some(message) =
+            crate::state::list_too_long("sorts", sorts.len(), crate::state::MAX_SEARCH_SORTS)
+        {
+            return Err(SearchAllRelatedItemsErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+        // A sort term names the property it orders by and the direction it
+        // orders in, and a value that is a member of neither enum orders
+        // nothing: it is a bad request rather than an arbitrary order. Checked
+        // here as well as at the boundary, so the comparison below is only ever
+        // asked about properties and directions this service knows.
+        for sort in &sorts {
+            if !SEARCH_ALL_RELATED_ITEMS_SORT_PROPERTY_VALUES.contains(&sort.sort_property.as_str())
+            {
+                return Err(SearchAllRelatedItemsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "sorts carries sortProperty {}, which is not a \
+                             SearchAllRelatedItemsSortProperty; the accepted values are {}",
+                            sort.sort_property,
+                            SEARCH_ALL_RELATED_ITEMS_SORT_PROPERTY_VALUES.join(", ")
+                        ),
+                    },
+                )
+                .into());
+            }
+            if !ORDER_VALUES.contains(&sort.sort_order.as_str()) {
+                return Err(SearchAllRelatedItemsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "sorts carries sortOrder {}, which is not an Order; the accepted \
+                             values are {}",
+                            sort.sort_order,
+                            ORDER_VALUES.join(", ")
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let filters = input.filters.unwrap_or_default();
+        if let Some(message) = crate::state::list_too_long(
+            "filters",
+            filters.len(),
+            crate::state::MAX_RELATED_ITEM_FILTERS,
+        ) {
+            return Err(SearchAllRelatedItemsErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+        for fields in custom_fields_filters(&filters) {
+            if let Some(message) = crate::state::custom_fields_filter_too_complex("filters", fields)
+            {
+                return Err(SearchAllRelatedItemsErrorModeled::ValidationException(
+                    ValidationException { message },
+                )
+                .into());
+            }
+        }
+
+        // The page size this operation admits is its own, narrower than the
+        // listings': `maxResults` is `@range(1..25)` and the response's
+        // `relatedItems` is `@length(max: 25)`. A size outside that range is
+        // refused rather than clamped, in the one wording this service refuses
+        // a page size with, and a request naming no `maxResults` gets the same
+        // number as its default.
+        let limit = input
+            .max_results
+            .unwrap_or(crate::state::MAX_RELATED_ITEMS_PER_PAGE);
+        if !(1..=crate::state::MAX_RELATED_ITEMS_PER_PAGE).contains(&limit) {
+            return Err(SearchAllRelatedItemsErrorModeled::ValidationException(
+                crate::state::max_results_out_of_range(
+                    limit,
+                    crate::state::MAX_RELATED_ITEMS_PER_PAGE,
+                ),
+            )
+            .into());
+        }
+
+        let store = state.lock();
+        let domain = store
+            .domain(&input.domain_id)
+            .map_err(SearchAllRelatedItemsErrorModeled::ResourceNotFoundException)?;
+
+        // The same reference rule the other searches apply: an id the domain
+        // holds no field RECORD for cannot be filtered on, so it is refused in
+        // the service's own words for an unresolvable field reference. A DELETED
+        // field still has a record and the values written against it stay
+        // searchable, so its id resolves here.
+        let filtered_ids: Vec<String> = custom_fields_filters(&filters)
+            .flat_map(crate::state::custom_fields_filter_field_ids)
+            .collect();
+        let unknown = domain.unrecorded_field_ids(filtered_ids.iter().map(String::as_str));
+        if !unknown.is_empty() {
+            return Err(SearchAllRelatedItemsErrorModeled::ValidationException(
+                crate::state::unknown_fields(&unknown),
+            )
+            .into());
+        }
+
+        // One instant for the whole answer, so every SLA it reports is measured
+        // against the same clock reading.
+        let now = ::std::time::SystemTime::now();
+        // Every association of every case of the domain, each projected into the
+        // content a reader reports, and kept when the request names no filter or
+        // when ANY of its filters admits it: "The filters work as an OR
+        // condition: caller gets back related items that match any of the
+        // specified filter types" (`filters`' own documentation). The scan is
+        // linear in the associations the domain holds, which
+        // `crate::state::MAX_CASES_PER_DOMAIN` and
+        // `crate::state::MAX_RELATED_ITEMS_PER_CASE` bound, times the clauses
+        // the request carries, which the checks above bound.
+        let mut matching: Vec<Found<'_>> = Vec::new();
+        for case in domain.cases.values() {
+            for item in case.related_items.values() {
+                let content = case.related_item_content(item, now);
+                if filters.is_empty()
+                    || filters
+                        .iter()
+                        .any(|filter| crate::state::related_item_matches(&content, filter))
+                {
+                    matching.push(Found {
+                        case_id: case.case_id.as_str(),
+                        item,
+                        content,
+                    });
+                }
+            }
+        }
+        matching.sort_by(|left, right| compare_items(left, right, &sorts));
+
+        // The page cursor is the POSITION of the first entry not on the page in
+        // THIS ordering, as a search of cases keys its cursor: the request's own
+        // `sorts` decide the order, and no key built from one stored value is
+        // monotone along an arbitrary sort, let alone a descending one. The rank
+        // is zero-padded so lexicographic order over the key is the result
+        // order, and carries the item's own id so two entries never share a key.
+        let ranked: Vec<(String, Found<'_>)> = matching
+            .into_iter()
+            .enumerate()
+            .map(|(rank, found)| (rank_key(rank, &found.item.related_item_id), found))
+            .collect();
+
+        let page = crate::state::page(
+            &crate::state::page_scope(
+                Self::NAME,
+                &input.domain_id,
+                &criteria_scope(&filters, &sorts),
+            ),
+            ranked,
+            Some(limit),
+            input.next_token.as_deref(),
+        )
+        .map_err(|error| {
+            SearchAllRelatedItemsErrorModeled::ValidationException(
+                crate::state::page_validation_exception(&error),
+            )
+        })?;
+
+        Ok(SearchAllRelatedItemsOutput {
+            related_items: page.items.into_iter().map(response_item).collect(),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The descending `Order`, one of `ORDER_VALUES` (`Asc | Desc`). Ascending is
+/// the other one, and is how a comparison reads before it is reversed.
+const ORDER_DESCENDING: &str = "Desc";
+
+/// The `SearchAllRelatedItemsSortProperty` that orders by the case an
+/// association belongs to; the other one, `AssociationTime`, orders by when the
+/// association was made (`SEARCH_ALL_RELATED_ITEMS_SORT_PROPERTY_VALUES`).
+const SORT_BY_CASE_ID: &str = "CaseId";
+
+/// One association the search found: the case it belongs to, the stored record,
+/// and that record projected into the content a reader reports — computed once,
+/// because the filters narrow on the same projection the response carries.
+struct Found<'a> {
+    case_id: &'a str,
+    item: &'a crate::state::RelatedItem,
+    content: RelatedItemContent,
+}
+
+/// Every custom-item field filter the request carries: the `fields` tree of each
+/// `custom` clause that names one.
+fn custom_fields_filters(
+    filters: &[RelatedItemTypeFilter],
+) -> impl Iterator<Item = &CustomFieldsFilter> {
+    filters.iter().filter_map(|filter| match filter {
+        RelatedItemTypeFilter::Custom(custom) => custom.fields.as_ref(),
+        _ => None,
+    })
+}
+
+/// The key one result is placed at in the ordering the request asked for: its
+/// rank, zero-padded so lexicographic order over the key is the result order,
+/// and the item's own id to make the key unique.
+fn rank_key(rank: usize, related_item_id: &str) -> String {
+    format!("{rank:010}#{related_item_id}")
+}
+
+/// Order two associations by the request's `sorts`, then by association order.
+///
+/// "The sorts work in the order specified: first sort term takes precedence over
+/// subsequent terms" (`sorts`' own documentation). The association instant and
+/// then the item's own id break every remaining tie — including the one a
+/// request that names no sort term at all leaves — so an answer never depends on
+/// the store's hash iteration order, and a page boundary is stable across the
+/// call that hands out a `nextToken` and the call that resumes from it.
+fn compare_items(
+    left: &Found<'_>,
+    right: &Found<'_>,
+    sorts: &[SearchAllRelatedItemsSort],
+) -> ::std::cmp::Ordering {
+    use ::std::cmp::Ordering;
+
+    for sort in sorts {
+        let ordering = if sort.sort_property == SORT_BY_CASE_ID {
+            left.case_id.cmp(right.case_id)
+        } else {
+            left.item.association_time.cmp(&right.item.association_time)
+        };
+        let ordering = if sort.sort_order == ORDER_DESCENDING {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    (
+        left.item.association_time,
+        left.item.related_item_id.as_str(),
+    )
+        .cmp(&(
+            right.item.association_time,
+            right.item.related_item_id.as_str(),
+        ))
+}
+
+/// One association as this operation reports it: the item's own identity, the
+/// case it is associated with, when it was associated, and the content and
+/// attribution the association recorded. "This API returns case identifiers, not
+/// complete case objects" (this operation's documentation), so the case it
+/// belongs to is reported by its id alone.
+fn response_item(found: Found<'_>) -> SearchAllRelatedItemsResponseItem {
+    SearchAllRelatedItemsResponseItem {
+        related_item_id: found.item.related_item_id.clone(),
+        case_id: found.case_id.to_string(),
+        r#type: found.item.item_type.clone(),
+        association_time: crate::state::timestamp(found.item.association_time),
+        content: found.content,
+        performed_by: found.item.performed_by.clone(),
+        tags: crate::state::tags_output(&found.item.tags),
+    }
+}
+
+/// What makes this search a DIFFERENT listing from another one over the same
+/// domain, for [`crate::state::page_scope`]: the criteria that decide which
+/// associations match and in what order they come.
+fn criteria_scope(
+    filters: &[RelatedItemTypeFilter],
+    sorts: &[SearchAllRelatedItemsSort],
+) -> Vec<String> {
+    vec![
+        format!(
+            "filters={}",
+            filters
+                .iter()
+                .map(crate::state::related_item_filter_fingerprint)
+                .collect::<Vec<String>>()
+                .join(",")
+        ),
+        format!(
+            "sorts={}",
+            sorts
+                .iter()
+                .map(|sort| format!("{}:{}", sort.sort_property, sort.sort_order))
+                .collect::<Vec<String>>()
+                .join(",")
+        ),
+    ]
 }

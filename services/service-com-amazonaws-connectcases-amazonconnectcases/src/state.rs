@@ -37,6 +37,16 @@
 //! an opaque `nextToken` for the rest, so no single response grows with the
 //! store.
 
+// Comparing a stored field value against one of the model's `FieldFilter`
+// comparisons: what every search in this service narrows with.
+mod field_filters;
+// Projecting and narrowing a case's related items: what every related-item
+// reader reports.
+mod related_items;
+
+pub use field_filters::*;
+pub use related_items::*;
+
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
@@ -237,10 +247,11 @@ pub const MAX_EVENT_INCLUDED_FIELD_IDS: usize = 400;
 /// the handler for the same reason as [`MAX_CASE_FIELD_IDS`].
 pub const MAX_SEARCH_CASE_FIELD_IDS: usize = 25;
 
-/// Most sorts one `SearchCases` request may apply: the model's
-/// `SearchCasesRequest$sorts` cap of `0..2`
-/// (`smithy_query(query="operation", operation="SearchCases")`), re-checked in
-/// the handler for the same reason as [`MAX_CASE_FIELD_IDS`].
+/// Most sort terms one search of this service may apply: the cap the model
+/// states for BOTH search sort lists, `SearchCasesRequest$sorts` and
+/// `SearchAllRelatedItemsRequest$sorts`, which is `0..2` for each
+/// (`smithy_query(query="operation", operation="SearchCases,SearchAllRelatedItems")`),
+/// re-checked in the handler for the same reason as [`MAX_CASE_FIELD_IDS`].
 pub const MAX_SEARCH_SORTS: usize = 2;
 
 /// Entries one `CaseFilter` list (`andAll` / `orAll`) may carry: the model's

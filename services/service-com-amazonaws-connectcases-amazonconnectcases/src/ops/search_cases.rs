@@ -426,40 +426,10 @@ fn present_value<'a>(
         .filter(|value| !matches!(value, FieldValueUnion::emptyValue(_)))
 }
 
-/// The order one of AWS's comparisons relates two field values by, or `None`
-/// when none of them does: values of two different union variants are values of
-/// two different types, and nothing orders them, so no ordered `FieldFilter`
-/// may admit such a pair and no `equalTo` may call it equal. A double that is
-/// ordered against nothing (a NaN) is likewise related to nothing, which is
-/// what `partial_cmp` answers for it. `Text`, `Url`, `SingleSelect` and
-/// `DateTime` values are all carried as `stringValue`, and lexicographic order
-/// over an RFC 3339 instant is chronological order.
-fn compared_ordering(
-    left: &FieldValueUnion,
-    right: &FieldValueUnion,
-) -> Option<::std::cmp::Ordering> {
-    match (left, right) {
-        (FieldValueUnion::stringValue(left), FieldValueUnion::stringValue(right))
-        | (FieldValueUnion::userArnValue(left), FieldValueUnion::userArnValue(right)) => {
-            Some(left.cmp(right))
-        }
-        (FieldValueUnion::booleanValue(left), FieldValueUnion::booleanValue(right)) => {
-            Some(left.cmp(right))
-        }
-        (FieldValueUnion::doubleValue(left), FieldValueUnion::doubleValue(right)) => {
-            left.partial_cmp(right)
-        }
-        (FieldValueUnion::emptyValue(_), FieldValueUnion::emptyValue(_)) => {
-            Some(::std::cmp::Ordering::Equal)
-        }
-        _ => None,
-    }
-}
-
 /// Order two field values TOTALLY, for the sort.
 ///
 /// A sort needs a TOTAL order — `slice::sort_by` is entitled to panic on a
-/// comparator that is not one — and [`compared_ordering`] is deliberately
+/// comparator that is not one — and [`crate::state::compared_field_values`] is deliberately
 /// partial, so reporting its `None` as a tie would make the relation
 /// intransitive. Here the variant decides first, by a fixed rank, and the
 /// payload only within one variant; every double is ordered, including a NaN,
@@ -502,30 +472,6 @@ fn variant_rank(value: &FieldValueUnion) -> u8 {
     }
 }
 
-/// The text a value carries, for the containment comparisons, or `None` when it
-/// carries none: only the string-valued members of the union hold text.
-fn text_of(value: &FieldValueUnion) -> Option<&str> {
-    match value {
-        FieldValueUnion::stringValue(text) | FieldValueUnion::userArnValue(text) => Some(text),
-        _ => None,
-    }
-}
-
-/// The `FieldValue` a `FieldFilter` compares against: every member of that
-/// union targets `FieldValue`
-/// (`smithy_query(query="shape", shape="FieldFilter")`), which carries both the
-/// field id the filter is about and the value to compare with.
-fn filter_operand(filter: &FieldFilter) -> &FieldValue {
-    match filter {
-        FieldFilter::equalTo(operand)
-        | FieldFilter::Contains(operand)
-        | FieldFilter::greaterThan(operand)
-        | FieldFilter::greaterThanOrEqualTo(operand)
-        | FieldFilter::lessThan(operand)
-        | FieldFilter::lessThanOrEqualTo(operand) => operand,
-    }
-}
-
 /// Does `case` satisfy `filter`?
 ///
 /// `andAll` over no clauses narrows nothing and `orAll` over no clauses admits
@@ -535,9 +481,10 @@ fn filter_operand(filter: &FieldFilter) -> &FieldValue {
 /// already enforced.
 fn case_matches(case: &crate::state::Case, filter: &CaseFilter) -> bool {
     match filter {
-        CaseFilter::Field(field) => {
-            field_filter_matches(present_value(case, &filter_operand(field).id), field)
-        }
+        CaseFilter::Field(field) => crate::state::field_filter_matches(
+            present_value(case, &crate::state::field_filter_operand(field).id),
+            field,
+        ),
         CaseFilter::Tag(TagFilter::equalTo(tag)) => tag_matches(case, tag),
         CaseFilter::Not(inner) => !case_matches(case, inner),
         CaseFilter::andAll(clauses) => clauses.iter().all(|clause| case_matches(case, clause)),
@@ -556,58 +503,6 @@ fn tag_matches(case: &crate::state::Case, tag: &TagValue) -> bool {
     })
 }
 
-/// Does the case's value for the filtered field satisfy the comparison?
-///
-/// `stored` is what the case holds for that field, `None` when it holds nothing
-/// (see [`present_value`]).
-fn field_filter_matches(stored: Option<&FieldValueUnion>, filter: &FieldFilter) -> bool {
-    use ::std::cmp::Ordering;
-
-    match filter {
-        // Equality is equality of the value, variant included. Asking for the
-        // union's `emptyValue` asks for the cases that hold no value for the
-        // field, since that is how an unwritten field reads back.
-        FieldFilter::equalTo(operand) => match (stored, &operand.value) {
-            (stored, FieldValueUnion::emptyValue(_)) => stored.is_none(),
-            (None, _) => false,
-            (Some(stored), wanted) => compared_ordering(stored, wanted) == Some(Ordering::Equal),
-        },
-        // Containment is over text, compared without regard to case, and a value
-        // that carries no text contains nothing.
-        FieldFilter::Contains(operand) => {
-            match (stored.and_then(text_of), text_of(&operand.value)) {
-                (Some(stored), Some(wanted)) => {
-                    stored.to_lowercase().contains(&wanted.to_lowercase())
-                }
-                _ => false,
-            }
-        }
-        FieldFilter::greaterThan(operand) => {
-            ordered_as(stored, operand, &[Ordering::Greater])
-        }
-        FieldFilter::greaterThanOrEqualTo(operand) => {
-            ordered_as(stored, operand, &[Ordering::Greater, Ordering::Equal])
-        }
-        FieldFilter::lessThan(operand) => ordered_as(stored, operand, &[Ordering::Less]),
-        FieldFilter::lessThanOrEqualTo(operand) => {
-            ordered_as(stored, operand, &[Ordering::Less, Ordering::Equal])
-        }
-    }
-}
-
-/// Does the stored value stand in one of `accepted` orderings to the filter's
-/// value? A field with no value, and a value no order relates to the filter's,
-/// satisfies no ordered comparison.
-fn ordered_as(
-    stored: Option<&FieldValueUnion>,
-    operand: &FieldValue,
-    accepted: &[::std::cmp::Ordering],
-) -> bool {
-    stored
-        .and_then(|stored| compared_ordering(stored, &operand.value))
-        .is_some_and(|ordering| accepted.contains(&ordering))
-}
-
 /// Does a case match the quick search? `searchTerm` is "A word or phrase used to
 /// perform a quick search", so it narrows to the cases one of whose text-valued
 /// fields contains it, compared without regard to case as `contains` compares.
@@ -615,7 +510,7 @@ fn ordered_as(
 fn matches_search_term(case: &crate::state::Case, lowercased: &str) -> bool {
     case.field_values
         .values()
-        .filter_map(text_of)
+        .filter_map(crate::state::field_value_text)
         .any(|text| text.to_lowercase().contains(lowercased))
 }
 
@@ -673,7 +568,9 @@ fn filter_field_ids(filter: &CaseFilter) -> Vec<String> {
     let mut pending: Vec<&CaseFilter> = vec![filter];
     while let Some(clause) = pending.pop() {
         match clause {
-            CaseFilter::Field(field) => ids.push(filter_operand(field).id.clone()),
+            CaseFilter::Field(field) => {
+                ids.push(crate::state::field_filter_operand(field).id.clone())
+            }
             CaseFilter::Tag(_) => {}
             CaseFilter::Not(inner) => pending.push(inner),
             CaseFilter::andAll(list) | CaseFilter::orAll(list) => pending.extend(list.iter()),
@@ -721,15 +618,7 @@ fn fingerprint_within_depth(filter: &CaseFilter, depth: usize) -> String {
         return "deeper".to_string();
     }
     match filter {
-        CaseFilter::Field(field) => {
-            let operand = filter_operand(field);
-            format!(
-                "field({} {} {})",
-                operand.id,
-                comparison_name(field),
-                value_fingerprint(&operand.value)
-            )
-        }
+        CaseFilter::Field(field) => crate::state::field_filter_fingerprint(field),
         CaseFilter::Tag(TagFilter::equalTo(tag)) => format!(
             "tag({:?} {:?})",
             tag.key.as_deref(),
@@ -754,27 +643,3 @@ fn fingerprints(clauses: &[CaseFilter], depth: usize) -> String {
         .join(",")
 }
 
-/// Which comparison a `FieldFilter` names.
-fn comparison_name(filter: &FieldFilter) -> &'static str {
-    match filter {
-        FieldFilter::equalTo(_) => "equalTo",
-        FieldFilter::Contains(_) => "contains",
-        FieldFilter::greaterThan(_) => "greaterThan",
-        FieldFilter::greaterThanOrEqualTo(_) => "greaterThanOrEqualTo",
-        FieldFilter::lessThan(_) => "lessThan",
-        FieldFilter::lessThanOrEqualTo(_) => "lessThanOrEqualTo",
-    }
-}
-
-/// One field value rendered for [`filter_fingerprint`]: its union variant and
-/// the content it carries, so two values that differ in either render
-/// differently.
-fn value_fingerprint(value: &FieldValueUnion) -> String {
-    let content = match value {
-        FieldValueUnion::stringValue(text) | FieldValueUnion::userArnValue(text) => text.clone(),
-        FieldValueUnion::doubleValue(number) => number.to_string(),
-        FieldValueUnion::booleanValue(flag) => flag.to_string(),
-        FieldValueUnion::emptyValue(_) => String::new(),
-    };
-    format!("{}:{content}", crate::state::variant_name(value))
-}
