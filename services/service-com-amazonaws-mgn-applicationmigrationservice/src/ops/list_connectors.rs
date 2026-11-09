@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConnectors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConnectors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the account's connectors from this service's state, in creation order,
+//! filtered and paged as the request asks.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConnectors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Application Migration Service is account-scoped: this operation models
+//! `UninitializedAccountException` and refuses with it while the account the request
+//! acts on is uninitialized, ahead of any per-resource work.
+//!
+//! A reporting operation: it writes nothing, so two reads of an unchanged store answer
+//! the same connectors.
 //!
 //! ## Shape of an operation
 //!
@@ -81,11 +81,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // here — hence the `ListConnectorsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mgn#ListConnectors")]
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mgn#ListConnectors",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListConnectorsErrorModeled {
     UninitializedAccountException(UninitializedAccountException),
     ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -139,18 +146,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConnectors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConnectorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConnectors"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListConnectorsErrorModeled::InternalServerException(crate::state::state_unavailable())
+        })?;
+        // `ListConnectors` carries no `accountID` member, so it reports the connectors
+        // of the account the request was signed for.
+        let account = crate::state::account_key(None);
+
+        // `nextToken` is this service's own cursor, and only a string this service
+        // issued is a token: the marker below plus the `connectorID` the previous page
+        // ended on. A resume-after key rather than a positional offset, so the cursor
+        // keeps its meaning when the selection changes between pages.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                token
+                    .strip_prefix(PAGE_TOKEN_PREFIX)
+                    .ok_or_else(|| unresumable_token(token))?,
+            ),
+        };
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            // Defensive only: the modelled `MaxResultsType` range 1..1000 is already
+            // refused at the boundary, so no out-of-range value reaches this handler.
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let store = state.lock();
+        if !store.is_initialized(&account) {
+            return Err(ListConnectorsErrorModeled::UninitializedAccountException(
+                crate::state::uninitialized_account(),
+            )
+            .into());
+        }
+
+        let matching: Vec<&crate::state::Connector> = store
+            .connectors_of(&account)
+            .into_iter()
+            .filter(|connector| matches_filters(connector, input.filters.as_ref()))
+            .collect();
+        // The page starts after the connector the token names. A token naming a
+        // connector this selection does not hold cannot be resumed — it is a token for a
+        // selection that no longer exists — so it is refused rather than served as some
+        // other page.
+        let start = match resume_after {
+            None => 0usize,
+            Some(last_returned) => matching
+                .iter()
+                .position(|connector| connector.connector_id == last_returned)
+                .map(|index| index.saturating_add(1))
+                .ok_or_else(|| {
+                    unresumable_token(input.next_token.as_deref().unwrap_or_default())
+                })?,
+        };
+        let page: Vec<&crate::state::Connector> = matching
+            .iter()
+            .copied()
+            .skip(start)
+            .take(page_size)
+            .collect();
+        // A token only when connectors remain after this page, so a caller that follows
+        // tokens sees every connector exactly once.
+        let next_token = if start.saturating_add(page.len()) < matching.len() {
+            page.last()
+                .map(|connector| format!("{PAGE_TOKEN_PREFIX}{}", connector.connector_id))
+        } else {
+            None
+        };
+        let items: Vec<CreateConnectorOutput> =
+            page.iter().map(|connector| connector.to_shape()).collect();
+
+        Ok(ListConnectorsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
+}
+
+/// The largest page `maxResults` can ask for, and the page size used when the request
+/// names none: the model's `MaxResultsType` range is 1..1000.
+const MAX_PAGE_SIZE: i32 = 1000;
+
+/// The marker every `nextToken` this operation issues carries, ahead of the
+/// `connectorID` the page ended on, so a string the service never issued cannot be
+/// mistaken for a cursor.
+const PAGE_TOKEN_PREFIX: &str = "mgn-connectors-";
+
+/// The refusal for a `nextToken` this operation cannot resume from: a string it never
+/// issued, or one whose anchor connector the current selection no longer holds — the
+/// modelled `ValidationException` (400) this operation declares for a member it cannot
+/// accept.
+fn unresumable_token(token: &str) -> ListConnectorsError {
+    let message = format!(
+        "nextToken '{token}' cannot be resumed: it is not a token this service issued, or the connector it continues from is no longer in this selection"
+    );
+    ListConnectorsErrorModeled::ValidationException(ValidationException {
+        message: Some(message.clone()),
+        code: None,
+        reason: Some(crate::state::VALIDATION_FIELD_FAILED.to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: Some("nextToken".to_string()),
+            message: Some(message),
+        }]),
+    })
+    .into()
+}
+
+/// Whether `connector` satisfies every filter the request set. An absent filter, and a
+/// present-but-empty id list, select everything.
+fn matches_filters(
+    connector: &crate::state::Connector,
+    filters: Option<&ListConnectorsRequestFilters>,
+) -> bool {
+    let Some(filters) = filters else {
+        return true;
+    };
+    if let Some(ids) = filters.connector_i_ds.as_ref() {
+        if !ids.is_empty() && !ids.contains(&connector.connector_id) {
+            return false;
+        }
+    }
+    true
 }

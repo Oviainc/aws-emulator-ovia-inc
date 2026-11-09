@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWave
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWave`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a `waveID` and an ARN, stores the wave in this service's state and returns the
+//! stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWave::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Application Migration Service is account-scoped: the one-time `InitializeService`
+//! call initializes the account a request acts on, and this operation — which models
+//! `UninitializedAccountException` — refuses with it, ahead of any per-resource check,
+//! while the account is uninitialized.
+//!
+//! A wave name identifies a wave within its account, and the operation models no
+//! idempotency token, so the name is what decides between the two answers a repeat can
+//! get: a request every member of which matches a stored wave is an `@idempotent`
+//! replay and answers that wave, while a request whose name is taken but whose other
+//! members differ is the modelled `ConflictException` (409) — the narrowing
+//! `CreateApplication` states for an application name, which the model cannot express
+//! for either.
+//!
+//! The store is bounded by `crate::state::WAVE_QUOTA` and refuses past it with the
+//! modelled `ServiceQuotaExceededException` (402), so a caller cannot grow the
+//! emulator's heap without end.
 //!
 //! ## Shape of an operation
 //!
@@ -97,12 +107,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // here — hence the `CreateWaveError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mgn#CreateWave")]
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mgn#CreateWave",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateWaveErrorModeled {
     ConflictException(ConflictException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     UninitializedAccountException(UninitializedAccountException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -156,18 +173,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWave` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWaveErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWave"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWaveErrorModeled::InternalServerException(crate::state::state_unavailable())
+        })?;
+        let account = crate::state::account_key(input.account_id.as_deref());
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // The account gate is evaluated ahead of every per-resource check, so an
+        // uninitialized account is told so rather than being told about a name, a quota
+        // or a resource.
+        if !store.is_initialized(&account) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &input.name,
+                "refused: UninitializedAccountException",
+            );
+            return Err(CreateWaveErrorModeled::UninitializedAccountException(
+                crate::state::uninitialized_account(),
+            )
+            .into());
+        }
+
+        // Stored sorted, so the tags a read reports are in one stable order.
+        let tags: std::collections::BTreeMap<String, String> =
+            input.tags.clone().unwrap_or_default().into_iter().collect();
+
+        // A wave name identifies a wave within its account, so the name decides between
+        // the two answers a repeat can get:
+        //   * every member matches the stored record -> `@idempotent` replay, answer it;
+        //   * the name is taken but something else differs -> the modelled conflict.
+        if let Some(existing) = store
+            .waves_of(&account)
+            .into_iter()
+            .find(|wave| wave.name == input.name)
+        {
+            if existing.description == input.description && existing.tags == tags {
+                let replayed = store.wave_shape(existing);
+                crate::state::audit(
+                    ctx.parts(),
+                    Self::NAME,
+                    &account,
+                    replayed.wave_id.as_deref().unwrap_or_default(),
+                    "replayed",
+                );
+                return Ok(replayed);
+            }
+            let conflict = crate::state::wave_name_in_use(&input.name, &existing.wave_id);
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &existing.wave_id,
+                "refused: ConflictException",
+            );
+            return Err(CreateWaveErrorModeled::ConflictException(conflict).into());
+        }
+
+        // The store is bounded per account AND in total: see `crate::state::WAVE_QUOTA`.
+        if store.wave_store_is_full(&account) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &input.name,
+                "refused: ServiceQuotaExceededException",
+            );
+            return Err(CreateWaveErrorModeled::ServiceQuotaExceededException(
+                crate::state::wave_quota_exceeded(&account),
+            )
+            .into());
+        }
+
+        let now = crate::state::now_iso8601();
+        let wave_id = store.mint_wave_id();
+        let wave = crate::state::Wave {
+            arn: crate::state::wave_arn(&region, &wave_id),
+            wave_id,
+            name: input.name.clone(),
+            description: input.description.clone(),
+            is_archived: false,
+            aggregated_status: crate::state::AggregatedStatus {
+                last_update_date_time: now.clone(),
+                // Nothing is migrating yet, and with no application in the wave there
+                // is no health to report.
+                health_status: None,
+                progress_status: Some(crate::state::PROGRESS_NOT_STARTED.to_string()),
+            },
+            // Nothing has started replicating for this wave.
+            replication_started_date_time: None,
+            creation_date_time: now.clone(),
+            last_modified_date_time: now,
+            tags,
+            account_id: account.clone(),
+        };
+
+        let created = store.wave_shape(&wave);
+        let stored = store.insert_wave(wave);
+        debug_assert!(stored, "the store bound is checked above this insert");
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &account,
+            created.wave_id.as_deref().unwrap_or_default(),
+            "created",
+        );
+        Ok(created)
     }
 }

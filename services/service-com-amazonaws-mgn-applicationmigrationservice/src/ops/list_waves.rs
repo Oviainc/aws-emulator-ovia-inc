@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWaves
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWaves`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the account's waves from this service's state, in creation order, filtered
+//! and paged as the request asks.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWaves::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Application Migration Service is account-scoped: this operation models
+//! `UninitializedAccountException` and refuses with it while the account the request
+//! acts on is uninitialized, ahead of any per-resource work.
+//!
+//! A reporting operation: it writes nothing, so two reads of an unchanged store answer
+//! the same waves.
 //!
 //! ## Shape of an operation
 //!
@@ -82,10 +82,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // here — hence the `ListWavesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mgn#ListWaves")]
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mgn#ListWaves",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListWavesErrorModeled {
     UninitializedAccountException(UninitializedAccountException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -139,18 +146,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWaves` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWavesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWaves"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListWavesErrorModeled::InternalServerException(crate::state::state_unavailable())
+        })?;
+        let account = crate::state::account_key(input.account_id.as_deref());
+
+        // `nextToken` is this service's own cursor, and only a string this service
+        // issued is a token: the marker below plus the `waveID` the previous page ended
+        // on. A resume-after key rather than a positional offset, so the cursor keeps
+        // its meaning when the selection changes between pages.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                token
+                    .strip_prefix(PAGE_TOKEN_PREFIX)
+                    .ok_or_else(|| unresumable_token(token))?,
+            ),
+        };
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            // Defensive only: the modelled `MaxResultsType` range 1..1000 is already
+            // refused at the boundary, so no out-of-range value reaches this handler.
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let store = state.lock();
+        if !store.is_initialized(&account) {
+            return Err(ListWavesErrorModeled::UninitializedAccountException(
+                crate::state::uninitialized_account(),
+            )
+            .into());
+        }
+
+        let matching: Vec<&crate::state::Wave> = store
+            .waves_of(&account)
+            .into_iter()
+            .filter(|wave| matches_filters(wave, input.filters.as_ref()))
+            .collect();
+        // The page starts after the wave the token names. A token naming a wave this
+        // selection does not hold cannot be resumed — it is a token for a selection that
+        // no longer exists — so it is refused rather than served as some other page.
+        let start = match resume_after {
+            None => 0usize,
+            Some(last_returned) => matching
+                .iter()
+                .position(|wave| wave.wave_id == last_returned)
+                .map(|index| index.saturating_add(1))
+                .ok_or_else(|| {
+                    unresumable_token(input.next_token.as_deref().unwrap_or_default())
+                })?,
+        };
+        let page: Vec<&crate::state::Wave> = matching
+            .iter()
+            .copied()
+            .skip(start)
+            .take(page_size)
+            .collect();
+        // A token only when waves remain after this page, so a caller that follows
+        // tokens sees every wave exactly once.
+        let next_token = if start.saturating_add(page.len()) < matching.len() {
+            page.last()
+                .map(|wave| format!("{PAGE_TOKEN_PREFIX}{}", wave.wave_id))
+        } else {
+            None
+        };
+        let items: Vec<CreateWaveOutput> =
+            page.iter().map(|wave| store.wave_shape(wave)).collect();
+
+        Ok(ListWavesOutput {
+            items: Some(items),
+            next_token,
+        })
     }
+}
+
+/// The largest page `maxResults` can ask for, and the page size used when the request
+/// names none: the model's `MaxResultsType` range is 1..1000.
+const MAX_PAGE_SIZE: i32 = 1000;
+
+/// The marker every `nextToken` this operation issues carries, ahead of the `waveID`
+/// the page ended on, so a string the service never issued cannot be mistaken for a
+/// cursor.
+const PAGE_TOKEN_PREFIX: &str = "mgn-waves-";
+
+/// The refusal for a `nextToken` this operation cannot resume from: a string it never
+/// issued, or one whose anchor wave the current selection no longer holds. `ListWaves`
+/// models no client-input error, so this is the service's own 400 `ValidationException`.
+fn unresumable_token(token: &str) -> ListWavesError {
+    crate::scaffolded::Scaffolded::validation(format!(
+        "nextToken '{token}' cannot be resumed: it is not a token this service issued, or the wave it continues from is no longer in this selection"
+    ))
+}
+
+/// Whether `wave` satisfies every filter the request set. An absent filter, and a
+/// present-but-empty id list, select everything.
+fn matches_filters(wave: &crate::state::Wave, filters: Option<&ListWavesRequestFilters>) -> bool {
+    let Some(filters) = filters else {
+        return true;
+    };
+    if let Some(ids) = filters.wave_i_ds.as_ref() {
+        if !ids.is_empty() && !ids.contains(&wave.wave_id) {
+            return false;
+        }
+    }
+    if let Some(is_archived) = filters.is_archived {
+        if is_archived != wave.is_archived {
+            return false;
+        }
+    }
+    true
 }

@@ -15,14 +15,31 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 mod network_migration_jobs;
 pub use network_migration_jobs::*;
 
+/// The CONNECTOR concern: the connectors `CreateConnector` mints and `ListConnectors`
+/// reports. Re-exported like every other part of this state.
+mod connectors;
+pub use connectors::*;
+
+/// The WAVE concern: the waves `CreateWave` mints and `ListWaves` reports. Re-exported
+/// like every other part of this state.
+mod waves;
+pub use waves::*;
+
+/// The LAUNCH CONFIGURATION TEMPLATE concern: the templates an account holds, which
+/// `DeleteLaunchConfigurationTemplate` removes. Re-exported like every other part of
+/// this state.
+mod launch_configuration_templates;
+pub use launch_configuration_templates::*;
+
 use crate::ops::types::{
-    ApplicationAggregatedStatus, CidrMapping, ConflictException, CreateApplicationOutput,
-    CreateNetworkMigrationDefinitionOutput, DataReplicationInfo, InternalServerException,
-    LaunchedInstance, LifeCycle, NetworkMigrationExecution as NetworkMigrationExecutionShape,
-    ResourceNotFoundException, ServiceQuotaExceededException, SourceConfiguration,
-    SourceProperties, SourceServerConnectorAction, TargetNetwork, TargetS3Configuration,
+    ApplicationAggregatedStatus, CidrMapping, ConflictException, ConnectorSsmCommandConfig,
+    CreateApplicationOutput, CreateConnectorOutput, CreateNetworkMigrationDefinitionOutput,
+    CreateWaveOutput, DataReplicationInfo, InternalServerException, LaunchedInstance, LifeCycle,
+    NetworkMigrationExecution as NetworkMigrationExecutionShape, ResourceNotFoundException,
+    ServiceQuotaExceededException, SourceConfiguration, SourceProperties,
+    SourceServerConnectorAction, TargetNetwork, TargetS3Configuration,
     UninitializedAccountException, UpdateSourceServerOutput, ValidationException,
-    ValidationExceptionField,
+    ValidationExceptionField, WaveAggregatedStatus,
 };
 
 /// The region an ARN carries when the request names none: the emulator's default.
@@ -186,6 +203,21 @@ pub struct ComAmazonawsMgnApplicationmigrationserviceState {
     /// The `jobID`s in creation order, so a listing pages in a stable order and the
     /// job a retry replays is the last one started.
     pub network_migration_mapping_job_order: Vec<String>,
+    /// Every wave, by `waveID`.
+    pub waves: HashMap<String, Wave>,
+    /// The `waveID`s in creation order, so `ListWaves` pages in a stable order and a
+    /// `nextToken` resumes where the previous page stopped.
+    pub wave_order: Vec<String>,
+    /// Every connector, by `connectorID`.
+    pub connectors: HashMap<String, Connector>,
+    /// The `connectorID`s in creation order, so `ListConnectors` pages in a stable
+    /// order and a `nextToken` resumes where the previous page stopped.
+    pub connector_order: Vec<String>,
+    /// Every launch configuration template, by `launchConfigurationTemplateID`.
+    pub launch_configuration_templates: HashMap<String, LaunchConfigurationTemplate>,
+    /// The `launchConfigurationTemplateID`s in creation order, so a listing reports
+    /// them in a stable order.
+    pub launch_configuration_template_order: Vec<String>,
 }
 
 impl ComAmazonawsMgnApplicationmigrationserviceState {
@@ -542,10 +574,10 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
     ///
     /// The tag operations address a resource by the ARN it was created with rather than
     /// by a typed id, so the resolution is over the ARN every taggable record stores:
-    /// applications, source servers and network migration definitions — the kinds this
-    /// store mints an ARN for. An ARN is compared whole, so one naming another Region,
-    /// another vendor or another resource kind matches nothing, and a record of another
-    /// account is not this one's to read or write.
+    /// applications, source servers, network migration definitions, waves and
+    /// connectors — the kinds this store mints an ARN for. An ARN is compared whole, so
+    /// one naming another Region, another vendor or another resource kind matches
+    /// nothing, and a record of another account is not this one's to read or write.
     fn taggable_resource(&self, account_id: &str, resource_arn: &str) -> Option<TaggableResource> {
         if let Some(application) = self
             .applications
@@ -565,16 +597,24 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
                 server.source_server_id.clone(),
             ));
         }
-        self.network_migration_definitions
+        if let Some(definition) = self.network_migration_definitions.values().find(|definition| {
+            definition.account_id == account_id && definition.arn == resource_arn
+        }) {
+            return Some(TaggableResource::NetworkMigrationDefinition(
+                definition.network_migration_definition_id.clone(),
+            ));
+        }
+        if let Some(wave) = self
+            .waves
             .values()
-            .find(|definition| {
-                definition.account_id == account_id && definition.arn == resource_arn
-            })
-            .map(|definition| {
-                TaggableResource::NetworkMigrationDefinition(
-                    definition.network_migration_definition_id.clone(),
-                )
-            })
+            .find(|wave| wave.account_id == account_id && wave.arn == resource_arn)
+        {
+            return Some(TaggableResource::Wave(wave.wave_id.clone()));
+        }
+        self.connectors
+            .values()
+            .find(|connector| connector.account_id == account_id && connector.arn == resource_arn)
+            .map(|connector| TaggableResource::Connector(connector.connector_id.clone()))
     }
 
     /// The tags the resource `resource_arn` names within `account_id` carries, or
@@ -596,6 +636,10 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
                 .network_migration_definitions
                 .get(&id)
                 .map(|definition| &definition.configuration.tags),
+            TaggableResource::Wave(id) => self.waves.get(&id).map(|wave| &wave.tags),
+            TaggableResource::Connector(id) => {
+                self.connectors.get(&id).map(|connector| &connector.tags)
+            }
         }
     }
 
@@ -618,6 +662,11 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
                 .network_migration_definitions
                 .get_mut(&id)
                 .map(|definition| &mut definition.configuration.tags),
+            TaggableResource::Wave(id) => self.waves.get_mut(&id).map(|wave| &mut wave.tags),
+            TaggableResource::Connector(id) => self
+                .connectors
+                .get_mut(&id)
+                .map(|connector| &mut connector.tags),
         }
     }
 }
@@ -632,6 +681,8 @@ enum TaggableResource {
     Application(String),
     SourceServer(String),
     NetworkMigrationDefinition(String),
+    Wave(String),
+    Connector(String),
 }
 
 /// One stored network migration execution: the run of a network migration definition

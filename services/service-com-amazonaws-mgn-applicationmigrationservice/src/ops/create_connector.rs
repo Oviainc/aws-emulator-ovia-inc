@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a `connectorID` and an ARN, stores the connector in this service's state and
+//! returns the stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Application Migration Service is account-scoped: the one-time `InitializeService`
+//! call initializes the account a request acts on, and this operation — which models
+//! `UninitializedAccountException` — refuses with it while the account is uninitialized.
+//! The gate is evaluated AFTER the modelled field constraints (which the framework
+//! refuses at the boundary, ahead of this handler) and ahead of every per-resource
+//! check, so a malformed `ssmInstanceID` and a well-formed one on an uninitialized
+//! account surface two different refusals.
+//!
+//! The operation is `@idempotent` and models no idempotency token, so a repeat of a
+//! request every member of which matches a stored connector answers that connector
+//! rather than minting a second one.
+//!
+//! The store is bounded by `crate::state::CONNECTOR_QUOTA` and refuses past it with the
+//! modelled `ValidationException` (400) — the only client refusal this operation models
+//! besides the account gate — so a caller cannot grow the emulator's heap without end.
 //!
 //! ## Shape of an operation
 //!
@@ -92,11 +101,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // here — hence the `CreateConnectorError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mgn#CreateConnector")]
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mgn#CreateConnector",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateConnectorErrorModeled {
     UninitializedAccountException(UninitializedAccountException),
     ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -150,18 +166,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnector"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateConnectorErrorModeled::InternalServerException(crate::state::state_unavailable())
+        })?;
+        // `CreateConnector` carries no `accountID` member, so a connector lives in the
+        // account the request was signed for — the emulator's own canonical account.
+        let account = crate::state::account_key(None);
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // The account gate is evaluated ahead of every per-resource check: the modelled
+        // field constraints were already refused at the boundary, so a well-formed
+        // request on an uninitialized account is refused here and nowhere else.
+        if !store.is_initialized(&account) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &input.name,
+                "refused: UninitializedAccountException",
+            );
+            return Err(CreateConnectorErrorModeled::UninitializedAccountException(
+                crate::state::uninitialized_account(),
+            )
+            .into());
+        }
+
+        // Stored sorted, so the tags a read reports are in one stable order.
+        let tags: std::collections::BTreeMap<String, String> =
+            input.tags.clone().unwrap_or_default().into_iter().collect();
+
+        // `@idempotent` with no idempotency token: a request every member of which
+        // matches a stored connector is a replay of that connector.
+        if let Some(existing) = store.connectors_of(&account).into_iter().find(|connector| {
+            connector.matches_request(
+                &input.name,
+                &input.ssm_instance_id,
+                input.ssm_command_config.as_ref(),
+                &tags,
+            )
+        }) {
+            let replayed = existing.to_shape();
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &existing.connector_id,
+                "replayed",
+            );
+            return Ok(replayed);
+        }
+
+        // The store is bounded per account AND in total: see
+        // `crate::state::CONNECTOR_QUOTA`.
+        if store.connector_store_is_full(&account) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &input.name,
+                "refused: ValidationException",
+            );
+            return Err(CreateConnectorErrorModeled::ValidationException(
+                crate::state::connector_quota_exceeded(&account),
+            )
+            .into());
+        }
+
+        let connector_id = store.mint_connector_id();
+        let connector = crate::state::Connector {
+            arn: crate::state::connector_arn(&region, &connector_id),
+            connector_id,
+            name: input.name.clone(),
+            ssm_instance_id: input.ssm_instance_id.clone(),
+            ssm_command_config: input.ssm_command_config.clone(),
+            tags,
+            account_id: account.clone(),
+        };
+
+        let created = connector.to_shape();
+        let stored = store.insert_connector(connector);
+        debug_assert!(stored, "the store bound is checked above this insert");
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &account,
+            created.connector_id.as_deref().unwrap_or_default(),
+            "created",
+        );
+        Ok(created)
     }
 }
