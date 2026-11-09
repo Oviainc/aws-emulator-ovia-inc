@@ -160,11 +160,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // missing resource, not a malformed request (the modelled `RuleArn` pattern is
         // already enforced before this handler runs).
         let Some(rule) = store.rule_by_arn(&region, &input.resource_arn) else {
-            // Composed from the value the request addressed the rule by — here the
-            // `ResourceArn` — by the one place this service words a rule that does not
-            // exist.
+            // Composed from the rule's own IDENTIFIER — here the one the addressed
+            // `ResourceArn` names — by the one place this service words a rule that does
+            // not exist, so the message states nothing of the ARN the caller addressed
+            // it through.
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                crate::state::rule_not_found(&input.resource_arn),
+                crate::state::rule_not_found(crate::state::rule_identifier_in_arn(
+                    &input.resource_arn,
+                )),
             )
             .into());
         };

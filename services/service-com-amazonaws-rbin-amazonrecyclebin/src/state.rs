@@ -608,10 +608,12 @@ pub const CONFLICT_REASON_INVALID_RULE_STATE: &str = "INVALID_RULE_STATE";
 /// The modelled 404 for a retention rule the request addressed and this Region does
 /// not hold — one that was never created, or one already deleted.
 ///
-/// `addressed` is the value the REQUEST named the rule by: the `Identifier` an
-/// identifier-addressed operation binds, or the `ResourceArn` a tag operation binds.
-/// The message is composed from it, so a rule that does not exist reads the same way
-/// whichever operation reports it.
+/// `identifier` is the rule's own `RuleIdentifier`, the single variable part of this
+/// message: the `Identifier` an identifier-addressed operation binds, or — for an
+/// operation that addresses the rule by ARN — the identifier that ARN names
+/// ([`rule_identifier_in_arn`]), never the ARN itself. So a rule that does not exist
+/// reads the same way whichever operation reports it, and the message states nothing of
+/// the partition, Region or account the caller happened to address it through.
 ///
 /// `Reason` is left UNSET. It is an optional member of `ResourceNotFoundException`
 /// (smithy_query(query="shape", shape="ResourceNotFoundException") — only `Message` and
@@ -622,11 +624,37 @@ pub const CONFLICT_REASON_INVALID_RULE_STATE: &str = "INVALID_RULE_STATE";
 /// absent on this path. The other reason members this service DOES send
 /// (`ConflictException`, `ValidationException`, `ServiceQuotaExceededException`) are
 /// each populated by their own constructor below.
-pub fn rule_not_found(addressed: &str) -> ResourceNotFoundException {
+pub fn rule_not_found(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("Recycle Bin Rule '{addressed}' does not exist.")),
+        message: Some(format!("Recycle Bin Rule '{identifier}' does not exist.")),
         reason: None,
     }
+}
+
+/// The resource segment a retention rule's ARN carries: `rule/` then the rule's
+/// `Identifier`, as the modelled `RuleArn` pattern spells it
+/// (`^arn:\S+:rbin:[a-z\-0-9]{0,63}:[0-9]{12}:rule/[0-9a-zA-Z]{11}{0,1011}$`, from
+/// smithy_query(query="shape", shape="RuleArn")). Stated once, so the ARN this service
+/// MINTS and the identifier it reads back out of one cannot disagree about the spelling.
+pub const RULE_RESOURCE_PREFIX: &str = "rule/";
+
+/// The `Identifier` a rule ARN names: the identifier in its `rule/<Identifier>` resource
+/// segment.
+///
+/// The resource segment is what follows the ARN's last `:` — an ARN's six fields are
+/// `:`-separated and a rule's resource segment holds none — and the identifier is that
+/// segment without its [`RULE_RESOURCE_PREFIX`]. An argument carrying neither (a value
+/// the modelled `RuleArn` pattern would not admit, so not one a handler is reached with)
+/// yields what it holds, rather than an empty identifier.
+///
+/// MIGRATION NOTE: `services/common/src/arn.rs` owns this tree's ARN reading
+/// (`arn::resource_id_of_type(value, "rule")` is exactly this read), and a crate that
+/// already depends on that module should call it rather than split an ARN again. This
+/// crate depends on it for nothing else, so the two lines stay here until it does; they
+/// are not to be copied further.
+pub fn rule_identifier_in_arn(rule_arn: &str) -> &str {
+    let resource = rule_arn.rsplit(':').next().unwrap_or(rule_arn);
+    resource.strip_prefix(RULE_RESOURCE_PREFIX).unwrap_or(resource)
 }
 
 /// What a refused request asked to do to the rule, as the conflict message names it.
@@ -947,9 +975,12 @@ pub fn rule_state_conflict(
 /// its `@pattern` (an unusable page token whose syntax is fine is the service's own
 /// [`VALIDATION_REASON_INVALID_PAGE_TOKEN`] fault, raised by the handler that decodes
 /// it).
-pub fn constraint_violations(violations: &[Violation]) -> Option<ValidationException> {
+pub fn constraint_violations(
+    violations: &[Violation],
+    uri_path_labels: &[String],
+) -> Option<ValidationException> {
     Some(ValidationException {
-        message: Some(validation_envelope(violations)?),
+        message: Some(validation_envelope(violations, uri_path_labels)?),
         reason: Some(VALIDATION_REASON_INVALID_PARAMETER_VALUE.to_string()),
     })
 }
@@ -966,11 +997,14 @@ pub fn member_validation_failed(member_path: &str, requirement: &str) -> Validat
 
 /// Every violated constraint as one `ValidationException` message. `None` when
 /// `violations` is empty, so a caller cannot render "0 validation errors detected".
-pub fn validation_envelope(violations: &[Violation]) -> Option<String> {
+pub fn validation_envelope(violations: &[Violation], uri_path_labels: &[String]) -> Option<String> {
     if violations.is_empty() {
         return None;
     }
-    let clauses: Vec<String> = violations.iter().map(constraint_clause).collect();
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(|violation| constraint_clause(violation, uri_path_labels))
+        .collect();
     Some(envelope_of(&clauses))
 }
 
@@ -998,9 +1032,10 @@ const CONSTRAINT_MARKER: &str = " failed to satisfy constraint: ";
 /// ([`Violation::message`]), which is where the model's declared bound — a range
 /// endpoint, a `@pattern`, an enum's value set — is rendered, so no bound text is
 /// restated here. Two things change: Recycle Bin names the member that failed without
-/// quoting the submitted value back, and it reports a `@pattern` as the expression a
-/// value has to satisfy, without the `^`/`$` anchors a model spells it with (see
-/// [`unanchored`]).
+/// quoting the submitted value back, and it quotes a `@pattern` as the expression the
+/// service PUBLISHES as that member's requirement — the model's expression for a member
+/// the request carries in its body or query string, the spliced one for a member bound
+/// into the URI path (see [`quoted_pattern`]).
 ///
 /// The requirement is read off the wording for the SAME violation with no value
 /// attached, so the submitted value is nowhere in the text this splits and cannot leak
@@ -1009,12 +1044,12 @@ const CONSTRAINT_MARKER: &str = " failed to satisfy constraint: ";
 ///
 /// An absent required member states no value either — the framework's
 /// `Value null at '<path>' …` quotes nothing of the request — so that sentence stands.
-fn constraint_clause(violation: &Violation) -> String {
+fn constraint_clause(violation: &Violation, uri_path_labels: &[String]) -> String {
     let unechoed = Violation {
         path: violation.path.clone(),
         kind: match &violation.kind {
             ViolationKind::Pattern(pattern) => {
-                ViolationKind::Pattern(unanchored(pattern).to_string())
+                ViolationKind::Pattern(quoted_pattern(pattern, &violation.path, uri_path_labels))
             }
             other => other.clone(),
         },
@@ -1033,19 +1068,48 @@ fn constraint_clause(violation: &Violation) -> String {
     }
 }
 
-/// A `@pattern` as Recycle Bin reports it in a validation message: the expression
-/// without the `^` and `$` anchors a model spells it with.
+/// A `@pattern` as Recycle Bin quotes it in a validation message: the expression the
+/// service publishes as the requirement for the member that failed.
 ///
-/// The anchors say WHERE the expression had to match, which is a fact of the constraint
-/// and not of the input; the expression a caller has to satisfy is what is left. A `$`
-/// escaped by a backslash is a literal dollar sign inside the expression, not the end
-/// anchor, so it stays.
+/// Which expression that is follows from WHERE the request carried the member, because
+/// the two places are matched against two expressions:
+///
+/// * a member bound into the URI PATH (`@httpLabel`) is matched as one path segment of
+///   the route, so the expression its value is held to is the member's spliced into the
+///   route's — the modelled one without its whole-value anchors, which is the expression
+///   quoted back ([`unanchored`]);
+/// * a member the request carries in its BODY or its query string is matched against the
+///   member's own expression, so the modelled `@pattern` is quoted exactly as declared,
+///   anchors included.
+///
+/// `uri_path_labels` are the lower-camel member paths the operation binds into the URI
+/// path, read off the model's own `@httpLabel` traits by `crate::service`, so which
+/// members those are is nowhere restated here. A nested path
+/// (`retentionPeriod.retentionPeriodValue`, `tags.1.member`) is placed by its FIRST
+/// segment, the top-level member the whole subtree hangs off — the only segment an HTTP
+/// binding can be declared on.
+fn quoted_pattern(pattern: &str, member_path: &str, uri_path_labels: &[String]) -> String {
+    let top_level = member_path.split('.').next().unwrap_or(member_path);
+    if uri_path_labels.iter().any(|label| label == top_level) {
+        unanchored(pattern).to_string()
+    } else {
+        pattern.to_string()
+    }
+}
+
+/// `pattern` without the `^` and `$` anchors a model spells a whole-value match with —
+/// the expression a URI path segment is matched against once the member's own expression
+/// is spliced into the route's.
+///
+/// A `$` escaped by a backslash is a literal dollar sign inside the expression, not the
+/// end anchor, so it stays.
 ///
 /// MIGRATION NOTE, as `services/common/src/validation.rs` ("Still to migrate here") asks
-/// of anything that inlines this again: this rule — like the subject half and the
-/// requirement half of a clause — is the same for every service and belongs in that
-/// shared module; it is inlined here because the migration is one change of its own, and
-/// this copy is to be deleted by it rather than copied further.
+/// of anything that inlines this again: the DROP itself is the same for every service and
+/// belongs in that shared module, which already owns it as `validation::unanchored`; this
+/// copy is to be deleted by the change that owns that migration rather than copied
+/// further. What stays with this service is WHICH members are quoted this way
+/// ([`quoted_pattern`]), which that module's header lists as the service's own half.
 fn unanchored(pattern: &str) -> &str {
     let body = pattern.strip_prefix('^').unwrap_or(pattern);
     match body.strip_suffix('$') {

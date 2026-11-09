@@ -118,7 +118,8 @@ async fn listed_in(
 /// identifier and the ARN the rule was minted with.
 ///
 /// `Identifier` names the rule for five of them and `ResourceArn` for the three tag
-/// operations, so each row also carries the value the refusal must be worded from.
+/// operations, so each row also carries the rule IDENTIFIER the refusal must be worded
+/// from — which for an ARN-addressed row is the identifier that ARN names.
 async fn addressed_calls(
     router: &MultiServiceRouter,
     region: &str,
@@ -171,12 +172,12 @@ async fn addressed_calls(
         ),
         (
             "ListTagsForResource",
-            rule_arn.to_string(),
+            identifier.to_string(),
             call_signed_for(router, region, "GET", &arn_path, None).await,
         ),
         (
             "TagResource",
-            rule_arn.to_string(),
+            identifier.to_string(),
             call_signed_for(
                 router,
                 region,
@@ -188,7 +189,7 @@ async fn addressed_calls(
         ),
         (
             "UntagResource",
-            rule_arn.to_string(),
+            identifier.to_string(),
             call_signed_for(
                 router,
                 region,

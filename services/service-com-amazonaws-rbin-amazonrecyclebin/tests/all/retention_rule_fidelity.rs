@@ -8,7 +8,8 @@
 //!    `Recycle Bin Rule '<the requested identifier>' does not exist.`, whether the rule
 //!    never existed or was deleted;
 //! 3. a refused input constraint names the member path and the requirement it failed,
-//!    withholding the rejected value and reporting a `@pattern` without its anchors;
+//!    withholding the rejected value and quoting a `@pattern` as the service publishes
+//!    that member's requirement;
 //! 4. `CreateRule` refuses more tags than the tags-per-resource quota allows, and
 //!    persists nothing when it does.
 //!
@@ -301,7 +302,10 @@ struct RefusalCase {
 }
 
 /// RULE 3: a refused constraint is stated as the member path and the requirement, with
-/// the rejected value withheld and a `@pattern` reported unanchored.
+/// the rejected value withheld and a `@pattern` quoted as the service publishes that
+/// member's requirement — as the model declares it for a member the request carries in
+/// its BODY, and without the whole-value anchors for one bound into the URI PATH, which
+/// is matched as one segment of the route.
 ///
 /// The table spans the constraint classes the model uses (enum, `@range` at both ends,
 /// `@pattern`), the operations that carry them (`CreateRule`, `UpdateRule`, `GetRule`,
@@ -419,9 +423,10 @@ async fn a_refused_constraint_names_the_member_without_echoing_the_value() {
         rejected: "EBS_SNAPSHOTS",
     });
 
-    // `Description` is `@pattern ^[\S ]{0,255}$`: a tab is neither `\S` nor a space.
+    // `Description` is `@pattern ^[\S ]{0,255}$` and travels in the BODY, so the
+    // expression is quoted as the model declares it: a tab is neither `\S` nor a space.
     let description_pattern =
-        "Member must satisfy regular expression pattern: [\\S ]{0,255}".to_string();
+        "Member must satisfy regular expression pattern: ^[\\S ]{0,255}$".to_string();
     let (status, body) = create_rule(
         &router,
         serde_json::json!({
@@ -456,7 +461,8 @@ async fn a_refused_constraint_names_the_member_without_echoing_the_value() {
         rejected: "tab\tseparated",
     });
 
-    // `RuleIdentifier` is `^[0-9a-zA-Z]{11}$`, carried in the URI.
+    // `RuleIdentifier` is `^[0-9a-zA-Z]{11}$` and is bound into the URI PATH, so the
+    // expression is quoted spliced into the route's — without the anchor pair.
     for (case, bad_identifier) in [
         ("GetRule with a punctuated identifier", "not-a-valid-id!"),
         ("GetRule with a too-short identifier", "abc"),
@@ -521,7 +527,7 @@ async fn a_refused_constraint_names_the_member_without_echoing_the_value() {
     });
 
     // A violation INSIDE a list: the path is the framework's spelling, so this row pins
-    // only that the value is withheld and the pattern unanchored.
+    // only that the value is withheld, while the pattern it quotes is asserted here.
     let (status, body) = create_rule(
         &router,
         serde_json::json!({
@@ -534,6 +540,18 @@ async fn a_refused_constraint_names_the_member_without_echoing_the_value() {
         }),
     )
     .await;
+    // `TagKey` travels in the BODY, nested inside a list, so its expression is quoted as
+    // the model declares it — the member's depth changes nothing.
+    // Source: smithy_query(query="shape", shape="TagKey") — @pattern
+    // ^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$.
+    let tag_key_requirement =
+        r"Member must satisfy regular expression pattern: ^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$";
+    let stated = message_of(&body);
+    assert!(
+        stated.ends_with(tag_key_requirement),
+        "case \"CreateRule with a tag key outside its pattern\": expected the clause to state \
+         {tag_key_requirement:?}, got {stated:?}"
+    );
     rows.push(RefusalCase {
         case: "CreateRule with a tag key outside its pattern",
         status,
@@ -575,10 +593,6 @@ async fn a_refused_constraint_names_the_member_without_echoing_the_value() {
         assert!(
             !message.contains(rejected),
             "case {case:?}: the rejected value {rejected:?} must not be echoed, got {message:?}"
-        );
-        assert!(
-            !message.contains('^') && !message.contains('$'),
-            "case {case:?}: a reported pattern carries no ^/$ anchors, got {message:?}"
         );
     }
 

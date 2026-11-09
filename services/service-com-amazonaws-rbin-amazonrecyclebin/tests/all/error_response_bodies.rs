@@ -14,8 +14,10 @@
 //!    pattern, enum and required-member constraints, in the body and in a URI label, on
 //!    six operations.
 //! 2. A rule the request addressed and this Region does not hold is `ResourceNotFound`:
-//!    HTTP 404 and `Message` composed from the value the request addressed it by
-//!    (`Recycle Bin Rule '<addressed>' does not exist.`), with the optional `Reason` the
+//!    HTTP 404 and `Message` composed from the rule's own IDENTIFIER
+//!    (`Recycle Bin Rule '<identifier>' does not exist.`) — the `Identifier` member for
+//!    the five operations that bind one, and the identifier the `ResourceArn` names for
+//!    the three that address the rule by ARN — with the optional `Reason` the
 //!    service does not populate on this path left out —
 //!    `tests/all/not_found_error_body_members.rs` asserts that absence over the class.
 //!    Asserted on every operation that addresses a rule — by `Identifier` and by
@@ -57,17 +59,19 @@ const MAX_RESULTS_MAX: i64 = 1000;
 const UNLOCK_DELAY_MIN: i64 = 7;
 const UNLOCK_DELAY_MAX: i64 = 30;
 
-/// The `@pattern` each constrained member declares, as the service REPORTS it: the
-/// model's expression without the `^`/`$` anchors a model spells it with. The anchors say
-/// WHERE the expression had to match, which is a fact of the constraint and not of the
-/// input, and the recorded AWS refusal for a pattern violation carries the unanchored
-/// form (`…failed to satisfy constraint: Member must satisfy regular expression pattern:
-/// [0-9a-zA-Z]{11}` for `RuleIdentifier`).
-/// Source: smithy_query(query="shape", shape="RuleIdentifier,NextToken,Description,RuleArn"),
-/// unanchored by `crate::state`'s one clause renderer.
+/// The `@pattern` each constrained member declares, as the service QUOTES it for that
+/// member: a member bound into the URI PATH (`@httpLabel`) is matched as one path segment
+/// of the route, so what is quoted is its expression spliced into the route's — the
+/// modelled one without the whole-value anchors (the recorded AWS refusal for
+/// `GetRule$Identifier` carries `…regular expression pattern: [0-9a-zA-Z]{11}`), while a
+/// member the request carries in its BODY is matched against its own expression and is
+/// quoted exactly as the model declares it, anchors included (the recorded refusal for
+/// `ListRules$NextToken` carries `…pattern: ^[A-Za-z0-9+/=]{1,2048}$`).
+/// Source: smithy_query(query="shape", shape="RuleIdentifier,NextToken,Description,RuleArn")
+/// — `Identifier` and `ResourceArn` are `@httpLabel`, `NextToken` and `Description` are not.
 const RULE_IDENTIFIER_PATTERN: &str = "[0-9a-zA-Z]{11}";
-const NEXT_TOKEN_PATTERN: &str = "[A-Za-z0-9+/=]{1,2048}";
-const DESCRIPTION_PATTERN: &str = r"[\S ]{0,255}";
+const NEXT_TOKEN_PATTERN: &str = "^[A-Za-z0-9+/=]{1,2048}$";
+const DESCRIPTION_PATTERN: &str = r"^[\S ]{0,255}$";
 const RULE_ARN_PATTERN: &str = r"arn:\S+:rbin:[a-z\-0-9]{0,63}:[0-9]{12}:rule/[0-9a-zA-Z]{11}{0,1011}";
 
 /// `ResourceType` accepts exactly these values, in this order.
@@ -538,15 +542,16 @@ async fn an_addressed_rule_this_region_does_not_hold_is_reported_as_not_existing
     }
 
     // The same rule, addressed by ARN: the ARN of a deleted rule, and well-formed ARNs
-    // whose Region, account or rule id names no rule this Region holds.
+    // whose Region, account or rule id names no rule this Region holds. Each row carries
+    // the IDENTIFIER that ARN names, which is the only part of it the refusal states.
     let other_region = with_arn_segment(&rule_arn, 3, "us-gov-east-1");
     let other_account = with_arn_segment(&rule_arn, 4, "111122223333");
     let other_rule = rule_arn.replace(&identifier, "ZZZZZZZZZZZ");
-    for absent_arn in [
-        deleted_arn.as_str(),
-        other_region.as_str(),
-        other_account.as_str(),
-        other_rule.as_str(),
+    for (absent_arn, named) in [
+        (deleted_arn.as_str(), deleted.as_str()),
+        (other_region.as_str(), identifier.as_str()),
+        (other_account.as_str(), identifier.as_str()),
+        (other_rule.as_str(), "ZZZZZZZZZZZ"),
     ] {
         for (operation, response) in [
             ("ListTagsForResource", list_tags(&router, absent_arn).await),
@@ -565,11 +570,17 @@ async fn an_addressed_rule_this_region_does_not_hold_is_reported_as_not_existing
                 status, 404,
                 "case {case:?}: expected HTTP 404, got {status} / {body:?}"
             );
-            let expected = format!("Recycle Bin Rule '{absent_arn}' does not exist.");
+            let expected = format!("Recycle Bin Rule '{named}' does not exist.");
             assert_eq!(
                 message(&body),
                 expected,
                 "case {case:?}: expected Message {expected:?}, got {:?}",
+                message(&body)
+            );
+            assert!(
+                !message(&body).contains("arn:"),
+                "case {case:?}: the refusal states the rule identifier alone, not the ARN the \
+                 request addressed it through, got {:?}",
                 message(&body)
             );
             assert_eq!(

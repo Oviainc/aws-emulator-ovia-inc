@@ -51,7 +51,8 @@ const WITHHELD_MEMBER: &str = "Reason";
 
 /// The responses the eight rule-addressed operations give for a rule addressed by
 /// `identifier`, keyed by operation. The three ARN-addressed operations address the same
-/// absent rule through `arn`.
+/// absent rule through `arn`, and every row carries the rule's IDENTIFIER: that is what
+/// the refusal states, whichever of the two the request named the rule by.
 async fn rule_addressed_refusals(
     router: &MultiServiceRouter,
     identifier: &str,
@@ -90,26 +91,25 @@ async fn rule_addressed_refusals(
         ),
         (
             "ListTagsForResource",
-            arn.to_string(),
+            identifier.to_string(),
             list_tags(router, arn).await,
         ),
         (
             "TagResource",
-            arn.to_string(),
+            identifier.to_string(),
             tag_resource(router, arn, &pairs(&[("team", "platform")])).await,
         ),
         (
             "UntagResource",
-            arn.to_string(),
+            identifier.to_string(),
             untag_resource(router, arn, &keys(&["team"])).await,
         ),
     ]
 }
 
 /// The one body assertion of rule 1: status, error code, the message composed from the
-/// value the request addressed the rule by, and NO member beyond the ones the service
-/// populates.
-fn assert_not_found_body(case: &str, addressed: &str, status: u16, body: &Value) {
+/// rule's own identifier, and NO member beyond the ones the service populates.
+fn assert_not_found_body(case: &str, identifier: &str, status: u16, body: &Value) {
     assert_eq!(
         status, 404,
         "case {case:?}: expected HTTP 404, got {status} / {body:?}"
@@ -119,7 +119,7 @@ fn assert_not_found_body(case: &str, addressed: &str, status: u16, body: &Value)
         "ResourceNotFoundException",
         "case {case:?}: expected the modelled ResourceNotFoundException, got {body:?}"
     );
-    let expected = format!("Recycle Bin Rule '{addressed}' does not exist.");
+    let expected = format!("Recycle Bin Rule '{identifier}' does not exist.");
     assert_eq!(
         message(body),
         expected,
@@ -184,16 +184,18 @@ async fn an_absent_rule_is_reported_with_message_and_no_reason() {
     for (why, identifier) in &rows {
         // The same absent rule, addressed the way a tag operation addresses it.
         let arn = held_arn.replace(&held, identifier);
-        for (operation, addressed, (status, body)) in
+        for (operation, identifier_named, (status, body)) in
             rule_addressed_refusals(&router, identifier, &arn).await
         {
             let case = format!("{operation} on an identifier {why} ({identifier})");
-            assert_not_found_body(&case, &addressed, status, &body);
+            assert_not_found_body(&case, &identifier_named, status, &body);
         }
     }
 
     // Absence an ARN can express and an identifier cannot: a well-formed rule ARN whose
-    // Region or account names no rule this Region and account hold.
+    // Region or account names no rule this Region and account hold. The rule the ARN
+    // names is the held one, so its identifier is what the refusal states — no other
+    // segment of the ARN reaches the message.
     let other_region = with_arn_segment(&held_arn, 3, "us-gov-east-1");
     let other_account = with_arn_segment(&held_arn, 4, "111122223333");
     for (why, absent_arn) in [
@@ -212,7 +214,7 @@ async fn an_absent_rule_is_reported_with_message_and_no_reason() {
             ),
         ] {
             let case = format!("{operation} on an ARN naming {why} ({absent_arn})");
-            assert_not_found_body(&case, absent_arn, status, &body);
+            assert_not_found_body(&case, &held, status, &body);
         }
     }
 

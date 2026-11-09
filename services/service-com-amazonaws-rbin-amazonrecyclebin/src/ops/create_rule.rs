@@ -309,7 +309,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let identifier = store.mint_identifier();
-        let rule_arn = ::engine::emulator_arn("rbin", &region, &format!("rule/{identifier}"));
+        let rule_arn = ::engine::emulator_arn(
+            "rbin",
+            &region,
+            &format!("{}{identifier}", crate::state::RULE_RESOURCE_PREFIX),
+        );
         // A rule created WITH a lock configuration starts out `locked` — the guard above
         // has already refused every rule a lock cannot hold on, so only a Region-level
         // rule with no exclusion tags reaches here with one. A rule created without a

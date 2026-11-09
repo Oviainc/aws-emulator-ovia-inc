@@ -77,7 +77,8 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
-use aws_smithy_schema_server::constraints::{validate, Violation};
+use aws_smithy_schema::Schema;
+use aws_smithy_schema_server::constraints::{path, validate, Violation};
 use aws_smithy_schema_server::ProtocolError;
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
@@ -102,6 +103,12 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The input-validation gate for each modelled operation, keyed by the routing key
     /// the protocol resolves for it (the operation's own `NAME`). Built once, in `new`.
     input_validation: HashMap<&'static str, Box<dyn ErasedOperation>>,
+    /// Every member path this service binds into a request URI PATH, over all of its
+    /// operations — what [`Service::override_refusal`] renders a clause's `@pattern`
+    /// requirement by, since that seam is handed a refusal without the operation it
+    /// belongs to. Built once, in `new`, from the same operation list and the same
+    /// model-reading as the per-operation gates ([`uri_path_label_paths`]).
+    uri_path_labels: Vec<String>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -109,23 +116,46 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let (input_validation, uri_path_labels) = modelled_operation_gates::<Eng>();
         Self {
             entry: crate::ServiceDefinition::new(engine),
-            input_validation: input_validation_gates::<Eng>(),
+            input_validation,
+            uri_path_labels,
         }
     }
 }
 
-/// One [`ModelledInputValidation`] gate per modelled operation.
+/// The lower-camel member paths `input_schema` binds into the request URI PATH — its
+/// `@httpLabel` members, as a validation clause spells a member path.
+///
+/// Read off the member's own binding trait, so the MODEL decides: a member with no
+/// `@httpLabel` travels in the body or the query string. The casing is the framework's
+/// own path spelling ([`path::member`]), which is how the constraint walk spells the path
+/// a violation carries, so the two cannot drift.
+fn uri_path_label_paths(input_schema: &Schema) -> Vec<String> {
+    input_schema
+        .members()
+        .iter()
+        .filter(|member| member.http_label().is_some())
+        .filter_map(|member| member.member_name())
+        .map(path::member)
+        .collect()
+}
+
+/// One [`ModelledInputValidation`] gate per modelled operation, and the URI-path member
+/// paths of every one of them.
 ///
 /// Each gate is zero-sized: it carries only the operation TYPE, which is what names the
 /// input shape and its schema. The key is the operation's own `NAME`, so it is the
-/// model's routing key rather than a literal written here.
-fn input_validation_gates<Eng: Send + Sync + 'static>(
-) -> HashMap<&'static str, Box<dyn ErasedOperation>> {
+/// model's routing key rather than a literal written here. The second half is the union
+/// of each input shape's `@httpLabel` member paths, for the one refusal path that is
+/// reached without an operation.
+fn modelled_operation_gates<Eng: Send + Sync + 'static>(
+) -> (HashMap<&'static str, Box<dyn ErasedOperation>>, Vec<String>) {
     let mut gates: HashMap<&'static str, Box<dyn ErasedOperation>> = HashMap::new();
+    let mut uri_path_labels: Vec<String> = Vec::new();
     macro_rules! gate {
-        ($map:ident; $($module:ident :: $operation:ident),+ $(,)?) => {
+        ($map:ident, $labels:ident; $($module:ident :: $operation:ident),+ $(,)?) => {
             $(
                 $map.insert(
                     <crate::ops::$module::$operation<Eng> as Operation>::NAME,
@@ -133,6 +163,9 @@ fn input_validation_gates<Eng: Send + Sync + 'static>(
                         ModelledInputValidation::<crate::ops::$module::$operation<Eng>>::new(),
                     ) as Box<dyn ErasedOperation>,
                 );
+                $labels.extend(uri_path_label_paths(
+                    <crate::ops::$module::$operation<Eng> as Operation>::INPUT_SCHEMA,
+                ));
             )+
         };
     }
@@ -140,7 +173,7 @@ fn input_validation_gates<Eng: Send + Sync + 'static>(
     // the gate goes in front of all of them: a request that violates the model is
     // refused the same way whichever operation it named.
     gate!(
-        gates;
+        gates, uri_path_labels;
         create_rule::CreateRule,
         delete_rule::DeleteRule,
         get_rule::GetRule,
@@ -152,22 +185,28 @@ fn input_validation_gates<Eng: Send + Sync + 'static>(
         untag_resource::UntagResource,
         update_rule::UpdateRule,
     );
-    gates
+    uri_path_labels.sort_unstable();
+    uri_path_labels.dedup();
+    (gates, uri_path_labels)
 }
 
 /// The modelled-`ValidationException` gate in front of one operation `Op`.
 ///
-/// Zero-sized: `Op` is a type parameter only, naming the input shape and the schema the
-/// constraint walk runs against. It holds no engine and no state, so the operation it
-/// guards stays the single owner of the request's behaviour.
+/// `Op` is a type parameter only, naming the input shape and the schema the constraint
+/// walk runs against. The gate holds no engine and no request state, so the operation it
+/// guards stays the single owner of the request's behaviour — only the member paths that
+/// input shape binds into the URI path, read off the model once at construction because
+/// they are a fact of the shape and not of a request.
 struct ModelledInputValidation<Op> {
     operation: PhantomData<fn() -> Op>,
+    uri_path_labels: Vec<String>,
 }
 
-impl<Op> ModelledInputValidation<Op> {
-    const fn new() -> Self {
+impl<Op: Operation> ModelledInputValidation<Op> {
+    fn new() -> Self {
         Self {
             operation: PhantomData,
+            uri_path_labels: uri_path_label_paths(Op::INPUT_SCHEMA),
         }
     }
 }
@@ -180,7 +219,7 @@ impl<Op: Operation + 'static> ErasedOperation for ModelledInputValidation<Op> {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            if let Some(refused) = refuse_invalid_input::<Op>(svc, req) {
+            if let Some(refused) = refuse_invalid_input::<Op>(svc, req, &self.uri_path_labels) {
                 return refused;
             }
             // Valid: the generated operation serves it, through the framework's own
@@ -211,10 +250,17 @@ fn modelled_operation<'s>(
 /// `None` when the request satisfies the model, or when it failed to READ for a reason
 /// that is not a constraint violation — an unparseable body is a protocol failure, and
 /// the framework words those per protocol.
-fn refuse_invalid_input<Op: Operation>(svc: &dyn Service, req: &RtRequest) -> Option<RtResponse> {
+fn refuse_invalid_input<Op: Operation>(
+    svc: &dyn Service,
+    req: &RtRequest,
+    uri_path_labels: &[String],
+) -> Option<RtResponse> {
     let protocol = svc.definition().protocol();
     let violations = violations_of::<Op>(protocol, req);
-    let error = crate::state::constraint_violations(&violations)?;
+    // A clause quotes a `@pattern` as the service publishes that member's requirement,
+    // which turns on whether the member is bound into the URI path, so the refusal is
+    // rendered with the member paths THIS operation's input shape binds there.
+    let error = crate::state::constraint_violations(&violations, uri_path_labels)?;
     protocol
         .serialize_error(
             &error,
@@ -319,10 +365,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // what the model declares, so code and message move together.
         match refusal {
             Refusal::Invalid(violations) => {
-                crate::state::validation_envelope(violations).map(|message| Refused {
-                    code: VALIDATION_EXCEPTION_CODE.to_string(),
-                    message,
-                })
+                crate::state::validation_envelope(violations, &self.uri_path_labels).map(
+                    |message| Refused {
+                        code: VALIDATION_EXCEPTION_CODE.to_string(),
+                        message,
+                    },
+                )
             }
             // Authentication is the emulator's, not this service's: leave its wording.
             // `Refusal` is `#[non_exhaustive]`, so a class added later keeps the

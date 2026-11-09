@@ -31,6 +31,8 @@ mod lockable_rule_invariant;
 mod minted_arn_region_segment;
 #[path = "all/not_found_error_body_members.rs"]
 mod not_found_error_body_members;
+#[path = "all/pattern_requirement_quoting.rs"]
+mod pattern_requirement_quoting;
 #[path = "all/quota_refusal_bodies.rs"]
 mod quota_refusal_bodies;
 #[path = "all/regional_rule_isolation.rs"]
@@ -53,6 +55,8 @@ mod retention_rule_fidelity;
 mod retention_rule_lifecycle;
 #[path = "all/rule_lock_transitions.rs"]
 mod rule_lock_transitions;
+#[path = "all/rule_not_found_identifier.rs"]
+mod rule_not_found_identifier;
 #[path = "all/rule_status_transitions.rs"]
 mod rule_status_transitions;
 #[path = "all/selection_combination_invariant.rs"]

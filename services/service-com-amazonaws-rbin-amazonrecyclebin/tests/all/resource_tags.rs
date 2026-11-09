@@ -9,8 +9,8 @@
 //! exercises them. The rules under test:
 //!
 //! * a tagging call addresses its retention rule by the ARN this service MINTED, and an
-//!   ARN no stored rule carries is HTTP 404 `ResourceNotFoundException` naming the ARN
-//!   the request addressed, on every one of the three operations;
+//!   ARN no stored rule carries is HTTP 404 `ResourceNotFoundException` naming the rule
+//!   IDENTIFIER that ARN carries, on every one of the three operations;
 //! * `TagResource` is an UPSERT keyed by tag key: a key the rule already carries takes
 //!   the new value, a key it does not carry is added, every other key survives, and no
 //!   other rule's tags move;
@@ -825,8 +825,15 @@ async fn the_tag_operations_answer_resource_not_found_for_an_arn_no_rule_carries
         );
         assert_eq!(
             body["Message"].as_str(),
-            Some(format!("Recycle Bin Rule '{arn}' does not exist.").as_str()),
-            "case {case:?}: ListTagsForResource must name the ARN the request addressed, got {:?}",
+            Some(
+                format!(
+                    "Recycle Bin Rule '{}' does not exist.",
+                    arn.rsplit('/').next().unwrap_or(&arn)
+                )
+                .as_str()
+            ),
+            "case {case:?}: ListTagsForResource must name the rule identifier the ARN \
+             addressed, got {:?}",
             body["Message"]
         );
 
