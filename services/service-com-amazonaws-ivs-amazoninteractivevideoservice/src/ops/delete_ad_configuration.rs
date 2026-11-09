@@ -188,12 +188,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A channel that still names this ad configuration would be left pointing at a
         // resource that no longer exists, which is the inconsistent state the modelled
-        // `ConflictException` (409) refuses.
-        if let Some(channel_arn) = store.channel_referencing(&input.arn) {
+        // `ConflictException` (409) refuses. Its sentence names the action, the resource
+        // kind this operation's form spells, and the ARN the request sent — never the
+        // channel that holds the reference.
+        if store.is_referenced_by_channel(&input.arn) {
             return Err(crate::state::resource_referenced(
                 DeleteAdConfigurationErrorModeled::ConflictException,
+                Self::NAME,
+                Some("ad configuration"),
                 &input.arn,
-                channel_arn,
             ));
         }
         store.ad_configurations.remove(&input.arn);

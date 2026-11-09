@@ -317,8 +317,8 @@ async fn a_recording_configuration_a_channel_still_references_cannot_be_deleted(
             }
             channels.push(channel_arn);
         }
-        // The store keeps channels in ONE stable (ARN) order, so the channel the
-        // refusal names is the smallest ARN among those that still reference it.
+        // Sorted only so each row clears its references in one fixed order: the
+        // refusal names no channel, so which one is cleared first cannot change it.
         channels.sort();
 
         let mut remaining = channels.clone();
@@ -336,9 +336,9 @@ async fn a_recording_configuration_a_channel_still_references_cannot_be_deleted(
             );
             assert_eq!(
                 message(&refused),
-                resource_referenced_message(&arn, &remaining[0]),
-                "case {case:?} with {} reference(s) left: the refusal names the resource and \
-                 the channel still referencing it, got {}",
+                resource_referenced_message("DeleteRecordingConfiguration", None, &arn),
+                "case {case:?} with {} reference(s) left: the refusal states the attachment \
+                 rule and names no channel, got {}",
                 remaining.len(),
                 refused.body
             );

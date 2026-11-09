@@ -126,7 +126,7 @@ impl ComAmazonawsIvsAmazoninteractivevideoserviceState {
         }
     }
 
-    /// The ARN of a channel that still POINTS AT `arn`, if any holds it.
+    /// Whether any channel still POINTS AT `arn`.
     ///
     /// A channel is the only resource in this service that references another: it
     /// names a recording configuration, a playback restriction policy and an ad
@@ -136,25 +136,22 @@ impl ComAmazonawsIvsAmazoninteractivevideoserviceState {
     /// resource a channel can reference, without the caller saying which kind it
     /// asked about.
     ///
-    /// The scan runs in the store's one stable order (see [`Self::channels`]), so
-    /// the same store always names the same channel. A member left as the empty
-    /// string references nothing and is simply never equal to a well-formed ARN.
-    pub fn channel_referencing(&self, arn: &str) -> Option<&str> {
-        self.channels.values().find_map(|channel| {
+    /// The answer is a yes/no and not the channel's ARN, because the only thing
+    /// this service does with it is refuse a delete, and that refusal names the
+    /// resource the request named and no other (see
+    /// [`resource_referenced_message`]). A member left as the empty string
+    /// references nothing and is simply never equal to a well-formed ARN.
+    pub fn is_referenced_by_channel(&self, arn: &str) -> bool {
+        self.channels.values().any(|channel| {
             let references = [
                 channel.recording_configuration_arn.as_deref(),
                 channel.playback_restriction_policy_arn.as_deref(),
                 channel.ad_configuration_arn.as_deref(),
             ];
-            if references
+            references
                 .into_iter()
                 .flatten()
                 .any(|reference| reference == arn)
-            {
-                Some(channel.arn.as_deref().unwrap_or_default())
-            } else {
-                None
-            }
         })
     }
 }
@@ -899,16 +896,31 @@ pub fn channel_offline_message(channel_arn: &str) -> String {
     format!("Channel: {channel_arn} is not currently online")
 }
 
-/// How IVS states a delete refused because another resource still POINTS AT the one
-/// being deleted (`ConflictException`, HTTP 409): it names the resource the request
-/// asked to delete and one resource that still references it.
+/// How IVS states a delete refused because a channel still POINTS AT the resource the
+/// request named (`ConflictException`, HTTP 409): one attachment sentence naming the
+/// action it refused — `ivs:` plus the operation name — and the resource that request
+/// named, and nothing else. The channel holding the reference is NOT part of it, so a
+/// refusal never discloses a resource the caller did not name.
+///
+/// `resource_kind` is the kind the sentence spells before the ARN, for the operations
+/// whose sentence names it (`ad configuration`); where the service names the ARN alone
+/// it is `None`. Both per-operation parts come from the call site, because one delete's
+/// sentence is not another's.
 ///
 /// AWS documents the status and the code for this refusal ("If you try to delete a
 /// recording configuration that is associated with a channel, you will get an error
-/// (409 ConflictException)") but no message text, so the text is built from the
-/// request the same way every other message above is.
-pub fn resource_referenced_message(arn: &str, referenced_by: &str) -> String {
-    format!("Resource: {arn} is still referenced by: {referenced_by}")
+/// (409 ConflictException)"); the sentence is the one the service answers for the
+/// class, with the request's ARN as its only variable part.
+pub fn resource_referenced_message(
+    operation: &str,
+    resource_kind: Option<&str>,
+    arn: &str,
+) -> String {
+    let subject = match resource_kind {
+        Some(kind) => format!("{kind} {arn}"),
+        None => arn.to_string(),
+    };
+    format!("Unable to perform ivs:{operation} while {subject} is still attached to a channel")
 }
 
 /// How IVS states a quota refusal (`ServiceQuotaExceededException`, HTTP 402): it names
@@ -1035,15 +1047,17 @@ pub fn quota_exceeded<E>(
     )
 }
 
-/// The `ConflictException` (HTTP 409) this service answers when a delete would leave
-/// another resource pointing at something that no longer exists. See
-/// [`resource_referenced_message`].
+/// The `ConflictException` (HTTP 409) this service answers when a delete would leave a
+/// channel pointing at something that no longer exists. See
+/// [`resource_referenced_message`] for the sentence and for what `operation` and
+/// `resource_kind` are.
 pub fn resource_referenced<E>(
     variant: fn(ConflictException) -> E,
+    operation: &str,
+    resource_kind: Option<&str>,
     arn: &str,
-    referenced_by: &str,
 ) -> Scaffolded<E> {
-    let message = resource_referenced_message(arn, referenced_by);
+    let message = resource_referenced_message(operation, resource_kind, arn);
     Scaffolded::stated(
         variant(ConflictException {
             exception_message: Some(message.clone()),

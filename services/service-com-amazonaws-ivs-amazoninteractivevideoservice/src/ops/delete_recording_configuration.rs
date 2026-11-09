@@ -198,12 +198,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A channel that still names this configuration would be left pointing at a
         // resource that no longer exists, which is the inconsistent state the
-        // modelled `ConflictException` (409) refuses.
-        if let Some(channel_arn) = store.channel_referencing(&input.arn) {
+        // modelled `ConflictException` (409) refuses. Its sentence names the action
+        // and the ARN the request sent — this operation's form spells no resource
+        // kind — and never the channel that holds the reference.
+        if store.is_referenced_by_channel(&input.arn) {
             return Err(crate::state::resource_referenced(
                 DeleteRecordingConfigurationErrorModeled::ConflictException,
+                Self::NAME,
+                None,
                 &input.arn,
-                channel_arn,
             ));
         }
         store.recording_configurations.remove(&input.arn);
