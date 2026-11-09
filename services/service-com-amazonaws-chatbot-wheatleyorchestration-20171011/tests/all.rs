@@ -19,6 +19,8 @@ mod associations;
 mod chime_webhook_configuration;
 #[path = "all/chime_webhook_configuration_delete.rs"]
 mod chime_webhook_configuration_delete;
+#[path = "all/chime_webhook_configuration_delete_reach.rs"]
+mod chime_webhook_configuration_delete_reach;
 #[path = "all/chime_webhook_configuration_update.rs"]
 mod chime_webhook_configuration_update;
 #[path = "all/chime_webhook_configuration_update_refusals.rs"]
