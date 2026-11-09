@@ -71,8 +71,9 @@ pub struct EdgeAnswer {
 /// The two stores are locked one after the other and never at the same time, and the
 /// wafv2 side locks nothing of this service's, so the two cannot deadlock: the caller
 /// releases this service's store before asking, and `decide` reads its own records under a
-/// shared lock, evaluates with the lock released and writes the data plane's own
-/// bookkeeping — the sample `GetSampledRequests` draws from — under an exclusive one.
+/// shared lock, evaluates with the lock released, writes the data plane's own
+/// bookkeeping — the sample `GetSampledRequests` draws from — under an exclusive one, and
+/// publishes the `AWS/WAFV2` counters of the dimensions that acted once that lock is gone.
 pub fn decision<Eng: Send + Sync + 'static>(
     engine: &Eng,
     load_balancer_arn: &str,
@@ -80,12 +81,6 @@ pub fn decision<Eng: Send + Sync + 'static>(
     uri_path: &str,
     query_string: &str,
 ) -> Decision {
-    let Some(waf) = ::service_com_amazonaws_wafv2_awswaf_20190729::state::service_state(engine)
-    else {
-        // The wafv2 service is not mounted in this process at all, so no binding can
-        // exist and the listener answers every request.
-        return Decision::Unchanged;
-    };
     // The body as it arrived, which is what a rule inspecting `FieldToMatch$Body` reads.
     // A request this plane serves is one the front door handed over whole, so its body is in
     // memory; a body that cannot be read as bytes is reported rather than quietly inspected
@@ -102,8 +97,9 @@ pub fn decision<Eng: Send + Sync + 'static>(
         }
     };
     let inspected = waf_edge::InspectedRequest::of_http(req, uri_path, query_string, body);
-    let Some(decided) = waf_edge::decide(&waf, load_balancer_arn, &inspected) else {
-        // No web ACL is in front of this load balancer.
+    let Some(decided) = waf_edge::decide(engine, load_balancer_arn, &inspected) else {
+        // No web ACL is in front of this load balancer — or the wafv2 service is not
+        // mounted in this process at all, so no binding can exist.
         return Decision::Unchanged;
     };
     if decided.action.is_allow() {

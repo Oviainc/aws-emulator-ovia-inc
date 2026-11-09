@@ -150,8 +150,6 @@ struct Case {
 #[tokio::test]
 async fn a_sample_names_a_group_rule_by_its_group_whatever_action_the_web_acl_left_in_force() {
     let (waf, engine) = Waf::sharing_engine();
-    let state = service_com_amazonaws_wafv2_awswaf_20190729::state::service_state(&*engine)
-        .expect("the wafv2 store is reachable from the shared engine");
 
     // The rule names each vendor's group declares, read from the group's own
     // declaration: the rows take them out of force BY NAME, and every row's last
@@ -334,7 +332,7 @@ async fn a_sample_names_a_group_rule_by_its_group_whatever_action_the_web_acl_le
         )
         .await;
 
-        let decision = edge::decide(&state, &resource, &request_at(case.path, case.query))
+        let decision = edge::decide(&*engine, &resource, &request_at(case.path, case.query))
             .unwrap_or_else(|| {
                 panic!(
                     "case {:?}: the associated web acl must decide the request",

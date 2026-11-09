@@ -133,8 +133,6 @@ async fn sampled(waf: &Waf, arn: &str, metric: &str, start: i64, end: i64, max_i
 async fn a_sample_reports_the_requests_the_web_acl_evaluated_for_that_dimension() {
     let (waf, engine) = Waf::sharing_engine();
     let (_, arn) = web_acl_in_front(&waf).await;
-    let state = service_com_amazonaws_wafv2_awswaf_20190729::state::service_state(&*engine)
-        .expect("the wafv2 store is reachable from the shared engine");
 
     // Before anything is evaluated, every window is empty: the report is computed from
     // what the edge recorded, and it has recorded nothing.
@@ -148,7 +146,7 @@ async fn a_sample_reports_the_requests_the_web_acl_evaluated_for_that_dimension(
 
     // Three requests the blocking rule decides, and one the default action does.
     for path in ["/prod/orders", "/prod/orders", "/prod/orders", "/prod/admin"] {
-        let decision = edge::decide(&state, &stage_arn(), &request_from("198.51.100.5", path))
+        let decision = edge::decide(&*engine, &stage_arn(), &request_from("198.51.100.5", path))
             .unwrap_or_else(|| panic!("case {path}: the associated web acl must decide the request"));
         let expected_allow = path.ends_with("/admin");
         assert_eq!(
@@ -297,8 +295,6 @@ async fn a_sample_reports_the_requests_the_web_acl_evaluated_for_that_dimension(
 async fn the_managed_keys_are_the_aggregation_instances_currently_over_the_limit() {
     let (waf, engine) = Waf::sharing_engine();
     let (web_acl_id, _) = web_acl_in_front(&waf).await;
-    let state = service_com_amazonaws_wafv2_awswaf_20190729::state::service_state(&*engine)
-        .expect("the wafv2 store is reachable from the shared engine");
 
     /// The keys the report lists for the rate-based rule, by family.
     async fn managed_keys(waf: &Waf, web_acl_id: &str) -> (Vec<String>, Vec<String>) {
@@ -368,7 +364,7 @@ async fn the_managed_keys_are_the_aggregation_instances_currently_over_the_limit
             // `/admin` so the byte-match rule above does not decide the request before
             // the rate-based rule counts it.
             let decided = edge::decide(
-                &state,
+                &*engine,
                 &stage_arn(),
                 &request_from(caller.client_ip, "/prod/admin"),
             );

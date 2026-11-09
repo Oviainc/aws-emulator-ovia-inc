@@ -124,12 +124,11 @@ fn place_counts(
 
 /// Drive one request at `resource_arn` and answer whether the web ACL in front of it
 /// let the request through.
-fn allowed(
-    state: &::engine::ServiceState<ComAmazonawsWafv2Awswaf20190729State>,
-    resource_arn: &str,
-    case: &str,
-) -> bool {
-    edge::decide(state, resource_arn, &request())
+///
+/// Given the shared ENGINE, which is what the data plane's entry point takes: what WAF
+/// reports about one request spans its own store and the CloudWatch one.
+fn allowed(engine: &::engine::InMemoryEngine, resource_arn: &str, case: &str) -> bool {
+    edge::decide(engine, resource_arn, &request())
         .unwrap_or_else(|| panic!("case {case:?}: the associated web acl must decide"))
         .action
         .is_allow()
@@ -245,7 +244,7 @@ async fn a_rate_based_rule_serves_the_caller_again_once_its_window_has_passed() 
         // past it is not.
         for sent in 1..=LIMIT {
             assert!(
-                allowed(&state, &resource_arn, "a request at or under the limit"),
+                allowed(&engine, &resource_arn, "a request at or under the limit"),
                 "case a request at or under the limit at EvaluationWindowSec \
                  {window_sec}: request {sent} of {LIMIT} must be served, it is not over \
                  the limit yet"
@@ -253,7 +252,7 @@ async fn a_rate_based_rule_serves_the_caller_again_once_its_window_has_passed() 
         }
         assert!(
             !allowed(
-                &state,
+                &engine,
                 &resource_arn,
                 "the request that takes the caller over the limit"
             ),
@@ -290,7 +289,7 @@ async fn a_rate_based_rule_serves_the_caller_again_once_its_window_has_passed() 
                 case.case, case.listed
             );
 
-            let served = allowed(&state, &resource_arn, case.case);
+            let served = allowed(&engine, &resource_arn, case.case);
             assert_eq!(
                 served, case.served,
                 "case {:?} at EvaluationWindowSec {window_sec}: expected the request to \

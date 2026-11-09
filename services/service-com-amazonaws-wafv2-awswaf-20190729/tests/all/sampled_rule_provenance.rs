@@ -143,8 +143,6 @@ struct Case {
 #[tokio::test]
 async fn a_sample_names_the_terminating_rule_by_the_group_that_holds_it() {
     let (waf, engine) = Waf::sharing_engine();
-    let state = service_com_amazonaws_wafv2_awswaf_20190729::state::service_state(&*engine)
-        .expect("the wafv2 store is reachable from the shared engine");
 
     // A customer-owned rule group, so one row's terminating rule lives in a group this
     // account owns rather than in a vendor's.
@@ -289,7 +287,7 @@ async fn a_sample_names_the_terminating_rule_by_the_group_that_holds_it() {
         )
         .await;
 
-        let decision = edge::decide(&state, &resource, &request_at(case.path, case.query))
+        let decision = edge::decide(&*engine, &resource, &request_at(case.path, case.query))
             .unwrap_or_else(|| {
                 panic!(
                     "case {:?}: the associated web acl must decide the request",

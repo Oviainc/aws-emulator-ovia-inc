@@ -50,6 +50,13 @@ aes-gcm = { version = "0.10", default-features = false, features = ["aes", "allo
 # references, so a named, decimal or hexadecimal reference is decoded the way a browser
 # decodes it rather than by a hand-written table.
 html-escape = "0.2"
+# The CloudWatch store the DATA plane publishes its per-dimension counters to (the
+# `AWS/WAFV2` namespace, `service::metrics`): what a `VisibilityConfig` with
+# `CloudWatchMetricsEnabled` asks WAF to send. CloudWatch refuses a `PutMetricData` into
+# a reserved `AWS/` namespace, so a service's own metrics never travel over that API;
+# this writes the very store `ListMetrics`, `GetMetricStatistics` and the alarm
+# evaluation read.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 # Exact decimal arithmetic over a `MonetizationAmountValue`, which the model carries
 # as a string: a revenue total is a sum of money, so it is added as the decimal each
 # amount spells rather than through a binary float (`state::monetization_amount`).

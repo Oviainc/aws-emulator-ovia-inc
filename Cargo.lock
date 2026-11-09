@@ -19051,6 +19051,7 @@ dependencies = [
  "percent-encoding",
  "regex",
  "serde_json",
+ "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "sha2 0.10.9",
  "tokio",
  "tracing",

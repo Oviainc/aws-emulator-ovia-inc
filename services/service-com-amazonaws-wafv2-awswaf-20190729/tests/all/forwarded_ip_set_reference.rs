@@ -168,8 +168,6 @@ async fn assert_cases(cases: &[Case]) {
             fronts.push((case.config, stage));
         }
     }
-    let state = service_com_amazonaws_wafv2_awswaf_20190729::state::service_state(&*shared)
-        .expect("the wafv2 store is reachable from the shared engine");
 
     for case in cases {
         let stage = fronts
@@ -190,7 +188,7 @@ async fn assert_cases(cases: &[Case]) {
             body: Vec::new(),
             client_ip: case.client_ip.to_string(),
         };
-        let decision = edge::decide(&state, &stage, &request).unwrap_or_else(|| {
+        let decision = edge::decide(&*shared, &stage, &request).unwrap_or_else(|| {
             panic!(
                 "case {:?}: the associated web ACL must decide the request",
                 case.case

@@ -49,9 +49,13 @@
 //! request. It lives here, with this service, because the semantics are WAFv2's:
 //! the rule order, the actions, the labels, the rate counts and the samples.
 //! [`sqli`] is the injection detection the SQL and cross-site-scripting statements
-//! inspect with.
+//! inspect with. [`metrics`] is what that evaluation REPORTS to CloudWatch about the
+//! requests each dimension acted on, which is the other half of a `VisibilityConfig`.
 
 pub mod edge;
+/// The `AWS/WAFV2` series the data plane publishes: the per-dimension counters a
+/// `VisibilityConfig$CloudWatchMetricsEnabled` asks WAF to send to CloudWatch.
+pub mod metrics;
 /// The judgement every operation makes about the request itself, before it resolves
 /// anything the request names: the `Scope` against the endpoint it was signed for.
 pub mod requests;

@@ -147,12 +147,15 @@ pub fn refusal<Eng: Send + Sync + 'static>(
         addressed_pool_arn(&store, &submitted)?
     };
 
-    let waf = ::service_com_amazonaws_wafv2_awswaf_20190729::state::service_state(engine)?;
     // The decision, and the lock discipline it needs, are wafv2's own: `decide` reads
-    // its records under a shared lock, evaluates the web ACL with the lock RELEASED and
+    // its records under a shared lock, evaluates the web ACL with the lock RELEASED,
     // writes the data plane's own bookkeeping — the sample `GetSampledRequests` draws
-    // from — under an exclusive one. This service's store is not held across the call.
-    let decision = waf_edge::decide(&waf, &pool_arn, &inspected_request(req, submitted_body))?;
+    // from — under an exclusive one, and publishes the `AWS/WAFV2` counters of the
+    // dimensions that acted once that lock is gone. It is given the shared engine
+    // because reporting what the web ACL did spans two stores, and it answers `None`
+    // when the wafv2 service is not mounted in this process at all, so no binding can
+    // exist. This service's store is not held across the call.
+    let decision = waf_edge::decide(engine, &pool_arn, &inspected_request(req, submitted_body))?;
     tracing::debug!(
         user_pool_arn = %pool_arn,
         operation = %operation,

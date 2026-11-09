@@ -1999,17 +1999,17 @@ fn web_acl_decision<Eng: Send + Sync + 'static>(
         )
     };
 
-    let Some(waf) = ::service_com_amazonaws_wafv2_awswaf_20190729::state::service_state(engine)
-    else {
-        return EdgeOutcome::Unchanged;
-    };
     let inspected = inspected_request(req, &invoke_path);
     // The decision, and the lock discipline it needs, are wafv2's own: `decide` reads
-    // the records under a shared lock, evaluates the web ACL with the lock RELEASED and
-    // writes the data plane's own bookkeeping under an exclusive one. This service's own
-    // store is not held across the call, and the wafv2 side locks nothing of this
-    // service's, so the two cannot deadlock.
-    let Some(decision) = waf_edge::decide(&waf, &stage_arn, &inspected) else {
+    // the records under a shared lock, evaluates the web ACL with the lock RELEASED,
+    // writes the data plane's own bookkeeping under an exclusive one, and publishes the
+    // `AWS/WAFV2` counters of the dimensions that acted once that lock is gone. It is
+    // given the shared engine because reporting what the web ACL did spans two stores,
+    // and it answers `None` when the wafv2 service is not mounted in this process at
+    // all, so no binding can exist and the stage serves the request unchanged. This
+    // service's own store is not held across the call, and the wafv2 side locks nothing
+    // of this service's, so the two cannot deadlock.
+    let Some(decision) = waf_edge::decide(engine, &stage_arn, &inspected) else {
         // No web ACL in front of this stage.
         return EdgeOutcome::Unchanged;
     };

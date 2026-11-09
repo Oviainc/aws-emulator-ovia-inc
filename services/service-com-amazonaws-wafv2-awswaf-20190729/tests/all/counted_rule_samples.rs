@@ -210,8 +210,6 @@ async fn samples_of(waf: &Waf, web_acl_arn: &str, metric: &str) -> (Vec<Value>, 
 #[tokio::test]
 async fn every_rule_that_matched_samples_the_request_under_its_own_dimension() {
     let (waf, engine) = Waf::sharing_engine();
-    let state = service_com_amazonaws_wafv2_awswaf_20190729::state::service_state(&*engine)
-        .expect("the wafv2 store is reachable from the shared engine");
 
     // A rule group this account owns, whose one rule BLOCKS what it matches: the rows
     // below run it as it is, excluded, overridden to count, and counted whole.
@@ -500,7 +498,7 @@ async fn every_rule_that_matched_samples_the_request_under_its_own_dimension() {
         .await;
 
         let request = request_with(case.path, case.query, &case.headers);
-        let decision = edge::decide(&state, &resource, &request).unwrap_or_else(|| {
+        let decision = edge::decide(&*engine, &resource, &request).unwrap_or_else(|| {
             panic!(
                 "case {:?}: the associated web acl must decide the request",
                 case.case
@@ -631,8 +629,6 @@ async fn every_rule_that_matched_samples_the_request_under_its_own_dimension() {
 #[tokio::test]
 async fn a_counted_dimension_holds_every_request_the_rule_counted() {
     let (waf, engine) = Waf::sharing_engine();
-    let state = service_com_amazonaws_wafv2_awswaf_20190729::state::service_state(&*engine)
-        .expect("the wafv2 store is reachable from the shared engine");
 
     let created = waf
         .ok(
@@ -666,7 +662,7 @@ async fn a_counted_dimension_holds_every_request_the_rule_counted() {
     // dimension is read: the population tracks the traffic.
     for driven in 1..=3_i64 {
         let request = request_with("/prod/orders", "", &[(MARKER_HEADER, MARKER_VALUE)]);
-        edge::decide(&state, &resource, &request).unwrap_or_else(|| {
+        edge::decide(&*engine, &resource, &request).unwrap_or_else(|| {
             panic!("case request {driven}: the associated web acl must decide the request")
         });
         let (samples, population) = samples_of(&waf, &web_acl_arn, "count-marker").await;

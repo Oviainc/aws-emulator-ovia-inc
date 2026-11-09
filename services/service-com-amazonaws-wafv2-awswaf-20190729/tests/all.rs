@@ -149,3 +149,5 @@ mod web_acl_associations;
 mod web_acl_edge_reports;
 #[path = "all/web_acl_lifecycle.rs"]
 mod web_acl_lifecycle;
+#[path = "all/web_acl_request_metrics.rs"]
+mod web_acl_request_metrics;

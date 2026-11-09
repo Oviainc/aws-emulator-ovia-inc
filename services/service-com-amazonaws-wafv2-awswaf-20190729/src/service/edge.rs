@@ -418,6 +418,24 @@ pub struct SampledRequestRecord {
     pub sample: SampledHTTPRequest,
 }
 
+/// What the evaluation of ONE request recorded about WAF's own reporting of it.
+///
+/// A `VisibilityConfig` carries two independent switches, so one walk over the rules
+/// produces two records of the same evaluation: the sample population
+/// `GetSampledRequests` draws from, kept for a dimension whose
+/// `SampledRequestsEnabled` asks for it, and the CloudWatch counters, sent for a
+/// dimension whose `CloudWatchMetricsEnabled` asks for them. They are collected
+/// together because they are recorded at the same points — wherever a dimension ACTED
+/// on the request — and written apart because they live in different stores.
+#[derive(Debug, Default)]
+struct Recorded {
+    /// One record per rule dimension that is keeping samples.
+    samples: Vec<SampledRequestRecord>,
+    /// One entry per rule dimension that is sending metrics, and the action it
+    /// applied.
+    acted: Vec<super::metrics::ActedDimension>,
+}
+
 /// The instants one rate-based aggregation instance has been seen at.
 ///
 /// "WAF monitors web requests and manages keys independently for each unique
@@ -482,20 +500,30 @@ fn group_rule_name(group: &[&str], rule_name: &str) -> String {
 /// `None` means no web ACL is associated with that resource, so the resource answers
 /// the request as it would with no WAF in front of it at all. `Some` is the decision,
 /// and by the time it is returned the request is in the web ACL's sample population
-/// (for every rule dimension whose `VisibilityConfig` enables sampling) and in the
-/// rate counts of every rate-based rule that counted it.
+/// (for every rule dimension whose `VisibilityConfig` enables sampling), in the rate
+/// counts of every rate-based rule that counted it, and counted into the CloudWatch
+/// series of every dimension whose `VisibilityConfig` enables metrics
+/// ([`super::metrics`]).
 ///
-/// THREE phases, and the middle one holds no lock. Inspecting a request is work the
-/// web ACL's stored rules decide the cost of — a regular expression to compile, a body
-/// to scan — so it must not run while every other request to this service waits on the
-/// store: the records the evaluation needs are copied out under one shared read, the
-/// evaluation runs with the lock released, and the bookkeeping it produced is written
-/// under a second, exclusive one.
-pub fn decide(
-    state: &::engine::ServiceState<ComAmazonawsWafv2Awswaf20190729State>,
+/// It is given the shared ENGINE rather than this service's store alone, because what
+/// WAF reports about one request spans two stores: its own bookkeeping, and the
+/// CloudWatch series a client reads the counters back from. One entry point writes
+/// both, so no protected resource's service can serve traffic that is enforced but
+/// never reported.
+///
+/// FOUR phases, and no two stores are ever locked at once. Inspecting a request is work
+/// the web ACL's stored rules decide the cost of — a regular expression to compile, a
+/// body to scan — so it must not run while every other request to this service waits on
+/// the store: the records the evaluation needs are copied out under one shared read, the
+/// evaluation runs with the lock released, the bookkeeping it produced is written under a
+/// second, exclusive one, and the counters are published once that lock is gone.
+pub fn decide<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     resource_arn: &str,
     request: &InspectedRequest,
 ) -> Option<EdgeDecision> {
+    let state: ::engine::ServiceState<ComAmazonawsWafv2Awswaf20190729State> =
+        crate::state::service_state(engine)?;
     // PHASE 1, under a shared read: the web ACL, the entities its rules reference, and
     // the rate counts already recorded for it.
     let (entry, catalogue, counts): (
@@ -532,28 +560,42 @@ pub fn decide(
         web_acl_id: entry.web_acl.id.clone(),
         now,
     };
-    let (decision, samples, counted) = evaluation.run(&entry.web_acl, &counts);
+    let (decision, recorded, counted) = evaluation.run(&entry.web_acl, &counts);
 
     // PHASE 3, under an exclusive lock: the bookkeeping WAF keeps about the requests it
     // evaluated. Written here, once, for the request that has just been decided —
     // never on a read.
-    let mut store = state.lock();
-    for key in counted {
-        prune_rate_instances(&mut store, &key, now);
-        let buckets = store.rate_based_counts.entry(key).or_default();
-        record_request(buckets, now);
-    }
-    if !samples.is_empty() {
-        let population = store
-            .sampled_requests
-            .entry((entry.scope.clone(), entry.web_acl.id.clone()))
-            .or_default();
-        population.extend(samples);
-        if population.len() > SAMPLE_POPULATION_CAP {
-            let overflow = population.len() - SAMPLE_POPULATION_CAP;
-            population.drain(..overflow);
+    {
+        let mut store = state.lock();
+        for key in counted {
+            prune_rate_instances(&mut store, &key, now);
+            let buckets = store.rate_based_counts.entry(key).or_default();
+            record_request(buckets, now);
+        }
+        if !recorded.samples.is_empty() {
+            let population = store
+                .sampled_requests
+                .entry((entry.scope.clone(), entry.web_acl.id.clone()))
+                .or_default();
+            population.extend(recorded.samples);
+            if population.len() > SAMPLE_POPULATION_CAP {
+                let overflow = population.len() - SAMPLE_POPULATION_CAP;
+                population.drain(..overflow);
+            }
         }
     }
+
+    // PHASE 4, with this service's store released: the CloudWatch counters of every
+    // dimension that acted on the request. The metric store belongs to another service,
+    // so it is locked only once this one's lock is gone and the two can never be held
+    // at the same time.
+    super::metrics::publish(
+        engine,
+        &entry.web_acl.name,
+        &super::metrics::reported_region(&entry.scope, &entry.web_acl.arn),
+        &recorded.acted,
+        now,
+    );
     Some(decision)
 }
 
@@ -869,8 +911,8 @@ struct GroupRuleProvenance {
 }
 
 impl Evaluation<'_> {
-    /// Walk the web ACL's rules and settle on a terminating action, recording a sample
-    /// per rule dimension and the rate counts the walk incurred.
+    /// Walk the web ACL's rules and settle on a terminating action, recording what WAF
+    /// reports about the request ([`Recorded`]) and the rate counts the walk incurred.
     ///
     /// `counts` are the rate counts already recorded for this web ACL; the counts this
     /// request ADDS come back as the third element, so the walk itself writes nothing.
@@ -878,11 +920,7 @@ impl Evaluation<'_> {
         &self,
         web_acl: &WebACL,
         counts: &HashMap<RateInstanceKey, Vec<RateBucket>>,
-    ) -> (
-        EdgeDecision,
-        Vec<SampledRequestRecord>,
-        Vec<RateInstanceKey>,
-    ) {
+    ) -> (EdgeDecision, Recorded, Vec<RateInstanceKey>) {
         let mut cx = MatchContext {
             request: self.request,
             catalogue: self.catalogue,
@@ -890,7 +928,7 @@ impl Evaluation<'_> {
             labels: Vec::new(),
         };
         let mut inserted: Vec<(String, String)> = Vec::new();
-        let mut samples: Vec<SampledRequestRecord> = Vec::new();
+        let mut recorded = Recorded::default();
         let mut counted: Vec<RateInstanceKey> = Vec::new();
         let namespace = web_acl
             .label_namespace
@@ -907,7 +945,7 @@ impl Evaluation<'_> {
                 &mut counted,
                 counts,
                 &namespace,
-                &mut samples,
+                &mut recorded,
             );
             if let RuleOutcome::Terminate {
                 action,
@@ -916,8 +954,8 @@ impl Evaluation<'_> {
             } = outcome
             {
                 let custom = self.rendered_response(web_acl, custom_response.as_ref(), action);
-                self.record_sample(
-                    &mut samples,
+                self.record_outcome(
+                    &mut recorded,
                     &rule.visibility_config,
                     action.action_value(),
                     group.overridden_action.clone(),
@@ -926,7 +964,7 @@ impl Evaluation<'_> {
                     &cx.labels,
                 );
                 report_response_code(
-                    &mut samples,
+                    &mut recorded.samples,
                     custom.as_ref().map(|response| response.status),
                 );
                 return (
@@ -942,7 +980,7 @@ impl Evaluation<'_> {
                         rule_name_within_rule_group: group.inner_rule,
                         labels: cx.labels,
                     },
-                    samples,
+                    recorded,
                     counted,
                 );
             }
@@ -962,8 +1000,8 @@ impl Evaluation<'_> {
             (None, None) => (EdgeAction::Allow, None),
         };
         let custom = self.rendered_response(web_acl, custom_response.as_ref(), action);
-        self.record_sample(
-            &mut samples,
+        self.record_outcome(
+            &mut recorded,
             &web_acl.visibility_config,
             action.action_value(),
             None,
@@ -972,7 +1010,7 @@ impl Evaluation<'_> {
             &cx.labels,
         );
         report_response_code(
-            &mut samples,
+            &mut recorded.samples,
             custom.as_ref().map(|response| response.status),
         );
         (
@@ -988,7 +1026,7 @@ impl Evaluation<'_> {
                 rule_name_within_rule_group: None,
                 labels: cx.labels,
             },
-            samples,
+            recorded,
             counted,
         )
     }
@@ -1003,7 +1041,7 @@ impl Evaluation<'_> {
         counted: &mut Vec<RateInstanceKey>,
         counts: &HashMap<RateInstanceKey, Vec<RateBucket>>,
         namespace: &str,
-        samples: &mut Vec<SampledRequestRecord>,
+        recorded: &mut Recorded,
     ) -> RuleOutcome {
         // A rule that runs a rule GROUP has no `Action` of its own: each of the
         // group's rules carries one, and the web ACL rule's `OverrideAction` is what
@@ -1021,7 +1059,7 @@ impl Evaluation<'_> {
                 &managed_namespace(managed),
                 cx,
                 inserted,
-                samples,
+                recorded,
                 &rule.visibility_config,
             );
         }
@@ -1043,7 +1081,7 @@ impl Evaluation<'_> {
                 inserted,
                 counted,
                 counts,
-                samples,
+                recorded,
                 &rule.visibility_config,
             );
         }
@@ -1063,8 +1101,8 @@ impl Evaluation<'_> {
             // this request is one the rule COUNTED: it belongs to the rule's own
             // dimension exactly as a terminating match does, and the next rule runs.
             if let Some(counted_as) = counting_action_value(rule.action.as_ref()) {
-                self.record_sample(
-                    samples,
+                self.record_outcome(
+                    recorded,
                     &rule.visibility_config,
                     counted_as,
                     None,
@@ -1090,7 +1128,7 @@ impl Evaluation<'_> {
         namespace: &str,
         cx: &mut MatchContext<'_>,
         inserted: &mut Vec<(String, String)>,
-        samples: &mut Vec<SampledRequestRecord>,
+        recorded: &mut Recorded,
         visibility: &VisibilityConfig,
     ) -> RuleOutcome {
         // "An optional nested statement that narrows the scope of the web requests
@@ -1132,8 +1170,8 @@ impl Evaluation<'_> {
             // request: it belongs to the dimension of the web ACL rule that runs the
             // group, named by the group rule that counted it.
             if let Some(counted_as) = decided.counted_as {
-                self.record_sample(
-                    samples,
+                self.record_outcome(
+                    recorded,
                     visibility,
                     counted_as,
                     decided.overridden_action,
@@ -1160,7 +1198,7 @@ impl Evaluation<'_> {
         inserted: &mut Vec<(String, String)>,
         counted: &mut Vec<RateInstanceKey>,
         counts: &HashMap<RateInstanceKey, Vec<RateBucket>>,
-        samples: &mut Vec<SampledRequestRecord>,
+        recorded: &mut Recorded,
         visibility: &VisibilityConfig,
     ) -> RuleOutcome {
         let counted_group = override_action.is_some_and(|action| action.count.is_some());
@@ -1210,8 +1248,8 @@ impl Evaluation<'_> {
             // terminating counted the request, under the dimension of the web ACL
             // rule that runs the group.
             if let Some(counted_as) = decided.counted_as {
-                self.record_sample(
-                    samples,
+                self.record_outcome(
+                    recorded,
                     visibility,
                     counted_as,
                     decided.overridden_action,
@@ -1421,19 +1459,28 @@ impl Evaluation<'_> {
         })
     }
 
-    /// Record one sample of this request under a rule dimension, when that
-    /// dimension's `VisibilityConfig` asks for samples.
+    /// Record what WAF reports about this request under one rule dimension that ACTED
+    /// on it.
     ///
     /// `action` is the `ActionValue` the dimension applied to the request — the
     /// terminating action for the rule that ended the evaluation, and
     /// [`COUNT_ACTION_VALUE`] or [`EXCLUDED_AS_COUNT_ACTION_VALUE`] for a rule that
-    /// only counted it. The response code the request was answered with is reported by
+    /// only counted it. The dimension's `VisibilityConfig` decides what is recorded,
+    /// and its two switches are independent: `SampledRequestsEnabled` — "indicates
+    /// whether WAF should store a sampling of the web requests that match the rules" —
+    /// asks for the sample `GetSampledRequests` draws from, and
+    /// `CloudWatchMetricsEnabled` — "indicates whether the associated resource sends
+    /// metrics to Amazon CloudWatch" — asks for this action to be counted into the
+    /// dimension's own series ([`super::metrics`]). Either turned off, that record is
+    /// not kept, and the request is decided either way.
+    ///
+    /// The response code the request was answered with is reported by
     /// [`report_response_code`] once the evaluation has settled on one, because every
     /// sample recorded here is of the SAME request.
     #[allow(clippy::too_many_arguments)]
-    fn record_sample(
+    fn record_outcome(
         &self,
-        samples: &mut Vec<SampledRequestRecord>,
+        recorded: &mut Recorded,
         visibility: &VisibilityConfig,
         action: &str,
         overridden_action: Option<String>,
@@ -1441,13 +1488,16 @@ impl Evaluation<'_> {
         inserted: &[(String, String)],
         labels: &[String],
     ) {
-        // `VisibilityConfig$SampledRequestsEnabled`: "indicates whether WAF should
-        // store a sampling of the web requests that match the rules". Turned off,
-        // nothing is stored and `GetSampledRequests` has nothing to draw from.
+        if visibility.cloud_watch_metrics_enabled {
+            recorded.acted.push(super::metrics::ActedDimension {
+                metric_name: visibility.metric_name.clone(),
+                action_value: action.to_string(),
+            });
+        }
         if !visibility.sampled_requests_enabled {
             return;
         }
-        samples.push(SampledRequestRecord {
+        recorded.samples.push(SampledRequestRecord {
             observed_at_millis: self.now,
             metric_name: visibility.metric_name.clone(),
             sample: SampledHTTPRequest {

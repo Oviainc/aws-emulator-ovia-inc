@@ -497,12 +497,9 @@ async fn a_published_label_is_the_label_a_matching_rule_sees() {
         fronts.push((label, stage));
     }
 
-    let state = service_com_amazonaws_wafv2_awswaf_20190729::state::service_state(&*shared)
-        .expect("the wafv2 store is reachable from the shared engine");
-
     for (case, (label, stage)) in cases.iter().zip(fronts.iter()) {
         for (probe, expected_block) in [(&case.tripping, true), (&case.control, false)] {
-            let decision = edge::decide(&state, stage, &probe.inspected()).unwrap_or_else(|| {
+            let decision = edge::decide(&*shared, stage, &probe.inspected()).unwrap_or_else(|| {
                 panic!(
                     "case {:?}: the associated web ACL must decide the request",
                     case.case
