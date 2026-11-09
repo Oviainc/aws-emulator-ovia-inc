@@ -240,10 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.log_groups.len() >= crate::state::MAX_LOG_GROUPS {
                 return Err(CreateLogGroupErrorModeled::LimitExceededException(
                     LimitExceededException {
-                        message: Some(format!(
-                            "the maximum of {} log groups per Region per account has been reached",
-                            crate::state::MAX_LOG_GROUPS
-                        )),
+                        message: Some(crate::state::log_groups_quota_message()),
                     },
                 )
                 .into());

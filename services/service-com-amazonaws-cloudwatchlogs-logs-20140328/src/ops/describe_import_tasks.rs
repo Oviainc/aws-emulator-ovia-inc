@@ -251,12 +251,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Optional filter to describe a specific import task by its ID": the one input
         // that names a resource of this service rather than describing a subset, so an id
-        // no task carries is a missing resource rather than an empty page.
+        // no task carries is a missing resource rather than an empty page — stated in the
+        // sentence CloudWatch Logs words that condition in.
         if let Some(import_id) = input.import_id.as_deref() {
             if !store.import_tasks.contains_key(import_id) {
                 return Err(DescribeImportTasksErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::resource_not_found_message("import task")),
+                        message: Some(crate::state::NO_MATCHING_IMPORT_MESSAGE.to_string()),
                     },
                 )
                 .into());

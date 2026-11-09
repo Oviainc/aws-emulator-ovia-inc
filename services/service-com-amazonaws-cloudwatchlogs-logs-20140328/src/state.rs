@@ -184,6 +184,10 @@ pub mod callback_client;
 /// Resolving the S3 bucket an export task's `destination` names against the object store.
 pub mod export_destination;
 
+/// Resolving the data source an import task's `importSourceArn` names against the service
+/// that holds it.
+pub mod import_source;
+
 /// Writing an export task's selected log events to its destination bucket, which is the work
 /// the task does.
 pub mod export_worker;
@@ -273,6 +277,10 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// `DescribeImportTasks` enumerates in import-id order without re-sorting, which is
     /// also what makes its pagination cursor stable.
     pub import_tasks: BTreeMap<String, ImportTaskRecord>,
+    /// Monotonic counter behind the `importId`s `CreateImportTask` mints, so every import task
+    /// it creates gets an id no earlier create used — including after the task holding an id
+    /// has been dropped. See [`mint_import_task_id`].
+    pub next_import_task_seq: u64,
     /// Every export task of this account — the resource `CreateExportTask` starts and
     /// `DescribeExportTasks` reports — keyed by `ExportTask$taskId`. A `BTreeMap` so
     /// `DescribeExportTasks` enumerates in task-id order without re-sorting, which is also
@@ -523,6 +531,13 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
     pub fn take_export_task_seq(&mut self) -> u64 {
         let seq = self.next_export_task_seq;
         self.next_export_task_seq = self.next_export_task_seq.saturating_add(1);
+        seq
+    }
+
+    /// Take the next import-task sequence number, advancing the counter.
+    pub fn take_import_task_seq(&mut self) -> u64 {
+        let seq = self.next_import_task_seq;
+        self.next_import_task_seq = self.next_import_task_seq.saturating_add(1);
         seq
     }
 
@@ -819,6 +834,37 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         }
     }
 
+    /// How many import tasks of this account are still running, which is what
+    /// [`MAX_ACTIVE_IMPORT_TASKS`] bounds ("there can be no more than 3 active imports per
+    /// account at a given time").
+    ///
+    /// Read AFTER [`Self::materialize_due_import_transitions`], so a task the clock has
+    /// already completed does not hold a slot.
+    pub fn active_import_tasks(&self) -> usize {
+        self.import_tasks
+            .values()
+            .filter(|task| !task.is_terminal())
+            .count()
+    }
+
+    /// Drop the oldest finished import tasks the store holds beyond [`MAX_IMPORT_TASKS`], so
+    /// repeated creates cannot grow it without bound. A task that is still running is never
+    /// dropped: its import has not finished.
+    pub fn enforce_import_task_ceiling(&mut self) {
+        while self.import_tasks.len() > MAX_IMPORT_TASKS {
+            let Some(oldest) = self
+                .import_tasks
+                .values()
+                .filter(|task| task.is_terminal())
+                .min_by_key(|task| (task.creation_time_ms, task.import_id.clone()))
+                .map(|task| task.import_id.clone())
+            else {
+                return;
+            };
+            self.import_tasks.remove(&oldest);
+        }
+    }
+
     /// Materialise every export-task status change the clock has ALREADY made due, as of
     /// `now_ms`.
     ///
@@ -1002,10 +1048,8 @@ pub struct ImportTaskRecord {
     pub import_source_arn: String,
     /// `CreateImportTask$importRoleArn` — "The ARN of the IAM role that grants CloudWatch
     /// Logs permission to import". No `Import` member reports it, but the task is the only
-    /// record of the role the import runs under, so it is stored with the task. Written by
-    /// `CreateImportTask` once that operation is implemented (it is still a scaffold stub),
-    /// which is also the only caller [`ImportTaskRecord::new`] is waiting for — neither is
-    /// dead code to prune.
+    /// record of the role the import runs under, so it is stored with the task, by the
+    /// `CreateImportTask` that starts the import.
     pub import_role_arn: String,
     /// `Import$importDestinationArn` — "The ARN of the managed CloudWatch Logs log group
     /// where the events are being imported to."
@@ -1039,7 +1083,7 @@ pub struct ImportTaskRecord {
 impl ImportTaskRecord {
     /// A brand-new import task: running, nothing imported yet, and due to complete
     /// [`IMPORT_COMPLETION_DELAY_MS`] after it was created. This is what
-    /// `CreateImportTask` stores once it is implemented.
+    /// `CreateImportTask` stores for the import it starts.
     pub fn new(
         import_id: &str,
         import_source_arn: &str,
@@ -1472,6 +1516,17 @@ impl ExportTaskRecord {
             }),
         }
     }
+}
+
+/// The id `CreateImportTask` gives the task it creates — "A unique identifier for the import
+/// task" — minted from the store's monotonic import-task counter so it is unique for the life
+/// of the store and DERIVED FROM STORED STATE.
+///
+/// CloudWatch Logs renders one as a canonical hyphenated UUID, which the modelled `ImportId`
+/// (`^[\-a-zA-Z0-9]+$`, 1..256) admits, so it is minted through the shared
+/// [`mint_uuid_from_seq`] every UUID-shaped id of this service comes from.
+pub fn mint_import_task_id(seq: u64) -> String {
+    mint_uuid_from_seq(seq)
 }
 
 /// The id `CreateExportTask` gives the task it creates — "The ID of the export task" —

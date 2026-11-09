@@ -70,6 +70,10 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", 
 # Logs use it for that group, which is read from KMS with the `GetKeyPolicy` this client
 # generates, over the same in-process callback.
 aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# `CreateImportTask` imports from a CloudTrail Lake event data store, so it resolves the
+# source its `importSourceArn` names where CloudTrail holds it, with the `GetEventDataStore`
+# this client generates, over the same in-process callback.
+aws-sdk-cloudtrail = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -95,6 +99,10 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 # about them mounts Amazon S3 beside this service on the same engine and reads the objects
 # back through it.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# An import task's SOURCE is a REAL event data store of the CloudTrail emulator, so the suite
+# about creating one mounts CloudTrail beside this service on the same engine and creates,
+# and deletes, the source through it.
+service-com-amazonaws-cloudtrail-cloudtrail-20131101 = { workspace = true }
 
 [lints]
 workspace = true

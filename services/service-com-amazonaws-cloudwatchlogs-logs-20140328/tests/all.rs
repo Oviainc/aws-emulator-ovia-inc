@@ -105,6 +105,8 @@ mod filter_log_events_search_reporting;
 mod fixed_text_refusals;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/import_task_creation.rs"]
+mod import_task_creation;
 #[path = "all/import_tasks.rs"]
 mod import_tasks;
 #[path = "all/index_policies.rs"]

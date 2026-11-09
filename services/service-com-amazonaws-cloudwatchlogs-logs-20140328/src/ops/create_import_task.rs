@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateImportTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateImportTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateImportTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts an import from a CloudTrail Lake event data store and persists it in
+//! [`crate::state`]: the source is resolved where CloudTrail holds it
+//! ([`crate::state::import_source`]), the managed destination log group is created in this
+//! service's own store, and the task is handed back `IN_PROGRESS` for the clock to complete.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +182,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateImportTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateImportTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region = crate::state::request_region(ctx.parts());
+
+        // Every error this operation models is a CLIENT error, so a store that is not there
+        // at all is reported with the one of them that says the service rather than the
+        // request is at fault — and that a retry may find it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateImportTaskError::from(CreateImportTaskErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let invalid = |message: String| {
+            CreateImportTaskError::from(CreateImportTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            ))
+        };
+
+        // Both ARN-typed members are read as ARNs before anything else is decided, the way
+        // every ARN-typed member of this service is: a value that is not an ARN at all names
+        // no resource, and the refusal states which member could not be parsed.
+        for (member, value) in [
+            ("importSourceArn", input.import_source_arn.as_str()),
+            ("importRoleArn", input.import_role_arn.as_str()),
+        ] {
+            if let Some(message) = crate::state::unparsable_arn_message(member, value) {
+                return Err(invalid(message));
+            }
+        }
+
+        // "The startEventTime must be less than or equal to endEventTime": the window is a
+        // filter over EVENT TIMES, so a window bounded at one end only is still a window, and
+        // the one window that spans no instant is the one whose end precedes its start.
+        if let Some(filter) = &input.import_filter {
+            if let (Some(start), Some(end)) = (filter.start_event_time, filter.end_event_time) {
+                if end < start {
+                    return Err(invalid(
+                        crate::state::IMPORT_EVENT_TIME_RANGE_MESSAGE.to_string(),
+                    ));
+                }
+            }
+        }
+
+        // "Currently, CloudTrail Event Data Store is the only supported data source", so the
+        // source names a resource of ANOTHER service and is resolved where that service holds
+        // it — no lock is held across the call. An import from a source that is not there
+        // could never read an event, so the service refuses it rather than minting an import
+        // id the caller would then poll for data nothing will move. `ctx` carries the
+        // credential scope the resolution is addressed in; nothing else about the request
+        // enters into it.
+        match crate::state::import_source::resolve(ctx, &region, &input.import_source_arn).await {
+            crate::state::import_source::ImportSource::Absent => {
+                return Err(CreateImportTaskErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message("import source")),
+                    },
+                )
+                .into());
+            }
+            // "The specified source must be in an ACTIVE state": the source is there, but not
+            // in a state its events can be read from, which is a refusal about the resource
+            // rather than about the value the request carried.
+            crate::state::import_source::ImportSource::Inactive => {
+                return Err(CreateImportTaskErrorModeled::InvalidOperationException(
+                    InvalidOperationException {
+                        message: Some(crate::state::IMPORT_SOURCE_NOT_ACTIVE_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            crate::state::import_source::ImportSource::Active
+            | crate::state::import_source::ImportSource::Unresolved => {}
+        }
+
+        // The destination log group is named after the event data store the events come from,
+        // which the source ARN carries; an ARN naming no store was refused above.
+        let source_id = crate::state::import_source::event_data_store_id(&input.import_source_arn)
+            .unwrap_or_default()
+            .to_string();
+        let destination_name = crate::state::import_destination_log_group_name(&source_id);
+
+        let mut store = state.lock();
+        let now = crate::state::now_ms();
+
+        // "There can be no more than 3 active imports per account at a given time": the
+        // completions the clock already owed are materialised first, so a task it has since
+        // finished does not hold a slot. The slots are the ACCOUNT's, so what the create
+        // names does not enter into it.
+        store.materialize_due_import_transitions(now);
+        if store.active_import_tasks() >= crate::state::MAX_ACTIVE_IMPORT_TASKS {
+            return Err(CreateImportTaskErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(crate::state::active_import_tasks_limit_message()),
+                },
+            )
+            .into());
+        }
+
+        // The import "creates a managed log group as the destination for the imported data":
+        // the group is this service's own resource, so it is created in this store and is read
+        // back through every log-group operation. A group already standing under that name is
+        // the destination of an earlier import from the same source, so it is delivered into
+        // rather than created a second time.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateImportTask"))
+        // A destination that has to be CREATED is a log group of this account like any other,
+        // so the account's log-group quota bounds it: a create that would pass that quota is
+        // refused with the quota-shaped error this operation models, before anything is
+        // minted. An import delivering into a group that already stands needs no new one and
+        // is not held to it.
+        let destination_stands = store.log_groups.contains_key(&destination_name);
+        if !destination_stands && store.log_groups.len() >= crate::state::MAX_LOG_GROUPS {
+            return Err(CreateImportTaskErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(crate::state::log_groups_quota_message()),
+                },
+            )
+            .into());
+        }
+        let destination = store
+            .log_groups
+            .entry(destination_name.clone())
+            .or_insert_with(|| crate::state::LogGroupRecord::new(&region, &destination_name, now));
+        let destination_arn = destination.log_group_arn.clone();
+
+        let import_id = crate::state::mint_import_task_id(store.take_import_task_seq());
+        let record = crate::state::ImportTaskRecord::new(
+            &import_id,
+            &input.import_source_arn,
+            &input.import_role_arn,
+            &destination_arn,
+            input.import_filter.as_ref(),
+            now,
+        );
+        store.import_tasks.insert(import_id.clone(), record);
+        store.enforce_import_task_ceiling();
+
+        Ok(CreateImportTaskOutput {
+            import_id: Some(import_id),
+            import_destination_arn: Some(destination_arn),
+            creation_time: Some(now),
+        })
     }
 }

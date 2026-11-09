@@ -16,10 +16,11 @@
 //! what is asserted here is what a client reads off the wire.
 //!
 //! The tasks themselves are put in the store through
-//! [`ImportTaskRecord::new`] — the SAME constructor `CreateImportTask` will call — because
-//! that operation is still a scaffold stub (`issues/.../logs-createimporttask-stub.md`),
-//! so no wire call can create one yet. Once it is implemented, these suites' seeding is
-//! the only thing that changes; nothing they assert does.
+//! [`ImportTaskRecord::new`] — the SAME constructor `CreateImportTask` calls — so that each
+//! case seeds exactly the state it is about, including the statuses no create hands back
+//! (cancelled, failed) and a corpus wide enough to page. What a CREATED import task carries
+//! is `CreateImportTask`'s own rule, asserted over the wire in
+//! `tests/all/import_task_creation.rs`.
 //!
 //! The table spans what the rule generalises over rather than one request: each value of
 //! the model's `ImportStatus` enum, several sources and one no task uses, a filter present
@@ -550,8 +551,8 @@ async fn a_token_from_another_enumeration_is_refused() {
 }
 
 /// An `importId` no task carries names a resource that does not exist: the operation
-/// refuses with `ResourceNotFoundException` and this service's missing-resource sentence,
-/// rather than reporting an empty page.
+/// refuses with `ResourceNotFoundException` and the sentence CloudWatch Logs words that
+/// condition in, rather than reporting an empty page.
 #[tokio::test]
 async fn an_import_id_no_task_carries_is_a_missing_resource() {
     let logs = Logs::new();
@@ -566,8 +567,9 @@ async fn an_import_id_no_task_carries_is_a_missing_resource() {
             "case {id:?}: expected ResourceNotFoundException, got {code} {message:?}"
         );
         assert_eq!(
-            message, "The specified import task does not exist.",
-            "case {id:?}: expected this service's missing-resource sentence, got {message:?}"
+            message, "No matching import found.",
+            "case {id:?}: expected the sentence CloudWatch Logs states for an id it holds no \
+             import under, got {message:?}"
         );
     }
 }

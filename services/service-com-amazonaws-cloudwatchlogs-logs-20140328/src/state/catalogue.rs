@@ -115,6 +115,16 @@ pub const LOG_GROUP_NAME_PATTERN_SEPARATOR: char = '|';
 /// 1,000,000 log groups per Region per account."
 pub const MAX_LOG_GROUPS: usize = 1_000_000;
 
+/// The refusal a create that would need a log group past [`MAX_LOG_GROUPS`] carries: the
+/// quota that refused it, so a caller can tell this limit from a request it could fix.
+///
+/// Stated once here because more than one operation creates a log group — `CreateLogGroup`
+/// and the managed destination group an import task delivers into — and the quota is the
+/// account's, so both refuse past it with the same sentence.
+pub fn log_groups_quota_message() -> String {
+    format!("the maximum of {MAX_LOG_GROUPS} log groups per Region per account has been reached")
+}
+
 /// AWS's documented resource-policy quota, from `PutResourcePolicy`: "An account can
 /// have a maximum of 10 policies without resourceARN and one per LogGroup resourceARN".
 /// The per-resource half of that quota is structural here: a resource-scoped policy is
@@ -535,10 +545,71 @@ pub const IMPORT_STATUS_FAILED: &str = "FAILED";
 /// AWS documents no duration for an import ("Starts an import from a data source to
 /// CloudWatch Log"), so this span is THE EMULATOR'S OWN CHOICE: the import runs
 /// asynchronously, so the task is handed back `IN_PROGRESS` and the clock owes it a
-/// terminal status later. The span is deliberately not zero — a caller that reads or
-/// cancels the task straight after creating it still observes `IN_PROGRESS`, and the
-/// state rules that go with it.
-pub const IMPORT_COMPLETION_DELAY_MS: i64 = 500;
+/// terminal status later. It is a WHOLE span of the length this emulator gives a transition
+/// the clock owes, not a fraction of a client round-trip, which is what makes the one
+/// non-terminal status observable: a caller that creates an import and then reads or cancels
+/// it over one or more further API calls still finds it `IN_PROGRESS`, and so still meets the
+/// state rules that status carries — chief among them that "there can be no more than 3
+/// active imports per account at a given time" ([`MAX_ACTIVE_IMPORT_TASKS`]), a limit a task
+/// settling inside one round-trip could never impose. The instant it falls due at is stored
+/// on the record and never slept on.
+pub const IMPORT_COMPLETION_DELAY_MS: i64 = 3_000;
+
+/// How many import tasks of one account may be running at the same time: `CreateImportTask`
+/// documents that "there can be no more than 3 active imports per account at a given time".
+pub const MAX_ACTIVE_IMPORT_TASKS: usize = 3;
+
+/// THE EMULATOR'S OWN CEILING on the import tasks one account's store holds, not a quota
+/// cited from AWS: a task stays in memory for as long as the process runs and nothing expires
+/// one, so the oldest finished tasks are dropped once the store holds this many rather than
+/// growing without bound on request.
+pub const MAX_IMPORT_TASKS: usize = 1_000;
+
+/// The refusal `CreateImportTask` answers when the source it is given is not in a state an
+/// import can read from: the operation documents the constraint as a sentence of its own —
+/// "the specified source must be in an ACTIVE state" — and the text is fixed for the
+/// condition, carrying neither the source ARN nor the state it is actually in.
+pub const IMPORT_SOURCE_NOT_ACTIVE_MESSAGE: &str =
+    "The specified source must be in an ACTIVE state.";
+
+/// The refusal `CreateImportTask` answers when the `importFilter` it is given bounds the
+/// event time at both ends in the wrong order: the operation documents the constraint as a
+/// sentence of its own — "the startEventTime must be less than or equal to endEventTime" —
+/// and the text is fixed for the condition, carrying neither bound.
+pub const IMPORT_EVENT_TIME_RANGE_MESSAGE: &str =
+    "The startEventTime must be less than or equal to endEventTime.";
+
+/// The refusal `CreateImportTask` answers when the account already has
+/// [`MAX_ACTIVE_IMPORT_TASKS`] imports running: the quota that refused it, so a caller can
+/// tell this limit from a request it could fix. The slots are the ACCOUNT's, so the text
+/// carries nothing of the request or of the tasks holding them. It is refused with the only
+/// quota-shaped error the operation models (`ThrottlingException`, "The request was throttled
+/// because of quota limits").
+pub fn active_import_tasks_limit_message() -> String {
+    format!("the maximum of {MAX_ACTIVE_IMPORT_TASKS} active import(s) per account has been reached")
+}
+
+/// The refusal `DescribeImportTasks` answers when the `importId` it is given names no import
+/// task of this account: the service states that nothing it holds matched, rather than naming
+/// the resource kind the way [`resource_not_found_message`] does, and the text is fixed for
+/// the condition — it carries not even the id it was handed.
+pub const NO_MATCHING_IMPORT_MESSAGE: &str = "No matching import found.";
+
+/// The name prefix of the managed log group an import task delivers into, which is also the
+/// one `CreateImportTask`'s own IAM example documents for an import destination
+/// ("arn:aws:logs:us-east-1:123456789012:log-group:/aws/cloudtrail/*").
+pub const IMPORT_DESTINATION_LOG_GROUP_PREFIX: &str = "/aws/cloudtrail/";
+
+/// The name of the managed log group `CreateImportTask` creates "as the destination for the
+/// imported data", for an import whose source carries the store id `source_id`.
+///
+/// The group is named after the EVENT DATA STORE the events come from, which is what the
+/// operation's IAM example pairs with it: the import destination it grants
+/// `log-group:/aws/cloudtrail/<id>:*` on carries the same id as the
+/// `eventdatastore/<id>` it grants `cloudtrail:GetEventDataStoreData` on.
+pub fn import_destination_log_group_name(source_id: &str) -> String {
+    format!("{IMPORT_DESTINATION_LOG_GROUP_PREFIX}{source_id}")
+}
 
 /// An export task that has been accepted but has not started moving data yet, from the
 /// model's `ExportTaskStatusCode` enum (`CANCELLED` | `COMPLETED` | `FAILED` | `PENDING` |
