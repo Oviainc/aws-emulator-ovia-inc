@@ -183,10 +183,14 @@ async fn set_queue_attributes_refuses_every_name_it_cannot_accept_as_an_unknown_
         let url = create_ok(&router, &format!("names{suffix}"), &attributes).await;
         // The dead-letter queue the `RedrivePolicy` row names, of this row's own kind.
         create_ok(&router, &dead_letter_name(fifo), &attributes).await;
-        let before = all_attributes(&router, &url).await;
 
         for name in QUEUE_ATTRIBUTE_NAMES.iter().chain([&UNDECLARED_NAME]) {
             let value = value_for(name, fifo);
+            // The queue as it stands going INTO this call, which is what a refused call has to
+            // leave untouched: the rows before this one set the names they could, and an
+            // accepted set is a change to the queue, so the comparison below is against the
+            // state this call found rather than against the queue as it was created.
+            let before = all_attributes(&router, &url).await;
             let (status, parsed) = call(
                 &router,
                 "SetQueueAttributes",

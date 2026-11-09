@@ -989,3 +989,259 @@ async fn one_record_is_written_per_delivery_of_the_topic() {
         }
     }
 }
+
+/// The MD5 digest of `body`, in lowercase hexadecimal — the digest function itself, so a row
+/// with no published test value of its own still states what the record must carry.
+fn md5_hex(body: &str) -> String {
+    use md5::{Digest, Md5};
+
+    hex::encode(Md5::digest(body.as_bytes()))
+}
+
+/// One row of the digest table: the case, the body published, and the digest the record must
+/// report for it (`None` for a body with no published test value, whose digest is taken with
+/// [`md5_hex`]).
+type DigestCase = (&'static str, String, Option<&'static str>);
+
+/// The bodies whose digest the table asserts.
+///
+/// The first four are RFC 1321's own published MD5 test values (its "MD5 test suite"), which
+/// pin the digest to that function rather than to whatever this emulator computes; the rest
+/// differ along what the rule generalises over — the body's length, its character set and its
+/// shape.
+fn digest_rows() -> Vec<DigestCase> {
+    vec![
+        (
+            "a one-byte body",
+            "a".to_string(),
+            Some("0cc175b9c0f1b6a831c399e269772661"),
+        ),
+        (
+            "a three-byte body",
+            "abc".to_string(),
+            Some("900150983cd24fb0d6963f7d28e17f72"),
+        ),
+        (
+            "a body with a space in it",
+            "message digest".to_string(),
+            Some("f96b697d7cb7938d525a2f31aaf161d0"),
+        ),
+        (
+            "the whole lower-case alphabet",
+            "abcdefghijklmnopqrstuvwxyz".to_string(),
+            Some("c3fcd3d76192e4007dfb496cca67e13b"),
+        ),
+        (
+            "a multi-byte body",
+            "notificación — ✉".to_string(),
+            None,
+        ),
+        (
+            "a JSON body",
+            r#"{"alarm":"CPUHigh","value":97.5}"#.to_string(),
+            None,
+        ),
+        // Far longer than one MD5 block, so the digest spans many of them.
+        (
+            "a body of eight thousand bytes",
+            "payload-".repeat(1_000),
+            None,
+        ),
+    ]
+}
+
+/// Wait until `log_group` holds `expected` record(s) of `message_id`, and answer them.
+async fn records_of(
+    emulator: &Emulator,
+    log_group: &str,
+    message_id: &str,
+    expected: usize,
+    case: &str,
+) -> Vec<Value> {
+    let deadline = Instant::now() + RECORD_BUDGET;
+    loop {
+        let records: Vec<Value> = records_in(emulator, log_group)
+            .await
+            .into_iter()
+            .filter(|record| record["notification"]["messageId"].as_str() == Some(message_id))
+            .collect();
+        if records.len() >= expected {
+            return records;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected {expected} delivery-status record(s) for {message_id} in \
+             {log_group}, got {records:?}"
+        );
+        tokio::time::sleep(LOOK_INTERVAL).await;
+    }
+}
+
+/// RULE: a delivery-status record's `notification` block reports the digest of the PUBLISHED
+/// MESSAGE'S BODY as `messageMD5Sum`, beside the message's id, its topic and its publish time —
+/// for every delivery of that message, whatever the outcome of the attempt.
+///
+/// The rows differ along the body the digest is taken of; every row is published to ONE topic
+/// with TWO subscribed queues, so each row also asserts that the two records of one message
+/// report the same digest (it is taken of the content, not of the delivery), and that bodies
+/// that differ report digests that differ.
+#[tokio::test]
+async fn a_record_reports_the_digest_of_the_published_body() {
+    let emulator = emulator();
+    let topic = element(
+        &sns(&emulator, "CreateTopic", &[("Name", "digest")]).await,
+        "TopicArn",
+    );
+    let role = given_role(
+        &emulator,
+        "sns-digest-feedback",
+        SNS_PRINCIPAL,
+        Permissions::WritesLogs,
+    )
+    .await;
+    let (_, first) = given_queue(&emulator, "digest-one", true).await;
+    let (_, second) = given_queue(&emulator, "digest-two", true).await;
+    for endpoint in [&first, &second] {
+        sns(
+            &emulator,
+            "Subscribe",
+            &[
+                ("TopicArn", &topic),
+                ("Protocol", "sqs"),
+                ("Endpoint", endpoint),
+            ],
+        )
+        .await;
+    }
+    for (name, value) in [
+        ("SQSSuccessFeedbackRoleArn", role.as_str()),
+        ("SQSSuccessFeedbackSampleRate", "100"),
+    ] {
+        sns(
+            &emulator,
+            "SetTopicAttributes",
+            &[
+                ("TopicArn", &topic),
+                ("AttributeName", name),
+                ("AttributeValue", value),
+            ],
+        )
+        .await;
+    }
+
+    let log_group = feedback_log_group(&topic);
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for (case, body, published_digest) in digest_rows() {
+        let expected = published_digest
+            .map(str::to_string)
+            .unwrap_or_else(|| md5_hex(&body));
+        let message_id = element(
+            &sns(
+                &emulator,
+                "Publish",
+                &[("TopicArn", &topic), ("Message", &body)],
+            )
+            .await,
+            "MessageId",
+        );
+        let records = records_of(&emulator, &log_group, &message_id, 2, case).await;
+        assert_eq!(
+            records.len(),
+            2,
+            "case {case:?}: expected one record per subscribed queue, got {records:?}"
+        );
+        for record in &records {
+            assert_eq!(
+                record["notification"]["messageMD5Sum"].as_str(),
+                Some(expected.as_str()),
+                "case {case:?}: expected messageMD5Sum {expected:?}, got {record}"
+            );
+        }
+        // The two records are of two different deliveries of ONE message: the digest is of the
+        // body, so neither the endpoint nor the delivery changes it.
+        let destinations: Vec<&str> = records
+            .iter()
+            .filter_map(|record| record["delivery"]["destination"].as_str())
+            .collect();
+        for endpoint in [&first, &second] {
+            assert!(
+                destinations.contains(&endpoint.as_str()),
+                "case {case:?}: expected a record naming {endpoint}, got {destinations:?}"
+            );
+        }
+        for (earlier, digest) in &seen {
+            assert!(
+                (earlier == &body) == (digest == &expected),
+                "case {case:?}: a body differing from {earlier:?} must digest differently, got \
+                 {digest:?} and {expected:?}"
+            );
+        }
+        seen.push((body, expected));
+    }
+}
+
+/// RULE (same rule, the other outcome): a FAILED delivery's record carries the same
+/// `notification` block, so the digest of the published body is reported in the `/Failure`
+/// group too.
+#[tokio::test]
+async fn a_failed_deliverys_record_reports_the_digest_too() {
+    let emulator = emulator();
+    let topic = element(
+        &sns(&emulator, "CreateTopic", &[("Name", "digest-failure")]).await,
+        "TopicArn",
+    );
+    let role = given_role(
+        &emulator,
+        "sns-digest-failure-feedback",
+        SNS_PRINCIPAL,
+        Permissions::WritesLogs,
+    )
+    .await;
+    // A queue granting this service nothing: the delivery is withheld, so the record is a
+    // FAILURE.
+    let (_, endpoint) = given_queue(&emulator, "digest-failure", false).await;
+    sns(
+        &emulator,
+        "Subscribe",
+        &[
+            ("TopicArn", &topic),
+            ("Protocol", "sqs"),
+            ("Endpoint", &endpoint),
+        ],
+    )
+    .await;
+    sns(
+        &emulator,
+        "SetTopicAttributes",
+        &[
+            ("TopicArn", &topic),
+            ("AttributeName", "SQSFailureFeedbackRoleArn"),
+            ("AttributeValue", &role),
+        ],
+    )
+    .await;
+
+    let case = "a delivery the queue's own policy withheld";
+    let body = "abc";
+    let message_id = element(
+        &sns(
+            &emulator,
+            "Publish",
+            &[("TopicArn", &topic), ("Message", body)],
+        )
+        .await,
+        "MessageId",
+    );
+    let records = records_of(&emulator, &failure_log_group(&topic), &message_id, 1, case).await;
+    let record = &records[0];
+    assert_eq!(
+        record["status"].as_str(),
+        Some("FAILURE"),
+        "case {case:?}: expected a FAILURE record, got {record}"
+    );
+    assert_eq!(
+        record["notification"]["messageMD5Sum"].as_str(),
+        Some(md5_hex(body).as_str()),
+        "case {case:?}: expected the body's digest, got {record}"
+    );
+}

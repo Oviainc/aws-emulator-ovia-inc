@@ -18034,6 +18034,7 @@ dependencies = [
  "hex",
  "http",
  "ipnet",
+ "md-5 0.10.6",
  "serde",
  "serde_json",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",

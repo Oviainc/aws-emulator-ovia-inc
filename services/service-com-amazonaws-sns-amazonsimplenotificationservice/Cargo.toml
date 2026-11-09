@@ -31,6 +31,9 @@ tracing = { workspace = true }
 # and the message/subscription ids are formatted from a SHA-256 digest.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The `messageMD5Sum` a delivery-status record reports for the published message is the MD5
+# digest of its body (`state::delivery_status`).
+md-5 = "0.10"
 # `arn`: the ONE parse of a caller-supplied resource ARN, shared with every other service —
 # a subscription's SQS endpoint ARN is read through it rather than split here.
 service-common = { path = "../common" }

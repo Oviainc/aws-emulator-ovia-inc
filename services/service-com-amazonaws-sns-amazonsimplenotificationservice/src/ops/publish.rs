@@ -736,12 +736,15 @@ pub(crate) fn subscription_deliveries(
     let function_body: ::std::cell::OnceCell<String> = ::std::cell::OnceCell::new();
     let mut raw_body: Option<::std::sync::Arc<str>> = None;
     let mut deliveries = Deliveries::default();
+    // The digest of the published body the delivery-status records report, taken at most once
+    // for the whole fan-out rather than per subscriber.
+    let digest = state::delivery_status::MessageDigest::of(published);
     for subscription in subscriptions {
         // What the topic asks to have logged about a delivery over THIS subscription's
         // protocol, read once per subscription and carried with the delivery, so the write
         // that follows the attempt needs nothing from the store.
         let logged =
-            state::delivery_status::Logged::of(topic, &subscription.protocol, published);
+            state::delivery_status::Logged::of(topic, &subscription.protocol, published, &digest);
         match subscription.protocol.as_str() {
             SQS_PROTOCOL => {
                 let Some(target) = QueueTarget::of(subscription) else {

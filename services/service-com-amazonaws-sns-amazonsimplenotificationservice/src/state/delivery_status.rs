@@ -38,8 +38,9 @@
 //! naming the endpoint, the delivery's status, the HTTP status the endpoint's own service
 //! answered with and that service's own answer; the member set around them is the form AWS
 //! publishes for a delivery-status record in the Amazon SNS Developer Guide (a `notification`
-//! block, a `delivery` block and a `status`), and the log STREAM's name is this emulator's,
-//! pinned by no recording.
+//! block naming the published message by id, topic, publish time and CONTENT DIGEST, a
+//! `delivery` block and a `status`), and the log STREAM's name is this emulator's, pinned by
+//! no recording.
 
 use ::std::time::SystemTime;
 
@@ -190,6 +191,9 @@ struct Attempt<'a> {
     /// The subscription that owed the delivery: what the record's delivery id is derived
     /// from, so one message's records are told apart per subscriber.
     subscription_arn: &'a str,
+    /// The digest of the published message's body, which the record reports beside the
+    /// message's id so a reader can tell WHICH payload the attempt carried.
+    message_md5: &'a str,
     /// The endpoint the message was delivered to, as the subscription names it — the
     /// `destination` the record reports.
     endpoint: &'a str,
@@ -222,6 +226,10 @@ fn rendered(attempt: &Attempt<'_>, at: SystemTime) -> String {
     notification.insert(
         "topicArn".to_string(),
         ::serde_json::Value::from(attempt.topic_arn),
+    );
+    notification.insert(
+        "messageMD5Sum".to_string(),
+        ::serde_json::Value::from(attempt.message_md5),
     );
     if let Some(timestamp) = rfc3339(attempt.published_at) {
         notification.insert("timestamp".to_string(), ::serde_json::Value::from(timestamp));
@@ -267,6 +275,55 @@ fn rendered(attempt: &Attempt<'_>, at: SystemTime) -> String {
         ::serde_json::Value::from(attempt.status.reported()),
     );
     ::serde_json::Value::Object(record).to_string()
+}
+
+/// The `messageMD5Sum` of a published message: the MD5 digest of its body, in lowercase
+/// hexadecimal.
+///
+/// A digest of the CONTENT, so every record of one published message — one per subscriber,
+/// over every protocol — reports the same value, two publishes of the same body report the
+/// same value, and the value changes only when the body does. The body is the one `Publish`
+/// received, which is what the record's `notification` block names.
+///
+/// The digest function is the one the member's own name states, and the value is a checksum a
+/// reader compares against its own copy of the body: nothing is authenticated or protected by
+/// it, here or anywhere a client reads it.
+fn message_md5(message: &str) -> String {
+    use ::md5::{Digest, Md5};
+
+    ::hex::encode(Md5::digest(message.as_bytes()))
+}
+
+/// The digest of ONE published message's body, taken at most once however many subscriptions
+/// that message fans out to.
+///
+/// The digest is a property of the PUBLISH rather than of a delivery: one publish is
+/// delivered to every subscription of the topic and each delivery's record reports the same
+/// value, so one pass over the body serves the whole fan-out. Held per publish and read on
+/// first use, so a publish no subscription logs takes no pass at all, and one that logs N
+/// deliveries still takes one — what a publish costs here does not grow with the number of
+/// subscribers.
+#[derive(Debug)]
+pub struct MessageDigest<'a> {
+    /// The published body the digest is taken of.
+    message: &'a str,
+    /// That digest, once something has asked for it.
+    digest: ::std::cell::OnceCell<String>,
+}
+
+impl<'a> MessageDigest<'a> {
+    /// The digest of `published`'s body, not yet taken.
+    pub fn of(published: &'a PublishedMessage) -> Self {
+        Self {
+            message: &published.message,
+            digest: ::std::cell::OnceCell::new(),
+        }
+    }
+
+    /// That digest, taken now if this is the first ask.
+    fn get(&self) -> &str {
+        self.digest.get_or_init(|| message_md5(self.message))
+    }
 }
 
 /// How many hexadecimal characters a record's `deliveryId` carries. Half a SHA-256 digest
@@ -349,6 +406,8 @@ pub struct Logged {
     feedback: Feedback,
     /// The published message the delivery carries.
     message_id: String,
+    /// The digest of that message's body, as the record reports it.
+    message_md5: String,
     /// When it was published: what the record's dwell time is measured from.
     published_at: SystemTime,
 }
@@ -357,14 +416,20 @@ impl Logged {
     /// What `topic` asks to have logged about `published`'s delivery over `protocol`, or
     /// `None` when it asks for nothing — there is no topic (a replay of one that is no longer
     /// there), the protocol has no feedback attributes, or the topic names no role for it.
+    ///
+    /// `digest` is the published body's digest, shared across the whole fan-out of one publish
+    /// ([`MessageDigest`]), and is read only for a delivery that IS logged.
     pub fn of(
         topic: Option<&TopicRecord>,
         protocol: &str,
         published: &PublishedMessage,
+        digest: &MessageDigest<'_>,
     ) -> Option<Self> {
+        let feedback = feedback_of(topic?, protocol)?;
         Some(Self {
-            feedback: feedback_of(topic?, protocol)?,
+            feedback,
             message_id: published.message_id.clone(),
+            message_md5: digest.get().to_string(),
             published_at: published.published_at,
         })
     }
@@ -413,6 +478,7 @@ impl Logged {
             message_id: &self.message_id,
             topic_arn,
             subscription_arn,
+            message_md5: &self.message_md5,
             endpoint,
             published_at: self.published_at,
             status,
@@ -828,6 +894,7 @@ mod tests {
                 message_id: "0123",
                 topic_arn: "arn:aws:sns:us-west-2:000000000000:alerts",
                 subscription_arn: "arn:aws:sns:us-west-2:000000000000:alerts:abcd",
+                message_md5: &message_md5("a notification"),
                 endpoint: "arn:aws:lambda:us-west-2:000000000000:function:notify",
                 published_at: published,
                 status,
@@ -879,6 +946,7 @@ mod tests {
             message_id: "0123",
             topic_arn: "arn:aws:sns:us-west-2:000000000000:alerts",
             subscription_arn: "arn:aws:sns:us-west-2:000000000000:alerts:abcd",
+            message_md5: &message_md5("a notification"),
             endpoint: "arn:aws:sqs:us-west-2:000000000000:orders",
             published_at: published,
             status: Status::Failure,
@@ -892,5 +960,50 @@ mod tests {
                 "case \"no answer\": {member} must be left out, got {record}"
             );
         }
+    }
+
+    /// RULE: the `notification` block reports the digest of the published message's BODY, so
+    /// one body always digests to the same value and two different bodies to different ones.
+    /// The rows differ along the body the digest is taken of: its length, its character set
+    /// and its shape. The first two are RFC 1321's own published test values for MD5, which
+    /// is what pins the digest to that function rather than to this code.
+    #[test]
+    fn the_record_reports_the_digest_of_the_published_body() {
+        for (case, body, expected) in [
+            ("the empty body", "", "d41d8cd98f00b204e9800998ecf8427e"),
+            ("a three-byte body", "abc", "900150983cd24fb0d6963f7d28e17f72"),
+            (
+                "the same three-byte body again",
+                "abc",
+                "900150983cd24fb0d6963f7d28e17f72",
+            ),
+        ] {
+            let digest = message_md5(body);
+            assert_eq!(
+                digest, expected,
+                "case {case:?}: expected the MD5 of the body, got {digest:?}"
+            );
+        }
+
+        let published = SystemTime::now();
+        let answered = Answered::default();
+        let digest = message_md5("a notification");
+        let attempt = Attempt {
+            message_id: "0123",
+            topic_arn: "arn:aws:sns:us-west-2:000000000000:alerts",
+            subscription_arn: "arn:aws:sns:us-west-2:000000000000:alerts:abcd",
+            message_md5: &digest,
+            endpoint: "arn:aws:sqs:us-west-2:000000000000:orders",
+            published_at: published,
+            status: Status::Success,
+            answered: &answered,
+        };
+        let record: ::serde_json::Value = ::serde_json::from_str(&rendered(&attempt, published))
+            .unwrap_or_else(|error| panic!("case \"a rendered record\": not JSON ({error})"));
+        assert_eq!(
+            record["notification"]["messageMD5Sum"].as_str(),
+            Some(digest.as_str()),
+            "case \"a rendered record\": the record must carry the body's digest, got {record}"
+        );
     }
 }
