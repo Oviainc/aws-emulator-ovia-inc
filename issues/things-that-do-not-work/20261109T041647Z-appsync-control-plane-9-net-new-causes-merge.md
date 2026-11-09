@@ -1,0 +1,118 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: appsync.create-ops-invalid-input-bad-request appsync.get-schema-status-and-association-not-found appsync.graphql-pipeline-stash-prev-result-and-before-return appsync.pipeline-resolver-function-chain-stash-propagation appsync.pipeline-resolver-update-reorders-execution appsync.merged-api-disassociate-wrong-source-rejected appsync.schema-merge-requires-reconciled-source-association appsync.start-schema-merge-managed-execution appsync.start-schema-merge-server-managed appsync.start-schema-creation-conflict-in-progress appsync.op-contract-getType
+Issue-Shape-Id: com.amazonaws.appsync#AWSDeepdishControlPlaneService
+Issue-Key: appsync.create-ops-invalid-input-bad-request|run#18|AssertionError|assert error == expected, f"CreateDataSource: expected {expected}, got {error}"
+Issue-Key: appsync.get-schema-status-and-association-not-found|run#14|AssertionError|assert code == "NotFoundException", f"GetDataSourceIntrospection: expected NotFoundException, got {code}"
+Issue-Key: appsync|CreateFunction|ValidationException
+Issue-Key: appsync.merged-api-disassociate-wrong-source-rejected|run#11|AssertionError|raise AssertionError(
+Issue-Key: appsync.schema-merge-requires-reconciled-source-association|_error#15|AssertionError|raise AssertionError(f"expected the call to be rejected, but it succeeded with {result!r}")
+Issue-Key: appsync|GetType|NotFoundException
+Issue-Key: appsync.start-schema-merge-server-managed|run#19|AssertionError|assert detail == (
+Issue-Key: appsync|StartSchemaCreation|ConcurrentModificationException
+Issue-Key: appsync.op-contract-getType|run#10|AssertionError|assert msg == "Type not found.", f"unexpected message: {msg!r}"
+Issue-Commit: 334d129fab697d26de5f1a380859b6b7c66be502
+
+# AppSync control plane: 9 net-new causes — merge is status-only (merged schema never written, no concurrency gate, AssociateMergedGraphqlApi stuck MERGE_SCHEDULED), CreateFunction refuses multi-line VTL, GetDataSourceIntrospection 501, and three refusal texts/classes diverge
+
+> _Note: this issue was identified against the code base at commit `334d129fab697d26de5f1a380859b6b7c66be502`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+StartSchemaMerge
+
+## Description
+Nine independent net-new root causes in the emulator's AppSync control plane, all under the suite heading `appsync`. All nine must be closed before this issue is submitted. None of them is a CreateResolver/ListTypes/EvaluateCode/GetIntrospectionSchema scaffold stub (those have their own filed issues and their checks were skipped here).
+
+Cause 1 of 9 — CreateDataSource refuses an invalid data-source name with the wrong error class and an emulator/validator-authored message.
+AWS: Smithy: CreateDataSource.name targets ResourceName (@length 1..65536, @pattern "^[_A-Za-z][_0-9A-Za-z]*$"); CreateDataSource's modeled client errors are BadRequestException (httpError 400), ConcurrentModificationException (409), NotFoundException (404), UnauthorizedException (401) — ValidationException is NOT a modeled error of this operation. AWS refuses a name that violates the pattern with HTTP 400 BadRequestException and the message "The data source name is invalid. Please refer to the documentation for more details." — that sentence is entirely fixed text and interpolates nothing from the request (recorded behavior for the wording; the class/status are modeled).
+Emulator: the generic pre-handler constraint walk answers ValidationException "1 validation error detected: Value '<name>' at 'name' failed to satisfy constraint: Member must satisfy regular expression pattern: ^[_A-Za-z][_0-9A-Za-z]*$" (in that message the fixed text is "<n> validation error(s) detected: Value '<value>' at '<member>' failed to satisfy constraint: Member must satisfy regular expression pattern: <regex>"; the submitted name is a request value, not part of any template). Replay: expected ('BadRequestException', 'The data source name is invalid. Please refer to the documentation for more details.'), got ('ValidationException', "...Value 'bad-name-with-hyphens' at 'name'...").
+Why: a client catching BadRequestException for a malformed data-source name sees an unmodeled error code instead, so its error handling (and any SDK error-shape dispatch) misses the refusal; the message also leaks the submitted name where AWS keeps a fixed sentence.
+Fix: the CreateDataSource handler's own name validation must own this refusal (BadRequestException with AWS's fixed sentence) instead of letting the shared @pattern constraint walk produce a ValidationException for this member. Related but distinct open issues that do not carry this check: 20261024T032443Z-appsync-control-plane-fidelity-domain-name-operations-unimplemented.md and 20261029T200818Z-appsync-validation-refusals-are-emulator-authored-wrong-message.md.
+Traces: appsync.create-ops-invalid-input-bad-request.
+
+Cause 2 of 9 — GetDataSourceIntrospection answers 501 NotImplemented instead of a modeled not-found refusal.
+AWS: Smithy: GetDataSourceIntrospection = GET /v1/datasources/introspections/{introspectionId}, errors BadRequestException (400), NotFoundException (404), InternalFailureException (500). For an introspectionId that does not exist AWS answers 404 NotFoundException with the message "No introspection was found that matches the supplied ID." — fixed text, no request interpolation (recorded behavior for the wording).
+Emulator: answers error code NotImplemented (HTTP 501), which is not a modeled error of the operation. Replay: "GetDataSourceIntrospection: expected NotFoundException, got NotImplemented". The same check's GetSchemaCreationStatus and GetSourceApiAssociation not-found refusals passed, so this is isolated to GetDataSourceIntrospection. There is no filed stub issue for this operation (the filed stub issue 20261024T032443Z-appsync-startdatasourceintrospection-stub.md names StartDataSourceIntrospection, a different operation).
+Why: clients cannot distinguish "no such introspection" from a server fault, and polling an introspection job id can never terminate.
+Fix: implement the GetDataSourceIntrospection handler (lookup in the introspection state keyed by introspectionId) and raise NotFoundException with AWS's fixed message when the id is unknown.
+Traces: appsync.get-schema-status-and-association-not-found.
+
+Cause 3 of 9 — CreateFunction refuses every multi-line VTL mapping template.
+AWS: Smithy: MappingTemplate is string with @length(1..65536) and @pattern("^.*$"); it targets CreateFunction.requestMappingTemplate/responseMappingTemplate. `^`/`$` are per-line anchors, so a newline-containing template satisfies the pattern and AWS accepts multi-line VTL (the normal form: `#set(...)` on its own line followed by the JSON payload). The recordings show CreateFunction returning HTTP 200 with the template echoed including its newlines. ValidationException is not a modeled error of CreateFunction.
+Emulator: the shared pre-handler @pattern check matches the whole string without multiline semantics, so the first newline fails: HTTP 400 ValidationException "1 validation error detected: Value '#set($ctx.stash.counter = 1)\n{\"version\":\"2018-05-29\",\"payload\":{}}' at 'requestMappingTemplate' failed to satisfy constraint: Member must satisfy regular expression pattern: ^.*$" (fixed text as in cause 1; the template value and member name are request values). A single-line template is accepted, which pins the cause to newline handling.
+Why: no pipeline function can be created, so every pipeline-resolver behaviour (stash propagation across functions, before/after templates, function reordering) is unreachable behind a 400.
+Fix: the shared constraint-validation step of the request walk (deserialize → validate → handle) in the vendored smithy schema server: an AWS @pattern must be matched with multiline/search semantics so `^...$` does not reject newline-containing values. This is the SAME validator defect already filed as 20261109T020601Z-appsync-rejects-every-multi-line-vtl-mapping-template.md (which names CreateResolver/CreateFunction); these three checks are not listed in that issue's replay keys, so they are recorded here as additional grounding — fixing the validator closes both.
+Traces: appsync.graphql-pipeline-stash-prev-result-and-before-return, appsync.pipeline-resolver-function-chain-stash-propagation, appsync.pipeline-resolver-update-reorders-execution.
+
+Cause 4 of 9 — an association created by AssociateMergedGraphqlApi never leaves MERGE_SCHEDULED.
+AWS: AssociateMergedGraphqlApi starts an asynchronous merge; the association then settles into a terminal SourceApiAssociationStatus (MERGE_SUCCESS, MERGE_FAILED or AUTO_MERGE_SCHEDULE_FAILED) and GetSourceApiAssociation reports it (Smithy: SourceApiAssociationStatus enum; GetSourceApiAssociation output sourceApiAssociation.sourceApiAssociationStatus). Recorded behavior: it settles within the check's 180s window.
+Emulator: GetSourceApiAssociation keeps reporting 'MERGE_SCHEDULED' for the whole window — the merge is never performed on the merged-side association path. Replay: "source API merge did not reach a terminal status within 180s (still 'MERGE_SCHEDULED')".
+Why: any client that polls for a terminal merge status after associating from the merged-API side hangs forever, and every subsequent call that AWS gates on a settled association (DisassociateMergedGraphqlApi, StartSchemaMerge) is never reachable.
+Fix: the AssociateMergedGraphqlApi handler / association state must actually run and settle the merge job, as the AssociateSourceGraphqlApi path does. (The open wire issue 20261029T200818Z-appsync-source-api-association-projection-and-merge-status.md covers the stuck state only on the UpdateSourceApiAssociation auto-merge-reconfigure path, not this one.)
+Traces: appsync.merged-api-disassociate-wrong-source-rejected.
+
+Cause 5 of 9 — StartSchemaMerge has no in-progress concurrency gate.
+AWS: Smithy: StartSchemaMerge errors include ConcurrentModificationException (errorKind client, httpError 409). While an association's merge is non-terminal (MERGE_SCHEDULED/MERGE_IN_PROGRESS), a StartSchemaMerge on it is refused 409 ConcurrentModificationException with the message "This association currently has an operation in progress, please wait until that is complete" — entirely fixed text, no request interpolation (recorded behavior for the wording). Once the association is terminal the same call is accepted with 200.
+Emulator: accepts the call while the association is still MERGE_SCHEDULED and answers HTTP 200 {"sourceApiAssociationStatus": "MERGE_SCHEDULED"}. Replay: "expected the call to be rejected, but it succeeded with ... 'sourceApiAssociationStatus': 'MERGE_SCHEDULED'".
+Why: an over-permissive emulator lets a client stack concurrent merges that AWS serializes; code paths handling 409/back-off are never exercised and the client believes a second merge was scheduled when AWS would have refused it.
+Fix: the StartSchemaMerge handler must check the association's current status in state and raise ConcurrentModificationException with AWS's fixed message while it is non-terminal.
+Traces: appsync.schema-merge-requires-reconciled-source-association.
+
+Cause 6 of 9 — a MERGE_SUCCESS merge does not write the source API's types into the merged API's schema.
+AWS: after StartSchemaMerge drives an association to MERGE_SUCCESS, the merged API's schema contains the source API's types, so GetType(apiId=<mergedApiId>, typeName="Query", format="SDL") answers 200 and its definition contains the source API's field (Smithy: GetType GET /v1/apis/{apiId}/types/{typeName}, output Type.definition; recorded behavior for the merge effect).
+Emulator: the association reaches MERGE_SUCCESS but the merged API has no types at all: GetType on the merged API answers 404 NotFoundException ("Type Query not found"). The merge updates only the association's status fields; no schema is materialised on the merged API.
+Why: a merged API reports a schema it does not have — every client that queries, introspects or lists types on the merged endpoint after a successful merge gets nothing, while the status says the merge succeeded.
+Fix: the schema-merge routine must compose the source APIs' type sets into the merged API's schema/type state, not just flip the association status.
+Traces: appsync.start-schema-merge-managed-execution.
+
+Cause 7 of 9 — the successful-merge sourceApiAssociationStatusDetail is an emulator-authored constant.
+AWS: on MERGE_SUCCESS, sourceApiAssociationStatusDetail is the template "Successfully merged source GraphQL API (API Id: <sourceApiId>, Association Id: <associationId>)" — fixed text "Successfully merged source GraphQL API (API Id: ", ", Association Id: " and the closing paren, with the source API id and association id taken from state (Smithy: SourceApiAssociation.sourceApiAssociationStatusDetail, optional String; recorded behavior for the wording). The particular id values in any one run are not part of the template.
+Emulator: 'The source API was merged into the Merged API.' — a fixed sentence with no variable parts. Replay: "unexpected sourceApiAssociationStatusDetail: 'The source API was merged into the Merged API.'".
+Why: the detail no longer identifies which source API and association the merge covered, the only correlation handle a multi-source merged API offers.
+Fix: the merge routine's status-detail template in association state.
+Traces: appsync.start-schema-merge-server-managed. (Same defect as cause 5 of the open wire issue 20261029T200818Z-appsync-source-api-association-projection-and-merge-status.md, which does not carry this behavioral check's replay key.)
+
+Cause 8 of 9 — StartSchemaCreation's in-progress refusal message is emulator-authored.
+AWS: Smithy: StartSchemaCreation errors include ConcurrentModificationException (client, httpError 409). A StartSchemaCreation issued while a schema creation for the same API is still PROCESSING is refused 409 ConcurrentModificationException with the message "Schema is currently being altered, please wait until that is complete." — entirely fixed text, no request interpolation (recorded behavior for the wording).
+Emulator: correct class but the message 'Another modification is in progress at this time and it must complete before you can make your change.' — a generic emulator-wide concurrency sentence. Replay: expected 'Schema is currently being altered, please wait until that is complete.'
+Why: clients and test suites matching on AWS's refusal sentence (and operators reading logs) see a message AWS never emits for this operation.
+Fix: the StartSchemaCreation handler's concurrency refusal must carry AppSync's schema-specific message instead of the shared ConcurrentModificationException text. (Distinct from the open 20261109T022338Z-appsync-schema-creation-plane-diverges-success-detail-text.md, which covers the SUCCESS detail text and the unknown-API refusal class.)
+Traces: appsync.start-schema-creation-conflict-in-progress.
+
+Cause 9 of 9 — GetType's not-found message interpolates the requested type name.
+AWS: Smithy: GetType errors include NotFoundException (client, httpError 404, member message). For an unknown typeName AWS answers 404 with the message "Type not found." — entirely fixed text ending in a period, interpolating nothing from the request (recorded behavior for the wording).
+Emulator: answers the correct 404/NotFoundException but with "Type <typeName> not found" — it splices the request's typeName in and drops the trailing period. Replay: expected 'Type not found.', got 'Type DoesNotExist not found' ('DoesNotExist' is the request's typeName, not part of the template).
+Why: clients asserting on the service's refusal sentence mis-classify the failure, and the message leaks the requested name where AWS deliberately does not.
+Fix: the GetType handler's not-found error construction — emit the fixed message with no request interpolation.
+Traces: appsync.op-contract-getType. (Same defect as cause 3 of the open wire issue 20261108T071728Z-appsync-type-operations-diverge-deleted-types-stay-readable.md, which does not carry this behavioral check's replay key.)
+
+## Evidence
+Replay of suite simparity-behavioral-aws-v1 against the emulator built from this checkout; service heading `appsync`.
+
+1) appsync.create-ops-invalid-input-bad-request [mismatch]: AssertionError "CreateDataSource: expected ('BadRequestException', 'The data source name is invalid. Please refer to the documentation for more details.'), got ('ValidationException', \"1 validation error detected: Value 'bad-name-with-hyphens' at 'name' failed to satisfy constraint: Member must satisfy regular expression pattern: ^[_A-Za-z][_0-9A-Za-z]*$\")".
+2) appsync.get-schema-status-and-association-not-found [mismatch]: AssertionError "GetDataSourceIntrospection: expected NotFoundException, got NotImplemented" (expected message "No introspection was found that matches the supplied ID."). The GetSchemaCreationStatus and GetSourceApiAssociation assertions in the same check passed.
+3) appsync.pipeline-resolver-function-chain-stash-propagation / appsync.pipeline-resolver-update-reorders-execution / appsync.graphql-pipeline-stash-prev-result-and-before-return [error]: ClientError "An error occurred (ValidationException) when calling the CreateFunction operation: 1 validation error detected: Value '#set($ctx.stash.counter = 1)\n{\"version\":\"2018-05-29\",\"payload\":{}}' at 'requestMappingTemplate' failed to satisfy constraint: Member must satisfy regular expression pattern: ^.*$" (expected HTTP 200 with the FunctionConfiguration record).
+4) appsync.merged-api-disassociate-wrong-source-rejected [mismatch]: AssertionError "source API merge did not reach a terminal status within 180s (still 'MERGE_SCHEDULED')" after AssociateMergedGraphqlApi, polling GetSourceApiAssociation every 5s.
+5) appsync.schema-merge-requires-reconciled-source-association [mismatch]: AssertionError "expected the call to be rejected, but it succeeded with {'ResponseMetadata': {'HTTPStatusCode': 200, ...}, 'sourceApiAssociationStatus': 'MERGE_SCHEDULED'}" — expected 409 ConcurrentModificationException "This association currently has an operation in progress, please wait until that is complete".
+6) appsync.start-schema-merge-managed-execution [error]: after the association reached MERGE_SUCCESS twice (association + explicit StartSchemaMerge), botocore NotFoundException "An error occurred (NotFoundException) when calling the GetType operation: Type Query not found" on the MERGED api id; expected 200 with a Query definition containing the source field.
+7) appsync.start-schema-merge-server-managed [mismatch]: AssertionError "unexpected sourceApiAssociationStatusDetail: 'The source API was merged into the Merged API.'" — expected "Successfully merged source GraphQL API (API Id: <sourceApiId>, Association Id: <associationId>)".
+8) appsync.start-schema-creation-conflict-in-progress [mismatch]: AssertionError "expected message 'Schema is currently being altered, please wait until that is complete.', got 'Another modification is in progress at this time and it must complete before you can make your change.'".
+9) appsync.op-contract-getType [mismatch]: AssertionError "unexpected message: 'Type DoesNotExist not found'" — expected 'Type not found.'; the same check's positive GetType(typeName="Query") read succeeded.
+
+Model evidence (services/service-com-amazonaws-appsync-awsdeepdishcontrolplaneservice/smithy-model): CreateDataSource POST /v1/apis/{apiId}/datasources, name→ResourceName (len 1..65536, pattern ^[_A-Za-z][_0-9A-Za-z]*$), errors BadRequestException(400)/ConcurrentModificationException(409)/NotFoundException(404)/UnauthorizedException(401)/InternalFailureException(500) — no ValidationException. GetDataSourceIntrospection GET /v1/datasources/introspections/{introspectionId}, errors BadRequestException(400)/NotFoundException(404)/InternalFailureException(500). StartSchemaMerge POST /v1/mergedApis/{mergedApiIdentifier}/sourceApiAssociations/{associationId}/merge, output sourceApiAssociationStatus, errors include ConcurrentModificationException(409). StartSchemaCreation POST /v1/apis/{apiId}/schemacreation, errors include ConcurrentModificationException(409). GetType GET /v1/apis/{apiId}/types/{typeName}, errors include NotFoundException(404). MappingTemplate: @length(1..65536), @pattern("^.*$").
+
+Per-run values (api ids, association ids, merge timestamps, the generated names in the quoted messages) are not requirements; the statuses, error classes and message templates are.
+
+## Steps to Reproduce
+Boot the emulator from this checkout and point an appsync client (and iam/sts clients) at it, then:
+1. Cause 1: CreateGraphqlApi, then CreateDataSource(apiId, name="bad-name-with-hyphens", type="NONE"). Expect 400 BadRequestException "The data source name is invalid. Please refer to the documentation for more details."; the emulator answers ValidationException with the pattern-constraint sentence.
+2. Cause 2: GetDataSourceIntrospection(introspectionId=<random uuid>). Expect 404 NotFoundException "No introspection was found that matches the supplied ID."; the emulator answers NotImplemented (501).
+3. Cause 3: on an API with a NONE data source, CreateFunction(requestMappingTemplate='#set($ctx.stash.counter = 1)\n{"version":"2018-05-29","payload":{}}', responseMappingTemplate="$util.toJson($ctx.result)"). Expect 200 with the FunctionConfiguration; the emulator answers 400 ValidationException on 'requestMappingTemplate'. Collapse the template to one line and it is accepted.
+4. Cause 4: create a source API with a schema and a MERGED API with a merge execution role, call AssociateMergedGraphqlApi(sourceApiIdentifier, mergedApiIdentifier), then poll GetSourceApiAssociation(mergedApiIdentifier, associationId) for up to 180s. Expect a terminal MERGE_SUCCESS/MERGE_FAILED; the emulator stays MERGE_SCHEDULED.
+5. Cause 5: with a fresh AssociateSourceGraphqlApi association still reporting MERGE_SCHEDULED, call StartSchemaMerge(associationId, mergedApiIdentifier). Expect 409 ConcurrentModificationException "This association currently has an operation in progress, please wait until that is complete"; the emulator answers 200.
+6. Cause 6: once that association reports MERGE_SUCCESS, call StartSchemaMerge again, wait for MERGE_SUCCESS, then GetType(apiId=<mergedApiId>, typeName="Query", format="SDL"). Expect 200 with a definition containing the source API's field; the emulator answers 404 NotFoundException.
+7. Cause 7: read sourceApiAssociationStatusDetail from GetSourceApiAssociation after that MERGE_SUCCESS. Expect "Successfully merged source GraphQL API (API Id: <sourceApiId>, Association Id: <associationId>)"; the emulator returns 'The source API was merged into the Merged API.'
+8. Cause 8: StartSchemaCreation with a large SDL (hundreds of types) and, while GetSchemaCreationStatus still reports PROCESSING, call StartSchemaCreation again. Expect 409 ConcurrentModificationException "Schema is currently being altered, please wait until that is complete."; the emulator returns 'Another modification is in progress at this time and it must complete before you can make your change.'
+9. Cause 9: GetType(apiId, typeName="DoesNotExist", format="SDL"). Expect 404 NotFoundException "Type not found."; the emulator returns "Type DoesNotExist not found".
+10. Equivalent replay: re-run the nine check ids in trace_ids from suite simparity-behavioral-aws-v1.
