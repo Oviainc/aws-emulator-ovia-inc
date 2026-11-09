@@ -7,12 +7,12 @@
 //! Two rules are pinned here:
 //!
 //! * an operation that REPORTS on a resource and binds no not-found error answers HTTP 200
-//!   with its collection member empty when the `ScalingPlanName` names no stored plan —
-//!   the empty set of things to report, not a client error. A refusal belongs to the
-//!   operations that DO model a not-found error (the two mutating ones, pinned in
-//!   [`crate::error_message_wording`]) and to what the request itself says — including its
-//!   `ScalingPlanVersion`, which documents one valid value and is refused on the member
-//!   ([`crate::plan_version_member_validation`]);
+//!   with its collection member empty when the (`ScalingPlanName`, `ScalingPlanVersion`)
+//!   coordinate selects no stored plan — the empty set of things to report, not a client
+//!   error. A refusal belongs to the operations that DO model a not-found error (the two
+//!   mutating ones, pinned in [`crate::error_message_wording`]) and to what the request
+//!   itself says; the VERSION half of the coordinate is pinned over a table of versions in
+//!   [`crate::plan_version_selects_a_plan`];
 //! * the day bounds documented on the forecast window are spans of forecast DATA, and
 //!   forecast data exists at one data point per hour, so each bound is measured in whole
 //!   hourly forecast periods: a window reaching less than one period past a bound is
@@ -171,24 +171,29 @@ async fn a_read_that_matches_no_stored_plan_reports_its_collection_empty() {
         }
     }
 
-    // The VERSION half of the same lookup is NOT a miss: `ScalingPlanVersion` documents
-    // exactly one valid value on both reporting requests, so each refuses the member
-    // before any lookup — a property of the request and not of what is stored. The full
-    // table of versions lives in [`crate::plan_version_member_validation`].
+    // The VERSION half of the same coordinate misses the same way: the member carries no
+    // `@range` and no enum, so it selects the plan a read addresses rather than gating the
+    // request, and a version no stored plan carries reports the same empty collection. The
+    // full table of versions lives in [`crate::plan_version_selects_a_plan`].
     for (label, version) in [
-        ("the version past the only one modelled", ONLY_VERSION + 1),
+        ("the version past the one a created plan carries", ONLY_VERSION + 1),
         ("version zero", 0),
         ("a negative version", -1),
         ("a version past 32 bits", 4_294_967_296),
     ] {
-        for (operation, _) in READS {
+        for (operation, member) in READS {
             let request = read_request(operation, STORED_PLAN, version);
             let (status, body) = emulator.call(operation, &request).await;
             assert_eq!(
-                (status, error_code(&body)),
-                (400, "ValidationException"),
-                "case {operation}/{label} ({version}): the documented member bound refuses \
-                 it, got {status} with {body}"
+                status, 200,
+                "case {operation}/{label} ({version}): a version nothing holds is a miss, \
+                 got {status} with {body}"
+            );
+            assert_eq!(
+                body[member],
+                json!([]),
+                "case {operation}/{label} ({version}): expected an empty {member} list, got \
+                 {body}"
             );
         }
     }

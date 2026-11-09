@@ -757,10 +757,10 @@ async fn describe_scaling_plan_resources_reports_an_empty_set_for_a_lookup_that_
 
     // Rows: the ways a (name, version) lookup can miss — a name nothing ever created,
     // a name whose case differs, and a name that was created and then deleted — plus a
-    // bounded page size on the miss, which changes nothing: there is no page to size. A
-    // version other than the one documented valid value is NOT a miss but a refusal on the
-    // member ([`crate::plan_version_member_validation`]), so every row holds the version
-    // the model documents.
+    // bounded page size on the miss, which changes nothing: there is no page to size. The
+    // VERSION half of the same coordinate misses the same way, over a table of versions in
+    // [`crate::plan_version_selects_a_plan`], so every row here holds the version a created
+    // plan carries.
     emulator
         .ok(
             "CreateScalingPlan",

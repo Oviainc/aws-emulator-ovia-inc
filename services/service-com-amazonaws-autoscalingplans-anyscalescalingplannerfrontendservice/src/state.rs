@@ -1742,32 +1742,6 @@ pub fn one_of(member: &str, value: &str, allowed: &[&str]) -> Result<(), String>
     ))
 }
 
-/// Validate a `ScalingPlanVersion` a caller wrote, on a REPORTING operation that carries
-/// the member and models no not-found error — whether it identifies one plan by it or
-/// filters a collection with it.
-///
-/// The member documents exactly one valid value ([`ONLY_VERSION`]) — "The version number
-/// of the scaling plan. Currently, the only valid value is 1", on every request shape that
-/// carries it — so a value other than that one is a request this service refuses on the
-/// member itself, before any lookup, rather than a lookup that quietly matches nothing.
-/// Where the operation also models no not-found shape, refusing the member is the ONLY
-/// answer that tells a caller its request was malformed: an empty collection would report
-/// a version that cannot exist as merely holding nothing.
-///
-/// `pub` so every such operation refuses the member with the same sentence. The two
-/// MUTATING operations bind `ObjectNotFoundException` and keep answering a lookup that
-/// finds no plan with [`plan_not_found_message`] in that shape.
-///
-/// `Err` carries the refusal message naming the member, the value and the only valid one.
-pub fn validate_plan_version(version: i64) -> Result<(), String> {
-    if version != ONLY_VERSION {
-        return Err(format!(
-            "ScalingPlanVersion {version} is not valid: the only valid value is {ONLY_VERSION}"
-        ));
-    }
-    Ok(())
-}
-
 /// AWS's wording for "the name and version in this request name no stored plan",
 /// built from the request's own `ScalingPlanName` and `ScalingPlanVersion`.
 ///

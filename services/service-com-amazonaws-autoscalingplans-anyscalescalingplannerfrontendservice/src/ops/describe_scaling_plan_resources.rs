@@ -15,12 +15,12 @@
 //! status, both derived from the plan record AND that same instruction, so the two
 //! halves of one resource's report cannot disagree about the policies it carries.
 //!
-//! Both input members are required and together name ONE plan, but this operation binds
-//! no not-found error at all, so a `ScalingPlanName` naming no stored plan is not a client
-//! error: it reports the empty set of scalable resources, HTTP 200 with an empty
-//! `ScalingPlanResources` list and no `NextToken`. Only the request's own members
-//! (`ScalingPlanVersion`, which documents exactly one valid value, `MaxResults` and
-//! `NextToken`) can make this call a refusal.
+//! Both input members are required and together SELECT one plan, but this operation binds
+//! no not-found error at all, so a `(ScalingPlanName, ScalingPlanVersion)` pair naming no
+//! stored plan is not a client error: it reports the empty set of scalable resources, HTTP
+//! 200 with an empty `ScalingPlanResources` list and no `NextToken`. Only the members the
+//! model constrains (`MaxResults`) or this service minted (`NextToken`) can make this call
+//! a refusal.
 //!
 //! A read, except for the transitions the clock already owes: `settle_due` applies
 //! only what was due at this instant whether or not anybody called.
@@ -174,10 +174,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whether or not the named plan exists.
         let page_size =
             crate::state::effective_max_results(input.max_results).map_err(validation)?;
-        // `ScalingPlanVersion` documents exactly one valid value, so any other version is
-        // a request this service refuses on the member rather than a lookup that misses —
-        // the same rule the forecast read applies to its own copy of this member.
-        crate::state::validate_plan_version(input.scaling_plan_version).map_err(validation)?;
 
         // The cursor is the IDENTITY of the resource the previous page stopped after —
         // the `(ServiceNamespace, ResourceId, ScalableDimension)` triple this crate
@@ -196,13 +192,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than a stale one.
         state.settle_due(now);
 
-        // A lookup that finds no plan of the requested name reports the empty set of
-        // scalable resources, not a client error: this operation binds no not-found shape
-        // (`ObjectNotFoundException` is modelled only on the mutating `DeleteScalingPlan`
-        // and `UpdateScalingPlan`), and `ScalingPlanResources` is exactly the list of
-        // resources the named plan covers — which, for a plan this service does not hold,
-        // is empty. Polling for a plan's resources while it is created or drained is
-        // therefore a 200 answer throughout.
+        // A lookup that finds no plan under the requested name AND version reports the
+        // empty set of scalable resources, not a client error: this operation binds no
+        // not-found shape (`ObjectNotFoundException` is modelled only on the mutating
+        // `DeleteScalingPlan` and `UpdateScalingPlan`), and `ScalingPlanResources` is
+        // exactly the list of resources the selected plan covers — which, for a plan this
+        // service does not hold, is empty. Both members are SELECTORS of that plan: the
+        // model constrains neither to a set of values, so a version this service holds no
+        // plan at misses exactly like a name it holds no plan under. Polling for a plan's
+        // resources while it is created or drained, or walking versions, is therefore a 200
+        // answer throughout.
         let (scaling_plan_resources, next_token) =
             match state.plan(&input.scaling_plan_name, input.scaling_plan_version) {
                 None => (Vec::new(), None),

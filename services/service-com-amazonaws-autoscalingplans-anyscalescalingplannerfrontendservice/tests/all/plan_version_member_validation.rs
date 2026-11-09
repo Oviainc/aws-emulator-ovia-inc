@@ -1,53 +1,44 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The `ScalingPlanVersion` member on the operations that identify ONE plan by it and
-//! model no not-found error.
+//! What `ScalingPlanVersion` is still VALIDATED for, now that its value selects rather
+//! than gates — and the table of versions every suite driving the member spans.
 //!
-//! One rule is pinned here, over a TABLE of versions rather than the one request that
-//! exposed it: a request member the model documents as having exactly one valid value is a
-//! request-level constraint, so a value other than that one is refused with the modelled
-//! `ValidationException` (HTTP 400) naming the member, the value and the only valid value,
-//! before any lookup — never answered as a lookup that quietly matched nothing. The
-//! boundary of the rule is pinned too: the two MUTATING operations bind
-//! `ObjectNotFoundException` and keep answering a lookup that finds no plan in that shape.
+//! The member carries no `@range` and no enum
+//! (`smithy_query(query="operation",operation="DescribeScalingPlanResources")` — member
+//! `ScalingPlanVersion`, type `long`), so its VALUE is a selector of the plan a request
+//! addresses ([`crate::plan_version_selects_a_plan`] pins what selecting nothing answers,
+//! [`crate::describe_scaling_plans_version_member`] the collection read's copy of it).
+//! What is still refused on the request is which MEMBERS accompany it: the collection
+//! read documents "If you specify a scaling plan version, you must also specify a scaling
+//! plan name", and refuses the version beside `ApplicationSources` with the
+//! selector-conflict sentence instead. Both are rules about the request's SHAPE, so each
+//! is driven here over versions a stored plan carries and versions none does.
 //!
 //! The harness (router, dispatch, error-body readers) is reused from
-//! [`crate::scaling_plan_lifecycle`], and the two read requests are built by
-//! [`crate::absent_plan_reads::read_request`]; nothing here builds a second one.
+//! [`crate::scaling_plan_lifecycle`]; nothing here builds a second one.
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::state::ONLY_VERSION;
 
-use crate::absent_plan_reads::{read_request, READS};
 use crate::scaling_plan_lifecycle::{
     error_code, error_message, simple_instructions, stack_source, Emulator,
 };
 
-/// The plan the emulator holds in these tests, so a row probes the VERSION member rather
-/// than the name half of the lookup.
-const STORED_PLAN: &str = "held plan";
+/// AWS's fixed refusal for a request that selects by application source AND by the
+/// name-based selector, whose wording is pinned in [`crate::error_message_wording`].
+const APPLICATION_SOURCES_CONFLICT: &str =
+    "Application sources cannot be provided with scaling plan names or version";
 
-/// A plan name this service does not hold, so a row shows the member is refused before any
-/// lookup runs.
-const ABSENT_PLAN: &str = "sim-probe-absent";
-
-/// The Auto Scaling group [`simple_instructions`] instructs, and the one resource the
-/// stored plan reports.
-const RESOURCE_ID: &str = "autoScalingGroup/my-asg";
-
-/// Versions other than the single documented valid value.
+/// Versions no plan this service holds carries.
 ///
-/// `ScalingPlanVersion` is a `long`
-/// (`smithy_query(query="operation",operation="DescribeScalingPlanResources")` — member
-/// `ScalingPlanVersion`, type `long`) documented as "The version number of the scaling
-/// plan. Currently, the only valid value is 1", so the rows span that type's MAGNITUDE and
-/// SIGN: the version below the documented one, the one above it, a negative version,
-/// versions past 32 and past 53 bits, and both ends of the type.
+/// `ScalingPlanVersion` is a `long` with no `@range` and no enum, so the rows span that
+/// type's MAGNITUDE and SIGN: the version below the one a created plan carries, the one
+/// above it, a negative version, versions past 32 and past 53 bits, and both ends of the
+/// type.
 ///
-/// `pub(crate)` so every suite driving this member spans the same values — including the
-/// collection read in [`crate::describe_scaling_plans_version_member`].
-pub(crate) fn rejected_versions() -> [(&'static str, i64); 7] {
+/// `pub(crate)` so every suite driving this member spans the same values.
+pub(crate) fn unheld_versions() -> [(&'static str, i64); 7] {
     [
         ("version zero", ONLY_VERSION - 1),
         ("the next version up", ONLY_VERSION + 1),
@@ -59,14 +50,24 @@ pub(crate) fn rejected_versions() -> [(&'static str, i64); 7] {
     ]
 }
 
-/// An emulator holding one settled plan with one scaling instruction.
+/// Every version a request may carry: the one a created plan carries, and the ones no
+/// stored plan does — so a rule about the request's shape is shown to hold whatever the
+/// value is.
+fn every_version() -> Vec<(&'static str, i64)> {
+    let mut versions = vec![("the stored version", ONLY_VERSION)];
+    versions.extend(unheld_versions());
+    versions
+}
+
+/// An emulator holding one settled plan, so a refusal below is about the request's shape
+/// and not about an empty store.
 async fn with_one_stored_plan() -> Emulator {
     let emulator = Emulator::new();
     emulator
         .ok(
             "CreateScalingPlan",
             json!({
-                "ScalingPlanName": STORED_PLAN,
+                "ScalingPlanName": "held plan",
                 "ApplicationSource": stack_source(1),
                 "ScalingInstructions": simple_instructions(),
             }),
@@ -77,172 +78,78 @@ async fn with_one_stored_plan() -> Emulator {
 }
 
 #[tokio::test]
-async fn a_version_other_than_the_only_documented_one_is_refused_on_the_member() {
+async fn a_version_with_no_name_is_refused_whatever_the_version_is() {
     let emulator = with_one_stored_plan().await;
 
-    // Each rejected version is driven against a plan the emulator HOLDS and a name it does
-    // not: the version is a member of the request, so the refusal must not depend on what
-    // is stored. The third column adds a page size where the operation takes one, so the
-    // refusal does not depend on the request's other members either.
-    for (label, version) in rejected_versions() {
-        for (operation, member) in READS {
-            for plan in [STORED_PLAN, ABSENT_PLAN] {
-                for paged in [false, true] {
-                    let mut request = read_request(operation, plan, version);
-                    if paged {
-                        if operation != "DescribeScalingPlanResources" {
-                            continue;
-                        }
-                        request["MaxResults"] = json!(1);
-                    }
-                    let case = format!("{operation}/{label} ({version}) on {plan}, paged {paged}");
-                    let (status, body) = emulator.call(operation, &request).await;
-                    assert_eq!(
-                        (status, error_code(&body)),
-                        (400, "ValidationException"),
-                        "case {case:?}: expected a 400 ValidationException, got {status} with \
-                         {body}"
-                    );
-                    let message = error_message(&body);
-                    assert!(
-                        message.contains("ScalingPlanVersion"),
-                        "case {case:?}: the refusal must name the member it is about, got \
-                         {message:?}"
-                    );
-                    assert!(
-                        message.contains(&version.to_string()),
-                        "case {case:?}: the refusal must name the value it refused, got \
-                         {message:?}"
-                    );
-                    assert!(
-                        message.contains(&ONLY_VERSION.to_string()),
-                        "case {case:?}: the refusal must name the only valid value, got \
-                         {message:?}"
-                    );
-                    assert!(
-                        body.get(member).is_none(),
-                        "case {case:?}: a refusal carries no {member}, got {body}"
-                    );
-                }
-            }
-        }
-    }
-
-    // The control, at the one documented version: the held plan is served what it holds and
-    // the absent name is served the empty set, so the refusals above are about the member
-    // and not about these operations.
-    let described = emulator
-        .ok(
-            "DescribeScalingPlanResources",
-            read_request("DescribeScalingPlanResources", STORED_PLAN, ONLY_VERSION),
-        )
-        .await;
-    assert_eq!(
-        described["ScalingPlanResources"]
-            .as_array()
-            .map(|resources| resources.len()),
-        Some(1),
-        "case the documented version on the held plan: the stored plan instructs one \
-         resource, got {described}"
-    );
-    assert_eq!(
-        described["ScalingPlanResources"][0]["ResourceId"],
-        json!(RESOURCE_ID),
-        "case the documented version on the held plan: the reported resource must be the \
-         instructed one, got {described}"
-    );
-    for (operation, member) in READS {
-        let body = emulator
-            .ok(operation, read_request(operation, ABSENT_PLAN, ONLY_VERSION))
-            .await;
+    for (label, version) in every_version() {
+        let request = json!({ "ScalingPlanVersion": version });
+        let (status, body) = emulator.call("DescribeScalingPlans", &request).await;
         assert_eq!(
-            body[member],
-            json!([]),
-            "case {operation} at the documented version on an absent name: expected an empty \
-             {member} list, got {body}"
+            (status, error_code(&body)),
+            (400, "ValidationException"),
+            "case {label:?} ({version}) with no name: expected a 400 ValidationException, got \
+             {status} with {body}"
+        );
+        let message = error_message(&body);
+        assert!(
+            message.contains("ScalingPlanVersion"),
+            "case {label:?} ({version}) with no name: the refusal must name the member it is \
+             about, got {message:?}"
+        );
+        assert_ne!(
+            message, APPLICATION_SOURCES_CONFLICT,
+            "case {label:?} ({version}) with no name: a request carrying no application \
+             source must not borrow the selector-conflict sentence, got {message:?}"
         );
     }
 }
 
 #[tokio::test]
-async fn a_refused_version_changes_nothing_a_later_caller_sees() {
-    let emulator = with_one_stored_plan().await;
-    let before = emulator.ok("DescribeScalingPlans", json!({})).await;
-
-    for (label, version) in rejected_versions() {
-        for (operation, _) in READS {
-            let request = read_request(operation, STORED_PLAN, version);
-            let (first, first_body) = emulator.call(operation, &request).await;
-            let (again, again_body) = emulator.call(operation, &request).await;
-            assert_eq!(
-                (first, error_code(&first_body)),
-                (again, error_code(&again_body)),
-                "case {operation}/{label} ({version}): two refusals of the same request must \
-                 agree, got {first_body} then {again_body}"
-            );
-        }
-    }
-
-    let after = emulator.ok("DescribeScalingPlans", json!({})).await;
-    assert_eq!(
-        after["ScalingPlans"], before["ScalingPlans"],
-        "case the refused versions above: the stored plans must be as they were, got {after} \
-         after {before}"
-    );
-    let described = emulator
-        .ok(
-            "DescribeScalingPlanResources",
-            read_request("DescribeScalingPlanResources", STORED_PLAN, ONLY_VERSION),
-        )
-        .await;
-    assert_eq!(
-        described["ScalingPlanResources"]
-            .as_array()
-            .map(|resources| resources.len()),
-        Some(1),
-        "case after the refusals: the held plan must still report its one resource, got \
-         {described}"
-    );
-}
-
-#[tokio::test]
-async fn the_operations_that_model_a_not_found_shape_still_answer_in_that_shape() {
+async fn a_version_beside_an_application_source_is_refused_as_the_selector_conflict() {
     let emulator = with_one_stored_plan().await;
 
-    // The boundary of the rule above: `DeleteScalingPlan` and `UpdateScalingPlan` bind
-    // `ObjectNotFoundException`
-    // (`smithy_query(query="operation",operation="DeleteScalingPlan,UpdateScalingPlan")`),
-    // so a lookup of theirs that finds no plan is reported in that shape — the version
-    // member did not take that answer over.
-    for (label, name, version) in [
-        ("an absent name at the documented version", ABSENT_PLAN, ONLY_VERSION),
-        ("a stored name at another version", STORED_PLAN, ONLY_VERSION + 1),
-    ] {
-        for operation in ["DeleteScalingPlan", "UpdateScalingPlan"] {
-            let request = json!({ "ScalingPlanName": name, "ScalingPlanVersion": version });
-            let (status, body) = emulator.call(operation, &request).await;
+    for (label, version) in every_version() {
+        for (names_label, request) in [
+            (
+                "with no name",
+                json!({
+                    "ApplicationSources": [stack_source(1)],
+                    "ScalingPlanVersion": version,
+                }),
+            ),
+            (
+                "with a name",
+                json!({
+                    "ScalingPlanNames": ["held plan"],
+                    "ApplicationSources": [stack_source(1)],
+                    "ScalingPlanVersion": version,
+                }),
+            ),
+        ] {
+            let case = format!("{label:?} ({version}) {names_label}");
+            let (status, body) = emulator.call("DescribeScalingPlans", &request).await;
             assert_eq!(
                 (status, error_code(&body)),
-                (400, "ObjectNotFoundException"),
-                "case {operation}/{label}: expected a 400 ObjectNotFoundException, got {status} \
-                 with {body}"
+                (400, "ValidationException"),
+                "case {case}: expected a 400 ValidationException, got {status} with {body}"
             );
             let message = error_message(&body);
-            let expected = format!(
-                "No scaling plan found for scaling plan name: {name}, version: {version}"
-            );
             assert_eq!(
-                message, expected,
-                "case {operation}/{label}: expected {expected:?}, got {message:?}"
+                message, APPLICATION_SOURCES_CONFLICT,
+                "case {case}: expected {APPLICATION_SOURCES_CONFLICT:?}, got {message:?}"
             );
         }
     }
 
-    // And the plan that IS stored, at the version it has, is not refused on either path.
-    let stored: &Value = &emulator.ok("DescribeScalingPlans", json!({})).await;
-    assert_eq!(
-        stored["ScalingPlans"].as_array().map(Vec::len),
-        Some(1),
-        "the refusals above must leave the one stored plan in place, got {stored}"
-    );
+    // The control: the member accompanied by a name and no application source is a request
+    // this operation serves, whatever the version selects.
+    for (label, version) in every_version() {
+        let request = json!({ "ScalingPlanNames": ["held plan"], "ScalingPlanVersion": version });
+        let (status, body) = emulator.call("DescribeScalingPlans", &request).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?} ({version}) with a name and no source: expected HTTP 200, got \
+             {status} with {body}"
+        );
+    }
 }

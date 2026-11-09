@@ -16,9 +16,8 @@
 //! * a request that passes those checks is looked up by (`ScalingPlanName`,
 //!   `ScalingPlanVersion`), and a lookup that finds no stored plan has no forecast to
 //!   report: HTTP 200 with an empty `Datapoints` list, because this operation models no
-//!   not-found error (`crate::absent_plan_reads` pins that rule across both reads);
-//! * `ScalingPlanVersion` has exactly one documented valid value, so every other version
-//!   is refused with the modelled `ValidationException` (HTTP 400) rather than served;
+//!   not-found error (`crate::absent_plan_reads` pins that rule across both reads, and
+//!   `crate::plan_version_selects_a_plan` the version half of the coordinate);
 //! * the resource coordinates are refused only where the `(ServiceNamespace, ResourceId,
 //!   ScalableDimension)` triple describes no one scalable resource — a dimension owned by
 //!   another service namespace, or a resource id that identifies no resource of the kind
@@ -672,55 +671,40 @@ async fn a_too_wide_window_is_refused_on_its_width_wherever_it_sits() {
 }
 
 #[tokio::test]
-async fn only_the_documented_scaling_plan_version_is_accepted() {
-    // `ScalingPlanVersion` is a long (`smithy_query(query="shape",
-    // shape="ScalingPlanVersion")`) documented as "Currently, the only valid value is 1",
-    // so the rows differ in version MAGNITUDE and SIGN across that type's whole range:
-    // zero, the next version up, a negative version, a version past 32 bits and both
-    // extremes of the type.
-    let cases: [(&str, i64, bool); 7] = [
-        ("the only documented version", ONLY_VERSION, true),
-        ("version zero", 0, false),
-        ("the next version up", ONLY_VERSION + 1, false),
-        ("a negative version", -7, false),
-        ("a version past 32 bits", 4_294_967_296, false),
-        ("the largest long", i64::MAX, false),
-        ("the smallest long", i64::MIN, false),
+async fn the_scaling_plan_version_selects_the_plan_to_forecast_from() {
+    // `ScalingPlanVersion` is a long with no `@range` and no enum
+    // (`smithy_query(query="shape",shape="ScalingPlanVersion")`), so its value selects the
+    // plan a forecast is issued from rather than gating the request: the rows differ in
+    // version MAGNITUDE and SIGN across that type's whole range — zero, the next version
+    // up, a negative version, a version past 32 bits and both extremes of the type — and
+    // every one of them is answered, not refused.
+    let cases: [(&str, i64); 7] = [
+        ("the version a created plan carries", ONLY_VERSION),
+        ("version zero", 0),
+        ("the next version up", ONLY_VERSION + 1),
+        ("a negative version", -7),
+        ("a version past 32 bits", 4_294_967_296),
+        ("the largest long", i64::MAX),
+        ("the smallest long", i64::MIN),
     ];
 
     let emulator = with_stored_plan().await;
-    // Checked against a plan the emulator holds and a name it does not: the version is a
-    // request member, so an unmodelled version is refused on the MEMBER either way, while
-    // the documented version is served either way — an absent name has no forecast, which
-    // is the empty `Datapoints` list and not a refusal.
+    // Checked against a plan the emulator holds and a name it does not: either way the
+    // coordinate selects a plan that configures no predictive scaling, or no plan at all,
+    // and both have no forecast — the empty `Datapoints` list, not a refusal.
     for (plan, held) in [(STORED_PLAN, "a stored plan"), (ABSENT_PLAN, "an absent plan")] {
-        for (label, version, accepted) in cases {
+        for (label, version) in cases {
             let base = now_secs();
             let body = asg_request(plan, version, "CapacityForecast", (base, base + HOUR));
             let (status, parsed) = emulator.call(OPERATION, &body).await;
-            if accepted {
-                assert_eq!(
-                    status, 200,
-                    "case {label:?} ({version}) on {held}: expected HTTP 200, got {status} \
-                     with {parsed}"
-                );
-                assert!(
-                    datapoints(&parsed).is_empty(),
-                    "case {label:?} ({version}) on {held}: expected no data points, got {parsed}"
-                );
-                continue;
-            }
             assert_eq!(
-                (status, error_code(&parsed)),
-                (400, "ValidationException"),
-                "case {label:?} ({version}) on {held}: expected HTTP 400 \
-                 ValidationException, got {status} with {parsed}"
+                status, 200,
+                "case {label:?} ({version}) on {held}: expected HTTP 200, got {status} \
+                 with {parsed}"
             );
-            let message = error_message(&parsed);
             assert!(
-                message.contains("ScalingPlanVersion"),
-                "case {label:?} ({version}) on {held}: the refusal must name the member it \
-                 is about, got {message:?}"
+                datapoints(&parsed).is_empty(),
+                "case {label:?} ({version}) on {held}: expected no data points, got {parsed}"
             );
         }
     }

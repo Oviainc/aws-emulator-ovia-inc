@@ -178,13 +178,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "ScalingPlanVersion can only be specified together with ScalingPlanNames",
             ));
         }
-        // `ScalingPlanVersion` documents exactly one valid value, so any other version is
-        // refused on the member here — before any lookup — exactly as the two sibling reads
-        // refuse their own copy of it. Folding such a value into the match predicate
-        // instead would report a version that cannot exist as merely holding nothing.
-        if let Some(version) = input.scaling_plan_version {
-            crate::state::validate_plan_version(version).map_err(validation)?;
-        }
 
         let page_size = crate::state::effective_max_results(input.max_results).map_err(validation)?;
 
@@ -212,9 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             wanted_source_keys.insert(key);
         }
 
-        // The version, where the request carries one, is the version of the plans it names;
-        // it was refused above unless it is the one version this service's plans carry, so
-        // it narrows the name selector rather than silently emptying it.
+        // The version, where the request carries one, narrows the name selector to the
+        // plans stored at that version: the model constrains the member to no set of
+        // values, so it selects rather than gates, and a version this service holds no plan
+        // at reports the empty page like a name it holds no plan under.
         let matching = state.scaling_plans.values().filter(|plan| {
             if !wanted_names.is_empty() {
                 return wanted_names.contains(plan.name.as_str())

@@ -10,8 +10,7 @@
 //!    endpoints in order, the documented seven-day maximum width and the documented
 //!    56-day limit on how far before the current date and time the start may sit, both
 //!    measured in whole hourly forecast periods, the granularity forecast data exists
-//!    at), the scaling plan version (the model documents a
-//!    single valid value), and the resource coordinates — refused only where the
+//!    at), and the resource coordinates — refused only where the
 //!    `(ServiceNamespace, ResourceId, ScalableDimension)` triple describes no one scalable
 //!    resource ([`crate::state::validate_resource_triple`]), the same question the write
 //!    paths ask of a scaling instruction's triple — and the `ForecastDataType` enum — so a
@@ -213,7 +212,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             FORECAST_DATA_TYPE_VALUES,
         )
         .map_err(validation)?;
-        crate::state::validate_plan_version(input.scaling_plan_version).map_err(validation)?;
         validate_forecast_window(input.start_time, input.end_time, now).map_err(validation)?;
         // A triple that describes one scalable resource is a request this service answers,
         // whichever resource it describes: WHICH resources it holds a forecast for is
@@ -234,12 +232,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The forecast is computed from the stored plan: the scaling instruction that
         // names the requested resource is what a forecast for it is issued from.
         //
-        // Where this service holds no plan of that (name, version), or the held plan
+        // Where this service holds no plan at that (name, version), or the held plan
         // instructs no such resource, there is nothing to forecast — and that is the
         // empty `Datapoints` list, not a refusal: this operation binds no not-found shape
         // (`smithy_query(query="operation",operation="GetScalingPlanResourceForecastData")`
-        // binds only `InternalServiceException` and `ValidationException`), so only the
-        // request's own members, refused above, can make this call a refusal.
+        // binds only `InternalServiceException` and `ValidationException`), and the plan's
+        // name and version are both SELECTORS the model constrains to no set of values, so
+        // a version this service holds no plan at misses exactly like an unknown name.
+        // Only the request's own members, refused above, can make this call a refusal.
         let datapoints = state
             .plan(&input.scaling_plan_name, input.scaling_plan_version)
             .and_then(|plan| instruction_for(plan, &input))

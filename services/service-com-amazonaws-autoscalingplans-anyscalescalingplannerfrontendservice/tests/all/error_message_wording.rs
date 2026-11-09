@@ -44,9 +44,7 @@ const LOOKUP_OPERATIONS: [(&str, &str); 2] = [
 ];
 
 /// The reporting operation that looks one plan up by name and version. It is driven apart
-/// from [`LOOKUP_OPERATIONS`] because its request carries five more required members, and
-/// because it checks `ScalingPlanVersion` against the single documented valid value
-/// BEFORE any lookup — so only rows at that version reach its lookup.
+/// from [`LOOKUP_OPERATIONS`] because its request carries five more required members.
 const FORECAST_OPERATION: &str = "GetScalingPlanResourceForecastData";
 
 /// The only scaling-plan version the model documents as valid.
@@ -159,11 +157,9 @@ async fn a_lookup_that_finds_no_plan_names_the_requested_name_and_version() {
             );
         }
 
-        // The same miss on the two reporting paths is not a refusal at all, so the
-        // sentence above must not travel in their answers.
-        if version != ONLY_VERSION {
-            continue;
-        }
+        // The same miss on the two reporting paths is not a refusal at all — whichever
+        // half of the coordinate missed — so the sentence above must not travel in their
+        // answers.
         for (operation, request) in [
             (
                 "DescribeScalingPlanResources",
