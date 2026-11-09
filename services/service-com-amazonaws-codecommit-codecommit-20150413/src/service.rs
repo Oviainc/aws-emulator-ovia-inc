@@ -329,13 +329,15 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         // Every member that carries an `ObjectId` naming a blob takes the blob
         // errors: `beforeBlobId` and `afterBlobId` are `GetBlobDifferences`'s names
         // for the two sides of one, and it models these same codes for them.
+        //
+        // Only the ABSENCE of one is refused here. `ObjectId` carries no modelled
+        // constraint, so a value that names no git object reaches the handler, which
+        // is what refuses it as `InvalidBlobIdException` — and that refusal names the
+        // rejected id (`crate::state::invalid_blob_id_message`), which this seam
+        // cannot do because it words a refusal with a fixed sentence.
         ("blobId" | "beforeBlobId" | "afterBlobId", _) if missing => (
             "BlobIdRequiredException",
             crate::state::BLOB_ID_REQUIRED_MESSAGE,
-        ),
-        ("blobId" | "beforeBlobId" | "afterBlobId", _) => (
-            "InvalidBlobIdException",
-            crate::state::INVALID_BLOB_ID_MESSAGE,
         ),
         ("commitMessage", ViolationKind::MaxLength(_)) => (
             "CommitMessageLengthExceededException",

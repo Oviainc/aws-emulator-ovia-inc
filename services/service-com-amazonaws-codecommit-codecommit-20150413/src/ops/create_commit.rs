@@ -441,7 +441,6 @@ fn normalized_entries(input: &CreateCommitInput) -> Result<Entries, CreateCommit
 /// repository that holds none.
 fn resolve_parent(
     repository: &crate::state::Repository,
-    repository_name: &str,
     branch_name: &str,
     parent_commit_id: Option<&str>,
 ) -> Result<Option<String>, CreateCommitError> {
@@ -478,10 +477,9 @@ fn resolve_parent(
                 } else {
                     Err(CreateCommitErrorModeled::ParentCommitDoesNotExistException(
                         ParentCommitDoesNotExistException {
-                            message: Some(format!(
-                                "the parent commit id {parent} does not exist in the \
-                                 repository {repository_name}"
-                            )),
+                            message: Some(
+                                crate::state::PARENT_COMMIT_DOES_NOT_EXIST_MESSAGE.to_string(),
+                            ),
                         },
                     )
                     .into())
@@ -498,13 +496,12 @@ fn resolve_parent(
                 )
                 .into());
             }
-            if let Some(parent) = parent {
+            if parent.is_some() {
                 return Err(CreateCommitErrorModeled::ParentCommitDoesNotExistException(
                     ParentCommitDoesNotExistException {
-                        message: Some(format!(
-                            "the parent commit id {parent} does not exist in the repository \
-                             {repository_name}"
-                        )),
+                        message: Some(
+                            crate::state::PARENT_COMMIT_DOES_NOT_EXIST_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());
@@ -585,7 +582,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // must name, or none for the first commit of an empty repository.
         let parent = resolve_parent(
             repository,
-            &input.repository_name,
             &input.branch_name,
             input.parent_commit_id.as_deref(),
         )?;

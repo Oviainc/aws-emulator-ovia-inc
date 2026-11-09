@@ -9,9 +9,10 @@
 //! template — the fixed words "Could not find path " followed by that path — and
 //! nothing else of the request or of the stored state reaches it: not the commit the
 //! path was resolved against, not the branch, not the repository. It is the path
-//! sibling of the `CommitDoesNotExistException` text ("Could not find commit
-//! <specifier>") the neighbouring suites pin. `DeleteFile` answers the same code with
-//! its OWN fixed sentence, which names no path at all.
+//! sibling of the `CommitDoesNotExistException` text (for a commit specifier that
+//! resolved to nothing, "AWS CodeCommit could not find the commit specifier
+//! <specifier>. …") the neighbouring suites pin. `DeleteFile` answers the same code
+//! with its OWN fixed sentence, which names no path at all.
 //!
 //! So the tables below vary what the rule generalises over — where the path sits
 //! (repository root, one folder, four folders deep), how it is spelled (bare, with a

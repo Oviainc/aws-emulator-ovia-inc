@@ -105,6 +105,8 @@ mod file_does_not_exist_message;
 mod folder_collection_members;
 #[path = "all/folder_listing.rs"]
 mod folder_listing;
+#[path = "all/git_object_and_commit_specifier_messages.rs"]
+mod git_object_and_commit_specifier_messages;
 #[path = "all/git_object_ids.rs"]
 mod git_object_ids;
 #[path = "all/git_transport.rs"]

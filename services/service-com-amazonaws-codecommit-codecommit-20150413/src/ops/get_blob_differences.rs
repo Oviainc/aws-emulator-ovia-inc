@@ -467,12 +467,13 @@ impl From<GetBlobDifferencesErrorModeled> for GetBlobDifferencesError {
 /// The object name a blob id names, lower-cased: an object name is a hexadecimal
 /// number, so its case does not change which object it names and the store writes it
 /// lowercase. Refused where the value is not an object name — the 40 hexadecimal
-/// characters a git object id is wide — at all.
+/// characters a git object id is wide — at all, naming the id that was rejected,
+/// which is the only thing that tells a caller which of the two sides was at fault.
 fn object_name(blob_id: &str) -> Result<String, GetBlobDifferencesError> {
     if !crate::state::is_object_id(blob_id) {
         return Err(GetBlobDifferencesErrorModeled::InvalidBlobIdException(
             InvalidBlobIdException {
-                message: Some(crate::state::INVALID_BLOB_ID_MESSAGE.to_string()),
+                message: Some(crate::state::invalid_blob_id_message(blob_id)),
             },
         )
         .into());
@@ -610,9 +611,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .ok_or_else(|| {
                         GetBlobDifferencesErrorModeled::BlobIdDoesNotExistException(
                             BlobIdDoesNotExistException {
-                                message: Some(crate::state::blob_id_does_not_exist_message(
-                                    blob_id,
-                                )),
+                                message: Some(
+                                    crate::state::BLOB_ID_DOES_NOT_EXIST_MESSAGE.to_string(),
+                                ),
                             },
                         )
                     })

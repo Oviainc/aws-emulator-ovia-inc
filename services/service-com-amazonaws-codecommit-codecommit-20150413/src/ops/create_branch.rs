@@ -242,11 +242,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // A branch is a reference TO a commit, so the commit has to be one this
-        // repository holds before any reference can point at it.
+        // repository holds before any reference can point at it. `commitId` is a raw
+        // object name rather than a specifier to resolve, so the refusal is the git
+        // object lookup's own.
         if !repository.commits.contains_key(&input.commit_id) {
             return Err(CreateBranchErrorModeled::CommitDoesNotExistException(
                 CommitDoesNotExistException {
-                    message: Some(crate::state::commit_does_not_exist_message(
+                    message: Some(crate::state::commit_object_missing_message(
                         &input.commit_id,
                     )),
                 },
@@ -254,14 +256,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // Branch names are unique within a repository, so creating one that already
-        // exists is refused rather than repointing it.
+        // exists is refused rather than repointing it. The refusal names the
+        // reference it would have written, and what that name collides with.
         if repository.branches.contains_key(&input.branch_name) {
             return Err(CreateBranchErrorModeled::BranchNameExistsException(
                 BranchNameExistsException {
-                    message: Some(format!(
-                        "the branch {} already exists in the repository {}",
-                        input.branch_name, input.repository_name
-                    )),
+                    message: Some(crate::state::branch_name_exists_message(&input.branch_name)),
                 },
             )
             .into());

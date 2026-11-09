@@ -371,10 +371,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     } else {
                         Err(PutFileErrorModeled::ParentCommitDoesNotExistException(
                             ParentCommitDoesNotExistException {
-                                message: Some(format!(
-                                    "the parent commit id {parent} does not exist in the repository {}",
-                                    input.repository_name
-                                )),
+                                message: Some(
+                                    crate::state::PARENT_COMMIT_DOES_NOT_EXIST_MESSAGE.to_string(),
+                                ),
                             },
                         )
                         .into())
@@ -395,13 +394,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
-                if let Some(parent) = parent {
+                if parent.is_some() {
                     return Err(PutFileErrorModeled::ParentCommitDoesNotExistException(
                         ParentCommitDoesNotExistException {
-                            message: Some(format!(
-                                "the parent commit id {parent} does not exist in the repository {}",
-                                input.repository_name
-                            )),
+                            message: Some(
+                                crate::state::PARENT_COMMIT_DOES_NOT_EXIST_MESSAGE.to_string(),
+                            ),
                         },
                     )
                     .into());

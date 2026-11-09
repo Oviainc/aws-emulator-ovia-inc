@@ -8,10 +8,12 @@
 //! 1. One error code is worded ONE way: a CONSTANT where the service's text names
 //!    nothing from the request (`ParentCommitIdOutdatedException`,
 //!    `ParentCommitIdRequiredException`, `NoChangeException`,
-//!    `SameFileContentException`), and a TEMPLATE whose single slot is a named
-//!    request value where it does — the blob id for `BlobIdDoesNotExistException`,
-//!    the resolved commit specifier for `CommitDoesNotExistException` — whichever
-//!    operation raises the code and whatever else the request said.
+//!    `SameFileContentException`, `BlobIdDoesNotExistException`), and a TEMPLATE
+//!    whose single slot is a named request value where it does — the resolved
+//!    commit specifier for `CommitDoesNotExistException` raised on a member the
+//!    model types `CommitName`, and the object name for the same code raised on
+//!    one it types `CommitId` — whichever operation raises the code and whatever
+//!    else the request said.
 //! 2. Whether the body carries a `message` at all is part of the response shape,
 //!    decided per operation: the branch READ (`GetBranch`) answers
 //!    `BranchDoesNotExistException` with no message text, while the write paths
@@ -70,6 +72,25 @@ const SAME_FILE_CONTENT: &str = "The content of the file is exactly the same as 
     the file in the AWS CodeCommit repository and branch you specified. The file has not been \
     added.";
 const BRANCH_DOES_NOT_EXIST: &str = "The specified branch does not exist";
+/// `BlobIdDoesNotExistException`'s whole text: a well-formed object name no object
+/// carries states that the blob is not in the repository, and names nothing.
+const BLOB_ID_DOES_NOT_EXIST: &str = "The specified blob does not exist in the repository.";
+
+/// `CommitDoesNotExistException`'s text for a member the model types `CommitName`
+/// — a commit SPECIFIER (a branch, a tag, `HEAD` or a full commit id) — that
+/// resolved to no commit. The one slot is that specifier.
+fn commit_specifier_not_found(specifier: &str) -> String {
+    format!(
+        "AWS CodeCommit could not find the commit specifier {specifier}. Either the specifier \
+         does not exist, or the commit has not yet been pushed to the remote repository."
+    )
+}
+
+/// `CommitDoesNotExistException`'s text for a member the model types `CommitId` —
+/// a raw git object name looked up rather than resolved. The one slot is that id.
+fn commit_object_missing(commit_id: &str) -> String {
+    format!("Object missing: {commit_id}")
+}
 
 /// One row of the write tables: a repository name, the branch written to and the
 /// path of the file the first commit carries. The names span what
@@ -375,11 +396,12 @@ async fn no_change_and_same_file_content_messages_are_constants() {
     }
 }
 
-/// Rule 1, `BlobIdDoesNotExistException` — the template's one slot is the blob id
-/// the request asked for, and the repository is NOT named, whichever repository
-/// the lookup ran in.
+/// Rule 1, `BlobIdDoesNotExistException` — the message is the same constant
+/// whichever repository the lookup ran in and whichever object name it was asked
+/// for: a well-formed object name that no object carries states only that the blob
+/// is not in the repository, naming neither the id nor the repository.
 #[tokio::test]
-async fn blob_id_does_not_exist_message_names_the_blob_id_and_not_the_repository() {
+async fn blob_id_does_not_exist_message_is_a_constant() {
     let router = emulator();
 
     // Two repositories, one holding a blob and one holding none, so the same
@@ -440,8 +462,7 @@ async fn blob_id_does_not_exist_message_names_the_blob_id_and_not_the_repository
                 "case ({label}, {repository}): expected code BlobIdDoesNotExistException, \
                  got {code:?}"
             );
-            let expected =
-                format!("AWS CodeCommit could not find the blob {blob_id} in the repository.");
+            let expected = BLOB_ID_DOES_NOT_EXIST;
             assert_eq!(
                 message, expected,
                 "case ({label}, {repository}): expected message {expected:?}, got {message:?}"
@@ -451,12 +472,17 @@ async fn blob_id_does_not_exist_message_names_the_blob_id_and_not_the_repository
                 "case ({label}, {repository}): the message must not name the repository, \
                  got {message:?}"
             );
+            assert!(
+                !message.contains(blob_id.as_str()),
+                "case ({label}, {repository}): the message must not name the blob id, \
+                 got {message:?}"
+            );
         }
     }
 
     // An object name is hexadecimal, so its case does not change which object it
-    // names: the same id in upper case is the same missing blob, and the slot
-    // carries that id.
+    // names: the same id in upper case is the same missing blob, and the same
+    // sentence.
     let upper = FULL_OBJECT_ID.to_ascii_uppercase();
     let (code, message) = error_with_message(
         &router,
@@ -469,10 +495,9 @@ async fn blob_id_does_not_exist_message_names_the_blob_id_and_not_the_repository
         code, "BlobIdDoesNotExistException",
         "case (upper-case id): expected code BlobIdDoesNotExistException, got {code:?}"
     );
-    let expected = format!("AWS CodeCommit could not find the blob {upper} in the repository.");
-    assert!(
-        message.eq_ignore_ascii_case(&expected),
-        "case (upper-case id): expected message {expected:?} (ignoring hex case), got {message:?}"
+    assert_eq!(
+        message, BLOB_ID_DOES_NOT_EXIST,
+        "case (upper-case id): expected message {BLOB_ID_DOES_NOT_EXIST:?}, got {message:?}"
     );
 }
 
@@ -608,9 +633,11 @@ async fn the_branch_read_refusal_carries_no_message() {
     }
 }
 
-/// Rule 1, `CommitDoesNotExistException` — the template's one slot is the
-/// specifier the read was resolved against, which for a request that names none is
-/// `HEAD`.
+/// Rule 1, `CommitDoesNotExistException` — the code is worded by the KIND of
+/// member that named nothing: a specifier member (`CommitName`) takes the
+/// specifier template, whose one slot is the specifier the read was resolved
+/// against (`HEAD` for a request that names none), and a raw object id member
+/// (`CommitId`) takes the object-missing template.
 #[tokio::test]
 async fn commit_does_not_exist_message_names_the_resolved_specifier() {
     let router = emulator();
@@ -691,7 +718,7 @@ async fn commit_does_not_exist_message_names_the_resolved_specifier() {
                     "case ({operation}, {repository}, {label}): expected code \
                      CommitDoesNotExistException, got {code:?}"
                 );
-                let expected = format!("Could not find commit {named}");
+                let expected = commit_specifier_not_found(named);
                 assert_eq!(
                     message, expected,
                     "case ({operation}, {repository}, {label}): expected message {expected:?}, \
@@ -701,16 +728,18 @@ async fn commit_does_not_exist_message_names_the_resolved_specifier() {
         }
     }
 
-    // The operations that take a specifier by another member name carry the same
-    // template, with the value they were given in the slot.
-    let others: Vec<(&str, Value, &str)> = vec![
+    // The operations that name the commit by another member carry the template for
+    // the KIND of member they name it with: a specifier member keeps the specifier
+    // template, while `CreateBranch`'s `commitId` — typed `CommitId`, a raw object
+    // name — takes the object-missing one.
+    let others: Vec<(&str, Value, String)> = vec![
         (
             "GetDifferences",
             json!({
                 "repositoryName": row.repository,
                 "afterCommitSpecifier": "ghost-branch",
             }),
-            "ghost-branch",
+            commit_specifier_not_found("ghost-branch"),
         ),
         (
             "CreateBranch",
@@ -719,7 +748,7 @@ async fn commit_does_not_exist_message_names_the_resolved_specifier() {
                 "branchName": "from-nowhere",
                 "commitId": FULL_OBJECT_ID,
             }),
-            FULL_OBJECT_ID,
+            commit_object_missing(FULL_OBJECT_ID),
         ),
         (
             "GetMergeOptions",
@@ -728,17 +757,16 @@ async fn commit_does_not_exist_message_names_the_resolved_specifier() {
                 "sourceCommitSpecifier": "ghost-branch",
                 "destinationCommitSpecifier": row.branch,
             }),
-            "ghost-branch",
+            commit_specifier_not_found("ghost-branch"),
         ),
     ];
-    for (operation, body, named) in others {
+    for (operation, body, expected) in others {
         let (code, message) =
             error_with_message(&router, operation, &body, CLIENT_ERROR_STATUS).await;
         assert_eq!(
             code, "CommitDoesNotExistException",
             "case {operation}: expected code CommitDoesNotExistException, got {code:?}"
         );
-        let expected = format!("Could not find commit {named}");
         assert_eq!(
             message, expected,
             "case {operation}: expected message {expected:?}, got {message:?}"

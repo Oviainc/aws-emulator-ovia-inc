@@ -386,13 +386,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A named side of the comparison has to be a commit this repository holds:
-        // an id it never had addresses no version of the pull request's files.
+        // an id it never had addresses no version of the pull request's files. Each
+        // side is a raw object name rather than a specifier to resolve, so the
+        // refusal is the git object lookup's own.
         for commit_id in [before_commit_id, after_commit_id].into_iter().flatten() {
             if !repository.commits.contains_key(commit_id) {
                 return Err(
                     GetCommentsForPullRequestErrorModeled::CommitDoesNotExistException(
                         CommitDoesNotExistException {
-                            message: Some(crate::state::commit_does_not_exist_message(commit_id)),
+                            message: Some(crate::state::commit_object_missing_message(commit_id)),
                         },
                     )
                     .into(),

@@ -383,7 +383,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Both sides of the comparison have to be commits this repository holds: a
         // comment is filed against stored commits, never against an id the
-        // repository never had.
+        // repository never had. Each side is a raw object name rather than a
+        // specifier to resolve, so the refusal is the git object lookup's own.
         for commit_id in [Some(input.after_commit_id.as_str()), before_commit_id]
             .into_iter()
             .flatten()
@@ -392,7 +393,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     PostCommentForComparedCommitErrorModeled::CommitDoesNotExistException(
                         CommitDoesNotExistException {
-                            message: Some(crate::state::commit_does_not_exist_message(commit_id)),
+                            message: Some(crate::state::commit_object_missing_message(commit_id)),
                         },
                     )
                     .into(),

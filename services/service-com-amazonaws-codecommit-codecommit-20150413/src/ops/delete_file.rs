@@ -343,10 +343,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 Err(DeleteFileErrorModeled::ParentCommitDoesNotExistException(
                     ParentCommitDoesNotExistException {
-                        message: Some(format!(
-                            "the parent commit id {} does not exist in the repository {}",
-                            input.parent_commit_id, input.repository_name
-                        )),
+                        message: Some(
+                            crate::state::PARENT_COMMIT_DOES_NOT_EXIST_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into())
@@ -363,10 +362,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DeleteFileErrorModeled::ParentCommitDoesNotExistException(
                     ParentCommitDoesNotExistException {
-                        message: Some(format!(
-                            "the parent commit id {} does not exist in the repository {}",
-                            input.parent_commit_id, input.repository_name
-                        )),
+                        message: Some(
+                            crate::state::PARENT_COMMIT_DOES_NOT_EXIST_MESSAGE.to_string(),
+                        ),
                     },
                 )
             })?;

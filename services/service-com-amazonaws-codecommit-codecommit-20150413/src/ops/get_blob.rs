@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an object id is wide. Anything else names no object in any repository.
         if !crate::state::is_object_id(&input.blob_id) {
             return Err(GetBlobErrorModeled::InvalidBlobIdException(InvalidBlobIdException {
-                message: Some(crate::state::INVALID_BLOB_ID_MESSAGE.to_string()),
+                message: Some(crate::state::invalid_blob_id_message(&input.blob_id)),
             })
             .into());
         }
@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // repository holds under it.
         let content = repository.blob(&blob_id).ok_or_else(|| {
             GetBlobErrorModeled::BlobIdDoesNotExistException(BlobIdDoesNotExistException {
-                message: Some(crate::state::blob_id_does_not_exist_message(&blob_id)),
+                message: Some(crate::state::BLOB_ID_DOES_NOT_EXIST_MESSAGE.to_string()),
             })
         })?;
 
