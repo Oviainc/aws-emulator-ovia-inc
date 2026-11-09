@@ -75,15 +75,13 @@ const SIGNATURE_MISMATCH_MESSAGE: &str =
 /// server, never a caller's malformed response.
 const UNREADABLE_BODY_MESSAGE: &str = "The server could not read the response document";
 
-/// What this plane says to a response document larger than one a provider sends. "The total
-/// size of the response body can't exceed 4096 bytes" (custom resource response objects),
-/// and this plane accepts a generous multiple of that rather than the published figure
-/// exactly, so a provider that pads its document is still answered — while nothing a caller
-/// sends sizes this store.
-const MAX_RESPONSE_BYTES: usize = 64 * 1024;
-
-/// What this plane says to a document past that bound.
-const TOO_LARGE_MESSAGE: &str = "The custom resource response document is too large";
+// What this plane does with a response document larger than one a provider may send. "The
+// total size of the response body can't exceed 4096 bytes" (custom resource response
+// objects), and a document past that bound is not read at all: the write is still accepted
+// — a pre-signed `PUT` is — and the answer recorded for it is the resource's FAILURE with
+// the response-too-long reason (`ProviderResponse::too_long`). So nothing a caller sends
+// sizes this store either: a document past the bound leaves one fixed reason behind and
+// none of its own bytes.
 
 /// What this plane says when this service's store is not reachable.
 const STORE_UNAVAILABLE_MESSAGE: &str = "The CloudFormation store is unavailable";
@@ -118,15 +116,19 @@ pub fn serve<Eng: Send + Sync + 'static>(
     let Some(body) = req.body().bytes() else {
         return refusal(500, "InternalFailure", UNREADABLE_BODY_MESSAGE.to_string());
     };
-    if body.len() > MAX_RESPONSE_BYTES {
-        return refusal(400, "EntityTooLarge", TOO_LARGE_MESSAGE.to_string());
-    }
-    let Ok(document) = ::serde_json::from_slice::<::serde_json::Value>(body) else {
-        return malformed("a Status and a PhysicalResourceId");
-    };
-    let answered = match ProviderResponse::read(&document) {
-        Ok(answered) => answered,
-        Err(member) => return malformed(member),
+    // A document past the size a response may carry is one CloudFormation does not read:
+    // the answer it records is the resource's failure with the response-too-long reason,
+    // which is what then fails the resource and rolls its stack back.
+    let answered = if body.len() > custom_resource::MAX_RESPONSE_BODY_BYTES {
+        ProviderResponse::too_long()
+    } else {
+        let Ok(document) = ::serde_json::from_slice::<::serde_json::Value>(body) else {
+            return malformed("a Status and a PhysicalResourceId");
+        };
+        match ProviderResponse::read(&document) {
+            Ok(answered) => answered,
+            Err(member) => return malformed(member),
+        }
     };
     let Some(state) = crate::state::service_state(engine) else {
         return refusal(500, "InternalFailure", STORE_UNAVAILABLE_MESSAGE.to_string());

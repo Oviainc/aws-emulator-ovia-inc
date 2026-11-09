@@ -288,6 +288,7 @@ mod tests {
                 region: "us-east-1",
                 stack_name: "checked",
                 stack_id: "arn:aws:cloudformation:us-east-1:000000000000:stack/checked/0",
+                notification_arns: &[],
             },
             &BTreeMap::new(),
         );

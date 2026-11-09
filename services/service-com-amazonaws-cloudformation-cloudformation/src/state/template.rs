@@ -1526,6 +1526,10 @@ pub struct StackScope<'a> {
     pub region: &'a str,
     pub stack_name: &'a str,
     pub stack_id: &'a str,
+    /// The Amazon SNS topic ARNs the stack publishes its events to, in the order the stack
+    /// records them — what `AWS::NotificationARNs` stands for. Empty for a stack that
+    /// carries none, which is a resolvable value (the empty list) and not an unknown.
+    pub notification_arns: &'a [String],
 }
 
 /// Materialise the resources a template declares.
@@ -3906,6 +3910,16 @@ fn reference(name: &str, scope: &Scope<'_>) -> Option<Resolved> {
         "AWS::StackName" => return Some(Resolved::Text(scope.stack.stack_name.to_string())),
         "AWS::StackId" => return Some(Resolved::Text(scope.stack.stack_id.to_string())),
         "AWS::Partition" => return Some(Resolved::Text(PARTITION.to_string())),
+        // "AWS::NotificationARNs — Returns the list of notification Amazon Resource Names
+        // (ARNs) for the current stack": a LIST, so `Fn::Join`, `Fn::Select` and
+        // `Fn::Length` read it the same way they read a list-typed parameter's `Ref`. A
+        // stack with no notification topics resolves to the EMPTY list — which it HAS —
+        // rather than to nothing.
+        "AWS::NotificationARNs" => {
+            let arns = scope.stack.notification_arns;
+            return (arns.len() <= MAX_RESOLVED_LIST_LEN)
+                .then(|| Resolved::List(arns.to_vec()));
+        }
         "AWS::URLSuffix" => return Some(Resolved::Text(URL_SUFFIX.to_string())),
         // "AWS::NoValue … removes the corresponding resource property" — there is no
         // value to substitute.

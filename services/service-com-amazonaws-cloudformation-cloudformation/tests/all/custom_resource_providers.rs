@@ -47,7 +47,7 @@ use super::stack_lifecycle::form_encode;
 /// The topic every suite row names as its `ServiceToken`: an Amazon SNS topic this emulator
 /// really holds, created through SNS's own wire before the stack is deployed, so the request
 /// CloudFormation publishes is one SNS accepts.
-const PROVIDER_TOPIC: &str = "custom-resource-provider";
+pub const PROVIDER_TOPIC: &str = "custom-resource-provider";
 
 /// How long one poll of a stack's status waits before asking again, and how many times: the
 /// stack's own transition is clock-owed, and what makes a released wait due is a READ.

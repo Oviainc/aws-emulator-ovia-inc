@@ -15,6 +15,7 @@ fn computed_attributes(resource_type: &str) -> BTreeMap<String, String> {
         region: "us-east-1",
         stack_name: "a-stack",
         stack_id: "a-stack-id",
+        notification_arns: &[],
     };
     let parameters = BTreeMap::new();
     let parameter_types = BTreeMap::new();
@@ -97,6 +98,7 @@ fn named(resource_type: &str, properties: Value) -> String {
         region: "us-east-1",
         stack_name: "a-stack",
         stack_id: "a-stack-id",
+        notification_arns: &[],
     };
     let parameters = BTreeMap::new();
     let parameter_types = BTreeMap::new();

@@ -505,14 +505,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the ones the request supplies — in that order of precedence, which is the set
         // `merged_parameters` and `parameters_in_force` resolve to under the lock below. The
         // stack's half is read under a lock of its own, released before the reads.
-        let (stack_template, stack_parameters) = {
+        let (stack_template, stack_parameters, stack_notification_arns) = {
             let store = state.lock();
             match store
                 .resolve(&region, &input.stack_name)
                 .filter(|stack| stack.is_live())
             {
-                Some(stack) => (stack.template_body.clone(), stack.parameters.clone()),
-                None => (None, Vec::new()),
+                Some(stack) => (
+                    stack.template_body.clone(),
+                    stack.parameters.clone(),
+                    stack.notification_arns.clone(),
+                ),
+                None => (None, Vec::new(), Vec::new()),
             }
         };
         let resolution_body = input.template_body.clone().or(stack_template);
@@ -565,6 +569,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stack's ID exists only once the stack does, so a name built from it resolves to
         // nothing here and that resource is simply not asked about — a name no service holds
         // is never reported as taken.
+        // The topics this change set would put in force, read the same way the record below
+        // reads them: the ones the request STATES, and the stack's own where it states none.
+        // One rule for both stages, so a name built from `AWS::NotificationARNs` resolves
+        // here to what the execution would deploy with.
+        let topics_in_force: &[String] = match input.notification_ar_ns.as_deref() {
+            Some(stated) => stated,
+            None => &stack_notification_arns,
+        };
         let named_resources = match (&declared_submitted, &values_in_force) {
             (Some(declared), Some(values)) => early_validation::named_resources(
                 declared,
@@ -572,6 +584,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     region: &region,
                     stack_name: &input.stack_name,
                     stack_id: "",
+                    // The topics this change set would put in force: what a name built
+                    // from `AWS::NotificationARNs` would resolve to under it.
+                    notification_arns: topics_in_force,
                 },
                 values,
             ),
@@ -760,6 +775,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|stack_id| store.resolve(&region, stack_id))
             .map(|stack| stack.imports.clone())
             .unwrap_or_default();
+        // The Amazon SNS topics in force on the stack, which is what
+        // `AWS::NotificationARNs` resolves to on both sides of the plan.
+        let previous_notification_arns = target_stack_id
+            .as_deref()
+            .and_then(|stack_id| store.resolve(&region, stack_id))
+            .map(|stack| stack.notification_arns.clone())
+            .unwrap_or_default();
         // "Whether to reuse the template that's associated with the stack to create the
         // change set." Either way the body and its processed stage travel together, which
         // `zip` is what expresses: a submitted body ALWAYS has the stage computed for it
@@ -897,6 +919,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         parameters: &previous_parameters,
                         deployed: &deployed,
                         imports: &previous_imports,
+                        notification_arns: &previous_notification_arns,
                     }
                 }),
                 &submitted,
@@ -922,7 +945,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // comparison below holds a re-created name to AND what the record stores.
         let capabilities = input.capabilities.clone().unwrap_or_default();
         let resource_types = input.resource_types.clone().unwrap_or_default();
-        let notification_arns = input.notification_ar_ns.clone().unwrap_or_default();
+        // "The Amazon Resource Names (ARNs) of Amazon SNS topics that CloudFormation
+        // associates with the stack": a request that names none states nothing about the
+        // stack's topics, so the ones in force stay in force — the same reading `UpdateStack`
+        // gives its own member. An explicitly EMPTY list is a statement, and it CLEARS them.
+        let notification_arns = match input.notification_ar_ns.clone() {
+            Some(stated) => stated,
+            None => previous_notification_arns.clone(),
+        };
         let tags = crate::state::stored_tags(input.tags.as_deref().unwrap_or_default());
         let rollback_configuration =
             crate::state::stored_rollback_configuration(input.rollback_configuration.as_ref());
@@ -1141,6 +1171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The Region the stack lives in is the one this call was signed for, as it
                 // is for a stack `CreateStack` creates.
                 stack.region = region.clone();
+                // ...and so are the Amazon SNS topics the change set names: the change set
+                // that brings the stack into existence carries the stack's configuration,
+                // so `DescribeStacks` echoes them from here on and the events of the stack
+                // are published to them.
+                stack.notification_arns = notification_arns.clone();
                 stack.record_event(
                     now,
                     status::REVIEW_IN_PROGRESS,

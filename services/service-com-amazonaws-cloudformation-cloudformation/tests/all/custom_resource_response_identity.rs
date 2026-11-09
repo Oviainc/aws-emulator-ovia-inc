@@ -438,10 +438,14 @@ async fn the_reason_a_failed_answer_states_is_the_resources_failure_reason() {
             custom_resource::UNSTATED_REASON.to_string(),
         ),
         (
+            // A `Reason` this long cannot reach CloudFormation at all: the document
+            // carrying it is past the size a response may be, and such a document is not
+            // read ([`custom_resource::MAX_RESPONSE_BODY_BYTES`]) — the resource fails with
+            // the response-too-long reason instead of with the provider's own.
             "a reason longer than a response may carry",
             "reason-longest",
             Some(longest.clone()),
-            longest.chars().take(custom_resource::MAX_REASON_CHARS).collect(),
+            custom_resource::RESPONSE_TOO_LONG_REASON.to_string(),
         ),
     ];
     for (case, stack_name, stated, expected) in rows {

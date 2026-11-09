@@ -249,6 +249,10 @@ pub mod custom_resource;
 mod in_process_calls;
 pub use in_process_calls::*;
 
+/// The second half of a deployment's walk: the resources it WITHHELD because a resource
+/// they read had not published its attributes yet, created once that resource has.
+mod deferred;
+
 /// Where each of this algorithm's questions is PUT to the module that owns a resource type
 /// ([`Owner`]'s own methods, moved out so adding a type's arms does not grow this file).
 mod owner;
@@ -417,6 +421,16 @@ pub struct StackProvenance {
     /// SHARED: one read per Region answers every deployment one request sets off
     /// ([`super::physical_name::ManagedNames`]).
     pub managed_names: super::physical_name::ManagedNames,
+    /// What each resource of the template being deployed WAITS FOR
+    /// ([`super::template::direct_dependencies`]).
+    ///
+    /// The walk reads it to decide whether a resource can be created AT ALL YET: a resource
+    /// that depends on one whose own wait is still open — a CUSTOM RESOURCE whose provider
+    /// has not answered, whose `Data` is what an `Fn::GetAtt` on it resolves against — is
+    /// not asked of anybody in this pass, because the declaration that would be sent is not
+    /// resolved yet ([`deferred`]). EMPTY is a relation the caller does not know, and then
+    /// nothing is held back.
+    pub dependencies: Dependencies,
 }
 
 impl StackProvenance {
@@ -861,6 +875,12 @@ pub async fn advance_stabilisations(
     };
     for (stack_id, barriers) in waiting {
         for (barrier, declared) in barriers {
+            // A resource whose creation has NOT STARTED is no question for anybody: what it
+            // waits for is the resources it depends on, and the pass that creates it once
+            // they have answered is [`deferred::resume`].
+            if barrier.awaited == super::stabilising::Awaited::Deferred {
+                continue;
+            }
             // A CUSTOM RESOURCE's wait is no question for an owning service: the resource is
             // backed by the PROVIDER its `ServiceToken` names, and what ends the wait is the
             // answer that provider PUT to the request's `ResponseURL`, which the plane that
@@ -888,7 +908,10 @@ pub async fn advance_stabilisations(
                         // A create's wait and a change's wait ask that service the one
                         // question: is the resource in the state it serves traffic in?
                         super::stabilising::Awaited::Ready
-                        | super::stabilising::Awaited::Updated => {
+                        | super::stabilising::Awaited::Updated
+                        // Unreachable: a wait for a creation that has not started is not
+                        // asked of anybody ([`deferred`]) and left this loop above.
+                        | super::stabilising::Awaited::Deferred => {
                             provisioner
                                 .readiness(
                                     ctx,
@@ -1107,6 +1130,16 @@ pub async fn advance_stabilisations(
             }
         }
     }
+    // ...and the resources this operation WITHHELD because a resource they read had not
+    // published its attributes yet: created now that those waits have answered
+    // ([`deferred`]), which is what finishes the walk.
+    deferred::resume(ctx, state, region).await;
+    // Last: the notifications the stack events OWE to the stack's `NotificationARNs`. Here
+    // for the same reason everything above is — the publish was due the instant the event
+    // was recorded, and it reaches another service, which nothing under this store's lock
+    // can do ([`super::stack_notifications`]) — and last, so the events this call has just
+    // made due are among the ones it publishes.
+    super::stack_notifications::deliver(ctx, state, region).await;
 }
 
 /// The properties the resource `logical_id` of `stack` was DECLARED with, or `None` where
@@ -1405,6 +1438,10 @@ pub async fn reconcile(
     // The identifiers the owning services MINTED in this walk, each against the stand-in
     // the naming rules had computed for that resource ([`repoint_references`]).
     let mut minted: Vec<Minted> = Vec::new();
+    // The resources of this walk whose own attributes are NOT PUBLISHED yet: a custom
+    // resource held for its provider's answer, and every resource withheld behind one
+    // ([`awaits_a_dependency`]).
+    let mut unpublished: BTreeSet<String> = BTreeSet::new();
     let mut declared = declared.into_iter();
     // Every `{{resolve:...}}` DYNAMIC REFERENCE the declarations carry is resolved by
     // CLOUDFORMATION ITSELF, here, before anything is asked of any owning service: a
@@ -1487,6 +1524,24 @@ pub async fn reconcile(
                 // of the old one is sent when that answer lands
                 // ([`advance_stabilisations`]).
                 if custom_resource::is_custom_resource(&resource.resource_type) {
+                    // The same declaration rule the create is held to: a changed
+                    // declaration whose `ServiceTimeout` is outside the documented range is
+                    // refused before the provider is sent the `Update`.
+                    if let Some(reason) =
+                        custom_resource::service_timeout_refusal(&deployed_properties)
+                    {
+                        outcome.failure = Some(super::resource_failure_summary(
+                            super::failed_action::UPDATE,
+                            [resource.logical_id.as_str()],
+                        ));
+                        outcome.transitions.push(ResourceTransition::finished(
+                            &resource,
+                            super::resource_status::UPDATE_FAILED,
+                            Some(reason.to_string()),
+                        ));
+                        outcome.resources.push(resource);
+                        break;
+                    }
                     let request_id = custom_resource::new_request_id();
                     let call = custom_resource::ProviderCall {
                         request_type: custom_resource::request_type::UPDATE,
@@ -1515,6 +1570,11 @@ pub async fn reconcile(
                                     .to_string(),
                                 provider_request: Some(request),
                             });
+                            // The attributes in force are the `Data` the answer to THIS
+                            // request will carry, so nothing that reads one of them is
+                            // asked for with the previous answer's value
+                            // ([`awaits_a_dependency`]).
+                            unpublished.insert(resource.logical_id.clone());
                             outcome.transitions.push(ResourceTransition::finished(
                                 &resource,
                                 super::resource_status::UPDATE_COMPLETE,
@@ -1769,6 +1829,28 @@ pub async fn reconcile(
             outcome.resources.push(resource);
             continue;
         }
+        // A resource whose declaration reads something a resource it DEPENDS ON has not
+        // published yet is not created in this pass. A CUSTOM RESOURCE's attributes are the
+        // `Data` its provider answers with, so a declaration naming one through `Fn::GetAtt`
+        // is not resolved until that answer is in hand, and creating the resource now would
+        // ask its owning service for something the template does not describe. It is held at
+        // a wait of its own ([`super::stabilising::Awaited::Deferred`]) and created by the
+        // pass that runs when those waits release ([`deferred::resume`]) — which is the
+        // order CloudFormation creates a stack's resources in: "a resource that depends on
+        // another is scheduled only once that one has finished".
+        if awaits_a_dependency(&resource.logical_id, &stack.dependencies, &unpublished) {
+            unpublished.insert(resource.logical_id.clone());
+            outcome.stabilising.push(Stabilising {
+                awaited: super::stabilising::Awaited::Deferred,
+                logical_id: resource.logical_id.clone(),
+                resource_type: resource.resource_type.clone(),
+                physical_resource_id: resource.physical_resource_id.clone(),
+                reported_state: super::resource_status::CREATE_IN_PROGRESS.to_string(),
+                provider_request: None,
+            });
+            outcome.resources.push(resource);
+            continue;
+        }
         // The deployment is CREATING this resource: the stack records it as one it created
         // once this is through, whether the create reaches an owning service or not, so the
         // transition that opens it is recorded here.
@@ -1817,6 +1899,23 @@ pub async fn reconcile(
         // service at all, and the wait it opens is released by the provider's answer rather
         // than by a service's own read.
         if custom_resource::is_custom_resource(&resource.resource_type) {
+            // A property rule of the DECLARATION, applied before anything is sent: a
+            // resource whose `ServiceTimeout` is outside the range the property documents
+            // is one CloudFormation refuses itself, so the provider is never asked about it
+            // and the resource fails with the rule as its reason.
+            if let Some(reason) = custom_resource::service_timeout_refusal(&deployed_properties) {
+                outcome.failure = Some(super::resource_failure_summary(
+                    super::create_action(stack.express),
+                    [resource.logical_id.as_str()],
+                ));
+                outcome.transitions.push(ResourceTransition::failed(
+                    &resource,
+                    super::resource_status::CREATE_FAILED,
+                    reason.to_string(),
+                ));
+                outcome.resources.push(resource);
+                break;
+            }
             let request_id = custom_resource::new_request_id();
             let call = custom_resource::ProviderCall {
                 request_type: custom_resource::request_type::CREATE,
@@ -1851,6 +1950,9 @@ pub async fn reconcile(
                         reported_state: super::resource_status::CREATE_IN_PROGRESS.to_string(),
                         provider_request: Some(request),
                     });
+                    // Its attributes are the `Data` that answer will carry, so nothing that
+                    // READS one of them can be created yet ([`awaits_a_dependency`]).
+                    unpublished.insert(resource.logical_id.clone());
                     outcome.transitions.push(ResourceTransition::finished(
                         &resource,
                         super::resource_status::CREATE_COMPLETE,
@@ -2592,6 +2694,26 @@ fn needed_by(needs: &Dependencies, refused: &str) -> BTreeSet<String> {
         }
     }
     closure
+}
+
+/// Whether `logical_id` depends — directly or through another resource — on one of
+/// `unpublished`: the resources whose own attributes are not published yet.
+///
+/// What a resource DEPENDS ON is what its declaration reads ([`Dependencies`]), so this is
+/// the one question that decides whether its declaration is resolved: a resource none of
+/// whose dependencies is waiting reads nothing that is still unknown. An EMPTY set is
+/// nothing waiting, which is the common case and answers without walking the relation.
+fn awaits_a_dependency(
+    logical_id: &str,
+    dependencies: &Dependencies,
+    unpublished: &BTreeSet<String>,
+) -> bool {
+    if unpublished.is_empty() {
+        return false;
+    }
+    needed_by(dependencies, logical_id)
+        .iter()
+        .any(|needed| unpublished.contains(needed))
 }
 
 /// Whether a teardown reads each resource's own `DeletionPolicy`

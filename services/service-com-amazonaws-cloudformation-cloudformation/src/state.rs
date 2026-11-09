@@ -433,6 +433,10 @@ pub use ascii_text::ascii_text;
 /// operation are stamped with.
 pub mod timeline;
 
+/// The STACK EVENT NOTIFICATIONS a stack's `NotificationARNs` owe: the Amazon SNS message
+/// published for every `StackEvent` of a stack that names topics.
+pub mod stack_notifications;
+
 /// The constraints a stack IDENTIFIER a request names is held to, checked before any lookup
 /// ([`stack_identifier`]).
 pub mod stack_identifier;
@@ -1611,6 +1615,16 @@ pub struct StoredEvent {
     /// ([`StoredValidationFailure`]); `None` for every event that reports a resource or
     /// stack transition.
     pub validation: Option<StoredValidationFailure>,
+    /// Whether this event still OWES a notification, and to which topic list: the digest of
+    /// the stack's `NotificationARNs` as they stood when the event was recorded
+    /// ([`stack_notifications::topics_digest`]), taken off the event as the notification is
+    /// claimed for publishing. `None` is "nothing owed" — the stack carried no topics then,
+    /// or the message has been claimed already — so no event is ever published twice.
+    ///
+    /// A DIGEST and not the list: the stack holds the one copy of its own topics, and an ARN
+    /// is caller text whose length the model does not bound, so what the event log retains
+    /// per event is eight bytes.
+    pub owed_notification: Option<u64>,
 }
 
 /// The bytes of one event that a CALLER sized: its `ResourceProperties` document. Every

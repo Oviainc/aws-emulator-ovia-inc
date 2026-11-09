@@ -97,6 +97,7 @@ fn provisioned(template_body: &str, parameters: &[(&str, &str)]) -> BTreeMap<Str
             region: REGION,
             stack_name: STACK_NAME,
             stack_id: STACK_ID,
+            notification_arns: &[],
         },
         parameters: &parameter_values,
         parameter_types: &parameter_types,

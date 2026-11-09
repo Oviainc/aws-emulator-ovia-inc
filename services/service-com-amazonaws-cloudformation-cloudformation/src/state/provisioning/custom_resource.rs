@@ -62,6 +62,47 @@ use super::{call_query, dispatch, percent_encoded, refusal_of, Refusal, REST_JSO
 /// (`AWS::CloudFormation::CustomResource`'s `ServiceToken`).
 pub const SERVICE_TOKEN: &str = "ServiceToken";
 
+/// The property that bounds how long CloudFormation waits for the provider's answer:
+/// "ServiceTimeout — the maximum time, in seconds, that can elapse before a custom resource
+/// operation times out".
+pub const SERVICE_TIMEOUT: &str = "ServiceTimeout";
+
+/// The range that property is documented to take: "the value must be an integer from 1 to
+/// 14400".
+const MIN_SERVICE_TIMEOUT: i64 = 1;
+const MAX_SERVICE_TIMEOUT: i64 = 14_400;
+
+/// What a resource whose declared `ServiceTimeout` is outside that range fails with: the
+/// rule, in the words the service states it in. Entirely fixed text — nothing of the
+/// declaration is interpolated into it.
+pub const SERVICE_TIMEOUT_OUT_OF_RANGE: &str =
+    "ServiceTimeout must be an integer between 1 and 14400 seconds";
+
+/// `Some(reason)` for a declaration whose `ServiceTimeout` CloudFormation refuses, `None`
+/// for one it accepts — a declaration that states none included, since the property is
+/// optional.
+///
+/// A property value is TEXT however the template spelled it, so the integer is read out of
+/// the text the declaration carries: anything that is not a whole number in the documented
+/// range is outside it. The check belongs BEFORE the provider is sent anything, because a
+/// resource CloudFormation refuses is one no provider is ever asked about.
+pub fn service_timeout_refusal(properties: &Value) -> Option<&'static str> {
+    let declared = properties.get(SERVICE_TIMEOUT)?;
+    if declared.is_null() {
+        return None;
+    }
+    let seconds = match declared {
+        Value::String(text) => text.trim().parse::<i64>().ok(),
+        Value::Number(number) => number.as_i64(),
+        // A boolean, a list or an object is not an integer in the range either.
+        _ => None,
+    };
+    match seconds {
+        Some(seconds) if (MIN_SERVICE_TIMEOUT..=MAX_SERVICE_TIMEOUT).contains(&seconds) => None,
+        _ => Some(SERVICE_TIMEOUT_OUT_OF_RANGE),
+    }
+}
+
 /// The `RequestType` of a provider request: which stack operation it is for.
 pub mod request_type {
     /// The resource is being created.
@@ -141,9 +182,13 @@ pub const MAX_DATA_ENTRIES: usize = crate::state::template::MAX_ATTRIBUTES_PER_R
 /// value a well-formed answer carries is longer than this.
 pub const MAX_DATA_VALUE_CHARS: usize = 4096;
 
-/// How many characters of a `FAILED` answer's `Reason` the resource's status carries. The
-/// same bound a response body is held to, so a reason is kept whole and nothing longer than
-/// one response sizes an event.
+/// How many characters of a `FAILED` answer's `Reason` the resource's status carries.
+///
+/// A DEFENSIVE ceiling no well-formed answer can reach: it is the size of a whole response
+/// document ([`MAX_RESPONSE_BODY_BYTES`]), and a document within that bound cannot carry a
+/// `Reason` as long as itself, so nothing a provider sends is truncated here. It stays at
+/// that size rather than beneath it because a reason is kept WHOLE — nothing longer than one
+/// response may size an event, and nothing shorter than one response may be cut.
 pub const MAX_REASON_CHARS: usize = 4096;
 
 /// What a resource's failure reads when the provider answered `FAILED` and stated no reason
@@ -151,6 +196,16 @@ pub const MAX_REASON_CHARS: usize = 4096;
 /// [`ProviderResponse::failure_reason`] falls back to. Public so a suite asserting a
 /// resource's reported reason reads it from here rather than spelling it again.
 pub const UNSTATED_REASON: &str = "The custom resource provider reported FAILED";
+
+/// The most bytes one provider response document may carry: "The total size of the response
+/// body can't exceed 4096 bytes" (custom resource response objects). A document of exactly
+/// this size is one CloudFormation reads; one byte more is not.
+pub const MAX_RESPONSE_BODY_BYTES: usize = 4096;
+
+/// What a resource whose provider answered with a document past that bound fails with.
+/// Entirely fixed text: nothing of the document is interpolated into it, and the document
+/// itself is never read.
+pub const RESPONSE_TOO_LONG_REASON: &str = "Response object is too long.";
 
 /// The provider request ONE stack operation sent about ONE custom resource: which operation
 /// it was for and the id it is answered under.
@@ -205,6 +260,21 @@ impl ProviderResponse {
         match self.reason.as_deref().map(str::trim) {
             Some(reason) if !reason.is_empty() => bounded(reason, MAX_REASON_CHARS),
             _ => UNSTATED_REASON.to_string(),
+        }
+    }
+
+    /// The answer CloudFormation reads for a document past [`MAX_RESPONSE_BODY_BYTES`]: the
+    /// resource FAILED with [`RESPONSE_TOO_LONG_REASON`], whatever the document says.
+    ///
+    /// It names no physical resource, because the document was not read: the resource stays
+    /// known by the identifier CloudFormation itself assigned it, which is the id its
+    /// rollback then deletes it under.
+    pub fn too_long() -> Self {
+        Self {
+            status: FAILED.to_string(),
+            physical_resource_id: String::new(),
+            reason: Some(RESPONSE_TOO_LONG_REASON.to_string()),
+            data: BTreeMap::new(),
         }
     }
 

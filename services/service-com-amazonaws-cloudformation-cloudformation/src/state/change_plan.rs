@@ -238,6 +238,9 @@ pub struct DeployedStack<'a> {
     pub parameters: &'a [StoredParameter],
     pub deployed: &'a [DeployedResource],
     pub imports: &'a BTreeMap<String, String>,
+    /// The Amazon SNS topic ARNs in force on the stack — what `AWS::NotificationARNs`
+    /// resolves to on both sides of the comparison, the way the deployed resources are.
+    pub notification_arns: &'a [String],
 }
 
 /// [`computed_changes`] against a stack whose template has not been read yet: the stack's
@@ -265,6 +268,7 @@ pub fn changes_against(
                 region: current.region,
                 stack_name: current.stack_name,
                 stack_id: current.stack_id,
+                notification_arns: current.notification_arns,
             },
             template: &declared,
             parameters: current.parameters,

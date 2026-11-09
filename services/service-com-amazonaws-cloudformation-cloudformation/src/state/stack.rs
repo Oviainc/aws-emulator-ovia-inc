@@ -467,6 +467,7 @@ impl StoredStack {
             region: &self.region,
             stack_name: &self.stack_name,
             stack_id: &self.stack_id,
+            notification_arns: &self.notification_arns,
         };
         // ONE budget for the whole deployment: the resource names and every output are
         // evaluated out of it, so the total work one request can ask for is bounded.
@@ -795,6 +796,7 @@ impl StoredStack {
                     region: &self.region,
                     stack_name: &self.stack_name,
                     stack_id: &self.stack_id,
+                    notification_arns: &self.notification_arns,
                 },
                 parameters: &parameters,
                 parameter_types: &parameter_types,
@@ -818,6 +820,60 @@ impl StoredStack {
     /// stack ID").
     pub fn is_live(&self) -> bool {
         self.status != status::DELETE_COMPLETE
+    }
+
+    /// Resolve the DECLARATIONS of the deployment in flight once more, against the resource
+    /// records as they now stand.
+    ///
+    /// A declaration that reads an attribute of a resource whose own wait was still open
+    /// resolved to nothing when the deployment computed it: a CUSTOM RESOURCE's attributes
+    /// are the `Data` its provider answers with, and that answer lands later
+    /// ([`provisioning::advance_stabilisations`] records it). Once it has, the declaration
+    /// the owning service is asked for is the one that reads it, so the properties are
+    /// evaluated again here — over the same template, parameters and scope the deployment
+    /// used, with the recorded attributes in place.
+    ///
+    /// The returned map is one entry per resource whose declaration STILL reads an attribute
+    /// the resource it names does not publish, with the error that is
+    /// ([`template::unsupported_attribute_reason`]): the answer is in hand and its `Data`
+    /// does not carry the key, so the consuming resource cannot be created at all.
+    pub fn resolve_deferred_declarations(&mut self) -> BTreeMap<String, String> {
+        let Some((declared, parameters)) = self.template_scope() else {
+            return BTreeMap::new();
+        };
+        let Some(deployment) = self.pending_deployment.as_ref() else {
+            return BTreeMap::new();
+        };
+        let imports = deployment.imports.clone();
+        let mut resources = deployment.resources.clone();
+        let in_force: BTreeMap<String, StoredResource> = resources
+            .iter()
+            .map(|resource| (resource.logical_id.clone(), resource.clone()))
+            .collect();
+        let parameter_types = ssm_parameters::parameter_types_in_force(&declared);
+        let mut budget = template::Budget::new();
+        let unresolved = {
+            let scope = template::Scope {
+                stack: template::StackScope {
+                    region: &self.region,
+                    stack_name: &self.stack_name,
+                    stack_id: &self.stack_id,
+                    notification_arns: &self.notification_arns,
+                },
+                parameters: &parameters,
+                parameter_types: &parameter_types,
+                resources: &in_force,
+                mappings: &declared.mappings,
+                conditions: &declared.conditions,
+                imports: &imports,
+            };
+            template::resolve_properties(&declared, &mut resources, &scope, &mut budget);
+            template::unresolved_attributes(&declared, &scope, &mut budget)
+        };
+        if let Some(deployment) = self.pending_deployment.as_mut() {
+            deployment.resources = resources;
+        }
+        unresolved
     }
 
     /// The stack's `Description`: the template's own `Description`, which is where
@@ -895,6 +951,8 @@ impl StoredStack {
             client_request_token,
             // A transition, not a validation result ([`Self::record_validation_failure`]).
             validation: None,
+            // Filled by [`Self::push_event`], from the topics the stack carries now.
+            owed_notification: None,
         });
     }
 
@@ -930,6 +988,7 @@ impl StoredStack {
             resource_properties: None,
             client_request_token,
             validation: Some(validation),
+            owed_notification: None,
         });
     }
 
@@ -943,6 +1002,13 @@ impl StoredStack {
     /// any ONE of them, past which the event reports no properties at all rather than a
     /// document cut in half.
     pub(super) fn push_event(&mut self, mut event: StoredEvent) {
+        // "The Amazon SNS topic ARNs to publish stack related events": the notification this
+        // event owes goes to the topics the stack carries NOW, so an operation that later
+        // clears them does not silence an event already recorded, and one that names a topic
+        // again does not deliver the events of the window in which the stack had none. What
+        // the event carries is the DIGEST of that list and not the list itself
+        // ([`super::stack_notifications`]).
+        event.owed_notification = super::stack_notifications::owed_by(&self.notification_arns);
         if event
             .resource_properties
             .as_ref()
@@ -1837,11 +1903,13 @@ impl StoredStack {
     /// ([`Self::reported_resources`]) and its own terminal event is held back
     /// ([`Self::schedule_resource_events`]). A wait for a resource the operation DELETED
     /// holds the operation and nothing else, because the stack stopped recording that
-    /// physical resource when the owning service accepted the delete.
+    /// physical resource when the owning service accepted the delete. A resource the
+    /// operation is creating but has not STARTED on yet is one of these too
+    /// ([`stabilising::Awaited::Deferred`]): the operation is bringing it into the stack.
     pub(super) fn coming_up(&self) -> impl Iterator<Item = &stabilising::StabilisationBarrier> {
         self.stabilisations
             .iter()
-            .filter(|barrier| barrier.awaited.awaits_readiness())
+            .filter(|barrier| barrier.awaited != stabilising::Awaited::Gone)
     }
 
     /// Record that the service owning the resource `barrier` is held for has given the answer
@@ -1933,6 +2001,26 @@ impl StoredStack {
                     logical_id,
                     resource_status::CREATE_FAILED,
                     reason,
+                );
+                failed_action::CREATE
+            }
+            // The resource's creation had not STARTED: it was waiting for the resources it
+            // depends on, and what did not go through is still its own create. There is no
+            // planned event of it to rewrite — CloudFormation reports a resource once its
+            // creation has started — so the failure is recorded as the resource's own.
+            stabilising::Awaited::Deferred => {
+                self.record_resource_event(
+                    now,
+                    logical_id,
+                    None,
+                    &barrier.resource_type,
+                    resource_status::CREATE_FAILED,
+                    Some(reason.to_string()),
+                    None,
+                    self.pending
+                        .as_ref()
+                        .and_then(|pending| pending.operation_id.clone()),
+                    self.client_request_token.clone(),
                 );
                 failed_action::CREATE
             }
@@ -2450,6 +2538,10 @@ impl StoredStack {
             // ([`provisioning::StackProvenance::managed_names`]), and a deployment that
             // re-creates only this stack's own resources leaves it empty.
             managed_names: super::physical_name::ManagedNames::default(),
+            // What the deployment in flight declares each resource waits for, which is what
+            // says whether a resource can be created yet
+            // ([`provisioning::StackProvenance::dependencies`]).
+            dependencies: provisioning::dependencies_in_flight(self),
         }
     }
 

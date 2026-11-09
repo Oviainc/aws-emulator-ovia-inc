@@ -3169,6 +3169,108 @@ pub fn resolve(value: &Value, scope: &Scope<'_>, budget: &mut Budget) -> Option<
     resolved_value(value, scope, 0, budget)
 }
 
+/// What CloudFormation says about an `Fn::GetAtt` naming an attribute the resource it names
+/// does not publish: "Template error: resource <logical id> does not support attribute type
+/// <attribute> in Fn::GetAtt". Fixed text around the two names the error is about.
+pub fn unsupported_attribute_reason(logical_id: &str, attribute: &str) -> String {
+    format!(
+        "Template error: resource {logical_id} does not support attribute type {attribute} in \
+         Fn::GetAtt"
+    )
+}
+
+/// Every resource of `template` whose declaration reads an attribute the resource it names
+/// does not publish, with the error that is ([`unsupported_attribute_reason`]).
+///
+/// `Fn::GetAtt` "returns the value of an attribute from a resource in the template", and the
+/// attributes a resource publishes are the ones its record carries — for a CUSTOM RESOURCE
+/// that is the `Data` its provider answered with. So this is only asked once the records are
+/// settled: a resource whose attributes are not published YET reads as publishing none, and
+/// a reader of this answers for the resources whose attributes are final.
+///
+/// Only an attribute of a resource `scope` KNOWS is judged: a `GetAtt` naming a logical id
+/// the scope does not carry is a reference to nothing rather than to an attribute nothing
+/// publishes, which is a different error and not this one.
+pub fn unresolved_attributes(
+    template: &Template,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> BTreeMap<String, String> {
+    let mut unresolved = BTreeMap::new();
+    for declared in &template.resources {
+        if let Some((logical_id, attribute)) =
+            missing_attribute(&declared.properties, scope, 0, budget)
+        {
+            unresolved.insert(
+                declared.logical_id.clone(),
+                unsupported_attribute_reason(&logical_id, &attribute),
+            );
+        }
+    }
+    unresolved
+}
+
+/// The FIRST `Fn::GetAtt` of `value` naming an attribute the resource it names does not
+/// publish, as `(logical id, attribute)`.
+///
+/// Walked over the same document shape every other evaluation walks, and charged to the same
+/// budget, so a declaration cannot drive this deeper or longer than its own evaluation.
+fn missing_attribute(
+    value: &Value,
+    scope: &Scope<'_>,
+    depth: usize,
+    budget: &mut Budget,
+) -> Option<(String, String)> {
+    if depth > MAX_INTRINSIC_DEPTH {
+        return None;
+    }
+    budget.spend(1)?;
+    match value {
+        Value::Object(members) => {
+            if let Some(argument) = members.get("Fn::GetAtt").filter(|_| members.len() == 1) {
+                if let Some((logical_id, attribute)) = named_attribute(argument) {
+                    let published = scope
+                        .resources
+                        .get(&logical_id)
+                        .map(|resource| resource.attributes.contains_key(&attribute));
+                    if published == Some(false) {
+                        return Some((logical_id, attribute));
+                    }
+                }
+            }
+            members
+                .values()
+                .find_map(|member| missing_attribute(member, scope, depth + 1, budget))
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| missing_attribute(item, scope, depth + 1, budget)),
+        _ => None,
+    }
+}
+
+/// The resource and attribute an `Fn::GetAtt` argument NAMES, for the two forms that spell
+/// both out: `["<logical id>", "<attribute>", …]` and the short form's `<logical id>.<attribute>`.
+///
+/// `None` where either half is itself an expression — such a `GetAtt` names whatever that
+/// expression resolves to, which is not something to judge against one resource's attributes.
+fn named_attribute(argument: &Value) -> Option<(String, String)> {
+    match argument {
+        Value::Array(parts) if parts.len() >= 2 => {
+            let logical_id = parts[0].as_str()?.to_string();
+            let mut path = Vec::with_capacity(parts.len() - 1);
+            for part in &parts[1..] {
+                path.push(part.as_str()?.to_string());
+            }
+            Some((logical_id, path.join(".")))
+        }
+        Value::String(dotted) => dotted
+            .split_once('.')
+            .map(|(logical_id, attribute)| (logical_id.to_string(), attribute.to_string())),
+        _ => None,
+    }
+}
+
 /// One template value with every intrinsic function it carries evaluated, preserving the
 /// objects and arrays around them; `None` for a value that cannot be evaluated at all.
 pub(super) fn resolved_value(

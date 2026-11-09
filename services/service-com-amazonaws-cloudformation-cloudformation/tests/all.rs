@@ -341,6 +341,8 @@ mod section_loop_expansion;
 mod service_role_permissions;
 #[path = "all/ssm_typed_parameters.rs"]
 mod ssm_typed_parameters;
+#[path = "all/stack_configuration_and_provider_limits.rs"]
+mod stack_configuration_and_provider_limits;
 #[path = "all/stack_delete_failure_reason.rs"]
 mod stack_delete_failure_reason;
 #[path = "all/stack_event_timeline.rs"]

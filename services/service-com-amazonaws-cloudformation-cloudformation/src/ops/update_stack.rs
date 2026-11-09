@@ -407,6 +407,7 @@ fn planned_actions(
             parameters: &previous.parameters,
             deployed: &previous.deployed,
             imports: &previous.imports,
+            notification_arns: &previous.notification_arns,
         }),
         &submitted,
         parameters,

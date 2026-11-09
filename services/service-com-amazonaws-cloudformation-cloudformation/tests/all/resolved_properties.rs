@@ -44,6 +44,7 @@ fn deployed(body: &str, parameters: &[(&str, &str)]) -> Vec<StoredResource> {
         region: REGION,
         stack_name: STACK_NAME,
         stack_id: STACK_ID,
+        notification_arns: &[],
     };
     let mut budget = Budget::new();
     let parameter_types = declared.parameter_types();

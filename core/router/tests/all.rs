@@ -954,6 +954,8 @@ mod cloudformation_provisions_sfn_state_machines;
 mod cloudformation_provisions_s3vectors_resources;
 #[path = "all/cloudformation_stamps_s3vectors_stack_provenance.rs"]
 mod cloudformation_stamps_s3vectors_stack_provenance;
+#[path = "all/cloudformation_stack_event_notifications.rs"]
+mod cloudformation_stack_event_notifications;
 #[path = "all/cloudformation_provisions_msk_clusters.rs"]
 mod cloudformation_provisions_msk_clusters;
 #[path = "all/logs_emf_metric_extraction.rs"]

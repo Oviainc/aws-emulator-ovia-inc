@@ -104,6 +104,17 @@ pub enum Awaited {
     /// The resource the operation DELETED is no longer held by that service
     /// ([`super::provisioner::Provisioner::removal`]).
     Gone,
+    /// Nothing has been asked of anybody about this resource yet: the resources it DEPENDS
+    /// ON are still waiting for their own answers, so what this barrier waits for is those
+    /// waits releasing — which is when its own creation can START.
+    ///
+    /// It is held because the declaration that would be sent reads an attribute of a resource
+    /// whose OWN wait is still open — a custom resource's attributes are the `Data` its
+    /// provider answers with — so the resource is created once that wait releases, by the
+    /// same walk that would have created it ([`super::provisioning::deferred`]). Not a
+    /// question for any owning service, which is why it is not one of the readiness answers
+    /// above.
+    Deferred,
 }
 
 impl Awaited {
@@ -211,6 +222,10 @@ impl StabilisationBarrier {
             // creation is: both wait for that service to report the resource in the state it
             // serves traffic in.
             Awaited::Ready | Awaited::Updated => CREATE_STABILISATION_WINDOW,
+            // A creation that has not started yet is held for the same window a started one
+            // is: what it waits for is the wait of the resource it depends on, which runs
+            // for no longer than that itself.
+            Awaited::Deferred => CREATE_STABILISATION_WINDOW,
             Awaited::Gone => REMOVAL_STABILISATION_WINDOW,
         };
         self.opened_at + window
@@ -234,6 +249,7 @@ impl StabilisationBarrier {
         };
         let awaited = match self.awaited {
             Awaited::Ready => "created",
+            Awaited::Deferred => "created",
             Awaited::Updated => "updated",
             Awaited::Gone => "deleted",
         };
