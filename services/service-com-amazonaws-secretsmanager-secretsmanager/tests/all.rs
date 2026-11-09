@@ -75,6 +75,8 @@ mod secret_tags_and_replication;
 mod secret_version_history;
 #[path = "all/secret_version_ids.rs"]
 mod secret_version_ids;
+#[path = "all/secret_version_ids_are_caller_named.rs"]
+mod secret_version_ids_are_caller_named;
 #[path = "all/secret_version_stage_stale_remove_from.rs"]
 mod secret_version_stage_stale_remove_from;
 #[path = "all/secret_version_stages.rs"]

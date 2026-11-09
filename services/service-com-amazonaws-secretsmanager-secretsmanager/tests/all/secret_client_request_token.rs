@@ -59,12 +59,12 @@ const VALUE_MEMBERS: &[&str] = &["SecretString", "SecretBinary"];
 
 /// The published bounds of `ClientRequestTokenType` (`@length` min 32, max 64,
 /// this service's Smithy model).
-const TOKEN_MIN_LEN: usize = 32;
-const TOKEN_MAX_LEN: usize = 64;
+pub const TOKEN_MIN_LEN: usize = 32;
+pub const TOKEN_MAX_LEN: usize = 64;
 
 /// The sentence Secrets Manager refuses a version-creating write with when the
 /// request names no token.
-const MISSING_TOKEN_MESSAGE: &str =
+pub const MISSING_TOKEN_MESSAGE: &str =
     "You must provide a ClientRequestToken value. We recommend a UUID-type value.";
 
 /// Hands out a token no other call in this test binary uses, so an injected token
@@ -73,7 +73,11 @@ static TOKENS: AtomicU64 = AtomicU64::new(0);
 
 /// A `ClientRequestToken` of `length` characters, which is also the version id the
 /// write that carries it stakes.
-fn token_of_length(length: usize) -> String {
+///
+/// Every token this test binary hands out is unique: the serial number sits in the
+/// first few characters, so even a token truncated to the shortest modelled length
+/// still names a version no other call in the binary names.
+pub fn token_of_length(length: usize) -> String {
     let unique = TOKENS.fetch_add(1, Ordering::Relaxed);
     let token = format!("token-{unique}-");
     let mut token: String = token.chars().take(length).collect();

@@ -56,6 +56,9 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The seeded generator the version-id invariant suite draws its write sequences
+# from, so the rule is checked over generated input rather than one table of rows.
+rand = "0.9"
 # SecretBinary is a blob, which awsJson1_1 carries base64-encoded on the wire.
 base64 = "0.22"
 # The rotation suite mounts Lambda beside this service on one engine, exactly as the

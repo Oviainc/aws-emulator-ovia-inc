@@ -17580,6 +17580,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "rand 0.9.5",
  "ring",
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
