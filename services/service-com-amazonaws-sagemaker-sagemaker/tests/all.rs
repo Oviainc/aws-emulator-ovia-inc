@@ -205,6 +205,8 @@ mod read_responses_report_what_a_resource_holds;
 mod refusal_subject_wording;
 #[path = "all/rejection_fidelity.rs"]
 mod rejection_fidelity;
+#[path = "all/resource_precondition_gates.rs"]
+mod resource_precondition_gates;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/search_resources.rs"]
