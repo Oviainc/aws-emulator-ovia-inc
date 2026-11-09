@@ -15,6 +15,11 @@
 //! stored resource with `ResourceNotFoundException` (404). Both refusals remove
 //! nothing.
 //!
+//! The caller-account boundary is decided before either refusal, as it is for
+//! every operation that identifies a billing view by ARN: an ARN whose embedded
+//! account id is not the caller's is `AccessDeniedException` (403), so the answer
+//! never discloses what another account holds.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -167,7 +172,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The modeled constraints (`resourceArn` pattern, `resourceTagKeys`
         // 0..200 and each key's own length) are refused by the boundary validator
         // before this runs.
-        let _ = ctx;
+        // The account boundary comes first, as it does for every operation that
+        // identifies a billing view by ARN: a well-formed ARN outside the
+        // caller's own account is refused before the store is consulted, so the
+        // answer never depends on what another account holds.
+        if !crate::state::is_caller_account_arn(&input.resource_arn) {
+            return Err(UntagResourceErrorModeled::AccessDeniedException(
+                crate::state::cross_account_access_denied(
+                    Self::NAME,
+                    &input.resource_arn,
+                    &*self.engine,
+                    ctx,
+                ),
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UntagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: "the billing view store is unavailable".to_string(),

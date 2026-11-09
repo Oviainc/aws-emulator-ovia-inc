@@ -235,8 +235,11 @@ async fn an_arn_no_view_is_stored_under_is_refused_with_the_modeled_error() {
     let router = emulator();
 
     // Pattern-valid `BillingViewArn`s (the boundary validator already refuses
-    // anything else) that name no stored view: a deleted one, one that never
-    // existed, and one in another account.
+    // anything else) that name no stored view of the caller's own account: a
+    // deleted one, one that never existed, and one whose resource id is a nested
+    // path. An ARN of ANOTHER account never reaches this lookup — the account
+    // boundary is enforced first, which `tests/all/arn_account_boundary.rs`
+    // pins for every ARN-addressed operation.
     let deleted = create_view(
         &router,
         "deleted view",
@@ -254,8 +257,8 @@ async fn an_arn_no_view_is_stored_under_is_refused_with_the_modeled_error() {
         ("never created", ABSENT_ARN.to_string()),
         ("deleted since", deleted),
         (
-            "another account",
-            "arn:aws:billing::123456789012:billingview/primary".to_string(),
+            "a nested resource id",
+            format!("arn:aws:billing::{ACCOUNT_ID}:billingview/never/created"),
         ),
     ];
 
@@ -268,6 +271,21 @@ async fn an_arn_no_view_is_stored_under_is_refused_with_the_modeled_error() {
             "case {case:?}: expected 404 ResourceNotFoundException, got {status} {refused:?}"
         );
     }
+
+    // The same "no view is stored under it" ARN in ANOTHER account is a
+    // different answer, because the account boundary is decided first: the
+    // refusal may not disclose whether the other account holds a view.
+    let (status, refused) = call(
+        &router,
+        "ListSourceViewsForBillingView",
+        &json!({ "arn": "arn:aws:billing::123456789012:billingview/primary" }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&refused).as_str()),
+        (403, "AccessDeniedException"),
+        "case \"another account\": expected 403 AccessDeniedException, got {status} {refused:?}"
+    );
 }
 
 #[tokio::test]

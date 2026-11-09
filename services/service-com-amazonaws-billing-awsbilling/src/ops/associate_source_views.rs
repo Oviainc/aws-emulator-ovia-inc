@@ -9,6 +9,11 @@
 //! from — so a request that would close such a loop is refused with the modeled
 //! `ValidationException` (400) and nothing is stored.
 //!
+//! The caller-account boundary is decided before anything is looked up, as it is
+//! for every operation that identifies a billing view by ARN: an `arn` whose
+//! embedded account id is not the caller's is `AccessDeniedException` (403), so
+//! the answer never discloses what another account holds.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -190,7 +195,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The modeled constraints (`arn` pattern, `sourceViews` 1..10 and each
         // member's pattern) are refused by the boundary validator before this
         // runs; what is left is the state this request is legal against.
-        let _ = ctx;
+        // The account boundary comes first, as it does for every operation that
+        // identifies a billing view by ARN: a well-formed ARN outside the
+        // caller's own account is refused before the store is consulted, so the
+        // answer never depends on what another account holds.
+        if !crate::state::is_caller_account_arn(&input.arn) {
+            return Err(AssociateSourceViewsErrorModeled::AccessDeniedException(
+                crate::state::cross_account_access_denied(
+                    Self::NAME,
+                    &input.arn,
+                    &*self.engine,
+                    ctx,
+                ),
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             AssociateSourceViewsErrorModeled::InternalServerException(InternalServerException {
                 message: "the billing view store is unavailable".to_string(),

@@ -10,6 +10,11 @@
 //! `ValidationException` (400) and an ARN naming no stored resource with
 //! `ResourceNotFoundException` (404). Both refusals attach nothing.
 //!
+//! The caller-account boundary is decided before either refusal, as it is for every
+//! operation that identifies a billing view by ARN: an ARN whose embedded account id
+//! is not the caller's is `AccessDeniedException` (403), so the answer never
+//! discloses what another account holds.
+//!
 //! The stored set grows with every call, so it carries the explicit ceiling
 //! [`crate::state::MAX_TAGS_PER_RESOURCE`]: a request that would leave the
 //! resource holding more than that is refused, and attaches nothing.
@@ -165,7 +170,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The modeled constraints (`resourceArn` pattern, `resourceTags` 0..200
         // and each tag's key length 1..128 / value length 0..256) are refused by
         // the boundary validator before this runs.
-        let _ = ctx;
+        // The account boundary comes first, as it does for every operation that
+        // identifies a billing view by ARN: a well-formed ARN outside the
+        // caller's own account is refused before the store is consulted, so the
+        // answer never depends on what another account holds.
+        if !crate::state::is_caller_account_arn(&input.resource_arn) {
+            return Err(TagResourceErrorModeled::AccessDeniedException(
+                crate::state::cross_account_access_denied(
+                    Self::NAME,
+                    &input.resource_arn,
+                    &*self.engine,
+                    ctx,
+                ),
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: "the billing view store is unavailable".to_string(),

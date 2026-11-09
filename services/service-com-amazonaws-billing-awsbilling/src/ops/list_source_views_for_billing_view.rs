@@ -17,6 +17,11 @@
 //! holds is preferred over refusing the read or inventing an entry the store
 //! does not hold.
 //!
+//! The caller-account boundary is decided before that lookup, as it is for every
+//! operation that identifies a billing view by ARN: an ARN whose embedded account
+//! id is not the caller's is `AccessDeniedException` (403), so the answer never
+//! discloses what another account holds.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -202,7 +207,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `nextToken` pattern and length) is refused by the boundary validator
         // before this runs; what is left to decide is which view the ARN names
         // and which slice of its source views the page carries.
-        let _ = ctx;
+        // The account boundary comes first, as it does for every operation that
+        // identifies a billing view by ARN: a well-formed ARN outside the
+        // caller's own account is refused before the store is consulted, so the
+        // answer never depends on what another account holds.
+        if !crate::state::is_caller_account_arn(&input.arn) {
+            return Err(
+                ListSourceViewsForBillingViewErrorModeled::AccessDeniedException(
+                    crate::state::cross_account_access_denied(
+                        Self::NAME,
+                        &input.arn,
+                        &*self.engine,
+                        ctx,
+                    ),
+                )
+                .into(),
+            );
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListSourceViewsForBillingViewErrorModeled::InternalServerException(
                 InternalServerException {
