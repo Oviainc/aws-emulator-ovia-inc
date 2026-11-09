@@ -77,6 +77,8 @@ mod ses_production_access_gate_wording;
 mod ses_query_error_envelope;
 #[path = "all/ses_receipt_filters.rs"]
 mod ses_receipt_filters;
+#[path = "all/ses_receipt_rule_s3_destination_authorization.rs"]
+mod ses_receipt_rule_s3_destination_authorization;
 #[path = "all/ses_receipt_rule_set_creation.rs"]
 mod ses_receipt_rule_set_creation;
 #[path = "all/ses_receipt_rule_set_deletion.rs"]

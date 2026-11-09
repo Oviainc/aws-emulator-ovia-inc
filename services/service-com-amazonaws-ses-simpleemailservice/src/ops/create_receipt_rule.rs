@@ -159,11 +159,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; this operation needs none of it.
-        let _ = ctx;
         let rule_set_name = input.rule_set_name;
         let after = input.after;
         let rule = input.rule;
+        let region = crate::state::region_from_request(ctx.parts());
 
         // `ReceiptRuleName` is only a string in the model, so a name outside the
         // form `ReceiptRule$Name` documents reaches here; this operation models
@@ -220,6 +219,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             });
+        }
+
+        // An `S3Action` names a destination of two OTHER services, and SES has to
+        // have permission to write the received message into it: the bucket's own
+        // policy has to grant it the object write, and the key it would encrypt
+        // the message with has to grant it the encryption. Both are read against
+        // those services' own stores, and a rule SES could never deliver is
+        // refused instead of being blessed at create time and failing silently on
+        // every message the rule matches.
+        if let Some(refusal) = crate::state::s3_action_authorization::unauthorized_s3_action(
+            ctx,
+            &region,
+            &rule_set_name,
+            &rule.name,
+            rule.actions.as_deref().unwrap_or_default(),
+        )
+        .await
+        {
+            return Err(
+                CreateReceiptRuleErrorModeled::InvalidS3ConfigurationException(
+                    InvalidS3ConfigurationException {
+                        bucket: Some(refusal.bucket),
+                        message: Some(refusal.message),
+                    },
+                )
+                .into(),
+            );
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

@@ -152,10 +152,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; this operation needs none of it.
-        let _ = ctx;
         let rule_set_name = input.rule_set_name;
         let rule = input.rule;
+        let region = crate::state::region_from_request(ctx.parts());
 
         // The rule this request carries is stored whole, so its actions are held
         // to the same requirements a created rule's are (`create_receipt_rule.rs`
@@ -199,6 +198,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             });
+        }
+
+        // The destination an `S3Action` names has to be one SES may write the
+        // received message into, exactly as it has to be on the create
+        // (`create_receipt_rule.rs` reads it through the same one reading): the
+        // bucket's own policy has to grant SES the object write and the key it
+        // would encrypt the message with has to grant it the encryption, or the
+        // update is refused and the stored rule is left exactly as it was.
+        if let Some(refusal) = crate::state::s3_action_authorization::unauthorized_s3_action(
+            ctx,
+            &region,
+            &rule_set_name,
+            &rule.name,
+            rule.actions.as_deref().unwrap_or_default(),
+        )
+        .await
+        {
+            return Err(
+                UpdateReceiptRuleErrorModeled::InvalidS3ConfigurationException(
+                    InvalidS3ConfigurationException {
+                        bucket: Some(refusal.bucket),
+                        message: Some(refusal.message),
+                    },
+                )
+                .into(),
+            );
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

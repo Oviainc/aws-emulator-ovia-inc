@@ -42,6 +42,11 @@
 //! topics, its custom MAIL FROM setup — and [`reconcile_identities`] is where the two
 //! are brought back into agreement, on every operation this service serves.
 
+/// Whether Amazon SES may really write a received message into the Amazon S3 destination an
+/// `S3Action` names — the bucket's own policy and the KMS key's — which is read against those
+/// services' own stores rather than decided here.
+pub mod s3_action_authorization;
+
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2250,9 +2255,10 @@ pub enum ReceiptActionDefect {
 /// members name: a member the model documents as the ARN of a resource of another
 /// service must name a resource of THAT service ([`is_sns_topic_arn`],
 /// [`LAMBDA_FUNCTION_ARN`], [`is_kms_key_arn`]), and an `S3Action` must name a
-/// bucket. Whether those resources exist, and whether SES may write to them, is
-/// the other service's own state and permissions, which this service does not
-/// hold — so a well-formed ARN is accepted here and the rule is stored.
+/// bucket. Whether those resources EXIST, and whether SES may write to them, is
+/// the other service's own state and permissions, read against that service's own
+/// store instead ([`s3_action_authorization::unauthorized_s3_action`] for the
+/// bucket and the key of an `S3Action`) — so a well-formed value is accepted here.
 pub fn receipt_actions_defect(
     actions: &[crate::ops::types::ReceiptAction],
 ) -> Option<ReceiptActionDefect> {
