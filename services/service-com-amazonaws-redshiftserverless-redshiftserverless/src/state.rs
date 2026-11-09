@@ -706,45 +706,10 @@ pub type DataPlaneUnavailable =
 
 /// Why a copy of a namespace's data did not happen.
 ///
-/// The copy runs on the blocking pool under a budget, so it can fail three ways: the
-/// copy itself could not be made, the request gave up waiting for it, or the task
-/// carrying it did not return.
-#[derive(Debug)]
-pub enum DataPlaneFailure {
-    /// The databases could not be copied.
-    Unavailable(DataPlaneUnavailable),
-    /// The request waited [`DATA_COPY_BUDGET`] and gave up, so the copy is abandoned
-    /// rather than reported as done.
-    GaveUp(Duration),
-    /// The blocking task carrying the copy did not return a result.
-    Lost,
-}
-
-impl DataPlaneFailure {
-    /// True when the failure is this emulator being at its capacity for open
-    /// databases — the one of these an operation reports as a quota error rather
-    /// than as a server fault.
-    pub fn is_capacity(&self) -> bool {
-        matches!(
-            self,
-            Self::Unavailable(DataPlaneUnavailable::TooManyOpen(_))
-        )
-    }
-}
-
-impl std::fmt::Display for DataPlaneFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unavailable(unavailable) => write!(f, "{unavailable}"),
-            Self::GaveUp(budget) => write!(
-                f,
-                "the copy did not finish within {} seconds and was abandoned",
-                budget.as_secs()
-            ),
-            Self::Lost => write!(f, "the copy did not return a result"),
-        }
-    }
-}
+/// The three outcomes a bounded copy has, as the crate that owns the seam and the
+/// budget states them: there is ONE of these, so this control plane and the
+/// provisioned one cannot drift apart on what a failed copy was.
+pub type DataPlaneFailure = ::service_com_amazonaws_redshiftdata_redshiftdata::state::CopyFailure;
 
 /// How long a request waits for a copy of a namespace's data: the Data API's own
 /// budget for one copy, which is longer than the deadline the copy holds itself to,
@@ -762,31 +727,26 @@ pub const DATA_COPY_BUDGET: Duration =
 /// restore.
 ///
 /// The copy is blocking engine work, so it runs on the blocking pool under
-/// [`DATA_COPY_BUDGET`] and never on the async worker the request is served on — the
-/// rule the Data API's `capture_warehouse` documents and its `ExecuteStatement`
-/// follows for the same engine. Call it with NO state guard held, so one caller's copy
-/// serialises nothing else.
+/// [`DATA_COPY_BUDGET`] — the bounded form the crate that owns the engine provides
+/// (`capture_warehouse_bounded`), rather than a second copy of that rule here.
+/// Call it with NO state guard held, so one caller's copy serialises nothing else.
 pub async fn capture_namespace_data<Eng: Send + Sync + 'static>(
     engine: &::std::sync::Arc<Eng>,
     workgroups: Vec<String>,
 ) -> Result<NamespaceData, DataPlaneFailure> {
-    let engine = ::std::sync::Arc::clone(engine);
-    let joined = ::tokio::time::timeout(
-        DATA_COPY_BUDGET,
-        ::tokio::task::spawn_blocking(move || {
-            let names: Vec<&str> = workgroups.iter().map(String::as_str).collect();
-            ::service_com_amazonaws_redshiftdata_redshiftdata::state::capture_warehouse(
-                &*engine, &names,
+    // A namespace's data is reached through the workgroups attached to it, so each
+    // of them is one warehouse target of the capture.
+    let targets: Vec<::service_com_amazonaws_redshiftdata_redshiftdata::state::ConnectionTarget> =
+        workgroups
+            .into_iter()
+            .map(
+                ::service_com_amazonaws_redshiftdata_redshiftdata::state::ConnectionTarget::Workgroup,
             )
-        }),
+            .collect();
+    ::service_com_amazonaws_redshiftdata_redshiftdata::state::capture_warehouse_bounded(
+        engine, targets,
     )
-    .await;
-    match joined {
-        Ok(Ok(Ok(data))) => Ok(data),
-        Ok(Ok(Err(unavailable))) => Err(DataPlaneFailure::Unavailable(unavailable)),
-        Ok(Err(_panicked)) => Err(DataPlaneFailure::Lost),
-        Err(_elapsed) => Err(DataPlaneFailure::GaveUp(DATA_COPY_BUDGET)),
-    }
+    .await
 }
 
 /// Write `data` back over the databases `workgroup` serves, and report how many
@@ -801,22 +761,14 @@ pub async fn restore_namespace_data<Eng: Send + Sync + 'static>(
     data: ::std::sync::Arc<NamespaceData>,
     workgroup: String,
 ) -> Result<usize, DataPlaneFailure> {
-    let engine = ::std::sync::Arc::clone(engine);
-    let joined = ::tokio::time::timeout(
-        DATA_COPY_BUDGET,
-        ::tokio::task::spawn_blocking(move || {
-            ::service_com_amazonaws_redshiftdata_redshiftdata::state::restore_warehouse(
-                &*engine, &data, &workgroup,
-            )
-        }),
+    ::service_com_amazonaws_redshiftdata_redshiftdata::state::restore_warehouse_bounded(
+        engine,
+        data,
+        ::service_com_amazonaws_redshiftdata_redshiftdata::state::ConnectionTarget::Workgroup(
+            workgroup,
+        ),
     )
-    .await;
-    match joined {
-        Ok(Ok(Ok(restored))) => Ok(restored),
-        Ok(Ok(Err(unavailable))) => Err(DataPlaneFailure::Unavailable(unavailable)),
-        Ok(Err(_panicked)) => Err(DataPlaneFailure::Lost),
-        Err(_elapsed) => Err(DataPlaneFailure::GaveUp(DATA_COPY_BUDGET)),
-    }
+    .await
 }
 
 /// The engine pages the stored snapshots' data occupies between them, the quantity

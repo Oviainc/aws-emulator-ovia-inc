@@ -77,6 +77,10 @@ pub mod notifications;
 /// against the control plane that owns it.
 pub mod serverless;
 
+/// Whether the zero-ETL source a `CreateIntegration` names exists, resolved
+/// against the service that owns the table or bucket it names.
+pub mod zero_etl_source;
+
 /// The store's own operations, on the state struct this module declares.
 mod store;
 /// The wording of the resource-policy ARN resolution in
@@ -107,7 +111,11 @@ mod resize;
 /// The snapshot schedules an account created, and the invocation times computed
 /// from their definitions.
 mod snapshot_schedules;
+/// A cluster's DATA, which lives in the SQL engine the Redshift Data API runs
+/// statements on: what a snapshot of a cluster copies and a restore writes back.
+mod cluster_data;
 
+pub use cluster_data::*;
 pub use clusters::*;
 pub use ec2_subnets::*;
 pub use derived::*;
@@ -2295,6 +2303,18 @@ pub struct StoredSnapshot {
     /// from it rebuilds from the modelled [`StoredSnapshot::snapshot`] members
     /// and this service's documented defaults alone.
     pub source: Option<StoredCluster>,
+    /// The cluster's DATABASES as they stood when the snapshot was taken —
+    /// "a snapshot contains a copy of the cluster data as of this exact time"
+    /// — so a `RestoreFromClusterSnapshot` serves the rows written before it was
+    /// taken and none of those written after.
+    ///
+    /// Taken through the Data API's own seam ([`capture_cluster_data`]) and
+    /// opaque here; held behind an `Arc` because a snapshot's data is also the
+    /// data of every copy `CopyClusterSnapshot` makes of it, and because a
+    /// restore reads it with no store lock held. EMPTY for a snapshot of a
+    /// cluster no statement has run against, and for a record seeded straight
+    /// into the store.
+    pub data: ::std::sync::Arc<ClusterData>,
 }
 
 /// An HSM configuration as this service stores it: the modelled projection a

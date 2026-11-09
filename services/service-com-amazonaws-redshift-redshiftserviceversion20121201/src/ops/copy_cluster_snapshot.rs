@@ -479,6 +479,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyClusterSnapsh
             // The copy holds the same data as the source, so it restores the same
             // cluster configuration the source was taken of.
             source: source.source,
+            // ... and the same DATABASES, as they stood when the SOURCE was taken:
+            // a copy of a snapshot is another name for the same copy of the data,
+            // not a second reading of the cluster, so the two share one capture
+            // and the copy occupies no more of the retained bound.
+            data: source.data,
         });
 
         Ok(CopyClusterSnapshotOutput {

@@ -143,6 +143,9 @@ pub(crate) fn seed_automated(
             Instant::now()
         },
         source: Some(stored_cluster),
+        // A seeded record holds no copy of the cluster's databases; what a copy
+        // of a snapshot carries over is asserted on the stored records.
+        data: Default::default(),
     });
 }
 

@@ -44,6 +44,21 @@ pub(crate) struct Answer {
     pub(crate) body: String,
 }
 
+/// What ONE awsJson service of this emulator is addressed and signed as: the four
+/// values the request builder [`Emulator::call_json`] differs on per service.
+#[derive(Debug, Clone, Copy)]
+struct JsonService {
+    /// The first label of the endpoint host the call is addressed to.
+    endpoint_prefix: &'static str,
+    /// The service name in the SigV4 credential scope, which is what routes the
+    /// call to that service.
+    signing_name: &'static str,
+    /// The `content-type` of the awsJson version it speaks.
+    content_type: &'static str,
+    /// The prefix the operation name travels behind in `x-amz-target`.
+    target_prefix: &'static str,
+}
+
 impl Answer {
     /// The `<Code>` of an awsQuery `<ErrorResponse>`, or `None` on a success.
     pub(crate) fn error_code(&self) -> Option<String> {
@@ -107,6 +122,96 @@ impl Emulator {
         emulator
     }
 
+    /// An emulator with Amazon DynamoDB, Amazon S3 AND the Redshift Serverless
+    /// control plane mounted beside Redshift on the SAME engine, exactly as the
+    /// assembled emulator mounts them.
+    ///
+    /// Those three own the resources the two ARNs of a zero-ETL integration name:
+    /// the table or bucket a `SourceArn` names is DynamoDB's or Amazon S3's and
+    /// the namespace a `TargetArn` names is the serverless control plane's, so a
+    /// suite about resolving either has to have them all to reach.
+    pub(crate) fn with_integration_owners() -> Self {
+        let mut emulator = Self::with_serverless();
+        emulator.router.register_service(
+            service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService::new(Arc::clone(
+                &emulator.engine,
+            )),
+        );
+        emulator
+            .router
+            .register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+                Arc::clone(&emulator.engine),
+            ));
+        emulator
+    }
+
+    /// POST one Amazon DynamoDB operation with this JSON body, signed for
+    /// [`REGION`], and answer its status and parsed body.
+    ///
+    /// That service speaks awsJson1_0, so the operation travels in `x-amz-target`
+    /// rather than in a form field. Panics unless
+    /// [`Emulator::with_integration_owners`] built this emulator — there is
+    /// no DynamoDB to call otherwise.
+    pub(crate) async fn call_dynamodb(
+        &self,
+        operation: &str,
+        body: &serde_json::Value,
+    ) -> (u16, serde_json::Value) {
+        self.call_json(
+            JsonService {
+                endpoint_prefix: "dynamodb",
+                signing_name: "dynamodb",
+                content_type: "application/x-amz-json-1.0",
+                target_prefix: "DynamoDB_20120810",
+            },
+            operation,
+            body,
+        )
+        .await
+    }
+
+    /// An emulator with the Redshift Data API mounted beside Redshift on the
+    /// SAME engine, exactly as the assembled emulator mounts them.
+    ///
+    /// A cluster's DATABASES live in the SQL engine that service owns, so a suite
+    /// about what a snapshot of a cluster holds — and what a restore from it
+    /// serves — has to have it to run statements through.
+    pub(crate) fn with_data_api() -> Self {
+        let mut emulator = Self::build(false);
+        emulator.router.register_service(
+            service_com_amazonaws_redshiftdata_redshiftdata::EmulatedService::new(Arc::clone(
+                &emulator.engine,
+            )),
+        );
+        emulator
+    }
+
+    /// POST one Redshift Data API operation with this JSON body, signed for
+    /// [`REGION`], and answer its status and parsed body.
+    ///
+    /// That service speaks awsJson1_1, so the operation travels in `x-amz-target`
+    /// rather than in a form field, and the credential scope names
+    /// `redshift-data`, which is what routes the call to it. Panics unless
+    /// [`Emulator::with_data_api`] built this emulator — there is no Data API to
+    /// call otherwise.
+    pub(crate) async fn call_data_api(
+        &self,
+        operation: &str,
+        body: &serde_json::Value,
+    ) -> (u16, serde_json::Value) {
+        self.call_json(
+            JsonService {
+                endpoint_prefix: "redshift-data",
+                signing_name: "redshift-data",
+                content_type: "application/x-amz-json-1.1",
+                target_prefix: "RedshiftData",
+            },
+            operation,
+            body,
+        )
+        .await
+    }
+
     /// POST one Amazon Redshift Serverless operation with this JSON body,
     /// signed for [`REGION`], and answer its status and parsed body.
     ///
@@ -119,17 +224,47 @@ impl Emulator {
         operation: &str,
         body: &serde_json::Value,
     ) -> (u16, serde_json::Value) {
+        self.call_json(
+            JsonService {
+                endpoint_prefix: "redshift-serverless",
+                signing_name: "redshift-serverless",
+                content_type: "application/x-amz-json-1.1",
+                target_prefix: "RedshiftServerless",
+            },
+            operation,
+            body,
+        )
+        .await
+    }
+
+    /// POST one awsJson operation of `service` with this JSON body, signed for
+    /// [`REGION`], and answer its status and parsed body.
+    ///
+    /// The ONE request builder the three awsJson services this suite reaches are
+    /// driven through: they differ only in the four values [`JsonService`] carries,
+    /// so a new one is a row rather than another copy of this function.
+    async fn call_json(
+        &self,
+        service: JsonService,
+        operation: &str,
+        body: &serde_json::Value,
+    ) -> (u16, serde_json::Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!(
-                "https://redshift-serverless.{REGION}.amazonaws.com/"
+                "https://{}.{REGION}.amazonaws.com/",
+                service.endpoint_prefix
             ))
-            .header("content-type", "application/x-amz-json-1.1")
-            .header("x-amz-target", format!("RedshiftServerless.{operation}"))
+            .header("content-type", service.content_type)
+            .header(
+                "x-amz-target",
+                format!("{}.{operation}", service.target_prefix),
+            )
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/redshift-serverless/aws4_request, SignedHeaders=host;x-amz-target, Signature=0"
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{}/aws4_request, SignedHeaders=host;x-amz-target, Signature=0",
+                    service.signing_name
                 ),
             )
             .body(bytes::Bytes::from(
@@ -402,8 +537,10 @@ impl Emulator {
             // Already past, so the record needs no clock-owed transition.
             available_at: std::time::Instant::now(),
             // A seeded record was taken of no cluster this store holds, so it
-            // carries no source configuration for a restore to rebuild from.
+            // carries no source configuration for a restore to rebuild from,
+            // and no copy of any cluster's databases either.
             source: None,
+            data: Default::default(),
         });
     }
 

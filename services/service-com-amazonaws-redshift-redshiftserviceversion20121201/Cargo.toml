@@ -56,11 +56,24 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # the pair a `RegisterNamespace` / `DeregisterNamespace` names exists is a
 # question only it can answer (`state::serverless`).
 aws-sdk-redshiftserverless = { version = "1", default-features = false }
-# The Amazon S3 client `EnableLogging` resolves the audit-log bucket through,
-# over the same in-process callback: whether the account has the bucket, and what
-# its policy permits, are facts of the service that owns it
-# (`state::logging`).
+# The Amazon S3 client `EnableLogging` resolves the audit-log bucket through, and
+# the one a zero-ETL integration's `SourceArn` is resolved through when it names a
+# bucket, over the same in-process callback: whether the account has the bucket,
+# and what its policy permits, are facts of the service that owns it
+# (`state::logging`, `state::zero_etl_source`).
 aws-sdk-s3 = { version = "1", default-features = false }
+# The Amazon DynamoDB client the other arm of that same `SourceArn` is resolved
+# through, over the same in-process callback: the table a `CreateIntegration`
+# replicates is a resource of THAT service, so whether it exists is a question
+# only it can answer (`state::zero_etl_source`).
+aws-sdk-dynamodb = { version = "1", default-features = false }
+# A cluster snapshot holds the cluster's DATA, and a cluster's databases live in
+# the SQL engine the Redshift Data API runs statements on — so the copy a snapshot
+# carries is taken and written back through that crate's
+# `state::capture_warehouse` / `state::restore_warehouse` seam
+# (`state::cluster_data`) rather than kept as a second copy of the data here. No
+# SQL type crosses into this crate: the capture is opaque.
+service-com-amazonaws-redshiftdata-redshiftdata = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -93,6 +106,11 @@ service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # registration change names are ITS resources: the suite creates them there and
 # registers them here. Another workspace member this repository already locks.
 service-com-amazonaws-redshiftserverless-redshiftserverless = { workspace = true }
+# The zero-ETL source suite mounts Amazon DynamoDB beside Redshift on one engine,
+# because the table a `CreateIntegration` replicates is ITS resource: the suite
+# creates the table there and names it here. Another workspace member this
+# repository already locks.
+service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 # The audit-logging suite mounts Amazon S3 beside Redshift on one engine, because
 # the bucket `EnableLogging` names is ITS resource: the suite creates the bucket
 # and puts the delivery policy on it there, and enables logging here. Another

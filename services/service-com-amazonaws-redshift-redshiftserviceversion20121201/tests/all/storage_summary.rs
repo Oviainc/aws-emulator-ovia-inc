@@ -64,6 +64,9 @@ fn seed_snapshot(emulator: &Emulator, identifier: &str, backup_size: f64) {
         // Already past, so the record needs no clock-owed transition.
         available_at: Instant::now(),
         source: None,
+        // A seeded record was taken of no cluster this store holds, so it holds
+        // no copy of any cluster's databases either.
+        data: Default::default(),
     });
 }
 

@@ -3355,7 +3355,10 @@ struct CapturedDatabase {
 ///
 /// Redshift Serverless' `CreateSnapshot` takes one ("creates a snapshot of all
 /// databases in a namespace") and its `RestoreFromSnapshot` writes it back over a
-/// workgroup's databases. The copy is taken HERE, in the crate that owns the SQL
+/// workgroup's databases; Amazon Redshift's `CreateClusterSnapshot` takes one of a
+/// provisioned cluster ("a snapshot contains a copy of the cluster data as of this
+/// exact time") and `RestoreFromClusterSnapshot` writes it into the cluster it
+/// creates. The copy is taken HERE, in the crate that owns the SQL
 /// engine the databases live in, and handed to the control plane as an opaque
 /// value: nothing outside this module can read or alter a captured database.
 ///
@@ -3435,7 +3438,7 @@ impl std::fmt::Display for WarehouseUnavailable {
 
 impl std::error::Error for WarehouseUnavailable {}
 
-/// Copy the databases reachable through `workgroups` into a capture.
+/// Copy the databases reachable through `targets` into a capture.
 ///
 /// BLOCKING, deliberately, exactly as [`run_on`] is: it drives the SQL engine, so a
 /// caller must put it on a blocking pool (`tokio::task::spawn_blocking`) and bound
@@ -3443,17 +3446,18 @@ impl std::error::Error for WarehouseUnavailable {}
 /// Its own deadline is [`COPY_TIMEOUT`], checked while waiting for a database and
 /// between copy steps, so it always gives up before the request does.
 ///
-/// The union of those workgroups' databases, because a Redshift Serverless
-/// namespace's data is reached through the workgroups attached to it and this
-/// emulator's Data API addresses a database by the workgroup a statement named; a
-/// database name two of them both hold is captured once, from the first workgroup
-/// in the order given.
+/// The union of those targets' databases, because this emulator's Data API
+/// addresses a database by the warehouse a statement named: a Redshift Serverless
+/// namespace's data is reached through the workgroups attached to it, and a
+/// provisioned cluster's through the cluster itself — so each control plane hands
+/// over the targets its own resource is reached through. A database name two of
+/// them both hold is captured once, from the first target in the order given.
 ///
 /// The state lock is released before any database is touched — see
 /// [`ComAmazonawsRedshiftdataRedshiftdataState::warehouse_handles`].
 pub fn capture_warehouse<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    workgroups: &[&str],
+    targets: &[ConnectionTarget],
 ) -> Result<WarehouseCapture, WarehouseUnavailable> {
     let Some(state) = service_state(engine) else {
         return Err(WarehouseUnavailable::StoreUnreachable);
@@ -3463,9 +3467,8 @@ pub fn capture_warehouse<Eng: Send + Sync + 'static>(
     let sources: Vec<(String, DatabaseHandle)> = {
         let state = state.lock();
         let mut sources: Vec<(String, DatabaseHandle)> = Vec::new();
-        for workgroup in workgroups {
-            let target = ConnectionTarget::Workgroup((*workgroup).to_string());
-            for (database, handle) in state.warehouse_handles(&target) {
+        for target in targets {
+            for (database, handle) in state.warehouse_handles(target) {
                 if !sources.iter().any(|(held, _)| held == &database) {
                     sources.push((database, handle));
                 }
@@ -3493,7 +3496,7 @@ pub fn capture_warehouse<Eng: Send + Sync + 'static>(
     Ok(capture)
 }
 
-/// Write `capture` over the databases of `workgroup`, and report how many
+/// Write `capture` over the databases of `target`, and report how many
 /// databases it materialised.
 ///
 /// BLOCKING and bounded exactly as [`capture_warehouse`] is: a blocking pool and
@@ -3512,19 +3515,18 @@ pub fn capture_warehouse<Eng: Send + Sync + 'static>(
 pub fn restore_warehouse<Eng: Send + Sync + 'static>(
     engine: &Eng,
     capture: &WarehouseCapture,
-    workgroup: &str,
+    target: &ConnectionTarget,
 ) -> Result<usize, WarehouseUnavailable> {
     let Some(state) = service_state(engine) else {
         return Err(WarehouseUnavailable::StoreUnreachable);
     };
-    let target = ConnectionTarget::Workgroup(workgroup.to_string());
     let deadline = Instant::now() + COPY_TIMEOUT;
 
     // Asked before anything is copied: a restore the emulator has no room for is
     // refused while the warehouse is still untouched.
     state
         .lock()
-        .room_for_databases(&target, capture.databases.len())?;
+        .room_for_databases(target, capture.databases.len())?;
 
     // With the state lock released: one fresh confined database per captured
     // database, with the copy already in it.
@@ -3544,8 +3546,111 @@ pub fn restore_warehouse<Eng: Send + Sync + 'static>(
 
     // The swap, under the state lock and infallible.
     let count = restored.len();
-    state.lock().install_databases(&target, restored);
+    state.lock().install_databases(target, restored);
     Ok(count)
+}
+
+/// Why a bounded copy of a warehouse's databases did not happen.
+///
+/// The copy is blocking engine work, so a caller runs it on the blocking pool
+/// under a budget ([`capture_warehouse_bounded`], [`restore_warehouse_bounded`])
+/// and it can fail three ways: the copy itself could not be made, the request gave
+/// up waiting for it, or the task carrying it did not return.
+///
+/// It lives HERE, beside the seam and the budget, so every control plane that
+/// snapshots a warehouse through this engine reports the same three outcomes
+/// rather than keeping its own copy of them.
+#[derive(Debug)]
+pub enum CopyFailure {
+    /// The databases could not be copied.
+    Unavailable(WarehouseUnavailable),
+    /// The request waited [`COPY_REQUEST_BUDGET`] and gave up, so the copy is
+    /// abandoned rather than reported as done.
+    GaveUp(Duration),
+    /// The blocking task carrying the copy did not return a result.
+    Lost,
+}
+
+impl CopyFailure {
+    /// True when the failure is this emulator being at its capacity for open
+    /// databases — the one of these a control plane reports as a quota error
+    /// rather than as a server fault.
+    pub fn is_capacity(&self) -> bool {
+        matches!(self, Self::Unavailable(WarehouseUnavailable::TooManyOpen(_)))
+    }
+}
+
+impl std::fmt::Display for CopyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(unavailable) => write!(f, "{unavailable}"),
+            Self::GaveUp(budget) => write!(
+                f,
+                "the copy did not finish within {} seconds and was abandoned",
+                budget.as_secs()
+            ),
+            Self::Lost => write!(f, "the copy did not return a result"),
+        }
+    }
+}
+
+impl std::error::Error for CopyFailure {}
+
+/// [`capture_warehouse`] run the way a REQUEST must run it: on the blocking pool,
+/// under [`COPY_REQUEST_BUDGET`].
+///
+/// Copying databases drives the SQL engine, so it may never run on the async
+/// worker the request is served on, and the wait for it has to be bounded — the
+/// budget is longer than the deadline the copy holds itself to, so what ends a
+/// copy is its own deadline and not the request's patience. Call it with NO state
+/// guard held, so one caller's copy serialises nothing else.
+pub async fn capture_warehouse_bounded<Eng: Send + Sync + 'static>(
+    engine: &std::sync::Arc<Eng>,
+    targets: Vec<ConnectionTarget>,
+) -> Result<WarehouseCapture, CopyFailure> {
+    let engine = std::sync::Arc::clone(engine);
+    collect(
+        tokio::time::timeout(
+            COPY_REQUEST_BUDGET,
+            tokio::task::spawn_blocking(move || capture_warehouse(&*engine, &targets)),
+        )
+        .await,
+    )
+}
+
+/// [`restore_warehouse`] run the way a REQUEST must run it: bounded and off the
+/// async worker exactly as [`capture_warehouse_bounded`] is, and for the same
+/// reasons.
+pub async fn restore_warehouse_bounded<Eng: Send + Sync + 'static>(
+    engine: &std::sync::Arc<Eng>,
+    capture: std::sync::Arc<WarehouseCapture>,
+    target: ConnectionTarget,
+) -> Result<usize, CopyFailure> {
+    let engine = std::sync::Arc::clone(engine);
+    collect(
+        tokio::time::timeout(
+            COPY_REQUEST_BUDGET,
+            tokio::task::spawn_blocking(move || restore_warehouse(&*engine, &capture, &target)),
+        )
+        .await,
+    )
+}
+
+/// The outcome of one bounded blocking copy: the copy's own answer, or why there
+/// is none.
+type JoinedCopy<T> = Result<
+    Result<Result<T, WarehouseUnavailable>, tokio::task::JoinError>,
+    tokio::time::error::Elapsed,
+>;
+
+/// Read one bounded copy's three failure modes off the join result.
+fn collect<T>(joined: JoinedCopy<T>) -> Result<T, CopyFailure> {
+    match joined {
+        Ok(Ok(Ok(done))) => Ok(done),
+        Ok(Ok(Err(unavailable))) => Err(CopyFailure::Unavailable(unavailable)),
+        Ok(Err(_panicked)) => Err(CopyFailure::Lost),
+        Err(_elapsed) => Err(CopyFailure::GaveUp(COPY_REQUEST_BUDGET)),
+    }
 }
 
 /// Lock a database, giving up at `deadline` rather than waiting for a statement

@@ -6,6 +6,13 @@
 //! snapshot record and reports it back in the `creating` status, which the clock
 //! moves to `available`.
 //!
+//! The record also holds the cluster's DATABASES as they stand at this instant —
+//! "a snapshot contains a copy of the cluster data as of this exact time" — taken
+//! through the seam the Redshift Data API owns the SQL engine behind
+//! ([`crate::state::capture_cluster_data`]), so a later
+//! `RestoreFromClusterSnapshot` serves exactly the rows that were written before
+//! this call.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -167,10 +174,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The DATA the snapshot holds, copied before the store's lock is taken:
+        // copying databases is blocking engine work, so it may not run under a
+        // lock every other request to this service needs. A copy taken for a
+        // create that is then refused is simply dropped — the refusals below
+        // write nothing either way.
+        let data = match crate::state::capture_cluster_data(
+            &self.engine,
+            input.cluster_identifier.clone(),
+        )
+        .await
+        {
+            Ok(data) => ::std::sync::Arc::new(data),
+            // The emulator cannot hold another open database: a capacity limit,
+            // which this operation reports as its own snapshot quota — the same
+            // class the retained-pages bound below answers with.
+            Err(failure) if failure.is_capacity() => {
+                return Err(
+                    CreateClusterSnapshotErrorModeled::ClusterSnapshotQuotaExceededFault(
+                        ClusterSnapshotQuotaExceededFault {
+                            message: Some(format!(
+                                "The cluster's databases could not be copied: {failure}"
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            // The databases are there but could not be copied: a snapshot stored
+            // now would claim to hold data it does not, so nothing is stored.
+            Err(failure) => {
+                return Err(
+                    CreateClusterSnapshotErrorModeled::DependentServiceUnavailableFault(
+                        DependentServiceUnavailableFault {
+                            message: Some(format!(
+                                "The cluster's databases could not be copied: {failure}"
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
         // The create holds the store's lock; the event it raises is published
         // once that lock is released, because a publish is an in-process call
         // into another service and must not run under it.
-        let output = self.create(&input, ctx)?;
+        let output = self.create(&input, ctx, data)?;
 
         // The snapshot now exists, which is the event this write raises: every
         // subscription scoped to it is told, on its own topic.
@@ -205,6 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateClusterSnap
         &self,
         input: &CreateClusterSnapshotInput,
         ctx: &smithy_server_runtime::OperationContext<'_>,
+        data: ::std::sync::Arc<crate::state::ClusterData>,
     ) -> Result<CreateClusterSnapshotOutput, CreateClusterSnapshotError> {
         use crate::state as st;
 
@@ -258,7 +309,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateClusterSnap
             );
         }
         // Identity before capacity: a request that would create nothing keeps the
-        // more specific fault even when the store is full.
+        // more specific fault even when the store is full. The retained COPIES are
+        // bounded as well as the number of records, because a snapshot holds the
+        // cluster's databases; see [`st::MAX_SNAPSHOT_DATA_PAGES`].
+        if st::retained_snapshot_data_pages(&store) + data.pages()
+            > st::MAX_SNAPSHOT_DATA_PAGES
+        {
+            return Err(
+                CreateClusterSnapshotErrorModeled::ClusterSnapshotQuotaExceededFault(
+                    ClusterSnapshotQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the amount of snapshot data this account retains in this Region ({} engine pages).",
+                            st::MAX_SNAPSHOT_DATA_PAGES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
         if store.snapshots.len() >= st::SNAPSHOT_QUOTA {
             return Err(
                 CreateClusterSnapshotErrorModeled::ClusterSnapshotQuotaExceededFault(
@@ -313,6 +381,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateClusterSnap
             // `RestoreFromClusterSnapshot` rebuilds this instant rather than
             // whatever the source cluster has become by then.
             source: Some(stored_cluster),
+            // ... and its DATABASES as they stood at the same instant, copied
+            // before this lock was taken.
+            data,
         });
 
         Ok(CreateClusterSnapshotOutput {

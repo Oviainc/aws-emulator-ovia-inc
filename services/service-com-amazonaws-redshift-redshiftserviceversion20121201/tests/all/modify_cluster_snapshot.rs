@@ -109,6 +109,8 @@ pub(crate) fn seed_snapshot(emulator: &Emulator, identifier: &str, snapshot_type
         // Already past, so the record needs no clock-owed transition.
         available_at: Instant::now(),
         source: None,
+        // A seeded record holds no copy of any cluster's databases.
+        data: Default::default(),
     });
 }
 

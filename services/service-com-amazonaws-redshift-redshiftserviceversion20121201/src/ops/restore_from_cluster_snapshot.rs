@@ -14,6 +14,14 @@
 //! groups: "the new cluster is created with the default cluster security and
 //! parameter groups", so those are never inherited from the source.
 //!
+//! The new cluster also serves the snapshot's DATA, not just its configuration:
+//! the databases the snapshot captured are written into the cluster this call
+//! creates ([`crate::state::restore_cluster_data`]), so a `SELECT` submitted to
+//! the Data API against the restored cluster reads the rows that were written
+//! before the snapshot was taken and none of those written after it. A copy that
+//! cannot be made leaves no cluster behind: the record this call inserted is
+//! removed again and the failure is reported.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -393,7 +401,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The restore holds the store's lock; the event it raises is published
         // once that lock is released, because a publish is an in-process call
         // into another service and must not run under it.
-        let (output, identifier, restored_from) = self.restore(&input, ctx)?;
+        let (output, identifier, restored_from, data) = self.restore(&input, ctx)?;
+
+        // Phase 2, with no store lock held: the snapshot's DATABASES into the
+        // cluster this call created, so "creates a new cluster from a snapshot"
+        // means a cluster that serves the snapshot's tables and rows. Copying
+        // databases is blocking engine work, which is why it cannot run under the
+        // lock the restore above held. The copy either installs every database or
+        // none, so a call that fails here moves no data — and the cluster it
+        // created is removed again, leaving the store as the call found it.
+        if let Err(failure) =
+            crate::state::restore_cluster_data(&self.engine, data, identifier.clone()).await
+        {
+            if let Some(state) = crate::state::service_state(&*self.engine) {
+                let mut store = state.lock();
+                if let Some(position) = store.cluster_position(&identifier) {
+                    store.clusters.remove(position);
+                }
+            }
+            return Err(
+                RestoreFromClusterSnapshotErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        // Every way the copy can fail is reported the same way
+                        // here, capacity included: the engine the databases live
+                        // in is a dependent service of this control plane, and
+                        // this operation models no quota for the databases it
+                        // holds open (its own quota faults count clusters and
+                        // nodes). The condition is transient either way.
+                        message: Some(format!(
+                            "The snapshot's databases could not be restored: {failure}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
 
         // The cluster was built from a snapshot, which is the event this write
         // raises — about the cluster it created, naming the snapshot it came
@@ -419,8 +461,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromClusterSnapshot<Eng> {
     /// The restore itself: the output it reports, the identifier of the cluster
-    /// it created — the source the event it raises is about — and the identifier
-    /// of the snapshot that cluster was built from.
+    /// it created — the source the event it raises is about —, the identifier
+    /// of the snapshot that cluster was built from, and that snapshot's DATA,
+    /// which the caller then writes into the new cluster's databases.
     ///
     /// Everything that touches the store lives here, so the lock is held for the
     /// write ALONE and nothing is awaited while it is.
@@ -428,8 +471,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
         &self,
         input: &RestoreFromClusterSnapshotInput,
         ctx: &smithy_server_runtime::OperationContext<'_>,
-    ) -> Result<(RestoreFromClusterSnapshotOutput, String, String), RestoreFromClusterSnapshotError>
-    {
+    ) -> Result<
+        (
+            RestoreFromClusterSnapshotOutput,
+            String,
+            String,
+            ::std::sync::Arc<crate::state::ClusterData>,
+        ),
+        RestoreFromClusterSnapshotError,
+    > {
         use crate::state as st;
 
         let Some(state) = st::service_state(&*self.engine) else {
@@ -1101,6 +1151,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
             },
             identifier,
             restored_from,
+            // The databases the snapshot captured of its source cluster, handed
+            // over as a handle so the copy that writes them into the new cluster
+            // needs no lock on this store.
+            ::std::sync::Arc::clone(&stored.data),
         ))
     }
 }

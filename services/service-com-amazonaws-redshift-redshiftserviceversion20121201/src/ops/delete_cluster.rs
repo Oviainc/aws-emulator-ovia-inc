@@ -6,7 +6,11 @@
 //! `ClusterStatus="deleting"`. Unless `SkipFinalClusterSnapshot` is true a final
 //! manual snapshot is taken first, under the `FinalClusterSnapshotIdentifier` the
 //! request must then supply, and stays visible through
-//! `DescribeClusterSnapshots` after the cluster is gone.
+//! `DescribeClusterSnapshots` after the cluster is gone. That snapshot carries the
+//! cluster's DATABASES as they stood when this call arrived, copied through the
+//! seam the Redshift Data API owns the SQL engine behind
+//! ([`crate::state::capture_cluster_data`]), so a `RestoreFromClusterSnapshot`
+//! from it serves the deleted cluster's rows.
 //!
 //! ## Shape of an operation
 //!
@@ -180,10 +184,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The DATA a final snapshot holds, copied before the store's lock is
+        // taken: copying databases is blocking engine work, so it may not run
+        // under a lock every other request to this service needs. Only a request
+        // that asks for a final snapshot copies anything, and a copy taken for a
+        // delete that is then refused is simply dropped.
+        let data = if input.final_cluster_snapshot_identifier.is_some() {
+            match crate::state::capture_cluster_data(
+                &self.engine,
+                input.cluster_identifier.clone(),
+            )
+            .await
+            {
+                Ok(data) => ::std::sync::Arc::new(data),
+                // The emulator cannot hold another open database: a capacity
+                // limit, which this operation reports as the snapshot quota its
+                // final snapshot would exceed.
+                Err(failure) if failure.is_capacity() => {
+                    return Err(
+                        DeleteClusterErrorModeled::ClusterSnapshotQuotaExceededFault(
+                            ClusterSnapshotQuotaExceededFault {
+                                message: Some(format!(
+                                    "The cluster's databases could not be copied: {failure}"
+                                )),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+                // The databases are there but could not be copied: the final
+                // snapshot would claim to hold data it does not, so the cluster
+                // is not deleted either.
+                Err(failure) => {
+                    return Err(DeleteClusterErrorModeled::DependentServiceUnavailableFault(
+                        DependentServiceUnavailableFault {
+                            message: Some(format!(
+                                "The cluster's databases could not be copied: {failure}"
+                            )),
+                        },
+                    )
+                    .into())
+                }
+            }
+        } else {
+            ::std::sync::Arc::default()
+        };
+
         // The delete holds the store's lock; the events it raises are published
         // once that lock is released, because a publish is an in-process call
         // into another service and must not run under it.
-        let (output, final_snapshot) = self.delete(&input, ctx)?;
+        let (output, final_snapshot) = self.delete(&input, ctx, data)?;
 
         // The cluster is gone, and a final snapshot of it was taken when the
         // request asked for one: each is an event of its own source type, so a
@@ -234,6 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteCluster<Eng
         &self,
         input: &DeleteClusterInput,
         ctx: &smithy_server_runtime::OperationContext<'_>,
+        data: ::std::sync::Arc<crate::state::ClusterData>,
     ) -> Result<(DeleteClusterOutput, Option<String>), DeleteClusterError> {
         use crate::state as st;
 
@@ -330,7 +381,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteCluster<Eng
                 )
                 .into());
             }
-            // Identity before capacity, as in CreateClusterSnapshot.
+            // Identity before capacity, as in CreateClusterSnapshot — and the
+            // retained COPIES are bounded as well as the number of records,
+            // because a snapshot holds the cluster's databases.
+            if st::retained_snapshot_data_pages(&store) + data.pages()
+                > st::MAX_SNAPSHOT_DATA_PAGES
+            {
+                return Err(
+                    DeleteClusterErrorModeled::ClusterSnapshotQuotaExceededFault(
+                        ClusterSnapshotQuotaExceededFault {
+                            message: Some(format!(
+                                "The request would exceed the amount of snapshot data this account retains in this Region ({} engine pages).",
+                                st::MAX_SNAPSHOT_DATA_PAGES
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
             if store.snapshots.len() >= st::SNAPSHOT_QUOTA {
                 return Err(
                     DeleteClusterErrorModeled::ClusterSnapshotQuotaExceededFault(
@@ -374,6 +442,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteCluster<Eng
                 snapshot,
                 available_at: started + st::PROVISIONING_SPAN,
                 source,
+                // The cluster's DATABASES as they stood when this call arrived,
+                // copied before the lock was taken: a final snapshot holds the
+                // deleted cluster's data exactly as any other snapshot holds it.
+                data,
             });
             final_snapshot = Some(identifier);
         }

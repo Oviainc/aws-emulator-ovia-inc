@@ -61,6 +61,8 @@ fn seed_snapshot(emulator: &Emulator, cluster: &str, snapshot: &str) {
         // Already past, so the record needs no clock-owed transition.
         available_at: std::time::Instant::now(),
         source: None,
+        // A seeded record holds no copy of any cluster's databases.
+        data: Default::default(),
     });
 }
 

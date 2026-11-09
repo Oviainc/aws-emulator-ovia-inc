@@ -15,7 +15,13 @@
 //! not available answers this operation's own `InvalidClusterStateFault` (400),
 //! so a refused create leaves no integration behind. The SOURCE is a resource
 //! of another service (the model's own pattern admits an Amazon S3 or DynamoDB
-//! ARN), so it is stored exactly as the request carried it. A second create over
+//! ARN), so whether it exists is asked of that service
+//! (`crate::state::zero_etl_source`) BEFORE anything about the target is judged:
+//! an owner that answers it holds no such table or bucket makes the request one
+//! this service cannot honour the parameters of, refused 400
+//! `InvalidParameterValue` with that source kind's access sentence, while an
+//! owner that cannot be asked at all leaves the question undecided and the ARN is
+//! stored exactly as the request carried it. A second create over
 //! one (`SourceArn`, `TargetArn`) pair, or under one `IntegrationName`, is
 //! refused with `IntegrationAlreadyExistsFault`.
 //! The integration becomes `active` a `crate::state::PROVISIONING_SPAN` after
@@ -247,6 +253,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // The SOURCE is a resource of ANOTHER service — the modelled `SourceArn`
+        // pattern admits an Amazon DynamoDB and an Amazon S3 ARN alike — so
+        // whether there is such a table or bucket is a question only that service
+        // can answer ([`st::zero_etl_source`]). It is asked with no lock held and
+        // BEFORE anything about the target is judged: a source that exists nowhere
+        // can be replicated into no data warehouse, whatever state that warehouse
+        // is in, so the source decides the answer.
+        match st::zero_etl_source::resolve_zero_etl_source(ctx, &input.source_arn).await {
+            st::zero_etl_source::SourceResolution::Absent(kind) => {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    kind.inaccessible_message(),
+                ));
+            }
+            st::zero_etl_source::SourceResolution::Unresolvable(reason) => {
+                // Visible at default verbosity: a create admitted because the
+                // service that owns the source could not be asked reads exactly
+                // like one admitted against a source known to be there, so the
+                // degraded path says so rather than passing quietly — and nothing
+                // is assumed from silence.
+                ::tracing::warn!(
+                    reason = %reason,
+                    "the zero-ETL integration source could not be resolved"
+                );
+            }
+            st::zero_etl_source::SourceResolution::Present => {}
         }
 
         // The TARGET is a data warehouse namespace of EITHER Redshift control

@@ -1168,6 +1168,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-dynamodb"
+version = "1.137.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41515f51bd2b5608268336bda372065e8fd5d1ca2f684b63e5c25ae4abb62c53"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "aws-sdk-dynamodbstreams"
 version = "1.122.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16449,6 +16475,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-dynamodb",
  "aws-sdk-ec2",
  "aws-sdk-kms",
  "aws-sdk-redshiftserverless",
@@ -16463,8 +16490,10 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-dynamodb-dynamodb-20120810",
  "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-kms-trentservice",
+ "service-com-amazonaws-redshiftdata-redshiftdata",
  "service-com-amazonaws-redshiftserverless-redshiftserverless",
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-sns-amazonsimplenotificationservice",

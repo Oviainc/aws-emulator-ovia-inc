@@ -141,6 +141,8 @@ mod snapshot_copy_grant_kms_keys;
 mod snapshot_copy_grants;
 #[path = "all/snapshot_copy_retention_period.rs"]
 mod snapshot_copy_retention_period;
+#[path = "all/snapshot_data.rs"]
+mod snapshot_data;
 #[path = "all/snapshot_restore.rs"]
 mod snapshot_restore;
 #[path = "all/snapshot_schedules.rs"]
@@ -153,6 +155,8 @@ mod static_catalog;
 mod storage_summary;
 #[path = "all/usage_limits.rs"]
 mod usage_limits;
+#[path = "all/zero_etl_integration_sources.rs"]
+mod zero_etl_integration_sources;
 #[path = "all/zero_etl_integration_targets.rs"]
 mod zero_etl_integration_targets;
 #[path = "all/zero_etl_integrations.rs"]
