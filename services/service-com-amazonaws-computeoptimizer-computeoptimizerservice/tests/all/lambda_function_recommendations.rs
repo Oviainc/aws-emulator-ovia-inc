@@ -999,7 +999,7 @@ async fn a_request_that_is_not_valid_is_refused_with_the_modelled_error() {
         );
         assert_eq!(
             error_code(&body),
-            "ValidationException",
+            "InvalidParameterValueException",
             "case {case:?}: expected the model's own refusal, got {body}"
         );
     }

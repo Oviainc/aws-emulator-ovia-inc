@@ -62,6 +62,10 @@ mod auto_scaling_groups;
 // The Amazon Aurora and RDS databases the account OWNS, analysed from the Amazon RDS
 // inventory that holds them and the utilization published for them.
 mod rds_inventory;
+// How a preferred-resource preference's include and exclude lists resolve into the effective
+// set of recommendation candidates, and the instance-type catalog they resolve against.
+mod preferred_resources;
+pub use preferred_resources::*;
 pub use auto_scaling_groups::*;
 pub use rds_inventory::*;
 pub use idle::*;
@@ -712,27 +716,17 @@ pub fn is_recommendation_preference_name(name: &str) -> bool {
 
 /// A `PreferredResource` as the service reports it back: the stored include and exclude
 /// lists plus `effectiveIncludeList`, "the expanded version of your preferred resource's
-/// include list" — the preference "resolves any wildcard expressions and returns the
-/// effective list of candidate resource type values".
+/// include list".
 ///
-/// A value that is no wildcard expands to itself, and so does the catch-all
-/// [`INCLUDE_EVERY_RESOURCE_TYPE`], which already names every candidate. Expanding a
-/// NARROWER wildcard (`m5*`) needs the EC2 instance-type catalog, which this emulator does
-/// not hold, so the effective list is omitted rather than invented for one of those.
+/// The expansion is RESOLVED, never echoed: every value — an exact instance type, a family
+/// or the catch-all — is resolved against the instance-type catalog and the exclude list is
+/// taken out of what is left ([`effective_include_list`]), so a reader can see which
+/// candidates a preference leaves rather than only what was written.
 pub fn effective_preferred_resource(resource: &PreferredResource) -> EffectivePreferredResource {
-    let include_list = resource.include_list.clone();
-    let effective_include_list = include_list
-        .as_ref()
-        .filter(|values| {
-            values
-                .iter()
-                .all(|value| value == INCLUDE_EVERY_RESOURCE_TYPE || !value.contains('*'))
-        })
-        .cloned();
     EffectivePreferredResource {
         name: resource.name.clone(),
-        include_list,
-        effective_include_list,
+        include_list: resource.include_list.clone(),
+        effective_include_list: Some(effective_include_list(resource)),
         exclude_list: resource.exclude_list.clone(),
     }
 }
@@ -779,15 +773,14 @@ pub fn default_utilization_preferences() -> Vec<UtilizationPreference> {
 /// The preferred resources in force when no preference sets them: the one list name the
 /// service supports, including every candidate resource type and excluding none, because
 /// `PreferredResource$excludeList` documents that "if this isn't specified, all supported
-/// resources are included by default". Projected through
-/// [`effective_preferred_resource`], so the reported `effectiveIncludeList` is the
-/// expansion of that include list and not a second statement of it.
-pub fn default_preferred_resources() -> Vec<EffectivePreferredResource> {
-    vec![effective_preferred_resource(&PreferredResource {
+/// resources are included by default". Held as the lists themselves, so a reader resolves
+/// them into candidates ([`effective_preferred_resource`]) only where it reports them.
+pub fn default_preferred_resources() -> Vec<PreferredResource> {
+    vec![PreferredResource {
         name: Some(PREFERRED_RESOURCE_NAME_EC2_INSTANCE_TYPES.to_string()),
         include_list: Some(vec![INCLUDE_EVERY_RESOURCE_TYPE.to_string()]),
         exclude_list: Some(Vec::new()),
-    })]
+    }]
 }
 
 /// An ARN split into the fields the ARN grammar defines:
@@ -1710,8 +1703,12 @@ pub struct EffectivePreferences {
     /// utilization preferences for the Amazon EC2 instance resource type", so the list is
     /// empty for every other resource type.
     pub utilization_preferences: Vec<UtilizationPreference>,
-    /// `PreferredResources`, which default to [`default_preferred_resources`].
-    pub preferred_resources: Vec<EffectivePreferredResource>,
+    /// `PreferredResources` as the preference STATES them, which default to
+    /// [`default_preferred_resources`]. Held as the written lists rather than as candidate
+    /// sets, so the resolution a reader reports ([`effective_preferred_resource`]) is run
+    /// where that reader builds its response — for the items of one page — and not for every
+    /// resource a request selected on the way there.
+    pub preferred_resources: Vec<PreferredResource>,
     /// `SavingsEstimationMode`, reported only where a record sets it: the preference is
     /// what "activates" savings net of discounts.
     pub savings_estimation_mode: Option<String>,
@@ -1748,7 +1745,12 @@ impl EffectivePreferences {
             look_back_period: Some(self.look_back_period.clone()),
             utilization_preferences: (!self.utilization_preferences.is_empty())
                 .then(|| self.utilization_preferences.clone()),
-            preferred_resources: Some(self.preferred_resources.clone()),
+            preferred_resources: Some(
+                self.preferred_resources
+                    .iter()
+                    .map(effective_preferred_resource)
+                    .collect(),
+            ),
             savings_estimation_mode: Some(InstanceSavingsEstimationMode {
                 source: Some(SAVINGS_ESTIMATION_SOURCE.to_string()),
             }),
@@ -3897,13 +3899,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
                     }
                 }),
             preferred_resources: effective(|record| !record.preferred_resources.is_empty())
-                .map(|record| {
-                    record
-                        .preferred_resources
-                        .iter()
-                        .map(effective_preferred_resource)
-                        .collect()
-                })
+                .map(|record| record.preferred_resources.clone())
                 .unwrap_or_else(default_preferred_resources),
             savings_estimation_mode: effective(|record| record.savings_estimation_mode.is_some())
                 .and_then(|record| record.savings_estimation_mode.clone()),

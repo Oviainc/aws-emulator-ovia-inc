@@ -409,7 +409,18 @@ fn request_rejection(input: &PutRecommendationPreferencesInput) -> Option<String
     }
 
     // `preferredResources`: "You must specify either an includeList or excludeList. If the
-    // preference is an empty set of resource type values, an error occurs."
+    // preference is an empty set of resource type values, an error occurs." And either list
+    // holds at most the values the member publishes: "You can specify up to 1000 values in
+    // this list" (`PreferredResource$includeList`, and `$excludeList` in the same words), so
+    // a longer one is refused before anything is written or resolved.
+    //
+    // An entry names a preferred resource LIST ("The name of the preferred resource list",
+    // `EffectivePreferredResource$name`), so one name holds ONE list: a request naming the
+    // same list twice states two include/exclude sets for it and is refused rather than
+    // stored as two records of one name. That is also what bounds a later read — the entries
+    // one record holds, and so the candidate sets one response resolves, cannot exceed the
+    // `PreferredResourceName` values the model declares.
+    let mut named: Vec<&str> = Vec::new();
     for resource in input.preferred_resources.iter().flatten() {
         let included = resource.include_list.iter().flatten().count();
         let excluded = resource.exclude_list.iter().flatten().count();
@@ -420,6 +431,22 @@ fn request_rejection(input: &PutRecommendationPreferencesInput) -> Option<String
                     .to_string(),
             );
         }
+        if included.max(excluded) > crate::state::MAX_PREFERRED_RESOURCE_VALUES {
+            return Some(format!(
+                "The value supplied for parameter preferredResources is not valid: you can \
+                 specify up to {} values in an includeList or an excludeList.",
+                crate::state::MAX_PREFERRED_RESOURCE_VALUES,
+            ));
+        }
+        let name = resource.name.as_deref().unwrap_or_default();
+        if named.contains(&name) {
+            return Some(
+                "The value supplied for parameter preferredResources is not valid: each entry \
+                 must name a different preferred resource list."
+                    .to_string(),
+            );
+        }
+        named.push(name);
     }
 
     None

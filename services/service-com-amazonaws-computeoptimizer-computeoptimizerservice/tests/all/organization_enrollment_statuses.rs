@@ -447,7 +447,7 @@ async fn an_unhonourable_filter_or_token_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "ValidationException",
+            "InvalidParameterValueException",
             "case {case:?}: expected the model's own refusal, got {body}"
         );
     }

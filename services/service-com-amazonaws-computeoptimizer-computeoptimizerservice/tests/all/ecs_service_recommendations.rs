@@ -833,11 +833,11 @@ async fn a_malformed_request_is_refused_and_an_unenrolled_account_has_no_analysi
     opt_in(&router).await;
 
     // Every row is a request the service defines no answer for; each must be refused with
-    // the modelled 400, never with an empty page. A member the MODEL constrains (a filter
-    // name outside `ECSServiceRecommendationFilterName`) is refused by the framework's own
-    // constraint walk before the handler runs, with a `ValidationException`; everything the
-    // model leaves open is refused by the handler with the operation's own
-    // `InvalidParameterValueException`.
+    // the modelled 400, never with an empty page — and with the ONE bad-input error class
+    // this service models, `InvalidParameterValueException`, whether the member is one the
+    // MODEL constrains (a filter name outside `ECSServiceRecommendationFilterName`, refused
+    // by the constraint walk before the handler runs) or one the model leaves open (refused
+    // by the handler itself).
     let cases: [(&str, Value, &str); 7] = [
         (
             "two account ids",
@@ -862,7 +862,7 @@ async fn a_malformed_request_is_refused_and_an_unenrolled_account_has_no_analysi
         (
             "a filter name the service does not define",
             json!({ "filters": [{ "name": "LaunchType", "values": ["Fargate"] }] }),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
         (
             "a filter value outside the finding enum",

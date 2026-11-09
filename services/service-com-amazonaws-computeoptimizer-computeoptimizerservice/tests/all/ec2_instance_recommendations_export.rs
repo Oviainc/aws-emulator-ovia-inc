@@ -476,13 +476,13 @@ async fn an_invalid_export_request_is_refused() {
                 "s3DestinationConfig": {"bucket": BUCKET},
                 "filters": [{"name": "Colour", "values": ["Blue"]}],
             }),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
         (
             // `FileFormat` is a modelled enum whose only value is Csv.
             "a file format the model does not declare",
             json!({"s3DestinationConfig": {"bucket": BUCKET}, "fileFormat": "Parquet"}),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
         (
             // Likewise `ExportableInstanceField`.
@@ -491,7 +491,7 @@ async fn an_invalid_export_request_is_refused() {
                 "s3DestinationConfig": {"bucket": BUCKET},
                 "fieldsToExport": ["AccountId", "NotAField"],
             }),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
         (
             // Likewise `CpuVendorArchitecture`.
@@ -500,7 +500,7 @@ async fn an_invalid_export_request_is_refused() {
                 "s3DestinationConfig": {"bucket": BUCKET},
                 "recommendationPreferences": {"cpuVendorArchitectures": ["SPARC"]},
             }),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
     ];
 

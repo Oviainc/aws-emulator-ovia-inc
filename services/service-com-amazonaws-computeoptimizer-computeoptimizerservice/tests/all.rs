@@ -45,6 +45,8 @@ mod ecs_service_recommendation_projected_metrics;
 mod ecs_service_recommendations;
 #[path = "all/ecs_service_recommendations_export.rs"]
 mod ecs_service_recommendations_export;
+#[path = "all/effective_preferred_resource_candidates.rs"]
+mod effective_preferred_resource_candidates;
 #[path = "all/enrollment_and_preferences.rs"]
 mod enrollment_and_preferences;
 #[path = "all/export_preference_gated_columns.rs"]
@@ -71,6 +73,8 @@ mod lambda_function_recommendations_export;
 mod license_recommendations;
 #[path = "all/license_recommendations_export.rs"]
 mod license_recommendations_export;
+#[path = "all/modelled_constraint_refusal_class.rs"]
+mod modelled_constraint_refusal_class;
 #[path = "all/organization_enrollment_statuses.rs"]
 mod organization_enrollment_statuses;
 #[path = "all/preference_records_hold_a_preference.rs"]

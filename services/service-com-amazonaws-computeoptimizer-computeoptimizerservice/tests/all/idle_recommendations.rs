@@ -1141,22 +1141,23 @@ async fn an_invalid_request_is_refused() {
             // The service's prose also describes `tag:key` / `tag-key` filter names, but
             // the model's `IdleRecommendationFilterName` declares only Finding and
             // ResourceType, so the request boundary refuses anything else — the model is
-            // what this emulator follows.
+            // what this emulator follows, and the boundary refuses it with the same
+            // modelled error class the handler's own checks answer with.
             "a filter name the model does not declare",
             json!({"filters": [{"name": "tag:Owner", "values": ["TeamA"]}]}),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
         (
             // Likewise `OrderBy$dimension` and `$order` are modelled enums, so a value
             // outside them never reaches the sort.
             "a sort dimension the model does not declare",
             json!({"orderBy": {"dimension": "SavingsPercentage", "order": "Asc"}}),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
         (
             "a sort order the model does not declare",
             json!({"orderBy": {"dimension": "SavingsValue", "order": "Descending"}}),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
         (
             "a forged nextToken",

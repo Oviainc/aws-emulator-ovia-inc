@@ -453,7 +453,7 @@ async fn an_invalid_export_request_is_refused() {
             // boundary refuses anything else before the handler runs.
             "a file format the model does not declare",
             json!({"s3DestinationConfig": {"bucket": BUCKET}, "fileFormat": "Parquet"}),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
         (
             // Likewise `ExportableLambdaFunctionField`.
@@ -462,7 +462,7 @@ async fn an_invalid_export_request_is_refused() {
                 "s3DestinationConfig": {"bucket": BUCKET},
                 "fieldsToExport": ["FunctionArn", "NotAField"],
             }),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
         (
             // An `ExportableLambdaFunctionField` of another export's vocabulary is not one
@@ -472,7 +472,7 @@ async fn an_invalid_export_request_is_refused() {
                 "s3DestinationConfig": {"bucket": BUCKET},
                 "fieldsToExport": ["CurrentInstanceType"],
             }),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
     ];
 

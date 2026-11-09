@@ -20,6 +20,7 @@
 //! is what a client sees.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_ec2_amazonec2 as ec2;
 
 use crate::harness::{
     auto_scaling_group_arn, call, effective_for, emulator, error_code, instance_arn, opt_in,
@@ -40,15 +41,40 @@ fn default_utilization_preferences() -> Value {
     ])
 }
 
+/// Every Amazon EC2 instance type whose name begins with `prefix`, read from the Amazon EC2
+/// model's own `InstanceType` value set — the catalog a preferred-resource value is resolved
+/// against — in the order the service reports candidates in. The empty prefix therefore names
+/// every instance type.
+fn instance_types_starting_with(prefix: &str) -> Vec<String> {
+    let mut named: Vec<String> = ec2::ops::types::INSTANCE_TYPE_VALUES
+        .iter()
+        .filter(|instance_type| instance_type.starts_with(prefix))
+        .map(|instance_type| (*instance_type).to_string())
+        .collect();
+    named.sort();
+    named
+}
+
+/// Every Amazon EC2 instance type except the ones named — the candidates an exclude-only
+/// preference leaves.
+fn every_instance_type_except(excluded: &[&str]) -> Vec<String> {
+    instance_types_starting_with("")
+        .into_iter()
+        .filter(|instance_type| !excluded.contains(&instance_type.as_str()))
+        .collect()
+}
+
 /// The documented default preferred resources: the one name the service supports
 /// ("Compute Optimizer only supports the customization of `Ec2InstanceTypes`") including
 /// every candidate and excluding none, because `PreferredResource$excludeList` documents
-/// that "if this isn't specified, all supported resources are included by default".
+/// that "if this isn't specified, all supported resources are included by default" — whose
+/// `effectiveIncludeList`, "the expanded version of your preferred resource's include
+/// list", is that catch-all resolved against the instance-type catalog.
 fn default_preferred_resources() -> Value {
     json!([{
         "name": "Ec2InstanceTypes",
         "includeList": ["*"],
-        "effectiveIncludeList": ["*"],
+        "effectiveIncludeList": instance_types_starting_with(""),
         "excludeList": [],
     }])
 }
@@ -156,9 +182,10 @@ async fn effective_preferences_report_documented_defaults_when_nothing_is_stored
 }
 
 /// A stored preference replaces the default it covers, and `effectiveIncludeList` is the
-/// expansion of the include list: the identity for a list of concrete values or for the
-/// catch-all wildcard, and omitted rather than invented for a narrower wildcard this
-/// emulator cannot resolve without the EC2 instance-type catalog.
+/// expansion of the include list against the instance-type catalog: the identity for a list
+/// of concrete values, every candidate for the catch-all wildcard, the named family for a
+/// narrower wildcard, and every candidate but the excluded ones when only an exclude list is
+/// written.
 #[tokio::test]
 async fn a_stored_preference_replaces_the_default_the_effective_read_reports() {
     let instance = instance_arn("i-0abcdef1234567890");
@@ -200,6 +227,7 @@ async fn a_stored_preference_replaces_the_default_the_effective_read_reports() {
             json!([{
                 "name": "Ec2InstanceTypes",
                 "includeList": ["m5.large", "m5.xlarge"],
+                // Each exact value resolves to itself, in the catalog's own order.
                 "effectiveIncludeList": ["m5.large", "m5.xlarge"],
             }]),
         ),
@@ -213,7 +241,7 @@ async fn a_stored_preference_replaces_the_default_the_effective_read_reports() {
             json!([{
                 "name": "Ec2InstanceTypes",
                 "includeList": ["*"],
-                "effectiveIncludeList": ["*"],
+                "effectiveIncludeList": instance_types_starting_with(""),
             }]),
         ),
         (
@@ -223,9 +251,12 @@ async fn a_stored_preference_replaces_the_default_the_effective_read_reports() {
                 "includeList": ["m5*"],
             }]}),
             "preferredResources",
-            // No `effectiveIncludeList`: expanding `m5*` needs the instance-type catalog,
-            // which this emulator does not hold, so it is omitted rather than invented.
-            json!([{"name": "Ec2InstanceTypes", "includeList": ["m5*"]}]),
+            // `m5*` resolves to every instance type the catalog names under it.
+            json!([{
+                "name": "Ec2InstanceTypes",
+                "includeList": ["m5*"],
+                "effectiveIncludeList": instance_types_starting_with("m5"),
+            }]),
         ),
         (
             "exclude list only",
@@ -234,7 +265,13 @@ async fn a_stored_preference_replaces_the_default_the_effective_read_reports() {
                 "excludeList": ["t2.micro"],
             }]}),
             "preferredResources",
-            json!([{"name": "Ec2InstanceTypes", "excludeList": ["t2.micro"]}]),
+            // No include list includes every candidate by default; the excluded exact type
+            // is the one candidate taken out of it.
+            json!([{
+                "name": "Ec2InstanceTypes",
+                "excludeList": ["t2.micro"],
+                "effectiveIncludeList": every_instance_type_except(&["t2.micro"]),
+            }]),
         ),
     ];
 

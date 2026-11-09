@@ -482,13 +482,13 @@ async fn an_invalid_export_request_is_refused() {
                 "s3DestinationConfig": {"bucket": BUCKET},
                 "filters": [{"name": "tag:Owner", "values": ["TeamA"]}],
             }),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
         (
             // `FileFormat` is a modelled enum whose only value is Csv.
             "a file format the model does not declare",
             json!({"s3DestinationConfig": {"bucket": BUCKET}, "fileFormat": "Parquet"}),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
         (
             // Likewise `ExportableECSServiceField`.
@@ -497,7 +497,7 @@ async fn an_invalid_export_request_is_refused() {
                 "s3DestinationConfig": {"bucket": BUCKET},
                 "fieldsToExport": ["ServiceArn", "NotAField"],
             }),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
     ];
 

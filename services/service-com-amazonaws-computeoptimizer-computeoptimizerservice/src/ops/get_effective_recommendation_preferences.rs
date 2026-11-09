@@ -288,8 +288,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             utilization_preferences: Some(effective.utilization_preferences),
             // `PreferredResource` "is only available for the Amazon EC2 instance and Auto
             // Scaling group resource types" — both of the types a `resourceArn` can name —
-            // so the default applies to every resource this operation accepts.
-            preferred_resources: Some(effective.preferred_resources),
+            // so the default applies to every resource this operation accepts. The lists in
+            // force are resolved into the candidates they leave here, where this one
+            // resource's answer is built ([`crate::state::effective_preferred_resource`]).
+            preferred_resources: Some(
+                effective
+                    .preferred_resources
+                    .iter()
+                    .map(crate::state::effective_preferred_resource)
+                    .collect(),
+            ),
         })
     }
 }

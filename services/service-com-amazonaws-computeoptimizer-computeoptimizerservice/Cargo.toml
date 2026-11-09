@@ -39,6 +39,10 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # file into: "to an existing Amazon Simple Storage Service (Amazon S3) bucket that you
 # specify".
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The catalog a preferred-resource value is resolved against: the Amazon EC2 instance types
+# that service's model names, which are the rightsizing-recommendation candidates an
+# `effectiveIncludeList` is expanded over.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # The comma-separated-values codec the export file is written with.
 csv = "1.3"
 

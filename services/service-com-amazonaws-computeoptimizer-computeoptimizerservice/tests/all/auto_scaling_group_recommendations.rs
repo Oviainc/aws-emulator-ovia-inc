@@ -487,11 +487,11 @@ async fn the_cpu_vendor_architecture_preference_selects_the_options_reported() {
         status, 400,
         "a CPU vendor architecture outside the enum must be refused, got {status}: {body}"
     );
-    assert!(
-        body["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("AWS_ARM32")),
-        "a CPU vendor architecture outside the enum: the refusal must name the value, got {body}"
+    assert_eq!(
+        body["message"].as_str(),
+        Some("Invalid Cpu Vendor Architectures."),
+        "a CPU vendor architecture outside the enum: the refusal names the input parameter at \
+         fault, got {body}"
     );
 }
 

@@ -483,8 +483,8 @@ async fn a_filter_the_model_does_not_declare_is_refused() {
         assert_eq!(status, 400, "case {name}: expected 400, got {status}: {body}");
         assert_eq!(
             error_code(&body),
-            "ValidationException",
-            "case {name}: expected the boundary's ValidationException, got {body}"
+            "InvalidParameterValueException",
+            "case {name}: expected the modelled bad-input refusal, got {body}"
         );
     }
 }

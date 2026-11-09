@@ -402,7 +402,7 @@ async fn an_invalid_export_request_is_refused() {
             // boundary refuses anything else before the handler runs.
             "a file format the model does not declare",
             json!({"s3DestinationConfig": {"bucket": BUCKET}, "fileFormat": "Parquet"}),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
         (
             // Likewise `ExportableRDSDBField`.
@@ -411,7 +411,7 @@ async fn an_invalid_export_request_is_refused() {
                 "s3DestinationConfig": {"bucket": BUCKET},
                 "fieldsToExport": ["ResourceArn", "NotAField"],
             }),
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
     ];
 

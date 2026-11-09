@@ -45,6 +45,71 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The error code this service answers an input-constraint violation with.
+///
+/// Compute Optimizer models `InvalidParameterValueException` (HTTP 400, "The value
+/// supplied for the input parameter is out of range or not valid") as the ONE
+/// bad-input client error of every operation that takes an input, and models no
+/// `ValidationException` shape at all — so that is the only code a client written
+/// against this API can catch for a value its model's `@range`, `@length`, `@pattern`
+/// or `@enum` rules refuse, or for a required member it left out. Restated here
+/// because `override_refusal` replaces the code and the message together.
+const INVALID_PARAMETER_VALUE_EXCEPTION: &str = "InvalidParameterValueException";
+
+/// The segment a constraint walk spells where it steps from a collection into one of its
+/// elements; the segment before it is the element's position or key, not a member name.
+const COLLECTION_STEP: &str = "member";
+
+/// The input parameter a refused value sat at, as this service NAMES a parameter.
+///
+/// A constraint walk reports a POSITION rather than a parameter: `maxResults` for a scalar,
+/// `filters.1.member.name` for a member of the first element of a list. The parameter is the
+/// deepest member that position names, so the collection steps are dropped (the `member`
+/// segment and the index or key before it), and the member's lowerCamel name is written as
+/// the words it is made of, each capitalised — `maxResults` is the `Max Results` of the
+/// request.
+fn parameter_at(path: &str) -> String {
+    let mut named: Vec<&str> = Vec::new();
+    for segment in path.split('.') {
+        if segment == COLLECTION_STEP {
+            named.pop();
+            continue;
+        }
+        named.push(segment);
+    }
+    in_words(named.last().copied().unwrap_or(path))
+}
+
+/// A lowerCamel member name as the words it is made of, each capitalised: `maxResults`
+/// becomes `Max Results`. A new word starts at each uppercase letter, which is where a
+/// lowerCamel name marks one — so a name carrying an acronym is worded with the acronym
+/// capitalised rather than upper-cased (`instanceArn` becomes `Instance Arn`), which is the
+/// one general derivation a member name supports without a per-acronym table.
+fn in_words(member: &str) -> String {
+    let mut words: Vec<String> = Vec::new();
+    for character in member.chars() {
+        if words.is_empty() || character.is_uppercase() {
+            words.push(String::new());
+        }
+        let word = words.last_mut().expect("a word has been started");
+        if word.is_empty() {
+            word.extend(character.to_uppercase());
+        } else {
+            word.push(character);
+        }
+    }
+    words.join(" ")
+}
+
+/// How this service states a refusal of a value its model does not accept: it NAMES the
+/// input parameter at fault — `Invalid Max Results.` for a paging size outside its range —
+/// rather than restating the constraint the value failed. A refusal carrying more than one
+/// violation names the first, which is the one the walk reached first.
+fn invalid_parameter_message(violations: &[::aws_smithy_schema_server::constraints::Violation]) -> Option<String> {
+    let first = violations.first()?;
+    Some(format!("Invalid {}.", parameter_at(&first.path)))
+}
+
 /// The `com-amazonaws-computeoptimizer-computeoptimizerservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -98,15 +163,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Every input-constraint violation this API refuses is an
+        // `InvalidParameterValueException` (HTTP 400 — the status the framework
+        // would also have answered, so only the code and the wording change):
+        // that shape is the one bad-input error its operations model, and the
+        // model declares no `ValidationException` at all, so answering the
+        // framework's generic code hands a client an error code its own model
+        // cannot name and no typed handler can catch. The MESSAGE is this
+        // service's own: it names the input parameter at fault
+        // ([`invalid_parameter_message`]) rather than restating the bound, and a
+        // violation the walk cannot attribute to a parameter keeps the
+        // framework's sentence.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure, and this service models its own 403s for it.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: INVALID_PARAMETER_VALUE_EXCEPTION.to_string(),
+                message: invalid_parameter_message(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
@@ -135,5 +214,66 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+
+    /// The parameter a refusal names is the deepest MEMBER of the position the walk
+    /// reported, written as the words the member name is made of — whatever collection
+    /// steps the position carries on the way there.
+    #[test]
+    fn a_refusal_names_the_parameter_the_refused_value_sat_at() {
+        let cases: [(&str, &str); 7] = [
+            ("maxResults", "Max Results"),
+            ("status", "Status"),
+            ("resourceType", "Resource Type"),
+            ("orderBy.order", "Order"),
+            ("filters.1.member.name", "Name"),
+            ("scope.name", "Name"),
+            ("recommendationPreferenceNames.2.member", "Recommendation Preference Names"),
+        ];
+        for (path, expected) in cases {
+            let named = parameter_at(path);
+            assert_eq!(
+                named, expected,
+                "case {path:?}: expected {expected:?}, got {named:?}"
+            );
+        }
+    }
+
+    /// Every violation kind is stated the same way — by naming the parameter — and a
+    /// refusal carrying none has nothing to name, so the framework's wording is kept.
+    #[test]
+    fn every_violation_kind_is_stated_by_naming_its_parameter() {
+        let kinds = [
+            ViolationKind::MissingRequiredMember,
+            ViolationKind::MaxValue("100".to_string()),
+            ViolationKind::MinValue("0".to_string()),
+            ViolationKind::MaxLength(1000),
+            ViolationKind::EnumValue(vec!["Active".to_string()]),
+        ];
+        for kind in kinds {
+            let violations = vec![Violation {
+                path: "maxResults".to_string(),
+                kind: kind.clone(),
+                value: Some("101".to_string()),
+                sensitive: false,
+            }];
+            let message = invalid_parameter_message(&violations);
+            assert_eq!(
+                message.as_deref(),
+                Some("Invalid Max Results."),
+                "case {kind:?}: expected the parameter to be named, got {message:?}"
+            );
+        }
+        assert_eq!(
+            invalid_parameter_message(&[]),
+            None,
+            "a refusal carrying no violation names no parameter"
+        );
     }
 }
