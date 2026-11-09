@@ -63,6 +63,8 @@ mod pending_transition_comes_with_the_record;
 mod product_subscription_teardown;
 #[path = "all/product_user_removal_is_one_writer.rs"]
 mod product_user_removal_is_one_writer;
+#[path = "all/refusal_message_templates.rs"]
+mod refusal_message_templates;
 #[path = "all/refusals.rs"]
 mod refusals;
 #[path = "all/registration_pair_resolution_is_shared.rs"]

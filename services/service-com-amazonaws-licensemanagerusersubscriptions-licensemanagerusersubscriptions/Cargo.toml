@@ -30,6 +30,10 @@ hex = { workspace = true }
 # has rather than keeping a list of ids here. Only the generated client is needed — the
 # emulator supplies the transport.
 aws-sdk-ec2 = { version = "1", default-features = false }
+# The shared refusal-wording helpers every service in this tree reads the same rules
+# from: `validation::unanchored` is the one implementation of quoting a `@pattern`
+# requirement without the whole-value anchors a model writes around it.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

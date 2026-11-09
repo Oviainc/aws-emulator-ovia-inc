@@ -203,7 +203,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if req.method() != GATED_METHOD {
             return None;
         }
-        let path = request_path(req.uri());
+        // The path portion of the request URI, which is what an operation's `@http` `uri`
+        // pattern is written against. Read through `service_common::request_path`, the one
+        // shared reader for it in this tree, rather than a local copy of the split: the
+        // framework's own is `pub(crate)` in a read-only tree, and this crate now depends on
+        // that crate anyway.
+        let path = ::service_common::request_path(req.uri());
         let gate = self.gates.iter().find(|gate| gate.route.uri == path)?;
         Some(gate as &dyn ErasedOperation)
     }
@@ -237,7 +242,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 message: crate::scaffolded::INVALID_INPUT_RESOURCE_ARN_SYNTAX_MESSAGE.to_string(),
             });
         }
-        None
+        // Every other constraint refusal keeps the framework's envelope and its clauses —
+        // with ONE rendering this service owns: a `@pattern` requirement quotes the
+        // expression WITHOUT the `^` / `$` anchors the model writes around it. The clause
+        // already says the MEMBER must satisfy the expression, so the anchors that make the
+        // model's find total are the model's way of saying that and not part of the
+        // character grammar a caller has to satisfy; a client that lifts the expression out
+        // of the message and re-applies it locally must get the one the service advertises.
+        //
+        // A rendering rule, not a member rule: it is applied to whatever violation the
+        // walk produced, so it holds for every `@pattern`-constrained member of every
+        // operation of this service. A refusal carrying no pattern violation is left to the
+        // framework's own wording, which is what returning `None` keeps.
+        unanchored_pattern_refusal(violations)
     }
 
     fn override_routing_error(
@@ -269,23 +286,51 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 }
 
-/// The path portion of a request URI, which is what an operation's `@http` `uri` pattern
-/// is written against. The runtime-API request carries the URI as a string, so the query
-/// and any scheme/authority prefix are cut here rather than matched into the pattern.
+/// The wire error code this service states an input-constraint refusal with: its own
+/// modelled `ValidationException`, `@httpError 400`
+/// (`smithy_query(query="shape",shape="ValidationException")`). It is also the code the
+/// framework's own pre-dispatch renderer picks for such a refusal, so restating a clause
+/// changes the MESSAGE and nothing else about the answer.
+const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";
+
+/// The constraint envelope for `violations`, with every `@pattern` requirement quoted
+/// without the anchors the model writes around it — or `None` when no violation states a
+/// `@pattern`, which leaves the framework's own wording in place.
 ///
-/// A local copy, as the sibling services that need it carry one: the framework's own
-/// `request_path` (`vendor/smithy-schema-server/src/rest_xml.rs`) is `pub(crate)` and that
-/// tree is read-only here, and `service-common`'s `pub` one would make this crate depend
-/// on that crate for three lines. Migrating these copies onto one shared reader is the
-/// follow-up this duplication is waiting on.
-fn request_path(uri: &str) -> &str {
-    let without_query = uri.split(['?', '#']).next().unwrap_or(uri);
-    match without_query.find("://") {
-        Some(scheme_end) => match without_query[scheme_end + 3..].find('/') {
-            Some(authority_end) => &without_query[scheme_end + 3 + authority_end..],
-            None => "/",
+/// Built by handing the framework its OWN clause renderer a violation whose expression is
+/// already unanchored ([`aws_smithy_schema_server::constraints::envelope`]), so the
+/// envelope, the member path, the echoed value and the requirement wording of every other
+/// constraint class stay the framework's and cannot drift from the rest of the emulator:
+/// the one thing this service states differently is the expression.
+fn unanchored_pattern_refusal(violations: &[smithy_server_runtime::Violation]) -> Option<Refused> {
+    if !violations
+        .iter()
+        .any(|violation| matches!(violation.kind, ViolationKind::Pattern(_)))
+    {
+        return None;
+    }
+    let stated: Vec<smithy_server_runtime::Violation> =
+        violations.iter().map(unanchored_violation).collect();
+    Some(Refused {
+        code: VALIDATION_EXCEPTION_CODE.to_string(),
+        message: aws_smithy_schema_server::constraints::envelope(&stated)?,
+    })
+}
+
+/// `violation` with a `@pattern` expression stripped of the whole-value anchors the model
+/// spells it with; every other violation is itself.
+///
+/// The strip is `service_common::validation::unanchored`'s — the one implementation of that
+/// rule in this tree — rather than a second copy here.
+fn unanchored_violation(
+    violation: &smithy_server_runtime::Violation,
+) -> smithy_server_runtime::Violation {
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => smithy_server_runtime::Violation {
+            kind: ViolationKind::Pattern(service_common::validation::unanchored(pattern)),
+            ..violation.clone()
         },
-        None => without_query,
+        _ => violation.clone(),
     }
 }
 
@@ -351,9 +396,12 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for InstanceGate<Eng> {
                 }
                 // No instance named: the association an `InstanceUserArn` identifies is on
                 // an instance too, so for a route that declares one THAT is what the request
-                // names, and it is resolved against this account's own associations.
+                // names, and it is resolved against this account's own associations — in the
+                // scope `ctx` identifies, which is why the context is threaded here exactly
+                // as it is into the instance half above.
                 None => crate::state::instance_user_refusal(
                     &*self.engine,
+                    ctx,
                     named_resource_arn(req, self.route.arn_member).as_deref(),
                 ),
             };

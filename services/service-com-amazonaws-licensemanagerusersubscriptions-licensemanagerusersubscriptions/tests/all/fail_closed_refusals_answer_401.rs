@@ -19,7 +19,9 @@
 //!   the `InstanceUserArn` that identifies an association on an instance. So an ARN this
 //!   account's store holds no association for is refused identically whether or not it
 //!   satisfies that member's modelled `@pattern` — a client that handles the denial is not
-//!   handed a constraint violation instead.
+//!   handed a constraint violation instead. The SCOPE the ARN is read in is the request's
+//!   own: an ARN naming another account, or another Region than the request is signed for,
+//!   addresses nothing this store holds here and is refused the same way.
 //! * **Neither decision is a blanket refusal**: an association that IS held, addressed by
 //!   the `InstanceUserArn` alone, is served and observable afterwards; and a request that
 //!   names an instance the account holds is decided on that instance, so its malformed ARN
@@ -362,6 +364,10 @@ fn unheld_association_arns() -> Vec<(&'static str, String)> {
         (
             "a well-formed ARN in another account",
             format!("arn:aws:{SIGNING_NAME}:{REGION}:111111111111:instance-user/iu-000000000001"),
+        ),
+        (
+            "a well-formed ARN in another Region than the request is signed for",
+            format!("arn:aws:{SIGNING_NAME}:eu-central-1:{ACCOUNT}:instance-user/iu-000000000001"),
         ),
         (
             "a user-association ARN: two slashes in the resource part",

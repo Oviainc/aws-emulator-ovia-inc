@@ -3224,6 +3224,22 @@ fn attribute_names<'a>(attributes: &[(&'a str, Option<&str>)]) -> Vec<&'a str> {
     attributes.iter().map(|(name, _)| *name).collect()
 }
 
+/// How this service refuses a `Filter.Attribute` naming an attribute the list operation
+/// it was sent to does not filter on.
+///
+/// The template is the service's: the fixed text `Invalid Filter attribute ` followed by
+/// the ONE variable part — the rejected attribute name, copied from the request's
+/// `Filter.Attribute` exactly as it arrived. The set of attributes the operation DOES
+/// accept is not part of it: the refusal states what the request asked for, and the
+/// filterable set is what the operation's documentation advertises.
+///
+/// ONE wording for every list operation of this service, because every one of them reaches
+/// it through [`parse_filter`]: which attributes are filterable differs per operation, how
+/// an unfilterable one is refused does not.
+pub fn invalid_filter_attribute(attribute: &str) -> String {
+    format!("Invalid Filter attribute {attribute}")
+}
+
 /// Resolve one filter against the attributes a list operation exposes: which attribute it
 /// names (by index) and which comparison it asks for.
 fn parse_filter(
@@ -3238,12 +3254,7 @@ fn parse_filter(
     let index = attribute_names
         .iter()
         .position(|name| *name == attribute)
-        .ok_or_else(|| {
-            StateError::Validation(format!(
-                "Filter.Attribute {attribute} is not filterable; supported attributes: {}",
-                attribute_names.join(", ")
-            ))
-        })?;
+        .ok_or_else(|| StateError::Validation(invalid_filter_attribute(attribute)))?;
     // An absent operation is equality: the filter is then just an attribute/value pair.
     let spelling = filter.operation.as_deref().unwrap_or("eq");
     let folded = spelling.to_ascii_lowercase();
@@ -3275,6 +3286,33 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState>)
 }
 
+/// Whether `arn` addresses a resource of the account and Region THIS request is for.
+///
+/// An ARN carries both (`arn:<partition>:<vendor>:<region>:<account>:<resource>`), and
+/// every ARN this service mints carries the Region the request was signed for together with
+/// this emulator's account id ([`resource_arn`]). So the scope a request-supplied ARN is
+/// read in is taken from the REQUEST — its SigV4 credential scope, through
+/// [`request_region`], and the account this process serves — rather than believed from the
+/// ARN: an ARN naming another account or another Region addresses nothing this account's
+/// store holds in this Region, and is not an identifier whose resource can be shown to be
+/// the caller's.
+///
+/// The ARN is read through `service_common::arn::parse`, the one parse in this tree, so this
+/// service cannot disagree with another about what an ARN is: `false` for a value that is
+/// not a well-formed resource ARN, which is the same answer for the same reason — such a
+/// value identifies nothing. The VENDOR field is not matched here: an ARN of another service
+/// names no user association of this one either, and the store lookup is what decides that.
+fn addresses_request_scope(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    arn: &str,
+) -> bool {
+    let Some(parsed) = ::service_common::arn::parse(arn) else {
+        return false;
+    };
+    parsed.region == request_region(&ctx.parts().headers)
+        && parsed.account == ::engine::emulator_account_id()
+}
+
 /// THE GATE for a request that names a user association by its `InstanceUserArn`: `None`
 /// when the request goes on — either because it names no association, or because the
 /// account's store holds the one it names — and the fail-closed refusal otherwise.
@@ -3288,6 +3326,12 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// and the sentence are not restated here and the two layers cannot answer one refusal two
 /// ways.
 ///
+/// The SCOPE the ARN is read in comes from `ctx`, exactly as the instance half takes the
+/// Region it asks EC2 in from there: an ARN outside the account and Region the request is
+/// for is refused before the store is consulted at all
+/// ([`addresses_request_scope`]). `ctx` is required rather than optional so that scoping is
+/// a fact about the signature instead of a promise in this comment.
+///
 /// A READ: nothing is materialised and nothing is written. An association whose teardown the
 /// clock already owes is still held here, so the gate lets such a request through to the
 /// handler, which materialises what is due and answers this very refusal for it. `None` when
@@ -3295,9 +3339,13 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// here, and the handler reports that as the server failure it is.
 pub fn instance_user_refusal<Eng: Send + Sync + 'static>(
     engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
     instance_user_arn: Option<&str>,
 ) -> Option<crate::scaffolded::ServiceRefusal> {
     let arn = instance_user_arn?;
+    if !addresses_request_scope(ctx, arn) {
+        return Some(crate::scaffolded::ServiceRefusal::unauthorized());
+    }
     let state = service_state(engine)?;
     let held = state
         .lock()
