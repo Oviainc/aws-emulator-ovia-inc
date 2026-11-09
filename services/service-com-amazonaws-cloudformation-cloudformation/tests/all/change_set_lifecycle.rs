@@ -1073,6 +1073,10 @@ async fn a_change_set_is_deleted_by_request_by_execution_and_with_its_stack() {
     );
 
     create_creating_change_set(&router, "dropped", "dropped-set", template).await;
+    // A plan CloudFormation is still computing is not one it discards, so the change set's
+    // own creation is settled first — `change_set_status_refusals.rs` is where that refusal
+    // is held to its wording.
+    settle_the_store(&router, &engine).await;
     let (code, body) = call(
         &router,
         "DeleteChangeSet",

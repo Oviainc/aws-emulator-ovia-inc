@@ -552,19 +552,18 @@ async fn reported_status(
 /// The suffix of every status a stack is still being worked on in.
 const IN_PROGRESS_SUFFIX: &str = "_IN_PROGRESS";
 
-/// The two statuses that are the stack as the declaration asked for it: its creation and its
-/// update completed. Every other settled status is a stack that did not come up — a failure,
-/// or a rollback that undid what was asked.
-const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
-const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
-const IMPORT_COMPLETE: &str = "IMPORT_COMPLETE";
-
 /// The status a stack whose deletion has completed reports.
 const DELETE_COMPLETE: &str = "DELETE_COMPLETE";
 
-/// Whether a settled status is the stack as the declaration asked for it.
+/// Whether a settled status is the stack as the declaration asked for it — its creation, its
+/// update or its import completed. Every other settled status is a stack that did not come up
+/// — a failure, or a rollback that undid what was asked.
+///
+/// The one reading of that, shared with the change set whose execution ends in what the stack
+/// operation it started ended in ([`crate::state::operation_carried_through`]), so the two
+/// cannot drift when a status is added.
 fn settled_as_asked(status: &str) -> bool {
-    matches!(status, CREATE_COMPLETE | UPDATE_COMPLETE | IMPORT_COMPLETE)
+    crate::state::operation_carried_through(status)
 }
 
 /// What the PARENT's resource reports for a nested stack that did not come up: the child's
@@ -887,9 +886,9 @@ mod tests {
     fn the_child_status_decides_what_the_parent_reports() {
         let rows: &[(&str, &str, bool, bool)] = &[
             ("a creation still running", "CREATE_IN_PROGRESS", false, false),
-            ("a creation that completed", CREATE_COMPLETE, true, false),
-            ("an update that completed", UPDATE_COMPLETE, true, false),
-            ("an import that completed", IMPORT_COMPLETE, true, false),
+            ("a creation that completed", crate::state::status::CREATE_COMPLETE, true, false),
+            ("an update that completed", crate::state::status::UPDATE_COMPLETE, true, false),
+            ("an import that completed", crate::state::status::IMPORT_COMPLETE, true, false),
             ("a creation that failed", "CREATE_FAILED", false, true),
             ("a creation that rolled back", "ROLLBACK_COMPLETE", false, true),
             (

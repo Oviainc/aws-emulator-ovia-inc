@@ -1292,7 +1292,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status_reason: settles_to.2,
                 execution_status: Some(settles_to.1.to_string()),
                 due_at: now + crate::state::STATUS_TRANSITION_DELAY,
+                // Creating a change set is CloudFormation's own work on the plan, not a
+                // stack operation, so its conclusion waits for nothing but its own clock.
+                awaits_the_stack: false,
             }),
+            // Nothing has executed this plan, so there is nothing of it to discard yet.
+            plan_discarded: false,
             changes,
             // The Hook invocations CloudFormation would plan while creating this change
             // set: none, because nothing here can activate a Hook or configure one to

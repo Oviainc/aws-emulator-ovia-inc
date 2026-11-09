@@ -4,10 +4,14 @@
 //! IMPLEMENTED: drops the named change set from this service's store, so a later
 //! `DescribeChangeSet` for it answers the modelled 404. Deleting a change set that is not
 //! there succeeds and changes nothing — the model declares no not-found error for this
-//! operation, and the request asks for a state the store is already in — and so does
-//! deleting one that has already been executed, which the recorded CloudFormation
-//! responses answer 200 for. The stack the change set described is never touched: deleting
-//! a change set discards a plan, not a stack.
+//! operation, and the request asks for a state the store is already in. A plan
+//! CloudFormation is still working on — one whose creation has not concluded, or one whose
+//! execution is being applied to the stack — is refused with the modelled
+//! `InvalidChangeSetStatusException`; and a change set something has EXECUTED keeps the
+//! record of that execution, so a call asking for it to be executed again is still answered
+//! on its execution status ([`crate::state::StoredChangeSet::plan_discarded`]). The stack
+//! the change set described is never touched: deleting a change set discards a plan, not a
+//! stack.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +172,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Ok(DeleteChangeSetOutput {});
         };
-        // A change set being executed is being applied to the stack, so the plan is no
-        // longer anyone's to discard: that is the case `InvalidChangeSetStatusException`
-        // documents. A change set whose execution has COMPLETED is deletable — the
-        // recorded CloudFormation responses answer 200 for one.
-        if change_set.execution_status == crate::state::execution_status::EXECUTE_IN_PROGRESS {
+        // CloudFormation will not discard a plan it is still working on: one whose CREATION
+        // has not concluded is a change set it is still computing, and one whose EXECUTION
+        // is under way is a plan it is applying to the stack right now — the two states the
+        // model's own `InvalidChangeSetStatusException` names ("the change set status might
+        // be CREATE_IN_PROGRESS, or the stack status might be UPDATE_IN_PROGRESS"). The
+        // refusal names the execution status the change set is in, which is its only
+        // variable part.
+        if !change_set.creation_settled() || change_set.execution_in_flight() {
             return Err(
                 DeleteChangeSetErrorModeled::InvalidChangeSetStatusException(
                     InvalidChangeSetStatusException {
-                        message: Some(format!(
-                            "ChangeSet [{}] cannot be deleted while its execution status is \
-                             [{}]",
-                            change_set.change_set_id, change_set.execution_status
+                        message: Some(crate::state::cannot_delete_change_set(
+                            &change_set.execution_status,
                         )),
                     },
                 )
@@ -187,6 +192,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         let change_set_id = change_set.change_set_id.clone();
+        // A change set something has EXECUTED has had its plan applied to the stack: the
+        // plan is discarded here like any other, but the record that the stack took that
+        // change is not, so a later call asking for it to be executed again is answered on
+        // that execution rather than told the change set never existed
+        // ([`crate::state::StoredChangeSet::plan_discarded`]).
+        let executed = change_set.execution_began();
+        if executed {
+            if let Some(discarded) = store.resolve_change_set_mut(&region, &change_set_id, None) {
+                discarded.plan_discarded = true;
+            }
+            return Ok(DeleteChangeSetOutput {});
+        }
         store
             .change_sets
             .retain(|candidate| candidate.change_set_id != change_set_id);

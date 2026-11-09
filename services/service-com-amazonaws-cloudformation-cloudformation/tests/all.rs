@@ -51,6 +51,8 @@ mod change_set_lifecycle;
 mod change_set_preview;
 #[path = "all/change_set_recreation.rs"]
 mod change_set_recreation;
+#[path = "all/change_set_status_refusals.rs"]
+mod change_set_status_refusals;
 #[path = "all/client_request_tokens.rs"]
 mod client_request_tokens;
 #[path = "all/cloudformation_ec2_instance_rollback.rs"]

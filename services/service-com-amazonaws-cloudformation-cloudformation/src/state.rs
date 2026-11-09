@@ -1047,6 +1047,22 @@ pub mod status {
     pub const IMPORT_ROLLBACK_COMPLETE: &str = "IMPORT_ROLLBACK_COMPLETE";
 }
 
+/// Whether a stack operation that left the stack in `status` CARRIED THROUGH the change it
+/// was applying.
+///
+/// The completed create, update and import are the statuses an operation reaches having made
+/// the change it set out to make; a failure, and the rollback of one, are statuses the stack
+/// reaches with that change NOT applied. What the EXECUTION of a change set ends in follows
+/// this: executing a change set is the stack operation it starts, so the model's
+/// `EXECUTE_COMPLETE` belongs to one whose operation carried the change through and
+/// `EXECUTE_FAILED` to one whose did not ([`StoredChangeSet::settle`]).
+pub fn operation_carried_through(status: &str) -> bool {
+    matches!(
+        status,
+        status::CREATE_COMPLETE | status::UPDATE_COMPLETE | status::IMPORT_COMPLETE
+    )
+}
+
 /// Whether a stack carrying `status` is in a STABLE state — one a rollback can put it back
 /// to.
 ///
@@ -1272,6 +1288,16 @@ pub const MAX_CHANGE_SETS_PER_STACK: usize = 20;
 /// templates, so the store carries a second, global bound on the same records. Chosen,
 /// like every count here, and far above any client workflow.
 pub const MAX_CHANGE_SETS: usize = 2_000;
+
+/// The most DISCARDED change sets this service keeps.
+///
+/// Deleting a change set that has been executed discards its plan and keeps the record of
+/// that execution ([`StoredChangeSet::plan_discarded`]), so that record outlives the call
+/// that discarded it. The count of them is bounded here — oldest reclaimed first
+/// ([`ComAmazonawsCloudformationCloudformationState::reclaim_discarded_change_sets`]) — so a
+/// caller repeating create, execute and delete cannot fill the store with records nothing
+/// reads any more. Chosen, like every count here, and far above any client workflow.
+pub const MAX_DISCARDED_CHANGE_SETS_RETAINED: usize = 200;
 
 /// A resolved stack parameter: the key and the value in force on the stack.
 ///
@@ -1797,6 +1823,9 @@ pub use service_role_trust::*;
 /// The CONFIGURATION one stack operation runs under: its `DeploymentConfig` and its
 /// `RollbackConfiguration` ([`operation_configuration`]).
 mod operation_configuration;
+/// The change-set RECORD and the decisions that read its statuses ([`change_set`]).
+mod change_set;
+pub use change_set::*;
 pub use operation_configuration::*;
 
 pub use stack_nesting::Nesting;
@@ -1815,230 +1844,6 @@ pub(crate) use stack::failed_status_of;
 /// property-level detail behind each entry, which [`change_plan::computed_changes`]
 /// computes once where the change set is created.
 pub use change_plan::{StackRevision, StoredChangeDetail, StoredResourceChange};
-
-/// The change-set statuses a change set's creation is headed for, and the instant they
-/// are due.
-///
-/// `CreateChangeSet` answers while CloudFormation is still computing the change set ("After
-/// the CreateChangeSet call successfully completes, CloudFormation starts creating the
-/// change set"), so the terminal `Status`/`ExecutionStatus` pair is recorded as due a
-/// moment later and materialised by [`StoredChangeSet::settle`].
-#[derive(Debug, Clone)]
-pub struct PendingChangeSetStatus {
-    /// The `ChangeSetStatus` that becomes due, if this transition moves it.
-    pub status: Option<String>,
-    /// The `StatusReason` that comes with that status (the reason a creation that would
-    /// change nothing failed, say).
-    pub status_reason: Option<String>,
-    /// The `ExecutionStatus` that becomes due, if this transition moves it.
-    pub execution_status: Option<String>,
-    pub due_at: SystemTime,
-}
-
-/// One change set, as this emulator persists it.
-///
-/// The change set owns the template and the configuration the request submitted;
-/// `ExecuteChangeSet` is what copies them onto the stack. Nothing here is derived on a
-/// read: the change list is computed once, when the change set is created.
-#[derive(Debug, Clone)]
-pub struct StoredChangeSet {
-    pub change_set_id: String,
-    pub change_set_name: String,
-    /// The stack this change set belongs to, by id: a change set outlives its stack's
-    /// name changes and is never re-keyed.
-    pub stack_id: String,
-    pub stack_name: String,
-    /// `ChangeSetType`: `CREATE` for a change set that creates its stack, `UPDATE` for one
-    /// that updates an existing stack.
-    pub change_set_type: String,
-    pub description: Option<String>,
-    /// The template the change set would put on the stack, as the request submitted it:
-    /// the `Original` stage `GetTemplate` serves for this change set.
-    pub template_body: String,
-    /// The PROCESSED stage of that body — the document this change set would actually
-    /// deploy — computed ONCE when the change set was created, like
-    /// [`StoredStack::processed_template`]. It is what the change list was planned from,
-    /// what `GetTemplate(TemplateStage=Processed)` serves for this change set and what
-    /// `ExecuteChangeSet` puts on the stack, so the plan a caller reviews and the
-    /// deployment that is carried out are the same document. `Processed::Unavailable` for a
-    /// transform this service cannot apply, which is why such a change set settles to
-    /// `FAILED`.
-    pub processed_template: template::Processed,
-    pub parameters: Vec<StoredParameter>,
-    pub capabilities: Vec<String>,
-    pub tags: Vec<StoredTag>,
-    pub notification_arns: Vec<String>,
-    pub role_arn: Option<String>,
-    pub rollback_configuration: Option<StoredRollbackConfiguration>,
-    pub deployment_config: Option<StoredDeploymentConfig>,
-    pub deployment_mode: Option<String>,
-    pub resource_types: Vec<String>,
-    pub on_stack_failure: Option<String>,
-    pub include_nested_stacks: bool,
-    pub import_existing_resources: bool,
-    pub client_token: Option<String>,
-    pub creation_time: SystemTime,
-    /// The model's `ChangeSetStatus`.
-    pub status: String,
-    pub status_reason: Option<String>,
-    /// The model's `ExecutionStatus`.
-    pub execution_status: String,
-    /// `DescribeChangeSetOutput$StackDriftStatus`: "the drift status of the stack WHEN THE
-    /// CHANGE SET WAS CREATED" — so it is captured off the stack here, at creation, and
-    /// never re-read later.
-    pub stack_drift_status: String,
-    pub pending: Option<PendingChangeSetStatus>,
-    pub changes: Vec<StoredResourceChange>,
-    /// The Hook invocations planned for this change set, in the order they were planned,
-    /// so `DescribeChangeSetHooks` pages over them deterministically (see
-    /// [`change_set_hooks`]). Bounded at [`change_set_hooks::MAX_CHANGE_SET_HOOKS`],
-    /// oldest reclaimed first.
-    pub hooks: Vec<change_set_hooks::StoredChangeSetHook>,
-}
-
-impl StoredChangeSet {
-    /// Record one planned Hook invocation on this change set. The oldest record is
-    /// reclaimed past [`change_set_hooks::MAX_CHANGE_SET_HOOKS`], so the store cannot grow
-    /// without limit.
-    ///
-    /// This is the ONLY way a record enters a change set's plan, and
-    /// [`change_set_hooks`] is where what can and cannot plan one is written down.
-    pub fn plan_hook(&mut self, hook: change_set_hooks::StoredChangeSetHook) {
-        let over_the_bound = (self.hooks.len() + 1)
-            .saturating_sub(change_set_hooks::MAX_CHANGE_SET_HOOKS);
-        if over_the_bound > 0 {
-            // One shift for however many records the bound reclaims, rather than one per
-            // record.
-            self.hooks.drain(..over_the_bound);
-        }
-        self.hooks.push(hook);
-    }
-
-    /// The `ChangeSetHooksStatus` this change set's Hook plan is in
-    /// ([`change_set_hooks::hooks_status`]).
-    ///
-    /// The plan is computed as part of creating the change set, so its status follows that
-    /// creation: `PLANNING` while the creation is still in flight, `PLANNED` once it has
-    /// completed and the plan it computed is what a read reports, and `UNAVAILABLE` for a
-    /// change set whose creation did not complete, which has no computed plan to report.
-    pub fn hooks_status(&self) -> &'static str {
-        match self.status.as_str() {
-            change_set_status::CREATE_PENDING => change_set_hooks::hooks_status::PLANNING,
-            change_set_status::CREATE_COMPLETE => change_set_hooks::hooks_status::PLANNED,
-            _ => change_set_hooks::hooks_status::UNAVAILABLE,
-        }
-    }
-    /// Materialise the change-set transition the clock has already made due, if any, and
-    /// answer the instant it was due at — which is when the change set reached the status
-    /// it now carries, and so when the operation that was creating it concluded
-    /// ([`StoredStack::conclude_change_set_operation`]). `None` when nothing was due.
-    ///
-    /// Like [`StoredStack::settle`], it only ever applies a transition whose due instant
-    /// has passed: it reports what was owed at `now` even if nobody had called.
-    pub fn settle(&mut self, now: SystemTime) -> Option<SystemTime> {
-        if self.pending.as_ref().is_none_or(|p| p.due_at > now) {
-            return None;
-        }
-        let pending = self.pending.take().expect("checked just above");
-        if let Some(status) = pending.status {
-            self.status = status;
-            self.status_reason = pending.status_reason;
-        }
-        if let Some(execution_status) = pending.execution_status {
-            self.execution_status = execution_status;
-        }
-        Some(pending.due_at)
-    }
-
-    /// Whether `ExecuteChangeSet` can apply this change set: CloudFormation executes a
-    /// change set only once its creation has completed and nothing has executed it yet
-    /// (`InvalidChangeSetStatusException`: "the change set status might be
-    /// CREATE_IN_PROGRESS").
-    pub fn is_executable(&self) -> bool {
-        self.status == change_set_status::CREATE_COMPLETE
-            && self.execution_status == execution_status::AVAILABLE
-    }
-
-    /// The body `GetTemplate(TemplateStage=Processed)` serves for this change set, or `None`
-    /// when this service could not compute that stage from the submitted body.
-    pub fn processed_template_body(&self) -> Option<&str> {
-        self.processed_template.body(&self.template_body)
-    }
-
-    /// Whether the change set's own creation has settled.
-    ///
-    /// `GetTemplate`: "For change sets, the Original template is always available. After
-    /// CloudFormation finishes creating the change set, the Processed template becomes
-    /// available" — so the processed stage is serveable only once the creation this store
-    /// answered `CREATE_PENDING` has reached its terminal status.
-    pub fn creation_settled(&self) -> bool {
-        self.status != change_set_status::CREATE_PENDING
-    }
-
-    /// The first attribute this stored change set states differently from a request that
-    /// re-creates its name, spelled as the change set's OWN attribute, or `None` when the
-    /// request submits the very same change set.
-    ///
-    /// What `CreateChangeSet` answers for a name the stack already carries depends on this
-    /// comparison, not on the name alone: re-submitting the same plan under the same name is
-    /// the same change set (which is what makes a retried create idempotent), while one
-    /// whose attributes differ cannot be created, and the refusal names the attribute that
-    /// differs — "cannot be created due to a mismatch with existing attribute `<attribute>`".
-    ///
-    /// The attributes are the change set's own, in the order this function compares them;
-    /// its id, its stack, its creation time and its status are not submitted attributes and
-    /// are not compared. An attribute is named as the SERVICE names it, which is the request
-    /// member's name wherever one member carries one attribute — and `Template` for the
-    /// template the change set would put on the stack, which three request members
-    /// (`TemplateBody`, `TemplateURL`, `UsePreviousTemplate`) are three ways of stating, so
-    /// naming any one of them would name a member the conflicting request need not have
-    /// carried at all.
-    pub fn mismatching_attribute(
-        &self,
-        submitted: &SubmittedChangeSet<'_>,
-    ) -> Option<&'static str> {
-        let comparisons: [(&'static str, bool); 14] = [
-            ("ChangeSetType", self.change_set_type == submitted.change_set_type),
-            (
-                "Parameters",
-                same_parameters(&self.parameters, submitted.parameters),
-            ),
-            ("Template", self.template_body == submitted.template_body),
-            ("Capabilities", self.capabilities == submitted.capabilities),
-            ("ResourceTypes", self.resource_types == submitted.resource_types),
-            ("RoleARN", self.role_arn.as_deref() == submitted.role_arn),
-            (
-                "RollbackConfiguration",
-                self.rollback_configuration.as_ref() == submitted.rollback_configuration,
-            ),
-            (
-                "NotificationARNs",
-                self.notification_arns == submitted.notification_arns,
-            ),
-            ("Tags", same_tags(&self.tags, submitted.tags)),
-            ("Description", self.description.as_deref() == submitted.description),
-            (
-                "OnStackFailure",
-                self.on_stack_failure.as_deref() == submitted.on_stack_failure,
-            ),
-            (
-                "IncludeNestedStacks",
-                self.include_nested_stacks == submitted.include_nested_stacks,
-            ),
-            (
-                "ImportExistingResources",
-                self.import_existing_resources == submitted.import_existing_resources,
-            ),
-            (
-                "DeploymentMode",
-                self.deployment_mode.as_deref() == submitted.deployment_mode,
-            ),
-        ];
-        comparisons
-            .into_iter()
-            .find_map(|(attribute, agrees)| (!agrees).then_some(attribute))
-    }
-}
 
 /// Whether two parameter sets state the same values: `Parameters` is a SET keyed by
 /// `ParameterKey`, so two requests that list the same pairs in two orders submit the same
@@ -2244,8 +2049,35 @@ impl ComAmazonawsCloudformationCloudformationState {
         // what carries the status that creation reached: an operation whose change set has
         // just settled concluded at the instant that settlement was due.
         let mut settled_change_sets: Vec<(String, String, String, SystemTime)> = Vec::new();
+        // What each stack is doing, now that the stacks above have settled: a change set's
+        // EXECUTION is the stack operation it started, so it is neither concluded while that
+        // operation runs nor concluded in a status the operation's own outcome contradicts
+        // ([`StoredChangeSet::settle`]). Disjoint fields: the map borrows `stacks`, the loop
+        // mutates `change_sets`.
+        let progress: ::std::collections::HashMap<&str, StackProgress> = self
+            .stacks
+            .iter()
+            .map(|stack| {
+                (
+                    stack.stack_id.as_str(),
+                    StackProgress {
+                        operation_in_flight: stack.pending.is_some(),
+                        carried_through: operation_carried_through(&stack.status),
+                    },
+                )
+            })
+            .collect();
         for change_set in &mut self.change_sets {
-            if let Some(at) = change_set.settle(now) {
+            // A change set whose stack this store no longer holds has no operation to wait
+            // for: whatever its own clock owed is applied.
+            let stack = progress
+                .get(change_set.stack_id.as_str())
+                .copied()
+                .unwrap_or(StackProgress {
+                    operation_in_flight: false,
+                    carried_through: true,
+                });
+            if let Some(at) = change_set.settle(now, stack) {
                 settled_change_sets.push((
                     change_set.stack_id.clone(),
                     change_set.change_set_id.clone(),
@@ -2905,6 +2737,37 @@ impl ComAmazonawsCloudformationCloudformationState {
             .collect();
         self.change_sets
             .retain(|change_set| live.contains(change_set.stack_id.as_str()));
+        self.reclaim_discarded_change_sets();
+    }
+
+    /// Drop the oldest DISCARDED change sets past
+    /// [`MAX_DISCARDED_CHANGE_SETS_RETAINED`].
+    ///
+    /// Retention, not a mutation a caller asked for: a discarded plan is over the bound the
+    /// moment the delete that pushed the count past it was answered, whether or not anybody
+    /// called. All that is left of such a record is the execution it carries
+    /// ([`StoredChangeSet::plan_discarded`]), so this is what keeps a caller that creates,
+    /// executes and discards change sets in a loop from filling the store with them. Plans
+    /// nothing discarded are never touched.
+    fn reclaim_discarded_change_sets(&mut self) {
+        let discarded = self
+            .change_sets
+            .iter()
+            .filter(|change_set| change_set.plan_discarded)
+            .count();
+        if discarded <= MAX_DISCARDED_CHANGE_SETS_RETAINED {
+            return;
+        }
+        let mut over = discarded - MAX_DISCARDED_CHANGE_SETS_RETAINED;
+        // `change_sets` is in creation order, so the oldest discarded records are the ones
+        // this walk reaches first.
+        self.change_sets.retain(|change_set| {
+            if over > 0 && change_set.plan_discarded {
+                over -= 1;
+                return false;
+            }
+            true
+        });
     }
 
     /// The change sets of one stack, in creation order: what `ListChangeSets` reports and
@@ -2915,7 +2778,7 @@ impl ComAmazonawsCloudformationCloudformationState {
     ) -> impl Iterator<Item = &'a StoredChangeSet> {
         self.change_sets
             .iter()
-            .filter(move |change_set| change_set.stack_id == stack_id)
+            .filter(move |change_set| change_set.stack_id == stack_id && !change_set.plan_discarded)
     }
 
     /// Resolve the `ChangeSetName` input member, which CloudFormation accepts as either a
@@ -2946,18 +2809,61 @@ impl ComAmazonawsCloudformationCloudformationState {
             .map(|index| &mut self.change_sets[index])
     }
 
+    /// [`Self::resolve_change_set`] for `ExecuteChangeSet`, which also addresses a change
+    /// set whose PLAN has been discarded.
+    ///
+    /// Deleting a change set whose execution had already been carried out discards the plan
+    /// a read reports, but the execution it performed stays the stack's history
+    /// ([`StoredChangeSet::plan_discarded`]): a call asking for that change set to be
+    /// executed again is therefore refused on the execution status it is in, where a read of
+    /// the discarded plan answers the modelled not-found.
+    ///
+    /// A LIVE change set always wins: the name of a discarded plan is free again — nothing
+    /// lists or reads it — so a caller may create another change set under it, and that new
+    /// plan is the one this call is about. The discarded record answers only where no plan of
+    /// that name is there to execute.
+    pub fn resolve_executed_change_set(
+        &self,
+        region: &str,
+        name_or_id: &str,
+        stack_name_or_id: Option<&str>,
+    ) -> Option<&StoredChangeSet> {
+        self.change_set_position_among(region, name_or_id, stack_name_or_id, false)
+            .or_else(|| {
+                self.change_set_position_among(region, name_or_id, stack_name_or_id, true)
+            })
+            .map(|index| &self.change_sets[index])
+    }
+
     fn change_set_position(
         &self,
         region: &str,
         name_or_id: &str,
         stack_name_or_id: Option<&str>,
     ) -> Option<usize> {
+        self.change_set_position_among(region, name_or_id, stack_name_or_id, false)
+    }
+
+    /// [`Self::change_set_position`] among the records whose plan is there (`discarded` =
+    /// `false`) or among the records whose plan was discarded (`discarded` = `true`), which
+    /// only [`Self::resolve_executed_change_set`] asks for.
+    ///
+    /// The LAST matching record answers, so where one name has been used again the most
+    /// recent change set under it is the one addressed.
+    fn change_set_position_among(
+        &self,
+        region: &str,
+        name_or_id: &str,
+        stack_name_or_id: Option<&str>,
+        discarded: bool,
+    ) -> Option<usize> {
+        let wanted = |change_set: &StoredChangeSet| change_set.plan_discarded == discarded;
         // The change set's own ARN identifies it; a stack named beside it must be the
         // stack it belongs to, or the pair names nothing.
         if let Some(index) = self
             .change_sets
             .iter()
-            .position(|change_set| change_set.change_set_id == name_or_id)
+            .rposition(|change_set| change_set.change_set_id == name_or_id && wanted(change_set))
         {
             let change_set = &self.change_sets[index];
             // The change set is this Region's only where the stack it plans changes for
@@ -2972,8 +2878,10 @@ impl ComAmazonawsCloudformationCloudformationState {
         // set, you must also specify the stack name").
         let stack_name_or_id = stack_name_or_id?;
         let stack_id = self.resolve(region, stack_name_or_id)?.stack_id.clone();
-        self.change_sets.iter().position(|change_set| {
-            change_set.stack_id == stack_id && change_set.change_set_name == name_or_id
+        self.change_sets.iter().rposition(|change_set| {
+            change_set.stack_id == stack_id
+                && change_set.change_set_name == name_or_id
+                && wanted(change_set)
         })
     }
 
@@ -3884,6 +3792,43 @@ pub fn new_stack_refactor_id() -> String {
 /// that ARN.
 pub fn change_set_does_not_exist(name_or_id: &str) -> String {
     format!("ChangeSet [{name_or_id}] does not exist")
+}
+
+/// The `InvalidChangeSetStatusException` message CloudFormation answers a `DeleteChangeSet`
+/// for a change set whose plan it will not discard — one it is still computing, or one it is
+/// applying to the stack right now.
+///
+/// The execution status the change set is in is the message's ONLY variable part: the change
+/// set this refusal is about is the one the request named, so the sentence does not name it
+/// again.
+pub fn cannot_delete_change_set(execution_status: &str) -> String {
+    format!("Cannot delete ChangeSet in execution status {execution_status}")
+}
+
+/// The `InvalidChangeSetStatusException` message CloudFormation answers an
+/// `ExecuteChangeSet` whose change set has already been executed — whose EXECUTION status,
+/// not whose change-set status, is what refuses the call ([`StoredChangeSet::execution_began`]).
+///
+/// The two variable parts are the change set's own ARN and the `ExecutionStatus` it is in;
+/// [`change_set_not_executable_in_status`] is the companion template for a change set whose
+/// CREATION never put it in a state anything could execute.
+pub fn change_set_not_executable_in_execution_status(
+    change_set_id: &str,
+    execution_status: &str,
+) -> String {
+    format!(
+        "ChangeSet [{change_set_id}] cannot be executed in its current execution status of \
+         [{execution_status}]"
+    )
+}
+
+/// The `InvalidChangeSetStatusException` message CloudFormation answers an
+/// `ExecuteChangeSet` whose change set's own `ChangeSetStatus` — its creation's outcome —
+/// leaves nothing to execute ("the change set status might be CREATE_IN_PROGRESS").
+///
+/// The two variable parts are the change set's own ARN and the `ChangeSetStatus` it is in.
+pub fn change_set_not_executable_in_status(change_set_id: &str, status: &str) -> String {
+    format!("ChangeSet [{change_set_id}] cannot be executed in its current status of [{status}]")
 }
 
 /// The message CloudFormation answers when a request would act on a stack whose current

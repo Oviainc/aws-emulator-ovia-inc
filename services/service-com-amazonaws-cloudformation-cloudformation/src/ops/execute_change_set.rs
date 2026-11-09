@@ -334,8 +334,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
 
+            // A change set whose plan a `DeleteChangeSet` discarded is resolved here too: it
+            // was discarded only because it had already been EXECUTED, and that execution is
+            // what refuses this call — a client asking for an applied change to be applied
+            // again is told it has run, not that it never existed.
             let change_set = store
-                .resolve_change_set(
+                .resolve_executed_change_set(
                     &request_region,
                     &input.change_set_name,
                     input.stack_name.as_deref(),
@@ -363,16 +367,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The specified change set can't be used to update the stack. For example,
             // the change set status might be CREATE_IN_PROGRESS": a change set is
             // executable only once its creation has completed and nothing has executed it
-            // yet.
-            if !change_set.is_executable() {
+            // yet. The refusal names the member that REFUSES the call — the change set's
+            // own status, or the EXECUTION status of a plan something was already applied
+            // for ([`crate::state::StoredChangeSet::not_executable_refusal`]).
+            if let Some(message) = change_set.not_executable_refusal() {
                 return Err(
                     ExecuteChangeSetErrorModeled::InvalidChangeSetStatusException(
                         InvalidChangeSetStatusException {
-                            message: Some(format!(
-                                "ChangeSet [{}] cannot be executed in its current status \
-                                 of [{}]",
-                                change_set.change_set_id, change_set.status
-                            )),
+                            message: Some(message),
                         },
                     )
                     .into(),
@@ -760,7 +762,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 other.stack_id != stack_id || other.change_set_id == change_set_id
             });
             // The change set is executing now and reaches EXECUTE_COMPLETE with the stack
-            // it applied, on the same due instant.
+            // it applied: its execution is finished when the stack operation it started is,
+            // so a stack held past this span — by a wait condition nobody has signalled, or
+            // by a resource its owning service has not reported ready — keeps the change set
+            // in EXECUTE_IN_PROGRESS for as long as it reports that operation in flight.
             if let Some(change_set) =
                 store.resolve_change_set_mut(&request_region, &change_set_id, None)
             {
@@ -770,6 +775,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status_reason: None,
                     execution_status: Some(execution_status::EXECUTE_COMPLETE.to_string()),
                     due_at: now + crate::state::STATUS_TRANSITION_DELAY,
+                    awaits_the_stack: true,
                 });
             }
             (
