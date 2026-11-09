@@ -184,9 +184,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let registry_id = crate::state::identifier_to_id(&input.registry_id);
         let Some(registry) = state.registries.get(registry_id) else {
+            // The identifier is stated back exactly as the request supplied it — the
+            // model's `RegistryIdentifier` accepts either the ARN or the bare id, and the
+            // one that resolved to nothing is the one the caller sent.
             return Err(GetRegistryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("registry {registry_id} was not found")),
+                    message: Some(format!(
+                        "Registry with ARN {} not found.",
+                        input.registry_id
+                    )),
                 },
             )
             .into());

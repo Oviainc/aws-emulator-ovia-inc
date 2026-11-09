@@ -184,21 +184,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `clientToken` is an @idempotencyToken: "If this token matches a previous
         // request, the service ignores the request, but does not return an error" — so a
-        // replay answers with the ARN the first call minted and creates nothing. The
-        // registry it named is looked up, so once that registry has been deleted the
-        // token names nothing and this call falls through to a fresh create.
-        if let Some(token) = input.client_token.as_deref().filter(|t| !t.is_empty()) {
-            if let Some(arn) = state
-                .idempotent_answer(Self::NAME, token)
-                .map(str::to_string)
-            {
-                if state
-                    .registries
-                    .values()
-                    .any(|registry| registry.registry_arn == arn)
-                {
-                    return Ok(CreateRegistryOutput { registry_arn: arn });
+        // replay of the SAME request answers with the ARN the first call minted and
+        // creates nothing, while the same token presented with OTHER parameters is a
+        // conflict: the token is already bound to a different request. The parameters are
+        // compared as a fingerprint of the request with its token cleared, so the token
+        // itself is not part of what it names. The registry a replay names is looked up,
+        // so once that registry has been deleted the token names nothing and this call
+        // falls through to a fresh create.
+        let token = input.client_token.clone().filter(|t| !t.is_empty());
+        let fingerprint = crate::state::idempotency_fingerprint(
+            &CreateRegistryInput {
+                client_token: None,
+                ..input.clone()
+            },
+            Self::INPUT_SCHEMA,
+        );
+        if let Some(token) = token.as_deref() {
+            match state.token_replay(Self::NAME, token, &fingerprint) {
+                crate::state::TokenReplay::Replayed(arn) => {
+                    if state
+                        .registries
+                        .values()
+                        .any(|registry| registry.registry_arn == arn)
+                    {
+                        return Ok(CreateRegistryOutput { registry_arn: arn });
+                    }
                 }
+                crate::state::TokenReplay::ParametersDiffer => {
+                    return Err(CreateRegistryErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(
+                                crate::state::IDEMPOTENCY_PARAMETER_MISMATCH.to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::TokenReplay::Unused => {}
             }
         }
 
@@ -272,8 +294,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .registry_name_index
             .insert(input.name, registry_id.clone());
         state.registries.insert(registry_id, registry);
-        if let Some(token) = input.client_token.filter(|t| !t.is_empty()) {
-            state.remember_idempotent_answer(Self::NAME, &token, &registry_arn);
+        if let Some(token) = token {
+            state.remember_idempotent_answer(Self::NAME, &token, &fingerprint, &registry_arn);
         }
 
         Ok(CreateRegistryOutput { registry_arn })

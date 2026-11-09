@@ -23,6 +23,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes the opaque `nextToken` ListRegistryRecords hands out.
 hex = { workspace = true }
+# The claim rule for a service under a signing name it shares with a peer; the ONE ARN
+# parse; and the shared home for how a service states the framework's constraint refusal.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

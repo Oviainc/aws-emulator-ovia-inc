@@ -47,6 +47,24 @@ pub const MAX_REGISTRIES: usize = 1_000;
 /// [`MAX_REGISTRIES`].
 pub const MAX_RECORDS_PER_REGISTRY: usize = 10_000;
 
+/// How many tags one resource may hold before `TagResource` answers the modelled
+/// `ServiceQuotaExceededException`.
+///
+/// MODELLED: it is `TagsMap`'s own `@length` maximum, which every operation carrying a
+/// tag map declares for one request's worth of tags, applied to what the resource ends up
+/// holding.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The fixed text a tagging operation refuses an ARN with when it is not the ARN of a
+/// resource this service holds; the offending value follows it, taken from the request's
+/// `resourceArn` label.
+pub const UNRECOGNIZED_RESOURCE_ARN: &str = "Unrecognized Agent Registry resource ARN: ";
+
+/// `ValidationExceptionReason`'s modelled default, which the member carries for a request
+/// refused because one of its fields did not satisfy a requirement. The whole catalogue is
+/// `crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`.
+pub const FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
+
 /// How many `@idempotencyToken` replays are remembered at once. Entries are dropped
 /// when the resource they name is removed; this cap bounds what is left, oldest first,
 /// so a long-lived process cannot accumulate tokens for ever.
@@ -195,13 +213,42 @@ pub struct RegistryRecord {
     pub pending: Option<DueTransition<RecordTransition>>,
 }
 
-/// What one `@idempotencyToken` replay remembers: the ARN the first call answered, and
+/// What one `@idempotencyToken` replay remembers: the ARN the first call answered, a
+/// fingerprint of the parameters it was presented with ([`idempotency_fingerprint`]), and
 /// the order it was remembered in, so the oldest entry is the one evicted at the cap.
 #[derive(Debug, Clone)]
 pub struct IdempotentAnswer {
     arn: String,
+    fingerprint: String,
     seq: u64,
 }
+
+/// What a presented `@idempotencyToken` means for the call presenting it.
+///
+/// `ClientToken` is `@idempotencyToken`: "A unique, case-sensitive identifier to ensure
+/// that the operation completes no more than one time. If this token matches a previous
+/// request, the service ignores the request, but does not return an error" — which binds
+/// the token to the parameters of the request that first used it. A second call presenting
+/// it therefore has three possible meanings, and only one of them creates anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenReplay {
+    /// No remembered call used this token: the request is a first call and creates.
+    Unused,
+    /// A remembered call used it with the SAME parameters: the request is ignored and
+    /// answered with the ARN that call minted.
+    Replayed(String),
+    /// A remembered call used it with DIFFERENT parameters: the token is already bound to
+    /// another request, which is a conflict rather than a create
+    /// ([`IDEMPOTENCY_PARAMETER_MISMATCH`]).
+    ParametersDiffer,
+}
+
+/// What a create answers when an `@idempotencyToken` is presented with parameters other
+/// than the ones it was first used with. Wholly fixed text: it names neither the token nor
+/// any parameter, because the token is bound to the whole request and not to one member of
+/// it.
+pub const IDEMPOTENCY_PARAMETER_MISMATCH: &str =
+    "Idempotency token already used with different request parameters";
 
 /// Per-service state for com-amazonaws-agentregistrycontrol-agentregistrycontrol. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -210,9 +257,9 @@ pub struct ComAmazonawsAgentregistrycontrolAgentregistrycontrolState {
     pub registries: HashMap<String, Registry>,
     /// Registry name -> registry id, so a duplicate name is a `ConflictException`.
     pub registry_name_index: HashMap<String, String>,
-    /// `<operation>#<clientToken>` -> the ARN that call answered. The operation is part
-    /// of the key, so one token reused across two different creates cannot make one
-    /// replay the other's answer.
+    /// `<operation>#<clientToken>` -> what that call answered, and the parameters it
+    /// answered them for. The operation is part of the key, so one token reused across
+    /// two different creates cannot make one replay the other's answer.
     idempotency: HashMap<String, IdempotentAnswer>,
     /// Insertion order for the idempotency map, for eviction at the cap.
     idempotency_seq: u64,
@@ -296,17 +343,29 @@ impl ComAmazonawsAgentregistrycontrolAgentregistrycontrolState {
         });
     }
 
-    /// The ARN `operation` answered the first time it saw `token`, if it is still
-    /// remembered.
-    pub fn idempotent_answer(&self, operation: &str, token: &str) -> Option<&str> {
-        self.idempotency
-            .get(&idempotency_key(operation, token))
-            .map(|answer| answer.arn.as_str())
+    /// What `token` means for a call of `operation` whose parameters fingerprint as
+    /// `fingerprint`: unused, a replay of the same request, or the same token bound to a
+    /// different one. See [`TokenReplay`].
+    pub fn token_replay(&self, operation: &str, token: &str, fingerprint: &str) -> TokenReplay {
+        match self.idempotency.get(&idempotency_key(operation, token)) {
+            None => TokenReplay::Unused,
+            Some(answer) if answer.fingerprint == fingerprint => {
+                TokenReplay::Replayed(answer.arn.clone())
+            }
+            Some(_) => TokenReplay::ParametersDiffer,
+        }
     }
 
-    /// Remember what `operation` answered for `token`, evicting the oldest entry when
-    /// the cap is reached so this store cannot grow without bound.
-    pub fn remember_idempotent_answer(&mut self, operation: &str, token: &str, arn: &str) {
+    /// Remember what `operation` answered for `token`, and the parameters it was presented
+    /// with, evicting the oldest entry when the cap is reached so this store cannot grow
+    /// without bound.
+    pub fn remember_idempotent_answer(
+        &mut self,
+        operation: &str,
+        token: &str,
+        fingerprint: &str,
+        arn: &str,
+    ) {
         self.idempotency_seq = self.idempotency_seq.wrapping_add(1);
         let key = idempotency_key(operation, token);
         if self.idempotency.len() >= MAX_IDEMPOTENCY_ENTRIES && !self.idempotency.contains_key(&key)
@@ -324,6 +383,7 @@ impl ComAmazonawsAgentregistrycontrolAgentregistrycontrolState {
             key,
             IdempotentAnswer {
                 arn: arn.to_string(),
+                fingerprint: fingerprint.to_string(),
                 seq: self.idempotency_seq,
             },
         );
@@ -369,12 +429,196 @@ impl ComAmazonawsAgentregistrycontrolAgentregistrycontrolState {
             }
         }
     }
+
+    /// The tag set of the resource `addressed` names, to read, or `None` when this state
+    /// holds no such resource.
+    ///
+    /// The reading half of [`Self::resource_tags_mut`]: one lookup for every tagging
+    /// operation, so what a read reports is the set a write wrote.
+    pub fn resource_tags(&self, addressed: &TaggableResource) -> Option<&BTreeMap<String, String>> {
+        match addressed {
+            TaggableResource::Registry { registry_id } => {
+                Some(&self.registries.get(registry_id)?.tags)
+            }
+            TaggableResource::Record {
+                registry_id,
+                record_id,
+            } => Some(
+                &self
+                    .registries
+                    .get(registry_id)?
+                    .records
+                    .get(record_id)?
+                    .tags,
+            ),
+        }
+    }
+
+    /// The tag set of the resource `addressed` names, to read or to write, or `None` when
+    /// this state holds no such resource.
+    ///
+    /// One lookup for every tagging operation, so the resource a tag is written to is the
+    /// one a later read reports it from.
+    pub fn resource_tags_mut(
+        &mut self,
+        addressed: &TaggableResource,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        match addressed {
+            TaggableResource::Registry { registry_id } => {
+                Some(&mut self.registries.get_mut(registry_id)?.tags)
+            }
+            TaggableResource::Record {
+                registry_id,
+                record_id,
+            } => Some(
+                &mut self
+                    .registries
+                    .get_mut(registry_id)?
+                    .records
+                    .get_mut(record_id)?
+                    .tags,
+            ),
+        }
+    }
 }
 
 /// The key an idempotent answer is remembered under: the operation and the token, so a
 /// token reused across two operations cannot cross answers.
 fn idempotency_key(operation: &str, token: &str) -> String {
     format!("{operation}#{token}")
+}
+
+/// A fingerprint of the parameters an `@idempotencyToken` was presented with: the request
+/// serialized against its own modelled schema, with every object's members in key order.
+///
+/// The caller hands the request in with its token member CLEARED, so what is fingerprinted
+/// is the parameters the token names and not the token itself.
+///
+/// Rendered through the protocol's own JSON serializer and the model's schema, so the
+/// member names and the value forms are the model's rather than a second reading of the
+/// request held here. Sorted because neither rendering is a function of the value on its
+/// own: a map member (`tags`, and the `Document` a record's `customMetadata` is) is written
+/// in its `HashMap` iteration order, which two maps holding the same entries do not share,
+/// so one request would otherwise fingerprint two ways. `Debug` is the fallback for a
+/// request the serializer cannot render, which leaves such a request compared by value
+/// rather than compared not at all.
+pub fn idempotency_fingerprint<T>(parameters: &T, schema: &::aws_smithy_schema::Schema) -> String
+where
+    T: ::aws_smithy_schema::serde::SerializableStruct + ::std::fmt::Debug,
+{
+    use ::aws_smithy_schema::serde::ShapeSerializer;
+
+    let mut serializer =
+        ::aws_smithy_schema_server::json::JsonShapeSerializer::new_with_config(true);
+    if serializer.write_struct(schema, parameters).is_err() {
+        return format!("{parameters:?}");
+    }
+    let rendered = serializer.into_string();
+    // `serde_json`'s own parse bounds how deep a document it will read, so this walk is
+    // bounded by that crate rather than by the request; a document past that bound is not
+    // sorted and is compared as rendered.
+    match ::serde_json::from_str::<::serde_json::Value>(&rendered) {
+        Ok(parsed) => with_sorted_members(parsed).to_string(),
+        Err(_) => rendered,
+    }
+}
+
+/// `value` with the members of every object in key order, which is what makes two
+/// renderings of one request the same text.
+fn with_sorted_members(value: ::serde_json::Value) -> ::serde_json::Value {
+    match value {
+        ::serde_json::Value::Object(members) => ::serde_json::Value::Object(
+            members
+                .into_iter()
+                .collect::<BTreeMap<String, ::serde_json::Value>>()
+                .into_iter()
+                .map(|(name, member)| (name, with_sorted_members(member)))
+                .collect(),
+        ),
+        ::serde_json::Value::Array(items) => {
+            ::serde_json::Value::Array(items.into_iter().map(with_sorted_members).collect())
+        }
+        scalar => scalar,
+    }
+}
+
+/// A resource of this service an ARN names: what the tagging operations' `resourceArn`
+/// addresses, which the model documents as "registries and registry records".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggableResource {
+    /// `arn:<partition>:agent-registry:<region>:<account>:registry/<registryId>`.
+    Registry { registry_id: String },
+    /// A record, whose ARN the model nests under its registry's.
+    Record {
+        registry_id: String,
+        record_id: String,
+    },
+}
+
+/// The resource of this service `arn` names, or `None` when `arn` is not the ARN of one.
+///
+/// Recognised exactly where the model's two ARN shapes are: `RegistryArn`
+/// (`^arn:aws(-[^:]+)?:agent-registry:[a-z0-9-]+:[0-9]{12}:registry/[a-zA-Z0-9]{12,16}$`)
+/// and `RegistryRecordArn` (the same, continued with `/record/[a-zA-Z0-9]{12}`). The
+/// `ResourceArn` the tagging operations bind declares no pattern at all — any string of
+/// 1..1011 characters reaches the handler — so this is the one place an ARN of another
+/// vendor, of a resource type this service does not hold, or with an identifier outside
+/// those classes is told apart from a resource it could hold. Splitting the value into its
+/// ARN fields is `service-common`'s single ARN parse.
+pub fn taggable_resource(arn: &str) -> Option<TaggableResource> {
+    let parsed = ::service_common::arn::parse(arn)?;
+    let partitioned = parsed.partition == "aws" || parsed.partition.starts_with("aws-");
+    let regional = !parsed.region.is_empty()
+        && parsed
+            .region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    let accounted =
+        parsed.account.len() == 12 && parsed.account.bytes().all(|byte| byte.is_ascii_digit());
+    if parsed.vendor != ARN_SERVICE || !partitioned || !regional || !accounted {
+        return None;
+    }
+    let segments: Vec<&str> = parsed.resource.split('/').collect();
+    match segments.as_slice() {
+        ["registry", registry_id] if is_registry_id(registry_id) => {
+            Some(TaggableResource::Registry {
+                registry_id: (*registry_id).to_string(),
+            })
+        }
+        ["registry", registry_id, "record", record_id]
+            if is_registry_id(registry_id) && is_record_id(record_id) =>
+        {
+            Some(TaggableResource::Record {
+                registry_id: (*registry_id).to_string(),
+                record_id: (*record_id).to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether `id` is a `RegistryId`: `^[a-zA-Z0-9]{12,16}$`.
+fn is_registry_id(id: &str) -> bool {
+    (12..=16).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// Whether `id` is a `RegistryRecordId`: `^[a-zA-Z0-9]{12}$`.
+fn is_record_id(id: &str) -> bool {
+    id.len() == 12 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+impl TaggableResource {
+    /// How this service states that the resource an ARN named is not there, in the wording
+    /// it states that error class in: a registry by the identifier the request supplied, a
+    /// record by its id, both as one sentence ending in a period.
+    pub fn not_found_message(&self, resource_arn: &str) -> String {
+        match self {
+            Self::Registry { .. } => format!("Registry with ARN {resource_arn} not found."),
+            Self::Record { record_id, .. } => {
+                format!("Registry record with ID {record_id} not found.")
+            }
+        }
+    }
 }
 
 /// A process-wide mint counter, so two ids minted in the same nanosecond still differ.

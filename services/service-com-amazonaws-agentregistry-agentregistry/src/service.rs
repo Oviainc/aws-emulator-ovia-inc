@@ -75,13 +75,34 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `agent-registry` — a signing name it SHARES with the
+        // Agent Registry CONTROL plane
+        // (`services/service-com-amazonaws-agentregistrycontrol-agentregistrycontrol`),
+        // whose endpoint is `agent-registry-control` while this one's is
+        // `agent-registry`. The router resolves a request's routing key from its SigV4
+        // credential scope first, so BOTH services see the key `agent-registry`: claiming
+        // on the signing name alone makes each claim the other's traffic, and the router
+        // — which refuses rather than guesses — answers `500 AmbiguousService` for a
+        // request neither of them, or both of them, can be told apart on, a code no AWS
+        // model carries.
+        //
+        // Nor can a path segment separate them: both models publish `registries` as a
+        // first segment (`POST /registries/{registryId}/discoverable-records-list` here,
+        // `POST /registries` and `GET /registries/{registryId}` there).
+        //
+        // What separates them is what AWS itself dispatches on: the endpoint host, then
+        // the `restJson1` route. So this service claims a request whose routing key names
+        // THIS endpoint and whose method + URI its OWN model binds a route for, by the one
+        // rule `service-common` states for every service under a shared signing name. The
+        // two models bind no identical method + URI pattern, so exactly one of them claims
+        // any Agent Registry request. One key, not two: this service's `endpointPrefix`
+        // IS its signing name, so a host-addressed request resolves the same key a signed
+        // one does.
+        service_common::claims_modeled_route(
+            parts,
+            &[self.entry.identity().signing_name()],
+            self.definition(),
+        )
     }
 
     fn override_operation(

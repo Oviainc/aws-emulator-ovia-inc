@@ -189,6 +189,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let registry_id = crate::state::identifier_to_id(&input.registry_id).to_string();
         let token = input.client_token.clone().filter(|t| !t.is_empty());
+        // The parameters the token names: the request with its token cleared, so a replay
+        // is told from a reuse by what was asked for rather than by what named it.
+        let fingerprint = crate::state::idempotency_fingerprint(
+            &CreateRegistryRecordInput {
+                client_token: None,
+                ..input.clone()
+            },
+            Self::INPUT_SCHEMA,
+        );
 
         let registry_arn = {
             let Some(registry) = state.registries.get(&registry_id) else {
@@ -200,24 +209,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             };
 
-            // `clientToken` is an @idempotencyToken: a replayed token answers with what
-            // the first call created and creates no second record. This is checked
-            // BEFORE any state refusal, so a replay stays idempotent even once the
-            // parent registry has left READY. The record it named is looked up, so once
-            // that record has been deleted the token names nothing and this call falls
-            // through to a fresh create.
+            // `clientToken` is an @idempotencyToken: a replay of the SAME request answers
+            // with what the first call created and creates no second record, while the
+            // same token presented with OTHER parameters is a conflict — the token is
+            // already bound to a different request. This is checked BEFORE any state
+            // refusal, so a replay stays idempotent even once the parent registry has
+            // left READY. The record a replay named is looked up, so once that record has
+            // been deleted the token names nothing and this call falls through to a fresh
+            // create.
             if let Some(token) = token.as_deref() {
-                if let Some(arn) = state.idempotent_answer(Self::NAME, token) {
-                    if let Some(record) = registry
-                        .records
-                        .values()
-                        .find(|record| record.record_arn == arn)
-                    {
-                        return Ok(CreateRegistryRecordOutput {
-                            record_arn: record.record_arn.clone(),
-                            status: record.status.clone(),
-                        });
+                match state.token_replay(Self::NAME, token, &fingerprint) {
+                    crate::state::TokenReplay::Replayed(arn) => {
+                        if let Some(record) = registry
+                            .records
+                            .values()
+                            .find(|record| record.record_arn == arn)
+                        {
+                            return Ok(CreateRegistryRecordOutput {
+                                record_arn: record.record_arn.clone(),
+                                status: record.status.clone(),
+                            });
+                        }
                     }
+                    crate::state::TokenReplay::ParametersDiffer => {
+                        return Err(CreateRegistryRecordErrorModeled::ConflictException(
+                            ConflictException {
+                                message: Some(
+                                    crate::state::IDEMPOTENCY_PARAMETER_MISMATCH.to_string(),
+                                ),
+                            },
+                        )
+                        .into());
+                    }
+                    crate::state::TokenReplay::Unused => {}
                 }
             }
 
@@ -327,7 +351,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         registry.records.insert(record_id, record);
         if let Some(token) = token {
-            state.remember_idempotent_answer(Self::NAME, &token, &record_arn);
+            state.remember_idempotent_answer(Self::NAME, &token, &fingerprint, &record_arn);
         }
 
         Ok(CreateRegistryRecordOutput { record_arn, status })

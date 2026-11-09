@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves the `resourceArn` label to a registry or a registry record of
+//! this service's state and answers the tag set that resource holds.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +143,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the agent registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        // A read materialises only what the clock already made due (a finished creation,
+        // the removal a finished deletion owes), so it reports what any caller would see
+        // at this instant whether or not anybody asked.
+        state.materialise_due_transitions();
+
+        let Some(addressed) = crate::state::taggable_resource(&input.resource_arn) else {
+            let message = format!(
+                "{}{}",
+                crate::state::UNRECOGNIZED_RESOURCE_ARN, input.resource_arn
+            );
+            return Err(ListTagsForResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: message.clone(),
+                    reason: crate::state::FIELD_VALIDATION_FAILED.to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: RESOURCE_ARN_MEMBER.to_string(),
+                        message,
+                    }]),
+                },
+            )
+            .into());
+        };
+
+        let Some(tags) = state.resource_tags(&addressed) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(addressed.not_found_message(&input.resource_arn)),
+                },
+            )
+            .into());
+        };
+
+        // "Returns the current tag key-value pairs on the resource": whatever the resource
+        // holds, and `ResourceTagsMap`'s `@length` is 0..50, so a resource carrying no tags
+        // answers an empty map rather than nothing at all.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(tags.clone().into_iter().collect()),
+        })
     }
 }
+
+/// The input member a refused `resourceArn` is reported at, as the API spells it.
+const RESOURCE_ARN_MEMBER: &str = "resourceArn";

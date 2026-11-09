@@ -40,10 +40,20 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
+use aws_smithy_schema::Schema;
+use aws_smithy_schema_server::{ProtocolError, ServerProtocol};
+use service_common::no_content_responses::without_content;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The host label this service's endpoint is addressed by, from its model's
+/// `aws.api#service` `endpointPrefix`. It differs from the SigV4 signing name this
+/// service SHARES with the Agent Registry data plane, and is the second key a request
+/// that carries no credential scope resolves to. See [`EmulatedService::can_handle`].
+const ENDPOINT_PREFIX: &str = "agent-registry-control";
 
 /// The `com-amazonaws-agentregistrycontrol-agentregistrycontrol` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -65,6 +75,98 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 }
 
+/// The protocol this service answers modelled requests in: the model's own `restJson1`,
+/// with the one framing correction `service-common`'s no-content module states — an answer
+/// at HTTP 204 carries no body, where the serializer renders the empty JSON object for an
+/// output structure that declares no member.
+///
+/// Implemented on the service itself because the model-derived protocol it delegates to is
+/// owned by the generated entry and reached by reference (`self.entry.protocol()`), and
+/// [`Service::override_protocol`] hands back a borrow of `&self` — so there is one protocol
+/// instance, the generated one, and no second routing table to drift from the model.
+impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
+    type Request = WireRequest;
+    type Response = WireResponse;
+
+    fn protocol_id(&self) -> &aws_smithy_schema::ShapeId {
+        self.entry.protocol().protocol_id()
+    }
+
+    fn routing_key<'a>(&self, request: &'a WireRequest) -> Result<&'a str, ProtocolError> {
+        self.entry.protocol().routing_key(request)
+    }
+
+    fn deserialize_input<'a>(
+        &self,
+        request: &'a WireRequest,
+        input_schema: &Schema,
+    ) -> Result<Box<dyn aws_smithy_schema::serde::ShapeDeserializer + 'a>, ProtocolError> {
+        self.entry
+            .protocol()
+            .deserialize_input(request, input_schema)
+    }
+
+    fn serialize_output(
+        &self,
+        output: &dyn aws_smithy_schema::serde::SerializableStruct,
+        output_schema: &Schema,
+        operation_name: &str,
+        success_status: u16,
+    ) -> Result<WireResponse, ProtocolError> {
+        let response = self.entry.protocol().serialize_output(
+            output,
+            output_schema,
+            operation_name,
+            success_status,
+        )?;
+        // The status and every other header are the protocol's: only an answer that carries
+        // no content is emptied of the body rendered for it.
+        Ok(without_content(response))
+    }
+
+    fn serialize_error(
+        &self,
+        error: &dyn aws_smithy_schema::serde::SerializableStruct,
+        error_schema: &Schema,
+        error_code: &str,
+        http_status: u16,
+    ) -> Result<WireResponse, ProtocolError> {
+        let response = self
+            .entry
+            .protocol()
+            .serialize_error(error, error_schema, error_code, http_status)?;
+        // Every modelled failure of this service carries its error envelope at a 4xx or
+        // 5xx, so nothing here is emptied; the same call is made on both paths rather than
+        // leaving one of them to answer differently.
+        Ok(without_content(response))
+    }
+
+    fn serialize_event_stream_message(
+        &self,
+        event_type: &str,
+        is_exception: bool,
+        event: &dyn aws_smithy_schema::serde::SerializableStruct,
+        event_schema: &Schema,
+    ) -> Result<WireResponse, ProtocolError> {
+        self.entry.protocol().serialize_event_stream_message(
+            event_type,
+            is_exception,
+            event,
+            event_schema,
+        )
+    }
+}
+
+/// `ServerProtocol` requires `Debug`; the generated entry is not `Debug`, so this names the
+/// protocol being served rather than the service's internals.
+impl<Eng: Send + Sync + 'static> std::fmt::Debug for EmulatedService<Eng> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmulatedService")
+            .field("protocol", &self.entry.protocol().protocol_id())
+            .finish()
+    }
+}
+
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
@@ -73,14 +175,42 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self.entry
     }
 
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // Every response a modelled operation of this service produces is serialized by the
+        // protocol returned here: the model's own, with the one framing correction below —
+        // an answer at a no-content status carries no body. `TagResource` and
+        // `UntagResource` both declare `http { code: 204 }` over an output structure with
+        // no members, which the serializer would otherwise render as the empty JSON object.
+        Some(self)
+    }
+
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `agent-registry` — a signing name it SHARES with the
+        // Agent Registry DATA plane
+        // (`services/service-com-amazonaws-agentregistry-agentregistry`), whose endpoint
+        // is `agent-registry` while this one's is `agent-registry-control`. The router
+        // resolves a request's routing key from its SigV4 credential scope first, so BOTH
+        // services see the key `agent-registry`: claiming on the signing name alone makes
+        // each claim the other's traffic, and the router — which refuses rather than
+        // guesses — answers `500 AmbiguousService` for a request neither of them, or both
+        // of them, can be told apart on, a code no AWS model carries.
+        //
+        // Nor can a path segment separate them: both models publish `registries` as a
+        // first segment (`POST /registries` and `GET /registries/{registryId}` here,
+        // `POST /registries/{registryId}/discoverable-records-list` there).
+        //
+        // What separates them is what AWS itself dispatches on: the endpoint host, then
+        // the `restJson1` route. So this service claims a request whose routing key names
+        // THIS endpoint — its signing name, or the `endpointPrefix` a host-addressed,
+        // unsigned request resolves to — and whose method + URI its OWN model binds a
+        // route for, by the one rule `service-common` states for every service under a
+        // shared signing name. The two models bind no identical method + URI pattern, so
+        // exactly one of them claims any Agent Registry request.
+        service_common::claims_modeled_route(
+            parts,
+            &[self.entry.identity().signing_name(), ENDPOINT_PREFIX],
+            self.definition(),
+        )
     }
 
     fn override_operation(
@@ -97,16 +227,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. What this service states, and all it states, is in
+        // [`stated_refusal`]: the envelope, the error count, the member paths and every
+        // requirement sentence stay the framework's, and an authentication refusal keeps
+        // its own code and wording.
+        stated_refusal(refusal)
     }
 
     fn override_routing_error(
@@ -136,4 +262,32 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// How this service states the framework's constraint refusal, or `None` to keep the
+/// framework's own wording for anything that is not one.
+///
+/// Two renderings, and nothing else:
+///
+/// * NO clause quotes the value the request submitted. Every one names the member it was
+///   stated at and the requirement that member's value had to satisfy, whatever the
+///   request carried — which is also what keeps a `@sensitive` member (`description`,
+///   `customMetadataSchemaConfiguration`) out of the refusal it provoked.
+/// * a `@pattern` is quoted as this service advertises the expression: without the pair of
+///   whole-value anchors the model wraps it in, so a caller that re-applies the expression
+///   it was handed back uses the same one. The CHECK still runs the model's pattern as
+///   written; only the rendering drops the pair.
+///
+/// The envelope, its error count, the clause, the member paths, the grouping and every
+/// requirement sentence belong to the shared home for this wording and to the framework
+/// behind it — none of them is spelled here, so this service cannot drift from the sibling
+/// Agent Registry service, which states the same sentences. An authentication refusal is a
+/// different failure with its own code and status and nothing about it is this service's
+/// to word.
+fn stated_refusal(refusal: &Refusal) -> Option<Refused> {
+    service_common::validation_message::aws_validation_refusal_withholding_violations(
+        refusal,
+        // Every clause, whatever member or constraint class it is about.
+        |_| true,
+    )
 }

@@ -17,6 +17,11 @@
 // else appends to.
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
+// Declared here, in this same head region, for the reason the entry above records: the two
+// services sharing the `agent-registry` signing name are two crates, so neither crate's own
+// test target can mount both and ask which of them claims a request.
+#[path = "all/agent_registry_signing_name_routing.rs"]
+mod agent_registry_signing_name_routing;
 // Declared here, in this same head region, for the reason the entry above records: the
 // secret a stack declares, which has to exist in AWS Secrets Manager under the ARN the
 // stack publishes for it.
