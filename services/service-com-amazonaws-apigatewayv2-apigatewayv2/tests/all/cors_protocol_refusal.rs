@@ -14,22 +14,78 @@
 //! > (`smithy_query(query="doc", shape="CreateApiRequest", member="CorsConfiguration")`),
 //! > so a request that configures one on an api of any other `ProtocolType` is refused
 //! > with HTTP 400 / `BadRequestException` and the message
-//! > `Cors is not supported for <ProtocolType> protocolType` — API Gateway's own sentence
+//! > `Cors is not supported for <ProtocolType> protocolType ` — API Gateway's own sentence
 //! > for THIS member, naming the protocol type that does not support it — and nothing is
 //! > written. An HTTP api takes the same document and reports it back.
+//!
+//! The sentence is a TEMPLATE whose fixed text is part of the contract down to its
+//! whitespace: `Cors is not supported for `, the `ProtocolType` the request asked for,
+//! then ` protocolType ` INCLUDING the trailing space API Gateway emits. A client that
+//! classifies this refusal by comparing the message (the only way to tell it from the
+//! generic protocol-restricted-member refusal, which is the same 400 /
+//! `BadRequestException`) compares bytes, so the message is asserted untrimmed.
 //!
 //! The rows span what the rule generalises over: which CORS members the document carries,
 //! whether the configuration arrives on the create or on a later patch, and the api's
 //! `ProtocolType`.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_apigatewayv2_apigatewayv2::state::validate_cors_protocol;
 
 use crate::api_lifecycle::{as_str, call, carries_nothing, emulator, error_code};
 
-/// The sentence API Gateway refuses a CORS configuration with on an api of a protocol
-/// that does not support one. The protocol type is the variable part.
+/// The sentence API Gateway answers a WEBSOCKET api's CORS configuration with, byte for
+/// byte — the one the recorded refusal carries, trailing space included. Written out as a
+/// literal, so what the service's own gate formats is pinned against the recorded text
+/// rather than against a second copy of the gate's format string.
+const WEBSOCKET_REFUSAL: &str = "Cors is not supported for WEBSOCKET protocolType ";
+
+/// The recorded sentence with its ONE variable part — the protocol type — substituted, so
+/// the expectation for a protocol the recording does not carry is DERIVED from the recorded
+/// text instead of rebuilt from the implementation's template.
 fn refusal(protocol_type: &str) -> String {
-    format!("Cors is not supported for {protocol_type} protocolType")
+    WEBSOCKET_REFUSAL.replace(WEBSOCKET, protocol_type)
+}
+
+/// The service's gate answers the recorded sentence for the protocol type the recording
+/// used, and the same fixed text — trailing space included — for any other.
+///
+/// This drives the gate both the create and the patch call
+/// ([`validate_cors_protocol`]), so neither leg can word the refusal differently.
+#[test]
+fn the_refusal_template_carries_the_fixed_text_down_to_its_trailing_space() {
+    // `PROTOCOL_TYPE_VALUES` is `WEBSOCKET | HTTP` (`smithy_query(query="shape",
+    // shape="ProtocolType")`), so the first row is the modelled non-HTTP protocol — the
+    // recorded sentence, byte for byte — and the second is one a future api version could
+    // add, which the sentence must word in its own name.
+    for protocol_type in [WEBSOCKET, "A-FUTURE-PROTOCOL"] {
+        let sentence = validate_cors_protocol(protocol_type, true)
+            .expect_err("a non-HTTP protocol must refuse a CORS configuration");
+        assert_eq!(
+            sentence,
+            refusal(protocol_type),
+            "case {protocol_type:?}: expected {:?}, got {sentence:?}",
+            refusal(protocol_type)
+        );
+        assert!(
+            sentence.ends_with(" protocolType "),
+            "case {protocol_type:?}: expected the fixed text to keep its trailing space, \
+             got {sentence:?}"
+        );
+    }
+    // The protocol the member is supported on, and a request that configures nothing, ask
+    // for nothing the gate refuses.
+    for (case, protocol_type, configured) in [
+        ("an HTTP api carrying a document", HTTP, true),
+        ("a WEBSOCKET api carrying none", WEBSOCKET, false),
+    ] {
+        assert_eq!(
+            validate_cors_protocol(protocol_type, configured),
+            Ok(()),
+            "case {case:?}: expected the gate to admit it, got {:?}",
+            validate_cors_protocol(protocol_type, configured)
+        );
+    }
 }
 
 /// The one `ProtocolType` whose apis support a CORS configuration, and the one whose do
@@ -120,11 +176,11 @@ async fn create_api_refuses_a_cors_configuration_in_the_member_s_own_sentence() 
             "BadRequestException",
             "case {case:?}: expected BadRequestException, got {body}"
         );
+        let message = as_str(&body, "message");
         assert_eq!(
-            as_str(&body, "message"),
-            refusal(WEBSOCKET),
-            "case {case:?}: expected {:?}, got {body}",
-            refusal(WEBSOCKET)
+            message, WEBSOCKET_REFUSAL,
+            "case {case:?}: expected the recorded sentence {WEBSOCKET_REFUSAL:?} byte for \
+             byte, got {message:?} in {body}"
         );
 
         // The refused create minted nothing: the one api is the accepted one.
@@ -190,11 +246,11 @@ async fn update_api_refuses_a_cors_configuration_and_leaves_the_api_alone() {
             "BadRequestException",
             "case {case:?}: expected BadRequestException, got {body}"
         );
+        let message = as_str(&body, "message");
         assert_eq!(
-            as_str(&body, "message"),
-            refusal(WEBSOCKET),
-            "case {case:?}: expected {:?}, got {body}",
-            refusal(WEBSOCKET)
+            message, WEBSOCKET_REFUSAL,
+            "case {case:?}: expected the recorded sentence {WEBSOCKET_REFUSAL:?} byte for \
+             byte, got {message:?} in {body}"
         );
 
         // Nothing of the refused patch was applied: neither the CORS document nor the
