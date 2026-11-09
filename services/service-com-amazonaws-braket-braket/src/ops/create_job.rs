@@ -334,7 +334,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if device.device_status == crate::state::DEVICE_RETIRED {
             return Err(CreateJobErrorModeled::DeviceRetiredException(
                 DeviceRetiredException {
-                    message: Some(format!("Device {} has been retired", device.device_arn)),
+                    message: Some(crate::state::DEVICE_RETIRED_REFUSAL.to_string()),
                 },
             )
             .into());

@@ -17,6 +17,8 @@ mod arn_syntax;
 mod client_error_wording;
 #[path = "all/device_capabilities.rs"]
 mod device_capabilities;
+#[path = "all/device_refusal_wording.rs"]
+mod device_refusal_wording;
 #[path = "all/execution_role_resolution.rs"]
 mod execution_role_resolution;
 #[path = "all/hybrid_job_loop.rs"]

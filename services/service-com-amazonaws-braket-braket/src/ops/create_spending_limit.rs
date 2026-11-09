@@ -19,6 +19,10 @@
 //! Two device rules follow from the model's own documentation: a device the inventory
 //! publishes as RETIRED is refused with `DeviceRetiredException` (410), and a SIMULATOR
 //! with `ValidationException`, because "Simulators do not support spending limits".
+//! Each of the two is reported in the service's own FIXED sentence for its class
+//! ([`SIMULATOR_NOT_SUPPORTED`] and [`crate::state::DEVICE_RETIRED_REFUSAL`]), which
+//! interpolates nothing from the request, so the two negative classes stay
+//! distinguishable by message as well as by code.
 //!
 //! `clientToken` is an `@idempotencyToken`: replaying it with the same request returns
 //! the ARN minted the first time and creates no second spending limit.
@@ -136,6 +140,16 @@ fn refuse(message: String) -> CreateSpendingLimitError {
 /// Amazon Braket publishes is the device the service cannot resolve
 /// (`crate::state::DEVICE_ARN_NOT_FOUND`).
 const INVALID_ARN_MEMBER: &str = "deviceArn";
+
+/// How THIS operation refuses a `deviceArn` naming a simulator.
+///
+/// A spending limit is a cost control over what a device charges for, which simulators
+/// are not sold per device at all, so the refusal is about the KIND of device and not
+/// about the one the caller named: the recorded sentence is entirely fixed text, with no
+/// ARN, no device name and no device-type enum value interpolated into it. It lives here
+/// rather than in the service-wide vocabulary because this is the only door that takes
+/// this decision, and neighbouring operations word their own refusals differently.
+const SIMULATOR_NOT_SUPPORTED: &str = "Spending limits can not be created for simulator devices.";
 
 /// The digest that decides whether a repeated `clientToken` is a replay of the same
 /// request (same ARN comes back) or a reuse of the token for a different one (refused).
@@ -261,7 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateSpendingLimitErrorModeled::DeviceRetiredException(
                 DeviceRetiredException {
-                    message: Some(format!("Device {} has been retired", input.device_arn)),
+                    message: Some(crate::state::DEVICE_RETIRED_REFUSAL.to_string()),
                 },
             )
             .into());
@@ -269,17 +283,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What a limit may be created for turns on the KIND of device the ARN names, which
         // the published device-ARN form itself states: a quantum processor accepts one, and
         // "Simulators do not support spending limits" — the model's own documentation of
-        // this operation — so a simulator is refused whatever its status, because no
-        // spending limit can apply to it at all. A device this emulator's inventory does
-        // not publish is still a device of its ARN's kind, so the admission does not
-        // require it to be in the inventory.
+        // this operation — so a simulator the service has not already refused for its
+        // status (the retired gate above runs first, because a retired device is gone
+        // whatever kind it was) is refused here, since no spending limit can apply to it
+        // at all. A device this emulator's inventory does not publish is still a device of
+        // its ARN's kind, so the admission does not require it to be in the inventory.
         match crate::state::device_type_from_arn(&input.device_arn) {
             Some(kind) if kind == crate::state::DEVICE_TYPE_SIMULATOR => {
-                return Err(refuse(format!(
-                    "Device {} is a {} and simulators do not support spending limits",
-                    input.device_arn,
-                    crate::state::DEVICE_TYPE_SIMULATOR
-                )));
+                return Err(refuse(SIMULATOR_NOT_SUPPORTED.to_string()));
             }
             Some(_) => {}
             // The ARN names no kind of device Amazon Braket publishes. This operation

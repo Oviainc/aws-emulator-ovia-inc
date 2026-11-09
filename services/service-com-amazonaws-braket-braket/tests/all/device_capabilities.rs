@@ -20,7 +20,11 @@ use crate::quantum_task_loop::{member, Braket};
 
 /// The action types this inventory's devices accept, from
 /// `service_com_amazonaws_braket_braket::state`.
-use service_com_amazonaws_braket_braket::state::{ACTION_AHS, ACTION_OPENQASM};
+use service_com_amazonaws_braket_braket::state::{ACTION_AHS, ACTION_JAQCD, ACTION_OPENQASM};
+
+/// The GATE-MODEL program actions: only a program of gates names operations, result
+/// types or pragmas, so only these entries publish them.
+const GATE_MODEL_ACTIONS: &[&str] = &[ACTION_OPENQASM, ACTION_JAQCD];
 
 /// The units a `deviceCost` may be charged per.
 ///
@@ -70,6 +74,34 @@ fn string_array(value: &Value, name: &str, case: &str) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+/// Which key a device must publish its computing properties under, derived from the
+/// action families its document accepts: a device that computes with gates or with an
+/// analog Hamiltonian publishes a `paradigm`, and a device of any other family (an
+/// annealer, a photonic processor) has no gate-model paradigm, so what it publishes is
+/// its provider's own properties.
+fn expected_properties_key(actions: &serde_json::Map<String, Value>) -> &'static str {
+    let computes_in_a_paradigm = actions
+        .keys()
+        .any(|action| GATE_MODEL_ACTIONS.contains(&action.as_str()) || action == ACTION_AHS);
+    if computes_in_a_paradigm {
+        "paradigm"
+    } else {
+        "provider"
+    }
+}
+
+/// The device's own computing-properties section, under the key its family publishes it
+/// as: a `paradigm` for a gate-model or analog device, the provider's own properties for
+/// a family that has no gate-model paradigm.
+fn device_properties<'v>(document: &'v Value, case: &str) -> &'v Value {
+    document
+        .get("paradigm")
+        .or_else(|| document.get("provider"))
+        .unwrap_or_else(|| {
+            panic!("case {case}: the document publishes no device properties: {document}")
+        })
 }
 
 /// The parsed capability document of one device, read back over HTTP.
@@ -206,8 +238,8 @@ async fn the_service_section_publishes_the_cost_and_documentation_properties() {
 
 /// Every action entry carries its action type and the `major.minor` schema versions it
 /// accepts, and a gate-model entry carries the operations, result types and pragmas a
-/// program may use — while the analog action, whose programs name no gates or pragmas,
-/// carries none of them.
+/// program may use — while an entry of any other action family, whose problems and
+/// programs name no gates or pragmas, carries none of them.
 #[tokio::test]
 async fn every_action_entry_publishes_the_properties_its_schema_defines() {
     let braket = Braket::new();
@@ -215,7 +247,7 @@ async fn every_action_entry_publishes_the_properties_its_schema_defines() {
 
     let mut native_gate_sets: Vec<String> = Vec::new();
     let mut gate_model_entries = 0usize;
-    let mut analog_entries = 0usize;
+    let mut other_family_entries = 0usize;
     let mut declared_schemas: Vec<String> = Vec::new();
 
     for summary in &inventory {
@@ -231,15 +263,29 @@ async fn every_action_entry_publishes_the_properties_its_schema_defines() {
             "case device {arn}: expected at least one action type, got {document}"
         );
 
+        // The properties go under the key the device's FAMILY publishes them as, and
+        // under that key only: a gate-model device publishing a provider section, or an
+        // annealer publishing a paradigm, is not the document its schema defines.
+        let expected_key = expected_properties_key(actions);
+        let other_key = if expected_key == "paradigm" {
+            "provider"
+        } else {
+            "paradigm"
+        };
+        assert!(
+            document.get(expected_key).is_some() && document.get(other_key).is_none(),
+            "case device {arn}: the action types {:?} are published under {expected_key}, \
+             and not under {other_key}, got {document}",
+            actions.keys().collect::<Vec<_>>()
+        );
+
         // Each section of the document names the schema it is an instance of, so a
         // client knows which device-schema model to read it with.
         for (section, header) in [
             ("document", document.get("braketSchemaHeader")),
             (
-                "paradigm",
-                document
-                    .get("paradigm")
-                    .and_then(|paradigm| paradigm.get("braketSchemaHeader")),
+                "device properties",
+                device_properties(&document, &format!("device {arn}")).get("braketSchemaHeader"),
             ),
         ] {
             let header = header.unwrap_or_else(|| {
@@ -267,9 +313,7 @@ async fn every_action_entry_publishes_the_properties_its_schema_defines() {
              got {parameters}"
         );
 
-        let paradigm = document
-            .get("paradigm")
-            .unwrap_or_else(|| panic!("case device {arn}: no paradigm: {document}"));
+        let paradigm = device_properties(&document, &format!("device {arn}"));
         let native_gates: Vec<String> = paradigm
             .get("nativeGateSet")
             .map(|_| string_array(paradigm, "nativeGateSet", &format!("device {arn}")))
@@ -303,8 +347,8 @@ async fn every_action_entry_publishes_the_properties_its_schema_defines() {
                 );
             }
 
-            if action_type == ACTION_AHS {
-                analog_entries += 1;
+            if !GATE_MODEL_ACTIONS.contains(&action_type.as_str()) {
+                other_family_entries += 1;
                 for absent in [
                     "supportedOperations",
                     "supportedPragmas",
@@ -313,8 +357,8 @@ async fn every_action_entry_publishes_the_properties_its_schema_defines() {
                 ] {
                     assert!(
                         entry.get(absent).is_none(),
-                        "case {case}: an analog program names no gates, pragmas or result \
-                         types, so {absent} must be absent, got {entry}"
+                        "case {case}: a program that names no gates has no pragmas or result \
+                         types either, so {absent} must be absent, got {entry}"
                     );
                 }
                 continue;
@@ -489,12 +533,12 @@ async fn every_action_entry_publishes_the_properties_its_schema_defines() {
     );
 
     assert!(
-        gate_model_entries >= 2 && analog_entries >= 1,
+        gate_model_entries >= 2 && other_family_entries >= 1,
         "the inventory must span both action families: got {gate_model_entries} gate-model \
-         and {analog_entries} analog action entries"
+         and {other_family_entries} non-gate-model action entries"
     );
 
-    // The paradigm reports each device's OWN native gates, not one fixed set.
+    // The device properties report each device's OWN native gates, not one fixed set.
     native_gate_sets.sort();
     native_gate_sets.dedup();
     assert!(

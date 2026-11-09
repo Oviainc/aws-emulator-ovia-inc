@@ -724,6 +724,21 @@ pub const ACTION_OPENQASM: &str = "braket.ir.openqasm.program";
 pub const ACTION_JAQCD: &str = "braket.ir.jaqcd.program";
 /// The `actionType` of the analog Hamiltonian-simulation program action.
 pub const ACTION_AHS: &str = "braket.ir.ahs.program";
+/// The `actionType` of the annealing-problem action: a quantum annealer is given a
+/// problem to minimise rather than a program to run.
+pub const ACTION_ANNEALING: &str = "braket.ir.annealing.problem";
+/// The `actionType` of the photonic (Blackbird) program action.
+pub const ACTION_BLACKBIRD: &str = "braket.ir.blackbird.program";
+
+/// Whether an action is a GATE-MODEL program action.
+///
+/// Only a program of GATES can name operations, result types and pragmas, so only a
+/// gate-model action publishes them; every other action family (an analog Hamiltonian,
+/// an annealing problem, a photonic program) publishes its action type and the schema
+/// versions it accepts and nothing more.
+fn is_gate_model_action(action_type: &str) -> bool {
+    action_type == ACTION_OPENQASM || action_type == ACTION_JAQCD
+}
 
 /// The schema versions a device action in this inventory accepts.
 ///
@@ -953,6 +968,12 @@ struct DeviceSeed {
 /// every modelled `DeviceStatus` is reachable — `ONLINE` devices accept tasks, and
 /// the `OFFLINE` / `RETIRED` rows are what `CreateQuantumTask` refuses with
 /// `DeviceOfflineException` / `DeviceRetiredException`.
+///
+/// A device Amazon Braket has RETIRED stays in the list it publishes, carrying that
+/// status, which is what lets a caller naming one be told the device is retired rather
+/// than that no such device exists; so this inventory holds retired devices of every
+/// program family the list publishes — gate-model, analog, annealing and photonic — and
+/// not only the ones still taking work.
 const DEVICE_SEEDS: &[DeviceSeed] = &[
     DeviceSeed {
         arn: "arn:aws:braket:::device/quantum-simulator/amazon/sv1",
@@ -1130,6 +1151,77 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         cost: (0.00035, "shot"),
         summary: "Rigetti Aspen-M-3 superconducting quantum processor",
     },
+    DeviceSeed {
+        arn: "arn:aws:braket:::device/qpu/ionq/Harmony",
+        name: "Harmony",
+        provider: "IonQ",
+        device_type: DEVICE_TYPE_QPU,
+        device_status: DEVICE_RETIRED,
+        qubit_count: 11,
+        shots_range: (1, 10_000),
+        action_types: &[ACTION_OPENQASM],
+        supported_operations: GATE_MODEL_OPERATIONS,
+        native_gates: &["gpi", "gpi2", "ms"],
+        result_types: QPU_RESULT_TYPES,
+        verbatim: true,
+        noise: false,
+        cost: (0.01, "shot"),
+        summary: "IonQ Harmony trapped-ion quantum processor",
+    },
+    DeviceSeed {
+        arn: "arn:aws:braket:us-west-2::device/qpu/d-wave/Advantage_system6",
+        name: "Advantage_system6",
+        provider: "D-Wave",
+        device_type: DEVICE_TYPE_QPU,
+        device_status: DEVICE_RETIRED,
+        qubit_count: 5_760,
+        shots_range: (1, 10_000),
+        // An annealer is given a problem to MINIMISE rather than a program to run, so
+        // its action names no gates, no pragmas and no result types at all.
+        action_types: &[ACTION_ANNEALING],
+        supported_operations: &[],
+        native_gates: &[],
+        result_types: &[],
+        verbatim: false,
+        noise: false,
+        cost: (0.00019, "shot"),
+        summary: "D-Wave Advantage quantum annealer",
+    },
+    DeviceSeed {
+        arn: "arn:aws:braket:::device/qpu/d-wave/DW_2000Q_6",
+        name: "DW_2000Q_6",
+        provider: "D-Wave",
+        device_type: DEVICE_TYPE_QPU,
+        device_status: DEVICE_RETIRED,
+        qubit_count: 2_048,
+        shots_range: (1, 10_000),
+        action_types: &[ACTION_ANNEALING],
+        supported_operations: &[],
+        native_gates: &[],
+        result_types: &[],
+        verbatim: false,
+        noise: false,
+        cost: (0.00019, "shot"),
+        summary: "D-Wave 2000Q quantum annealer",
+    },
+    DeviceSeed {
+        arn: "arn:aws:braket:us-east-1::device/qpu/xanadu/Borealis",
+        name: "Borealis",
+        provider: "Xanadu",
+        device_type: DEVICE_TYPE_QPU,
+        device_status: DEVICE_RETIRED,
+        // A photonic device's register is its optical modes.
+        qubit_count: 216,
+        shots_range: (1, 100_000),
+        action_types: &[ACTION_BLACKBIRD],
+        supported_operations: &[],
+        native_gates: &[],
+        result_types: &[],
+        verbatim: false,
+        noise: false,
+        cost: (0.00035, "shot"),
+        summary: "Xanadu Borealis photonic quantum processor",
+    },
 ];
 
 /// Build the seeded inventory, keyed and ordered by device ARN.
@@ -1164,7 +1256,9 @@ fn seeded_devices() -> BTreeMap<String, Device> {
 /// the execution windows, the shot range, what a run costs (`deviceCost`) and where
 /// the device is documented (`deviceDocumentation`); one `action` entry per action
 /// type the device accepts, carrying the device-schema properties a client reads to
-/// decide what it may submit (see [`action_properties`]); and the paradigm. Built with
+/// decide what it may submit (see [`action_properties`]); and the device's own
+/// computing properties, under the key its family publishes them as (see
+/// [`device_properties_section`]). Built with
 /// `serde_json`, so what a caller parses is always well-formed JSON, and every
 /// property is computed from the catalog row — the emulator has no hardware, so it
 /// reports no calibration data.
@@ -1180,7 +1274,7 @@ fn capabilities_document(seed: &DeviceSeed, published_at: SystemTime) -> String 
         })
         .collect();
     let slug = url_slug(seed.name);
-    serde_json::json!({
+    let mut document = serde_json::json!({
         "braketSchemaHeader": {
             "name": capabilities_schema(seed),
             "version": "1",
@@ -1209,10 +1303,34 @@ fn capabilities_document(seed: &DeviceSeed, published_at: SystemTime) -> String 
             "updatedAt": as_iso8601(published_at),
         },
         "action": serde_json::Value::Object(actions),
-        "paradigm": paradigm_properties(seed),
         "deviceParameters": device_parameters_schema(seed),
-    })
-    .to_string()
+    });
+    // The device's own computing properties go under the key its family publishes them
+    // as, so a client reads the section the device-schema layout gives it.
+    document
+        .as_object_mut()
+        .expect("the document above is a JSON object")
+        .insert(
+            device_properties_section(seed).to_string(),
+            device_properties(seed),
+        );
+    document.to_string()
+}
+
+/// The key a device's own computing properties are published under.
+///
+/// A gate-model device computes with gates and an analog one with a Hamiltonian, and
+/// both publish that as their `paradigm`; a device of any other family (an annealer, a
+/// photonic processor) has no gate-model paradigm at all, and what it publishes in its
+/// place is its provider's own properties.
+fn device_properties_section(seed: &DeviceSeed) -> &'static str {
+    if seed.action_types.contains(&ACTION_AHS)
+        || seed.action_types.iter().any(|action| is_gate_model_action(action))
+    {
+        "paradigm"
+    } else {
+        "provider"
+    }
 }
 
 /// The schema a device's capability document declares itself to be an instance of.
@@ -1231,13 +1349,19 @@ fn capabilities_schema(seed: &DeviceSeed) -> String {
     }
 }
 
-/// The schema the `paradigm` section declares itself to be an instance of: the
-/// gate-model simulator or QPU paradigm, or the provider's analog
-/// Hamiltonian-simulation paradigm for a device whose programs are analog.
-fn paradigm_schema(seed: &DeviceSeed) -> String {
+/// The schema the device-properties section declares itself to be an instance of: the
+/// gate-model simulator or QPU paradigm, the provider's analog Hamiltonian-simulation
+/// paradigm for a device whose programs are analog, and the provider's own device
+/// properties for a family with no gate-model paradigm.
+fn device_properties_schema(seed: &DeviceSeed) -> String {
+    let namespace = provider_namespace(seed.arn);
     if seed.action_types.contains(&ACTION_AHS) {
-        let namespace = provider_namespace(seed.arn);
         format!("braket.device_schema.{namespace}.{namespace}_ahs_paradigm_properties")
+    } else if !seed.action_types.iter().any(|a| is_gate_model_action(a)) {
+        // A device whose programs are neither gates nor an analog Hamiltonian — an
+        // annealing problem, a photonic program — has no gate-model paradigm to
+        // publish, so what it publishes is its provider's own device properties.
+        format!("braket.device_schema.{namespace}.{namespace}_provider_properties")
     } else if seed.device_type == DEVICE_TYPE_SIMULATOR {
         "braket.device_schema.simulators.gate_model_simulator_paradigm_properties".to_string()
     } else {
@@ -1246,10 +1370,18 @@ fn paradigm_schema(seed: &DeviceSeed) -> String {
 }
 
 /// The provider segment of a device ARN — the `<provider>` of
-/// `.../device/<kind>/<provider>/<name>`, which is also the module a provider's Braket
-/// device schemas live in.
-fn provider_namespace(arn: &str) -> &str {
-    arn.rsplit('/').nth(1).unwrap_or_default()
+/// `.../device/<kind>/<provider>/<name>` — as the module a provider's Braket device
+/// schemas live in: the segment reduced to its letters and digits, because a schema
+/// module name carries none of the separators an ARN segment may (the provider whose
+/// ARN segment reads `d-wave` publishes `braket.device_schema.dwave`).
+fn provider_namespace(arn: &str) -> String {
+    arn.rsplit('/')
+        .nth(1)
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 /// The JSON Schema of the `deviceParameters` a task for this device may carry.
@@ -1284,9 +1416,9 @@ fn device_parameters_schema(seed: &DeviceSeed) -> serde_json::Value {
 /// the action schema's: a gate-model program action ([`ACTION_OPENQASM`],
 /// [`ACTION_JAQCD`]) publishes the operations and result types a program may use, and
 /// the OpenQASM one adds the pragmas it may carry and the array limits its schema
-/// defines; the analog Hamiltonian-simulation action carries neither, because a
-/// program for it names no gates and no pragmas. Every entry carries its
-/// `actionType` and the [`ACTION_SCHEMA_VERSIONS`] it accepts.
+/// defines; every other action family carries neither, because a problem or an analog
+/// program names no gates and no pragmas. Every entry carries its `actionType` and the
+/// [`ACTION_SCHEMA_VERSIONS`] it accepts.
 fn action_properties(seed: &DeviceSeed, action_type: &str) -> serde_json::Value {
     let mut entry = serde_json::Map::new();
     entry.insert("actionType".to_string(), serde_json::json!(action_type));
@@ -1294,7 +1426,7 @@ fn action_properties(seed: &DeviceSeed, action_type: &str) -> serde_json::Value 
         "version".to_string(),
         serde_json::json!(ACTION_SCHEMA_VERSIONS),
     );
-    if action_type == ACTION_AHS {
+    if !is_gate_model_action(action_type) {
         return serde_json::Value::Object(entry);
     }
     entry.insert(
@@ -1408,23 +1540,23 @@ fn pragmas(seed: &DeviceSeed) -> (Vec<&'static str>, Vec<&'static str>) {
     (supported, forbidden)
 }
 
-/// `paradigm`: how the device computes — which schema's paradigm this is, the qubits
-/// it offers and, for a device with a native gate layer, the gates it executes without
+/// The device's own computing properties — which schema's they are, the qubits it
+/// offers and, for a device with a native gate layer, the gates it executes without
 /// recompilation. A simulator and an analog device have none, so they publish none.
-fn paradigm_properties(seed: &DeviceSeed) -> serde_json::Value {
-    let mut paradigm = serde_json::Map::new();
-    paradigm.insert(
+fn device_properties(seed: &DeviceSeed) -> serde_json::Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
         "braketSchemaHeader".to_string(),
-        serde_json::json!({ "name": paradigm_schema(seed), "version": "1" }),
+        serde_json::json!({ "name": device_properties_schema(seed), "version": "1" }),
     );
-    paradigm.insert("qubitCount".to_string(), serde_json::json!(seed.qubit_count));
+    properties.insert("qubitCount".to_string(), serde_json::json!(seed.qubit_count));
     if !seed.native_gates.is_empty() {
-        paradigm.insert(
+        properties.insert(
             "nativeGateSet".to_string(),
             serde_json::json!(seed.native_gates),
         );
     }
-    serde_json::Value::Object(paradigm)
+    serde_json::Value::Object(properties)
 }
 
 /// A device name as the url slug the catalog's documentation links carry: lowercase,
@@ -1680,6 +1812,16 @@ pub fn member_value_is_not_a_valid_arn(member: &str, value: &str) -> String {
 pub const DEVICE_ARN_NOT_FOUND: &str =
     "Device ARN not found. Please use SearchDevices operation to get a list of supported \
      devices.";
+
+/// How every door that refuses a device because the inventory publishes it as `RETIRED`
+/// words that refusal.
+///
+/// The recorded behaviour of the `DeviceRetiredException` class is one FIXED sentence
+/// naming the status that closed the device and the recovery left to the caller: it
+/// interpolates nothing from the request — not the ARN, not the device name — so the
+/// class is reported identically whatever device was asked for, and stays distinguishable
+/// from the `ValidationException` classes that refuse a device for what KIND it is.
+pub const DEVICE_RETIRED_REFUSAL: &str = "Device is RETIRED. Try another device.";
 
 /// The service principal a role Amazon Braket acts under has to trust: Braket assumes the
 /// `roleArn` a hybrid job is created with, so a role whose trust policy does not admit this
