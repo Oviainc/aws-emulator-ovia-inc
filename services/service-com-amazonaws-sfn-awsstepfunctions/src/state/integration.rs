@@ -113,6 +113,15 @@
 //! execution waiting for an answer exactly as it waits for an activity worker's. The
 //! token itself is minted before the call, because the call is what delivers it.
 //!
+//! The token answers the task from that instant on, which is BEFORE the call has come
+//! back: the work it is handed to may report the task's outcome from inside the very
+//! call that delivered it, which is how the Lambda callback pattern is written. The
+//! walk therefore HANDS the token over before it makes the call ([`Tasks::hand_over`])
+//! and reads back what answered it when the call returns
+//! ([`Tasks::settle_handover`]) — an answer that already arrived is the state's own
+//! outcome, so the walk finishes the task here rather than suspending at a token
+//! nothing will quote again.
+//!
 //! An ACTIVITY `Resource` is not one of these: its work belongs to a worker that
 //! polls this emulator, so the walk schedules a task and suspends at it rather than
 //! asking for a call ([`read`] is not asked anything first by
@@ -1997,6 +2006,40 @@ pub struct Failed {
 /// state's result, or the failure the state reports.
 pub type Answer = Result<Value, Failed>;
 
+/// What a `SendTaskSuccess` or `SendTaskFailure` answered a callback task's token with:
+/// the `output` a success reported, or the `error` and `cause` a failure named — each
+/// member exactly as that call carried it, and absent where it named none.
+pub type Replied = Result<Value, super::asl::Failure>;
+
+/// Where a walk records the HANDOVER of a callback (`.waitForTaskToken`) token, and
+/// reads back what a `SendTask*` answered it with while the call carrying it was still
+/// in flight.
+///
+/// The token answers its task from the instant the call carries it, which is BEFORE that
+/// call comes back: the work the token is handed to reports its outcome through
+/// `SendTaskSuccess`/`SendTaskFailure` from inside that very call — which is how the
+/// Lambda callback pattern is written — so the token has to be answerable then. The
+/// handover is what makes it so: the operation serving the answer records it against the
+/// handover and tells its caller the task is answered, and the walk that handed the token
+/// over reads that answer when its call comes back, so the execution is continued ONCE,
+/// by the request that owns the walk.
+///
+/// The records live in this service's own store and are reached through the engine the
+/// operation holds ([`super::callbacks`]): the walk knows nothing of either and only asks.
+pub trait CallbackHandovers: Send + Sync {
+    /// Record that the work of `state_name` in `execution_arn` has been handed `token`,
+    /// so a `SendTask*` quoting it is accepted from now on.
+    fn handed_over(&self, token: &str, execution_arn: &str, state_name: &str);
+
+    /// What a `SendTask*` answered `token` with while its call was in flight, and the END
+    /// of the handover either way: after this the token is answered through the task the
+    /// store records for it.
+    fn settled(&self, token: &str) -> Option<Replied>;
+}
+
+/// See [`CallbackHandovers`].
+pub type Handovers = ::std::sync::Arc<dyn CallbackHandovers>;
+
 /// What performs a `Task` state's service integration for one walk.
 ///
 /// The walk is synchronous — it runs on a blocking thread and its states are a
@@ -2014,6 +2057,24 @@ pub trait Tasks: Send + Sync {
     /// emulator's own ceiling ([`MAX_CALL_DURATION`]) as the only bound, and a
     /// declared timeout longer than that ceiling does not lift it.
     fn perform(&self, call: &Call, request: &Value, within: Option<Duration>) -> Answer;
+
+    /// Record that this walk has handed `token` to the work `call` performs, over the
+    /// state `state_name` of the execution `execution_arn` ([`CallbackHandovers`]).
+    ///
+    /// Asked BEFORE the call is made, because the token travels WITH it. The default
+    /// records nothing, for a walk with no store to record it in — which leaves the token
+    /// answerable from the moment the store records the suspended task, as it was before.
+    fn hand_over(&self, _token: &str, _execution_arn: &str, _state_name: &str) {}
+
+    /// What a `SendTask*` answered `token` with while the call carrying it was in flight,
+    /// and the end of that handover ([`CallbackHandovers::settled`]).
+    ///
+    /// Asked once the call has come back: an answer here is the task's own outcome, so the
+    /// walk is finished at this state instead of suspending at it. The default answers
+    /// nothing, which suspends.
+    fn settle_handover(&self, _token: &str) -> Option<Replied> {
+        None
+    }
 
     /// Why the execution role this walk runs as may NOT make `call` with `request`,
     /// or `None` when nothing of the kind can be shown.
@@ -2569,6 +2630,9 @@ struct Dispatcher {
     /// when the call that started the walk could resolve that role; `None` leaves
     /// every call unjudged, which is what a walk with no role to ask about does.
     role: Option<RoleGate>,
+    /// Where the handover of a callback token is recorded and its answer read back
+    /// ([`CallbackHandovers`]); `None` for a walk with no store to record one in.
+    handovers: Option<Handovers>,
 }
 
 /// What decides whether the execution role a walk runs as may make one integration
@@ -2694,6 +2758,16 @@ impl Tasks for Dispatcher {
     fn authorize(&self, call: &Call, request: &Value) -> Option<Failed> {
         self.role.as_ref()?(call, request)
     }
+
+    fn hand_over(&self, token: &str, execution_arn: &str, state_name: &str) {
+        if let Some(handovers) = &self.handovers {
+            handovers.handed_over(token, execution_arn, state_name);
+        }
+    }
+
+    fn settle_handover(&self, token: &str) -> Option<Replied> {
+        self.handovers.as_ref()?.settled(token)
+    }
 }
 
 /// Run `work` — one interpretation of a definition — on a blocking thread, serving
@@ -2750,11 +2824,13 @@ where
     let (calls, mut handovers) = ::tokio::sync::mpsc::channel::<Handover>(1);
     let role = acting.role;
     let connections = acting.connections;
+    let handed = acting.handovers;
     let walk = ::tokio::task::spawn_blocking(move || {
         let dispatcher = Dispatcher {
             calls,
             depth,
             role,
+            handovers: handed,
         };
         work(&dispatcher)
     });

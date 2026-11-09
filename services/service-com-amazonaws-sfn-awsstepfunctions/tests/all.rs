@@ -117,6 +117,8 @@ mod json_parse_diagnostics;
 mod jsonata_field_diagnostics;
 #[path = "all/jsonata_states.rs"]
 mod jsonata_states;
+#[path = "all/lambda_callback_task_token.rs"]
+mod lambda_callback_task_token;
 #[path = "all/lambda_function_timeout.rs"]
 mod lambda_function_timeout;
 #[path = "all/lambda_task_control_flow.rs"]

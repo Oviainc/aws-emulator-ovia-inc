@@ -190,6 +190,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports with `TaskTimedOut`.
         store.settle(now);
 
+        // A CALLBACK task's token names a task from the instant the `Task` state's own
+        // call CARRIED it, which is BEFORE that call has come back and so before the
+        // suspended task exists ([`crate::state::callbacks`]): the work holding it is
+        // making progress, and nothing of the heartbeat window has started — the task's
+        // own window opens when the walk records it — so this reports progress and
+        // changes nothing.
+        if store.callback_handover_is_open(&input.task_token) {
+            return Ok(SendTaskHeartbeatOutput {});
+        }
+
         let Some(task) = store.activity_tasks.get(&input.task_token) else {
             return Err(SendTaskHeartbeatErrorModeled::TaskTimedOut(TaskTimedOut {
                 message: Some(crate::state::task_timed_out_message(&token_activity)),

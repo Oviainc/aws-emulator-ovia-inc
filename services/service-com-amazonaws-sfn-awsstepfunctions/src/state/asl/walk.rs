@@ -1122,6 +1122,39 @@ impl Interpreter<'_> {
         self.push_detailed(work.failed(failure), state_name, after, details);
     }
 
+    /// The outcome of a callback (`.waitForTaskToken`) task that its token's ANSWER
+    /// decided, with the event that closes the task.
+    ///
+    /// One statement of it, because the answer reaches the walk two ways and decides the
+    /// state the same way either way: a `SendTask*` that arrived while the call carrying
+    /// the token was still in flight is read when that call comes back
+    /// ([`super::super::integration::Tasks::settle_handover`]), and one that arrived
+    /// after the walk suspended begins a walk of its own, which consumes the reply the
+    /// continuation was planned from. A success is the state's result, measured
+    /// against the ceiling every state's document is measured against; a failure is the
+    /// task's own, which the state's `Retry` and `Catch` answer for.
+    pub(super) fn answered_callback(
+        &mut self,
+        state_name: &str,
+        work: &WorkEvents,
+        at: Duration,
+        outcome: Result<Value, Failure>,
+    ) -> Result<Value, Failure> {
+        match outcome {
+            Ok(result) => {
+                let mut details = work.naming();
+                details.output = Some(self.echo(&result));
+                self.push_detailed(work.succeeded(), state_name, at, details);
+                measure_payload(&result, &format!("the 'Task' state '{state_name}'"))
+                    .map(|_bytes| result)
+            }
+            Err(failure) => {
+                self.push_task_failure(state_name, work, &failure, at);
+                Err(failure)
+            }
+        }
+    }
+
     /// The event one attempt of a run-a-job task failed to START its job with: "the
     /// task submission failed", which is a different event from the failure of a task
     /// whose work ran — and the same event a request-response task records when ITS
@@ -1835,21 +1868,7 @@ impl Interpreter<'_> {
                     index: me.steps.len(),
                     at,
                 });
-                return match reply.outcome {
-                    Ok(result) => {
-                        let mut details = work.naming();
-                        details.output = Some(me.echo(&result));
-                        me.push_detailed(work.succeeded(), name, at, details);
-                        let measured =
-                            measure_payload(&result, &format!("the 'Task' state '{name}'"))
-                                .map(|_bytes| result);
-                        (measured, at)
-                    }
-                    Err(failure) => {
-                        me.push_task_failure(name, &work, &failure, at);
-                        (Err(failure), at)
-                    }
-                };
+                return (me.answered_callback(name, &work, at, reply.outcome), at);
             }
             // A branch of the enclosing `Parallel` state has already failed, so this
             // state's work was stopped in flight: the call is NOT made, nothing is
@@ -1917,7 +1936,20 @@ impl Interpreter<'_> {
                 return (Err(failure), at);
             }
             let began = super::super::now();
+            // A CALLBACK task's token goes out WITH this call, and it answers the task
+            // from that instant: the work it reaches may report the task's outcome from
+            // inside this very call. So it is handed over BEFORE the call is made, which
+            // is what lets a `SendTask*` quoting it be answered while the call is still
+            // in flight ([`super::super::integration::Tasks::hand_over`]).
+            if let Some(token) = &token {
+                me.tasks.hand_over(token, &me.execution_arn, name);
+            }
             let answered = me.tasks.perform(&call, &request, within);
+            // The call has come back, so the handover is over: what it carries, if
+            // anything answered it, is this task's own outcome.
+            let replied = token
+                .as_ref()
+                .and_then(|token| me.tasks.settle_handover(token));
             let spent = super::super::now()
                 .duration_since(began)
                 .unwrap_or_default();
@@ -1952,6 +1984,10 @@ impl Interpreter<'_> {
                     cause: Some(cause),
                 }),
             };
+            // What the ANSWER to this attempt's token decided, for a callback task whose
+            // token was answered while its call was in flight: it is the attempt's
+            // outcome, read below once the submission has been recorded.
+            let mut finished: Option<Result<Value, Failure>> = None;
             match (&attempt, call.job) {
                 // A run-a-job integration's call STARTED a job: the task is not
                 // finished, so what the call answered is recorded as the task's
@@ -1995,10 +2031,10 @@ impl Interpreter<'_> {
                     let mut details = work.naming();
                     details.output = Some(result.to_string());
                     // A CALLBACK integration's call HANDED the work over together
-                    // with the token that answers it: the task is not finished, so
-                    // what the call answered is recorded as the task's SUBMISSION
-                    // ("the response from a resource when a task has started") and
-                    // the walk suspends at the token until a `SendTask*` quotes it.
+                    // with the token that answers it: the task is not finished by
+                    // the call, so what the call answered is recorded as the task's
+                    // SUBMISSION ("the response from a resource when a task has
+                    // started") and the token is what finishes it.
                     match &token {
                         Some(token) => {
                             me.push_detailed(
@@ -2007,29 +2043,52 @@ impl Interpreter<'_> {
                                 at,
                                 details,
                             );
-                            me.waiting = Some(ScheduledActivity {
-                                // A callback task belongs to no activity: no poll
-                                // claims it, and what answers it is the token the
-                                // call just carried.
-                                activity_arn: None,
-                                token: Some(token.clone()),
-                                state_name: name.to_string(),
-                                input: me.echo(&request),
-                                raw_input: raw.clone(),
-                                at,
-                                timeout_seconds: within.map(|within| within.as_secs()),
-                                heartbeat_seconds: heartbeat,
-                                // The budget this state's `Retry` has spent so far,
-                                // which the walk that continues from the answer takes
-                                // up: the budget is the state's, not this attempt's.
-                                retries_taken: me.attempts_spent.clone(),
-                            });
+                            match replied {
+                                // The work ANSWERED the token while the call was
+                                // still in flight, which is how the callback pattern
+                                // is written for a function handed `$$.Task.Token`:
+                                // that answer is the task's outcome, so the state is
+                                // finished here instead of suspending at a token
+                                // nothing will quote again.
+                                Some(outcome) => {
+                                    finished =
+                                        Some(me.answered_callback(name, &work, at, outcome));
+                                }
+                                // Nothing has answered it: the walk suspends at the
+                                // token, and the task the store records for it is
+                                // what a later `SendTask*` answers.
+                                None => {
+                                    me.waiting = Some(ScheduledActivity {
+                                        // A callback task belongs to no activity: no
+                                        // poll claims it, and what answers it is the
+                                        // token the call just carried.
+                                        activity_arn: None,
+                                        token: Some(token.clone()),
+                                        state_name: name.to_string(),
+                                        input: me.echo(&request),
+                                        raw_input: raw.clone(),
+                                        at,
+                                        timeout_seconds: within
+                                            .map(|within| within.as_secs()),
+                                        heartbeat_seconds: heartbeat,
+                                        // The budget this state's `Retry` has spent
+                                        // so far, which the walk that continues from
+                                        // the answer takes up: the budget is the
+                                        // state's, not this attempt's.
+                                        retries_taken: me.attempts_spent.clone(),
+                                    });
+                                }
+                            }
                         }
                         None => {
                             me.push_detailed(work.succeeded(), name, at, details);
                         }
                     }
                 }
+                // The call itself FAILED, so the work was never submitted: that failure
+                // is the task's, and an answer the token happened to collect before it
+                // (the handover above ended either way) reports an outcome of work this
+                // state never handed over.
                 (Err(failure), _) => {
                     me.push_submit_failure(name, &work, failure, at, &call)
                 }
@@ -2040,7 +2099,10 @@ impl Interpreter<'_> {
             // states and `Retry` intervals advance, which the branches of a `Parallel`
             // share because they all begin together, so no call may move it.
             me.stamp_work_span(spent);
-            (attempt, at)
+            // A token the work answered before its call came back finished the task:
+            // that answer is the attempt's outcome rather than the submission the call
+            // itself answered.
+            (finished.unwrap_or(attempt), at)
         });
         match outcome {
             // The walk SUSPENDED at the token this state's callback call carried, or

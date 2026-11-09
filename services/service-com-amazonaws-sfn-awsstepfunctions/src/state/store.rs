@@ -51,6 +51,22 @@ pub enum StateMachineUpdateRejection {
     NoRoom,
 }
 
+/// What a `SendTask*` quoting a token found when it looked for a handed-over callback
+/// token ([`ComAmazonawsSfnAwsstepfunctionsState::answer_callback_handover`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallbackHandoverReply {
+    /// The answer was recorded against the handover: this call ANSWERED the task, and the
+    /// walk whose call carries the token finishes the state with it when that call comes
+    /// back.
+    Recorded,
+    /// The handover has already been answered — one token answers one task — so this
+    /// call resolves nothing.
+    Answered,
+    /// The store holds no handover of that token: no call carrying it is in flight, so
+    /// the task the store records for it is what answers.
+    NoHandover,
+}
+
 impl ComAmazonawsSfnAwsstepfunctionsState {
     /// Materialise every transition the clock has already made due.
     ///
@@ -63,6 +79,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// owed before the machine disappeared is still recorded.
     pub fn settle(&mut self, now: SystemTime) {
         self.settle_activity_tasks(now);
+        self.settle_callback_handovers(now);
         self.settle_job_tasks(now);
         let mut still_pending = Vec::with_capacity(self.pending_executions.len());
         for arn in std::mem::take(&mut self.pending_executions) {
@@ -341,6 +358,108 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             }
         }
         Some(task)
+    }
+
+    // -----------------------------------------------------------------------
+    // Handed-over callback tokens
+    // -----------------------------------------------------------------------
+
+    /// Record that the work of `state_name` in `execution_arn` has been handed `token`,
+    /// so a `SendTask*` quoting it is answered from `now` on — before the call carrying it
+    /// has come back, and so before the task it suspends at exists ([`super::callbacks`]).
+    ///
+    /// The record is admitted rather than refused, however full the store is: the token is
+    /// already with the work, so a handover the store declined would leave that work
+    /// holding a token nothing can answer. Its bytes are counted exactly as every other
+    /// record's are, and it is given back the moment the call comes back.
+    pub fn hand_over_callback(
+        &mut self,
+        token: &str,
+        execution_arn: &str,
+        state_name: &str,
+        now: SystemTime,
+    ) {
+        let mut handover = CallbackHandover {
+            execution_arn: execution_arn.to_string(),
+            state_name: state_name.to_string(),
+            handed_at: now,
+            answer: None,
+            retained_bytes: 0,
+        };
+        handover.retained_bytes = handover.measure();
+        self.retained_bytes = self.retained_bytes.saturating_add(handover.retained_bytes);
+        self.callback_handovers.insert(token.to_string(), handover);
+    }
+
+    /// Record `answer` against the handover `token` names, and report what the call
+    /// quoting it has to answer.
+    ///
+    /// One token answers one task, so a handover that already carries an answer takes no
+    /// second one.
+    pub fn answer_callback_handover(
+        &mut self,
+        token: &str,
+        answer: integration::Replied,
+    ) -> CallbackHandoverReply {
+        let Some(handover) = self.callback_handovers.get_mut(token) else {
+            return CallbackHandoverReply::NoHandover;
+        };
+        if handover.answer.is_some() {
+            return CallbackHandoverReply::Answered;
+        }
+        let before = handover.retained_bytes;
+        handover.answer = Some(answer);
+        handover.retained_bytes = handover.measure();
+        let after = handover.retained_bytes;
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(after)
+            .saturating_sub(before);
+        CallbackHandoverReply::Recorded
+    }
+
+    /// Whether the store holds a handover of `token` that nothing has answered yet, which
+    /// is a task outstanding with the work the call handed it to.
+    pub fn callback_handover_is_open(&self, token: &str) -> bool {
+        self.callback_handovers
+            .get(token)
+            .is_some_and(|handover| handover.answer.is_none())
+    }
+
+    /// END the handover of `token` and report what answered it, if anything did.
+    ///
+    /// Called by the walk when the call that carried the token comes back: from here on
+    /// the token is answered through the task the store records for the suspended state,
+    /// so reading the answer and ending the handover are ONE step — no answer can arrive
+    /// between them and be lost.
+    pub fn settle_callback_handover(&mut self, token: &str) -> Option<integration::Replied> {
+        let handover = self.discard_callback_handover(token)?;
+        handover.answer
+    }
+
+    /// Drop the handover `token` names, giving back what its record retained.
+    fn discard_callback_handover(&mut self, token: &str) -> Option<CallbackHandover> {
+        let handover = self.callback_handovers.remove(token)?;
+        self.retained_bytes = self.retained_bytes.saturating_sub(handover.retained_bytes);
+        Some(handover)
+    }
+
+    /// Drop every handover whose call cannot still be in flight
+    /// ([`MAX_HANDOVER_DURATION`]).
+    ///
+    /// The walk ends its own handover when its call comes back, so this closes only the
+    /// ones no walk is waiting for any more — an interpretation that ended at its own
+    /// deadline, a thread that went away — and it is owed whether or not anybody called.
+    fn settle_callback_handovers(&mut self, now: SystemTime) {
+        let expired: Vec<String> = self
+            .callback_handovers
+            .iter()
+            .filter(|(_, handover)| after(handover.handed_at, MAX_HANDOVER_DURATION) <= now)
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in expired {
+            self.discard_callback_handover(&token);
+        }
     }
 
     /// Record a worker's reply to the task `token` names: the task is CLOSED and the

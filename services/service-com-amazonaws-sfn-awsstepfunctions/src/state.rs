@@ -1269,6 +1269,57 @@ impl ActivityTask {
 /// [`STOP_RESERVE_BYTES`]).
 const WORKER_NAME_RESERVE_BYTES: usize = 80;
 
+/// One callback (`.waitForTaskToken`) token a walk has HANDED to the work its state's
+/// integration call performs, while that call is still in flight.
+///
+/// The token answers its task from the instant the call carries it, so this is what a
+/// `SendTaskSuccess` or `SendTaskFailure` quoting it resolves until the walk records the
+/// suspended task — see [`callbacks`] for why the two cannot be the same record. Keyed in
+/// the store by the token, which is the only name the work holding it has.
+#[derive(Debug, Clone)]
+pub struct CallbackHandover {
+    /// The execution whose walk handed the token over, and the state whose call carried
+    /// it: what the handover is ABOUT, so a reader of the store knows which task it
+    /// belongs to.
+    pub execution_arn: String,
+    pub state_name: String,
+    /// When it was handed over, which is what [`MAX_HANDOVER_DURATION`] is measured from.
+    pub handed_at: SystemTime,
+    /// What a `SendTask*` answered it with, once one has: the `output` a success carried,
+    /// or the `error` and `cause` a failure named. `None` while nothing has answered it.
+    pub answer: Option<integration::Replied>,
+    /// The bytes the store counts for this record, as every other record's are.
+    pub retained_bytes: usize,
+}
+
+impl CallbackHandover {
+    /// The bytes this record retains; see [`StateMachine::measure`].
+    pub fn measure(&self) -> usize {
+        let answered = match &self.answer {
+            None => 0,
+            Some(Ok(output)) => output.to_string().len(),
+            Some(Err(failure)) => {
+                failure.error.as_ref().map_or(0, String::len)
+                    + failure.cause.as_ref().map_or(0, String::len)
+            }
+        };
+        std::mem::size_of::<Self>() + self.execution_arn.len() + self.state_name.len() + answered
+    }
+}
+
+/// How long a handed-over callback token stays answerable through its handover
+/// ([`CallbackHandover`]) before the store drops it.
+///
+/// Emulator bound, NOT an AWS limit. The handover lasts exactly as long as the call that
+/// carries the token is in flight, and the walk ends it itself when that call comes back;
+/// this is the backstop for a walk that ended without ending its handover — an
+/// interpretation that ran out of its own deadline, or a thread that went away — so a
+/// record of a call nobody waits for any more cannot accumulate. It is twice the ceiling
+/// on ONE integration call ([`integration::MAX_CALL_DURATION`]), so it cannot expire a
+/// handover whose call is still inside that ceiling.
+pub const MAX_HANDOVER_DURATION: Duration =
+    integration::MAX_CALL_DURATION.saturating_mul(2);
+
 /// The activity task a planned run scheduled, with the walk's offsets turned into
 /// instants.
 ///
@@ -2469,6 +2520,10 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     /// one name the worker holding it has, and what `SendTaskHeartbeat`,
     /// `SendTaskSuccess` and `SendTaskFailure` resolve it by.
     pub activity_tasks: BTreeMap<String, ActivityTask>,
+    /// Every callback (`.waitForTaskToken`) token a walk has HANDED OVER and whose call
+    /// has not come back yet, keyed by that token: the window in which the token answers
+    /// its task before the suspended task exists to answer it ([`callbacks`]).
+    pub callback_handovers: BTreeMap<String, CallbackHandover>,
     /// Every job an execution is PARKED at, keyed by that execution's own ARN: the
     /// work a `Task` state's run-a-job (`.sync`) integration started, which the task
     /// is not finished until the invoked service reports finished. A walk parks at one
@@ -4389,6 +4444,7 @@ fn round_up_to(value: i64, increment: i64) -> i64 {
 }
 
 pub mod asl;
+pub mod callbacks;
 pub mod encryption;
 pub mod events;
 pub mod http_task;
@@ -4403,7 +4459,9 @@ mod plan;
 pub use plan::*;
 pub mod run_a_job;
 pub mod store;
-pub use store::{ActivityPoll, StateMachineUpdate, StateMachineUpdateRejection, Stopped};
+pub use store::{
+    ActivityPoll, CallbackHandoverReply, StateMachineUpdate, StateMachineUpdateRejection, Stopped,
+};
 pub mod task_authorization;
 pub mod xml_answer;
 

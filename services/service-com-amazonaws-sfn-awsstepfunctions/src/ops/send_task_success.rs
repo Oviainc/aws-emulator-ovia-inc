@@ -259,6 +259,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // decides whether the token still answers anything.
             store.settle(now);
 
+            // A CALLBACK task's token answers it from the instant the `Task` state's
+            // own call CARRIED it, which is BEFORE that call has come back and so
+            // before the suspended task exists: the work the token reached may report
+            // the task's outcome from inside that very call, which is how the pattern
+            // is written for a function handed `$$.Task.Token`
+            // ([`crate::state::callbacks`]). Such an answer is RECORDED against the
+            // handover and reported answered here, interpreting nothing: the walk whose
+            // call carries the token finishes the state with it, so the execution is
+            // continued once, by the request that owns that walk.
+            match store.answer_callback_handover(&input.task_token, Ok(result.clone())) {
+                crate::state::CallbackHandoverReply::Recorded => {
+                    return Ok(SendTaskSuccessOutput {})
+                }
+                // One token answers one task: a handover something has already answered
+                // takes no second answer.
+                crate::state::CallbackHandoverReply::Answered => {
+                    return Err(SendTaskSuccessErrorModeled::TaskTimedOut(TaskTimedOut {
+                        message: Some(crate::state::task_timed_out_message(&token_activity)),
+                    })
+                    .into())
+                }
+                // No call carrying this token is in flight, so what answers it is the
+                // task the store records — an activity's, or a callback the walk has
+                // suspended at.
+                crate::state::CallbackHandoverReply::NoHandover => {}
+            }
+
             let Some(task) = store.activity_tasks.get(&input.task_token) else {
                 return Err(SendTaskSuccessErrorModeled::TaskTimedOut(TaskTimedOut {
                     message: Some(crate::state::task_timed_out_message(&token_activity)),
