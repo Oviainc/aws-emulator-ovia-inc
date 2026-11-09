@@ -1899,6 +1899,20 @@ use crate::scaffolded::Scaffolded;
 mod image_recycle_bin;
 pub use image_recycle_bin::{RecycledImageRecord, recycled_image, require_recycled_image};
 
+/// The account's KEY PAIRS: the record one is stored as, the bounds a create holds a
+/// request to, the quota and name refusals EC2 answers about one, and the one writer that
+/// stores one. Re-exported, so a handler reaches them as `crate::state::<item>` like every
+/// other primitive of this module.
+pub mod key_pairs;
+pub use key_pairs::*;
+
+/// The key MATERIAL a key pair is made of — the real RSA or Ed25519 key, the fingerprint its
+/// own type is fingerprinted with, and the private-key file format the request asked for.
+/// Re-exported, so a handler reaches them as `crate::state::<item>` like every other
+/// primitive of this module.
+pub mod key_pair_material;
+pub use key_pair_material::*;
+
 /// A VPC's ROUTE TABLES and the ATTACHMENT an internet gateway of one carries: the store,
 /// the ids, the byte charge and the error channel `CreateRouteTable`, `CreateRoute`,
 /// `AssociateRouteTable`, `AttachInternetGateway` and `DescribeRouteTables` share. The

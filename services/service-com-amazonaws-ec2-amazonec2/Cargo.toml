@@ -31,6 +31,24 @@ jpeg-encoder = "0.6"
 font8x8 = "0.3"
 # `GetConsoleScreenshotResult$ImageData` carries the image as base64 text.
 base64 = "0.22"
+# The 2048-bit RSA key pair `CreateKeyPair` generates: the operation hands the caller the
+# private half, so the key has to be a real key.
+aws-lc-rs = "1"
+# The PKCS#1 `RSAPrivateKey` an RSA key pair's PEM private key is ("an unencrypted PEM
+# encoded PKCS#1 private key"), read out of the PKCS#8 `aws-lc-rs` encodes a key as.
+pkcs1 = { version = "0.7", features = ["pem"] }
+# Reads that PKCS#8 structure, whose `privateKey` IS the PKCS#1 one.
+pkcs8 = "0.10"
+# The SHA-1 digest an RSA key pair's fingerprint is (`KeyPair$KeyFingerprint`).
+sha1 = "0.10"
+# The OpenSSH key formats: an Ed25519 key pair, the PEM private key and the one-line public
+# key OpenSSH writes for one, and the base64 SHA-256 fingerprint it prints for it.
+ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "getrandom"] }
+# The SSH wire encoding of a key's own components, which the PuTTY private key file a
+# `ppk` key format asks for is built out of.
+ssh-encoding = { version = "0.2", features = ["alloc"] }
+# The keyed digest that file's integrity line carries.
+hmac = "0.12"
 # The shared XML rendering of a floating-point member, which AWS writes as a decimal
 # carrying a fractional part where Rust's own rendering drops it, and the ONE
 # evaluation of IAM policy documents the authorization gate decides a request with.

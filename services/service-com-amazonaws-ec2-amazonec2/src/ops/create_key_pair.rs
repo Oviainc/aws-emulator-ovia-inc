@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateKeyPair
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateKeyPair`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateKeyPair::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: generates a key pair of the type the request asked for, stores its PUBLIC
+//! half in this service's key pair store and hands the caller the private half once —
+//! "Amazon EC2 stores the public key and displays the private key for you to save to a
+//! file" (`CreateKeyPair`). The private key is in the response and nowhere else: no record
+//! holds it, so no later read can report it.
+//!
+//! The key is a REAL key of that type, from [`crate::state::generate_key_pair`]: a
+//! 2048-bit RSA key or an Ed25519 one, carrying the fingerprint its own type is
+//! fingerprinted with and written in the `KeyFormat` the request named (`pem` by default,
+//! or the PuTTY file `ppk` asks for). A caller can parse what it is handed and use it as the
+//! private half of the public key `DescribeKeyPairs` reports.
+//!
+//! The refusals, in the order they are answered: a name longer than
+//! [`crate::state::MAX_KEY_PAIR_NAME_CHARS`] or outside ASCII, a `KeyType` or `KeyFormat`
+//! outside the modelled catalog, a tag specification naming another resource type, a name
+//! the account already holds a key pair under (`InvalidKeyPair.Duplicate` — "if a key with
+//! the specified name already exists, Amazon EC2 returns an error"), and a store already at
+//! [`crate::state::MAX_KEY_PAIRS`] ("you can have up to 5,000 key pairs per Amazon Web
+//! Services Region"). `DryRun` is answered LAST, after everything that would have refused
+//! the request has been resolved, so a dry run reports whether the request WOULD have
+//! succeeded — and nothing is generated or stored for one.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +167,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateKeyPair` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateKeyPairErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateKeyPair"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // Nothing about a key pair depends on the Region the request was signed for: the
+        // record carries no Region member and no ARN.
+        let _ = ctx;
+
+        // "A unique name for the key pair. Constraints: Up to 255 ASCII characters"
+        // (`$KeyName`). The member targets a plain `String`, so the boundary validator
+        // enforces neither bound; a name outside them is refused here rather than stored.
+        let key_name = input.key_name.as_str();
+        if key_name.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter KeyName",
+            ));
+        }
+        if key_name.chars().count() > state::MAX_KEY_PAIR_NAME_CHARS {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({key_name}) for parameter keyName is invalid. \
+                 A key pair name accepts at most {max} characters",
+                max = state::MAX_KEY_PAIR_NAME_CHARS,
+            )));
+        }
+        if !key_name.is_ascii() {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({key_name}) for parameter keyName is invalid. \
+                 A key pair name accepts ASCII characters only"
+            )));
+        }
+
+        // "The type of key pair. Default: rsa" (`$KeyType`) and "the format of the key
+        // pair. Default: pem" (`$KeyFormat`), each one member of its modelled catalog. Both
+        // members target a modelled enum, so the boundary validator has already refused a
+        // value outside its catalog; resolving the request's text against the catalog HERE
+        // is what turns it into the catalog's own word, so what is stored is never the
+        // request's own text.
+        let key_type = match input.key_type.as_deref().filter(|value| !value.is_empty()) {
+            Some(requested) => state::key_pair_type(requested).ok_or_else(|| {
+                state::invalid_parameter_value(format!(
+                    "Value ({requested}) for parameter keyType is invalid. \
+                     Valid values: {valid}",
+                    valid = KEY_TYPE_VALUES.join(" | "),
+                ))
+            })?,
+            None => state::KEY_TYPE_RSA,
+        };
+        let key_format = match input.key_format.as_deref().filter(|value| !value.is_empty()) {
+            Some(requested) => state::key_pair_format(requested).ok_or_else(|| {
+                state::invalid_parameter_value(format!(
+                    "Value ({requested}) for parameter keyFormat is invalid. \
+                     Valid values: {valid}",
+                    valid = KEY_FORMAT_VALUES.join(" | "),
+                ))
+            })?,
+            None => state::KEY_FORMAT_PEM,
+        };
+
+        // "The tags to apply to the new key pair" (`$TagSpecifications`) — the shared reader
+        // refuses a specification naming any other resource type and holds the tag payload
+        // to the same documented bounds every create of this crate holds its tags to, so one
+        // rule has one implementation.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_KEY_PAIR,
+            Self::NAME,
+        )?;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+
+        // Taken, read and RELEASED before the key is generated: generating a key is the one
+        // piece of CPU work this handler does, and holding the store's lock across it would
+        // make every other request of this service wait for it. The name check is repeated
+        // under the lock that stores the record, which is what keeps the uniqueness rule
+        // true when two creates of one name run at once.
+        {
+            let store = state_handle.lock();
+            // "If a key with the specified name already exists, Amazon EC2 returns an error"
+            // (`CreateKeyPair`). This emulator's store IS that one account's resources, held
+            // the way it holds its placement groups — in one map rather than one per Region —
+            // so the uniqueness domain here is the whole store.
+            if store.key_pair_id_for_name(key_name).is_some() {
+                return Err(state::invalid_key_pair_duplicate());
+            }
+            // "You can have up to 5,000 key pairs per Amazon Web Services Region"
+            // (`CreateKeyPair`).
+            if !store.has_key_pair_capacity() {
+                return Err(state::key_pair_limit_exceeded());
+            }
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "if you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // No key is generated and nothing is stored.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // Generating a key pair is hundreds of milliseconds of CPU, so it runs on the
+        // blocking pool with the store lock RELEASED: `spawn_blocking(..).await` is a real
+        // await point, so one key pair cannot starve the worker that serves health checks
+        // and every other request, and no other request waits on the store while it runs.
+        // The same construct `CreateKeysAndCertificate` mints its key pair through.
+        let generation_name = key_name.to_string();
+        let generated = ::tokio::task::spawn_blocking(move || {
+            state::generate_key_pair(key_type, key_format, &generation_name)
+        })
+        .await;
+        let generated = match generated {
+            Ok(Some(generated)) => generated,
+            // No key material was produced, so this is reported as the server fault it is
+            // rather than answered as a key pair nothing generated.
+            Ok(None) => {
+                return Err(Scaffolded::internal_error(
+                    "The key pair could not be generated",
+                ))
+            }
+            // A panic or a cancellation on the pool says nothing about the request.
+            Err(error) => {
+                ::tracing::error!(
+                    operation = Self::NAME,
+                    error = %error,
+                    "the key pair generation did not complete"
+                );
+                return Err(Scaffolded::internal_error(
+                    "The key pair could not be generated",
+                ));
+            }
+        };
+
+        let spec = state::KeyPairSpec {
+            key_name: key_name.to_string(),
+            key_type,
+            key_fingerprint: generated.key_fingerprint,
+            public_key: generated.public_key,
+            tags,
+            created_at: ::std::time::SystemTime::now(),
+        };
+
+        let mut store = state_handle.lock();
+        // Asked again under the lock the record is stored through: a key pair another request
+        // stored under this name while the key was being generated is still a key pair of
+        // that name, so this one is refused rather than stored beside it.
+        if store.key_pair_id_for_name(key_name).is_some() {
+            return Err(state::invalid_key_pair_duplicate());
+        }
+        // ONE formula for the charge: the same helper `insert_key_pair` charges, so the
+        // budget this check reserves cannot drift from what the insert actually takes.
+        let payload_bytes = state::key_pair_spec_bytes(&spec);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // `insert_key_pair` derives the id and stores the record, so this handler never
+        // invents one, and it answers the record AS IT WAS STORED — so `CreateKeyPair` and
+        // `DescribeKeyPairs` cannot report one key pair differently. It asks the ceiling
+        // again for itself, so the quota refusal above cannot be bypassed.
+        let stored = store
+            .insert_key_pair(spec)
+            .ok_or_else(state::key_pair_limit_exceeded)?;
+
+        Ok(CreateKeyPairOutput {
+            key_pair_id: stored.info.key_pair_id.clone(),
+            key_name: stored.info.key_name.clone(),
+            key_fingerprint: stored.info.key_fingerprint.clone(),
+            tags: stored.info.tags.clone(),
+            // The one and only time the private half is reported: it is handed back here
+            // and held nowhere, which is why nothing else can ever answer it.
+            key_material: Some(generated.key_material),
+        })
     }
 }

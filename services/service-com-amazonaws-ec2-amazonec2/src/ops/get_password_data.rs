@@ -17,15 +17,15 @@
 //! keeps it ENCRYPTED under the PUBLIC KEY of the key pair the launch named; the caller
 //! decrypts it with the private half it kept ("The password is encrypted using the key
 //! pair that you specified when you launched the instance. You must provide the
-//! corresponding key pair file"). This emulator holds no key pair material: `CreateKeyPair`
-//! and `ImportKeyPair` are still scaffolds (`issues/.../*-ec2-createkeypair-stub.md`,
-//! `issues/.../*-ec2-importkeypair-stub.md`), so no key pair exists for a launch to name
-//! and there is no public key to encrypt a password under. A blob no caller could ever
-//! decrypt would be a FABRICATED password rather than a password, so what this reports is
-//! the answer the model documents for an instance whose password is not available:
-//! "Returns an empty string if the password is not available"
+//! corresponding key pair file"). What EC2 would need to do that is the public key of the
+//! key pair a launch named — which `CreateKeyPair` now stores — and a password its Windows
+//! boot agent generated at boot. This emulator runs no guest boot agent, so no instance of
+//! it has ever had an administrator password generated for it, and there is nothing to
+//! encrypt. A blob no caller could decrypt would be a FABRICATED password rather than a
+//! password, so what this reports is the answer the model documents for an instance whose
+//! password is not available: "Returns an empty string if the password is not available"
 //! (`GetPasswordDataResult$PasswordData`). The encryption step belongs here, over the
-//! public key of the named key pair, the day key pairs carry one.
+//! public key of the named key pair, the day a boot generates one.
 //!
 //! `Timestamp` is "the time the data was last updated", so it is reported only for data
 //! that exists: an instance the service holds no password data for has no instant at
@@ -202,9 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The id is read back off the stored record rather than echoed from the
             // request, so the response names the instance the service resolved.
             instance_id: Some(instance.instance_id.clone()),
-            // No key pair material exists for a launch to have named, so EC2 would hold
-            // no encrypted password for this instance: the documented empty string. See
-            // the module docs for why anything else here would be a fabrication.
+            // No Windows boot agent ever generated a password for this instance, so EC2
+            // would hold no encrypted password for it: the documented empty string. See the
+            // module docs for why anything else here would be a fabrication.
             password_data: Some(String::new()),
             // "The time the data was last updated" — there is no data, so there is no
             // such instant to report.

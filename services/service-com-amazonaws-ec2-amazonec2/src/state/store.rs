@@ -2889,6 +2889,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// "the number of partitions", "the spread level", "the ARN", "any tags applied to the
     /// placement group" — [`PlacementGroup`]) is a member of it.
     pub placement_groups: BTreeMap<String, PlacementGroup>,
+    /// The account's key pairs, by `KeyPairId`, as [`KeyPairRecord`]s — the modelled
+    /// [`crate::ops::types::KeyPairInfo`] shape every report of a key pair answers with,
+    /// beside the public key material a report carries only when it asked for it. Ordered
+    /// by id, the same stable order the other stores are kept in.
+    ///
+    /// Starts EMPTY: a key pair exists only because `CreateKeyPair` minted one.
+    /// [`Self::insert_key_pair`] is the one way one is stored, and the private half is
+    /// NEVER here — EC2 "stores the public key and displays the private key for you to save
+    /// to a file" (`CreateKeyPair`).
+    pub key_pairs: BTreeMap<String, KeyPairRecord>,
     /// Every root volume replacement task the account has started, by
     /// `ReplaceRootVolumeTaskId` — see [`ReplaceRootVolumeTaskRecord`] and the module docs.
     /// `CreateReplaceRootVolumeTask` is the operation that starts one and
@@ -3440,6 +3450,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             spot_fleet_requests: BTreeMap::new(),
             spot_fleet_request_client_tokens: HashMap::new(),
             placement_groups: BTreeMap::new(),
+            // A fresh account holds no key pair until `CreateKeyPair` mints one.
+            key_pairs: BTreeMap::new(),
             replace_root_volume_tasks: BTreeMap::new(),
             replace_root_volume_task_client_tokens: HashMap::new(),
             // A fresh account has started no Mac modification task, and no token names one.
