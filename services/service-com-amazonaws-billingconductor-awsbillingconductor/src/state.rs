@@ -1791,6 +1791,41 @@ impl DeletedBillingGroupRecord {
         }
     }
 
+    /// The generations of this deleted group a period-scoped read of the billing groups
+    /// can still REPORT, oldest first: the generation in force in each of the periods
+    /// [`Self::reported_in`] answers for, which is exactly what
+    /// [`billing_groups_in`](ComAmazonawsBillingconductorAwsbillingconductorState::billing_groups_in)
+    /// projects for this record.
+    ///
+    /// A generation is in force from its own start period up to the next generation's
+    /// ([`VersionedResource::effective_in`]), so a generation that took effect in the
+    /// period of the delete or later is reported by no period at all, and a group
+    /// created and deleted within ONE period is reported by none of its generations.
+    /// The OLDEST generation still kept answers for the periods before it, so it is
+    /// reported whenever any period reports the group at all.
+    pub fn reported_versions(&self) -> Vec<BillingGroupVersion> {
+        let (Some(created), Some(deleted)) = (
+            billing_period_key(&self.record.creation_billing_period()),
+            billing_period_key(&self.deletion_billing_period()),
+        ) else {
+            return Vec::new();
+        };
+        if created >= deleted {
+            return Vec::new();
+        }
+        self.record
+            .versions()
+            .into_iter()
+            .enumerate()
+            .filter(|(index, version)| {
+                *index == 0
+                    || billing_period_key(&version.start_billing_period())
+                        .is_some_and(|start| start < deleted)
+            })
+            .map(|(_, version)| version)
+            .collect()
+    }
+
     /// The name this group carried in `billing_period` — the name it OCCUPIED there —
     /// or `None` when it did not exist in that period.
     ///
@@ -3595,31 +3630,48 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         Some(removed)
     }
 
-    /// The ARNs of every stored billing group that computes with this pricing plan in
-    /// ANY billing period — the association "the pricing plan must not be associated
-    /// with any billing groups to delete successfully" is decided from.
+    /// The ARNs of every billing group that computes with this pricing plan in ANY
+    /// billing period a read of this store can still ask about — the association "the
+    /// pricing plan must not be associated with any billing groups to delete
+    /// successfully" is decided from.
     ///
     /// A group's `ComputationPreference.PricingPlanArn` is a member a write can change,
     /// so each GENERATION of a group carries the plan that generation computes with
     /// ([`BillingGroupVersion::pricing_plan_arn`]) and a period-scoped read reports the
     /// plan of the generation in force then ([`VersionedResource::effective_in`]).
-    /// Every generation of a stored group is therefore an association the store can
-    /// still report, and a plan one of them names is in use whether or not the LIVE
-    /// generation still names it — otherwise the plan could be deleted out from under a
-    /// closed period that goes on reporting it, leaving an ARN that resolves to no plan.
-    /// A group may name the plan in either spelling the `PricingPlanArn` pattern allows,
-    /// so both sides are normalised.
+    /// Every generation a period-scoped read of the groups can report is therefore an
+    /// association the store can still report, and a plan one of them names is in use
+    /// whether or not the LIVE generation still names it — otherwise the plan could be
+    /// deleted out from under a closed period that goes on reporting it, leaving an ARN
+    /// that resolves to no plan.
+    ///
+    /// The groups those reads report are the ones
+    /// [`Self::billing_groups_in`] answers from: the groups the store still holds, and
+    /// the groups a delete has since removed, for the periods before that delete took
+    /// effect — so a DELETED group's still-reportable generations
+    /// ([`DeletedBillingGroupRecord::reported_versions`]) hold a plan back exactly as a
+    /// stored group's do, the way a deleted group's generations still hold the name they
+    /// occupied ([`Self::deleted_billing_group_occupying_name`]). A group may name the
+    /// plan in either spelling the `PricingPlanArn` pattern allows, so both sides are
+    /// normalised. Keyed by ARN, so one group is reported once and the sequence is
+    /// creation order whether or not the group is still stored.
     pub fn billing_groups_referencing_pricing_plan(&self, plan_arn: &str) -> Vec<String> {
-        self.billing_groups
+        let names_the_plan = |versions: &[BillingGroupVersion]| {
+            versions
+                .iter()
+                .any(|version| normalize_pricing_plan_arn(&version.pricing_plan_arn) == plan_arn)
+        };
+        let stored = self
+            .billing_groups
             .iter()
-            .filter(|(_, group)| {
-                group
-                    .versions()
-                    .iter()
-                    .any(|version| normalize_pricing_plan_arn(&version.pricing_plan_arn) == plan_arn)
-            })
-            .map(|(arn, _)| arn.clone())
-            .collect()
+            .filter(|(_, group)| names_the_plan(&group.versions()))
+            .map(|(arn, _)| arn.clone());
+        let deleted = self
+            .deleted_billing_groups
+            .iter()
+            .filter(|deleted| names_the_plan(&deleted.reported_versions()))
+            .map(|deleted| deleted.record.arn.clone());
+        stored.chain(deleted).collect::<BTreeSet<String>>().into_iter().collect()
     }
 
     /// The ARNs of every stored pricing plan that associates this pricing rule in ANY

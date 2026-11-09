@@ -208,11 +208,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // case by name. The caller points the group at another plan, or deletes the
         // group, first.
         //
-        // Every GENERATION of a stored group counts, not just the one in force now: a
-        // group's computation preference is a member a write can change, so a closed
-        // billing period reports the plan the generation in force THEN computed with,
-        // and a plan still named by any of those generations is a plan a read of this
-        // store can still report.
+        // Every GENERATION a period-scoped read of the groups can report counts, not
+        // just the one in force now: a group's computation preference is a member a
+        // write can change, so a closed billing period reports the plan the generation
+        // in force THEN computed with, and a plan still named by any of those
+        // generations is a plan a read of this store can still report — including the
+        // generations of a group a delete has since removed, which the periods before
+        // that delete go on reporting.
         let holders = state.billing_groups_referencing_pricing_plan(&plan_arn);
         if let Some(group_arn) = holders.first() {
             return Err(DeletePricingPlanErrorModeled::ConflictException(ConflictException {

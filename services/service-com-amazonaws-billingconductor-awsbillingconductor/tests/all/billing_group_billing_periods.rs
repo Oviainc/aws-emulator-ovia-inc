@@ -51,6 +51,7 @@ const LIST_PATH: &str = "/list-billing-groups";
 /// `POST`).
 const CREATE_GROUP_PATH: &str = "/create-billing-group";
 const UPDATE_GROUP_PATH: &str = "/update-billing-group";
+const DELETE_GROUP_PATH: &str = "/delete-billing-group";
 const CREATE_PLAN_PATH: &str = "/create-pricing-plan";
 
 /// The account that serves as the billing owner of the `index`-th group here: a group
@@ -219,6 +220,32 @@ impl Emulator {
             .get_mut(group)
             .expect("setup generation_started_in: the group was created above");
         record.last_modified_time_millis = at;
+    }
+
+    /// `DeleteBillingGroup`: remove the group through the real wire, which keeps the
+    /// record of the periods it billed in.
+    pub(crate) async fn delete_group(&self, case: &str, group: &str) {
+        let (status, answer) = self
+            .post(DELETE_GROUP_PATH, &json!({"Arn": group}))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: setup DeleteBillingGroup expected 200, got {status} with {answer:?}"
+        );
+    }
+
+    /// Backdate the DELETE of `group` to `period`, as if the deleting call had been made
+    /// in that billing period: the wire can only delete now.
+    pub(crate) fn deleted_in(&self, group: &str, period: &str) {
+        let at = period_start_millis(period);
+        let state = self.engine.state::<BillingConductorState>();
+        let mut state = state.lock();
+        let deleted = state
+            .deleted_billing_groups
+            .iter_mut()
+            .find(|deleted| deleted.record.arn == group)
+            .expect("setup deleted_in: the group was deleted above");
+        deleted.deletion_time_millis = at;
     }
 
     /// How many SUPERSEDED generations of `group` the store holds: the slots this group

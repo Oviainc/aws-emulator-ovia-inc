@@ -83,6 +83,8 @@ mod custom_line_item_versions_by_billing_period;
 mod delete_auto_associate_billing_group;
 #[path = "all/delete_custom_line_item.rs"]
 mod delete_custom_line_item;
+#[path = "all/deleted_billing_group_holds_pricing_plan_back.rs"]
+mod deleted_billing_group_holds_pricing_plan_back;
 #[path = "all/deleted_billing_group_period_reads.rs"]
 mod deleted_billing_group_period_reads;
 #[path = "all/disassociate_accounts.rs"]

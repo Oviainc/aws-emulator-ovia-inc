@@ -8,10 +8,14 @@
 //! precondition over every association a period-scoped read of this store can still
 //! report, not only the one in force in the current billing period. So
 //!
-//! * `DeletePricingPlan` is refused while ANY generation of a stored billing group
-//!   computes with the plan — a group's `ComputationPreference.PricingPlanArn` is a
-//!   member a write can change, so each generation carries the plan it computed with and
-//!   `ListBillingGroups` reports the generation in force in the period it is asked about;
+//! * `DeletePricingPlan` is refused while ANY generation a period-scoped read of the
+//!   billing groups can still report computes with the plan — a group's
+//!   `ComputationPreference.PricingPlanArn` is a member a write can change, so each
+//!   generation carries the plan it computed with and `ListBillingGroups` reports the
+//!   generation in force in the period it is asked about. The rows here keep the group
+//!   STORED; `tests/all/deleted_billing_group_holds_pricing_plan_back.rs` owns the
+//!   generations of a group a delete has since removed, which those reads go on reporting
+//!   for the periods before the delete;
 //! * `DeletePricingRule` is refused while a stored pricing plan associates the rule in
 //!   ANY billing period, including an association a later call has since ended, which
 //!   the readers of a closed period still report.
@@ -46,7 +50,7 @@ use crate::pricing_rule_association_periods::{arns, shift_period, Emulator as Pl
 
 /// `POST /delete-pricing-plan` — one of the two operations under test
 /// (`smithy_query(query="operation",operation="DeletePricingPlan")`).
-const DELETE_PLAN_PATH: &str = "/delete-pricing-plan";
+pub(crate) const DELETE_PLAN_PATH: &str = "/delete-pricing-plan";
 
 /// `POST /delete-pricing-rule` — the other one.
 const DELETE_RULE_PATH: &str = "/delete-pricing-rule";
@@ -63,7 +67,7 @@ const LIST_RULES_OF_PLAN_PATH: &str = "/list-pricing-rules-associated-to-pricing
 const LIST_RULES_PATH: &str = "/list-pricing-rules";
 
 /// The wire error code of a failure response (`__type`), without any namespace.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -98,7 +102,7 @@ fn months(count: usize) -> i64 {
 /// Does the store still hold the pricing plan `plan`? Decided by the read-only
 /// `ListPricingRulesAssociatedToPricingPlan`, which answers 200 for a stored plan and the
 /// modelled 404 for one that is not.
-async fn plan_is_stored(em: &GroupEmulator, case: &str, plan: &str) -> bool {
+pub(crate) async fn plan_is_stored(em: &GroupEmulator, case: &str, plan: &str) -> bool {
     let (status, body) = em
         .post(LIST_RULES_OF_PLAN_PATH, &json!({"PricingPlanArn": plan}))
         .await;
@@ -115,7 +119,7 @@ async fn plan_is_stored(em: &GroupEmulator, case: &str, plan: &str) -> bool {
 /// The plan ARN `ListBillingGroups` reports for `group` in `period` — the plan the
 /// generation in force then computed with — or `None` when the listing does not report
 /// the group for that period at all.
-async fn reported_plan(
+pub(crate) async fn reported_plan(
     em: &GroupEmulator,
     case: &str,
     group: &str,
@@ -135,7 +139,7 @@ async fn reported_plan(
 /// The INVARIANT the gate exists for: every plan ARN the period-scoped group listing
 /// reports, for any period, names a plan the store still holds — no reader hands a caller
 /// an ARN that resolves to nothing.
-async fn assert_every_reported_plan_resolves(
+pub(crate) async fn assert_every_reported_plan_resolves(
     em: &GroupEmulator,
     case: &str,
     group: &str,
