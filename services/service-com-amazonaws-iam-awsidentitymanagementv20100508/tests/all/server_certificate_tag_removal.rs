@@ -50,7 +50,7 @@ use crate::user_lifecycle::{
 };
 
 /// One `UntagServerCertificate` call: the HTTP status and the XML body.
-async fn untag_certificate(
+pub(crate) async fn untag_certificate(
     router: &MultiServiceRouter,
     name: &str,
     removed: &[String],

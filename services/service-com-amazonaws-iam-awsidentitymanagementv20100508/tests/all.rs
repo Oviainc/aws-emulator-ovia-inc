@@ -67,6 +67,8 @@ mod custom_policy_simulation;
 mod delegation_request_acceptance;
 #[path = "all/delegation_request_association.rs"]
 mod delegation_request_association;
+#[path = "all/delegation_request_error_envelope.rs"]
+mod delegation_request_error_envelope;
 #[path = "all/delegation_request_filing.rs"]
 mod delegation_request_filing;
 #[path = "all/delegation_request_listing.rs"]
@@ -307,6 +309,8 @@ mod server_certificate_tag_listing;
 mod server_certificate_tag_removal;
 #[path = "all/server_certificate_tag_updates.rs"]
 mod server_certificate_tag_updates;
+#[path = "all/server_certificate_untag_listing.rs"]
+mod server_certificate_untag_listing;
 #[path = "all/server_certificates.rs"]
 mod server_certificates;
 #[path = "all/service_last_accessed_details.rs"]
