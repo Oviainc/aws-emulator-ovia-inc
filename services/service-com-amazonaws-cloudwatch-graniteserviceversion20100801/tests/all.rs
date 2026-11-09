@@ -139,6 +139,8 @@ mod live_published_actions_split;
 mod log_alarms;
 #[path = "all/managed_insight_rule_catalog.rs"]
 mod managed_insight_rule_catalog;
+#[path = "all/managed_insight_rule_definition.rs"]
+mod managed_insight_rule_definition;
 #[path = "all/managed_insight_rule_service_catalog.rs"]
 mod managed_insight_rule_service_catalog;
 #[path = "all/managed_insight_rules.rs"]

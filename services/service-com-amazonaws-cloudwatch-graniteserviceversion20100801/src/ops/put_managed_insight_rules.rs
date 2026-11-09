@@ -424,13 +424,20 @@ const TEMPLATE_NAME_FAILURE_CODE: &str = "TEMPLATE_NAME";
 /// to repair.
 const INVALID_PARAMETER_EXCEPTION: &str = "InvalidParameterException";
 
-/// The `Definition` a managed rule carries: the managed-rule schema, and the template and
-/// resource the rule was enabled from.
+/// The `Definition` a managed rule carries: the managed-rule schema, the template the rule was
+/// enabled from, and — under `Resource` — the ARN of the Amazon Web Services resource whose data
+/// it collects.
 ///
 /// `InsightRule$Definition` is required on the shape `DescribeInsightRules` reports, and a
 /// managed rule is not written by a caller — "You cannot edit these rules with PutInsightRule"
 /// (`PutManagedInsightRules`) — so what it reports is the request this rule came from, under
 /// the schema the model names for a managed rule.
+///
+/// A managed rule "collects data from Amazon Web Services services"
+/// (`PutManagedInsightRules`) for ONE resource, and the definition of such a rule names that
+/// resource under `Resource`: a client reading the described rules tells which resource a
+/// managed rule collects from by that member, so the key is the one a `ServiceLogRule`
+/// definition states it with and not a spelling of this emulator's own.
 fn managed_definition(origin: &crate::state::ManagedRuleOrigin) -> String {
     // The schema document is built from the one schema `crate::state` keeps for a managed rule,
     // so the definition and the rule's own `Schema` member cannot drift apart.
@@ -439,7 +446,7 @@ fn managed_definition(origin: &crate::state::ManagedRuleOrigin) -> String {
     ::serde_json::json!({
         "Schema": schema,
         "TemplateName": origin.template_name,
-        "ResourceARN": origin.resource_arn,
+        "Resource": origin.resource_arn,
     })
     .to_string()
 }
