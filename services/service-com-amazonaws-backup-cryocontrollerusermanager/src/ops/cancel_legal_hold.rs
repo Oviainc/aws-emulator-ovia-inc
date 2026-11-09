@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The id resolution this service words once for a legal hold
             // (`crate::state`), so this call and a read of the same id cannot
             // disagree about which ids the account holds.
-            return Err(CancelLegalHoldErrorModeled::ResourceNotFoundException(
+            return Err(CancelLegalHoldErrorModeled::InvalidParameterValueException(
                 crate::state::legal_hold_not_found(),
             )
             .into());

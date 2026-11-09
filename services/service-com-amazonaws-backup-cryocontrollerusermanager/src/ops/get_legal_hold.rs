@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_legal_holds(now);
         let hold = store
             .legal_hold(&input.legal_hold_id)
-            .map_err(GetLegalHoldErrorModeled::ResourceNotFoundException)?;
+            .map_err(GetLegalHoldErrorModeled::InvalidParameterValueException)?;
 
         // The members the list reports come from the ONE projection
         // `ListLegalHolds` and `CreateLegalHold` answer from, so the three reads

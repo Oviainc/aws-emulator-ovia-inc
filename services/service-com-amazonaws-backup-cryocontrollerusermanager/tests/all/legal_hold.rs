@@ -18,8 +18,8 @@
 //!   token already made, so no second hold is listed;
 //! * a request outside what AWS accepts — an absent required member (including
 //!   the recovery-point selection, which AWS requires though the model does
-//!   not), a selection bound in the future, a vault name or resource identifier
-//!   that names nothing, a page size outside the modelled range, a cursor from
+//!   not), a selection bound in the future, a resource identifier that is not
+//!   an ARN, a page size outside the modelled range, a cursor from
 //!   no result set, an id the account holds nothing under — is refused with the
 //!   modelled exception for that condition and stores nothing.
 //!
@@ -59,10 +59,9 @@ const MAX_RESULTS_MAX: i64 = 1000;
 /// `MESSAGE_MISSING_RESOURCE_SELECTION`).
 const MISSING_RESOURCE_SELECTION: &str = "Missing Resource Selection.";
 
-/// The sentence this service states for a legal hold id the account does not
-/// hold (`crate::state`'s `MESSAGE_LEGAL_HOLD_NOT_FOUND`), worded as it words
-/// the same condition for a recovery point.
-const LEGAL_HOLD_NOT_FOUND: &str = "Cannot find legal hold";
+/// The sentence AWS states for a legal hold id the account does not hold, which
+/// this service words once (`crate::state`'s `MESSAGE_LEGAL_HOLD_NOT_FOUND`).
+const LEGAL_HOLD_NOT_FOUND: &str = "Can not find Legal Hold ARN.";
 
 /// `POST /legal-holds` — `CreateLegalHold`'s HTTP binding.
 async fn create_legal_hold(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
@@ -315,7 +314,7 @@ async fn a_created_legal_hold_is_listed_member_for_member() {
 /// with the sentence AWS states for the condition, and an id it does hold is
 /// not.
 #[tokio::test]
-async fn a_read_of_an_unheld_legal_hold_id_is_resource_not_found() {
+async fn a_read_of_an_unheld_legal_hold_id_is_refused() {
     let router = router();
     let (status, created) = create_legal_hold(
         &router,
@@ -350,7 +349,11 @@ async fn a_read_of_an_unheld_legal_hold_id_is_resource_not_found() {
                 error_code(&missing).as_str(),
                 refusal_message(&missing).as_str()
             ),
-            (400, "ResourceNotFoundException", LEGAL_HOLD_NOT_FOUND),
+            (
+                400,
+                "InvalidParameterValueException",
+                LEGAL_HOLD_NOT_FOUND,
+            ),
             "id {unheld:?}: expected the read to be refused, got {status} {missing:?}"
         );
     }
@@ -590,26 +593,6 @@ async fn a_create_outside_what_aws_accepts_is_refused_and_stores_nothing() {
                         "ToDate": epoch_seconds(Duration::from_secs(86_400), true),
                     },
                 },
-            }),
-            "InvalidParameterValueException",
-            None,
-        ),
-        (
-            "a VaultNames entry outside the modelled vault-name pattern",
-            json!({
-                "Title": "BadVault",
-                "Description": "names no vault this service could hold",
-                "RecoveryPointSelection": {"VaultNames": ["not a vault name!"]},
-            }),
-            "InvalidParameterValueException",
-            None,
-        ),
-        (
-            "a VaultNames entry shorter than the modelled minimum",
-            json!({
-                "Title": "ShortVault",
-                "Description": "one character is below the pattern's floor",
-                "RecoveryPointSelection": {"VaultNames": ["v"]},
             }),
             "InvalidParameterValueException",
             None,

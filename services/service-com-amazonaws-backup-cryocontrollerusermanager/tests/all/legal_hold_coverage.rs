@@ -65,10 +65,10 @@ const MAX_RESULTS_MAX: i64 = 1000;
 /// The error shape every refusal of this operation names.
 const INVALID_PARAMETER: &str = "InvalidParameterValueException";
 
-/// The sentence this service states for a member whose value it cannot accept,
-/// which it words once for every such member (`crate::state`'s
-/// `rejected_parameter`).
-const INVALID_LEGAL_HOLD_ID: &str = "Parameter LegalHoldId is invalid.";
+/// The sentence AWS states for a legal hold id the account does not hold, which
+/// this service words once for every hold-scoped call (`crate::state`'s
+/// `MESSAGE_LEGAL_HOLD_NOT_FOUND`).
+const LEGAL_HOLD_NOT_FOUND: &str = "Can not find Legal Hold ARN.";
 
 /// A legal hold id of the form this service mints that no fresh account holds.
 const UNHELD_HOLD_ID: &str = "00000000-0000-0000-0000-000000000000";
@@ -579,12 +579,12 @@ async fn a_refused_coverage_read_answers_the_modelled_invalid_parameter() {
         );
     }
 
-    // The refusal for an unheld id names the member a client has to fix.
+    // The refusal for an unheld id states the condition AWS states for it.
     let (_, refused) = held_points(&fixture.router, UNHELD_HOLD_ID, "").await;
     assert_eq!(
         string_at(&refused, "Message"),
-        INVALID_LEGAL_HOLD_ID,
-        "the refusal names the member that named the hold, got {refused:?}"
+        LEGAL_HOLD_NOT_FOUND,
+        "the refusal states the hold it could not resolve, got {refused:?}"
     );
 
     // The control: both ends of the modelled page-size range are served.
@@ -670,7 +670,7 @@ async fn a_canceled_hold_releases_the_recovery_points_it_held() {
          got {status} {refused:?}"
     );
 
-    // A legal hold id the account holds nothing under is not found.
+    // A legal hold id the account holds nothing under cannot be resolved.
     let (status, refused) = cancel_legal_hold(
         &fixture.router,
         UNHELD_HOLD_ID,
@@ -678,9 +678,13 @@ async fn a_canceled_hold_releases_the_recovery_points_it_held() {
     )
     .await;
     assert_eq!(
-        (status, error_code(&refused).as_str()),
-        (400, "ResourceNotFoundException"),
-        "expected an unheld id to be refused as absent, got {status} {refused:?}"
+        (
+            status,
+            error_code(&refused).as_str(),
+            string_at(&refused, "Message").as_str()
+        ),
+        (400, INVALID_PARAMETER, LEGAL_HOLD_NOT_FOUND),
+        "expected an unheld id to be refused as unresolvable, got {status} {refused:?}"
     );
 }
 

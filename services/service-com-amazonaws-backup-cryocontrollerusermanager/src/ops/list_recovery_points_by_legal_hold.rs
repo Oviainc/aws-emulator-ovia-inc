@@ -178,13 +178,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         // This operation models no `ResourceNotFoundException` — its only client
         // errors are `InvalidParameterValueException` and
-        // `MissingParameterValueException` — so an id the account holds nothing
-        // under is refused as the value of the member that named it, with the
-        // refusal `crate::state` words once for every such member.
+        // `MissingParameterValueException` — which is the class this service
+        // answers an unresolvable hold id with anyway, worded once in
+        // `crate::state` so this listing and a read of the same id cannot
+        // disagree about which ids the account holds.
         let Some(hold) = store.legal_holds.get(&input.legal_hold_id) else {
             return Err(
                 ListRecoveryPointsByLegalHoldErrorModeled::InvalidParameterValueException(
-                    crate::state::rejected_parameter("LegalHoldId"),
+                    crate::state::legal_hold_not_found(),
                 )
                 .into(),
             );

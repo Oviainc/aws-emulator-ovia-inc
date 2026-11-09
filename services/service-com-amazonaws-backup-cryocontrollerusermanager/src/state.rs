@@ -524,6 +524,16 @@ pub fn is_modelled_vault_name(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// The `VaultNames` entry that selects EVERY vault rather than one vault.
+///
+/// A recovery-point selection's entries are plain strings, so this one cannot be
+/// read as the name of a vault: the `BackupVaultName` pattern
+/// ([`is_modelled_vault_name`]) admits no `*`, so no vault of this account can
+/// ever be called that, and an entry read literally would narrow the hold to a
+/// vault that cannot exist. It is the form a client uses to place a hold across
+/// all vaults.
+pub const VAULT_NAMES_WILDCARD: &str = "*";
+
 /// Whether `value` is structurally an ARN: the `arn` scheme and the six
 /// colon-separated fields `arn:<partition>:<service>:<region>:<account>:<resource>`
 /// every AWS ARN carries (the resource field may itself contain `:`).
@@ -728,12 +738,11 @@ pub const ERROR_CODE_BACKUP_JOB_NOT_FOUND: &str = "ERROR_2403";
 /// of the request, so the id asked about does not appear in it.
 pub const MESSAGE_BACKUP_JOB_NOT_FOUND: &str = "Cannot find Backup job";
 
-/// The sentence AWS states for "the copy job asked about is not one this account
-/// holds" — fixed, and worded as this service words the same condition for a
-/// backup job ([`MESSAGE_BACKUP_JOB_NOT_FOUND`]): it names no part of the
-/// request, so the id asked about does not appear in it. No `Code`: this
-/// condition has no observed token.
-pub const MESSAGE_COPY_JOB_NOT_FOUND: &str = "Cannot find copy job";
+/// `Code` for "the copy job asked about is not one this account holds".
+pub const ERROR_CODE_COPY_JOB_NOT_FOUND: &str = "ERROR_21001";
+/// The sentence AWS states for that condition — fixed: it names no part of the
+/// request, so the id asked about does not appear in it.
+pub const MESSAGE_COPY_JOB_NOT_FOUND: &str = "Copy job not found";
 
 /// `Code` for "a backup vault of this name already exists".
 pub const ERROR_CODE_VAULT_ALREADY_EXISTS: &str = "ERROR_1101";
@@ -891,12 +900,14 @@ pub const ERROR_CODE_MAX_RESULTS_INVALID: &str = "ERROR_3607";
 /// The sentence AWS states for that condition — fixed, like the ones above.
 pub const MESSAGE_MAX_RESULTS_INVALID: &str = "Max Results is invalid";
 
-/// The sentence AWS states for "the legal hold asked about is not one this
-/// account holds" — fixed, and worded as this service words the same condition
-/// for a recovery point ([`MESSAGE_RECOVERY_POINT_NOT_FOUND`]): it names no part
-/// of the request, so the id asked about does not appear in it. No `Code`: this
-/// condition has no observed token.
-pub const MESSAGE_LEGAL_HOLD_NOT_FOUND: &str = "Cannot find legal hold";
+/// `Code` for "the legal hold a hold-scoped call addresses is not one this
+/// account holds".
+pub const ERROR_CODE_LEGAL_HOLD_NOT_FOUND: &str = "ERROR_4218";
+/// The sentence AWS states for that condition — fixed: it names no part of the
+/// request, so neither the id nor the ARN asked about appears in it. AWS speaks
+/// of the hold's ARN whichever member named it, since the id a hold-scoped call
+/// carries is what the hold's ARN is built from ([`legal_hold_arn`]).
+pub const MESSAGE_LEGAL_HOLD_NOT_FOUND: &str = "Can not find Legal Hold ARN.";
 
 /// `Code` for "the legal hold named is not one a cancellation can release" —
 /// the condition's own token, constant across the states that raise it.
@@ -1026,9 +1037,11 @@ pub fn no_mpa_approval_team() -> InvalidRequestException {
     }
 }
 
-/// The modelled refusal for a copy job id this account does not hold.
+/// The modelled refusal for a copy job id this account does not hold, with the
+/// condition's own token.
 pub fn copy_job_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
+        code: Some(ERROR_CODE_COPY_JOB_NOT_FOUND.to_string()),
         message: Some(MESSAGE_COPY_JOB_NOT_FOUND.to_string()),
         ..Default::default()
     }
@@ -1173,9 +1186,19 @@ pub fn selection_plan_not_found(code: &str) -> InvalidParameterValueException {
     }
 }
 
-/// The modelled refusal for a legal hold id this account does not hold.
-pub fn legal_hold_not_found() -> ResourceNotFoundException {
-    ResourceNotFoundException {
+/// The modelled refusal for a legal hold id this account does not hold, with
+/// the condition's own token.
+///
+/// The PARAMETER-value class, not the not-found one: what the call could not
+/// resolve is the hold the request's `LegalHoldId` named, and AWS Backup reports
+/// a hold id that resolves to nothing as a value it cannot accept — the same
+/// reading this service already applies to a resource ARN that resolves to
+/// nothing ([`rejected_restore_access_vault_arn`]). ONE refusal for the
+/// condition, so every hold-scoped call answers it with one class, one token and
+/// one sentence.
+pub fn legal_hold_not_found() -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        code: Some(ERROR_CODE_LEGAL_HOLD_NOT_FOUND.to_string()),
         message: Some(MESSAGE_LEGAL_HOLD_NOT_FOUND.to_string()),
         ..Default::default()
     }
@@ -1585,9 +1608,11 @@ pub fn rejected_max_results(max_results: Option<i32>) -> Option<InvalidParameter
 /// shapes, so the framework's boundary validator passes anything, while each one
 /// still has a form it must take —
 ///
-/// * `VaultNames` names backup vaults, so an entry outside the model's
-///   `BackupVaultName` pattern ([`is_modelled_vault_name`]) names no vault this
-///   service could hold;
+/// * `VaultNames` names backup vaults, but the model types its entries as
+///   plain `string` with neither a pattern nor a length, so NO vault-name rule
+///   is applied to them: a client narrows a hold to a set of vaults by naming
+///   them and widens it to every vault with [`VAULT_NAMES_WILDCARD`], and both
+///   are values AWS accepts;
 /// * `ResourceIdentifiers` names protected resources, which are addressed by ARN
 ///   ([`rejected_arn`]);
 ///
@@ -1601,11 +1626,6 @@ pub fn rejected_recovery_point_selection(
     selection: &RecoveryPointSelection,
     now: SystemTime,
 ) -> Option<InvalidParameterValueException> {
-    for name in selection.vault_names.iter().flatten() {
-        if !is_modelled_vault_name(name) {
-            return Some(rejected_parameter("VaultNames"));
-        }
-    }
     for identifier in selection.resource_identifiers.iter().flatten() {
         if let Some(refusal) = rejected_arn("ResourceIdentifiers", identifier) {
             return Some(refusal);
@@ -2363,7 +2383,8 @@ impl LegalHoldRecord {
     ///
     /// * `VaultNames` are "the names of the vaults in which the selected
     ///   recovery points are contained", so a point in a vault the selection
-    ///   does not name is not held;
+    ///   does not name is not held — unless the selection names every vault
+    ///   ([`VAULT_NAMES_WILDCARD`]), which narrows nothing;
     /// * `ResourceIdentifiers` are "the resources included in the resource
     ///   selection", which a recovery point names by its protected resource;
     /// * `DateRange` is a window of creation instants, its `FromDate` "the
@@ -2379,7 +2400,9 @@ impl LegalHoldRecord {
         }
         let selection = &self.recovery_point_selection;
         let vault_names = selection.vault_names.as_deref().unwrap_or_default();
-        if !vault_names.is_empty() && !vault_names.contains(&point.backup_vault_name) {
+        let every_vault = vault_names.iter().any(|name| name == VAULT_NAMES_WILDCARD);
+        if !vault_names.is_empty() && !every_vault && !vault_names.contains(&point.backup_vault_name)
+        {
             return false;
         }
         let resources = selection.resource_identifiers.as_deref().unwrap_or_default();
@@ -2682,7 +2705,10 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     }
 
     /// Resolve a legal hold for a read, by the id it is stored under.
-    pub fn legal_hold(&self, id: &str) -> Result<&LegalHoldRecord, ResourceNotFoundException> {
+    pub fn legal_hold(
+        &self,
+        id: &str,
+    ) -> Result<&LegalHoldRecord, InvalidParameterValueException> {
         self.legal_holds.get(id).ok_or_else(legal_hold_not_found)
     }
 

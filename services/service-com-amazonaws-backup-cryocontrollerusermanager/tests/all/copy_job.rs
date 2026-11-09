@@ -671,7 +671,7 @@ async fn a_copy_job_id_nothing_answers_to_is_refused_as_not_found() {
                 error_code(&refused).as_str(),
                 string_at(&refused, "Message").as_str()
             ),
-            (400, "ResourceNotFoundException", "Cannot find copy job"),
+            (400, "ResourceNotFoundException", "Copy job not found"),
             "case {case:?} ({copy_job_id:?}): expected the not-found refusal, \
              got {status} {refused:?}"
         );
