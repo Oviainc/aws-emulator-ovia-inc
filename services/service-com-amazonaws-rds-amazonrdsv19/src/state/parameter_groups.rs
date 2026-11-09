@@ -447,11 +447,16 @@ pub fn db_parameter_default_apply_method(family: &str, name: &str) -> &'static s
 /// parameter was introduced in; an entry that names none reports none rather than a guessed
 /// version, since "the earliest engine version to which the parameter can apply" is a fact
 /// about the engine's release history and not something this front door can derive.
+///
+/// `ParameterValue` is reported only where the catalog publishes a default. A parameter the
+/// engine AUTOSIZES at startup publishes none, and reporting an empty string for it would say
+/// the engine runs that parameter at the empty value, which is not something the engine ever
+/// published.
 pub fn engine_default_parameter_to_wire(family: &str, spec: &ClusterParameterSpec) -> Parameter {
     let spec = published_spec_for_family(family, spec);
     Parameter {
         parameter_name: Some(spec.name.to_string()),
-        parameter_value: Some(spec.default_value.to_string()),
+        parameter_value: published_default(spec.default_value),
         description: Some(spec.description.to_string()),
         source: Some(PARAMETER_SOURCE_ENGINE_DEFAULT.to_string()),
         apply_type: Some(spec.apply_type.to_string()),
@@ -463,6 +468,18 @@ pub fn engine_default_parameter_to_wire(family: &str, spec: &ClusterParameterSpe
         apply_method: None,
         supported_engine_modes: None,
     }
+}
+
+/// The default a catalog entry publishes, as `ParameterValue` reports it: the value where the
+/// catalog publishes one, and nothing where it publishes none.
+///
+/// The catalog writes "the engine publishes no default for this parameter" as the EMPTY
+/// `default_value` — MySQL's `back_log` is autosized from the permitted connection count
+/// rather than given a published default — and the member is then left out rather than
+/// reported empty, since an empty `ParameterValue` would say the engine runs the parameter at
+/// the empty value.
+fn published_default(default_value: &str) -> Option<String> {
+    (!default_value.is_empty()).then(|| default_value.to_string())
 }
 
 /// A CLUSTER parameter the family `family` publishes, as the modelled `Parameter`: what

@@ -56,6 +56,13 @@ const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 /// same published set.
 pub(crate) const DATA_TYPES: [&str; 4] = ["boolean", "float", "integer", "string"];
 
+/// The parameters whose default the ENGINE computes at startup instead of publishing one, and
+/// which therefore report no `ParameterValue` at all: MySQL's `back_log` is autosized from
+/// the permitted connection count ("Default Value: -1 (autosized)"), so there is no published
+/// value for the report to carry. Every other published parameter must report the value its
+/// engine runs with; this is the NAMED exception, not a licence to omit one.
+const AUTOSIZED: [&str; 1] = ["back_log"];
+
 /// One reported `<Parameter>`.
 ///
 /// `pub(crate)` with the reader below because the sibling suite for
@@ -202,9 +209,14 @@ async fn every_published_family_reports_its_engines_defaults() {
                 parameter.source
             );
             assert!(
-                parameter.value.is_some(),
+                parameter.value.is_some() || AUTOSIZED.contains(&name.as_str()),
                 "case {case:?}: {name} must report the value the engine runs with, got \
                  {:?}",
+                parameter.value
+            );
+            assert!(
+                parameter.value.as_ref().is_none_or(|value| !value.is_empty()),
+                "case {case:?}: {name} must never report an EMPTY value, got {:?}",
                 parameter.value
             );
             assert!(
@@ -690,9 +702,11 @@ async fn the_documented_max_records_window_is_served_and_its_bounds_are_refused(
                 page < whole_catalog,
                 "case {case:?}: a Marker is owed exactly while records are left, got {body}"
             );
-            // And resuming from it reports the rest of the catalog, so the walk covers the
-            // whole published list and no record is served twice.
-            if let Some(marker) = optional_text(&body, "Marker") {
+            // And resuming from it walks the REST of the catalog, page by page, so the walk
+            // covers the whole published list and no record is served twice.
+            let mut seen = page;
+            let mut cursor = optional_text(&body, "Marker");
+            while let Some(marker) = cursor {
                 let rest = expect_ok(
                     case,
                     call(
@@ -706,13 +720,20 @@ async fn the_documented_max_records_window_is_served_and_its_bounds_are_refused(
                     )
                     .await,
                 );
-                assert_eq!(
-                    reported(&rest).len(),
-                    whole_catalog - page,
-                    "case {case:?}: the page after the marker reports the rest of the \
-                     catalog, got {rest}"
+                let rows = reported(&rest).len();
+                assert!(
+                    rows > 0 && rows <= page,
+                    "case {case:?}: a page after a marker holds at least one record and no \
+                     more than the request asked for, got {rows} in {rest}"
                 );
+                seen += rows;
+                cursor = optional_text(&rest, "Marker");
             }
+            assert_eq!(
+                seen, whole_catalog,
+                "case {case:?}: paging from the first marker to the last reports the whole \
+                 published catalog exactly once, got {seen} of {whole_catalog}"
+            );
             continue;
         }
         expect_error(case, response, 400, INVALID_PARAMETER_VALUE);

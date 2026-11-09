@@ -947,6 +947,15 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                 })
                 .map(|other| other.identifier.clone())
                 .collect(),
+            // The global database cluster the cluster belongs to, read from that global
+            // cluster's own record: the cluster stores only its identifier, and the
+            // immutable id the envelope reports beside it is the one that record carries,
+            // so the two cannot name different global clusters.
+            global_cluster_resource_id: record
+                .global_cluster_identifier
+                .as_ref()
+                .and_then(|identifier| self.global_clusters.get(identifier))
+                .map(|global| global.resource_id.clone()),
             // "backing-up — the DB cluster is currently being backed up": a backup of this
             // cluster is in flight exactly while a snapshot OF it is still being taken, so
             // it is read off those snapshot records — as the members above are read off the

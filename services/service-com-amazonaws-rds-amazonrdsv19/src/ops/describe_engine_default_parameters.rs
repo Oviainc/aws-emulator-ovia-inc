@@ -416,19 +416,75 @@ pub(crate) const fn parameter(
 /// instance that does not exist at the time of this call.
 ///
 /// It is not AWS's whole list — RDS publishes hundreds of parameters per family, and that
-/// list moves with every engine release. What a caller can rely on is that a family this
-/// service serves reports its engine's parameters with the metadata above, each sourced
-/// `engine-default`, in parameter-name order, filtered and paginated as this operation
-/// documents.
+/// list moves with every engine release. It does carry the HEAD of that list unbroken: the
+/// parameters AWS publishes ahead of `binlog_stmt_cache_size` in name order, so a caller
+/// reading the first page of this engine's defaults reads the parameters AWS reports there
+/// rather than a sample taken from the middle of the list. The managed engine publishes no
+/// host-level startup variable (the base directory, the bind address, the administrative
+/// interface), so none of those appears in it. Past the head, what a caller can rely on is
+/// that a family this service serves reports its engine's parameters with the metadata
+/// above, each sourced `engine-default`, in parameter-name order, filtered and paginated as
+/// this operation documents.
+///
+/// A parameter the engine AUTOSIZES — one whose default it computes at startup rather than
+/// publishing — carries an empty `default_value` and reports no `ParameterValue` at all,
+/// which is what AWS reports for it. MySQL's `back_log` is the one such entry here
+/// ("Default Value: -1 (autosized)", computed from the permitted connection count).
 ///
 /// `minimum_engine_version` is published only where the version a parameter was introduced
-/// in is the same for every engine that shares this catalog; an entry that names none — one
-/// the engine has carried since before any version this service serves — reports no
-/// `MinimumEngineVersion` rather than a guessed one.
+/// in is the same for every engine that shares this catalog, and only where that version
+/// falls INSIDE the releases those engines run — the MySQL releases from 5.7 on, as the
+/// MySQL manual's "Server System Variables" states each variable's introduction release. An
+/// entry that names none — one the engine has carried since before any version this service
+/// serves — reports no `MinimumEngineVersion` rather than a guessed one.
 ///
 /// The entries of every catalog here are in ascending parameter-name order, which is the
 /// order the report is paginated in.
 pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
+    parameter(
+        "allow-suspicious-udfs",
+        crate::state::APPLY_TYPE_STATIC,
+        "boolean",
+        "0,1",
+        "0",
+        // A managed engine loads no such function and does not let a caller ask for one.
+        false,
+        "",
+        "Controls whether user-defined functions that have only an xxx symbol for the main \
+         function can be loaded",
+    ),
+    parameter(
+        "auto_generate_certs",
+        crate::state::APPLY_TYPE_STATIC,
+        "boolean",
+        "0,1",
+        "1",
+        // The managed service owns the server's SSL key and certificate files.
+        false,
+        "5.7.5",
+        "Controls whether the server autogenerates SSL key and certificate files in the \
+         data directory, if they do not already exist.",
+    ),
+    parameter(
+        "auto_increment_increment",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1-65535",
+        "1",
+        true,
+        "",
+        "Controls the increment between successive AUTO_INCREMENT values.",
+    ),
+    parameter(
+        "auto_increment_offset",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "1-65535",
+        "1",
+        true,
+        "",
+        "Determines the starting point for the AUTO_INCREMENT column value.",
+    ),
     parameter(
         "autocommit",
         crate::state::APPLY_TYPE_DYNAMIC,
@@ -438,6 +494,178 @@ pub(crate) const MYSQL_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         true,
         "",
         "Sets the autocommit mode.",
+    ),
+    parameter(
+        "automatic_sp_privileges",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "1",
+        true,
+        "",
+        "Whether the server automatically grants the EXECUTE and ALTER ROUTINE privileges \
+         to the creator of a stored routine.",
+    ),
+    parameter(
+        "avoid_temporal_upgrade",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Whether ALTER TABLE implicitly upgrades temporal columns found to be in pre-5.6.4 \
+         format.",
+    ),
+    parameter(
+        "back_log",
+        crate::state::APPLY_TYPE_STATIC,
+        "integer",
+        "1-65535",
+        // Autosized by the engine from the permitted connection count, so the engine
+        // publishes no default of its own and this reports none.
+        "",
+        true,
+        "",
+        "The number of outstanding connection requests the server can have.",
+    ),
+    parameter(
+        "big_tables",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Whether all internal temporary tables are stored on disk rather than in memory.",
+    ),
+    parameter(
+        "binlog_cache_size",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "4096-9223372036854775807",
+        "32768",
+        true,
+        "",
+        "The size in bytes of the cache holding changes to the binary log during a \
+         transaction.",
+    ),
+    parameter(
+        "binlog_checksum",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "string",
+        "NONE,CRC32",
+        "CRC32",
+        true,
+        "",
+        "Whether the server writes a checksum for each event in the binary log.",
+    ),
+    parameter(
+        "binlog_direct_non_transactional_updates",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Whether updates to nontransactional tables are written directly to the binary log.",
+    ),
+    parameter(
+        "binlog_error_action",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "string",
+        "IGNORE_ERROR,ABORT_SERVER",
+        "ABORT_SERVER",
+        true,
+        "",
+        "What the server does when it cannot write to the binary log.",
+    ),
+    parameter(
+        "binlog_format",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "string",
+        "ROW,STATEMENT,MIXED",
+        "MIXED",
+        true,
+        "",
+        "The format the server writes to the binary log in.",
+    ),
+    parameter(
+        "binlog_group_commit_sync_delay",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-1000000",
+        "0",
+        true,
+        "5.7.5",
+        "The time in microseconds the server waits before synchronizing transactions to \
+         disk.",
+    ),
+    parameter(
+        "binlog_group_commit_sync_no_delay_count",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-1000000",
+        "0",
+        true,
+        "5.7.5",
+        "The maximum number of transactions to wait for before aborting the current \
+         binary log commit delay.",
+    ),
+    parameter(
+        "binlog_max_flush_queue_time",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "0-100000",
+        "0",
+        true,
+        "",
+        "The time in microseconds the server keeps reading transactions before flushing \
+         them to the binary log.",
+    ),
+    parameter(
+        "binlog_order_commits",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "1",
+        true,
+        "",
+        "Whether transactions are externalized in the same order they are written to the \
+         binary log.",
+    ),
+    parameter(
+        "binlog_row_image",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "string",
+        "full,minimal,noblob",
+        "full",
+        true,
+        "",
+        "How much row image information is written to the binary log for row-based \
+         logging.",
+    ),
+    parameter(
+        "binlog_rows_query_log_events",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Whether the original query is written to the binary log in informational log \
+         events for row-based logging.",
+    ),
+    parameter(
+        "binlog_stmt_cache_size",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "4096-9223372036854775807",
+        "32768",
+        true,
+        "",
+        "The size in bytes of the cache holding changes to statements that use \
+         nontransactional tables during a transaction.",
     ),
     parameter(
         "connect_timeout",

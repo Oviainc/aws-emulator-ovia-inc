@@ -170,13 +170,17 @@ fn published_record(family: &str, spec: &ClusterParameterSpec) -> (&'static str,
 }
 
 /// The declared record `spec` publishes FOR `family`, as an engine default is reported.
+///
+/// An EMPTY `default_value` is a parameter the engine autosizes and publishes no default for
+/// (MySQL's `back_log`), and `ParameterValue` is then left out rather than reported empty,
+/// which is how the service projects it.
 fn published(family: &str, spec: &ClusterParameterSpec) -> Declared {
     let (apply_type, default_value) = published_record(family, spec);
     (
         Some(apply_type.to_string()),
         Some(spec.data_type.to_string()),
         Some(spec.allowed_values.to_string()),
-        Some(default_value.to_string()),
+        (!default_value.is_empty()).then(|| default_value.to_string()),
         Some(spec.is_modifiable.to_string()),
         Some(PARAMETER_SOURCE_ENGINE_DEFAULT.to_string()),
     )

@@ -135,6 +135,8 @@ mod db_subnet_group_subnet_existence;
 mod delete_custom_db_engine_version;
 #[path = "all/docdb_query_surface.rs"]
 mod docdb_query_surface;
+#[path = "all/engine_default_catalog_head.rs"]
+mod engine_default_catalog_head;
 #[path = "all/engine_default_cluster_parameters.rs"]
 mod engine_default_cluster_parameters;
 #[path = "all/engine_default_parameters.rs"]
@@ -165,6 +167,8 @@ mod events;
 mod existence_and_parameter_guards;
 #[path = "all/export_tasks.rs"]
 mod export_tasks;
+#[path = "all/global_cluster_member_resource_id.rs"]
+mod global_cluster_member_resource_id;
 #[path = "all/global_cluster_membership.rs"]
 mod global_cluster_membership;
 #[path = "all/global_cluster_modification.rs"]

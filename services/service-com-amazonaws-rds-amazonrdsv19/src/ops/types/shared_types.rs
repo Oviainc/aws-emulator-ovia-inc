@@ -762,6 +762,14 @@ pub struct DBCluster {
     /// Whether the cluster carries a custom data group; added to the on-disk model from
     /// the recorded AWS responses, like [`DBCluster::db_activity_stream_status`].
     pub custom_data_group_present: Option<bool>,
+    /// The immutable resource id of the global database cluster this cluster is a MEMBER
+    /// of, reported beside [`DBCluster::global_cluster_identifier`] (the caller-supplied
+    /// name of that same global cluster); added to the on-disk model from the recorded AWS
+    /// responses, like [`DBCluster::db_activity_stream_status`]. Projected by
+    /// [`crate::state::ComAmazonawsRdsAmazonrdsv19State::cluster_to_wire`] from the global
+    /// cluster record the membership resolves to, so it cannot name a global cluster this
+    /// service does not hold.
+    pub global_cluster_resource_id: Option<String>,
     pub allocated_storage: Option<i32>,
     pub availability_zones: Option<Vec<String>>,
     pub backup_retention_period: Option<i32>,

@@ -18,6 +18,11 @@ pub struct ClusterMembership {
     pub read_replica_identifiers: Vec<String>,
     /// `MultiAZ`: whether the member instances sit in more than one Availability Zone.
     pub multi_az: bool,
+    /// The immutable resource id of the global database cluster the cluster belongs to,
+    /// read from that global cluster's own record — `None` for a cluster that belongs to
+    /// none. Read rather than copied onto the cluster, for the same reason its members are:
+    /// a copy would still name a global cluster the cluster was removed from.
+    pub global_cluster_resource_id: Option<String>,
     /// Whether a backup of the cluster is in flight — a snapshot OF it is still being taken
     /// — which is the `backing-up` status the cluster reports while it lasts; see
     /// [`DbClusterRecord::reported_status`].
@@ -590,6 +595,11 @@ impl DbClusterRecord {
                     .collect(),
             ),
             global_cluster_identifier: self.global_cluster_identifier.clone(),
+            // `GlobalClusterResourceId`: the immutable id of the global database cluster
+            // this one is a member of, resolved through that membership
+            // ([`ClusterMembership::global_cluster_resource_id`]) so the name and the id
+            // the envelope carries always describe the same global cluster.
+            global_cluster_resource_id: membership.global_cluster_resource_id.clone(),
             global_write_forwarding_requested: Some(self.global_write_forwarding_requested),
             local_write_forwarding_status: Some(
                 if self.local_write_forwarding_enabled {
