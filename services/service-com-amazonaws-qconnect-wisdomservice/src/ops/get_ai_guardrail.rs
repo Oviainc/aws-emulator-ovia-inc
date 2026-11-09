@@ -2,11 +2,13 @@
 
 //! @op GetAIGuardrail
 //!
-//! REPORTS the AI guardrail the route names, out of the record `CreateAIGuardrail`
-//! stored: a read changes nothing, so two reads of an unchanged guardrail answer alike.
-//! A guardrail is reachable only through its assistant, so a label naming a guardrail of
-//! another assistant — or a `versionNumber` qualifier, which names a VERSION no
-//! implemented operation of this emulator publishes yet — is the modelled
+//! REPORTS the AI guardrail the route names, out of the record the store holds for it as
+//! it now stands — whatever a create and every later mutation left there: a read changes
+//! nothing, so two reads of an unchanged guardrail answer alike. The reported
+//! `aiGuardrailArn` names the version this read answered for, the working copy's floating
+//! `$LATEST` alias. A guardrail is reachable only through its assistant, so a label naming
+//! a guardrail of another assistant — or a numbered version qualifier, which names a
+//! VERSION no implemented operation of this emulator publishes yet — is the modelled
 //! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
@@ -185,13 +187,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.ai_guardrail_id,
             ));
         };
+        // The version this read answered for: the one the label addressed, and the
+        // working copy's floating alias when the label named no version — which is what
+        // the reported ARN carries, so a client can tell which version it read.
+        let (_, qualifier) = crate::state::resolve_qualified_id(&input.ai_guardrail_id);
+        let qualifier = qualifier.unwrap_or(crate::state::VERSION_QUALIFIER_LATEST);
         Ok(GetAIGuardrailOutput {
-            ai_guardrail: Some(guardrail.to_ai_guardrail_data()),
+            ai_guardrail: Some(guardrail.to_ai_guardrail_data_at_version(qualifier)),
             // The model's own wording: the version number is "returned if an AI Guardrail
             // version was specified via use of a qualifier for the `aiGuardrailId` on the
-            // request". This read answered for the guardrail itself rather than for one of
-            // its versions — a qualified label is refused above — so there is no version
-            // number to report.
+            // request". This read answered for the guardrail's working copy rather than for
+            // a published version of it — a numbered qualifier names nothing here — and the
+            // working copy carries no `Version` number (the model's `Version` is `range
+            // 1..`), so there is none to report.
             version_number: None,
         })
     }

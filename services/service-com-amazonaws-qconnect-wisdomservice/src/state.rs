@@ -1220,6 +1220,21 @@ pub fn ai_guardrail_arn(region: &str, assistant_id: &str, ai_guardrail_id: &str)
     )
 }
 
+/// The ARN a resource of a VERSIONED family reports when it is addressed through a label
+/// that may carry a version qualifier: the resource's own ARN with the qualifier of the
+/// version addressed appended, `<resourceArn>:<QUALIFIER>`.
+///
+/// The model's `UuidOrArnOrEitherWithQualifier` labels name either a resource or one
+/// VERSION of it (`smithy_query(query="shape",shape="UuidOrArnOrEitherWithQualifier")`),
+/// and a request that names no version addresses the working copy, whose qualifier is the
+/// floating [`VERSION_QUALIFIER_LATEST`] alias — so an operation reached through such a
+/// label reports which version it answered for, rather than the bare resource path that
+/// names no version at all. An operation whose label carries no qualifier at all (a
+/// create, a list) reports the bare ARN, because it addressed no version.
+pub fn version_qualified_arn(resource_arn: &str, qualifier: &str) -> String {
+    format!("{resource_arn}:{qualifier}")
+}
+
 /// The ARN of the SNS topic an assistant streams chat messages through, which the
 /// service provisions with the assistant: an Amazon SNS topic ARN
 /// (`arn:aws:sns:<region>:<account>:<topic>`), named after the assistant it belongs to,
@@ -1825,6 +1840,17 @@ impl AiGuardrail {
             modified_time: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
         }
     }
+
+    /// The same `AIGuardrailData` as [`Self::to_ai_guardrail_data`], for an operation that
+    /// addressed this guardrail through a label that may carry a VERSION qualifier: every
+    /// member comes out of the stored record, and the reported ARN names the version the
+    /// request addressed ([`version_qualified_arn`]).
+    pub fn to_ai_guardrail_data_at_version(&self, qualifier: &str) -> AIGuardrailData {
+        AIGuardrailData {
+            ai_guardrail_arn: version_qualified_arn(&self.ai_guardrail_arn, qualifier),
+            ..self.to_ai_guardrail_data()
+        }
+    }
 }
 
 /// One Amazon Q in Connect assistant, as this emulator persists it.
@@ -2085,15 +2111,32 @@ impl Assistant {
     /// The AI guardrail a `UuidOrArnOrEitherWithQualifier` label names, or `None` when
     /// this assistant holds none under it.
     ///
-    /// A label carrying a VERSION qualifier names a version of the guardrail rather than
-    /// the guardrail itself, and this emulator publishes none — `CreateAIGuardrailVersion`
-    /// is still a scaffold stub — so such a label names nothing here and the caller gets
-    /// the operation's not-found answer.
+    /// A label carrying the [`VERSION_QUALIFIER_LATEST`] qualifier names the guardrail's
+    /// own working copy, which is the record below — so the ARN a read reports, which
+    /// names that version, addresses the same record it was read from. Any other qualifier
+    /// names a numbered VERSION of the guardrail, and this emulator publishes none —
+    /// `CreateAIGuardrailVersion` is still a scaffold stub — so such a label names nothing
+    /// here and the caller gets the operation's not-found answer.
     pub fn ai_guardrail(&self, label: &str) -> Option<&AiGuardrail> {
         let (id, qualifier) = resolve_qualified_id(label);
         match qualifier {
-            Some(_) => None,
-            None => self.ai_guardrails.get(id),
+            Some(qualifier) if qualifier != VERSION_QUALIFIER_LATEST => None,
+            _ => self.ai_guardrails.get(id),
+        }
+    }
+
+    /// The same AI guardrail as [`Self::ai_guardrail`], for a caller that WRITES to it:
+    /// the seam `UpdateAIGuardrail` applies its change through, so an update and a read
+    /// reach one record rather than two copies.
+    ///
+    /// A label resolves here exactly as it does for a read, so a qualifier naming a
+    /// numbered VERSION of the guardrail names nothing to write either: a version is a
+    /// snapshot of the guardrail, not the working copy an update changes.
+    pub fn ai_guardrail_mut(&mut self, label: &str) -> Option<&mut AiGuardrail> {
+        let (id, qualifier) = resolve_qualified_id(label);
+        match qualifier {
+            Some(qualifier) if qualifier != VERSION_QUALIFIER_LATEST => None,
+            _ => self.ai_guardrails.get_mut(id),
         }
     }
 
@@ -3561,6 +3604,18 @@ impl ComAmazonawsQconnectWisdomserviceState {
     /// assistant, so an agent of ANOTHER assistant is not found under this one.
     pub fn ai_agent(&self, assistant_label: &str, agent_label: &str) -> Option<&AiAgent> {
         self.assistant(assistant_label)?.ai_agent(agent_label)
+    }
+
+    /// The same AI guardrail as [`Self::ai_guardrail`], for a caller that WRITES to it —
+    /// the seam [`Assistant::ai_guardrail_mut`] describes, reached through the assistant
+    /// the route named.
+    pub fn ai_guardrail_mut(
+        &mut self,
+        assistant_label: &str,
+        guardrail_label: &str,
+    ) -> Option<&mut AiGuardrail> {
+        self.assistant_mut(assistant_label)?
+            .ai_guardrail_mut(guardrail_label)
     }
 
     /// The same AI agent as [`Self::ai_agent`], for a caller that WRITES to it — the seam

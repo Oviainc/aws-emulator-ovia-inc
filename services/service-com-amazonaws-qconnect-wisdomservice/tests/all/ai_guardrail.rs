@@ -40,30 +40,36 @@ use super::resource_tags::{
 /// Both values the modelled `VisibilityStatus` declares
 /// (`smithy_query(query="shape",shape="VisibilityStatus")`), written out here rather than
 /// imported from the implementation so the table spans the whole enumeration.
-const VISIBILITY_SAVED: &str = "SAVED";
-const VISIBILITY_PUBLISHED: &str = "PUBLISHED";
+pub(crate) const VISIBILITY_SAVED: &str = "SAVED";
+pub(crate) const VISIBILITY_PUBLISHED: &str = "PUBLISHED";
+
+/// The floating version alias the working copy of a versioned AI resource is named by
+/// (the model's `UuidOrArnOrEitherWithQualifier` admits `:<QUALIFIER>`,
+/// `smithy_query(query="shape",shape="UuidOrArnOrEitherWithQualifier")`), written out here
+/// so the assertions pin the qualifier a client sees.
+pub(crate) const QUALIFIER_LATEST: &str = "$LATEST";
 
 /// The `Status` an AI guardrail this service holds reports
 /// (`smithy_query(query="shape",shape="Status")` declares it beside the transient
 /// `CREATE_IN_PROGRESS`, `DELETE_IN_PROGRESS` and the rest).
-const STATUS_ACTIVE: &str = "ACTIVE";
+pub(crate) const STATUS_ACTIVE: &str = "ACTIVE";
 
 /// The published bounds of the members this suite varies in length
 /// (`smithy_query(query="operation",operation="CreateAIGuardrail")`: `name` is `len
 /// 1..255`, `description` `len 1..200`, and both blocked-messaging members `len 1..500`).
 const NAME_MIN: usize = 1;
 const NAME_MAX: usize = 255;
-const DESCRIPTION_MIN: usize = 1;
-const DESCRIPTION_MAX: usize = 200;
-const MESSAGING_MIN: usize = 1;
-const MESSAGING_MAX: usize = 500;
+pub(crate) const DESCRIPTION_MIN: usize = 1;
+pub(crate) const DESCRIPTION_MAX: usize = 200;
+pub(crate) const MESSAGING_MIN: usize = 1;
+pub(crate) const MESSAGING_MAX: usize = 500;
 
 /// Every value of the enumerations the content policy carries
 /// (`smithy_query(query="shape",shape="GuardrailContentFilterType")` and
 /// `…shape="GuardrailFilterStrength"`), so the row that configures it spans the catalog
 /// instead of the one filter a single recording used. `filtersConfig` admits at most six
 /// entries, which is exactly the number of filter types.
-const CONTENT_FILTER_TYPES: [&str; 6] = [
+pub(crate) const CONTENT_FILTER_TYPES: [&str; 6] = [
     "SEXUAL",
     "VIOLENCE",
     "HATE",
@@ -71,44 +77,44 @@ const CONTENT_FILTER_TYPES: [&str; 6] = [
     "MISCONDUCT",
     "PROMPT_ATTACK",
 ];
-const FILTER_STRENGTHS: [&str; 4] = ["NONE", "LOW", "MEDIUM", "HIGH"];
+pub(crate) const FILTER_STRENGTHS: [&str; 4] = ["NONE", "LOW", "MEDIUM", "HIGH"];
 
 /// The only value the modelled `GuardrailTopicType` declares, and the only
 /// `GuardrailManagedWordsType`
 /// (`smithy_query(query="shape",shape="GuardrailTopicType")`,
 /// `…shape="GuardrailManagedWordsType"`).
-const TOPIC_TYPE_DENY: &str = "DENY";
-const MANAGED_WORDS_PROFANITY: &str = "PROFANITY";
+pub(crate) const TOPIC_TYPE_DENY: &str = "DENY";
+pub(crate) const MANAGED_WORDS_PROFANITY: &str = "PROFANITY";
 
 /// Both values the modelled `GuardrailSensitiveInformationAction` declares, and both
 /// `GuardrailContextualGroundingFilterType` values
 /// (`smithy_query(query="shape",shape="GuardrailSensitiveInformationAction")`,
 /// `…shape="GuardrailContextualGroundingFilterType"`).
-const ACTIONS: [&str; 2] = ["BLOCK", "ANONYMIZE"];
-const GROUNDING_TYPES: [&str; 2] = ["GROUNDING", "RELEVANCE"];
+pub(crate) const ACTIONS: [&str; 2] = ["BLOCK", "ANONYMIZE"];
+pub(crate) const GROUNDING_TYPES: [&str; 2] = ["GROUNDING", "RELEVANCE"];
 
 /// PII entity types the sensitive-information rows configure: entries of the modelled
 /// `GuardrailPiiEntityType` catalog (`smithy_query(query="shape",shape="GuardrailPiiEntityType")`
 /// declares thirty-one), including ones no recording of this surface used.
-const PII_ENTITY_TYPES: [&str; 3] = ["EMAIL", "PHONE", "US_SOCIAL_SECURITY_NUMBER"];
+pub(crate) const PII_ENTITY_TYPES: [&str; 3] = ["EMAIL", "PHONE", "US_SOCIAL_SECURITY_NUMBER"];
 
 /// The published minimum of `GuardrailContextualGroundingFilterConfig$threshold`
 /// (`smithy_query(query="shape",shape="GuardrailContextualGroundingFilterConfig")`:
 /// `range 0..`), and one value above it.
-const THRESHOLD_MIN: f64 = 0.0;
-const THRESHOLD_ABOVE_MIN: f64 = 0.75;
+pub(crate) const THRESHOLD_MIN: f64 = 0.0;
+pub(crate) const THRESHOLD_ABOVE_MIN: f64 = 0.75;
 
 /// The fixed sentences this endpoint answers a resource it does not hold with, and the
 /// ones it refuses a conflicting create with. Written out here rather than imported from
 /// the implementation, so the assertions pin the answer a client sees.
-const MESSAGE_AI_GUARDRAIL_NOT_FOUND: &str = "AI Guardrail does not exist.";
-const MESSAGE_ASSISTANT_NOT_FOUND: &str = "Assistant does not exist.";
+pub(crate) const MESSAGE_AI_GUARDRAIL_NOT_FOUND: &str = "AI Guardrail does not exist.";
+pub(crate) const MESSAGE_ASSISTANT_NOT_FOUND: &str = "Assistant does not exist.";
 const MESSAGE_NAME_IN_USE: &str = "Name is already in use";
-const MESSAGE_IDEMPOTENCY_CONFLICT: &str = "Idempotency conflict";
+pub(crate) const MESSAGE_IDEMPOTENCY_CONFLICT: &str = "Idempotency conflict";
 
 /// `CreateAIGuardrail` on one assistant, as the model's URI binds it
 /// (`POST /assistants/{assistantId}/aiguardrails`).
-async fn create_guardrail(emulator: &Emulator, assistant: &str, body: Value) -> Reply {
+pub(crate) async fn create_guardrail(emulator: &Emulator, assistant: &str, body: Value) -> Reply {
     emulator
         .send(
             "POST",
@@ -119,7 +125,7 @@ async fn create_guardrail(emulator: &Emulator, assistant: &str, body: Value) -> 
 }
 
 /// `GetAIGuardrail` (`GET /assistants/{assistantId}/aiguardrails/{aiGuardrailId}`).
-async fn get_guardrail(emulator: &Emulator, assistant: &str, guardrail: &str) -> Reply {
+pub(crate) async fn get_guardrail(emulator: &Emulator, assistant: &str, guardrail: &str) -> Reply {
     emulator
         .send(
             "GET",
@@ -134,7 +140,11 @@ async fn get_guardrail(emulator: &Emulator, assistant: &str, guardrail: &str) ->
 }
 
 /// `DeleteAIGuardrail` (`DELETE /assistants/{assistantId}/aiguardrails/{aiGuardrailId}`).
-async fn delete_guardrail(emulator: &Emulator, assistant: &str, guardrail: &str) -> Reply {
+pub(crate) async fn delete_guardrail(
+    emulator: &Emulator,
+    assistant: &str,
+    guardrail: &str,
+) -> Reply {
     emulator
         .send(
             "DELETE",
@@ -149,7 +159,7 @@ async fn delete_guardrail(emulator: &Emulator, assistant: &str, guardrail: &str)
 }
 
 /// A fresh assistant to nest guardrails in, answering with the id its create minted.
-async fn assistant_id(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn assistant_id(emulator: &Emulator, name: &str) -> String {
     let reply = emulator.create_assistant(name, &tag_map(0)).await;
     assert_eq!(
         reply.status, 200,
@@ -168,7 +178,7 @@ async fn assistant_id(emulator: &Emulator, name: &str) -> String {
 
 /// The required members of every create in this suite, so a row states only what it
 /// varies.
-fn required(name: &str, visibility: &str) -> Value {
+pub(crate) fn required(name: &str, visibility: &str) -> Value {
     json!({
         "name": name,
         "visibilityStatus": visibility,
@@ -425,7 +435,7 @@ fn cases() -> Vec<Case> {
 
 /// Every member the request carried is reported back unchanged, whichever answer is
 /// being read — the create's own or a later read's.
-fn assert_reports_request(case: &str, what: &str, body: &Value, reply: &Reply) {
+pub(crate) fn assert_reports_request(case: &str, what: &str, body: &Value, reply: &Reply) {
     let members = body
         .as_object()
         .unwrap_or_else(|| panic!("case {case:?}: the request body must be an object"));
@@ -462,12 +472,23 @@ fn is_uuid_shaped(value: &str) -> bool {
 /// The ARN AWS documents for an AI guardrail of this service, written out here rather
 /// than taken from the handler's helper so the test pins the format the modelled `Arn`
 /// pattern describes: the guardrail's own id LAST, behind its parent assistant's.
-fn expected_guardrail_arn(assistant_id: &str, guardrail_id: &str) -> String {
+pub(crate) fn expected_guardrail_arn(assistant_id: &str, guardrail_id: &str) -> String {
     wisdom_arn(
         "aws",
         REGION,
         engine::EMULATOR_ACCOUNT_ID,
         &format!("ai-guardrail/{assistant_id}/{guardrail_id}"),
+    )
+}
+
+/// The ARN a read of one VERSION of a guardrail reports: the guardrail's own ARN with the
+/// qualifier of the version read appended. An operation addressed through a label that may
+/// carry a version qualifier names the version it answered for; the create, which
+/// addresses no version, reports the bare resource ARN.
+pub(crate) fn expected_read_arn(assistant_id: &str, guardrail_id: &str, qualifier: &str) -> String {
+    format!(
+        "{}:{qualifier}",
+        expected_guardrail_arn(assistant_id, guardrail_id)
     )
 }
 
@@ -552,10 +573,15 @@ async fn a_created_guardrail_is_reported_out_of_the_stored_record_by_every_later
         created.push((case, guardrail_id, data));
     }
 
-    // A read by id, and the same read by ARN, answer with the record the create stored.
+    // A read by id, by ARN, and by either carrying the working copy's version qualifier,
+    // answer with the record the create stored.
     for (case, guardrail_id, data) in &created {
-        for addressed_by in [guardrail_id.clone(), expected_guardrail_arn(&assistant, guardrail_id)]
-        {
+        for addressed_by in [
+            guardrail_id.clone(),
+            expected_guardrail_arn(&assistant, guardrail_id),
+            format!("{guardrail_id}:{QUALIFIER_LATEST}"),
+            expected_read_arn(&assistant, guardrail_id, QUALIFIER_LATEST),
+        ] {
             let reply = get_guardrail(&emulator, &assistant, &addressed_by).await;
             assert_eq!(
                 reply.status, 200,
@@ -606,21 +632,30 @@ async fn a_created_guardrail_is_reported_out_of_the_stored_record_by_every_later
     }
 }
 
-/// A read answers with the `AIGuardrailData` the create stored, member for member.
-fn assert_reads_the_create(case: &str, what: &str, created: &Value, reply: &Reply) {
+/// A read answers with the `AIGuardrailData` the create stored, member for member — with
+/// the one member a read renders differently: the ARN it reports names the version it
+/// answered for, which for the guardrail's working copy is the floating alias.
+pub(crate) fn assert_reads_the_create(case: &str, what: &str, created: &Value, reply: &Reply) {
     assert_eq!(reply.status, 200, "case {case:?}: {what} must be served, got HTTP {} with body {}", reply.status, reply.body);
+    let mut expected = created.clone();
+    let stored_arn = expected
+        .get("aiGuardrailArn")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    expected["aiGuardrailArn"] = json!(format!("{stored_arn}:{QUALIFIER_LATEST}"));
     let read = reply.field("/aiGuardrail");
     assert_eq!(
         read,
-        Some(created),
+        Some(&expected),
         "case {case:?}: {what} must answer with the record the create stored, expected \
-         {created}, got {read:?}"
+         {expected}, got {read:?}"
     );
 }
 
 /// The modelled `ResourceNotFoundException` (HTTP 404), carrying this endpoint's fixed
 /// sentence for the condition and the label the request used.
-fn assert_not_found(case: &str, message: &str, resource_name: &str, reply: &Reply) {
+pub(crate) fn assert_not_found(case: &str, message: &str, resource_name: &str, reply: &Reply) {
     assert_eq!(
         reply.status, 404,
         "case {case:?}: a label naming nothing this account holds is not found, got HTTP {} \
@@ -690,10 +725,13 @@ async fn a_guardrail_name_identifies_it_inside_its_assistant() {
             conflict.body
         );
         let read = get_guardrail(&emulator, &first, &guardrail_id).await;
-        assert_eq!(
-            read.field("/aiGuardrail"),
-            created.field("/aiGuardrail"),
-            "case {name:?}: the refused create must leave the first record untouched"
+        assert_reads_the_create(
+            name,
+            "a read after the refused create",
+            created
+                .field("/aiGuardrail")
+                .expect("the create answered an aiGuardrail"),
+            &read,
         );
 
         // Another assistant may hold the same name: a guardrail is scoped to its parent.
