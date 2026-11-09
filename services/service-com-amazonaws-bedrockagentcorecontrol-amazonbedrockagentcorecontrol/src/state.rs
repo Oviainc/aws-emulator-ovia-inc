@@ -94,6 +94,7 @@ use crate::ops::types::{
     CodeInterpreterNetworkConfiguration, CreateCodeInterpreterOutput, DeleteCodeInterpreterOutput,
     GetCodeInterpreterOutput,
     CreateBrowserOutput, CreateGatewayOutput, DeleteBrowserOutput, GetBrowserOutput,
+    BrowserProfileSummary,
     CreateBrowserProfileOutput, DeleteBrowserProfileOutput, GetBrowserProfileOutput,
     RecordingConfig, ToolsFileSystemConfiguration,
     CreateGatewayTargetOutput, CredentialProviderConfiguration, CustomTransformConfiguration,
@@ -2510,6 +2511,24 @@ impl BrowserProfileRecord {
     /// What a read of this profile reports.
     pub fn get_output(&self) -> GetBrowserProfileOutput {
         GetBrowserProfileOutput {
+            profile_id: self.profile_id.clone(),
+            profile_arn: self.profile_arn.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            status: self.status.clone(),
+            created_at: timestamp(self.created_at),
+            last_updated_at: timestamp(self.updated_at),
+            last_saved_at: self.last_saved_at.map(timestamp),
+            last_saved_browser_session_id: self.last_saved_browser_session_id.clone(),
+            last_saved_browser_id: self.last_saved_browser_id.clone(),
+        }
+    }
+
+    /// What a listing reports for this profile: every member
+    /// `BrowserProfileSummary` declares, each off this same record, so a
+    /// listing and a read of the profile cannot disagree about it.
+    pub fn summary(&self) -> BrowserProfileSummary {
+        BrowserProfileSummary {
             profile_id: self.profile_id.clone(),
             profile_arn: self.profile_arn.clone(),
             name: self.name.clone(),

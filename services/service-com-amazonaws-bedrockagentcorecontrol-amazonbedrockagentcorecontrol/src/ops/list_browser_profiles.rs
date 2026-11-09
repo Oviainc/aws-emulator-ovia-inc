@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBrowserProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBrowserProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBrowserProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -150,20 +141,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBrowserProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBrowserProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBrowserProfiles"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListBrowserProfilesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the browser profile store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A profile whose accepted deletion the clock has already made due is
+        // gone before this read walks the store — the removal was owed at this
+        // instant whether or not anybody called — so a removed profile is
+        // listed no more, exactly as `GetBrowserProfile` stops finding it.
+        store.expire_deleted_browser_profiles(now);
+
+        // The token is opaque on the wire: it carries the `profileId` the
+        // previous page ended on, and the next page starts strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListBrowserProfilesErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                    reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message:
+                            "must be a nextToken returned by a previous ListBrowserProfiles call"
+                                .to_string(),
+                    }]),
+                })
+            })?),
+        };
+
+        // `maxResults` has the modeled range 1..100; absent, a page holds that
+        // same documented maximum. The page walk is `crate::state`'s, so every
+        // listing of this service pages by one rule.
+        let page_size = crate::state::page_size(input.max_results, MAX_PAGE_SIZE);
+        // `name` is a filter, not a lookup: a listing asked for one reports the
+        // profiles whose name is exactly it — the name a create holds unique
+        // within the account — and an unmatched name is an empty page, not a
+        // failure. A filtered-out profile consumes no page slot.
+        let wanted_name = input.name.as_deref();
+        let (profile_summaries, next_token) = crate::state::page_over(
+            &store.browser_profiles,
+            resume_after.as_deref(),
+            page_size,
+            |record| {
+                wanted_name
+                    .is_none_or(|name| record.name == name)
+                    .then(|| record.summary())
+            },
+        );
+
+        Ok(ListBrowserProfilesOutput {
+            profile_summaries,
+            next_token,
+        })
     }
 }
+
+/// The modeled upper bound of `maxResults` (`MaxResults`, range 1..100), used as the
+/// page size when the caller names none.
+const MAX_PAGE_SIZE: i32 = 100;
