@@ -314,7 +314,10 @@ async fn lambda(
 
 /// Every segment document X-Ray holds for `trace_id`, read through `BatchGetTraces` — the
 /// operation a client reads a trace back with (`POST /Traces`).
-async fn documents_of(router: &MultiServiceRouter, trace_id: &str) -> Vec<Value> {
+///
+/// `pub(crate)` so the sibling `stage_trace_sampling_decision` suite reads a chain back the
+/// same one way rather than keeping a second reader of the same response shape.
+pub(crate) async fn documents_of(router: &MultiServiceRouter, trace_id: &str) -> Vec<Value> {
     let answered = dispatch(
         router,
         "POST",
