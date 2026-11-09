@@ -1,0 +1,37 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: chatbot__cloudformation.deploy-chatbot-customaction-round-trip-and-delete chatbot__cloudformation.deploy-chatbot-customaction-invalid-actionname-rejected-and-rolled-back
+Issue-Key: chatbot__cloudformation|CreateStack|ValidationError
+Issue-Commit: 86c25e3173c48b1c4d4a9173324e183693bfe876
+
+# cloudformation refuses AWS::Chatbot::CustomAction as an unrecognized resource type, so no Chatbot custom action can be deployed from a template
+
+> _Note: this issue was identified against the code base at commit `86c25e3173c48b1c4d4a9173324e183693bfe876`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateStack
+
+## Description
+Cause 1 of 1: CloudFormation's resource-type registry does not know AWS::Chatbot::CustomAction, so every template that declares one is refused at CreateStack and no Chatbot resource can be provisioned by IaC. Failing checks: chatbot__cloudformation.deploy-chatbot-customaction-round-trip-and-delete, chatbot__cloudformation.deploy-chatbot-customaction-invalid-actionname-rejected-and-rolled-back.
+
+AWS: AWS::Chatbot::CustomAction is a supported CloudFormation resource type. A template whose Resources contain {"Type": "AWS::Chatbot::CustomAction", "Properties": {"ActionName": <name>, "Definition": {"CommandText": <text>}}} is accepted by CreateStack; the stack reaches CREATE_COMPLETE, Ref and Fn::GetAtt "CustomActionArn" both resolve to the created custom action's ARN, and the action is independently readable through the Chatbot API (ListCustomActions lists the ARN; GetCustomAction returns CustomAction with that CustomActionArn, ActionName and Definition.CommandText). Deleting the stack deletes the action, after which GetCustomAction on the ARN is refused with 404 ResourceNotFoundException and the message "sdk action [<ActionName>] not found for account [<account id>]" — fixed text "sdk action [" / "] not found for account [" / "]", with the action name taken from the request's resource and the account id from the caller's identity — and ListCustomActions no longer lists it. Smithy (chatbot): CreateCustomAction.ActionName target CustomActionName, required, @length min 1 max 64, @pattern ^[a-zA-Z0-9_-]{1,64}$; CreateCustomAction errors InvalidRequestException (400); GetCustomAction errors ResourceNotFoundException (404), output CustomActionArn @pattern ^arn:aws:chatbot:...:custom-action/[a-zA-Z0-9_-]{1,64}$. Because the ActionName property carries that pattern, a template value that breaks it (e.g. a name containing spaces) must fail property validation for that resource rather than be created: the stack settles ROLLBACK_COMPLETE and CloudFormation records a VALIDATION_ERROR operation event for the resource with ValidationName PROPERTY_VALIDATION, ValidationStatus FAILED, ValidationFailureMode FAIL, ValidationPath /Resources/<LogicalId>/Properties/ActionName and ValidationStatusReason "Property value [<the supplied name>] does not match pattern: ^[a-zA-Z0-9_-]{1,64}$" — the quoted pattern and the fixed words are the template, the bracketed value comes from the request (recorded behavior for the event row shape; the pattern itself is modelled).
+
+Emulator: CreateStack is refused outright for both the valid and the invalid template with HTTP 400, error code "ValidationError" and message "Template format error: Unrecognized resource types: [AWS::Chatbot::CustomAction]". Fixed text: "Template format error: Unrecognized resource types: [" + the comma-separated unrecognized type names + "]". No stack is created, so neither the happy-path round trip nor the property-validation rollback is reachable at all.
+
+Why: a client cannot provision Chatbot custom actions through CloudFormation (or CDK, which emits the same type). The whole template is rejected, so a stack that merely mentions a Chatbot custom action alongside other resources fails before anything is created; there is no workaround short of dropping the resource and calling CreateCustomAction out of band. Templates that AWS would reject for a bad ActionName are also rejected here, but with the wrong code, message and lifecycle (no stack, no ROLLBACK_COMPLETE, no validation event), so negative-path IaC tests cannot distinguish "bad property" from "unsupported type".
+
+Fix: CloudFormation's template resource-type registry (the table of recognized AWS::<Service>::<Resource> types consulted during template validation in the CreateStack handler) must register AWS::Chatbot::CustomAction, and a provisioner for it must be added that creates/reads/deletes through chatbot's custom-action state, exposes the physical id and the CustomActionArn attribute for Ref/Fn::GetAtt, and runs the modelled ActionName length/pattern property validation so a bad value produces the PROPERTY_VALIDATION event row and a rollback instead of a format error.
+
+Traces: chatbot__cloudformation.deploy-chatbot-customaction-round-trip-and-delete (valid template, blocked at CreateStack), chatbot__cloudformation.deploy-chatbot-customaction-invalid-actionname-rejected-and-rolled-back (invalid ActionName template, blocked at the same CreateStack).
+
+## Evidence
+Expected (AWS): CreateStack with a template declaring {"Type": "AWS::Chatbot::CustomAction", "Properties": {"ActionName": "<valid name>", "Definition": {"CommandText": "echo <name>"}}} is accepted and returns a StackId; DescribeStacks settles StackStatus CREATE_COMPLETE; Outputs give Ref == Fn::GetAtt("CustomActionArn"); chatbot ListCustomActions contains that ARN and GetCustomAction returns the ActionName/CommandText; after DeleteStack the stack reaches DELETE_COMPLETE and GetCustomAction answers 404 ResourceNotFoundException "sdk action [<ActionName>] not found for account [<account>]". With an ActionName that breaks ^[a-zA-Z0-9_-]{1,64}$ (e.g. "bad action name"), CreateStack is still accepted and the stack settles ROLLBACK_COMPLETE with one VALIDATION_ERROR operation event ('Action', 'PROPERTY_VALIDATION', 'FAILED', 'FAIL', 'Property value [bad action name] does not match pattern: ^[a-zA-Z0-9_-]{1,64}$', '/Resources/Action/Properties/ActionName').
+
+Actual (emulator): both CreateStack calls raise botocore.exceptions.ClientError: An error occurred (ValidationError) when calling the CreateStack operation: Template format error: Unrecognized resource types: [AWS::Chatbot::CustomAction]. No StackId is returned and no stack exists, so every subsequent assertion in both checks is unreachable.
+
+## Steps to Reproduce
+1. Boot the emulator and point botocore at it.
+2. cfn = client("cloudformation"); template = json.dumps({"AWSTemplateFormatVersion": "2010-09-09", "Resources": {"Action": {"Type": "AWS::Chatbot::CustomAction", "Properties": {"ActionName": "my-action", "Definition": {"CommandText": "echo hi"}}}}, "Outputs": {"ActionRef": {"Value": {"Ref": "Action"}}, "ActionArn": {"Value": {"Fn::GetAtt": ["Action", "CustomActionArn"]}}}}).
+3. cfn.create_stack(StackName="chatbot-ca-stack", TemplateBody=template) -> observe ValidationError "Template format error: Unrecognized resource types: [AWS::Chatbot::CustomAction]" instead of a StackId.
+4. Repeat step 3 with ActionName="bad action name": AWS accepts the stack and rolls it back with a PROPERTY_VALIDATION event; the emulator gives the same template-format error, so the rollback path is never exercised.
