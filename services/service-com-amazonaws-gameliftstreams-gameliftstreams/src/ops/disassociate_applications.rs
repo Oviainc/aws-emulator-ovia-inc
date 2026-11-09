@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateApplications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateApplications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateApplications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Unlinks applications from a stream group and PERSISTS the unlink on BOTH sides: the
+//! group drops each application from `AssociatedApplications`, each application drops
+//! the group from `AssociatedStreamGroups` and forgets the content replication that
+//! group's locations owed it, and the response is read back out of the stored group.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +168,187 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateApplications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateApplicationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Every identifier this request carries has to resolve to the ARN of the
+        // resource it names, which is checked BEFORE the store is read: a value that
+        // resolves to no such ARN is a bad value for the member, not a resource that
+        // is missing — the two mean opposite things to a caller.
+        if let Some(refusal) = crate::state::invalid_resource_arn(
+            crate::state::IDENTIFIER_MEMBER,
+            &input.identifier,
+            crate::state::STREAM_GROUP_RESOURCE,
+        ) {
+            return Err(DisassociateApplicationsErrorModeled::ValidationException(refusal).into());
+        }
+        if let Some(refusal) = input.application_identifiers.iter().find_map(|identifier| {
+            crate::state::invalid_resource_arn(
+                crate::state::APPLICATION_IDENTIFIERS_MEMBER,
+                identifier,
+                crate::state::APPLICATION_RESOURCE,
+            )
+        }) {
+            return Err(DisassociateApplicationsErrorModeled::ValidationException(refusal).into());
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DisassociateApplicationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::region_of(ctx.parts());
+        let mut state = state.lock();
+        state.materialize(now);
+
+        let Some(group) = state.stream_group(&input.identifier) else {
+            return Err(DisassociateApplicationsErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&crate::state::resolved_arn(
+                    &region,
+                    &input.identifier,
+                    crate::state::STREAM_GROUP_RESOURCE,
+                )),
+            )
+            .into());
+        };
+        let group_id = group.id.clone();
+        let group_arn = group.arn.clone();
+
+        // "To disassociate an application, the stream group must be in ACTIVE status."
+        // This operation models no `ConflictException`, so a group that is not there
+        // yet is refused with the client-input error it does model, exactly as
+        // `AssociateApplications` refuses the mirror case.
+        if group.status != crate::state::STREAM_GROUP_ACTIVE {
+            return Err(DisassociateApplicationsErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::with_internal_id(format!(
+                        "stream group {group_id} is in {} status; applications can only be \
+                         disassociated from a stream group in ACTIVE status",
+                        group.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every identifier is resolved BEFORE anything is written, so a request naming
+        // one application that does not exist leaves the group's associations exactly
+        // as they were. An application the store does not hold is a resource the
+        // caller addressed and that is not there, so it is the modelled 404 — unlike
+        // an application that EXISTS and is simply not linked to this group, which is
+        // this @idempotent operation's own no-op below.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateApplications"))
+        // Each resolved application is carried as the (id, ARN) pair the STORE holds:
+        // the id is the store's own key, so nothing below has to find the record again
+        // by re-parsing an ARN.
+        let mut applications: Vec<(String, String)> = Vec::new();
+        for identifier in &input.application_identifiers {
+            let Some(application) = state.application(identifier) else {
+                return Err(DisassociateApplicationsErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(&crate::state::resolved_arn(
+                        &region,
+                        identifier,
+                        crate::state::APPLICATION_RESOURCE,
+                    )),
+                )
+                .into());
+            };
+            let resolved = (application.id.clone(), application.arn.clone());
+            if !applications.iter().any(|(id, _)| id == &resolved.0) {
+                applications.push(resolved);
+            }
+        }
+
+        // @idempotent: an application this group holds no link to is left exactly as
+        // it is, so a repeated call — and a call naming an application that was never
+        // associated — succeeds without changing a thing.
+        let mut unlinked_any = false;
+        for (application_id, application_arn) in &applications {
+            let linked = state.stream_groups[&group_id]
+                .associated_applications
+                .contains(application_arn);
+            if !linked {
+                continue;
+            }
+            // Keyed by the store's own id, not by the ARN: the lookup cannot be
+            // defeated by the SPELLING of a stored ARN. A store that no longer holds
+            // the record this call just resolved under the same lock is a broken
+            // emulator, answered with the modelled server error rather than a panic
+            // that would leave the write half applied.
+            let Some(application) = state.applications.get_mut(application_id) else {
+                return Err(DisassociateApplicationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::with_internal_id(format!(
+                            "the gameliftstreams emulator lost application \
+                             {application_id} while disassociating it"
+                        )),
+                    },
+                )
+                .into());
+            };
+            application
+                .associated_stream_groups
+                .retain(|arn| *arn != group_arn);
+            // "Amazon GameLift Streams will not initiate new streams in the stream
+            // group using the disassociated application", so the content this group's
+            // locations replicated for it is no longer held for them: exactly the rows
+            // `AssociateApplications` added for this group, and none another group
+            // asked for.
+            application
+                .replications
+                .retain(|replication| replication.stream_group_arn != group_arn);
+            application.last_updated_at = now;
+            let group = state
+                .stream_groups
+                .get_mut(&group_id)
+                .expect("the stream group was resolved above");
+            group
+                .associated_applications
+                .retain(|arn| arn != application_arn);
+            group.last_updated_at = now;
+            unlinked_any = true;
+        }
+
+        // "If you disassociate the default application, Amazon GameLift Streams will
+        // automatically choose a new default application from the remaining associated
+        // applications" — and a group left with none has no default at all. Only a
+        // call that actually unlinked something reconsiders the default, so a no-op
+        // never rewrites it.
+        if unlinked_any {
+            let group = &state.stream_groups[&group_id];
+            let default_dropped = group
+                .default_application
+                .as_ref()
+                .and_then(|default| default.arn.as_ref())
+                .is_some_and(|arn| !group.associated_applications.contains(arn));
+            if default_dropped {
+                let remaining = group.associated_applications.first().cloned();
+                // The id comes from the stored record of the application that is
+                // left, never from re-reading its ARN.
+                let replacement = remaining.and_then(|arn| {
+                    state.application(&arn).map(|application| DefaultApplication {
+                        id: Some(application.id.clone()),
+                        arn: Some(application.arn.clone()),
+                    })
+                });
+                let group = state
+                    .stream_groups
+                    .get_mut(&group_id)
+                    .expect("the stream group was resolved above");
+                group.default_application = replacement;
+                group.last_updated_at = now;
+            }
+        }
+
+        // Answered from the stored group, so the response is what a later
+        // `GetStreamGroup` reports: the applications this group is still associated
+        // with, which is empty once the last link is gone.
+        let group = &state.stream_groups[&group_id];
+        Ok(DisassociateApplicationsOutput {
+            arn: Some(group.arn.clone()),
+            application_arns: Some(group.associated_applications.clone()),
+        })
     }
 }

@@ -289,13 +289,21 @@ async fn every_not_found_path_names_the_resolved_arn_and_a_per_request_internal_
             missing_app_arn.clone(),
         ),
         (
-            "UpdateStreamGroup with a DefaultApplicationIdentifier ARN that is not there"
+            "DisassociateApplications with an ApplicationIdentifiers entry that is not there"
                 .to_string(),
-            "PATCH",
-            format!("/streamgroups/{group_id}"),
-            Some(json!({"DefaultApplicationIdentifier": ELSEWHERE})),
+            "POST",
+            format!("/streamgroups/{group_id}/disassociations"),
+            Some(json!({"ApplicationIdentifiers": ["a-gone"]})),
             "Resource",
-            ELSEWHERE.to_string(),
+            missing_app_arn.clone(),
+        ),
+        (
+            "DisassociateApplications in a stream group that is not there".to_string(),
+            "POST",
+            "/streamgroups/sg-gone/disassociations".to_string(),
+            Some(json!({"ApplicationIdentifiers": [app_id.clone()]})),
+            "Resource",
+            missing_group_arn.clone(),
         ),
         (
             "StartStreamSession with an ApplicationIdentifier that is not there".to_string(),
@@ -424,8 +432,7 @@ async fn every_not_found_path_names_the_resolved_arn_and_a_per_request_internal_
     assert_eq!(
         got["DefaultApplication"]["Arn"],
         Value::String(app_arn.clone()),
-        "a refused DefaultApplicationIdentifier must not change the default application, \
-         got {got}"
+        "a refused call must not change the default application, got {got}"
     );
 }
 

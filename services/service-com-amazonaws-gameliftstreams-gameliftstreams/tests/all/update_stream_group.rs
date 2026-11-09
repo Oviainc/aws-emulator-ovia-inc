@@ -336,7 +336,9 @@ async fn an_update_refuses_what_the_documented_rules_forbid() {
 
     // A READY application the group is not associated with.
     let (unassociated_id, _) = ready_application(&router, "unassociated-app").await;
-    // An application the clock has not made READY yet.
+    // An application the clock has not made READY yet, ASSOCIATED with the group: the
+    // status rule is the one that applies to an application the member may name at all,
+    // so it is only reachable past the association rule.
     let (status, fresh) = call(
         &router,
         "POST",
@@ -349,6 +351,17 @@ async fn an_update_refuses_what_the_documented_rules_forbid() {
         "CreateApplication: expected 201, got {status} {fresh}"
     );
     let initialized_id = text(&fresh, "/Id", "an INITIALIZED application");
+    let (status, associated) = call(
+        &router,
+        "POST",
+        &format!("/streamgroups/{group_id}/associations"),
+        Some(json!({"ApplicationIdentifiers": [initialized_id.clone()]})),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "AssociateApplications: expected 200, got {status} {associated}"
+    );
 
     let cases: Vec<(&str, String, Value, u16)> = vec![
         (
@@ -395,13 +408,16 @@ async fn an_update_refuses_what_the_documented_rules_forbid() {
             400,
         ),
         (
+            // `DefaultApplicationIdentifier` "only sets the default application in a
+            // stream group", so an identifier the group holds no association for is a
+            // bad value for the member, not a resource that is missing.
             "a default application no application matches",
             group_id.clone(),
             json!({"DefaultApplicationIdentifier": "a-notstored"}),
-            404,
+            400,
         ),
         (
-            "a default application that is not READY",
+            "an associated default application that is not READY",
             group_id.clone(),
             json!({"DefaultApplicationIdentifier": initialized_id}),
             409,

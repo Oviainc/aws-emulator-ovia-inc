@@ -565,6 +565,28 @@ pub fn application_not_associated(
     }
 }
 
+/// The refusal a `DefaultApplicationIdentifier` that names no application of the
+/// addressed stream group's associations carries.
+///
+/// The member "only sets the default application in a stream group. To associate a
+/// new application to an existing stream group, you must use AssociateApplications"
+/// (`UpdateStreamGroup`'s `DefaultApplicationIdentifier`), so the only values it
+/// accepts are the applications that group is ALREADY associated with: every other
+/// value — including one that names no application at all — is a bad value for the
+/// member rather than a resource the caller addressed and could not find, and is
+/// answered with the modelled `ValidationException`. The text names the full ARN
+/// the identifier resolves to, which is the one spelling of it a caller can always
+/// read back, and carries the per-request suffix [`with_internal_id`] appends to
+/// every handler-side message of this service.
+pub fn default_application_not_associated(application_arn: &str) -> ValidationException {
+    ValidationException {
+        message: with_internal_id(format!(
+            "Application '{application_arn}' cannot be set as default because it is not \
+             currently associated with the stream group"
+        )),
+    }
+}
+
 /// The refusal a `DisplayConfiguration` whose `Resolution` breaks one of the two
 /// rules the model states in prose carries, or `None` when the operation may go on.
 ///

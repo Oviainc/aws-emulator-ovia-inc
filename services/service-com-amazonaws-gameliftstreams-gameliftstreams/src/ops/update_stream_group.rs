@@ -427,20 +427,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ---- the new default application, if the request names one ----
         let default_application = match input.default_application_identifier.as_deref() {
             Some(identifier) => {
-                let Some(application) = state.application(identifier) else {
-                    // Same rule for an identifier that is not a path label: the
-                    // message names the ARN `DefaultApplicationIdentifier` resolves
-                    // to.
-                    return Err(UpdateStreamGroupErrorModeled::ResourceNotFoundException(
-                        crate::state::resource_not_found(&crate::state::resolved_arn(
+                // "Note that this parameter only sets the default application in a
+                // stream group. To associate a new application to an existing stream
+                // group, you must use AssociateApplications." So the member's only
+                // legal values are the applications the group is ALREADY associated
+                // with, and the check is made against THAT set rather than against the
+                // store at large: an identifier the group holds no association for is
+                // a bad value for the member — whether or not an application of that
+                // identifier exists anywhere — and never a resource the caller
+                // addressed and could not find. `ResourceNotFoundException` stays
+                // reserved for the stream group the path `Identifier` names.
+                //
+                // The ARN the refusal names is the stored one when the store holds the
+                // record and the one the identifier resolves to otherwise, so either
+                // spelling of the member is reported as the ARN it addresses.
+                let stored = state.application(identifier);
+                let application_arn = stored.map_or_else(
+                    || {
+                        crate::state::resolved_arn(
                             &region,
                             identifier,
                             crate::state::APPLICATION_RESOURCE,
-                        )),
+                        )
+                    },
+                    |application| application.arn.clone(),
+                );
+                if !associated_applications.contains(&application_arn) {
+                    return Err(UpdateStreamGroupErrorModeled::ValidationException(
+                        crate::state::default_application_not_associated(&application_arn),
+                    )
+                    .into());
+                }
+                // An association names an application this store holds, so the record
+                // is here; a store that lost it is a broken emulator, answered with the
+                // modelled server error rather than a panic.
+                let Some(application) = state.application(identifier) else {
+                    return Err(UpdateStreamGroupErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: crate::state::with_internal_id(format!(
+                                "the gameliftstreams emulator lost application \
+                                 '{application_arn}', which stream group {group_id} is \
+                                 associated with"
+                            )),
+                        },
                     )
                     .into());
                 };
-                // "The application that you specify must be in READY status."
+                // "The application that you specify must be in READY status." Only an
+                // associated application gets this far, so the status rule is applied
+                // to the record the group's own association names.
                 if application.status != crate::state::APPLICATION_READY {
                     return Err(UpdateStreamGroupErrorModeled::ConflictException(
                         ConflictException {
@@ -450,23 +485,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 application.id,
                                 application.status,
                                 crate::state::APPLICATION_READY
-                            )),
-                        },
-                    )
-                    .into());
-                }
-                // "Note that this parameter only sets the default application in a
-                // stream group. To associate a new application to an existing stream
-                // group, you must use AssociateApplications." So this call may only
-                // promote an application the group is already associated with; it never
-                // associates one itself.
-                if !associated_applications.contains(&application.arn) {
-                    return Err(UpdateStreamGroupErrorModeled::ValidationException(
-                        ValidationException {
-                            message: crate::state::with_internal_id(format!(
-                                "application {} is not associated with stream group {group_id}; \
-                                 use AssociateApplications to associate it first",
-                                application.id
                             )),
                         },
                     )
