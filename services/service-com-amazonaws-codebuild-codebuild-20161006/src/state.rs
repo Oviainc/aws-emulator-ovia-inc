@@ -606,6 +606,29 @@ pub const UNRESOLVABLE_SANDBOX_ID_MESSAGE: &str = "No sandbox found with specifi
 /// site keeps whichever of the two is recorded for ITS operation.
 pub const PROJECT_NOT_FOUND_MESSAGE: &str = "Project does not exist";
 
+/// What CodeBuild states as the reason the operation that changes a project's build
+/// visibility names a project this account does not hold, carried by the modelled
+/// `ResourceNotFoundException`.
+///
+/// The same absence as [`PROJECT_NOT_FOUND_MESSAGE`], stated as a terminated sentence:
+/// recorded behaviour, and fixed text under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule — it
+/// quotes back neither the ARN the request sent nor the name inside it, so no identifier
+/// for a project that does not exist reaches the wire.
+pub const PROJECT_VISIBILITY_PROJECT_NOT_FOUND_MESSAGE: &str = "Project does not exist.";
+
+/// What CodeBuild states as the reason the operation that empties ONE project's build
+/// cache names a project this account does not hold, carried by the modelled
+/// `ResourceNotFoundException`.
+///
+/// The same absence as [`PROJECT_NOT_FOUND_MESSAGE`], with the project the request named
+/// quoted after it: the operation's whole input IS that name, so the name is the entire
+/// diagnostic value of the refusal, and it is taken from the request exactly as sent.
+/// Recorded behaviour, the sentence terminated the way
+/// [`PROJECT_VISIBILITY_PROJECT_NOT_FOUND_MESSAGE`] is.
+pub fn named_project_absent_message(project_name: &str) -> String {
+    format!("{PROJECT_NOT_FOUND_MESSAGE}: {project_name}.")
+}
+
 /// What CodeBuild states as the reason a webhook-addressing request names a project that
 /// carries no webhook, carried by the modelled `ResourceNotFoundException`.
 ///
@@ -3310,6 +3333,8 @@ pub enum AuditOutcome {
     ProjectDeleted,
     /// A batch build was removed from the store, with the builds of that batch.
     BuildBatchDeleted,
+    /// A build was removed from the store, with its place in its project's index.
+    BuildDeleted,
     /// A batch build that was still running was ended by a caller.
     BuildBatchStopped,
     /// No resource of that name exists (400 `ResourceNotFoundException`).
@@ -3338,6 +3363,7 @@ impl AuditOutcome {
             Self::ProjectUpdated => "project-updated",
             Self::ProjectDeleted => "project-deleted",
             Self::BuildBatchDeleted => "build-batch-deleted",
+            Self::BuildDeleted => "build-deleted",
             Self::BuildBatchStopped => "build-batch-stopped",
             Self::NotFound => "not-found",
             Self::ResourcePolicyStored => "resource-policy-stored",

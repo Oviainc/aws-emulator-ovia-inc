@@ -280,7 +280,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateProjectVisibilityErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("Project cannot be found: {}", input.project_arn)),
+                        // The sentence CodeBuild states for THIS operation's missing
+                        // resource (`crate::state::PROJECT_VISIBILITY_PROJECT_NOT_FOUND_MESSAGE`):
+                        // fixed text that quotes back neither the ARN nor the name in it.
+                        message: Some(
+                            crate::state::PROJECT_VISIBILITY_PROJECT_NOT_FOUND_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

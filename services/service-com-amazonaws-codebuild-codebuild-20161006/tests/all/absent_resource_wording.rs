@@ -173,6 +173,111 @@ async fn project_management_states_codebuilds_fixed_absent_project_sentence() {
     );
 }
 
+/// RULE: the two project operations that act on ONE project and are recorded stating a
+/// TERMINATED sentence state it for every absent project: the cache reset quotes the name
+/// it was given (`Project does not exist: <name>.`) because that name is its whole input,
+/// and the visibility change states the sentence alone (`Project does not exist.`) because
+/// it is addressed by an ARN it never quotes back. Both are 400
+/// `ResourceNotFoundException`, the class the model gives a missing resource.
+///
+/// The table crosses both operations with every form of an absent project name, and ends
+/// on the contrast each one must keep with the project-MANAGEMENT family's unterminated
+/// sentence, so the three wordings are proved to be per-operation rather than one shared
+/// template.
+#[tokio::test]
+async fn acting_on_one_absent_project_states_that_operations_terminated_sentence() {
+    let router = emulator();
+    create_project(&router, "held-project", json!({})).await;
+
+    for project in ABSENT_PROJECTS {
+        let case = format!("InvalidateProjectCache for {project:?}");
+        let stated = refusal(
+            &router,
+            &case,
+            "InvalidateProjectCache",
+            json!({"projectName": project}),
+            "ResourceNotFoundException",
+        )
+        .await;
+        assert_eq!(
+            stated,
+            state::named_project_absent_message(project),
+            "case {case:?}: expected the sentence naming the project asked for, got {stated:?}"
+        );
+        assert!(
+            !stated.contains("arn:"),
+            "case {case:?}: the name is quoted as sent, not as an ARN, got {stated:?}"
+        );
+
+        let case = format!("UpdateProjectVisibility for {project:?}");
+        let stated = refusal(
+            &router,
+            &case,
+            "UpdateProjectVisibility",
+            json!({
+                "projectArn": state::project_arn(REGION, project),
+                "projectVisibility": "PRIVATE",
+            }),
+            "ResourceNotFoundException",
+        )
+        .await;
+        assert_eq!(
+            stated,
+            state::PROJECT_VISIBILITY_PROJECT_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected the terminated fixed sentence, got {stated:?}"
+        );
+        assert!(
+            !stated.contains("arn:") && !stated.contains(project),
+            "case {case:?}: the sentence must name neither the project nor its ARN, got \
+             {stated:?}"
+        );
+
+        // The contrast, on the SAME absent project: MANAGING its configuration states
+        // the unterminated sentence.
+        let case = format!("UpdateProject for {project:?}");
+        let stated = refusal(
+            &router,
+            &case,
+            "UpdateProject",
+            json!({"name": project}),
+            "ResourceNotFoundException",
+        )
+        .await;
+        assert_eq!(
+            stated,
+            state::PROJECT_NOT_FOUND_MESSAGE,
+            "case {case:?}: a management refusal states the unterminated sentence, got \
+             {stated:?}"
+        );
+    }
+
+    // The controls: the project this account DOES hold is acted on rather than refused, so
+    // every row above was decided by the name and not by the operation.
+    let (status, answer) = call(
+        &router,
+        "InvalidateProjectCache",
+        json!({"projectName": "held-project"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "InvalidateProjectCache for a held project: expected 200, got {status} with {answer}"
+    );
+    let (status, answer) = call(
+        &router,
+        "UpdateProjectVisibility",
+        json!({
+            "projectArn": state::project_arn(REGION, "held-project"),
+            "projectVisibility": "PRIVATE",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "UpdateProjectVisibility for a held project: expected 200, got {status} with {answer}"
+    );
+}
+
 /// RULE: a batch-build stop refuses an id this account holds no batch build under with 400
 /// `ResourceNotFoundException` stating `BuildBatch <id> does not exist` — the resource
 /// named by its MODELLED shape name, the id echoed exactly as the request sent it, and no

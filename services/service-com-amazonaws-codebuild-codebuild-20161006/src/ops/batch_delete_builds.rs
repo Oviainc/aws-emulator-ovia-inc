@@ -136,7 +136,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
 
         // Every id has to ADDRESS a build — the `<projectName>:<uuid>` form every build of
         // this service is keyed by, or the ARN whose resource segment is such an id — the
@@ -160,45 +160,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
         let mut deleted: Vec<String> = Vec::new();
-        let mut not_deleted: Vec<BuildNotDeleted> = Vec::new();
+        // The builds this call really removed a record for, so the audit below states
+        // what was destroyed rather than what was asked for.
+        let mut removed: Vec<String> = Vec::new();
         // Two entries naming the same build name one build, so each named build is
-        // reported once ([`crate::state::distinct_identifiers`]): without this the
-        // repeat would read as "not deleted" purely because the first occurrence had
-        // just deleted it.
+        // reported once ([`crate::state::distinct_identifiers`]).
         for id in crate::state::distinct_identifiers(&input.ids) {
             // AWS states no status precondition for deleting a build (unlike
             // `StopBuild`, which needs one still running), so a build is removed
-            // whatever status it carries; the only build this emulator cannot delete
-            // is one it holds no record of. A deleted build leaves both the build map
-            // and its project's id index, so every later read — `BatchGetBuilds`,
-            // `ListBuildsForProject`, and `ListBuilds` once its own stub issue is
-            // closed — stops reporting it. The record is addressed by the build's own
-            // id, and an entry given as a build ARN names the same build
+            // whatever status it carries. Deleting is IDEMPOTENT: the call answers for
+            // the state it leaves behind — no build under that id — so an id this
+            // account holds no record of is reported deleted exactly like one that was
+            // held, and nothing distinguishes the second delete of a build from the
+            // first. A deleted build leaves both the build map and its project's id
+            // index, so every later read — `BatchGetBuilds`, `ListBuildsForProject`,
+            // `ListBuilds` — stops reporting it. The record is addressed by the build's
+            // own id, and an entry given as a build ARN names the same build
             // (`crate::state::build_store_id`), the way `BatchGetBuilds` resolves one.
-            if guard.remove_build(crate::state::build_store_id(id)) {
-                deleted.push(id.to_string());
+            let store_id = crate::state::build_store_id(id);
+            let held = guard.remove_build(store_id);
+            // A build is named by its ARN in every answer this service gives
+            // (`Build$arn`, and the `buildArn` a batch build's summary carries), so the
+            // builds this call deleted are reported in that same form: a caller
+            // correlating what it asked to delete with what came back is comparing
+            // ARNs. An identifier already given as an ARN is reported back as sent —
+            // the same normalisation `crate::ops::batch_get_build_batches` states for
+            // the half of ITS partition that resolved nothing.
+            let reported = if crate::state::is_arn(id) {
+                id.to_string()
             } else {
-                not_deleted.push(BuildNotDeleted {
-                    id: Some(id.to_string()),
-                    // `statusCode` is documented only as "Additional information
-                    // about the build that could not be successfully deleted", and
-                    // CodeBuild builds it from the request: it names the id the
-                    // caller asked for, exactly as given, and says it does not
-                    // exist.
-                    status_code: Some(format!("Build {id} does not exist")),
-                });
+                crate::state::build_arn(&region, id)
+            };
+            if held {
+                removed.push(reported.clone());
             }
+            deleted.push(reported);
+        }
+        // The lock is dropped before the records are written, so a log consumer never
+        // waits on this request's critical section.
+        drop(guard);
+
+        // A delete is destructive, so each build this call removed leaves a local
+        // record, the way the other removals of this service are recorded.
+        for arn in &removed {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::BuildDeleted,
+                Some(arn),
+            );
         }
 
         Ok(BatchDeleteBuildsOutput {
-            // The builds this call deleted, serialized the same way as the half below:
-            // `[]` when it deleted none. The `@length(min: 1)` on `BuildIds` bounds
-            // what a request may carry, not whether the answer states its result.
+            // Every id the request named, since every one of them now names no build.
             builds_deleted: Some(deleted),
-            // `BuildsNotDeleted` carries no `@length`, so it is always reported —
-            // `[]` when every named build was deleted. A client reads the member
-            // unconditionally to find out what it has left to deal with.
-            builds_not_deleted: Some(not_deleted),
+            // "Information about any builds that could not be successfully deleted" —
+            // `BuildsNotDeleted` carries no `@length`, so the member is always stated,
+            // `[]` when nothing was left behind, which is what a caller reads to find
+            // out what it still has to deal with. This emulator holds no build it
+            // refuses to delete, and an id naming no build is not one: the delete it
+            // asked for has already happened.
+            builds_not_deleted: Some(Vec::new()),
         })
     }
 }

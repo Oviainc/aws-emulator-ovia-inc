@@ -4,18 +4,19 @@
 //! (`POST /` with `X-Amz-Target: CodeBuild_20161006.BatchDeleteBuilds` on awsJson1_1)
 //! through the harness in `project_build_lifecycle`.
 //!
-//! RULE under test: `BatchDeleteBuilds` removes every build the request names from
-//! this account's build records, whatever status that build carries, and reports each
-//! named build exactly once — in `buildsDeleted` when a record was held and removed,
-//! and in `buildsNotDeleted` with its id and a `statusCode` saying why when no record
-//! was held. `buildsNotDeleted` carries no `@length`, so it is always reported, `[]`
-//! when nothing was left behind. A removed build is gone from every later read.
+//! RULE under test: `BatchDeleteBuilds` answers for the state it LEAVES, so deleting is
+//! idempotent — it removes every build the request names, whatever status that build
+//! carries, and reports each named build exactly once in `buildsDeleted`, in the build-ARN
+//! form this service names a build by, whether or not a record was held under that id.
+//! `buildsNotDeleted` is "information about any builds that could not be successfully
+//! deleted", and nothing here cannot be deleted, so it is reported `[]`. A removed build
+//! is gone from every later read.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::project_build_lifecycle::{
-    call, create_project, emulator, error_type, start_build, PAST_THE_SETTLE_SPAN,
+    call, create_project, emulator, error_type, expected_arn, start_build, PAST_THE_SETTLE_SPAN,
 };
 
 /// How a row leaves a build before the delete call: the three states a stored build
@@ -39,8 +40,8 @@ fn expected_status(left: Left) -> &'static str {
 }
 
 /// One row of the table: the builds to set up, which of them the request names (by
-/// index, in request order), how many ids naming no build to mix in, and whether the
-/// first id is repeated.
+/// index, in request order), how many ids naming no build to mix in, whether the
+/// first id is repeated, and whether the ids are sent in their ARN form.
 #[derive(Debug)]
 struct Case {
     name: &'static str,
@@ -49,6 +50,23 @@ struct Case {
     named: &'static [usize],
     unknown: usize,
     repeat_first: bool,
+    as_arns: bool,
+}
+
+/// The form `BatchDeleteBuilds` reports a deleted build in: the build ARN the id
+/// denotes, and an id already given as an ARN exactly as it was sent.
+fn deleted_form(sent: &str) -> String {
+    if sent.starts_with("arn:") {
+        sent.to_string()
+    } else {
+        expected_arn(&format!("build/{sent}"))
+    }
+}
+
+/// The build id a request entry addresses: the resource half of a build ARN, or the
+/// value itself when it is already an id.
+fn addressed_id(sent: &str) -> &str {
+    sent.split_once(":build/").map_or(sent, |(_, id)| id)
 }
 
 /// A syntactically valid build id (`<projectName>:<uuid>`) that names no build: the
@@ -143,6 +161,12 @@ fn requested_ids(case: &Case, started: &[String]) -> Vec<String> {
             ids.push(first);
         }
     }
+    if case.as_arns {
+        ids = ids
+            .iter()
+            .map(|id| expected_arn(&format!("build/{id}")))
+            .collect();
+    }
     ids
 }
 
@@ -157,11 +181,11 @@ fn deduped(items: &[String]) -> Vec<String> {
     out
 }
 
-/// RULE: every named build that is held is removed and reported in `buildsDeleted`,
-/// each named build is reported exactly once, and an id naming no build is reported in
-/// `buildsNotDeleted` with that id and a `statusCode` saying so. The table varies the
-/// build's status, the number of ids, the mix of held and unheld ids, the request order
-/// and a repeated id.
+/// RULE: every id the request names is removed and reported once in `buildsDeleted`, in
+/// the build-ARN form, whether or not a record was held under it, and `buildsNotDeleted`
+/// is `[]` because nothing here cannot be deleted. The table varies the build's status,
+/// the number of ids, the mix of held and unheld ids, the request order, a repeated id
+/// and the form the ids are sent in.
 #[tokio::test]
 async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
     let cases: &[Case] = &[
@@ -172,6 +196,7 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
             named: &[0],
             unknown: 0,
             repeat_first: false,
+            as_arns: false,
         },
         Case {
             name: "one build the clock already finished",
@@ -180,6 +205,7 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
             named: &[0],
             unknown: 0,
             repeat_first: false,
+            as_arns: false,
         },
         Case {
             name: "one build the caller stopped",
@@ -188,6 +214,7 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
             named: &[0],
             unknown: 0,
             repeat_first: false,
+            as_arns: false,
         },
         Case {
             name: "every build of a project, named out of start order",
@@ -196,6 +223,7 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
             named: &[2, 0, 1],
             unknown: 0,
             repeat_first: false,
+            as_arns: false,
         },
         Case {
             name: "some builds, leaving the rest in place",
@@ -209,6 +237,7 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
             named: &[1, 3],
             unknown: 0,
             repeat_first: false,
+            as_arns: false,
         },
         Case {
             name: "only ids naming no build",
@@ -217,6 +246,7 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
             named: &[],
             unknown: 2,
             repeat_first: false,
+            as_arns: false,
         },
         Case {
             name: "held and unheld ids mixed in one request",
@@ -225,6 +255,7 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
             named: &[0, 1],
             unknown: 2,
             repeat_first: false,
+            as_arns: false,
         },
         Case {
             name: "the same build named twice",
@@ -233,6 +264,16 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
             named: &[0],
             unknown: 0,
             repeat_first: true,
+            as_arns: false,
+        },
+        Case {
+            name: "held and unheld ids sent in their ARN form",
+            project: "del-arn-form",
+            builds: &[Left::Stopped, Left::InProgress],
+            named: &[1, 0],
+            unknown: 2,
+            repeat_first: true,
+            as_arns: true,
         },
     ];
 
@@ -241,20 +282,15 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
         let router = emulator();
         let (started, start_order) = set_up(&router, case).await;
         let requested = requested_ids(case, &started);
-        let expected_deleted: Vec<String> = deduped(
-            &requested
-                .iter()
-                .filter(|id| started.contains(id))
-                .cloned()
-                .collect::<Vec<String>>(),
-        );
-        let expected_not_deleted: Vec<String> = deduped(
-            &requested
-                .iter()
-                .filter(|id| !started.contains(id))
-                .cloned()
-                .collect::<Vec<String>>(),
-        );
+        // Every named build, once, in the form the answer reports it in.
+        let expected_deleted: Vec<String> =
+            deduped(&requested).iter().map(|id| deleted_form(id)).collect();
+        // The builds the account held and this call removed, by store id.
+        let gone: Vec<String> = deduped(&requested)
+            .iter()
+            .map(|sent| addressed_id(sent).to_string())
+            .filter(|id| started.contains(id))
+            .collect();
 
         let (status, body) = call(
             &router,
@@ -278,48 +314,26 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
             .unwrap_or_default();
         assert_eq!(
             deleted, expected_deleted,
-            "case {:?}: buildsDeleted must report each held id once, in request order; got {body}",
+            "case {:?}: buildsDeleted must report each named id once, as a build ARN, in \
+             request order; got {body}",
             case.name
         );
-        // The deleted half of the partition is always serialized — `[]` when this call
-        // deleted nothing — the way the not-deleted half below is.
-        assert!(
-            body["buildsDeleted"].is_array(),
-            "case {:?}: buildsDeleted must be a list, got {body}",
-            case.name
-        );
-
-        let not_deleted: Vec<String> = body["buildsNotDeleted"]
-            .as_array()
-            .map(|entries| {
-                entries
-                    .iter()
-                    .map(|entry| entry["id"].as_str().unwrap_or_default().to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-        assert_eq!(
-            not_deleted, expected_not_deleted,
-            "case {:?}: buildsNotDeleted must report each unheld id once; got {body}",
-            case.name
-        );
-        // `BuildsNotDeleted` carries no `@length`, so the member is always there —
-        // `[]` when every named build was deleted.
-        assert!(
-            body["buildsNotDeleted"].is_array(),
-            "case {:?}: buildsNotDeleted is always reported, got {body}",
-            case.name
-        );
-        for (position, id) in expected_not_deleted.iter().enumerate() {
-            // CodeBuild builds this text from the request: it names the id as the
-            // caller gave it and says it does not exist.
-            assert_eq!(
-                body["buildsNotDeleted"][position]["statusCode"],
-                Value::String(format!("Build {id} does not exist")),
-                "case {:?}: the statusCode for {id} must name that id and say why; got {body}",
+        for reported in &deleted {
+            assert!(
+                reported.contains(":build/"),
+                "case {:?}: a deleted build is named by its ARN, got {reported:?} in {body}",
                 case.name
             );
         }
+
+        // Nothing here cannot be deleted, so the other half of the partition is the
+        // empty list — stated, because `BuildsNotDeleted` carries no `@length`.
+        assert_eq!(
+            body["buildsNotDeleted"],
+            json!([]),
+            "case {:?}: buildsNotDeleted is stated empty, got {body}",
+            case.name
+        );
 
         // Every later read is computed from the store the delete wrote: the deleted
         // builds are gone and the survivors are untouched.
@@ -338,12 +352,8 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
                     .collect()
             })
             .unwrap_or_default();
-        let survivors: Vec<String> = started
-            .iter()
-            .filter(|id| !expected_deleted.contains(id))
-            .cloned()
-            .collect();
-        for id in &expected_deleted {
+        let survivors: Vec<String> = started.iter().filter(|id| !gone.contains(id)).cloned().collect();
+        for id in &gone {
             assert!(
                 !reported.contains(id),
                 "case {:?}: {id} was deleted, so BatchGetBuilds must not report it; got {after}",
@@ -365,7 +375,7 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
                     .collect()
             })
             .unwrap_or_default();
-        for id in &expected_deleted {
+        for id in &gone {
             assert!(
                 not_found.contains(id),
                 "case {:?}: a deleted build reads as not found; got {after}",
@@ -389,7 +399,7 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
         let expected_listed: Vec<String> = start_order
             .iter()
             .map(|index| started[*index].clone())
-            .filter(|id| !expected_deleted.contains(id))
+            .filter(|id| !gone.contains(id))
             .rev()
             .collect();
         let actual_listed: Vec<String> = listed["ids"]
@@ -409,11 +419,12 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
 }
 
 /// RULE: a deleted build frees nothing a later build reuses — `buildNumber` keeps
-/// counting up for a project whose builds were all deleted — and the deletion is
-/// durable: deleting the same id again reports it as not deleted, and the operations
-/// that answer for an absent build name it by the id the request gave.
+/// counting up for a project whose builds were all deleted — and the delete is
+/// IDEMPOTENT: repeating it answers exactly as the first call did, because the state it
+/// asks for is already the state the account is in. The operations that ACT on a build
+/// still refuse an absent one, naming it by the id the request gave.
 #[tokio::test]
-async fn deleting_a_build_neither_rewinds_the_build_number_nor_can_be_repeated() {
+async fn deleting_a_build_neither_rewinds_the_build_number_nor_differs_when_repeated() {
     let router = emulator();
     create_project(&router, "del-numbers", json!({})).await;
 
@@ -439,9 +450,13 @@ async fn deleting_a_build_neither_rewinds_the_build_number_nor_can_be_repeated()
         "BatchDeleteBuilds: expected 200, got {status} with {body}"
     );
     assert_eq!(
-        body["buildsDeleted"].as_array().map(Vec::len),
-        Some(ids.len()),
-        "every build of the project was named, so every one is deleted; got {body}"
+        body["buildsDeleted"],
+        json!(ids
+            .iter()
+            .map(|id| expected_arn(&format!("build/{id}")))
+            .collect::<Vec<String>>()),
+        "every build of the project was named, so every one is reported deleted by its \
+         ARN; got {body}"
     );
     assert_eq!(
         body["buildsNotDeleted"],
@@ -457,7 +472,8 @@ async fn deleting_a_build_neither_rewinds_the_build_number_nor_can_be_repeated()
         "a deleted build must not free its buildNumber, got {next}"
     );
 
-    // Deleting an already-deleted id is reported, not re-deleted.
+    // Deleting an already-deleted id answers as the first delete did: the caller asked
+    // for a state the account is already in.
     let (status, again) = call(
         &router,
         "BatchDeleteBuilds",
@@ -470,18 +486,13 @@ async fn deleting_a_build_neither_rewinds_the_build_number_nor_can_be_repeated()
     );
     assert_eq!(
         again["buildsDeleted"],
+        json!([expected_arn(&format!("build/{}", ids[0]))]),
+        "the repeated delete reports the same ARN as the first; got {again}"
+    );
+    assert_eq!(
+        again["buildsNotDeleted"],
         json!([]),
-        "nothing was held, so buildsDeleted is empty; got {again}"
-    );
-    assert_eq!(
-        again["buildsNotDeleted"][0]["id"],
-        Value::String(ids[0].clone()),
-        "the already-deleted id reads as not deleted; got {again}"
-    );
-    assert_eq!(
-        again["buildsNotDeleted"][0]["statusCode"],
-        Value::String(format!("Build {} does not exist", ids[0])),
-        "the already-deleted id's statusCode names it; got {again}"
+        "the repeated delete leaves nothing behind either; got {again}"
     );
 
     // The same rule, in the other operation that answers for a build it holds no
@@ -527,7 +538,7 @@ async fn the_ids_list_is_held_to_its_declared_length_bounds() {
     );
     assert_eq!(
         body["buildsDeleted"],
-        json!([held.clone()]),
+        json!([expected_arn(&format!("build/{held}"))]),
         "one id, the declared minimum: expected it deleted, got {body}"
     );
 
@@ -545,13 +556,16 @@ async fn the_ids_list_is_held_to_its_declared_length_bounds() {
     );
     assert_eq!(
         body["buildsDeleted"],
-        json!([second_id]),
-        "100 ids, the declared maximum: only the held one is deleted, got {body}"
+        json!(at_max
+            .iter()
+            .map(|id| expected_arn(&format!("build/{id}")))
+            .collect::<Vec<String>>()),
+        "100 ids, the declared maximum: every one is reported deleted, got {body}"
     );
     assert_eq!(
-        body["buildsNotDeleted"].as_array().map(Vec::len),
-        Some(99),
-        "100 ids, the declared maximum: the other 99 are reported, got {body}"
+        body["buildsNotDeleted"],
+        json!([]),
+        "100 ids, the declared maximum: nothing is left behind, got {body}"
     );
 
     let refused: Vec<(&str, Value)> = vec![

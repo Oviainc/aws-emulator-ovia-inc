@@ -138,9 +138,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A cache belongs to a project, so the project is this call's one precondition:
         // a name this account holds no project under addresses no cache to reset, which
         // is the modelled missing resource rather than a bad request. The sentence is
-        // the fixed one the project-MANAGEMENT operations state
-        // (`crate::state::PROJECT_NOT_FOUND_MESSAGE`): a reset is an act ON the project,
-        // not a listing of one project's records.
+        // the fixed one the operation that empties a project's cache states
+        // (`crate::state::named_project_absent_message`), which quotes the name the
+        // request named the project by: a reset is an act ON the project, not a listing
+        // of one project's records.
         let Some(stored) = guard.projects.get_mut(&input.project_name) else {
             drop(guard);
             crate::state::audit(
@@ -154,7 +155,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(InvalidateProjectCacheErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::PROJECT_NOT_FOUND_MESSAGE.to_string()),
+                    message: Some(crate::state::named_project_absent_message(
+                        &input.project_name,
+                    )),
                 },
             )
             .into());

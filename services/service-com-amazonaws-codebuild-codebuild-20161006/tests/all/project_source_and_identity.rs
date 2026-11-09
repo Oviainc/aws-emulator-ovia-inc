@@ -432,7 +432,8 @@ async fn invalidating_a_cache_resets_a_held_project_and_refuses_an_absent_one() 
     }
 
     // A name this account holds no project under: the modelled missing resource, worded
-    // the way the project-management operations word it.
+    // the way the operation that empties ONE project's cache words it — the name it was
+    // given, quoted inside the sentence.
     for absent in ["cache-never-created", "cache-proj-0-not-this-one"] {
         let (status, body) = call(
             &router,
@@ -451,12 +452,12 @@ async fn invalidating_a_cache_resets_a_held_project_and_refuses_an_absent_one() 
         );
         assert_eq!(
             message(&body),
-            state::PROJECT_NOT_FOUND_MESSAGE,
+            state::named_project_absent_message(absent),
             "case {absent:?}: expected CodeBuild's absent-project sentence, got {body}"
         );
         assert!(
-            !message(&body).contains(absent),
-            "case {absent:?}: the sentence must name no identifier, got {body}"
+            !message(&body).contains("arn:"),
+            "case {absent:?}: the name is quoted as sent, not as an ARN, got {body}"
         );
     }
 }

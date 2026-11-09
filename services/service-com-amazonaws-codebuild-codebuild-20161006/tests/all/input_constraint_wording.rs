@@ -373,8 +373,9 @@ async fn a_malformed_build_id_is_refused_rather_than_reported_absent() {
         "a refused request must delete nothing, got {read}"
     );
 
-    // A well-formed id for a build nobody started is the not-found case, not a refusal —
-    // on the read and on the delete alike.
+    // A well-formed id for a build nobody started is the not-found case on the READ, and
+    // on the DELETE it is the already-done case: the delete answers for the state it
+    // leaves, which is the state the account is already in.
     let absent = absent_build_id("id-form", 7);
     let (status, read) = call(
         &router,
@@ -402,9 +403,14 @@ async fn a_malformed_build_id_is_refused_rather_than_reported_absent() {
         "BatchDeleteBuilds for a well-formed absent id: expected 200, got {status} with {deleted}"
     );
     assert_eq!(
-        deleted["buildsNotDeleted"][0]["id"],
-        json!(absent),
-        "a well-formed absent id belongs in buildsNotDeleted, got {deleted}"
+        deleted["buildsDeleted"],
+        json!([state::build_arn(REGION, &absent)]),
+        "a well-formed absent id is reported deleted, by its ARN, got {deleted}"
+    );
+    assert_eq!(
+        deleted["buildsNotDeleted"],
+        json!([]),
+        "a well-formed absent id leaves nothing behind, got {deleted}"
     );
 
     // The build's own ARN form is ADMITTED rather than refused, and it names the same
