@@ -97,7 +97,11 @@
 //! enum is stated alike, with the rows' DATA living in that service's own crate. A
 //! hand-authored operation reading its own request reaches the same rows, because the
 //! shared request reader hands its refusal back structurally
-//! ([`crate::event_stream::read_request`]). The other
+//! ([`crate::event_stream::read_request`]). A third order is neither the model's,
+//! lexicographic nor published but computed from the values themselves:
+//! [`in_hashed_enum_order`], for a front door that holds the admissible values in a hash
+//! table keyed on each value's text and enumerates the table rather than the declaration.
+//! The other
 //! order is over the CLAUSES rather than inside one: [`in_pattern_first_order`] states a
 //! member's `@pattern` requirement before that member's other requirements, for a front
 //! door whose recordings show that order, with the members themselves left where the walk
@@ -465,6 +469,95 @@ pub fn in_sorted_enum_order(violation: &Violation) -> Violation {
         value: violation.value.clone(),
         sensitive: violation.sensitive,
     }
+}
+
+/// `violation` with an enumerated type's value set stated in the order the set's own HASH
+/// TABLE is walked, and any other violation returned unchanged.
+///
+/// The third of the three orders a refusal of a value outside an enumerated type is seen
+/// listing that type's values in, beside [`in_sorted_enum_order`] (lexicographic) and
+/// [`in_stated_enum_order`] (a set the service publishes): a front door that holds the
+/// admissible values in a hash table keyed on each value's own text, and enumerates the
+/// table rather than the type's declaration, lists them
+///
+/// * in ascending bucket index, the bucket being the low bits
+///   ([`ENUM_VALUE_SET_BUCKETS`]) of the value's string hash — the 31-polynomial over its
+///   UTF-16 code units ([`enum_value_bucket`]);
+/// * a bucket holding more than one value (two values whose hashes agree in those low
+///   bits) read from the head each value was pushed onto, so the LATER of the two is
+///   stated first. That direction is shown by a recorded refusal of a set that HAS a
+///   collision — `com.amazonaws.acm-pca#ValidityPeriodType`, declared `END_DATE`,
+///   `ABSOLUTE`, `DAYS`, `MONTHS`, `YEARS`, is stated `END_DATE, MONTHS, YEARS, DAYS,
+///   ABSOLUTE`: `ABSOLUTE` and `DAYS` share a bucket and the later-declared `DAYS` comes
+///   first.
+///
+/// The width and the chain direction are what the recorded listings show, and those sets
+/// are small — the two cited above hold six and five values. A type with MORE values than
+/// the table has buckets would make the width observable in a way no recording here pins,
+/// so a listing of one that does not match is a reason to revisit [`ENUM_VALUE_SET_BUCKETS`]
+/// rather than to add a row somewhere.
+///
+/// The order is computed from the declared values themselves, so it belongs to the
+/// enumerated TYPE and not to a member, an operation or a depth: one type is stated alike
+/// wherever it is carried, and a type the model gains needs no row anywhere. It is the
+/// type's up to the chain order of values that COLLIDE, which follows the order they were
+/// declared in, so a model revision that reorders a type's declaration moves the stated
+/// set only where two of its values share a bucket. The CLAUSE stays the framework's: this
+/// only re-orders what goes into it, so the member path, the echoed value and the
+/// requirement's wording keep coming from the one place that writes them. A service wires
+/// this in for EVERY enum of its model rather than for a table of them.
+///
+/// THE HOME for this order: `service-com-amazonaws-acmpca-acmprivateca`,
+/// `service-com-amazonaws-databrew-awsgluedatabrew` and
+/// `service-com-amazonaws-partnercentralaccount-partnercentralaccount` each carry the same
+/// derivation privately, written before this module had one, and are to be migrated onto
+/// this function rather than copied again.
+#[must_use]
+pub fn in_hashed_enum_order(violation: &Violation) -> Violation {
+    let ViolationKind::EnumValue(declared) = &violation.kind else {
+        return violation.clone();
+    };
+    Violation {
+        path: violation.path.clone(),
+        kind: ViolationKind::EnumValue(
+            hashed_enum_order(declared)
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        ),
+        value: violation.value.clone(),
+        sensitive: violation.sensitive,
+    }
+}
+
+/// How wide the table [`in_hashed_enum_order`] walks is, and so the modulus a value's
+/// bucket is taken at.
+pub const ENUM_VALUE_SET_BUCKETS: u32 = 32;
+
+/// `declared` — an enumerated type's admissible values, in the order they reached the
+/// clause — in the order [`in_hashed_enum_order`] states them, for a caller holding the
+/// values rather than a [`Violation`].
+#[must_use]
+pub fn hashed_enum_order<S: AsRef<str>>(declared: &[S]) -> Vec<&str> {
+    // The given order reversed FIRST, so the stable sort below leaves two values that
+    // share a bucket in that reverse order: the chain is read from the head each value was
+    // pushed onto.
+    let mut stated: Vec<&str> = declared.iter().rev().map(AsRef::as_ref).collect();
+    stated.sort_by_key(|value| enum_value_bucket(value));
+    stated
+}
+
+/// Which bucket of the table `value` sits in: its 31-based string hash — the hash so far
+/// multiplied by 31 plus the next UTF-16 code unit, wrapping at 32 bits — reduced to the
+/// table's width.
+///
+/// The hash is a fold over values a MODEL declares; it reads nothing a caller sent and is
+/// not a digest, so it decides a listing order and nothing else.
+#[must_use]
+pub fn enum_value_bucket(value: &str) -> u32 {
+    value.encode_utf16().fold(0u32, |hash, unit| {
+        hash.wrapping_mul(31).wrapping_add(u32::from(unit))
+    }) % ENUM_VALUE_SET_BUCKETS
 }
 
 /// The violations of ONE refusal in the order a front door states them that reports a
@@ -1742,15 +1835,16 @@ mod tests {
         api_parameter_path, aws_validation_refusal, aws_validation_refusal_over_elements,
         aws_validation_refusal_over_elements_stating_withholding, aws_validation_refusal_with,
         aws_validation_refusal_withholding, aws_validation_refusal_withholding_violations,
-        aws_validation_refusal_withholding_with, element_set_requirement, enum_value_not_found,
-        envelope_over, float_value_text, in_float_value_rendering, in_pattern_first_order,
-        in_stated_enum_order, map_key_refusal, map_key_refusal_quoting, must_be_at_least,
-        must_be_at_most, must_be_one_of, must_match_pattern, parameter_pattern_mismatch,
-        parameter_pattern_refusal, parameter_value_mismatch, parameters_value_mismatch,
-        pattern_constraint_report, pattern_mismatch, pattern_requirement_unstated,
-        property_count_refusal, quoting_the_submitted_collection,
-        quoting_the_whole_submitted_value, requirement, stated_enum_value_set, string_too_long,
-        string_too_short, StatedEnumValueSets,
+        aws_validation_refusal_withholding_with, element_set_requirement, enum_value_bucket,
+        enum_value_not_found,
+        envelope_over, float_value_text, hashed_enum_order, in_float_value_rendering,
+        in_hashed_enum_order, in_pattern_first_order, in_stated_enum_order, map_key_refusal,
+        map_key_refusal_quoting, must_be_at_least, must_be_at_most, must_be_one_of,
+        must_match_pattern, parameter_pattern_mismatch, parameter_pattern_refusal,
+        parameter_value_mismatch, parameters_value_mismatch, pattern_constraint_report,
+        pattern_mismatch, pattern_requirement_unstated, property_count_refusal,
+        quoting_the_submitted_collection, quoting_the_whole_submitted_value, requirement,
+        stated_enum_value_set, string_too_long, string_too_short, StatedEnumValueSets,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
@@ -3044,6 +3138,118 @@ mod tests {
         assert_eq!(
             stated, expected,
             "each clause must state its own enum's set, got {stated:?}"
+        );
+    }
+
+    /// RULE: a front door that holds an enumerated type's admissible values in a hash
+    /// table keyed on each value's own text states them in the order that table is walked
+    /// — ascending bucket, a shared bucket read from the head each value was pushed onto —
+    /// which belongs to the TYPE and so does not depend on the order the values reached
+    /// the clause in, nor on the member, operation or depth that carried the bad value.
+    #[test]
+    fn a_hashed_value_set_is_stated_in_the_order_its_table_is_walked() {
+        // (case, the values as declared, the order the table is walked in). The first row
+        // is a set a refusal is known to state: `ProcessorType` of
+        // `com.amazonaws.firehose` (`smithy_query(query="shape", shape="ProcessorType")`),
+        // whose six values fall in six distinct buckets.
+        let rows: &[(&str, &[&str], &[&str])] = &[
+            (
+                "six values in six buckets",
+                &[
+                    "RecordDeAggregation",
+                    "Decompression",
+                    "CloudWatchLogProcessing",
+                    "Lambda",
+                    "MetadataExtraction",
+                    "AppendDelimiterToRecord",
+                ],
+                &[
+                    "Decompression",
+                    "Lambda",
+                    "RecordDeAggregation",
+                    "MetadataExtraction",
+                    "AppendDelimiterToRecord",
+                    "CloudWatchLogProcessing",
+                ],
+            ),
+            // Two values of ONE bucket: the chain is read from its head, so the later of
+            // the two is stated first. This row is a set a recorded refusal shows a
+            // collision in: `com.amazonaws.acm-pca#ValidityPeriodType`, where `ABSOLUTE`
+            // and `DAYS` share a bucket and the later-declared `DAYS` is stated first.
+            (
+                "a declared set with a collision",
+                &["END_DATE", "ABSOLUTE", "DAYS", "MONTHS", "YEARS"],
+                &["END_DATE", "MONTHS", "YEARS", "DAYS", "ABSOLUTE"],
+            ),
+            // Two values of ONE bucket: the chain is read from its head, so the later of
+            // the two is stated first. `RoleArn` and `Delimiter` are both values of
+            // `com.amazonaws.firehose#ProcessorParameterName` and their hashes agree in
+            // the low bits.
+            (
+                "two values sharing a bucket",
+                &["RoleArn", "Delimiter"],
+                &["Delimiter", "RoleArn"],
+            ),
+            (
+                "the same two, declared the other way round",
+                &["Delimiter", "RoleArn"],
+                &["RoleArn", "Delimiter"],
+            ),
+            ("one value", &["GZIP"], &["GZIP"]),
+            ("no values at all", &[], &[]),
+        ];
+
+        assert_eq!(
+            enum_value_bucket("RoleArn"),
+            enum_value_bucket("Delimiter"),
+            "the collision rows need two values of ONE bucket, got {} and {}",
+            enum_value_bucket("RoleArn"),
+            enum_value_bucket("Delimiter")
+        );
+
+        for (case, declared, expected) in rows {
+            let actual = hashed_enum_order(declared);
+            assert_eq!(
+                actual,
+                expected.to_vec(),
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+
+            // A set is RE-ORDERED, never changed.
+            let mut sorted_actual = actual.clone();
+            sorted_actual.sort_unstable();
+            let mut sorted_declared = declared.to_vec();
+            sorted_declared.sort_unstable();
+            assert_eq!(
+                sorted_actual, sorted_declared,
+                "case {case:?}: the stated set is the declared one re-ordered, got {actual:?}"
+            );
+
+            // On the violation: only the values move, and the clause is the framework's.
+            let values: Vec<String> = declared.iter().map(|v| (*v).to_owned()).collect();
+            let reported = violation("processorType", ViolationKind::EnumValue(values), "nope");
+            let restated = in_hashed_enum_order(&reported);
+            assert_eq!(
+                restated.kind,
+                ViolationKind::EnumValue(
+                    expected.iter().map(|v| (*v).to_owned()).collect()
+                ),
+                "case {case:?}: wrong value set on the violation, got {:?}",
+                restated.kind
+            );
+            assert_eq!(
+                (restated.path.as_str(), restated.value.as_deref()),
+                ("processorType", Some("nope")),
+                "case {case:?}: nothing but the value set may move"
+            );
+        }
+
+        // Every other violation kind is returned unchanged.
+        let other = violation("name", ViolationKind::MinLength(1), "");
+        assert_eq!(
+            in_hashed_enum_order(&other).message(),
+            other.message(),
+            "a violation that is not an enum value set must be left alone"
         );
     }
 

@@ -55,6 +55,8 @@ mod destination_update;
 mod direct_put_source_gate;
 #[path = "all/encryption_conflict_messages.rs"]
 mod encryption_conflict_messages;
+#[path = "all/enum_value_set_order.rs"]
+mod enum_value_set_order;
 #[path = "all/error_output_prefix_resolution.rs"]
 mod error_output_prefix_resolution;
 #[path = "all/http_endpoint_delivery.rs"]

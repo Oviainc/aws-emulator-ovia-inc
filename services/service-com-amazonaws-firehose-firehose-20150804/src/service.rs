@@ -29,7 +29,9 @@
 //!   `@pattern` is reported as the expression a value must satisfy rather than as the
 //!   model's anchored string (see `constraint_clause` / `reported_pattern`), and a value
 //!   submitted as an element of a list of constrained strings is reported against the list
-//!   with that element's whole constraint set.
+//!   with that element's whole constraint set, and an enumerated type's value set is
+//!   listed in the order the table it is held in is walked
+//!   (`service_common::validation_message::in_hashed_enum_order`).
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -50,6 +52,11 @@
 //! request boundary cannot enforce (`check_tag_keys` / `check_tag_key_list` /
 //! `check_bucket_arns`), so a handler judging one refuses in the words the boundary would
 //! have used.
+//!
+//! WHICH of the shared stated value-set orders this service takes, and the evidence for
+//! it, is `enum_value_sets`.
+
+mod enum_value_sets;
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
@@ -96,6 +103,13 @@ const INVALID_ROLE_ARN: &str = "Invalid role ARN.";
 /// rather than invent a sentence for it ([`ViolationKind`] is `#[non_exhaustive]`, so a
 /// class can be added upstream).
 fn constraint_clause(violation: &Violation) -> Option<String> {
+    // An enumerated type's admissible values are stated in the order the table they are
+    // held in is walked rather than in the order the schema presented them, so the
+    // violation is re-ordered before its requirement is worded
+    // (`service_common::validation_message::in_hashed_enum_order`). Only the values move:
+    // the member path, the subject and the requirement's wording are built below either
+    // way, and every other violation class comes back untouched.
+    let violation = &::service_common::validation_message::in_hashed_enum_order(violation);
     let requirement = constraint_requirement(&violation.kind)?;
     // A value submitted as an ELEMENT of a list of constrained strings has no member name
     // of its own, so it is reported against the LIST it was submitted in, and with that
