@@ -6,8 +6,9 @@
 //! of `AssociateSubnets` over the same mapping set — and re-mints the firewall's
 //! `UpdateToken` when the mapping set changed, so a following `DescribeFirewall`
 //! reports the remainder. A stale `UpdateToken` is refused with
-//! `InvalidTokenException`, and a firewall carrying `SubnetChangeProtection` with
-//! `InvalidOperationException`.
+//! `InvalidTokenException`, a firewall carrying `SubnetChangeProtection` with
+//! `InvalidOperationException`, and a request that would leave the firewall with
+//! no subnet mapping at all with `InvalidRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -294,6 +295,14 @@ fn disassociate_breach_error(
                     "Subnet is specified more than once",
                     &subnet_id,
                 )),
+            })
+        }
+        // A firewall filters through the endpoints its subnet mappings are, so a
+        // request that would remove every one of them is a bad request and the
+        // mappings are left intact (see `state::last_mapping_message`).
+        Breach::LastMapping(subnet_ids) => {
+            DisassociateSubnetsErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(crate::state::last_mapping_message(&subnet_ids)),
             })
         }
         // Removing subnets only shrinks the mapping set, so no disassociation is

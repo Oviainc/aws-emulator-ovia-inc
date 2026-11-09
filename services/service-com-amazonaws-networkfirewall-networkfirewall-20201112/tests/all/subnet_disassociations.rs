@@ -112,8 +112,10 @@ struct DisassociateCase {
 ///
 /// The rows vary what the rule generalises over: how many subnets are named, how
 /// many of them the firewall carries, whether the request names a strict subset,
-/// the whole set, a superset, or nothing the firewall carries at all, and in
-/// which order the subnets are named.
+/// every mapping but one, a superset, or nothing the firewall carries at all, and
+/// in which order the subnets are named. A request naming the WHOLE set would
+/// leave the firewall with no endpoint, which is refused rather than served
+/// (`subnet_mapping_minimum`).
 #[tokio::test]
 async fn disassociate_subnets_removes_the_named_subnets_from_the_mapping_set() {
     let cases = [
@@ -130,10 +132,10 @@ async fn disassociate_subnets_removes_the_named_subnets_from_the_mapping_set() {
             expected: &["subnet-1b", "subnet-1d"],
         },
         DisassociateCase {
-            firewall_name: "disassoc-every-subnet",
-            initial: &["subnet-2a", "subnet-2b"],
-            requested: &["subnet-2a", "subnet-2b"],
-            expected: &[],
+            firewall_name: "disassoc-every-subnet-but-one",
+            initial: &["subnet-2a", "subnet-2b", "subnet-2c"],
+            requested: &["subnet-2c", "subnet-2b"],
+            expected: &["subnet-2a"],
         },
         DisassociateCase {
             firewall_name: "disassoc-partial-overlap",

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFirewallPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFirewallPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFirewallPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replaces the stored `FirewallPolicyRecord`'s policy document — and
+//! its description and encryption settings when the request carries them — after
+//! the same document checks the create runs, so a reference the caller dropped
+//! stops counting towards the rule group's `NumberOfAssociations` and one it added
+//! starts counting. The required `UpdateToken` must be the one the policy carries
+//! (`InvalidTokenException` otherwise), and `DryRun` checks the request without
+//! storing anything.
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +195,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFirewallPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFirewallPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFirewallPolicy"))
+        // An update mints no ARN, so it reads nothing off the request's credential
+        // scope: the policy it edits is the one already stored.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFirewallPolicyErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the firewall policy store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // "You must specify the ARN or the name, and you can specify both", so
+        // the policy this call edits is identified exactly the way every other
+        // firewall-policy operation identifies one.
+        let key = state
+            .resolve_firewall_policy(
+                input.firewall_policy_name.as_deref(),
+                input.firewall_policy_arn.as_deref(),
+            )
+            .map_err(update_lookup_error)?;
+
+        // The same two checks the create runs on a submitted document, in the
+        // same order, because the document is the same thing: what this emulator
+        // will retain of it, and then whether every rule group it references
+        // exists and is of the kind its reference list is for. Both run for a dry
+        // run too — checking "whether the request can run successfully" is what a
+        // caller pre-flights a swapped reference with — and both run before the
+        // record is touched, so a refused update leaves the stored policy as it
+        // was.
+        if let Some(breach) = crate::state::policy_document_breach(&input.firewall_policy) {
+            // This operation's model declares no limit error, so a document
+            // past what this emulator retains is refused as the bad request it
+            // is: `InvalidRequestException` covers "an unsupported parameter
+            // name or value".
+            return Err(UpdateFirewallPolicyErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(breach),
+                },
+            )
+            .into());
+        }
+        if let Some(breach) = state.policy_reference_breach(&input.firewall_policy) {
+            return Err(UpdateFirewallPolicyErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(breach),
+                },
+            )
+            .into());
+        }
+
+        let Some(record) = state.firewall_policies.get_mut(&key) else {
+            return Err(
+                UpdateFirewallPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `UpdateToken` is required here: the token "marks the state of the
+        // firewall policy resource at the time of the request", so an update is
+        // always conditional on the caller having read the policy it is editing,
+        // and one holding a stale token is refused rather than overwriting the
+        // change it never saw.
+        if input.update_token != record.update_token {
+            return Err(UpdateFirewallPolicyErrorModeled::InvalidTokenException(
+                InvalidTokenException {
+                    message: Some(crate::state::INVALID_TOKEN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The document the request carries REPLACES the stored one, which is what
+        // makes the documented edit cycle — retrieve the policy, change it, send
+        // it back — mean what it says: a reference the caller dropped is gone, so
+        // the rule group it named is no longer used by this policy. The two
+        // optional members replace what was stored only when the request carries
+        // them.
+        let mut updated = record.clone();
+        updated.policy = input.firewall_policy;
+        if input.description.is_some() {
+            updated.description = input.description;
+        }
+        if input.encryption_configuration.is_some() {
+            updated.encryption_configuration = Some(
+                crate::state::effective_encryption_configuration(input.encryption_configuration),
+            );
+        }
+        updated.update_token = crate::state::new_uuid();
+        updated.last_modified_time = ::std::time::SystemTime::now();
+
+        // `DryRun` asks the service to "check whether the request can run
+        // successfully, but doesn't actually make the requested changes": every
+        // refusal above has already run, and nothing is stored — so the response
+        // reports the policy the update WOULD have left behind, with the token it
+        // would have minted.
+        if !input.dry_run {
+            *record = updated.clone();
+        }
+
+        let consumed = state.consumed_policy_capacity(&updated.policy);
+        Ok(UpdateFirewallPolicyOutput {
+            update_token: updated.update_token.clone(),
+            firewall_policy_response: updated.to_response(consumed),
+        })
     }
 }
+
+crate::state::impl_resolve_error!(
+    update_lookup_error -> UpdateFirewallPolicyError, UpdateFirewallPolicyErrorModeled,
+    name_member = "FirewallPolicyName", arn_member = "FirewallPolicyArn"
+);

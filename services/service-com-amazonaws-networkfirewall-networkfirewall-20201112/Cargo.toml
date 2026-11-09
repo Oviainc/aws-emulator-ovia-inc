@@ -32,6 +32,12 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex codec for those ids' digits, so nothing here hand-writes one.
 hex = { workspace = true }
+# The Amazon S3 client `UpdateLoggingConfiguration` resolves an S3 log destination
+# through, over the emulator's in-process callback: attaching log delivery to a
+# bucket is a change to THAT bucket's policy, so whether the caller may make it is
+# a question only the service owning the bucket can answer
+# (`state::log_destinations`).
+aws-sdk-s3 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -41,6 +47,14 @@ emulator-core-build-support = { workspace = true }
 # firewall provisioning span with `tokio::time::sleep`. Test-only, so it does not
 # widen the shipped crate's feature set.
 tokio = { workspace = true, features = ["time"] }
+# The logging-configuration suite mounts Amazon S3 beside Network Firewall on one
+# engine, because the bucket an S3 log destination names is ITS resource: the suite
+# creates the bucket and puts the policy on it there, and configures logging here.
+# A workspace member this repository already locks.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The AWS SDK for Amazon S3, which that suite drives the bucket and its policy
+# through — the same client the handler resolves a destination with.
+aws-sdk-s3 = { version = "1", default-features = false }
 
 [lints]
 workspace = true

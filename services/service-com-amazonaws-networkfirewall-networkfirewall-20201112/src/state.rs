@@ -12,10 +12,12 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Address, AnalysisResult, Attachment, EncryptionConfiguration, Firewall, FirewallMetadata,
     FirewallPolicy, FirewallPolicyMetadata, FirewallPolicyResponse, FirewallStatus, FlowFilter,
-    FlowOperation, FlowOperationMetadata, MatchAttributes, PerObjectStatus, PortRange, RuleGroup,
-    RuleGroupMetadata, RuleGroupResponse, SourceMetadata, SubnetMapping, SummaryConfiguration,
-    SyncState, Tag,
+    FlowOperation, FlowOperationMetadata, LogDestinationConfig, LoggingConfiguration,
+    MatchAttributes, PerObjectStatus, PortRange, RuleGroup, RuleGroupMetadata, RuleGroupResponse,
+    SourceMetadata, SubnetMapping, SummaryConfiguration, SyncState, Tag,
 };
+
+pub mod log_destinations;
 
 /// The ARN namespace (and SigV4 signing name) this service's ARNs carry, from the
 /// model's `aws.api#service` trait: `arnNamespace: network-firewall`
@@ -261,6 +263,29 @@ pub fn policy_document_breach(policy: &FirewallPolicy) -> Option<String> {
                  {MAX_POLICY_LIST_ENTRIES} are allowed."
             )
         })
+}
+
+/// How many `LogDestinationConfigs` entries one logging configuration may carry.
+///
+/// CHOSEN, not an AWS quota: the model puts NO length constraint on the list, and
+/// every entry is both retained on the firewall's record and resolved against the
+/// service that owns its destination
+/// ([`log_destinations::attachment_refused`]) — so without a ceiling one request
+/// could make a single retained record arbitrarily large and ask the destination
+/// owners arbitrarily many questions. It is far above any firewall's logging:
+/// `LogType` has three members, and each can be sent to each of the three
+/// `LogDestinationType` members. A request past it is refused as the bad request
+/// it is, since the update models no limit error.
+pub const MAX_LOG_DESTINATION_CONFIGS: usize = 16;
+
+/// What a logging configuration past [`MAX_LOG_DESTINATION_CONFIGS`] is refused
+/// with, naming the member, how many entries it carried and how many are allowed
+/// — the same shape [`policy_document_breach`] states its own ceiling in.
+pub fn too_many_log_destinations_message(found: usize) -> String {
+    format!(
+        "LoggingConfiguration.LogDestinationConfigs has {found} entries; at most \
+         {MAX_LOG_DESTINATION_CONFIGS} are allowed."
+    )
 }
 
 /// How many resource policies this emulator keeps.
@@ -1468,6 +1493,10 @@ pub enum SubnetAssociationBreach {
     RepeatedSubnet(String),
     /// The change would need more Availability Zones than one firewall spans.
     ZoneCapacity,
+    /// The change would remove every mapping the firewall has left, leaving it
+    /// with no firewall endpoint at all; the subnets it names are carried so the
+    /// refusal can report them.
+    LastMapping(Vec<String>),
 }
 
 /// What a change one of a firewall's change-protection settings blocks is
@@ -1506,6 +1535,31 @@ pub const FIREWALL_POLICY_CHANGE_PROTECTION_MEMBER: &str = "FirewallPolicyChange
 /// What a subnet-association change naming no subnet is refused with: the
 /// request asks for no association at all, which no mapping can satisfy.
 pub const NO_SUBNETS_MESSAGE: &str = "Specify at least one subnet.";
+
+/// What a subnet disassociation that would empty a firewall's mapping set is
+/// refused with, naming the subnets it would have removed.
+///
+/// `AssociateSubnets` is documented "This request creates an Network Firewall
+/// firewall endpoint in each of the subnets", and `Firewall$SubnetMappings` is
+/// "the public subnets that Network Firewall is using for the firewall. Each
+/// subnet must belong to a different Availability Zone" — a firewall's endpoints
+/// ARE its subnet mappings, so a firewall left with none would filter nothing,
+/// and the removal is refused instead (`InvalidRequestException`, client,
+/// HTTP 400).
+///
+/// The model does not fix the text, so the wording is the recorded one, and it
+/// takes this service's one request-derived shape ([`parameter_message`]): a
+/// fixed sentence naming the invariant, then the subnets the request asked to
+/// remove in parameter brackets — which is what a caller has to drop from its
+/// request in order to keep the firewall reachable. Several ids are listed in
+/// the order the request gave them.
+pub fn last_mapping_message(subnet_ids: &[String]) -> String {
+    parameter_message(
+        "availability zone subnet(s) cannot be removed as firewall must have at least one subnet \
+         mapping",
+        &subnet_ids.join(", "),
+    )
+}
 
 /// What a subnet-association change past [`MAX_AVAILABILITY_ZONES`] is refused
 /// with: `AssociateSubnets` is documented "You can specify one subnet for each
@@ -1567,6 +1621,17 @@ pub struct FirewallRecord {
     /// is held inside that firewall's record and deleting the firewall drops its
     /// flow operations with it.
     pub flow_operations: HashMap<String, FlowOperationRecord>,
+    /// `LoggingConfiguration.LogDestinationConfigs`, in the order the last
+    /// accepted `UpdateLoggingConfiguration` gave them.
+    ///
+    /// A firewall nobody configured logging on carries none, which is logging
+    /// disabled: "if you omit this setting, Network Firewall disables logging for
+    /// the firewall" (`UpdateLoggingConfigurationRequest$LoggingConfiguration`).
+    pub log_destination_configs: Vec<LogDestinationConfig>,
+    /// `EnableMonitoringDashboard`: "a boolean that reflects whether or not the
+    /// firewall monitoring dashboard is enabled on a firewall", which is off
+    /// until a call enables it.
+    pub monitoring_dashboard_enabled: bool,
 }
 
 impl FirewallRecord {
@@ -1702,6 +1767,11 @@ impl FirewallRecord {
     /// this call removes are gone from every projection of the record, so no
     /// reader is shown an endpoint for a subnet the firewall no longer carries.
     ///
+    /// What it cannot do is leave the firewall with NO mapping: a firewall
+    /// filters through the endpoints its mappings are, so a request that would
+    /// remove every one of them is refused
+    /// ([`SubnetAssociationBreach::LastMapping`]).
+    ///
     /// Nothing is written on a refusal: every check runs before the first
     /// mutation.
     pub fn disassociate_subnets(
@@ -1721,12 +1791,26 @@ impl FirewallRecord {
             }
         }
 
-        let detached: Vec<String> = self
+        // The subnets this call takes out of the mapping set, in the order the
+        // REQUEST named them: a refusal reports them back as the caller sent
+        // them, and the success path only asks whether there were any.
+        let carried: HashSet<&str> = self
             .subnet_mappings
             .iter()
-            .filter(|mapping| named.contains(mapping.subnet_id.as_str()))
-            .map(|mapping| mapping.subnet_id.clone())
+            .map(|mapping| mapping.subnet_id.as_str())
             .collect();
+        let detached: Vec<String> = requested
+            .iter()
+            .filter(|subnet_id| carried.contains(subnet_id.as_str()))
+            .cloned()
+            .collect();
+        // A firewall's endpoints are its subnet mappings, so a request that would
+        // leave it with none is refused and nothing is removed (see
+        // [`last_mapping_message`]). A request naming subnets this firewall does
+        // not carry removes none of its mappings, so it cannot empty the set.
+        if !self.subnet_mappings.is_empty() && self.subnet_mappings.len() == detached.len() {
+            return Err(SubnetAssociationBreach::LastMapping(detached));
+        }
         self.subnet_mappings
             .retain(|mapping| !named.contains(mapping.subnet_id.as_str()));
         self.sync_states
@@ -1798,6 +1882,20 @@ impl FirewallRecord {
             firewall_name: Some(self.firewall_name.clone()),
             firewall_arn: Some(self.firewall_arn.clone()),
             ..FirewallMetadata::default()
+        }
+    }
+
+    /// The `LoggingConfiguration` this firewall's logging is, as both
+    /// `UpdateLoggingConfiguration` and `DescribeLoggingConfiguration` report it.
+    ///
+    /// `LoggingConfiguration$LogDestinationConfigs` is a required member, so a
+    /// firewall nobody configured logging on reports the configuration with an
+    /// EMPTY list of destinations rather than no configuration: that is what
+    /// "Network Firewall disables logging for the firewall" looks like to a
+    /// reader, and it is the same document a caller edits and sends back.
+    pub fn to_logging_configuration(&self) -> LoggingConfiguration {
+        LoggingConfiguration {
+            log_destination_configs: self.log_destination_configs.clone(),
         }
     }
 }
@@ -1910,8 +2008,6 @@ pub struct RuleGroupRecord {
     pub summary_configuration: Option<SummaryConfiguration>,
     /// A `ResourceStatus` member.
     pub status: String,
-    /// How many firewall policies use this rule group.
-    pub number_of_associations: i32,
     /// The optimistic-locking token; re-minted on every mutation.
     pub update_token: String,
     /// `RuleGroupResponse.LastModifiedTime`.
@@ -1921,10 +2017,17 @@ pub struct RuleGroupRecord {
 impl RuleGroupRecord {
     /// The `RuleGroupResponse` shape for this record.
     ///
+    /// `associations` is how many firewall policies reference this rule group;
+    /// it is read from the firewall-policy store, so it is passed in rather than
+    /// held on the record (see
+    /// [`ComAmazonawsNetworkfirewallNetworkfirewall20201112State::rule_group_associations`]) —
+    /// the same way a policy's consumed capacity is read from the rule-group
+    /// store rather than kept beside it.
+    ///
     /// `AnalysisResults` is left to the caller: the analyzer runs only when the
     /// request sets `AnalyzeRuleGroup`, and its findings are computed from the
     /// rules rather than stored.
-    pub fn to_response(&self) -> RuleGroupResponse {
+    pub fn to_response(&self, associations: i32) -> RuleGroupResponse {
         RuleGroupResponse {
             rule_group_name: self.rule_group_name.clone(),
             rule_group_arn: self.rule_group_arn.clone(),
@@ -1935,7 +2038,7 @@ impl RuleGroupRecord {
             description: self.description.clone(),
             rule_group_status: Some(self.status.clone()),
             tags: self.tags.clone(),
-            number_of_associations: Some(self.number_of_associations),
+            number_of_associations: Some(associations),
             encryption_configuration: self.encryption_configuration.clone(),
             source_metadata: self.source_metadata.clone(),
             summary_configuration: self.summary_configuration.clone(),
@@ -2453,6 +2556,35 @@ impl ComAmazonawsNetworkfirewallNetworkfirewall20201112State {
             }
         }
         consumed
+    }
+
+    /// How many stored firewall policies reference the rule group `rule_group_arn`
+    /// names.
+    ///
+    /// `RuleGroupResponse$NumberOfAssociations` is "the number of firewall
+    /// policies that use this rule group", and a policy uses a rule group by
+    /// naming its ARN in `FirewallPolicy.StatelessRuleGroupReferences` or
+    /// `StatefulRuleGroupReferences` — so the count is READ from the policy
+    /// store rather than kept as a counter beside it: a policy created, updated
+    /// or deleted changes which rule groups it names, and a derived count cannot
+    /// drift from the documents it is derived from.
+    ///
+    /// One policy that somehow named the same rule group twice would still be
+    /// one policy using it, so the referencing policies are counted, not their
+    /// references.
+    ///
+    /// READ ONLY: it reports what the policy writes left behind and changes
+    /// nothing a later caller sees.
+    pub fn rule_group_associations(&self, rule_group_arn: &str) -> i32 {
+        let using = self
+            .firewall_policies
+            .values()
+            .filter(|policy| {
+                policy_rule_group_references(&policy.policy)
+                    .any(|reference| reference == rule_group_arn)
+            })
+            .count();
+        i32::try_from(using).unwrap_or(i32::MAX)
     }
 }
 

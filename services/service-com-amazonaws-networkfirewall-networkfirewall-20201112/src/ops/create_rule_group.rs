@@ -339,12 +339,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source_metadata: input.source_metadata,
             summary_configuration: input.summary_configuration,
             status: crate::state::RESOURCE_ACTIVE.to_string(),
-            number_of_associations: 0,
             update_token: crate::state::new_uuid(),
             last_modified_time: ::std::time::SystemTime::now(),
         };
 
-        let mut rule_group_response = record.to_response();
+        // A rule group a policy references is a rule group that already exists
+        // (`state::policy_reference_breach` refuses a reference to one that does
+        // not), so the rule group this call mints is referenced by nothing yet —
+        // which is what the policy store answers for its ARN.
+        let mut rule_group_response =
+            record.to_response(state.rule_group_associations(&record.rule_group_arn));
         rule_group_response.analysis_results = analysis_results;
         let output = CreateRuleGroupOutput {
             update_token: record.update_token.clone(),

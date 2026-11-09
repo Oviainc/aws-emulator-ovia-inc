@@ -306,6 +306,14 @@ fn associate_breach_error(
                 message: Some(crate::state::too_many_zones_message()),
             })
         }
+        // Associating subnets only grows the mapping set, so no association is
+        // refused for emptying it; the arm carries the same bad-request wording
+        // the disassociation path answers it with.
+        Breach::LastMapping(subnet_ids) => {
+            AssociateSubnetsErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(crate::state::last_mapping_message(&subnet_ids)),
+            })
+        }
     }
     .into()
 }

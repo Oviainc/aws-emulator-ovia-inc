@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLoggingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLoggingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLoggingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores the submitted `LoggingConfiguration` — and the monitoring
+//! dashboard setting — on the stored `FirewallRecord`, so a following
+//! `DescribeLoggingConfiguration` reports it, after resolving each destination the
+//! configuration names against the service that OWNS it
+//! (`crate::state::log_destinations`): a destination whose own policy denies the
+//! caller the permissions attaching log delivery needs is refused with
+//! `LogDestinationPermissionException` and nothing is stored. A configuration the
+//! request omits disables logging for the firewall.
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +187,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLoggingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLoggingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLoggingConfiguration"))
+        // The destination owner is asked in the Region this request was signed
+        // for, the same Region every ARN this service mints is built in.
+        let region = crate::state::request_region(ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateLoggingConfigurationErrorModeled::InternalServerError(InternalServerError {
+                    message: Some("the firewall store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+
+        // "You must specify the ARN or the name, and you can specify both", so
+        // the firewall this call changes is identified exactly the way every
+        // other firewall operation identifies one. The lock is taken only to
+        // resolve it: asking the destination's owner awaits, and no request to
+        // this service may wait behind one that is waiting on another service.
+        let (firewall_arn, firewall_name) = {
+            let mut guard = state.lock();
+            let key = guard
+                .resolve_firewall(input.firewall_name.as_deref(), input.firewall_arn.as_deref())
+                .map_err(update_lookup_error)?;
+            let Some(record) = guard.firewalls.get_mut(&key) else {
+                return Err(not_found());
+            };
+            // The `PROVISIONING` -> `READY` move the clock owed at `ready_at()`
+            // is materialised here too, so every handler that touches the record
+            // sees the same status a reader would, not a stale one.
+            record.settle(::std::time::SystemTime::now());
+            (record.firewall_arn.clone(), record.firewall_name.clone())
+        };
+
+        // "Defines how Network Firewall performs logging for a firewall. If you
+        // omit this setting, Network Firewall disables logging for the firewall"
+        // — an omitted configuration is logging with no destination at all.
+        let submitted = input.logging_configuration.unwrap_or_default();
+        // Bound what one call can make this emulator retain — and how many
+        // destination owners it can make this one request ask — before the first
+        // hop is made.
+        if submitted.log_destination_configs.len() > crate::state::MAX_LOG_DESTINATION_CONFIGS {
+            return Err(invalid_request(
+                &crate::state::too_many_log_destinations_message(
+                    submitted.log_destination_configs.len(),
+                ),
+            ));
+        }
+        for config in &submitted.log_destination_configs {
+            // A destination map that names no destination is a bad request: there
+            // is nothing to send the logs to.
+            if let Some(breach) = crate::state::log_destinations::destination_breach(config) {
+                return Err(invalid_request(&breach));
+            }
+            // Network Firewall attaches log delivery to the destination the
+            // caller named, which for an Amazon S3 bucket is a change to that
+            // bucket's own policy — so a destination whose policy denies the
+            // caller the permissions that attachment needs is one no logs can be
+            // sent to (`LogDestinationPermissionException`).
+            if let Some(destination) = crate::state::log_destinations::attachment_refused(
+                ctx,
+                &region,
+                &firewall_arn,
+                config,
+            )
+            .await
+            {
+                return Err(
+                    UpdateLoggingConfigurationErrorModeled::LogDestinationPermissionException(
+                        LogDestinationPermissionException {
+                            message: Some(
+                                crate::state::log_destinations::destination_permission_message(
+                                    &destination,
+                                ),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Every check has run, so the configuration is stored: the firewall is
+        // re-resolved because the lock was released for the hop above, and a
+        // firewall deleted in the meantime is no longer there to configure.
+        let mut guard = state.lock();
+        let Some(record) = guard.firewalls.get_mut(&firewall_name) else {
+            return Err(not_found());
+        };
+        record.log_destination_configs = submitted.log_destination_configs;
+        // "A boolean that lets you enable or disable the detailed firewall
+        // monitoring dashboard on the firewall" — a request that names no
+        // preference leaves the setting as the last write left it.
+        if let Some(enabled) = input.enable_monitoring_dashboard {
+            record.monitoring_dashboard_enabled = enabled;
+        }
+
+        Ok(UpdateLoggingConfigurationOutput {
+            firewall_arn: Some(record.firewall_arn.clone()),
+            firewall_name: Some(record.firewall_name.clone()),
+            logging_configuration: Some(record.to_logging_configuration()),
+            enable_monitoring_dashboard: Some(record.monitoring_dashboard_enabled),
+        })
     }
 }
+
+/// Refuse a request this operation models `InvalidRequestException` for: "The
+/// operation failed because of a problem with your request."
+fn invalid_request(message: &str) -> UpdateLoggingConfigurationError {
+    UpdateLoggingConfigurationErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// Refuse a request whose firewall is not stored, with the one constant every
+/// `ResourceNotFoundException` this service answers carries.
+fn not_found() -> UpdateLoggingConfigurationError {
+    UpdateLoggingConfigurationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+crate::state::impl_resolve_error!(
+    update_lookup_error -> UpdateLoggingConfigurationError,
+    UpdateLoggingConfigurationErrorModeled,
+    name_member = "FirewallName", arn_member = "FirewallArn"
+);

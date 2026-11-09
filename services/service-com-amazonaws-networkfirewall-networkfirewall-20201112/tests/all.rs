@@ -25,6 +25,8 @@ mod firewall_protection_settings;
 mod flow_operations;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/logging_configuration.rs"]
+mod logging_configuration;
 #[path = "all/reference_validation.rs"]
 mod reference_validation;
 #[path = "all/refusal_message_shapes.rs"]
@@ -45,6 +47,8 @@ mod rule_group_lifecycle;
 mod rule_group_listing;
 #[path = "all/rule_group_mutations.rs"]
 mod rule_group_mutations;
+#[path = "all/rule_group_policy_associations.rs"]
+mod rule_group_policy_associations;
 #[path = "all/rule_group_response_members.rs"]
 mod rule_group_response_members;
 #[path = "all/state_roundtrip.rs"]
@@ -53,5 +57,7 @@ mod state_roundtrip;
 mod subnet_associations;
 #[path = "all/subnet_disassociations.rs"]
 mod subnet_disassociations;
+#[path = "all/subnet_mapping_minimum.rs"]
+mod subnet_mapping_minimum;
 #[path = "all/validation_refusal_wording.rs"]
 mod validation_refusal_wording;

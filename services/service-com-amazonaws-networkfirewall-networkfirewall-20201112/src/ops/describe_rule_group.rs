@@ -201,12 +201,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
+        // `NumberOfAssociations` is "the number of firewall policies that use
+        // this rule group", which is a fact about the POLICY store, so it is read
+        // out of it here while the lock is still held.
+        let associations = state.rule_group_associations(&record.rule_group_arn);
         // Everything below reads the record this request took a copy of, so the lock
         // is released before the response — and before the analyzer — is built: a read
         // never holds the store while it works.
         drop(state);
 
-        let mut rule_group_response = record.to_response();
+        let mut rule_group_response = record.to_response(associations);
         // The analyzer runs on request and reports on stateless rule groups only, so a
         // stateful rule group has no findings to report rather than an empty list. It
         // reads the rules and writes nothing: a describe leaves the rule group exactly

@@ -29,11 +29,46 @@ pub struct Harness {
 impl Harness {
     /// Stand up the router with this service mounted on a fresh engine.
     pub fn new() -> Self {
+        Self::mounting(false)
+    }
+
+    /// Stand up the router with this service AND Amazon S3 mounted on the SAME
+    /// engine, exactly as the assembled emulator mounts them.
+    ///
+    /// The bucket an S3 log destination names is a resource of THAT service, and
+    /// what its policy permits is a fact only it can answer, so a suite about
+    /// those destinations needs one to reach; [`Harness::new`] deliberately
+    /// leaves it unmounted, which is the "Amazon S3 said nothing" case.
+    pub fn with_s3() -> Self {
+        Self::mounting(true)
+    }
+
+    /// Stand up the router, with Amazon S3 beside this service when `s3` says so.
+    fn mounting(s3: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        if s3 {
+            router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+                Arc::clone(&engine),
+            ));
+        }
         Self { router }
+    }
+
+    /// A handle to this emulator for driving it through an AWS SDK client: the
+    /// same in-process seam a handler reaches another mounted service through.
+    pub fn callback(&self) -> smithy_server_runtime::EmbeddedEmulator {
+        smithy_server_runtime::EmbeddedEmulator::from_router(self.router.clone())
+    }
+
+    /// An Amazon S3 client for [`REGION`] over this emulator's own in-process
+    /// callback — the very seam, and the very client construction
+    /// ([`service_common::s3_client::s3_client`]), the handlers resolve a log
+    /// destination through.
+    pub fn s3(&self) -> ::aws_sdk_s3::Client {
+        ::service_common::s3_client::s3_client(&self.callback(), REGION)
     }
 
     /// Send one operation and return its HTTP status and parsed JSON body.

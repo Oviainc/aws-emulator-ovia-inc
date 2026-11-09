@@ -411,6 +411,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             update_token: crate::state::new_uuid(),
             provisioning_since: now,
             flow_operations: ::std::collections::HashMap::new(),
+            // "If you omit this setting, Network Firewall disables logging for
+            // the firewall" — a firewall nobody has configured logging on sends
+            // its logs nowhere, and its monitoring dashboard is off until a call
+            // enables it (`UpdateLoggingConfiguration`).
+            log_destination_configs: ::std::vec::Vec::new(),
+            monitoring_dashboard_enabled: false,
         };
 
         let output = CreateFirewallOutput {

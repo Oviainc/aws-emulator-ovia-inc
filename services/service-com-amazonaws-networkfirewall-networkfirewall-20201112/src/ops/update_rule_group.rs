@@ -331,7 +331,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut output = UpdateRuleGroupOutput {
             update_token: record.update_token.clone(),
-            rule_group_response: record.to_response(),
+            // An update edits the rule group's own document, not the policies
+            // that reference it, so the count comes from the policy store as it
+            // stands (`state::rule_group_associations`).
+            rule_group_response: record
+                .to_response(state.rule_group_associations(&record.rule_group_arn)),
         };
         let analyzed = (input.analyze_rule_group
             && record.rule_group_type == crate::state::RULE_GROUP_STATELESS)

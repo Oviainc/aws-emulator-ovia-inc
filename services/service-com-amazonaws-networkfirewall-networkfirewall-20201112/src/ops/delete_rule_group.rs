@@ -180,11 +180,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // valid. For example, you might have tried to delete a rule group or
         // firewall policy that's in use", so a rule group a firewall policy still
         // references is refused — the same guard `DeleteFirewallPolicy` applies to a
-        // policy a firewall still uses, reading the record's own association count.
+        // policy a firewall still uses, over the count the policy store itself
+        // yields (`state::rule_group_associations`).
         let associations = state
             .rule_groups
             .get(&key)
-            .map_or(0, |record| record.number_of_associations);
+            .map_or(0, |record| state.rule_group_associations(&record.rule_group_arn));
         if associations > 0 {
             return Err(DeleteRuleGroupErrorModeled::InvalidOperationException(
                 InvalidOperationException {
@@ -225,7 +226,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.tags = crate::state::removed_resource_tags(record.tags.take());
 
         Ok(DeleteRuleGroupOutput {
-            rule_group_response: record.to_response(),
+            // Every reference to this rule group had to be gone for the delete to
+            // be accepted at all, so the removed rule group reports the count the
+            // guard above read: no firewall policy uses it.
+            rule_group_response: record.to_response(associations),
         })
     }
 }
