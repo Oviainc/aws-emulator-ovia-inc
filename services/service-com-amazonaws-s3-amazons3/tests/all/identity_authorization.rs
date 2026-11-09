@@ -74,7 +74,11 @@ const INVALID_PRINCIPAL: &str = "Invalid principal in policy";
 /// A router serving S3 beside IAM over ONE shared engine, which is what lets a request
 /// signed with a key `iam:CreateAccessKey` vended be judged on the policies
 /// `iam:PutUserPolicy` wrote.
-fn router() -> MultiServiceRouter {
+///
+/// `pub(crate)`, like the three helpers below it ([`user_with_grant`], [`s3`], [`user_arn`]):
+/// the suite that pins the identity-OR-resource UNION ([`super::object_read_policy_union`])
+/// drives its callers through this one harness rather than standing up a second one.
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Neither the key id nor the signature is a credential here: the suite turns request
@@ -135,7 +139,7 @@ fn element(body: &str, tag: &str) -> String {
 /// An IAM user carrying exactly the inline policy `actions` on `resources` describes, and the
 /// access key id a request speaks for it with. `actions` empty leaves the user with no policy
 /// at all, which is the position every unprivileged principal is in.
-async fn user_with_grant(
+pub(crate) async fn user_with_grant(
     router: &MultiServiceRouter,
     name: &str,
     actions: &[&str],
@@ -186,7 +190,7 @@ fn json_strings(values: &[&str]) -> String {
 }
 
 /// One S3 request, presented as signed by `akid` when one is given.
-async fn s3(
+pub(crate) async fn s3(
     router: &MultiServiceRouter,
     akid: Option<&str>,
     method: &str,
@@ -230,14 +234,18 @@ fn bucket_resources(bucket: &str) -> Vec<String> {
 }
 
 /// The ARN of the IAM user `name` of this account, the spelling a policy names it by.
-fn user_arn(name: &str) -> String {
+pub(crate) fn user_arn(name: &str) -> String {
     format!("arn:aws:iam::{}:user/{name}", engine::emulator_account_id())
 }
 
 /// The sentence S3 refuses a request no document in force allows with: the principal that
 /// signed it, the action it asked for, the resource it addressed and IAM's reason clause for
 /// an absent grant. Written out here rather than built from the service's own helper.
-fn no_grant_message(principal: &str, action: &str, resource: &str) -> String {
+///
+/// `pub(crate)`: the suite that pins the identity-OR-resource UNION
+/// ([`super::object_read_policy_union`]) asserts the same sentence, and one spelling of it
+/// keeps the two suites from drifting on the wording.
+pub(crate) fn no_grant_message(principal: &str, action: &str, resource: &str) -> String {
     format!(
         "User: {principal} is not authorized to perform: {action} on resource: \"{resource}\" \
          because no identity-based policy allows the {action} action"
@@ -730,7 +738,10 @@ async fn a_bucket_policy_grant_names_the_caller_and_a_deny_overrides_every_grant
 }
 
 /// One statement of a resource policy, naming one principal.
-fn statement(effect: &str, principal: &str, action: &str, resource: &str) -> String {
+///
+/// `pub(crate)`, like the harness above: the union suite
+/// ([`super::object_read_policy_union`]) writes its bucket policies through this one builder.
+pub(crate) fn statement(effect: &str, principal: &str, action: &str, resource: &str) -> String {
     format!(
         "{{\"Effect\":\"{effect}\",\"Principal\":{{\"AWS\":\"{principal}\"}},\
          \"Action\":\"{action}\",\"Resource\":\"{resource}\"}}"

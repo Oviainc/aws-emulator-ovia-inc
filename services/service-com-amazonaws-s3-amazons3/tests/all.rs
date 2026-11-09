@@ -243,6 +243,8 @@ mod object_partial_reads;
 mod object_plane_byte_budget;
 #[path = "all/object_read_authorization.rs"]
 mod object_read_authorization;
+#[path = "all/object_read_policy_union.rs"]
+mod object_read_policy_union;
 #[path = "all/object_replication.rs"]
 mod object_replication;
 #[path = "all/object_retention.rs"]

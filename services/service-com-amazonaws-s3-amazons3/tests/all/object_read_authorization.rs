@@ -75,7 +75,11 @@ const NO_SUCH_KEY: &str = "NoSuchKey";
 const NO_SUCH_KEY_MESSAGE: &str = "The specified key does not exist.";
 
 /// A policy document carrying `statements`, in the form a client sends one.
-fn policy_document(statements: &str) -> String {
+///
+/// `pub(crate)`: the suite that pins the identity-OR-resource union
+/// ([`super::object_read_policy_union`]) wraps its statements with this one builder rather
+/// than spelling the envelope a second way.
+pub(crate) fn policy_document(statements: &str) -> String {
     format!("{{\"Version\":\"2012-10-17\",\"Statement\":[{statements}]}}")
 }
 
