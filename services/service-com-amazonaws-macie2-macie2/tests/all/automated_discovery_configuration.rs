@@ -94,6 +94,32 @@ fn is_absent(body: &serde_json::Value, member: &str) -> bool {
     body.get(member).is_none_or(serde_json::Value::is_null)
 }
 
+/// Read the configuration three times across the clock, requiring every report
+/// to be identical. Hands back that one report.
+///
+/// This is what "a read reports" means: `GetAutomatedDiscoveryConfiguration`
+/// retrieves the settings and status, so no report of it may differ from the
+/// next one when nothing wrote in between — no stamp moved, no identifier
+/// minted, no default settled into the store on first access.
+async fn read_repeatedly(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+) -> serde_json::Value {
+    let first = read(router, region, case).await;
+    for round in 1..=2 {
+        tokio::time::sleep(CLOCK_STEP).await;
+        let again = read(router, region, case).await;
+        assert_eq!(
+            again, first,
+            "case {case:?}: read {round} after the first must report the same \
+             configuration, because a read writes nothing a later caller sees; \
+             got {again:?} after {first:?}"
+        );
+    }
+    first
+}
+
 /// An account whose automated sensitive data discovery nothing has configured
 /// reports the never-configured state: none of its activities are performed,
 /// the auto-enable mode is the one its member documents as the default, and
@@ -498,5 +524,97 @@ async fn an_update_outside_the_modelled_input_is_refused() {
         after["status"].as_str(),
         Some(macie2::state::DEFAULT_AUTOMATED_DISCOVERY_STATUS),
         "case \"after the refusals\": a refused write persists nothing, got {after:?}"
+    );
+}
+
+/// `GetAutomatedDiscoveryConfiguration` RETRIEVES the settings and status, so
+/// every report of one configuration is the same report: reading it repeatedly
+/// across the clock, with nothing written in between, may move no stamp, mint
+/// no identifier and settle no default into the store.
+///
+/// The rows are the states a read can find an account in — never configured,
+/// then configured under each value of `AutomatedDiscoveryStatus`, the statuses
+/// as `smithy_query` reports them and this crate's
+/// `AUTOMATED_DISCOVERY_STATUS_VALUES` carries them — plus a second region that
+/// is read throughout and must stay never-configured. The persistence of each
+/// settings combination is the sibling case
+/// `an_update_persists_every_status_and_auto_enable_mode_a_read_reports`; what
+/// these rows add is that a READ alone changes none of it.
+#[tokio::test]
+async fn repeating_the_read_reports_the_same_configuration() {
+    let router = emulator();
+    enable_in(&router, REGION, "{}").await;
+    enable_in(&router, OTHER_REGION, "{}").await;
+
+    // An account that has configured nothing: the repeated reads must leave it
+    // that way, so the write below is still the FIRST to materialise a scope
+    // and a template.
+    let unconfigured = read_repeatedly(&router, REGION, "never configured").await;
+    for member in ["classificationScopeId", "sensitivityInspectionTemplateId"] {
+        assert!(
+            is_absent(&unconfigured, member),
+            "case \"never configured\": a read must not materialise {member}, got {:?}",
+            unconfigured.get(member)
+        );
+    }
+
+    let mut minted: Option<(String, String)> = None;
+    for status in macie2::ops::types::AUTOMATED_DISCOVERY_STATUS_VALUES {
+        let case = format!("configured {status}");
+        update(
+            &router,
+            REGION,
+            &serde_json::json!({ "status": status }),
+            &case,
+        )
+        .await;
+
+        let reported = read_repeatedly(&router, REGION, &case).await;
+        assert_eq!(
+            reported["status"].as_str(),
+            Some(*status),
+            "case {case:?}: the repeated reads must still report what the write \
+             persisted, got {reported:?}"
+        );
+
+        let identifier = |member: &str| -> String {
+            reported[member]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: a configured account reports its {member}, \
+                         got {reported:?}"
+                    )
+                })
+                .to_string()
+        };
+        let identifiers = (
+            identifier("classificationScopeId"),
+            identifier("sensitivityInspectionTemplateId"),
+        );
+        match &minted {
+            // The scope and the template were materialised by the first write,
+            // not by any of the reads that have run since.
+            Some(first) => assert_eq!(
+                &identifiers, first,
+                "case {case:?}: no read may re-materialise the scope or the template, \
+                 got {identifiers:?} after {first:?}"
+            ),
+            None => minted = Some(identifiers),
+        }
+    }
+
+    // The second region was read across all of that, and neither those reads
+    // nor the other region's writes configured it.
+    let elsewhere = read_repeatedly(&router, OTHER_REGION, "another region").await;
+    assert_eq!(
+        elsewhere["status"].as_str(),
+        Some(macie2::state::DEFAULT_AUTOMATED_DISCOVERY_STATUS),
+        "case \"another region\": reading a region must not configure it, got {elsewhere:?}"
+    );
+    assert!(
+        is_absent(&elsewhere, "classificationScopeId"),
+        "case \"another region\": no read may materialise a scope here, got {:?}",
+        elsewhere.get("classificationScopeId")
     );
 }
