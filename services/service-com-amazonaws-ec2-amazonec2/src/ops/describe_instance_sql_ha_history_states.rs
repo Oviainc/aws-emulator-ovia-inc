@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceSqlHaHistoryStates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceSqlHaHistoryStates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceSqlHaHistoryStates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports every SQL Server High Availability state each registration
+//! [`crate::state`] holds HAS HELD, as the one timeline
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::sql_ha_instance_history`] derives from the
+//! stored registration and the clock — narrowed by the `InstanceIds` and the documented
+//! `Filters` the request names, by the `StartTime`/`EndTime` window it asks over, and cut
+//! into `MaxResults`-sized pages. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +153,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceSqlHaHistoryStates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceSqlHaHistoryStatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            MAX_FILTER_MATCH_STEPS, MatchBudget, PageTokenRule, date_time_to_system_time,
+            matches_every_filter, page_from_cursor, require_service_state,
+            sql_ha_describe_selection, sql_ha_filter_values, sql_ha_instance_ids_not_found,
+            unresolved_sql_ha_instance_ids,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — a
+        // registration, and the states it has been through, are facts of the instance rather
+        // than of the Region the request was signed for. The store is reached through the
+        // engine held on `self`.
+        let _ = ctx;
+
+        // The request members both SQL Server High Availability describes publish —
+        // `InstanceIds`, `MaxResults`, `Filters` and `NextToken` — read and refused through
+        // the one place this surface reads them (`crate::state::sql_ha_describe_selection`),
+        // so the historical and the current-state describe cannot cap, refuse or resume a
+        // request differently. Nothing there reads the store, so whether a request is
+        // readable never depends on what the account holds.
+        let requested_ids: &[String] = input.instance_ids.as_deref().unwrap_or_default();
+        let selection = sql_ha_describe_selection(
+            requested_ids,
+            input.max_results,
+            input.filters.as_deref().unwrap_or_default(),
+            input.next_token.as_deref(),
+        )?;
+
+        // DryRun sits after every parameter has been validated and the ids have been read,
+        // but BEFORE they are RESOLVED, exactly as the current-state describe answers it: the
+        // flag asks whether the caller is permitted to make the request, so a dry run naming
+        // an id that resolves to nothing still answers `DryRunOperation`, while one whose
+        // request is unreadable is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        // "The start data and time of the period for which to get the historical SQL Server
+        // High Availability states. If omitted, the API returns all available historical
+        // states" (`StartTime`) and "The end data and time of the period for which to get
+        // historical SQL Server High Availability states. If omitted, the API returns
+        // historical states up to the current date and time" (`EndTime`): the window is the
+        // closed interval the request names, each end unbounded when it names none. A state
+        // the clock has not reached is no state the instance has held, so an end in the future
+        // reaches no further than the present whether or not it is clamped.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceSqlHaHistoryStates"))
+        // The ends are compared as INSTANTS, through the one conversion this crate reads a
+        // modelled timestamp with, rather than as renderings of them — and a window whose end
+        // falls before its start is an empty interval, which no state lies in. Neither member
+        // documents an ordering constraint, so an empty interval is answered with the states
+        // it contains — none — rather than with a refusal the API does not publish.
+        let start_time = input.start_time.map(date_time_to_system_time);
+        let end_time = input.end_time.map(date_time_to_system_time);
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // An id this operation cannot resolve is an error, not an absent row, and its
+        // validator does not distinguish an id the account holds no instance for from one
+        // whose instance is not enabled for monitoring — both are refused together, in one
+        // refusal naming every id it could not resolve
+        // (`crate::state::sql_ha_instance_ids_not_found`).
+        let unresolved = unresolved_sql_ha_instance_ids(&store, requested_ids);
+        if !unresolved.is_empty() {
+            return Err(sql_ha_instance_ids_not_found(&unresolved));
+        }
+
+        // A set, so narrowing by `InstanceIds` costs one lookup per stored registration
+        // rather than a scan of the requested list, and a repeated id cannot multiply the
+        // work.
+        let wanted: ::std::collections::HashSet<&str> =
+            requested_ids.iter().map(String::as_str).collect();
+
+        // "If omitted, the API returns historical states for all SQL Server High Availability
+        // instances" (`InstanceIds`): the default is every registered instance the account
+        // holds, narrowed to the ids the request names, and every state each of them has been
+        // through is then a candidate ROW — which is what makes this report historical rather
+        // than one row per instance.
+        //
+        // Every row is DERIVED from the stored registration and the clock
+        // (`crate::state::ComAmazonawsEc2Amazonec2State::sql_ha_instance_history`), so this
+        // read writes nothing and changes nothing a later caller sees, and the last state of
+        // a timeline is exactly what the current-state describe reports.
+        //
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored registrations,
+        // the states they have held, filters, values, held values and value length is bounded
+        // however the caller combines them — which is also what bounds how long this holds
+        // the state lock.
+        let now = ::std::time::SystemTime::now();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<(String, RegisteredInstance)> = Vec::new();
+        for instance_id in store.sql_ha_registrations.keys() {
+            if budget.exhausted() {
+                break;
+            }
+            // The id narrowing is read off the key, so a registration the request did not
+            // name costs no projection and no comparison at all.
+            if !wanted.is_empty() && !wanted.contains(instance_id.as_str()) {
+                continue;
+            }
+            for (ordinal, held) in store
+                .sql_ha_instance_history(instance_id, now)
+                .into_iter()
+                .enumerate()
+            {
+                if budget.exhausted() {
+                    break;
+                }
+                // A state the instance reached outside the requested period is not a state of
+                // that period, whichever end excludes it.
+                if start_time.is_some_and(|start| held.reached_at < start)
+                    || end_time.is_some_and(|end| held.reached_at > end)
+                {
+                    continue;
+                }
+                // Each filter is answered against the ROW — the state as it was held — so
+                // `haStatus` selects the states that carried that status rather than the
+                // instances whose CURRENT status is it ("If you specify multiple filters, the
+                // filters are joined with an AND" — `Filter`).
+                if matches_every_filter(&selection.filters, &mut budget, &|name| {
+                    sql_ha_filter_values(&held.instance, name)
+                }) {
+                    selected.push((history_position(instance_id, ordinal), held.instance));
+                }
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told so
+        // rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in the order the cursor names a position in: by instance, and within one
+        // instance oldest state first ([`history_position`]). Total, so the cursor always
+        // advances.
+        selected.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        // "This value is null when there are no more results to return" (`NextToken`): a
+        // token only when a further state follows this page — the crate's one reading of that
+        // rule (`crate::state::page_from_cursor`), so this report cannot page differently from
+        // the current-state one.
+        let (page, next_token) = page_from_cursor(
+            &selected,
+            selection.start_at.as_deref(),
+            Some(selection.limit),
+            PageTokenRule::WhenAnotherItemFollows,
+            |(position, _)| position.as_str(),
+        );
+
+        Ok(DescribeInstanceSqlHaHistoryStatesOutput {
+            instances: Some(page.iter().map(|(_, held)| held.clone()).collect()),
+            next_token,
+        })
     }
+}
+
+/// The position one historical state holds in the order this report pages over.
+///
+/// The instance, then the state's ordinal in that instance's timeline: an instance has held as
+/// many states as monitoring took it through, so the id alone is not a position. The ordinal
+/// is printed at the width the widest `usize` prints, so ordering these strings orders the
+/// timeline the way the timeline runs — oldest state first — and a state that falls due later
+/// is appended rather than shifting the position of one already reported. Joined by
+/// [`crate::state::CURSOR_SCOPE_SEPARATOR`], the character this crate already joins the halves
+/// of a cursor with because no id of this service carries it.
+fn history_position(instance_id: &str, ordinal: usize) -> String {
+    let separator = crate::state::CURSOR_SCOPE_SEPARATOR;
+    format!("{instance_id}{separator}{ordinal:020}")
 }

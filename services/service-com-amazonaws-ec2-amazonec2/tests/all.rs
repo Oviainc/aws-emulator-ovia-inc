@@ -893,6 +893,10 @@ mod instance_metadata_defaults;
 // The SQL Server High Availability state every enabled instance is reported in.
 #[path = "all/instance_sql_ha_states.rs"]
 mod instance_sql_ha_states;
+// Every SQL Server High Availability state an enabled instance HAS HELD, over the period the
+// request asks about.
+#[path = "all/instance_sql_ha_history_states.rs"]
+mod instance_sql_ha_history_states;
 #[path = "all/instance_type_offerings.rs"]
 mod instance_type_offerings;
 #[path = "all/instance_types.rs"]
