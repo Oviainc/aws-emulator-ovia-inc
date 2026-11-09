@@ -12211,6 +12211,7 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "chrono",
+ "chrono-tz",
  "flate2",
  "hex",
  "http",

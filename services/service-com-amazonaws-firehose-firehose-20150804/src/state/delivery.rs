@@ -23,6 +23,9 @@
 //!   ([`expand_prefix`]), and `ErrorOutputPrefix` for a record whose partition keys could
 //!   not be derived ("A prefix that Firehose evaluates and adds to failed records before
 //!   writing them to S3" — `ErrorOutputPrefix`).
+//! * IN WHICH ZONE — every time field of that location, and of the object's own name, is
+//!   the delivery's instant as the zone `CustomTimeZone` names reads it ("The time zone
+//!   you prefer. UTC is the default." — [`time_zone`]).
 //! * WHAT — the buffered records' data, concatenated in arrival order, encoded as
 //!   `CompressionFormat` asks ([`compressed`]).
 //! * UNDER WHICH KEY — the `AWSKMSKeyARN` of `EncryptionConfiguration`'s
@@ -74,10 +77,14 @@ use crate::ops::types::{
     BufferingHints, EncryptionConfiguration, ProcessingConfiguration, S3DestinationConfiguration,
 };
 use crate::state::cloudwatch_logs_pipeline::{CloudWatchLogsPipeline, Processed};
+use crate::state::delivery::time_zone::DeliveryTimeZone;
 use crate::state::{
     service_state, ComAmazonawsFirehoseFirehose20150804State, DeliveryStream,
     DestinationConfigKind, StoredRecord,
 };
+
+/// The zone a destination's time fields are rendered in.
+pub mod time_zone;
 
 /// Bytes in one MiB: `BufferingHints$SizeInMBs` buffers "to the specified size, in MiBs".
 const BYTES_PER_MIB: usize = 1024 * 1024;
@@ -515,6 +522,10 @@ pub struct S3Target {
     /// destination's `EncryptionConfiguration` ([`kms_key_arn`]), and `None` when the
     /// configuration names none.
     pub kms_key_arn: Option<String>,
+    /// The zone every time field of a delivery to this location is rendered in: the one
+    /// `CustomTimeZone` names, and UTC where the destination kind carries no such member or
+    /// names none ([`DeliveryTimeZone`]).
+    pub time_zone: DeliveryTimeZone,
 }
 
 /// One HTTP endpoint destination a stream's buffer is delivered to, with everything the
@@ -657,6 +668,9 @@ fn plain_target(config: &S3DestinationConfiguration) -> Option<S3Target> {
         append_delimiter: false,
         cloudwatch_logs: CloudWatchLogsPipeline::default(),
         kms_key_arn: kms_key_arn(config.encryption_configuration.as_ref()),
+        // A plain `S3DestinationConfiguration` carries no `CustomTimeZone` member at all,
+        // so a location read through here is named in the default zone.
+        time_zone: DeliveryTimeZone::default(),
     })
 }
 
@@ -776,6 +790,7 @@ pub fn s3_targets(config: &DestinationConfigKind) -> Vec<S3Target> {
                         config.processing_configuration.as_ref(),
                     ),
                     kms_key_arn: kms_key_arn(config.encryption_configuration.as_ref()),
+                    time_zone: DeliveryTimeZone::of(config.custom_time_zone.as_deref()),
                 });
             }
             if backs_up_all_records(config.s3_backup_mode.as_ref()) {
@@ -1592,7 +1607,10 @@ fn backup_object(
     let (body, extension) = compressed(error_payload(&records, failure, now), target)?;
     Some(DeliveredObject {
         bucket: target.bucket.clone(),
-        key: format!("{prefix}{}{extension}", object_name(delivery, now, ordinal)),
+        key: format!(
+            "{prefix}{}{extension}",
+            object_name(delivery, now, target.time_zone, ordinal)
+        ),
         body,
         kms_key_arn: target.kms_key_arn.clone(),
     })
@@ -1794,7 +1812,7 @@ fn search_backup_object(
         bucket: target.bucket.clone(),
         key: format!(
             "{prefix}{}{extension}",
-            object_name(delivery, now, ordinal)
+            object_name(delivery, now, target.time_zone, ordinal)
         ),
         body,
         kms_key_arn: target.kms_key_arn.clone(),
@@ -1818,6 +1836,7 @@ fn search_error_prefix(target: &S3Target, now: SystemTime) -> Result<String, Del
         &BTreeMap::new(),
         Some(SEARCH_FAILED_OUTPUT_TYPE),
         now,
+        target.time_zone,
     )
 }
 
@@ -1984,7 +2003,7 @@ async fn objects_of(delivery: &PendingDelivery, now: SystemTime) -> Option<Vec<D
         for group in grouped(target, &delivery.records).await? {
             match group.keys {
                 GroupKeys::Derived(keys) => {
-                    match expand_prefix(&target.prefix, &keys, None, now) {
+                    match expand_prefix(&target.prefix, &keys, None, now, target.time_zone) {
                         Ok(prefix) => writing.push((prefix, group.records)),
                         Err(failure) => failed.entry(failure).or_default().extend(group.records),
                     }
@@ -2029,7 +2048,7 @@ async fn objects_of(delivery: &PendingDelivery, now: SystemTime) -> Option<Vec<D
             bodies.push((prefix, error_payload(&records, failure, now)));
         }
         for (prefix, body) in bodies {
-            let name = object_name(delivery, now, objects.len());
+            let name = object_name(delivery, now, target.time_zone, objects.len());
             // An encoder that refused the body is not a record this delivery drops: the
             // whole delivery is owed again instead.
             let (body, extension) = compressed(body, target)?;
@@ -2064,6 +2083,7 @@ fn error_output_prefix(
         &BTreeMap::new(),
         Some(failure.output_type),
         now,
+        target.time_zone,
     )
 }
 
@@ -2881,8 +2901,16 @@ fn hadoop_snappy(body: &[u8]) -> Option<Vec<u8>> {
 /// `<stream>-<version>-<YYYY-MM-DD-HH-MM-SS>-<random>`, the form Firehose names an object
 /// it delivers to Amazon S3 with. `ordinal` distinguishes two objects of one flush written
 /// in the same second.
-fn object_name(delivery: &PendingDelivery, now: SystemTime, ordinal: usize) -> String {
-    let stamp = utc_fields(now).map_or_else(String::new, |fields| {
+///
+/// The stamp is the delivery's instant in the destination's own zone, like every other time
+/// field a delivery writes ([`time_zone`]).
+fn object_name(
+    delivery: &PendingDelivery,
+    now: SystemTime,
+    zone: DeliveryTimeZone,
+    ordinal: usize,
+) -> String {
+    let stamp = zone.fields(now).map_or_else(String::new, |fields| {
         format!(
             "{}-{}-{}-{}-{}-{}",
             fields.year, fields.month, fields.day, fields.hour, fields.minute, fields.second
@@ -2895,60 +2923,30 @@ fn object_name(delivery: &PendingDelivery, now: SystemTime, ordinal: usize) -> S
     )
 }
 
-/// The UTC calendar fields of an instant, each zero-padded as a key carries it.
-struct UtcFields {
-    year: String,
-    month: String,
-    day: String,
-    hour: String,
-    minute: String,
-    second: String,
-}
-
-/// The UTC calendar fields of `at`, or `None` for an instant the library cannot render.
-///
-/// The calendar conversion is the LIBRARY's: `DateTime::fmt(Format::DateTime)` renders an
-/// instant as RFC 3339 in UTC (`YYYY-MM-DDThh:mm:ss[.fff]Z`), and the fields are read off
-/// that text rather than computed here.
-fn utc_fields(at: SystemTime) -> Option<UtcFields> {
-    let rendered = ::aws_smithy_types::DateTime::from(at)
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .ok()?;
-    let (date, time) = rendered.split_once('T')?;
-    let mut date = date.split('-');
-    let mut time = time.split(':');
-    let fields = UtcFields {
-        year: date.next()?.to_string(),
-        month: date.next()?.to_string(),
-        day: date.next()?.to_string(),
-        hour: time.next()?.to_string(),
-        minute: time.next()?.to_string(),
-        // The seconds field carries the zone (and any fractional part) with it.
-        second: time
-            .next()?
-            .split(['.', 'Z', 'z', '+'])
-            .next()?
-            .to_string(),
-    };
-    Some(fields)
-}
-
 /// The prefix a delivered object is written under: `prefix` with its `!{...}` namespaces
 /// expanded, plus the automatic time prefix when it carries none.
+///
+/// Every time field comes from `zone`, the zone the destination's `CustomTimeZone` names
+/// ([`time_zone`]).
 ///
 /// The namespaces a prefix may carry, with what each expands to here:
 ///
 /// * `partitionKeyFromQuery:<name>` — the value `keys` holds for `<name>`; a name the
 ///   query derived no value for makes the whole prefix unresolvable, which is a record
-///   whose metadata extraction failed.
-/// * `timestamp:<pattern>` — the delivery's own instant under `<pattern>`
-///   ([`format_timestamp`]).
+///   whose metadata extraction failed. A partition key is not available for an ERROR OUTPUT
+///   prefix — a record is written there BECAUSE its keys could not be placed — so there the
+///   expression is carried through as written, like any other namespace this expander does
+///   not evaluate: the object reporting the failure is always written rather than the
+///   failure being reported by a delivery that can never be made.
+/// * `timestamp:<pattern>` — the delivery's own instant, in the destination's zone, under
+///   `<pattern>` ([`format_timestamp`]).
 /// * `firehose:error-output-type` — why the record is in the error output.
 /// * `firehose:random-string` — a value unique to this object.
 /// * `partitionKeyFromLambda:<name>` — the keys a Lambda data transformation returned.
 ///   This emulator runs no transformation, so there are none and the record's partition
 ///   keys could not be determined, rather than it landing under a prefix with a value
-///   invented for it.
+///   invented for it — and in an error output prefix, as above, it is carried through as
+///   written.
 ///
 /// "The \"YYYY/MM/DD/HH\" time format prefix is automatically used for delivered Amazon S3
 /// files" (`Prefix`), so a prefix carrying no expression at all gets it appended; one that
@@ -2961,6 +2959,7 @@ fn expand_prefix(
     keys: &BTreeMap<String, String>,
     error_output_type: Option<&str>,
     now: SystemTime,
+    zone: DeliveryTimeZone,
 ) -> Result<String, DeliveryFailure> {
     const OPEN: &str = "!{";
     let mut expanded = String::new();
@@ -2989,13 +2988,21 @@ fn expand_prefix(
             .split_once(':')
             .unwrap_or((expression.trim(), ""));
         match (namespace.trim(), argument.trim()) {
-            ("partitionKeyFromQuery", name) => {
+            // A partition key resolves only for the prefix of a DELIVERED object. The
+            // error output prefix is where a record whose keys could not be placed goes, so
+            // asking it for one of those keys there could never be answered: such an
+            // expression falls through to the arm that carries an unevaluated namespace
+            // through as written, which is what keeps the error output writable.
+            ("partitionKeyFromQuery", name) if error_output_type.is_none() => {
                 expanded.push_str(keys.get(name).ok_or(METADATA_EXTRACTION_FAILED)?);
             }
-            ("partitionKeyFromLambda", _) => return Err(METADATA_EXTRACTION_FAILED),
+            ("partitionKeyFromLambda", _) if error_output_type.is_none() => {
+                return Err(METADATA_EXTRACTION_FAILED)
+            }
             ("timestamp", pattern) => {
-                expanded
-                    .push_str(&format_timestamp(now, pattern).ok_or(METADATA_EXTRACTION_FAILED)?);
+                expanded.push_str(
+                    &format_timestamp(now, zone, pattern).ok_or(METADATA_EXTRACTION_FAILED)?,
+                );
             }
             ("firehose", "error-output-type") if error_output_type.is_some() => {
                 expanded.push_str(error_output_type.unwrap_or_default());
@@ -3017,7 +3024,7 @@ fn expand_prefix(
     }
     expanded.push_str(rest);
     if expressions == 0 {
-        let fields = utc_fields(now).ok_or(METADATA_EXTRACTION_FAILED)?;
+        let fields = zone.fields(now).ok_or(METADATA_EXTRACTION_FAILED)?;
         expanded.push_str(&format!(
             "{}/{}/{}/{}/",
             fields.year, fields.month, fields.day, fields.hour
@@ -3026,7 +3033,7 @@ fn expand_prefix(
     Ok(expanded)
 }
 
-/// `at` under a `!{timestamp:...}` pattern.
+/// `at` under a `!{timestamp:...}` pattern, in the zone `zone` names.
 ///
 /// The pattern is a Java `DateTimeFormatter` one, of which the fields a delivery prefix is
 /// written from are read: `y` (year), `M` (month), `d` (day), `H` (hour of day), `m`
@@ -3034,8 +3041,8 @@ fn expand_prefix(
 /// everything else — separators, literal text — carried through as written. A run of any
 /// other pattern letter is carried through as written too, so a prefix this emulator
 /// cannot read stays the caller's text rather than becoming a value guessed for it.
-fn format_timestamp(at: SystemTime, pattern: &str) -> Option<String> {
-    let fields = utc_fields(at)?;
+fn format_timestamp(at: SystemTime, zone: DeliveryTimeZone, pattern: &str) -> Option<String> {
+    let fields = zone.fields(at)?;
     let mut formatted = String::new();
     let mut letters = pattern.chars().peekable();
     while let Some(letter) = letters.next() {

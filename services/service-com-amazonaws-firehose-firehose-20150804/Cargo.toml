@@ -54,6 +54,10 @@ service-com-amazonaws-opensearch-amazonopensearchservice = { workspace = true }
 # including the ISO week a `OneWeek` rotation names — read from a maintained date library
 # rather than computed here.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# The IANA time-zone database behind a destination's `CustomTimeZone`: the offset that zone
+# was keeping at a delivery's instant, which decides the digits the delivered prefix and
+# object name carry.
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 # The `GZIP` compression format a destination can ask for.
 flate2 = "1"
 # The `ZIP` compression format a destination can ask for.

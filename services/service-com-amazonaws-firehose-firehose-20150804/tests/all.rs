@@ -23,6 +23,8 @@ mod cloudwatch_logs_source_gate;
 mod constraint_refusal_precedes_state;
 #[path = "all/control_plane_refusal_templates.rs"]
 mod control_plane_refusal_templates;
+#[path = "all/custom_time_zone_prefix.rs"]
+mod custom_time_zone_prefix;
 #[path = "all/delivered_object_encryption.rs"]
 mod delivered_object_encryption;
 #[path = "all/delivery_stream_encryption.rs"]
@@ -53,6 +55,8 @@ mod destination_update;
 mod direct_put_source_gate;
 #[path = "all/encryption_conflict_messages.rs"]
 mod encryption_conflict_messages;
+#[path = "all/error_output_prefix_resolution.rs"]
+mod error_output_prefix_resolution;
 #[path = "all/http_endpoint_delivery.rs"]
 mod http_endpoint_delivery;
 #[path = "all/kinesis_source_ingestion.rs"]
