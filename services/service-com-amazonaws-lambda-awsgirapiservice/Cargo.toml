@@ -223,6 +223,10 @@ service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
 # A handler's SDK call to AWS Step Functions is asserted against the execution that service
 # started, so Step Functions is mounted beside lambda on ONE engine for that test.
 service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
+# The same for the RDS Data API, the other REST-bound service a handler's SDK reaches: the
+# rows a handler's statements write are read back through that service's own endpoint, with
+# it mounted beside lambda on ONE engine.
+service-com-amazonaws-rdsdata-rdsdataservice = { workspace = true }
 # The same for Amazon SES API v2, the other REST-bound service a handler's SDK reaches: the
 # identity, configuration set and message a handler's calls produce are read back through
 # that service's own API, mounted beside lambda on ONE engine.

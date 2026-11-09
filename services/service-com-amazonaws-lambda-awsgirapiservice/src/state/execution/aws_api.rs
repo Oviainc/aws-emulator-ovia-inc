@@ -84,7 +84,9 @@ pub const MAX_CALLS_PER_RUN: usize = 256;
 #[derive(Debug)]
 pub struct Api {
     /// The token an AWS SDK client names this service by — the service's SDK id, lower
-    /// cased with its spaces dropped, which is what `boto3.client("sqs")` is given.
+    /// cased, which is what `boto3.client("sqs")` is given. A client is built with either
+    /// spelling of a two-word id, hyphenated (`rds-data`) or run together (`rdsdata`), and
+    /// both reach this one entry ([`same_service_token`]).
     pub sdk_token: &'static str,
     /// Its SigV4 signing name (`sigv4Name`) — also the credential scope that routes the
     /// call to this service inside this emulator.
@@ -389,7 +391,76 @@ pub const APIS: &[Api] = &[
         protocol: Protocol::RestJson(&XRAY),
         answer_model: Some(&XRAY_ANSWERS),
     },
+    // `services/service-com-amazonaws-rdsdata-rdsdataservice/smithy-model/
+    // com-amazonaws-rdsdata-rdsdataservice.json`: restJson1, sigv4Name `rds-data`,
+    // endpointPrefix `rds-data`, sdkId `RDS Data`. Its requests are bound per operation out
+    // of that same model ([`RDS_DATA`]).
+    //
+    // The DATA API is how a function reaches an Aurora cluster's SQL without a database
+    // connection of its own: a handler runs a statement, opens a transaction and commits or
+    // rolls it back through these operations, so a handler that cannot reach them cannot
+    // read or write the database it exists to serve.
+    Api {
+        sdk_token: "rds-data",
+        signing_name: "rds-data",
+        endpoint_prefix: "rds-data",
+        model: Some(RDS_DATA_MODEL),
+        protocol: Protocol::RestJson(&RDS_DATA),
+        answer_model: Some(&RDS_DATA_ANSWERS),
+    },
 ];
+
+/// Whether `named` and `asked` name the ONE service.
+///
+/// The SDKs spell one service's id two ways: hyphenated, which is the name a `boto3` client
+/// is built with for a two-word id (`rds-data`) and the name the JavaScript SDK publishes
+/// that service's package under (`@aws-sdk/client-cloudwatch-logs`), and run together, which
+/// is the spelling the same id gives with its spaces simply dropped (`cloudwatchlogs`). Both
+/// are lower case and differ in nothing else, so comparing two WELL-FORMED tokens with their
+/// hyphens dropped is what makes those two spellings one token: a client built with either
+/// reaches the same service, while a string no SDK spells a service by — a different case, a
+/// hyphen with no word beside it, a character no token carries — names no service, which is
+/// what a client built with it is told.
+#[must_use]
+pub fn same_service_token(named: &str, asked: &str) -> bool {
+    well_formed_token(named) && well_formed_token(asked) && compacted(named).eq(compacted(asked))
+}
+
+/// Whether `token` is spelled the way an SDK spells a service token: a non-empty run of
+/// lower-case ASCII alphanumeric words, each pair of them held apart by one hyphen.
+///
+/// What this keeps out is a string no SDK publishes for any service — `RDS-Data`, `-sqs`,
+/// `rds--data`, `rds_data`, a token of hyphens alone: it is told it names no service rather
+/// than read as a spelling of one.
+fn well_formed_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.split('-').all(|word| {
+            !word.is_empty()
+                && word
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+}
+
+/// One service token's characters, as [`same_service_token`] compares them: its hyphens
+/// dropped, which is the one thing its two spellings differ in.
+fn compacted(token: &str) -> impl Iterator<Item = char> + '_ {
+    token.chars().filter(|character| *character != '-')
+}
+
+/// The reachable service `service` names, or `None` when no entry of [`APIS`] answers to that
+/// token.
+///
+/// ONE service is named by two spellings of its SDK id: an SDK client is built from that id
+/// with the words run together (`boto3.client("secretsmanager")`) and the AWS SDK for
+/// JavaScript publishes the same service's client package with them hyphenated
+/// (`@aws-sdk/client-secrets-manager`), whose token is what a handler importing it hands over.
+/// Both spell the same service, so both reach it ([`same_service_token`]); a token no entry
+/// answers to under either spelling is still refused.
+fn api_for(service: &str) -> Option<&'static Api> {
+    APIS.iter()
+        .find(|api| same_service_token(api.sdk_token, service))
+}
 
 /// The Smithy MODEL of each service a call may be made to, embedded from the crate that
 /// service's own emulator is generated from — the SAME file, so nothing read out of it can
@@ -436,6 +507,10 @@ pub(super) const SFN_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-sfn-awsstepfunctions/smithy-model/\
      com-amazonaws-sfn-awsstepfunctions.json"
 );
+pub(super) const RDS_DATA_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-rdsdata-rdsdataservice/smithy-model/\
+     com-amazonaws-rdsdata-rdsdataservice.json"
+);
 pub(super) const OPENSEARCH_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-opensearch-amazonopensearchservice/smithy-model/\
      com-amazonaws-opensearch-amazonopensearchservice.json"
@@ -463,22 +538,10 @@ static XRAY: super::rest_json::RestApi = super::rest_json::RestApi {
 /// answers, so every token that names ONE service answers with that service's model.
 /// `None` for a service this emulator holds no model for.
 pub(super) fn held_model(token: &str) -> Option<(usize, &'static str)> {
-    let wanted = compacted(token);
     APIS.iter()
         .enumerate()
-        .find(|(_at, api)| compacted(api.sdk_token) == wanted)
+        .find(|(_at, api)| same_service_token(api.sdk_token, token))
         .and_then(|(at, api)| api.model.map(|model| (at, model)))
-}
-
-/// A service token with its separators dropped.
-///
-/// One service is named by two spellings of the same token: the SDK publishes the client
-/// package under the service's SDK id with the words hyphenated
-/// (`@aws-sdk/client-cloudwatch-logs`) and an SDK client is built from that id with the words
-/// run together (`boto3.client("cloudwatchlogs")`). Dropping the separators is what makes the
-/// two the one token.
-pub(super) fn compacted(token: &str) -> String {
-    token.chars().filter(|character| *character != '-').collect()
 }
 
 /// WHICH values of one service's answers carry BYTES, read out of that service's own model on
@@ -529,6 +592,10 @@ static SESV2_ANSWERS: super::blob_members::ServiceModel = super::blob_members::S
     source: SESV2_MODEL,
     plan: ::std::sync::OnceLock::new(),
 };
+static RDS_DATA_ANSWERS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: RDS_DATA_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
 
 /// Amazon API Gateway's own model, which a call to it is bound by.
 ///
@@ -562,26 +629,20 @@ static SESV2: super::rest_json::RestApi = super::rest_json::RestApi {
     parsed: ::std::sync::OnceLock::new(),
 };
 
+/// The RDS Data API's own model, which a call to it is bound by, embedded exactly as the
+/// models above are and for the same reason: the wire facts of its operations are that
+/// model's, so this seam states none of them.
+static RDS_DATA: super::rest_json::RestApi = super::rest_json::RestApi {
+    model: RDS_DATA_MODEL,
+    namespace: "com.amazonaws.rdsdata",
+    parsed: ::std::sync::OnceLock::new(),
+};
+
 /// Every service token a call may name, in the order [`APIS`] lists them — what the guest
 /// is told when it names one that is not there.
 #[must_use]
 pub fn reachable_services() -> Vec<&'static str> {
     APIS.iter().map(|api| api.sdk_token).collect()
-}
-
-/// The service a call naming `service` is made to, or `None` when no entry of [`APIS`] answers
-/// to that token.
-///
-/// The token is matched with its separators dropped ([`compacted`]), because ONE service is
-/// named by two spellings of its SDK id: an SDK client is built from that id with the words run
-/// together (`boto3.client("secretsmanager")`) and the AWS SDK for JavaScript publishes the
-/// same service's client package with them hyphenated (`@aws-sdk/client-secrets-manager`), whose
-/// token is what a handler importing it hands over. Both spell the same service, so both reach
-/// it; a token no entry answers to under either spelling is still refused.
-fn api_for(service: &str) -> Option<&'static Api> {
-    let wanted = compacted(service);
-    APIS.iter()
-        .find(|api| compacted(api.sdk_token) == wanted)
 }
 
 /// The CREDENTIAL one invocation's calls are signed with.
@@ -1324,6 +1385,63 @@ mod tests {
             tokens.len(),
             "case {tokens:?}: expected each service token once, got {sorted:?}"
         );
+        // And once under the comparison a client's own token is matched by, so no token a
+        // handler builds a client with can answer to two entries.
+        for (at, api) in APIS.iter().enumerate() {
+            let twice = APIS
+                .iter()
+                .skip(at + 1)
+                .find(|other| super::same_service_token(api.sdk_token, other.sdk_token));
+            assert!(
+                twice.is_none(),
+                "case {:?}: expected one entry per service token, got a second spelling of \
+                 it in the same table",
+                api.sdk_token
+            );
+        }
+    }
+
+    /// Either spelling of ONE service's SDK id reaches that one service, over a TABLE whose
+    /// rows differ along the spelling a client is built with: the id hyphenated, the same id
+    /// run together, and the spellings no SDK publishes — another case, a hyphen with no word
+    /// beside it, a character no token carries — which reach no service at all.
+    #[test]
+    fn either_spelling_of_a_service_token_reaches_the_one_service() {
+        let reached = [
+            ("the token the table spells", "rds-data", "rds-data"),
+            ("the same id run together", "rdsdata", "rds-data"),
+            ("a two-word id hyphenated", "cloudwatch-logs", "cloudwatchlogs"),
+            ("the same id run together", "cloudwatchlogs", "cloudwatchlogs"),
+            ("a one-word id", "sqs", "sqs"),
+            ("an id carrying a digit", "s3", "s3"),
+        ];
+        for (case, asked, expected) in reached {
+            let found = super::api_for(asked).map(|api| api.sdk_token);
+            assert_eq!(
+                found,
+                Some(expected),
+                "case {case:?}: expected {asked:?} to reach the {expected:?} entry, got \
+                 {found:?}"
+            );
+        }
+        for (case, asked) in [
+            ("a service this emulator does not serve", "kinesis"),
+            ("the empty token", ""),
+            ("a token of hyphens alone", "--"),
+            ("one with a doubled hyphen", "rds--data"),
+            ("one opening with a hyphen", "-rds-data"),
+            ("one closing with a hyphen", "rdsdata-"),
+            ("one carrying a character no token carries", "rds.data"),
+            ("one joined with an underscore", "rds_data"),
+            ("one written in another case", "RDS-Data"),
+            ("a one-word id in another case", "SQS"),
+        ] {
+            let found = super::api_for(asked).map(|api| api.sdk_token);
+            assert!(
+                found.is_none(),
+                "case {case:?}: expected {asked:?} to reach no service, got {found:?}"
+            );
+        }
     }
 
     /// What a guest may name as an operation and as a Region, over a TABLE whose rows

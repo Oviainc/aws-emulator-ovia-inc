@@ -179,6 +179,10 @@ mod tests {
             ("sesv2", "SendEmail", "MessageRejected"),
             ("s3", "PutObject", "NoSuchKey"),
             ("sfn", "StartExecution", "ExecutionDoesNotExist"),
+            // The SDK publishes the RDS Data API as `client-rds-data`, whose token is the
+            // same service's as `rdsdata`.
+            ("rds-data", "ExecuteStatement", "HttpEndpointNotEnabledException"),
+            ("rdsdata", "BeginTransaction", "AccessDeniedException"),
         ];
         for (token, operation, error) in cases {
             let exports = client_exports(token);

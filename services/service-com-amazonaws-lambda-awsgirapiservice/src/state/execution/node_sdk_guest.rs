@@ -186,6 +186,7 @@ fn client_name(token: &str) -> String {
         ("eks", "EKS"),
         ("efs", "EFS"),
         ("rds", "RDS"),
+        ("rds-data", "RDSData"),
         ("sfn", "SFN"),
         ("ses", "SES"),
         ("sesv2", "SESv2"),
@@ -929,6 +930,7 @@ mod tests {    use super::*;
             ("lambda", "LambdaClient"),
             ("eventbridge", "EventBridgeClient"),
             ("secrets-manager", "SecretsManagerClient"),
+            ("rds-data", "RDSDataClient"),
             ("scheduler", "SchedulerClient"),
         ];
         for (token, exported) in cases {
