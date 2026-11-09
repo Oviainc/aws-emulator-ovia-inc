@@ -1,0 +1,62 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: eks-auth.pod-identity-association-role-update-takes-effect eks-auth.pod-identity-concurrent-valid-token-all-succeed eks-auth.pod-identity-credentials-scoped-to-role-permissions-rejected eks-auth.pod-identity-native-round-trip-success eks-auth.pod-identity-no-matching-association-rejected eks-auth.pod-identity-repeated-calls-issue-fresh-credentials eks-auth.pod-identity-wrong-audience-token-rejected
+Issue-Shape-Id: com.amazonaws.eksauth#EKSAuthFrontend
+Issue-Key: eks-auth.pod-identity-association-role-update-takes-effect|_create_eks_cluster#1|PublishedUrlRejected|return cluster_name, ctx.endpoint_url(desc["endpoint"]), desc["certificateAuthority"]["data"]
+Issue-Key: eks-auth.pod-identity-concurrent-valid-token-all-succeed|_create_eks_cluster#1|PublishedUrlRejected|return cluster_name, ctx.endpoint_url(desc["endpoint"]), desc["certificateAuthority"]["data"]
+Issue-Key: eks-auth.pod-identity-credentials-scoped-to-role-permissions-rejected|_create_eks_cluster#1|PublishedUrlRejected|return cluster_name, ctx.endpoint_url(desc["endpoint"]), desc["certificateAuthority"]["data"]
+Issue-Key: eks-auth.pod-identity-native-round-trip-success|_create_eks_cluster#1|PublishedUrlRejected|return cluster_name, ctx.endpoint_url(desc["endpoint"]), desc["certificateAuthority"]["data"]
+Issue-Key: eks-auth.pod-identity-no-matching-association-rejected|_create_eks_cluster#1|PublishedUrlRejected|return cluster_name, ctx.endpoint_url(desc["endpoint"]), desc["certificateAuthority"]["data"]
+Issue-Key: eks-auth.pod-identity-repeated-calls-issue-fresh-credentials|_create_eks_cluster#1|PublishedUrlRejected|return cluster_name, ctx.endpoint_url(desc["endpoint"]), desc["certificateAuthority"]["data"]
+Issue-Key: eks-auth.pod-identity-wrong-audience-token-rejected|_create_eks_cluster#1|PublishedUrlRejected|return cluster_name, ctx.endpoint_url(desc["endpoint"]), desc["certificateAuthority"]["data"]
+Issue-Commit: 5252be52e0cc9f5d73bee5aa197523afb271707f
+
+# eks-auth: the pod-identity data plane is unaddressable — cluster.endpoint is published as a real <id>.<region>.eks.amazonaws.com host the emulator does not serve, so no pod-bound token can ever be minted (1 cause)
+
+> _Note: this issue was identified against the code base at commit `5252be52e0cc9f5d73bee5aa197523afb271707f`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+AssumeRoleForPodIdentity
+
+## Description
+Replaying simparity-behavioral-aws-v1 against this checkout, 7 of the 21 eks-auth checks never reach AssumeRoleForPodIdentity. They all follow the only path AWS offers for a usable pod-identity token: create an EKS cluster, read cluster.endpoint and cluster.certificateAuthority.data, open TLS to that endpoint, POST a Pod object, then POST a ServiceAccount TokenRequest bound to that Pod (boundObjectRef) so the resulting JWT carries the kubernetes.io/pod claim that AssumeRoleForPodIdentity requires. All 7 now die earlier than they used to: on the address the emulator itself published.
+
+ONE root cause; it must be closed before this issue is complete.
+
+Cause 1 of 1 — CreateCluster/DescribeCluster announce the Kubernetes API server at a real-AWS hostname instead of at an address on the emulator's own listener.
+AWS: Smithy (com.amazonaws.eks#Cluster$endpoint): "The endpoint for your Kubernetes API server." Smithy (com.amazonaws.eks#Certificate$data): "The Base64-encoded certificate data required to communicate with your cluster. Add this to the certificate-authority-data section of the kubeconfig file for your cluster." The contract of the pair is that a client builds a kubeconfig from them and reaches a live Kubernetes API server at that endpoint; the Kubernetes API itself is recorded behavior only (it is not in the AWS Smithy surface) and serves POST /api/v1/namespaces/{ns}/pods and POST /api/v1/namespaces/{ns}/serviceaccounts/{sa}/token. For an emulator the requirement is that the announced authority is one the emulator actually answers on — the endpoint member must name a host/port the emulator serves, with the path layout preserved; the concrete host, port and cluster id are per-environment values and are not themselves part of the requirement.
+Emulator: the endpoint member is a synthesized production-AWS DNS name of the form https://<32-hex-uppercase>.<3-hex>.<region>.eks.amazonaws.com, carrying no host or port the emulator listens on. Any client that dials it leaves the emulator entirely; the harness refuses to route it and reports: `simparity.published.PublishedUrlRejected: endpoint_url was given https://<32-hex>.<3hex>.us-west-2.eks.amazonaws.com (published by the emulator or built by the check): its host is not one of the emulator's own hosts; a customer of the emulator needs http(s)://127.0.0.1:<port>/<resource path>, or http(s)://<own host>:<port>/<path> on a per-resource listener`. The fixed text of that message is the harness's; the only variable part is the announced URL, which is verbatim what the emulator returned in cluster.endpoint. This is the emulator announcing an address other than the one it is reached on, not an outbound-egress failure of the runner.
+Why: every client that does the documented thing — build a kubeconfig from DescribeCluster and talk to the cluster — is sent off-emulator to a name that does not resolve to it. The entire positive side of eks-auth is therefore unusable: a caller cannot obtain the one token class AssumeRoleForPodIdentity accepts (kubernetes.io/pod claim), so credential issuance, association lookup, association-update propagation, session tags, target-role chaining, external-id binding and the wrong-audience/no-association refusals can never be exercised, while the control plane cheerfully reports the cluster ACTIVE with pod-identity associations attached.
+Fix: the eks crate's Cluster projection/serializer (the code that fills Cluster.endpoint for CreateCluster, DescribeCluster and the cluster state it persists) must publish an authority the emulator serves, and the eks cluster data plane must answer the Kubernetes API behind that authority (Pod create returning metadata.uid, and the ServiceAccount TokenRequest subresource minting a token whose claims include kubernetes.io/pod name+uid, kubernetes.io/serviceaccount, kubernetes.io/namespace and the requested audience, signed by a key the eks-auth AssumeRoleForPodIdentity handler validates against), under a TLS certificate issued by the CA whose PEM is published in certificateAuthority.data.
+Related open issue, which does NOT cover this: 20261104T053901Z-eks-auth-the-whole-pod-identity-data-plane.md owns the three checks that still fail on certificateAuthority.data not decoding to a PEM certificate (its Cause 1) and describes its Cause 2 on the explicit premise that "the harness routes that advertised URL back to the emulator". That premise no longer holds for these 7 checks: they are refused on the announced host before any socket is opened, which is the distinct defect filed here.
+Traces: eks-auth.pod-identity-association-role-update-takes-effect, eks-auth.pod-identity-concurrent-valid-token-all-succeed, eks-auth.pod-identity-credentials-scoped-to-role-permissions-rejected, eks-auth.pod-identity-native-round-trip-success, eks-auth.pod-identity-no-matching-association-rejected, eks-auth.pod-identity-repeated-calls-issue-fresh-credentials, eks-auth.pod-identity-wrong-audience-token-rejected.
+
+## Evidence
+Suite simparity-behavioral-aws-v1 against the emulator built from this checkout: total 10/22 passed; eks-auth 9/21 (12 failed). Five of the 12 are already owned by open issues (20261104T053901Z-eks-auth-the-whole-pod-identity-data-plane.md and 20261107T170624Z-eks-auth-assumeroleforpodidentity-never-evaluates-the-caller-s.md) and are excluded here. The remaining 7 are this issue, and all 7 raise the identical exception from the identical frame — the harness being asked to route the URL the emulator published as cluster.endpoint, before any request is made:
+
+  File "context.py", line 572, in endpoint_route -> return self._published_target(url, "endpoint_url"), {}
+  File "context.py", line 586, in _published_target -> raise PublishedUrlRejected(...)
+  simparity.published.PublishedUrlRejected: endpoint_url was given https://<32-hex>.<3hex>.us-west-2.eks.amazonaws.com (published by the emulator or built by the check): its host is not one of the emulator's own hosts; a customer of the emulator needs http(s)://127.0.0.1:<port>/<resource path>, or http(s)://<own host>:<port>/<path> on a per-resource listener
+
+One line per check, with the announced host the emulator returned (only the hex cluster id and the harness's own loopback port differ between runs; the *.eks.amazonaws.com shape is identical in all 7):
+  eks-auth.pod-identity-association-role-update-takes-effect — https://0EA0E30189071EEC1392AE62196AE417.0ea.us-west-2.eks.amazonaws.com
+  eks-auth.pod-identity-concurrent-valid-token-all-succeed — https://67E32676D23FAA56AC16EC9B82B99C6B.67e.us-west-2.eks.amazonaws.com
+  eks-auth.pod-identity-credentials-scoped-to-role-permissions-rejected — https://0B8C09CB1BCB2C368ECA34D520169338.0b8.us-west-2.eks.amazonaws.com
+  eks-auth.pod-identity-native-round-trip-success — https://30943C7A27A6558C851BC63243C74FF7.309.us-west-2.eks.amazonaws.com
+  eks-auth.pod-identity-no-matching-association-rejected — https://480947590557CECBCD7E99ED4939A1DC.480.us-west-2.eks.amazonaws.com
+  eks-auth.pod-identity-repeated-calls-issue-fresh-credentials — https://A15EDC5F00A4EA3833BDD933AAA259F2.a15.us-west-2.eks.amazonaws.com
+  eks-auth.pod-identity-wrong-audience-token-rejected — https://59DF13374A3579723E802DA1C2DAE89C.59d.us-west-2.eks.amazonaws.com
+
+Expected: cluster.endpoint names a host/port the emulator serves, and POST <endpoint>/api/v1/namespaces/default/pods then POST <endpoint>/api/v1/namespaces/default/serviceaccounts/default/token (audiences ['pods.eks.amazonaws.com'], boundObjectRef naming that Pod) return 201 with a metadata.uid and a token carrying the kubernetes.io/pod claim; eks_auth.assume_role_for_pod_identity(clusterName, token) then returns 200 with subject/credentials/assumedRoleUser/podIdentityAssociation.
+Actual: the announced authority is an AWS production DNS name the emulator does not serve, so nothing is ever sent and no assertion in any of the 7 checks is reached.
+
+Model consulted: services/service-com-amazonaws-eks-awswesleyfrontend/smithy-model/com-amazonaws-eks-awswesleyfrontend.json — Cluster$endpoint ("The endpoint for your Kubernetes API server."), Certificate$data ("The Base64-encoded certificate data required to communicate with your cluster. Add this to the certificate-authority-data section of the kubeconfig file for your cluster."); services/service-com-amazonaws-eksauth-eksauthfrontend/smithy-model/com-amazonaws-eksauth-eksauthfrontend.json — AssumeRoleForPodIdentity (POST /clusters/{clusterName}/assume-role-for-pod-identity).
+
+## Steps to Reproduce
+1. Clone the repo, build the emulator from this checkout and boot it.
+2. Point a boto3 `eks` client at the emulator and create a cluster in a VPC with two subnets in distinct AZs, then poll describe_cluster(name=...)['cluster']['status'] until 'ACTIVE'.
+3. Read cluster['endpoint']. Expected: a URL whose host:port is an authority the emulator listens on (e.g. the emulator's own host/port, or a per-resource listener). Observed: https://<32-hex-uppercase>.<3-hex>.<region>.eks.amazonaws.com — a real AWS production DNS name the emulator does not serve.
+4. Try to use it as the documented contract requires: POST <cluster['endpoint']>/api/v1/namespaces/default/pods with a minimal Pod manifest, trusting base64-decoded cluster['certificateAuthority']['data']. Observed: the request is not addressed to the emulator at all; the behavioral harness refuses to route the published URL with PublishedUrlRejected ("its host is not one of the emulator's own hosts").
+5. Consequence: no ServiceAccount TokenRequest bound to a Pod can be minted, so eks_auth.assume_role_for_pod_identity(clusterName=<cluster>, token=<pod-bound token>) can never be called with the only token class it accepts.
+6. Or just replay simparity-behavioral-aws-v1 and observe the 7 eks-auth checks listed in trace_ids all failing in context.py endpoint_route with PublishedUrlRejected.
