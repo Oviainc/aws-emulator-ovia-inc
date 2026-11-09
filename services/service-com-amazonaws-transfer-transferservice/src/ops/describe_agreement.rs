@@ -160,10 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An agreement is addressed by the pair the model makes `AgreementResource`'s
         // identifiers, so the lookup is that pair: a `(ServerId, AgreementId)` the
-        // store does not hold is the one not-found this report answers. The server
-        // itself is NOT re-resolved, because `DeleteServer` does not take a server's
-        // agreements with it — an agreement outlives the server it referenced, and
-        // still reports the configuration it was created with.
+        // store does not hold is the one not-found this report answers. `DeleteServer`
+        // takes the server's agreements with it, so the pair of a deleted server is one
+        // the store no longer holds and this report answers it as not found.
         let key = (input.server_id.clone(), input.agreement_id.clone());
         let stored = guard.agreements.get(&key).ok_or_else(|| {
             st::not_found(DescribeAgreementErrorModeled::ResourceNotFoundException(

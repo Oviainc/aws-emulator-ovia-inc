@@ -287,7 +287,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with the modelled `AccessDeniedException` (HTTP 403) and nothing changes.
         // The gate reads the account's own IAM store — see
         // `crate::state::authorization`.
-        let resource = st::server_arn(&st::request_region(ctx.parts()), &input.server_id);
+        // The Region the request was signed for, read once: the resource the
+        // authorization gate decides this action on, and the Region an invoke endpoint
+        // that carries none of its own is read in, are both in it.
+        let region = st::request_region(ctx.parts());
+        let resource = st::server_arn(&region, &input.server_id);
         if let Some(message) = st::authorization::explicit_deny(
             &*self.engine,
             ctx.parts(),
@@ -351,6 +355,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &*self.engine,
                         invocation_role,
                         url,
+                        &region,
                     ) {
                         return Err(UpdateServerErrorModeled::InvalidRequestException(
                             InvalidRequestException {
@@ -548,7 +553,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let server_id = stored.server_id.clone();
         if let Some(key) = rotated {
-            let region = st::request_region(ctx.parts());
             guard.materialise_host_key(&region, &server_id, &key);
         }
         drop(guard);

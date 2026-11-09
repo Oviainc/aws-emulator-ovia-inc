@@ -81,14 +81,27 @@ fn iam_state<Eng: Send + Sync + 'static>(
 }
 
 /// The refusal text IAM states an explicit-deny decision with: who was refused,
-/// which action, and that the refusal came from an explicit deny in an
-/// identity-based policy. Every value in it comes from the request and the stored
-/// policy, not from a recording.
-fn not_authorized(principal: &str, action: &str) -> String {
-    format!(
-        "User: {principal} is not authorized to perform: {action} \
-         with an explicit deny in an identity-based policy"
-    )
+/// which action, ON WHICH RESOURCE the action was evaluated, and that the refusal came
+/// from an explicit deny in an identity-based policy. Every value in it comes from the
+/// request and the stored policy, not from a recording.
+///
+/// The resource clause names the ARN the decision was taken against — the same value
+/// [`explicit_deny`] evaluated the action on — so a caller parsing the sentence can
+/// attribute the denial. A request that addresses no nameable ARN has none to state and
+/// is told the principal and the action alone ([`NO_RESOURCE`] is what it was decided
+/// against).
+fn not_authorized(principal: &str, action: &str, resource: Option<&str>) -> String {
+    match resource {
+        Some(resource) => format!(
+            "User: {principal} is not authorized to perform: {action} \
+             on resource: {resource} \
+             with an explicit deny in an identity-based policy"
+        ),
+        None => format!(
+            "User: {principal} is not authorized to perform: {action} \
+             with an explicit deny in an identity-based policy"
+        ),
+    }
 }
 
 /// The refusal text for a role ARN in another account, as the service states it.
@@ -135,7 +148,7 @@ pub fn explicit_deny<Eng: Send + Sync + 'static>(
         .collect();
     let request = iam_policy::Request::new(&action, resource.unwrap_or(NO_RESOURCE), &[]);
     (iam_policy::identity_decision(&documents, &request) == Decision::Denied)
-        .then(|| not_authorized(&principal, &action))
+        .then(|| not_authorized(&principal, &action, resource))
 }
 
 /// Whether the role `role_arn` names can invoke the API `url` names, according to
@@ -155,10 +168,15 @@ pub fn explicit_deny<Eng: Send + Sync + 'static>(
 /// nothing.
 /// A `url` that names no API Gateway invoke endpoint leaves no API ARN to compare, so
 /// only a policy covering every resource can verify such a provider.
+///
+/// `region` is the Region the calling request was signed for, which is the Region an
+/// invoke endpoint that does not carry one in its host is addressed in — see
+/// [`execute_api_arn`].
 pub fn invocation_role_can_invoke<Eng: Send + Sync + 'static>(
     engine: &Eng,
     role_arn: &str,
     url: Option<&str>,
+    region: &str,
 ) -> bool {
     if cross_account_role(role_arn) {
         return false;
@@ -180,7 +198,7 @@ pub fn invocation_role_can_invoke<Eng: Send + Sync + 'static>(
     // The API the URL names, as an `execute-api` ARN, so a policy scoped to one
     // API is honoured; `None` when the URL names no API Gateway endpoint, which
     // leaves only a statement covering every resource able to allow the invoke.
-    let api = url.and_then(execute_api_arn);
+    let api = url.and_then(|url| execute_api_arn(url, region));
     let inline = guard
         .role_inline_policies
         .get(&role_key)
@@ -298,30 +316,67 @@ fn default_policy_document(
         .and_then(|version| version.document.clone())
 }
 
-/// The `execute-api` ARN of the API an API Gateway invoke URL addresses.
+/// The vendor of an API Gateway invoke endpoint, which is also the label that names
+/// that data plane in both addressings below: `execute-api`.
+const EXECUTE_API: &str = "execute-api";
+
+/// The `execute-api` ARN of the API an API Gateway invoke URL addresses, in EITHER
+/// addressing a deployed stage is reached at.
 ///
-/// An invoke endpoint is `https://<api-id>.execute-api.<region>.amazonaws.com/<stage>`,
-/// and the resource a policy names for it is
-/// `arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/*`. `None` for a URL
-/// that is not an invoke endpoint, so nothing is derived from a URL that names no
-/// API.
-fn execute_api_arn(url: &str) -> Option<String> {
+/// A stage invoke endpoint names two things the policy resource needs — WHICH api, and
+/// that the address is the `execute-api` data plane — and where it carries them depends
+/// on the host the caller can resolve:
+///
+/// 1. `https://<api-id>.execute-api.<region>.amazonaws.com/<stage>/…` carries both in
+///    the HOST, with the Region beside them;
+/// 2. `https://<endpoint>/_aws/execute-api/<api-id>/<stage>/…` carries both in the PATH,
+///    behind the reserved namespace segment, because a caller reaching one endpoint for
+///    every service and every plane cannot carry them in the host. That is the
+///    addressing this emulator PUBLISHES as a deployed stage's invoke URL, so it is an
+///    invoke endpoint exactly as the first is — and the segments are read through the
+///    shared reading of that namespace, not a second copy of it.
+///
+/// Either way the resource a policy names for the API is
+/// `arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/*`. The second form carries
+/// no Region, so the API is read as being in `region` — the Region the calling request
+/// was signed for, which is the one the caller's own API Gateway calls were signed for
+/// too. `None` for a URL that is not an invoke endpoint in either form, so nothing is
+/// derived from a URL that names no API.
+fn execute_api_arn(url: &str, region: &str) -> Option<String> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
-    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let (api_id, domain) = host.split_once('.')?;
-    let mut labels = domain.split('.');
-    if labels.next()? != "execute-api" {
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = ::service_common::data_plane_addressing::host_only(authority);
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+
+    // The host form: the api id is the first label and `execute-api` the second, with
+    // the Region after it; the stage is the first path segment.
+    if let Some((api_id, domain)) = host.split_once('.') {
+        let mut labels = domain.split('.');
+        if labels.next() == Some(EXECUTE_API) {
+            let region = labels.next()?;
+            let stage = segments.next()?;
+            return Some(api_arn(region, api_id, stage));
+        }
+    }
+
+    // The path form: the reserved namespace segment, the plane, then the api id and the
+    // stage.
+    if segments.next()? != ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE
+        || segments.next()? != EXECUTE_API
+    {
         return None;
     }
-    let region = labels.next()?;
-    let stage = path.split('/').find(|segment| !segment.is_empty())?;
-    Some(::engine::emulator_arn(
-        "execute-api",
-        region,
-        &format!("{api_id}/{stage}/*"),
-    ))
+    let api_id = segments.next()?;
+    let stage = segments.next()?;
+    Some(api_arn(region, api_id, stage))
+}
+
+/// `arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/*` — the resource an IAM
+/// policy names to allow invoking one stage of one API.
+fn api_arn(region: &str, api_id: &str, stage: &str) -> String {
+    ::engine::emulator_arn(EXECUTE_API, region, &format!("{api_id}/{stage}/*"))
 }
 
 #[cfg(test)]
@@ -433,15 +488,92 @@ mod tests {
 
     #[test]
     fn an_invoke_url_resolves_to_the_apis_execute_api_arn() {
+        // The rows span both addressings a deployed stage is reached at (the host form
+        // AWS publishes and the path form this emulator publishes), the parts each one
+        // carries (api id, Region, stage, a resource path after the stage, a port on the
+        // endpoint), and values that are no invoke endpoint at all. `request_region` is
+        // the Region the calling request was signed for, which only the path form
+        // — carrying none of its own — is read in.
+        let request_region = "us-west-2";
+        // (case, url, the execute-api resource it names)
+        let rows: &[(&str, &str, Option<&str>)] = &[
+            (
+                "the host form AWS publishes",
+                "https://abc123.execute-api.us-east-1.amazonaws.com/prod",
+                Some("arn:aws:execute-api:us-east-1:000000000000:abc123/prod/*"),
+            ),
+            (
+                "the host form with a resource path after the stage",
+                "https://abc123.execute-api.eu-west-1.amazonaws.com/test/auth",
+                Some("arn:aws:execute-api:eu-west-1:000000000000:abc123/test/*"),
+            ),
+            (
+                "the host form naming no stage",
+                "https://abc123.execute-api.us-east-1.amazonaws.com/",
+                None,
+            ),
+            (
+                "the path form this emulator publishes, on a loopback endpoint",
+                "https://127.0.0.1:39477/_aws/execute-api/8sh3tqaaaa/sim2real",
+                Some("arn:aws:execute-api:us-west-2:000000000000:8sh3tqaaaa/sim2real/*"),
+            ),
+            (
+                "the path form with a resource path after the stage",
+                "https://localhost:9297/_aws/execute-api/8sh3tqaaaa/test/auth",
+                Some("arn:aws:execute-api:us-west-2:000000000000:8sh3tqaaaa/test/*"),
+            ),
+            (
+                "the path form over plain HTTP",
+                "http://127.0.0.1:9297/_aws/execute-api/zzz999/prod",
+                Some("arn:aws:execute-api:us-west-2:000000000000:zzz999/prod/*"),
+            ),
+            (
+                "the path form naming no stage",
+                "https://127.0.0.1:9297/_aws/execute-api/zzz999",
+                None,
+            ),
+            (
+                "a path that names another plane under the same namespace",
+                "https://127.0.0.1:9297/_aws/portal/zzz999/prod",
+                None,
+            ),
+            (
+                "a path whose namespace segment merely starts with the reserved one",
+                "https://127.0.0.1:9297/_awsx/execute-api/zzz999/prod",
+                None,
+            ),
+            ("a URL that is not an invoke endpoint", "https://example.invalid/auth", None),
+            ("a value that is no URL at all", "the-api", None),
+        ];
+        for (case, url, expected) in rows {
+            let resolved = execute_api_arn(url, request_region);
+            assert_eq!(
+                resolved.as_deref(),
+                *expected,
+                "case {case:?}: expected {expected:?}, got {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_deny_names_the_resource_it_was_decided_against() {
+        let principal = "arn:aws:iam::000000000000:user/denied";
+        let resource = "arn:aws:transfer:us-west-2:000000000000:server/*";
         assert_eq!(
-            execute_api_arn("https://abc123.execute-api.us-east-1.amazonaws.com/prod"),
-            Some("arn:aws:execute-api:us-east-1:000000000000:abc123/prod/*".to_string()),
-            "the invoke endpoint names the API, the region and the stage"
+            not_authorized(principal, "transfer:CreateServer", Some(resource)),
+            format!(
+                "User: {principal} is not authorized to perform: transfer:CreateServer \
+                 on resource: {resource} with an explicit deny in an identity-based policy"
+            ),
+            "the denial must name the principal, the action and the resource"
         );
         assert_eq!(
-            execute_api_arn("https://example.invalid/auth"),
-            None,
-            "a URL that is not an invoke endpoint names no API"
+            not_authorized(principal, "transfer:ListServers", None),
+            format!(
+                "User: {principal} is not authorized to perform: transfer:ListServers \
+                 with an explicit deny in an identity-based policy"
+            ),
+            "a request that addresses no nameable resource states none"
         );
     }
 

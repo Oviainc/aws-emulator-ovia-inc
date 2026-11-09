@@ -17,6 +17,12 @@
 //!
 //! The output shape is `Unit`, so a success carries no member at all.
 //!
+//! The delete is a WRITE of the same object the update writes, so it takes the same
+//! claim: a delete that overlaps another write of that web app's customization is
+//! refused with the modelled `ConflictException` (HTTP 409) rather than racing it — see
+//! [`crate::state::web_app_customization`]. A delete that overlaps nothing is applied,
+//! whatever came before it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -189,21 +195,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let mut guard = state.lock();
-        let Some(stored) = guard.web_apps.get_mut(&input.web_app_id) else {
-            return Err(st::not_found(
-                DeleteWebAppCustomizationErrorModeled::ResourceNotFoundException(
-                    st::unknown_web_app(&input.web_app_id),
-                ),
-            ));
+        // One writer of this web app's customization at a time, exactly as the update
+        // takes it: a delete that arrives while another write of the same
+        // customization is still being applied is refused with the modelled
+        // `ConflictException` (HTTP 409) rather than racing it. The claim is OWNED for
+        // as long as this write may still happen and released when `_claim` is dropped
+        // — on every exit below, and on a request that is cancelled at the await. See
+        // `crate::state::web_app_customization`.
+        let _claim = match st::web_app_customization::claim(&state, &input.web_app_id) {
+            Ok(claim) => claim,
+            Err(st::web_app_customization::Refusal::Conflict) => {
+                return Err(DeleteWebAppCustomizationErrorModeled::ConflictException(
+                    st::web_app_customization::write_conflict(),
+                )
+                .into());
+            }
+            Err(st::web_app_customization::Refusal::NoSuchWebApp) => {
+                return Err(st::not_found(
+                    DeleteWebAppCustomizationErrorModeled::ResourceNotFoundException(
+                        st::unknown_web_app(&input.web_app_id),
+                    ),
+                ));
+            }
         };
 
-        // The whole object goes, not the members a request named: this operation models
-        // `WebAppId` alone. An `@idempotent` delete states the end state, so a web app
-        // that already held none is left in exactly that state and answered the same
-        // success.
-        stored.customization = None;
-        drop(guard);
+        // The claim is held across this point, which is where a write of the same web
+        // app's customization that is in flight AT THE SAME TIME reaches the claim
+        // above and is refused.
+        st::web_app_customization::admit_a_racing_writer().await;
+
+        // The state lock is taken for the write alone and released before the claim is,
+        // which the release needs it to be.
+        {
+            let mut guard = state.lock();
+            let Some(stored) = guard.web_apps.get_mut(&input.web_app_id) else {
+                return Err(st::not_found(
+                    DeleteWebAppCustomizationErrorModeled::ResourceNotFoundException(
+                        st::unknown_web_app(&input.web_app_id),
+                    ),
+                ));
+            };
+
+            // The whole object goes, not the members a request named: this operation
+            // models `WebAppId` alone. An `@idempotent` delete states the end state, so
+            // a web app that already held none is left in exactly that state and
+            // answered the same success.
+            stored.customization = None;
+        }
 
         Ok(DeleteWebAppCustomizationOutput)
     }

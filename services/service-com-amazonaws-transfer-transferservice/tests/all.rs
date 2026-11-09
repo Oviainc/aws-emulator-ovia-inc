@@ -143,3 +143,21 @@ mod agreement_updates;
 // connector flow, polled the way a client polls it.
 #[path = "all/end_to_end_transfer_flow.rs"]
 mod end_to_end_transfer_flow;
+// The four suites below are appended rather than inserted into the sorted list, for the
+// reason the notes above record: the sorted list is where every concurrent change
+// inserts. Fold them into the list once the churn settles.
+// `api_gateway_identity_provider_addressing`: the API an API_GATEWAY provider's Url
+// names, in both addressings a deployed stage is published at.
+#[path = "all/api_gateway_identity_provider_addressing.rs"]
+mod api_gateway_identity_provider_addressing;
+// `explicit_deny_resource_clause`: which resource an explicit-deny refusal was decided
+// against, and what its sentence says.
+#[path = "all/explicit_deny_resource_clause.rs"]
+mod explicit_deny_resource_clause;
+// `ssh_public_key_body_validation`: the algorithm and the payload the service accepts in
+// an SshPublicKeyBody.
+#[path = "all/ssh_public_key_body_validation.rs"]
+mod ssh_public_key_body_validation;
+// `web_app_customization_write_guard`: one writer of a web app's customization at a time.
+#[path = "all/web_app_customization_write_guard.rs"]
+mod web_app_customization_write_guard;

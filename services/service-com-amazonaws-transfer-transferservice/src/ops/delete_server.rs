@@ -3,8 +3,10 @@
 //! @op DeleteServer
 //!
 //! Removes the stored server AND everything that hangs off it — its users and their
-//! SSH keys, and its host keys — so `DescribeServer` answers 404 and `ListServers` no
-//! longer lists it. An unknown `ServerId` is a `ResourceNotFoundException` (404).
+//! SSH keys, its host keys, and its AS2 agreements — so `DescribeServer` answers 404,
+//! `ListServers` no longer lists it, and no reader of a resource the server owned
+//! answers for a server that no longer exists. An unknown `ServerId` is a
+//! `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -215,6 +217,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DescribeHostKey` answer for a server that no longer exists.
         guard
             .host_keys
+            .retain(|(server_id, _), _| server_id != &input.server_id);
+
+        // The server's AS2 agreements are addressed by `(ServerId, AgreementId)` too, so
+        // they go with the server on the same rule: an agreement left behind would keep
+        // answering `DescribeAgreement` with an ACTIVE agreement whose own `ServerId`
+        // names a server that no longer exists, and a client reconciling its teardown
+        // would never see it gone.
+        guard
+            .agreements
             .retain(|(server_id, _), _| server_id != &input.server_id);
 
         Ok(DeleteServerOutput)

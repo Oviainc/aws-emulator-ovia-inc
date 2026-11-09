@@ -859,15 +859,31 @@ async fn an_agreements_arn_carries_the_region_it_was_created_in() {
     }
 }
 
-/// RULE (survival): deleting the server an agreement references succeeds and leaves the
-/// agreement itself, which still reports the configuration it was created with.
+/// RULE: deleting a server succeeds even while it still has ACTIVE agreements — there is
+/// no referential-integrity refusal — and the agreements go WITH it: an agreement is
+/// addressed by `(ServerId, AgreementId)`, so once that server is gone the pair resolves
+/// to nothing and `DescribeAgreement` answers the modelled `ResourceNotFoundException`
+/// rather than an ACTIVE agreement whose own `ServerId` names a server that does not
+/// exist.
 ///
 /// The rows differ in the agreement's directory configuration and in how many agreements
-/// the deleted server held.
+/// the deleted server held; a SECOND server's agreement, created before the delete, is
+/// asserted to survive it, so the delete is shown to take the agreements of the server it
+/// named and of no other.
 #[tokio::test]
-async fn an_agreement_outlives_the_server_it_references() {
+async fn an_agreement_goes_with_the_server_it_references() {
     let emulator = Emulator::new();
     let partnership = Partnership::create(&emulator).await;
+
+    // Another server of the same two profiles, whose agreement the delete must not touch.
+    let other_server = emulator.create_server(json!({})).await;
+    let other_partnership = Partnership {
+        server_id: other_server.clone(),
+        local_profile: partnership.local_profile.clone(),
+        partner_profile: partnership.partner_profile.clone(),
+    };
+    let survivor_case = case_named(PLAIN_CASE);
+    let survivor = create_agreement(&emulator, &other_partnership, &survivor_case).await;
 
     let rows = vec![case_named(PLAIN_CASE), case_named(CUSTOM_DIRECTORIES_CASE)];
     let mut created: Vec<(Case, String)> = Vec::new();
@@ -888,20 +904,38 @@ async fn an_agreement_outlives_the_server_it_references() {
     for (case, agreement_id) in &created {
         let answer = describe(&emulator, &partnership.server_id, agreement_id).await;
         assert_eq!(
-            answer.status, 200,
-            "case {:?}: expected the orphaned agreement to still describe, got {} with body {}",
-            case.name, answer.status, answer.body
-        );
-        assert_members(
+            answer.error_code(),
+            "ResourceNotFoundException",
+            "case {:?}: expected the deleted server's agreement to be gone, got {} with body {}",
             case.name,
-            answer.get("Agreement"),
-            &case.expected_members(
-                &partnership.server_id,
-                &partnership.local_profile,
-                &partnership.partner_profile,
-            ),
+            answer.status,
+            answer.body
+        );
+        assert!(
+            answer.body.get("Agreement").is_none(),
+            "case {:?}: a refused read must answer no agreement, got {}",
+            case.name,
+            answer.body
         );
     }
+
+    // The other server's agreement was never addressed by the delete, so it still reports
+    // the configuration it was created with.
+    let answer = describe(&emulator, &other_server, &survivor).await;
+    assert_eq!(
+        answer.status, 200,
+        "expected another server's agreement to survive, got {} with body {}",
+        answer.status, answer.body
+    );
+    assert_members(
+        "another server's agreement",
+        answer.get("Agreement"),
+        &survivor_case.expected_members(
+            &other_server,
+            &other_partnership.local_profile,
+            &other_partnership.partner_profile,
+        ),
+    );
 }
 
 /// RULE (the bounds on the store): the agreement store is bounded BOTH per server and in
@@ -909,8 +943,8 @@ async fn an_agreement_outlives_the_server_it_references() {
 /// `ServiceUnavailableException` instead of growing, and the refusal disturbs no stored
 /// record.
 ///
-/// The total bound is the one a caller cannot recycle past: an agreement outlives the
-/// server it references, so the rows below drive the per-server bound on one server and
+/// The total bound is reached across servers rather than on one: each server has its own
+/// per-server allowance, so the rows below drive the per-server bound on one server and
 /// then the total bound from a FRESH server, which has its whole per-server allowance.
 #[tokio::test]
 async fn the_agreement_store_is_bounded_per_server_and_in_total() {
@@ -955,9 +989,9 @@ async fn the_agreement_store_is_bounded_per_server_and_in_total() {
     );
 
     // Row 2: the store is at its TOTAL bound, reached the way a caller reaches it — new
-    // servers, each with a fresh per-server allowance, while nothing reclaims the
-    // agreements of the servers before them. The records are seeded directly so the row
-    // asserts the bound rather than spending a wire call per record.
+    // servers, each with a fresh per-server allowance, none of them deleted. The records
+    // are seeded directly so the row asserts the bound rather than spending a wire call
+    // per record.
     {
         let store = emulator.store();
         let mut guard = store.lock();

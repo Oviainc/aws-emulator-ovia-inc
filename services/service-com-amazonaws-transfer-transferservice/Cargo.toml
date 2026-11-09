@@ -26,6 +26,9 @@ hex = { workspace = true }
 # OpenSSH key formats: generates a server's host key and computes the Base64 SHA256
 # fingerprint `DescribedServer.HostKeyFingerprint` reports (see `src/state.rs`).
 ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "getrandom"] }
+# Decodes the base64 key payload of an `SshPublicKeyBody`, which is what says whether
+# the body carries key material at all (see `src/state/ssh_public_key_body.rs`).
+base64 = "0.22"
 # `arn::parse`: the ONE shared ARN parse, which the authorization gate reads a role
 # ARN's account and resource fields through; `iam_authorization`: the ONE shared
 # evaluation of IAM policy documents, which makes that gate's decision.

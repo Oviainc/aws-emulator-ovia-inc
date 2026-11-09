@@ -288,6 +288,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A key body the service does not accept as an SSH public key — an algorithm
+        // outside the key types it accepts, or material that is no base64 payload at
+        // all — is refused on the same rule `ImportSshPublicKey` applies, and before
+        // the user is created, so no user is ever created holding a key that could not
+        // authenticate a session. See `crate::state::ssh_public_key_body`.
+        if let Some(message) = input
+            .ssh_public_key_body
+            .as_deref()
+            .map(st::stored_ssh_public_key_body)
+            .and_then(|body| st::ssh_public_key_body::unsupported_key_body(&body))
+        {
+            return Err(CreateUserErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: message.to_string(),
+                },
+            )
+            .into());
+        }
+
         let state = st::service_state(&*self.engine).ok_or_else(|| {
             CreateUserErrorModeled::InternalServiceError(InternalServiceError {
                 message: "the transfer service state is unavailable".to_string(),

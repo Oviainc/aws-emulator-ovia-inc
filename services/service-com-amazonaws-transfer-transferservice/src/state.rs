@@ -63,6 +63,8 @@ pub mod connector_delivery;
 pub mod connector_plane;
 pub mod remote_storage;
 pub mod sftp_target;
+pub mod ssh_public_key_body;
+pub mod web_app_customization;
 pub mod workflow_runs;
 
 /// One run of a workflow, and the store the runs live in: they are their own concern,
@@ -3106,6 +3108,10 @@ pub struct WebApp {
     /// When the update this web app is CURRENTLY applying completes, or `None` when it
     /// is applying none — see [`WEB_APP_UPDATE_SPAN`].
     pub update_due: Option<Instant>,
+    /// Whether a write of this web app's CUSTOMIZATION is being applied right now, and
+    /// so whether a second one that arrives is a racing writer — see
+    /// [`web_app_customization`], which is the one place this is taken and released.
+    pub customization_write_in_flight: bool,
 }
 
 /// How long a web app is applying an `UpdateWebApp` before the next update may begin.
@@ -3721,6 +3727,17 @@ impl ComAmazonawsTransferTransferserviceState {
 /// `arn:aws:transfer:<region>:<account>:server/<ServerId>`.
 pub fn server_arn(region: &str, server_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("server/{server_id}"))
+}
+
+/// `arn:aws:transfer:<region>:<account>:server/*` — the resource an action on the
+/// SERVER resource type is evaluated against when the request names no server instance.
+///
+/// `CreateServer` is such an action: the identifier is the service's to mint, so the
+/// only server resource the request can be judged on is every server of the account in
+/// the Region it was signed for. The wildcard is IAM's own, so a policy scoped to a
+/// single server does not cover it while one scoped to the type does.
+pub fn any_server_arn(region: &str) -> String {
+    server_arn(region, "*")
 }
 
 /// `arn:aws:transfer:<region>:<account>:profile/<ProfileId>`.

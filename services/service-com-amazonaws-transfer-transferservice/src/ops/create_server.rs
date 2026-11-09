@@ -292,14 +292,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
+        // The Region the request was signed for, read once: both the resource the
+        // authorization gate decides this action on and the ARNs the created server
+        // carries are in it.
+        let region = st::request_region(ctx.parts());
+
         // WHO is asking is decided before WHAT is asked: a caller whose identity
         // policy explicitly denies this action is refused with the modelled
-        // `AccessDeniedException` (HTTP 403) and nothing is created. The gate reads
-        // the account's own IAM store, so a policy the caller changes changes the
+        // `AccessDeniedException` (HTTP 403) and nothing is created. The action is
+        // decided on the SERVER resource type's wildcard ARN — this create names no
+        // server instance, because the identifier is the service's to mint — and the
+        // refusal states that resource, so a caller can attribute the denial. The gate
+        // reads the account's own IAM store, so a policy the caller changes changes the
         // next answer. See `crate::state::authorization`.
-        if let Some(message) =
-            st::authorization::explicit_deny(&*self.engine, ctx.parts(), Self::NAME, None)
-        {
+        let evaluated_resource = st::any_server_arn(&region);
+        if let Some(message) = st::authorization::explicit_deny(
+            &*self.engine,
+            ctx.parts(),
+            Self::NAME,
+            Some(&evaluated_resource),
+        ) {
             return Err(CreateServerErrorModeled::AccessDeniedException(
                 AccessDeniedException {
                     message: Some(message),
@@ -374,6 +386,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &*self.engine,
                     invocation_role,
                     url,
+                    &region,
                 ) {
                     return Err(CreateServerErrorModeled::InvalidRequestException(
                         InvalidRequestException {
@@ -390,7 +403,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the transfer service state is unavailable".to_string(),
             })
         })?;
-        let region = st::request_region(ctx.parts());
         let now = ::std::time::Instant::now();
 
         let mut guard = state.lock();

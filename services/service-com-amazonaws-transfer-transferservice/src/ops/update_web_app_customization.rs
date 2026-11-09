@@ -21,9 +21,12 @@
 //! app has a customization again, and its readers project it rather than refusing.
 //!
 //! A `WebAppId` the store does not hold is answered with the modelled
-//! `ResourceNotFoundException`. The model carries no version, ETag or client token for
-//! this operation, so there is no documented condition under which it conflicts: two
-//! updates of one web app both apply, in the order the store serialises them.
+//! `ResourceNotFoundException`. Two writes of ONE web app's customization that overlap
+//! in time do not both apply: the service admits one writer at a time and refuses the
+//! racing one with the modelled `ConflictException` (HTTP 409), so the surviving
+//! customization is one submitter's values rather than a mixture — see
+//! [`crate::state::web_app_customization`], which both this operation and the delete
+//! take that claim through. Writes that do not overlap are serialised and both apply.
 //!
 //! ## Shape of an operation
 //!
@@ -183,25 +186,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let mut guard = state.lock();
-        let Some(stored) = guard.web_apps.get_mut(&input.web_app_id) else {
-            return Err(st::not_found(
-                UpdateWebAppCustomizationErrorModeled::ResourceNotFoundException(
-                    st::unknown_web_app(&input.web_app_id),
-                ),
-            ));
+        // One writer of this web app's customization at a time: a write that arrives
+        // while another is still being applied is refused with the modelled
+        // `ConflictException` (HTTP 409) rather than racing it, so two concurrent
+        // writers have exactly one winner. The claim is OWNED for as long as this write
+        // may still happen and released when `_claim` is dropped — on every exit below,
+        // and on a request that is cancelled at the await. See
+        // `crate::state::web_app_customization`.
+        let _claim = match st::web_app_customization::claim(&state, &input.web_app_id) {
+            Ok(claim) => claim,
+            Err(st::web_app_customization::Refusal::Conflict) => {
+                return Err(UpdateWebAppCustomizationErrorModeled::ConflictException(
+                    st::web_app_customization::write_conflict(),
+                )
+                .into());
+            }
+            Err(st::web_app_customization::Refusal::NoSuchWebApp) => {
+                return Err(st::not_found(
+                    UpdateWebAppCustomizationErrorModeled::ResourceNotFoundException(
+                        st::unknown_web_app(&input.web_app_id),
+                    ),
+                ));
+            }
         };
 
-        // The partial-update rule, applied through the one function that holds it:
-        // every member the request carries is assigned, every member it omits is left
-        // as it stands. An update of a web app that holds no customization object
-        // creates it, which is what makes the update the counterpart of the delete.
-        stored
-            .customization
-            .get_or_insert_with(st::WebAppCustomization::default)
-            .assign(input.title, input.logo_file, input.favicon_file);
-        let web_app_id = stored.web_app_id.clone();
-        drop(guard);
+        // The claim is held across this point, which is where a write of the same web
+        // app's customization that is in flight AT THE SAME TIME reaches the claim
+        // above and is refused.
+        st::web_app_customization::admit_a_racing_writer().await;
+
+        // The state lock is taken for the write alone and released before the claim is,
+        // which the release needs it to be.
+        let web_app_id = {
+            let mut guard = state.lock();
+            let Some(stored) = guard.web_apps.get_mut(&input.web_app_id) else {
+                return Err(st::not_found(
+                    UpdateWebAppCustomizationErrorModeled::ResourceNotFoundException(
+                        st::unknown_web_app(&input.web_app_id),
+                    ),
+                ));
+            };
+
+            // The partial-update rule, applied through the one function that holds it:
+            // every member the request carries is assigned, every member it omits is
+            // left as it stands. An update of a web app that holds no customization
+            // object creates it, which is what makes the update the counterpart of the
+            // delete.
+            stored
+                .customization
+                .get_or_insert_with(st::WebAppCustomization::default)
+                .assign(input.title, input.logo_file, input.favicon_file);
+            stored.web_app_id.clone()
+        };
 
         Ok(UpdateWebAppCustomizationOutput { web_app_id })
     }
