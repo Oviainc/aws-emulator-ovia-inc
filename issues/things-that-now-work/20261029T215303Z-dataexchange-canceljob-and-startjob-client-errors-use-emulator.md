@@ -68,3 +68,40 @@ Smithy citations: CancelJob DELETE /v1/jobs/{JobId} code 204, errors ConflictExc
 3. Cause 2: DELETE /v1/jobs/{JobId} (CancelJob) with the same never-created JobId and make the same comparison.
 4. Cause 3: CreateDataSet -> CreateRevision -> CreateJob(Type=IMPORT_ASSET_FROM_SIGNED_URL) to get a WAITING job, then CancelJob once (it succeeds, 204, and GetJob reports CANCELLED). Call CancelJob again on the same JobId: a 409 ConflictException comes back; compare $.Message against the exact string 'Cannot cancel the requested Job. To cancel a Job, it must be in the WAITING state.' The emulator instead emits its own sentence with the JobId and the stored state interpolated.
 5. Repeat cause 3 with a job in another non-WAITING state to confirm the emulator varies the sentence with stored state, where AWS's text is invariant.
+
+## Resolution
+
+All three causes are closed, and the one divergence the fixture's job plane has left is a
+transport boundary rather than behaviour this crate states.
+
+Causes 1 and 2 (the `ResourceNotFoundException` message on `StartJob` and `CancelJob`): the
+crate's ONE not-found constructor (`crate::state`'s `resource_not_found`, reached from every
+lookup site including both job-plane handlers) mints the fixed sentence "The requested resource
+was not found." and reports the identity in `ResourceId`/`ResourceType`. Nothing is interpolated
+into the text. Pinned by `tests/all/not_found_message.rs`, whose table includes the `StartJob`
+and `CancelJob` rows over several well-formed-but-absent ids.
+
+Cause 3 (the `ConflictException` message on a job whose `State` does not admit the call): the
+crate's ONE job-state conflict constructor (`crate::state::job_state_conflict`) composes
+"Cannot cancel the requested Job. To cancel a Job, it must be in the WAITING state." from the
+operation's own verb alone — neither the job's id nor the state it is actually in reaches the
+sentence — and the identity travels in `ResourceId`/`ResourceType`. Pinned by
+`tests/all/job_state_conflict_message.rs`, whose table spans both operations, every
+non-`WAITING` state a stored job reaches and every job `Type`.
+
+The step the fixture now diverges on is the `CancelJob` SUCCESS, on `$headers.content-length`:
+the recorded empty `204` states `content-length: 0` and the emulator stated no length at all.
+The service states that framing at the one place every modelled response is serialized
+(`Service::override_protocol` in `src/service.rs`, through the shared
+`service_common::no_content_responses`), so it holds for every operation of this model whose
+success is `204` over `Unit` — `CancelJob`, the deletes and both tag mutations — rather than
+for the one that prompted it. That half landed on mainline from
+`20261029T215303Z-dataexchange-canceljob-204-no-content-response-omits-the.md` while this
+report was being worked, which is why this report's own change is the record of its three
+message causes; this branch merged that work rather than carrying a second copy of the rule.
+CAVEAT: a client reached over HTTP/1.1 still does not see the header, because the HTTP writer
+the vendored transport serves with removes `content-length` from a `204`; that writer is under
+the read-only vendored tree, so the wire-level half is a platform limitation rather than
+something a service crate can state its way out of. What the service states is pinned by
+`tests/all/no_content_framing.rs`, and what a socket then delivers by
+`tests/all/no_content_wire_probe.rs`.

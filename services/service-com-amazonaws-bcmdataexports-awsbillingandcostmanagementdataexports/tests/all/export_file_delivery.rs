@@ -717,8 +717,11 @@ async fn the_clock_alone_delivers_the_export_file() {
 
     /// How often the bucket is read while waiting for the delivery the clock owes.
     const LOOK_INTERVAL: Duration = Duration::from_millis(100);
-    /// How many looks that is, which bounds the wait past the margin above at 20 s.
-    const LOOKS: usize = 200;
+    /// How many looks that is, which bounds the wait past the margin above at 120 s. The
+    /// bound is patience, not a weakened expectation: the assertion below is unchanged, and
+    /// a whole-workspace test run shares its cores with every other suite, so the task the
+    /// clock owes can be scheduled far later than it is owed.
+    const LOOKS: usize = 1_200;
 
     // The delivery is the CLOCK's, and a loaded machine can run it later than the margin
     // above: the bucket is read repeatedly, within a bound, rather than once after a fixed
