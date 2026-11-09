@@ -493,6 +493,10 @@ async fn the_published_block_limit_is_the_bound_on_what_a_directory_routes() {
         stored.len()
     );
 
+    // The accepted add left the directory under an update, which a second change has to
+    // wait out: what is compared to the limit here is the routing the directory has
+    // SETTLED on, so nothing but time passes first.
+    tokio::time::sleep(PAST_ONE_SPAN).await;
     refused(
         &router,
         "AddIpRoutes",

@@ -71,6 +71,8 @@ mod event_topics;
 mod harness;
 #[path = "all/ip_route_removal.rs"]
 mod ip_route_removal;
+#[path = "all/ip_route_update_serialization.rs"]
+mod ip_route_update_serialization;
 #[path = "all/ldaps.rs"]
 mod ldaps;
 #[path = "all/log_subscription_forwarding.rs"]
@@ -103,6 +105,8 @@ mod sharing_and_tagging_guards;
 mod single_sign_on;
 #[path = "all/snapshot_deletion.rs"]
 mod snapshot_deletion;
+#[path = "all/snapshot_read_scopes.rs"]
+mod snapshot_read_scopes;
 #[path = "all/snapshots.rs"]
 mod snapshots;
 #[path = "all/state_roundtrip.rs"]

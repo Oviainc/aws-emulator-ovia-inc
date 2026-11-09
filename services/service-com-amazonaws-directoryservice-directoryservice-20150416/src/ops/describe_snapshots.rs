@@ -226,19 +226,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Likewise for a `SnapshotIds` filter: an id naming no stored snapshot is
-        // reported rather than silently dropped from the page. The id arrived as a FILTER
-        // over the listing, so — like the `DirectoryId` above — the refusal reports the
-        // VALUE the listing cannot be narrowed by, which Directory Service answers as a
-        // parameter it would not accept rather than as an entity that does not exist: a
-        // snapshot id that resolved yesterday and was deleted since is no longer a usable
-        // filter value, while the directory the caller is reading is still there.
-        if let Some(requested) = requested_ids.as_ref() {
-            for snapshot_id in requested {
-                if !store.snapshots.contains_key(*snapshot_id) {
-                    return Err(invalid_parameter(crate::state::invalid_snapshot_id(
-                        snapshot_id,
-                    )));
+        // A `SnapshotIds` filter means two different things to the two read forms this
+        // operation has, and only ONE of them can refuse an id that resolves to nothing:
+        //
+        // * narrowed by a `DirectoryId` the service holds, the listing is that
+        //   directory's snapshots and the ids SELECT within them, so an entry selecting
+        //   none of them selects nothing and the page — empty when nothing is left — is
+        //   served. That is what lets a caller confirm a snapshot is gone by reading the
+        //   directory it was taken of, which is the last step of the documented snapshot
+        //   workflow;
+        // * unscoped, the ids are the whole of what the request asks about, so an id no
+        //   snapshot is stored under is a filter VALUE this listing cannot be narrowed by
+        //   — reported as a parameter Directory Service would not accept rather than as
+        //   an entity that does not exist, the way the `DirectoryId` above is.
+        if input.directory_id.is_none() {
+            if let Some(requested) = requested_ids.as_ref() {
+                for snapshot_id in requested {
+                    if !store.snapshots.contains_key(*snapshot_id) {
+                        return Err(invalid_parameter(crate::state::invalid_snapshot_id(
+                            snapshot_id,
+                        )));
+                    }
                 }
             }
         }

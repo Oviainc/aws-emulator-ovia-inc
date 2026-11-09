@@ -5,7 +5,10 @@
 //! Routes IP address blocks to a stored directory: each block is persisted once, under
 //! the modelled `Adding` status that the clock moves to `Added`, and a request that
 //! names a block the directory already routes, or that would take it past the 100-block
-//! limit, is refused without adding anything.
+//! limit, is refused without adding anything. An accepted call puts the directory's IP
+//! routing under an update for that span, and a call arriving while that update is in
+//! flight is refused with the update-in-progress client exception — see
+//! [`crate::state::Directory::ip_route_change_in_flight`].
 //!
 //! ## Shape of an operation
 //!
@@ -237,6 +240,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
                 .into(),
             );
+        }
+
+        // Routing an address block is an update OF THE DIRECTORY, and a directory takes
+        // one update at a time: while the change an earlier accepted call started is
+        // still being applied — any block of this directory still in a transient status —
+        // a second change is refused as the update already in progress, before the
+        // request is compared to the stored blocks at all. So two calls that genuinely
+        // overlap settle as exactly one accepted change and one refusal naming the
+        // condition, instead of the second being evaluated against routes the first has
+        // only just written.
+        if directory.ip_route_change_in_flight() {
+            return Err(AddIpRoutesErrorModeled::ClientException(crate::state::refusal(
+                crate::state::directory_update_in_progress(&input.directory_id),
+            ))
+            .into());
         }
 
         // The whole request is checked BEFORE anything is written, so a request that

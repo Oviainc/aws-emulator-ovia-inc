@@ -27,8 +27,8 @@
 //!   family's other fixed sentence, naming the action and nothing else.
 //! * `EnableDirectoryDataAccess` / `DisableDirectoryDataAccess` against a directory already
 //!   in the desired state state one sentence naming only the directory.
-//! * `DescribeSnapshots` narrowed by a snapshot id nothing is stored under reports an
-//!   unusable FILTER VALUE (`InvalidParameterException`), not a missing entity.
+//! * `DescribeSnapshots` UNSCOPED and narrowed by a snapshot id nothing is stored under
+//!   reports an unusable FILTER VALUE (`InvalidParameterException`), not a missing entity.
 //! * a conditional-forwarder mutation against a directory outside the stages that serve its
 //!   DNS configuration is refused as a PARAMETER naming the mutation and those stages, and
 //!   the same call is served once the directory reaches one of them.
@@ -142,6 +142,10 @@ async fn already_routed_blocks_are_listed_in_the_client_refusal() {
         "already routed: seeding",
     )
     .await;
+    // The seeding add left the directory under an update, and a change arriving inside
+    // that window is refused for THAT reason. The rows below are about blocks the
+    // directory already routes, so they are issued once the seeded routing has settled.
+    tokio::time::sleep(PAST_ONE_SPAN).await;
 
     // The rows differ along HOW the block repeats and along what is reported: one stored
     // IPv4 block, a stored IPv6 block, two stored blocks at once (so the list has more than
