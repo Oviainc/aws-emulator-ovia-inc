@@ -16,6 +16,7 @@
 //! into parallel structs, so a stored packaging configuration is byte-for-byte what a
 //! later read renders.
 
+pub mod data_plane;
 pub mod harvest_destination;
 pub mod harvest_export;
 
@@ -1921,6 +1922,12 @@ pub fn bound_origin_endpoint_durations(
 /// `Origination`'s default: a new endpoint may be requested unless the caller denies it.
 pub const DEFAULT_ORIGINATION: &str = "ALLOW";
 
+/// The `Origination` value that switches origination OFF for an endpoint — "control
+/// whether origination of video is permitted for this OriginEndpoint … can be helpful for
+/// temporarily disabling origination" — which is what the playback plane refuses while it
+/// is stored ([`data_plane::permits_origination`]).
+pub const ORIGINATION_DENY: &str = "DENY";
+
 /// `StartoverWindowSeconds`' default. The model documents "If not specified, startover
 /// playback will be disabled for the OriginEndpoint" — a window of zero seconds.
 pub const DEFAULT_STARTOVER_WINDOW_SECONDS: i32 = 0;
@@ -2277,6 +2284,10 @@ pub struct ChannelRecord {
     /// ISO-8601, minted once at creation and never recomputed on a read.
     pub created_at: String,
     pub ingest_endpoints: Vec<IngestEndpoint>,
+    /// The live window of media an encoder has PUSHED into this channel through either of
+    /// its ingest endpoints, which is what its origin endpoints serve
+    /// ([`data_plane`]). Empty for a channel nothing has been pushed to.
+    pub ingest: data_plane::ChannelIngest,
     pub egress_log_group_name: Option<String>,
     pub ingress_log_group_name: Option<String>,
     pub tags: BTreeMap<String, String>,
@@ -2659,14 +2670,15 @@ impl ComAmazonawsMediapackageMediapackageState {
     /// valid for exactly that endpoint.
     pub fn mint_ingest_endpoints(&mut self, region: &str, channel_id: &str) -> Vec<IngestEndpoint> {
         let hostname = media_hostname(region);
-        let channel_label = stable_label(&[channel_id, region]);
+        let channel_label = channel_path_label(channel_id, region);
         (0..INGEST_ENDPOINT_COUNT)
             .map(|_| {
                 let id = self.mint_hex("ingest-endpoint", INGEST_GENERATED_BYTES);
                 let (username, password) = self.mint_ingest_credentials();
                 IngestEndpoint {
                     url: Some(format!(
-                        "https://{hostname}/in/v2/{channel_label}/{id}/channel"
+                        "https://{hostname}{}",
+                        data_plane::ingest_path(&channel_label, &id)
                     )),
                     id: Some(id),
                     username: Some(username),
@@ -3323,8 +3335,45 @@ pub fn media_hostname(region: &str) -> String {
 /// sit under one playback path.
 pub fn playback_url_prefix(region: &str, channel_id: &str, endpoint_id: &str) -> String {
     let hostname = media_hostname(region);
-    let endpoint_label = stable_label(&[channel_id, endpoint_id, region]);
-    format!("https://{hostname}/out/v1/{endpoint_label}")
+    let endpoint_label = endpoint_path_label(channel_id, endpoint_id, region);
+    format!(
+        "https://{hostname}{}{endpoint_label}",
+        data_plane::PLAYBACK_PATH_PREFIX
+    )
+}
+
+/// The opaque label a CHANNEL is named by in the path of every URL this service publishes
+/// for it — its ingest URLs ([`data_plane::ingest_path`]).
+///
+/// The single statement of that derivation: the channel's own id and the Region it was
+/// created in, so the label names one channel of one Region and the data plane resolves
+/// both from it ([`data_plane`]).
+pub fn channel_path_label(channel_id: &str, region: &str) -> String {
+    stable_label(&[channel_id, region])
+}
+
+/// The opaque label an ORIGIN ENDPOINT is named by in the path of its playback URLs.
+///
+/// The single statement of that derivation: the endpoint's own id, the channel it packages
+/// and the Region it was created in.
+pub fn endpoint_path_label(channel_id: &str, endpoint_id: &str, region: &str) -> String {
+    stable_label(&[channel_id, endpoint_id, region])
+}
+
+/// The path ONE child HLS manifest of a CMAF package is served at, below its endpoint's
+/// playback prefix: that child's own label, the name it carries, and the playlist.
+///
+/// The single statement of that path: [`cmaf_manifest_url`] publishes it and the playback
+/// plane answers at it ([`data_plane::playback_content`]).
+pub fn cmaf_manifest_path(
+    channel_id: &str,
+    endpoint_id: &str,
+    region: &str,
+    manifest_id: &str,
+    manifest_name: &str,
+) -> String {
+    let manifest_label = stable_label(&[channel_id, endpoint_id, manifest_id, region]);
+    format!("{manifest_label}/{manifest_name}/index.m3u8")
 }
 
 /// The playback URL for an OriginEndpoint: the endpoint's own playback path
@@ -3352,8 +3401,8 @@ pub fn cmaf_manifest_url(
     manifest_name: &str,
 ) -> String {
     let prefix = playback_url_prefix(region, channel_id, endpoint_id);
-    let manifest_label = stable_label(&[channel_id, endpoint_id, manifest_id, region]);
-    format!("{prefix}/{manifest_label}/{manifest_name}/index.m3u8")
+    let path = cmaf_manifest_path(channel_id, endpoint_id, region, manifest_id, manifest_name);
+    format!("{prefix}/{path}")
 }
 
 /// How many hex characters a constant initialization vector is written as.

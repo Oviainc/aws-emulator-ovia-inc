@@ -39,9 +39,10 @@
 //! ([`PackagingKind`]: an HLS master playlist for HLS and CMAF, an MPD for DASH, a server
 //! manifest for Microsoft Smooth), and it states only what this emulator knows: the
 //! harvested window, read off the submitted job, and nothing about renditions or segments.
-//! A MediaPackage channel here ingests nothing — this emulator serves no MediaPackage data
-//! plane — so the window a harvest reads back holds no published media, and a manifest
-//! naming segments or bitrates would describe content that is not there.
+//! What a channel of this emulator ingests is served to a viewer as it was pushed and is
+//! never repackaged ([`super::data_plane`]), so no rendition of a harvested window exists
+//! here, and a manifest naming segments or bitrates would describe content that is not
+//! there.
 
 use std::time::SystemTime;
 
@@ -180,11 +181,14 @@ pub(super) fn s3_client(
 /// The media type each packaging format's top-level manifest is served as: the type
 /// registered for an HLS playlist, for an MPEG-DASH MPD, and for a Microsoft Smooth
 /// Streaming server manifest.
-const HLS_MANIFEST_MEDIA_TYPE: &str = "application/vnd.apple.mpegurl";
+///
+/// `pub(super)` because the playback plane serves a manifest of the same format under the
+/// same type ([`super::data_plane::media_type_of`]): one registration, one place.
+pub(super) const HLS_MANIFEST_MEDIA_TYPE: &str = "application/vnd.apple.mpegurl";
 /// See [`HLS_MANIFEST_MEDIA_TYPE`].
-const DASH_MANIFEST_MEDIA_TYPE: &str = "application/dash+xml";
+pub(super) const DASH_MANIFEST_MEDIA_TYPE: &str = "application/dash+xml";
 /// See [`HLS_MANIFEST_MEDIA_TYPE`].
-const MSS_MANIFEST_MEDIA_TYPE: &str = "application/vnd.ms-sstr+xml";
+pub(super) const MSS_MANIFEST_MEDIA_TYPE: &str = "application/vnd.ms-sstr+xml";
 
 /// How many of a Microsoft Smooth manifest's ticks make a second: its `TimeScale` is in
 /// 100-nanosecond units, which is the scale that format's manifests carry.
@@ -222,10 +226,10 @@ pub fn harvested_manifest(
 /// format requires, and no variant.
 ///
 /// A master playlist's entries are the renditions of the harvested content, and a
-/// MediaPackage endpoint here has none to export: nothing is ingested into a channel of
-/// this emulator, so the startover window a harvest reads back holds no published
-/// rendition. Naming one — with a bandwidth or a child playlist — would describe content
-/// the harvest did not write.
+/// MediaPackage endpoint here has none to export: this emulator repackages nothing it was
+/// pushed (see the module docs), so the startover window a harvest reads back holds no
+/// published rendition. Naming one — with a bandwidth or a child playlist — would describe
+/// content the harvest did not write.
 fn hls_master_playlist() -> String {
     "#EXTM3U\n".to_string()
 }

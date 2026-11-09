@@ -25,6 +25,8 @@ mod cmaf_child_manifest_name_follows_the_endpoint;
 mod created_initialization_vector;
 #[path = "all/dash_live_manifest_defaults.rs"]
 mod dash_live_manifest_defaults;
+#[path = "all/data_plane.rs"]
+mod data_plane;
 #[path = "all/duration_floor_one_implementation.rs"]
 mod duration_floor_one_implementation;
 #[path = "all/empty_response_framing.rs"]

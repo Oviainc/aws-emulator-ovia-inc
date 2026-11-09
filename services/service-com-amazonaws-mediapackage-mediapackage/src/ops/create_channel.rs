@@ -203,6 +203,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description.clone(),
             created_at: crate::state::now_iso8601(),
             ingest_endpoints,
+            // A new channel has been pushed nothing yet: its ingest window is empty until
+            // an encoder authenticates at one of the endpoints above and pushes media
+            // (`crate::state::data_plane`).
+            ingest: crate::state::data_plane::ChannelIngest::default(),
             egress_log_group_name: None,
             ingress_log_group_name: None,
             tags: crate::state::tags_from_wire(&input.tags),

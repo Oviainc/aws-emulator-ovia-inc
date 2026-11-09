@@ -79,6 +79,26 @@
 //! that sequence, so it is counted nowhere, exactly as a request refused before dispatch
 //! is.
 //!
+//! ## The two data planes
+//!
+//! `CreateChannel` hands out ingest URLs and `CreateOriginEndpoint` a playback URL, and a
+//! URL is a promise that it can be FOLLOWED. Neither wire protocol is modelled, so both
+//! paths reach this file twice:
+//!
+//! - [`Service::can_handle`] also claims a request whose PATH is one of those URLs' and
+//!   names a channel or an endpoint THIS store holds, so following the URL routes back
+//!   here even when nothing else in the request names a service (an encoder presents its
+//!   ingest credentials rather than a signature, a viewer presents nothing, and the
+//!   published host names no service the front door resolves).
+//! - [`Service::override_routing_error`] serves it: that seam is reached BEFORE
+//!   authentication precisely for requests that name no modelled operation, which is what
+//!   makes an unsigned push and an unsigned playback request work.
+//!
+//! What each plane ANSWERS — which credentials authenticate an ingest push, what a channel
+//! retains of what was pushed, and what an origin endpoint's `Origination` and `Whitelist`
+//! let a viewer see — is [`crate::state::data_plane`]'s, decided under one hold of the
+//! store's guard. This file only turns the outcome it reports into an HTTP response.
+//!
 //! ## How a response with no body is framed
 //!
 //! Two operations here answer with no body at all: `TagResource` (POST
@@ -109,13 +129,18 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::constraints::{validate, Violation};
 use aws_smithy_schema_server::{ProtocolError, ServerProtocol};
+use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
     Refused, ServerHttpProtocol, Service,
+};
+
+use crate::state::data_plane::{
+    self, IngestOutcome, IngestTarget, PlaneRequest, PlaybackOutcome, PlaybackTarget,
 };
 
 /// The `com-amazonaws-mediapackage-mediapackage` emulated service: the generated [`ServiceDefinition`] plus
@@ -128,6 +153,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The input-validation gate for each modelled operation, keyed by the routing key
     /// the protocol resolves for it (the operation's own `NAME`). Built once, in `new`.
     input_validation: HashMap<&'static str, Box<dyn ErasedOperation>>,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because the two data planes are served from [`Service::can_handle`] and
+    /// [`Service::override_routing_error`], neither of which is an operation with a
+    /// `self.engine` of its own; both must read the one store `CreateChannel` and
+    /// `CreateOriginEndpoint` wrote to, not a second copy.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -136,10 +168,186 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             input_validation: input_validation_gates::<Eng>(),
+            engine,
         }
     }
+
+    /// Whether this request addresses the ingest collection of a channel THIS store holds,
+    /// through one of that channel's own ingest endpoints.
+    ///
+    /// The path labels are derived from the resources' own identities, so a path naming a
+    /// channel or an endpoint this store does not hold is claimed by nobody and gets the
+    /// router's unknown-endpoint refusal — which is what an address this emulator never
+    /// published should answer.
+    fn holds_ingest_target(&self, target: &IngestTarget) -> bool {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return false;
+        };
+        let store = state.lock();
+        store.ingest_channel_key(target).is_some()
+    }
+
+    /// Whether this request addresses the playback path of an origin endpoint THIS store
+    /// holds. See [`Self::holds_ingest_target`].
+    fn holds_playback_target(&self, target: &PlaybackTarget) -> bool {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return false;
+        };
+        let store = state.lock();
+        store.playback_endpoint_key(&target.endpoint_label).is_some()
+    }
+
+    /// Serve one request to the ingest collection of a channel this store holds.
+    ///
+    /// Every decision — which credentials authenticate, what a verified push stores, what
+    /// a read answers — is `crate::state::data_plane`'s, under one hold of the store's
+    /// guard; this renders the outcome it reports as the HTTP answer that outcome names,
+    /// after the guard is released.
+    fn serve_ingest(&self, req: &RtRequest, target: &IngestTarget) -> RtResponse {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return plane_status(STORE_UNAVAILABLE_STATUS);
+        };
+        let request = plane_request(req);
+        let outcome = {
+            let mut store = state.lock();
+            data_plane::serve_ingest(&mut store, target, &request)
+        };
+        match outcome {
+            IngestOutcome::Challenge(challenge) => {
+                let mut response = plane_status(401);
+                // RFC 9110 requires a 401 to carry the challenge that asks for
+                // credentials, and a Digest client is driven entirely by it: without one
+                // it cannot compute a response and can never push.
+                response
+                    .headers_mut()
+                    .insert("www-authenticate", challenge);
+                response
+            }
+            IngestOutcome::SchemeRefused => plane_status(403),
+            IngestOutcome::UnknownEndpoint | IngestOutcome::NoSuchObject => plane_status(404),
+            IngestOutcome::Stored => plane_status(200),
+            IngestOutcome::Served {
+                content,
+                media_type,
+            } => served(req, content, media_type),
+            IngestOutcome::MethodRefused => method_refused(INGEST_METHODS),
+            IngestOutcome::NameRefused | IngestOutcome::Unreadable => plane_status(400),
+            IngestOutcome::ObjectTooLarge => plane_status(413),
+            IngestOutcome::StoreFull => plane_status(507),
+        }
+    }
+
+    /// Serve one request to the playback path of an origin endpoint this store holds. See
+    /// [`Self::serve_ingest`] for the division of labour.
+    fn serve_playback(&self, req: &RtRequest, target: &PlaybackTarget) -> RtResponse {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return plane_status(STORE_UNAVAILABLE_STATUS);
+        };
+        let request = plane_request(req);
+        let outcome = {
+            let store = state.lock();
+            data_plane::serve_playback(&store, target, &request)
+        };
+        match outcome {
+            PlaybackOutcome::Forbidden => plane_status(403),
+            PlaybackOutcome::UnknownEndpoint | PlaybackOutcome::NoContent => plane_status(404),
+            PlaybackOutcome::Served {
+                content,
+                media_type,
+            } => served(req, content, media_type),
+            PlaybackOutcome::MethodRefused => method_refused(PLAYBACK_METHODS),
+        }
+    }
+}
+
+/// The methods an ingest collection serves, as the refusal of any other one states them.
+const INGEST_METHODS: &str = "GET, HEAD, PUT";
+
+/// The methods a playback path serves: a viewer reads, it does not write.
+const PLAYBACK_METHODS: &str = "GET, HEAD";
+
+/// The status a data-plane request is answered with when this service's store is
+/// unreachable — the planes' equivalent of the modelled server failure a handler answers
+/// with, in a plane that has no modelled envelope to state it in.
+const STORE_UNAVAILABLE_STATUS: u16 = 500;
+
+/// The request header the address a request came from is recorded in where it reached the
+/// emulator through a forwarder.
+const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
+
+/// The address a request that no forwarder recorded an address for came from: this emulator
+/// is reached in process or over the loopback interface, so that is where such a request
+/// arrived from.
+const LOOPBACK_SOURCE_ADDRESS: &str = "127.0.0.1";
+
+/// One data-plane request, as both planes read it off the wire.
+///
+/// The source address is the FIRST hop a forwarder recorded, and the loopback address for a
+/// request no forwarder recorded one for — the same reading every emulated data plane that
+/// reports a caller's source address uses.
+fn plane_request<'r>(req: &'r RtRequest) -> PlaneRequest<'r> {
+    let source_address = req
+        .headers()
+        .get(FORWARDED_FOR_HEADER)
+        .and_then(|forwarded| forwarded.split(',').next())
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+        .unwrap_or(LOOPBACK_SOURCE_ADDRESS);
+    PlaneRequest {
+        method: req.method(),
+        // The PATH the request addressed, read by the workspace's one reader of it, so a
+        // request that carries its endpoint in an absolute-form URI is read exactly like
+        // one that carries it in the host.
+        path: ::service_common::request_path(req.uri()),
+        authorization: req.headers().get("authorization"),
+        source_address,
+        body: req.body().bytes(),
+        now: std::time::SystemTime::now(),
+    }
+}
+
+/// One answer of a plane this service serves outside the model: the status, and no body.
+///
+/// The recorded listeners answer a refusal bare — a status and nothing else — so a client
+/// that presents the wrong credentials and one that presents the right ones under the wrong
+/// scheme cannot be told apart by what comes back, and a refused viewer learns nothing
+/// about the endpoint it asked for. Every refusal of both planes is framed this way, and
+/// the framing header states the length the answer has.
+fn plane_status(status: u16) -> RtResponse {
+    let mut response = RtResponse::new(
+        StatusCode::try_from(status).expect("the status is a constant of this module"),
+        SdkBody::empty(),
+    );
+    response.headers_mut().insert("content-length", "0");
+    response
+}
+
+/// A 405 naming the methods the plane that refused it serves, as RFC 9110 requires of one.
+fn method_refused(methods: &str) -> RtResponse {
+    let mut response = plane_status(405);
+    response.headers_mut().insert("allow", methods.to_string());
+    response
+}
+
+/// Serve `content` as `media_type`: the bytes, their length and their type — and for a
+/// `HEAD`, the same answer without the body, which is what that method asks for.
+fn served(req: &RtRequest, content: Vec<u8>, media_type: &'static str) -> RtResponse {
+    let length = content.len();
+    let mut response = RtResponse::new(
+        StatusCode::try_from(200u16).expect("200 is a valid status"),
+        if req.method() == "HEAD" {
+            SdkBody::empty()
+        } else {
+            SdkBody::from(content)
+        },
+    );
+    response.headers_mut().insert("content-type", media_type);
+    response
+        .headers_mut()
+        .insert("content-length", length.to_string());
+    response
 }
 
 /// One [`ModeledInputValidation`] gate per modelled operation.
@@ -465,6 +673,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
+        // A request that FOLLOWS one of the URLs this service published for a channel's
+        // ingest endpoints or an origin endpoint's playback path is claimed by the store
+        // that minted it, whatever else the request carries: such a URL is followed
+        // WITHOUT a signature (an encoder authenticates with the endpoint's own
+        // credentials, a viewer with nothing at all) and its published host names no
+        // service the front door resolves, so the route key cannot route it. Neither path
+        // binds a modelled operation, so nothing modelled is diverted here, and a path
+        // whose label names no resource THIS store holds is not claimed at all. See
+        // `crate::state::data_plane`.
+        if let Some(target) = crate::state::data_plane::parse_ingest_path(parts.uri.path()) {
+            return self.holds_ingest_target(&target);
+        }
+        if let Some(target) = crate::state::data_plane::parse_playback_path(parts.uri.path()) {
+            return self.holds_playback_target(&target);
+        }
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
@@ -521,8 +744,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        //
+        // A request that follows one of the URLs this service PUBLISHED is exactly that
+        // case by construction — the model binds no operation to an ingest or a playback
+        // path — so this is where the two data planes are served: the seam is reached
+        // BEFORE authentication precisely for a request that names no modelled operation,
+        // which is what lets an encoder authenticate with its ingest credentials and a
+        // viewer with none at all. Anything else keeps the framework's default.
+        let path = ::service_common::request_path(req.uri());
+        if let Some(target) = crate::state::data_plane::parse_ingest_path(path) {
+            return Some(self.serve_ingest(req, &target));
+        }
+        let target = crate::state::data_plane::parse_playback_path(path)?;
+        Some(self.serve_playback(req, &target))
     }
 
     fn override_framework_error(

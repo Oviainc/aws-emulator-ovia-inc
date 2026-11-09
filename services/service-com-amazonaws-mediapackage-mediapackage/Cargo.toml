@@ -26,6 +26,16 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex encoding for those labels and for the opaque List* paging tokens.
 hex = { workspace = true }
+# `ipnet`: the ONE reading of an IP address or range in CIDR notation, which the origin
+# endpoint's playback plane matches a viewer's source address against its `Whitelist`.
+ipnet = "2"
+# `md-5`: the digest HTTP Digest authentication (RFC 2617) is computed with, which is how
+# an encoder authenticates at a channel's HLS ingest endpoints.
+md-5 = "0.10"
+# `http-auth`: the maintained reader of RFC 7235's challenge/credentials grammar, which the
+# ingest plane reads the parameters of a presented Digest response with (no feature is
+# enabled: the parser is all this uses).
+http-auth = { version = "0.1", default-features = false }
 # `iam_trust_policy`: the one reading of an IAM trust policy, shared with every other
 # service that resolves a caller-supplied role before it writes.
 service-common = { path = "../common" }
