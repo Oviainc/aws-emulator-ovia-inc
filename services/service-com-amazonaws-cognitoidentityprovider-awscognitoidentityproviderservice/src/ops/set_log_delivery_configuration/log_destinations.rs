@@ -12,6 +12,16 @@
 //! that owns the resource holds it, BEFORE anything is stored, and a request naming a
 //! destination that does not resolve is refused with [`INVALID_DESTINATION_MESSAGE`].
 //!
+//! Holding the resource is necessary, not sufficient: a destination resolves only when it
+//! also satisfies what its OWN member documents of the resource. For a log group that is
+//! "The log group must not be encrypted with Key Management Service and must be in the same
+//! Amazon Web Services account as your user pool"
+//! (`CloudWatchLogsConfigurationType.LogGroupArn`) — the account is read from the ARN, and
+//! whether the group's data is encrypted is read from the owning service's own answer, so
+//! neither is a judgement this module makes about state it does not hold. The other two
+//! members document no such requirement of the resource, so existence is the whole question
+//! for them.
+//!
 //! Each owning service is reached the way the framework documents a handler reaching
 //! another emulated service ([`smithy_server_runtime::OperationContext::callback`]): an
 //! AWS SDK client over the in-process callback's HTTP client and credentials, so nothing
@@ -51,31 +61,52 @@ const DELIVERY_STREAM_RESOURCE_TYPE: &str = "deliverystream";
 /// resource field of `arn:<partition>:s3:::<bucket>` IS the bucket.
 const S3_ARN_NAMESPACE: &str = "s3";
 
-/// Whether `configurations` names a destination the service that owns it does not hold.
+/// The user pool a collection is being set on, as destination resolution reads it.
+///
+/// A pool is what the documented requirements are relative to: an ARN carrying no Region
+/// falls back to the pool's ([`destination_region`]), and a log group has to be in the
+/// pool's account.
+pub struct ConfiguredPool<'a> {
+    /// The Region the pool was created in.
+    pub region: &'a str,
+    /// The account the pool's own ARN names ([`account_of`]).
+    pub account: &'a str,
+}
+
+/// The account the ARN `arn` names, and otherwise the one account this emulator serves.
+///
+/// A pool's ARN is minted by this service and always carries the account, so the fallback
+/// stands in for nothing a request can produce: it only keeps a pool whose ARN cannot be
+/// read from making every destination of this account unreachable.
+pub fn account_of(arn: &str) -> String {
+    ::service_common::arn::parse(arn)
+        .map(|parsed| parsed.account.to_string())
+        .unwrap_or_else(|| ::engine::emulator_account_id().to_string())
+}
+
+/// Whether `configurations` names a destination that is not one `pool` may export to.
 ///
 /// Call it with NO state guard held — it awaits. Every entry is asked about, so the answer
 /// is about the whole collection a `SetLogDeliveryConfiguration` request carries, which is
 /// the unit that is accepted or refused.
 pub async fn names_an_unresolvable_destination(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
-    pool_region: &str,
+    pool: &ConfiguredPool<'_>,
     configurations: &[LogConfigurationType],
 ) -> bool {
     for configuration in configurations {
         if let Some(cloud_watch_logs) = &configuration.cloud_watch_logs_configuration {
-            if log_group_is_absent(ctx, pool_region, cloud_watch_logs.log_group_arn.as_deref())
-                .await
-            {
+            if log_group_is_absent(ctx, pool, cloud_watch_logs.log_group_arn.as_deref()).await {
                 return true;
             }
         }
         if let Some(firehose) = &configuration.firehose_configuration {
-            if delivery_stream_is_absent(ctx, pool_region, firehose.stream_arn.as_deref()).await {
+            if delivery_stream_is_absent(ctx, pool, firehose.stream_arn.as_deref()).await {
                 return true;
             }
         }
         if let Some(s3) = &configuration.s3_configuration {
-            if bucket_is_absent(ctx, pool_region, s3.bucket_arn.as_deref()).await {
+            if bucket_is_absent(ctx, pool, s3.bucket_arn.as_deref()).await {
                 return true;
             }
         }
@@ -83,31 +114,43 @@ pub async fn names_an_unresolvable_destination(
     false
 }
 
-/// Whether CloudWatch Logs holds no log group under `arn`.
+/// Whether CloudWatch Logs holds no log group `pool` may export to under `arn`.
 ///
-/// A destination carrying no ARN, and one whose ARN is not a CloudWatch Logs log group's,
-/// names no log group at all: there is nothing to ask about, and no log group is there to
-/// export to whatever CloudWatch Logs would answer.
+/// A destination carrying no ARN, one whose ARN is not a CloudWatch Logs log group's, and
+/// one naming a group of another account name no log group this pool may export to: there
+/// is nothing to ask about, and no log group is there to export to whatever CloudWatch Logs
+/// would answer.
 async fn log_group_is_absent(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
-    pool_region: &str,
+    pool: &ConfiguredPool<'_>,
     arn: Option<&str>,
 ) -> bool {
     let Some(arn) = arn else {
         return true;
     };
-    if named_resource(arn, LOGS_ARN_NAMESPACE, LOG_GROUP_RESOURCE_TYPE).is_none() {
+    if log_group_of_account(arn, pool.account).is_none() {
         return true;
     }
     // A `logGroupIdentifier` names a log group "by name or ARN", so which group this ARN
     // addresses is read by the service that holds the group rather than re-read here.
-    let answer = logs_client(ctx, destination_region(arn, LOGS_ARN_NAMESPACE, pool_region))
+    let answer = logs_client(ctx, destination_region(arn, LOGS_ARN_NAMESPACE, pool.region))
         .describe_log_groups()
         .log_group_identifiers(arn)
         .send()
         .await;
     match answer {
-        Ok(answer) => answer.log_groups().is_empty(),
+        Ok(answer) => match answer.log_groups().first() {
+            // CloudWatch Logs holds no group this ARN addresses.
+            None => true,
+            // "The log group must not be encrypted with Key Management Service"
+            // (`CloudWatchLogsConfigurationType.LogGroupArn`): a group whose ingested data
+            // CloudWatch Logs encrypts with a KMS key is not a destination a pool may
+            // export to, however much the group itself is there. Which groups those are is
+            // the owning service's answer — `LogGroup$kmsKeyId` is "the Amazon Resource
+            // Name (ARN) of the KMS key to use when encrypting log data" — not a judgement
+            // made here.
+            Some(group) => group.kms_key_id().is_some(),
+        },
         Err(error) => {
             unresolved(arn, "CloudWatch Logs log group", &error);
             false
@@ -118,7 +161,7 @@ async fn log_group_is_absent(
 /// Whether Amazon Data Firehose holds no delivery stream under `arn`.
 async fn delivery_stream_is_absent(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
-    pool_region: &str,
+    pool: &ConfiguredPool<'_>,
     arn: Option<&str>,
 ) -> bool {
     let Some(arn) = arn else {
@@ -130,7 +173,7 @@ async fn delivery_stream_is_absent(
     };
     let answer = firehose_client(
         ctx,
-        destination_region(arn, FIREHOSE_ARN_NAMESPACE, pool_region),
+        destination_region(arn, FIREHOSE_ARN_NAMESPACE, pool.region),
     )
     .describe_delivery_stream()
     .delivery_stream_name(stream)
@@ -157,7 +200,7 @@ async fn delivery_stream_is_absent(
 /// Whether Amazon S3 holds no bucket under `arn`.
 async fn bucket_is_absent(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
-    pool_region: &str,
+    pool: &ConfiguredPool<'_>,
     arn: Option<&str>,
 ) -> bool {
     let Some(arn) = arn else {
@@ -169,7 +212,7 @@ async fn bucket_is_absent(
     // "All bucket names in the response begin with the specified bucket name prefix"
     // (`ListBucketsRequest$Prefix`), so the bucket this ARN names is the one the answer
     // carries under exactly that name.
-    let answer = s3_client(ctx, destination_region(arn, S3_ARN_NAMESPACE, pool_region))
+    let answer = s3_client(ctx, destination_region(arn, S3_ARN_NAMESPACE, pool.region))
         .list_buckets()
         .prefix(bucket)
         .send()
@@ -198,6 +241,18 @@ fn named_resource<'a>(arn: &'a str, vendor: &str, resource_type: &str) -> Option
     }
     let name = ::service_common::arn::resource_id_of_type(arn, resource_type)?;
     (!name.is_empty()).then_some(name)
+}
+
+/// The log group `arn` names in `pool_account`, when it names one at all.
+///
+/// Beside what every destination ARN has to name ([`named_resource`]), a log group carries
+/// the one requirement this member DOCUMENTS of the resource's own identity: the group
+/// "must be in the same Amazon Web Services account as your user pool"
+/// (`CloudWatchLogsConfigurationType.LogGroupArn`), so a group of ANOTHER account names no
+/// destination this pool may export to, whoever holds it.
+fn log_group_of_account<'a>(arn: &'a str, pool_account: &str) -> Option<&'a str> {
+    let name = named_resource(arn, LOGS_ARN_NAMESPACE, LOG_GROUP_RESOURCE_TYPE)?;
+    (::service_common::arn::parse(arn)?.account == pool_account).then_some(name)
 }
 
 /// The bucket an `S3ConfigurationType.BucketArn` names.
@@ -420,6 +475,79 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected the bucket {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// Which log groups are in the pool's own account, which the member documents as the
+    /// only ones a pool may export to.
+    #[test]
+    fn only_a_log_group_of_the_pools_account_names_a_destination() {
+        let pool_account = "000000000000";
+        // (case, the ARN, the name it gives a log group of the pool's account)
+        let cases: [(&str, &str, Option<&str>); 5] = [
+            (
+                "a log group of the pool's own account",
+                "arn:aws:logs:us-east-1:000000000000:log-group:/aws/cognito/pool",
+                Some("/aws/cognito/pool"),
+            ),
+            (
+                "a log group of another account",
+                "arn:aws:logs:us-east-1:123456789012:log-group:/aws/cognito/pool",
+                None,
+            ),
+            (
+                "another account, in another Region and partition",
+                "arn:aws-cn:logs:cn-north-1:111122223333:log-group:/aws/cognito/pool",
+                None,
+            ),
+            (
+                "the pool's account, in another Region",
+                "arn:aws:logs:eu-west-2:000000000000:log-group:/aws/cognito/pool",
+                Some("/aws/cognito/pool"),
+            ),
+            (
+                "an ARN carrying no account at all",
+                "arn:aws:logs:us-east-1::log-group:/aws/cognito/pool",
+                None,
+            ),
+        ];
+        for (case, arn, expected) in cases {
+            let actual = log_group_of_account(arn, pool_account);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the log group {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// Which account a destination's requirements are judged against: the one the pool's
+    /// own ARN names.
+    #[test]
+    fn the_pools_account_is_the_one_its_own_arn_names() {
+        // (case, the pool's ARN, the account it names)
+        let cases: [(&str, &str, &str); 3] = [
+            (
+                "a user pool ARN",
+                "arn:aws:cognito-idp:us-east-1:000000000000:userpool/us-east-1_abcd1234",
+                "000000000000",
+            ),
+            (
+                "a user pool ARN of another account",
+                "arn:aws:cognito-idp:eu-west-2:123456789012:userpool/eu-west-2_abcd1234",
+                "123456789012",
+            ),
+            (
+                "a value that is not an ARN falls back to the account this emulator serves",
+                "us-east-1_abcd1234",
+                ::engine::emulator_account_id(),
+            ),
+        ];
+        for (case, arn, expected) in cases {
+            let actual = account_of(arn);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the account {expected:?}, got {actual:?}"
             );
         }
     }

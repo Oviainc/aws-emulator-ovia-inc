@@ -6,8 +6,9 @@
 //! become the ones the request carries, so an empty collection is a clear and a
 //! configuration the request leaves out is one the pool no longer has. Every entry
 //! is judged BEFORE anything is written — including the DESTINATION it names, which
-//! is resolved against the service that holds it ([`log_destinations`]) — so a
-//! refused request leaves the pool's logging configuration exactly as it was.
+//! is resolved against the service that holds it and against what that destination's
+//! own member documents of the resource ([`log_destinations`]) — so a refused
+//! request leaves the pool's logging configuration exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -170,15 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(internal_error());
         };
 
-        // The pool's feature plan and its Region are read under the guard, which is
-        // then released: resolving a destination against the service that holds it
-        // is an await, and no lock over this service's state is held across one.
-        let (user_pool_tier, pool_region) = {
+        // The pool's feature plan and the Region and account its own ARN names are
+        // read under the guard, which is then released: resolving a destination
+        // against the service that holds it is an await, and no lock over this
+        // service's state is held across one.
+        let (user_pool_tier, pool_region, pool_account) = {
             let guard = state.lock();
             let pool = guard
                 .pool(&input.user_pool_id)
                 .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-            (pool.user_pool_tier.clone(), pool.region.clone())
+            (
+                pool.user_pool_tier.clone(),
+                pool.region.clone(),
+                log_destinations::account_of(&pool.arn),
+            )
         };
 
         // The whole collection is judged before the first entry is stored, so a
@@ -186,11 +192,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         check_request(&input.log_configurations, &user_pool_tier)?;
 
         // A pool exports its logs to resources of OTHER services, so a destination
-        // is accepted only once the service that owns it reports holding what the
-        // ARN names.
+        // is accepted only once the service that owns it reports holding a resource
+        // the pool may export to: what the ARN names, in the account and under the
+        // conditions the destination's own member documents.
         if log_destinations::names_an_unresolvable_destination(
             ctx,
-            &pool_region,
+            &log_destinations::ConfiguredPool {
+                region: &pool_region,
+                account: &pool_account,
+            },
             &input.log_configurations,
         )
         .await

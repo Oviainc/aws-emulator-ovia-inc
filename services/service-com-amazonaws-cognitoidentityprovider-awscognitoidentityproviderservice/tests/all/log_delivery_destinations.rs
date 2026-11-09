@@ -13,10 +13,18 @@
 //! state AT THE MOMENT OF THE CALL, not a list written here: a destination that resolved
 //! once stops resolving when the owning service no longer holds it.
 //!
+//! Holding the resource is necessary, not sufficient: a destination resolves only when it
+//! also satisfies what its own member documents of the resource. `LogGroupArn` is the one
+//! that documents any — "The log group must not be encrypted with Key Management Service
+//! and must be in the same Amazon Web Services account as your user pool" — so a log group
+//! of another account, and one CloudWatch Logs reports a KMS key for, are refused the same
+//! way a group nothing holds is.
+//!
 //! The rows span what the rule generalises over rather than one recorded request: WHICH
 //! destination member carries the ARN, WHICH event source is configured, whether the
 //! resource was never created or was created and then deleted, how many entries the
-//! collection carries, and a member that names no resource at all.
+//! collection carries, a member that names no resource at all, WHICH account the ARN
+//! names, and whether the owning service reports the resource as encrypted.
 //!
 //! Every service is mounted on ONE shared engine, exactly as the assembled emulator mounts
 //! them, so each destination is created through its own service's wire and resolved through
@@ -197,9 +205,80 @@ async fn given_delivery_stream(router: &MultiServiceRouter, name: &str) {
     );
 }
 
-/// The `CloudWatchLogsConfiguration.LogGroupArn` of the log group `name`.
+/// The `CloudWatchLogsConfiguration.LogGroupArn` of the log group `name`, in the account
+/// this emulator serves — which is the account every pool created here is in.
 fn log_group_arn(name: &str) -> String {
-    format!("arn:aws:logs:{REGION}:{}:log-group:{name}", account())
+    log_group_arn_in_account(account(), name)
+}
+
+/// The `CloudWatchLogsConfiguration.LogGroupArn` of the log group `name` in `account`.
+fn log_group_arn_in_account(account: &str, name: &str) -> String {
+    format!("arn:aws:logs:{REGION}:{account}:log-group:{name}")
+}
+
+/// A KMS key ARN of the form CloudWatch Logs' `kmsKeyId` documents ("The Amazon Resource
+/// Name (ARN) of the KMS key to use when encrypting log data"). No KMS service is mounted
+/// here, so this asserts nothing about KMS: what the rows below turn on is only that
+/// CloudWatch Logs REPORTS the group as encrypted.
+fn kms_key_arn() -> String {
+    format!(
+        "arn:aws:kms:{REGION}:{}:key/9cf5a1b2-0e4d-4c7a-9b3f-1d2e3f4a5b6c",
+        account()
+    )
+}
+
+/// Have CloudWatch Logs encrypt the log group `name` with `kms_key_id`, through its own
+/// wire, so its own read reports the group's `kmsKeyId`.
+async fn associate_kms_key(router: &MultiServiceRouter, name: &str, kms_key_id: &str) {
+    let (status, payload) = json_rpc(
+        router,
+        "logs",
+        "Logs_20140328",
+        "AssociateKmsKey",
+        &json!({ "logGroupName": name, "kmsKeyId": kms_key_id }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "AssociateKmsKey({name}) must succeed, got {status} with {payload}"
+    );
+}
+
+/// Clear the KMS key from the log group `name`, so CloudWatch Logs stops reporting one.
+async fn disassociate_kms_key(router: &MultiServiceRouter, name: &str) {
+    let (status, payload) = json_rpc(
+        router,
+        "logs",
+        "Logs_20140328",
+        "DisassociateKmsKey",
+        &json!({ "logGroupName": name }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "DisassociateKmsKey({name}) must succeed, got {status} with {payload}"
+    );
+}
+
+/// Assert that setting `log_configurations` on `user_pool_id` is refused as a destination
+/// the pool may not export to, and report `case` on every failure.
+async fn refused_as_an_invalid_destination(
+    router: &MultiServiceRouter,
+    case: &str,
+    user_pool_id: &str,
+    log_configurations: &Value,
+) {
+    let (status, payload) = set(router, user_pool_id, log_configurations).await;
+    assert_eq!(
+        (status, error_code(&payload)),
+        (400, "InvalidParameterException"),
+        "case {case:?}: expected a 400 InvalidParameterException, got {status} with {payload}"
+    );
+    let message = error_message(&payload);
+    assert_eq!(
+        message, INVALID_DESTINATION,
+        "case {case:?}: expected {INVALID_DESTINATION:?}, got {message:?}"
+    );
 }
 
 /// The `FirehoseConfiguration.StreamArn` of the delivery stream `name`.
@@ -388,6 +467,120 @@ async fn a_destination_is_accepted_only_where_the_service_that_owns_it_holds_it(
              got {configuration}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_log_group_destination_must_be_in_the_pools_own_account() {
+    let router = router();
+    let user_pool_id = given_destinations(&router).await;
+
+    // (case, the account the ARN names, whether the pool may export to it)
+    //
+    // The rule is `CloudWatchLogsConfiguration.LogGroupArn`: the log group "must be in the
+    // same Amazon Web Services account as your user pool". Every pool created here is in
+    // the one account this emulator serves, so an ARN naming any other account names a
+    // group this pool may not export to — the log group of exactly that name is held, so
+    // what each row turns on is the ACCOUNT and nothing else.
+    let rows: [(&str, &str, bool); 4] = [
+        ("the pool's own account", account(), true),
+        ("another account", "123456789012", false),
+        ("a third account", "111122223333", false),
+        (
+            "the pool's account with a digit changed",
+            "000000000001",
+            false,
+        ),
+    ];
+
+    // What the pool reports, which only an ACCEPTED row changes.
+    let mut stored = json!([]);
+    for (case, arn_account, exportable) in rows {
+        let log_configurations = json!([user_notification(&log_group_arn_in_account(
+            arn_account,
+            HELD_LOG_GROUP
+        ))]);
+        if exportable {
+            let (status, payload) = set(&router, &user_pool_id, &log_configurations).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the pool's own account holds this log group, got {status} \
+                 with {payload}"
+            );
+            stored = log_configurations.clone();
+        } else {
+            refused_as_an_invalid_destination(&router, case, &user_pool_id, &log_configurations)
+                .await;
+        }
+
+        let configuration = read_back(&router, case, &user_pool_id).await;
+        assert_eq!(
+            configuration,
+            json!({ "UserPoolId": user_pool_id, "LogConfigurations": stored }),
+            "case {case:?}: the pool must report the last accepted collection, \
+             got {configuration}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_log_group_the_owning_service_reports_as_encrypted_is_not_a_destination() {
+    let router = router();
+    let user_pool_id = given_destinations(&router).await;
+
+    // A second log group, so the pool can be left pointing at one that stays acceptable.
+    let rotated = "/aws/cognito/rotated-pool";
+    given_log_group(&router, rotated).await;
+
+    // The same group is acceptable while CloudWatch Logs reports no key for it.
+    let encrypted_group = json!([user_notification(&log_group_arn(HELD_LOG_GROUP))]);
+    ok(
+        &router,
+        "SetLogDeliveryConfiguration",
+        &json!({ "UserPoolId": user_pool_id, "LogConfigurations": encrypted_group }),
+    )
+    .await;
+
+    // Re-pointed at the second group, which is where the pool stays while the first is
+    // refused.
+    let plain_group = json!([user_notification(&log_group_arn(rotated))]);
+    ok(
+        &router,
+        "SetLogDeliveryConfiguration",
+        &json!({ "UserPoolId": user_pool_id, "LogConfigurations": plain_group }),
+    )
+    .await;
+
+    associate_kms_key(&router, HELD_LOG_GROUP, &kms_key_arn()).await;
+
+    // "The log group must not be encrypted with Key Management Service": the same request
+    // that was accepted above now names a group the owning service reports a KMS key for.
+    let case = "a log group CloudWatch Logs encrypts with a KMS key";
+    refused_as_an_invalid_destination(&router, case, &user_pool_id, &encrypted_group).await;
+    let configuration = read_back(&router, case, &user_pool_id).await;
+    assert_eq!(
+        configuration,
+        json!({ "UserPoolId": user_pool_id, "LogConfigurations": plain_group }),
+        "case {case:?}: the refused set must leave the pool on the group it was moved to, \
+         got {configuration}"
+    );
+
+    // The gate is the owning service's state at the moment of the call, so clearing the key
+    // makes the very same request acceptable again.
+    disassociate_kms_key(&router, HELD_LOG_GROUP).await;
+    let (status, payload) = set(&router, &user_pool_id, &encrypted_group).await;
+    assert_eq!(
+        status, 200,
+        "case {:?}: expected the set to be accepted once the key is cleared, got {status} \
+         with {payload}",
+        "a log group whose KMS key was disassociated"
+    );
+    let configuration = read_back(&router, "after the key was cleared", &user_pool_id).await;
+    assert_eq!(
+        configuration,
+        json!({ "UserPoolId": user_pool_id, "LogConfigurations": encrypted_group }),
+        "case {:?}: the accepted set must be what the pool reports, got {configuration}",
+        "a log group whose KMS key was disassociated"
+    );
 }
 
 #[tokio::test]
