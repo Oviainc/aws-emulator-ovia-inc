@@ -1207,9 +1207,7 @@ fn startup_notice_is_a_single_line_naming_the_controls() {
     let active = client_for(&server.base_url, dir.path());
     let notice = active.startup_notice();
     assert!(!notice.contains('\n'), "one line: {notice:?}");
-    assert!(
-        notice.starts_with("This emulator collects anonymous usage and error telemetry: enabled")
-    );
+    assert!(notice.starts_with("This emulator collects usage and error telemetry: enabled"));
     assert!(notice.contains(&format!("{TELEMETRY_SWITCH_ENV}={SWITCH_OFF}")));
     assert!(
         notice.contains(
@@ -1226,9 +1224,7 @@ fn startup_notice_is_a_single_line_naming_the_controls() {
     let configless = client_for(&server.base_url, off_dir.path());
     let notice = configless.startup_notice();
     assert!(!notice.contains('\n'));
-    assert!(
-        notice.starts_with("This emulator collects anonymous usage and error telemetry: enabled")
-    );
+    assert!(notice.starts_with("This emulator collects usage and error telemetry: enabled"));
     configless.shutdown(WAIT);
 }
 
@@ -2994,7 +2990,7 @@ fn nothing_is_transmitted_before_the_startup_notice() {
         "start emits the startup notice exactly once"
     );
     let (notice_instant, line) = &notices[0];
-    assert!(line.contains("collects anonymous usage and error telemetry: enabled"));
+    assert!(line.contains("collects usage and error telemetry: enabled"));
     let first_request = server
         .first_request_at()
         .expect("the flush reached the server");

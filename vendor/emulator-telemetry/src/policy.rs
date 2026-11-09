@@ -788,10 +788,15 @@ pub const README_ALLOWLIST_FOOTER: &str = "\
 The structural `environment`, `featureFlags`, `performance`, `crash`,
 and `latency` object keys are the only containers. `ALLOWED_WIRE_KEYS` in `policy.rs` pins
 this complete vocabulary, and `wire_schema_carries_no_forbidden_fields` proves
-that serialized output equals it exactly. Request/response bodies, raw headers,
-credentials, paths, ARNs, account or personal identifiers, resource names and
-keys, raw environment/config values, raw User-Agent strings, customer code,
-and error messages or frames are never sent.
+that serialized output equals it exactly. Request/response contents,
+credentials, paths, ARNs, account IDs or personal data, resource names and
+keys, raw environment/config values, the raw User-Agent string (or other
+request headers), customer code, error messages, and stack traces are
+never sent.
+
+`installationId` and `sessionId` are a random ID for the installation and a
+random ID for each run. The emulator makes them up; they are not derived from
+your account, hardware, or network.
 ";
 
 /// The distributor-responsibility sentence both README renderers embed
@@ -1270,7 +1275,7 @@ pub fn startup_notice_line(
     state: NoticeState,
     config_path: &str,
 ) -> String {
-    let subject = "This emulator collects anonymous usage and error telemetry";
+    let subject = "This emulator collects usage and error telemetry";
     let switch_env = TELEMETRY_SWITCH_ENV;
     let off = SWITCH_OFF;
     let on = SWITCH_ON;
@@ -1519,7 +1524,7 @@ mod tests {
                 path,
             );
             assert!(
-                line.starts_with("This emulator collects anonymous usage and error telemetry: "),
+                line.starts_with("This emulator collects usage and error telemetry: "),
                 "the notice must name the usage and error categories the page lists: {line}"
             );
             assert!(
