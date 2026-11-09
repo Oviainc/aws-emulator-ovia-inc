@@ -551,6 +551,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // "A case-insensitive list of applications for Amazon EMR to install and
+        // configure when launching the cluster" (RunJobFlow$Applications doc) names the
+        // applications; the RELEASE decides which version of each is installed, so the
+        // launch resolves every requested name against the release it names.
+        let applications = crate::state::installed_applications(
+            input.release_label.as_deref(),
+            input.applications.take().unwrap_or_default(),
+        );
+
         let record = ClusterRecord {
             id: id.clone(),
             arn: arn.clone(),
@@ -562,7 +571,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             service_role: input.service_role,
             job_flow_role: input.job_flow_role,
             auto_scaling_role: input.auto_scaling_role,
-            scale_down_behavior: input.scale_down_behavior,
+            scale_down_behavior: crate::state::effective_scale_down_behavior(
+                input.scale_down_behavior.take(),
+            ),
             custom_ami_id: input.custom_ami_id,
             security_configuration: input.security_configuration,
             os_release_label: input.os_release_label,
@@ -581,10 +592,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ebs_root_volume_throughput: input.ebs_root_volume_throughput,
             extended_support: input.extended_support,
             session_enabled: input.session_enabled,
-            applications: input.applications.unwrap_or_default(),
+            // The applications this cluster installs, resolved to the release's versions
+            // before the record is built (the release label is moved into it above).
+            applications,
             configurations: input.configurations.unwrap_or_default(),
             bootstrap_actions: input.bootstrap_actions.unwrap_or_default(),
-            placement_groups: input.placement_group_configs.unwrap_or_default(),
+            // The placement groups the launch really creates: an entry asking for the
+            // NONE strategy asks for no placement group at all.
+            placement_groups: crate::state::created_placement_groups(
+                input.placement_group_configs.take().unwrap_or_default(),
+            ),
             kerberos_attributes: input.kerberos_attributes,
             monitoring_configuration: input.monitoring_configuration,
             instances,

@@ -80,6 +80,12 @@ pub use modification_refusals::*;
 mod instance_fleet_modification;
 pub use instance_fleet_modification::*;
 
+/// The members Amazon EMR fills in for a launch that left them out — the effective
+/// configuration every read of a cluster or of its instance fleets reports — split out
+/// and re-exported the same way.
+mod launch_defaults;
+pub use launch_defaults::*;
+
 /// `com.amazonaws.emr#ClusterState`, as the wire carries it.
 pub mod cluster_state {
     pub const STARTING: &str = "STARTING";
@@ -2695,7 +2701,9 @@ impl InstancesRecord {
                 .keep_job_flow_alive_when_no_steps
                 .unwrap_or(false),
             termination_protected: config.termination_protected.unwrap_or(false),
-            unhealthy_node_replacement: config.unhealthy_node_replacement.unwrap_or(false),
+            unhealthy_node_replacement: config
+                .unhealthy_node_replacement
+                .unwrap_or(DEFAULT_UNHEALTHY_NODE_REPLACEMENT),
         }
     }
 }
@@ -2792,7 +2800,10 @@ pub struct ClusterRecord {
     pub service_role: Option<String>,
     pub job_flow_role: Option<String>,
     pub auto_scaling_role: Option<String>,
-    pub scale_down_behavior: Option<String>,
+    /// The scale-down behaviour this cluster runs under: the one its launch asked for, or
+    /// the one Amazon EMR applies to a launch that asked for none
+    /// ([`effective_scale_down_behavior`]). A described cluster always states it.
+    pub scale_down_behavior: String,
     pub custom_ami_id: Option<String>,
     pub security_configuration: Option<String>,
     pub os_release_label: Option<String>,
@@ -3191,15 +3202,18 @@ impl ClusterRecord {
             termination_protected: Some(self.instances.termination_protected),
             unhealthy_node_replacement: Some(self.instances.unhealthy_node_replacement),
             visible_to_all_users: Some(self.visible_to_all_users),
-            applications: optional_list(&self.applications),
-            tags: optional_list(&self.tags),
+            // A described cluster reports the collections it carries, empty for a launch
+            // that supplied none of that kind: an absent list would say the member is
+            // unknown where the service knows it is empty.
+            applications: Some(self.applications.clone()),
+            tags: Some(self.tags.clone()),
             service_role: self.service_role.clone(),
             normalized_instance_hours: Some(self.normalized_instance_hours()),
             master_public_dns_name: self.master_public_dns_name(),
-            configurations: optional_list(&self.configurations),
+            configurations: Some(served_configurations(&self.configurations)),
             security_configuration: self.security_configuration.clone(),
             auto_scaling_role: self.auto_scaling_role.clone(),
-            scale_down_behavior: self.scale_down_behavior.clone(),
+            scale_down_behavior: Some(self.scale_down_behavior.clone()),
             custom_ami_id: self.custom_ami_id.clone(),
             ebs_root_volume_size: self.ebs_root_volume_size,
             repo_upgrade_on_boot: self.repo_upgrade_on_boot.clone(),
@@ -3208,7 +3222,7 @@ impl ClusterRecord {
             // Not launched on an Outpost.
             outpost_arn: None,
             step_concurrency_level: Some(self.step_concurrency_level),
-            placement_groups: optional_list(&self.placement_groups),
+            placement_groups: Some(self.placement_groups.clone()),
             os_release_label: self.os_release_label.clone(),
             ebs_root_volume_iops: self.ebs_root_volume_iops,
             ebs_root_volume_throughput: self.ebs_root_volume_throughput,
@@ -3385,7 +3399,13 @@ impl InstanceFleetRecord {
                 .as_deref()
                 .and_then(optional_list),
             launch_specifications: self.config.launch_specifications.clone(),
-            resize_specifications: self.config.resize_specifications.clone(),
+            // The resize specifications this fleet runs under: the ones it was configured
+            // with, with the Spot resize timeout the service supplies for a fleet it can
+            // resize.
+            resize_specifications: effective_resize_specifications(
+                &self.config.instance_fleet_type,
+                self.config.resize_specifications.as_ref(),
+            ),
             context: self.config.context.clone(),
         }
     }
@@ -3435,11 +3455,26 @@ fn target_capacity(requested: Option<i32>) -> i32 {
 fn instance_type_specification(config: &InstanceTypeConfig) -> InstanceTypeSpecification {
     InstanceTypeSpecification {
         instance_type: Some(config.instance_type.clone()),
-        weighted_capacity: config.weighted_capacity,
+        // The units one instance of this type provides, and the Spot bid it makes, as the
+        // fleet provisions it: both default where the configuration named neither
+        // ([`DEFAULT_WEIGHTED_CAPACITY`], [`DEFAULT_BID_PRICE_PERCENTAGE_OF_ON_DEMAND`]),
+        // so a client can account for the capacity a fleet provisions.
+        weighted_capacity: Some(config.weighted_capacity.unwrap_or(DEFAULT_WEIGHTED_CAPACITY)),
         bid_price: config.bid_price.clone(),
-        bid_price_as_percentage_of_on_demand_price: config.bid_price_as_percentage_of_on_demand_price,
-        configurations: config.configurations.as_deref().and_then(optional_list),
-        ebs_block_devices: optional_list(&ebs_block_devices(config.ebs_configuration.as_ref())),
+        bid_price_as_percentage_of_on_demand_price: effective_bid_price_percentage(
+            config.bid_price.as_deref(),
+            config.bid_price_as_percentage_of_on_demand_price,
+        ),
+        configurations: config
+            .configurations
+            .as_deref()
+            .map(served_configurations)
+            // A configuration list the instance type supplied nothing for stays ABSENT,
+            // unlike `Cluster$Configurations`, which a described cluster always carries:
+            // what the service reports for a fleet's instance type that configured none
+            // is not settled here, so the member is left as it was.
+            .filter(|configurations| !configurations.is_empty()),
+        ebs_block_devices: optional_list(&fleet_ebs_block_devices(config)),
         ebs_optimized: config
             .ebs_configuration
             .as_ref()
@@ -3760,11 +3795,14 @@ impl InstanceGroupRecord {
             requested_instance_count: Some(self.config.instance_count),
             running_instance_count: Some(self.running_instance_count()),
             status: Some(self.to_status()),
+            // Served with the property map every configuration carries; an empty list is
+            // left absent for the reason [`instance_type_specification`] states.
             configurations: self
                 .config
                 .configurations
                 .as_deref()
-                .and_then(optional_list),
+                .map(served_configurations)
+                .filter(|configurations| !configurations.is_empty()),
             // The configuration versions are what a RECONFIGURATION moves ("the version
             // number of the requested configuration specification"), so a group nothing
             // has reconfigured carries none, and the ones last SUCCESSFULLY APPLIED are
@@ -3774,7 +3812,8 @@ impl InstanceGroupRecord {
             last_successfully_applied_configurations: self
                 .last_successfully_applied_configurations
                 .as_deref()
-                .and_then(optional_list),
+                .map(served_configurations)
+                .filter(|configurations| !configurations.is_empty()),
             last_successfully_applied_configurations_version: self
                 .last_successfully_applied_configurations_version,
             ebs_block_devices: optional_list(&ebs_block_devices(

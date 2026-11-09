@@ -39,8 +39,9 @@ const MAX_INSTANCE_FLEETS_PER_CLUSTER: usize = 50;
 const UNKNOWN_CLUSTER_IDS: &[&str] = &["j-ZZZZZZZZZZZZZ", "j-", "", "not-a-cluster-id"];
 
 /// What one reported `InstanceFleet` must carry. Every field is what the request asked
-/// for, so a row states the request's own values rather than anything the emulator
-/// invents.
+/// for, or — where it asked for nothing — the value Amazon EMR supplies for it: the
+/// weighted capacity, the Spot bid as a percentage of the On-Demand price and the
+/// instance type's default Amazon EBS layout.
 struct Expected {
     fleet_type: &'static str,
     name: Option<&'static str>,
@@ -194,8 +195,10 @@ async fn list_instance_fleets_reports_every_fleet_a_cluster_was_launched_with() 
                 name: None,
                 target_on_demand: 1,
                 target_spot: 0,
-                instance_types: &[("m5.xlarge", None, None)],
-                ebs_devices: &[],
+                instance_types: &[("m5.xlarge", Some(1), Some(100.0))],
+                // `m5.xlarge` declared no EBS configuration, so it keeps the default
+                // layout of its instance type: two volumes for an `xlarge`.
+                ebs_devices: &[("/dev/sdb", "gp2"), ("/dev/sdc", "gp2")],
             }],
         },
         Case {
@@ -239,27 +242,35 @@ async fn list_instance_fleets_reports_every_fleet_a_cluster_was_launched_with() 
                     name: Some("primary"),
                     target_on_demand: 1,
                     target_spot: 0,
-                    instance_types: &[("m5.2xlarge", None, None)],
-                    ebs_devices: &[],
+                    instance_types: &[("m5.2xlarge", Some(1), Some(100.0))],
+                    // A `2xlarge` is attached four default volumes.
+                    ebs_devices: &[
+                        ("/dev/sdb", "gp2"),
+                        ("/dev/sdc", "gp2"),
+                        ("/dev/sdd", "gp2"),
+                        ("/dev/sde", "gp2"),
+                    ],
                 },
                 Expected {
                     fleet_type: "CORE",
                     name: Some("core"),
                     target_on_demand: 2,
                     target_spot: 3,
+                    // The weights the request named stand; the bid percentage defaults
+                    // only where the configuration named neither bid.
                     instance_types: &[
-                        ("r5.xlarge", Some(2), None),
+                        ("r5.xlarge", Some(2), Some(100.0)),
                         ("r5.2xlarge", Some(4), Some(60.0)),
                     ],
-                    ebs_devices: &[],
+                    ebs_devices: &[("/dev/sdb", "gp2"), ("/dev/sdc", "gp2")],
                 },
                 Expected {
                     fleet_type: "TASK",
                     name: None,
                     target_on_demand: 0,
                     target_spot: 5,
-                    instance_types: &[("c5.xlarge", None, None)],
-                    ebs_devices: &[],
+                    instance_types: &[("c5.xlarge", Some(1), Some(100.0))],
+                    ebs_devices: &[("/dev/sdb", "gp2"), ("/dev/sdc", "gp2")],
                 },
             ],
         },
@@ -289,7 +300,8 @@ async fn list_instance_fleets_reports_every_fleet_a_cluster_was_launched_with() 
                 name: None,
                 target_on_demand: 1,
                 target_spot: 0,
-                instance_types: &[("m5.xlarge", None, None)],
+                instance_types: &[("m5.xlarge", Some(1), Some(100.0))],
+                // A declared configuration replaces the default layout entirely:
                 // `/dev/sda` is the root volume, so the requested volumes start at
                 // `/dev/sdb`, in configuration order.
                 ebs_devices: &[("/dev/sdb", "gp3"), ("/dev/sdc", "gp3"), ("/dev/sdd", "st1")],

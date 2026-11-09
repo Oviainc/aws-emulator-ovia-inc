@@ -550,7 +550,18 @@ async fn set_unhealthy_node_replacement_writes_what_describe_cluster_reports() {
     let emr = Emr::new();
     // The rows differ in the value the cluster was LAUNCHED with, so the write is
     // asserted both as a change and as a no-op.
-    let launched_off = emr.run_job_flow(kept_alive_request("off")).await;
+    let launched_off = emr
+        .run_job_flow(json!({
+            "Name": "off",
+            "JobFlowRole": crate::job_flow_lifecycle::INSTANCE_PROFILE, "ServiceRole": crate::job_flow_lifecycle::SERVICE_ROLE,
+            "Instances": {
+                "InstanceCount": 1,
+                "MasterInstanceType": "m5.xlarge",
+                "KeepJobFlowAliveWhenNoSteps": true,
+                "UnhealthyNodeReplacement": false,
+            },
+        }))
+        .await;
     let launched_on = emr
         .run_job_flow(json!({
             "Name": "on",

@@ -416,13 +416,35 @@ async fn run_job_flow_persists_each_cluster_and_describe_cluster_reads_it_back()
             cluster["ClusterArn"], out["ClusterArn"],
             "case {label:?}: DescribeCluster must answer the ARN RunJobFlow minted, got {cluster}"
         );
-        for member in ["Name", "ReleaseLabel", "LogUri", "ServiceRole", "Tags", "Applications"] {
+        for member in ["Name", "ReleaseLabel", "LogUri", "ServiceRole", "Tags"] {
             if let Some(expected) = case.request.get(member) {
                 assert_eq!(
                     &cluster[member], expected,
                     "case {label:?}: {member} must round-trip, got {cluster}"
                 );
             }
+        }
+        // `Applications` names applications, not versions: the cluster reports the names
+        // the request asked for, each resolved to the version its release installs (which
+        // `tests/all/cluster_defaults.rs` pins against the release catalog).
+        if let Some(requested) = case.request.get("Applications").and_then(Value::as_array) {
+            let asked: Vec<&str> = requested
+                .iter()
+                .map(|application| application["Name"].as_str().unwrap_or_default())
+                .collect();
+            let reported: Vec<&str> = cluster["Applications"]
+                .as_array()
+                .map(|applications| {
+                    applications
+                        .iter()
+                        .map(|application| application["Name"].as_str().unwrap_or_default())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                reported, asked,
+                "case {label:?}: Applications must round-trip, got {cluster}"
+            );
         }
         if let Some(expected) = case.request.get("AmiVersion") {
             assert_eq!(

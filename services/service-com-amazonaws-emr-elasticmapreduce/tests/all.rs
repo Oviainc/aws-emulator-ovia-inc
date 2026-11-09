@@ -17,6 +17,8 @@ mod auto_scaling_policy;
 mod auto_termination_policy;
 #[path = "all/block_public_access.rs"]
 mod block_public_access;
+#[path = "all/cluster_defaults.rs"]
+mod cluster_defaults;
 #[path = "all/cluster_id_refusal_code.rs"]
 mod cluster_id_refusal_code;
 #[path = "all/cluster_placement.rs"]
