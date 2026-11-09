@@ -1471,6 +1471,71 @@ pub fn page_of<'a, T>(
     (page, next_token)
 }
 
+/// How many grants one resource's permission list may hold: the model's own ceiling
+/// for `ResourcePermissionList` (`length 1..64`), the shape every `Permissions`
+/// member targets — so an update that would leave a resource holding more grants than
+/// its list can carry is refused rather than stored.
+pub const MAX_RESOURCE_PERMISSIONS: usize = 64;
+
+/// One resource's permission list after granting `grant` and revoking `revoke`.
+///
+/// A permission list holds one entry per principal, so an update is applied per
+/// principal rather than by appending entries: a grant adds its actions to that
+/// principal's entry (creating the entry when the principal holds nothing yet), and a
+/// revoke takes its actions away, dropping the entry once the principal is left
+/// holding none. Revokes are applied before grants, so a call that names one principal
+/// in both leaves it holding what the call granted. Entry order is the order
+/// principals were first granted in and each entry's actions keep the order they were
+/// granted in, so repeated reads report the same list; granting an action a principal
+/// already holds, or revoking one it does not, changes nothing.
+pub fn apply_permission_updates(
+    current: &[ResourcePermission],
+    grant: &[ResourcePermission],
+    revoke: &[ResourcePermission],
+) -> Vec<ResourcePermission> {
+    let mut updated: Vec<ResourcePermission> = current.to_vec();
+
+    for revoked in revoke {
+        let Some(entry) = updated
+            .iter_mut()
+            .find(|entry| entry.principal == revoked.principal)
+        else {
+            continue;
+        };
+        entry
+            .actions
+            .retain(|action| !revoked.actions.contains(action));
+    }
+
+    for granted in grant {
+        let at = match updated
+            .iter()
+            .position(|entry| entry.principal == granted.principal)
+        {
+            Some(at) => at,
+            None => {
+                updated.push(ResourcePermission {
+                    principal: granted.principal.clone(),
+                    actions: Vec::new(),
+                });
+                updated.len() - 1
+            }
+        };
+        for action in &granted.actions {
+            let entry = &mut updated[at];
+            if !entry.actions.contains(action) {
+                entry.actions.push(action.clone());
+            }
+        }
+    }
+
+    // A principal left with no action holds no grant on the resource at all, so its
+    // entry goes rather than staying as an empty one — the modelled `ActionList`
+    // carries at least one action.
+    updated.retain(|entry| !entry.actions.is_empty());
+    updated
+}
+
 /// The ARN of the data source a `PhysicalTable` reads, whichever kind of table it is.
 pub fn physical_table_data_source_arn(table: &PhysicalTable) -> &str {
     match table {

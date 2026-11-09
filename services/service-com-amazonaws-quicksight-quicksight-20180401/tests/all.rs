@@ -11,6 +11,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_subscription.rs"]
 mod account_subscription;
+#[path = "all/data_set_permissions.rs"]
+mod data_set_permissions;
 #[path = "all/data_source_data_set_lifecycle.rs"]
 mod data_source_data_set_lifecycle;
 #[path = "all/data_source_update.rs"]
