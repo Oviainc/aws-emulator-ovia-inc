@@ -1,0 +1,53 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudformation__codecommit.deploy-codecommit-repository-identity-and-deletion cloudformation__codecommit.deploy-codecommit-repository-invalid-kms-key-rejected
+Issue-Key: cloudformation__codecommit.deploy-codecommit-repository-identity-and-deletion|run#11|AssertionError|assert got == want, f"outputs and template {got!r} != GetRepository {want!r}"
+Issue-Key: cloudformation__codecommit.deploy-codecommit-repository-invalid-kms-key-rejected|run#7|AssertionError|assert status == "ROLLBACK_COMPLETE", f"missing-key stack ended {status!r}"
+Issue-Commit: 0cee419aadfb4868f9ccd3aa23bc5045ac08a29b
+
+# cloudformation__codecommit: 3 net-new causes — AWS::CodeCommit::Repository Ref returns the name instead of the repository id, GetAtt clone URLs are canonical AWS hosts instead of the ones CodeCommit reports, and a nonexistent KmsKeyId is never refused
+
+> _Note: this issue was identified against the code base at commit `0cee419aadfb4868f9ccd3aa23bc5045ac08a29b`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateStack
+
+## Description
+THREE net-new root causes behind the two cloudformation__codecommit deploy checks, all in the CloudFormation provider for AWS::CodeCommit::Repository and the CodeCommit CreateRepository validation it calls. A fixer must close ALL THREE before submitting.
+
+=== Cause 1 of 3: Ref of an AWS::CodeCommit::Repository resolves to the repository NAME instead of its repository id ===
+AWS: recorded behavior (the CloudFormation return values of AWS::CodeCommit::Repository are not in a Smithy model). For a repository resource, {"Ref": "Repo"} resolves to the repository's id — the same opaque uuid-shaped value codecommit GetRepository reports as repositoryMetadata.repositoryId (Smithy com-amazonaws-codecommit-codecommit-20150413: GetRepository -> RepositoryMetadata.repositoryId) — while the repository NAME is reachable only through Fn::GetAtt <Repo>.Name. The recording shows Ref and GetAtt Name holding two DIFFERENT values for one resource: the id and the name.
+Emulator: Ref resolves to the same string as Fn::GetAtt Name — the repository name — so the stack output for Ref is the repository name while GetRepository reports a distinct repositoryId. In the replay the Ref output was the repository name and GetRepository's repositoryId was an unrelated uuid-shaped id (the id value itself is per-run and is not the requirement; that the two outputs are the id and the name respectively is).
+Why: a template that passes Ref downstream as the repository's identifier (into a parameter, an export, a tag, or an output a deployment script consumes) gets a name where AWS gives an id, so the consumer looks the repository up by the wrong key or compares an id against a name and never matches. The two are also no longer distinguishable, so a template cannot obtain the id at all.
+Fix: the Ref / physical-identifier resolution of the AWS::CodeCommit::Repository resource provider in the cloudformation service's resource-handler layer — it must return the repository id the codecommit state holds, reserving the name for the Name attribute.
+Traces: cloudformation__codecommit.deploy-codecommit-repository-identity-and-deletion.
+
+=== Cause 2 of 3: Fn::GetAtt CloneUrlHttp/CloneUrlSsh are formatted as canonical public AWS endpoints instead of the URLs CodeCommit itself publishes ===
+AWS: recorded behavior only. Fn::GetAtt <Repo>.CloneUrlHttp and <Repo>.CloneUrlSsh are byte-identical to repositoryMetadata.cloneUrlHttp and repositoryMetadata.cloneUrlSsh that codecommit GetRepository returns for the same repository: one endpoint, published through two APIs.
+Emulator: the CloudFormation attributes are synthesised against the real-AWS endpoint template (https://codecommit.<region>.amazonaws.com/v1/repos/<repositoryName> and ssh://codecommit.<region>.amazonaws.com/v1/repos/<repositoryName>) while the codecommit API reports the endpoint the emulator actually serves, so the two disagree for the same resource. The specific hostnames and ports of a run are not the requirement — the requirement is that GetAtt returns the value CodeCommit's own GetRepository returns, which is a host the emulator serves.
+Why: the clone URL in a stack output is what a pipeline or a developer clones from. Pointed at an address the emulator never answers on, every `git clone`/`git push` driven from the stack output fails, and a client comparing the stack output with GetRepository's metadata (a drift check) reports a difference AWS never produces.
+Fix: the AWS::CodeCommit::Repository attribute resolution in the cloudformation service's resource-handler layer — read cloneUrlHttp/cloneUrlSsh from the codecommit repository record instead of formatting an endpoint string.
+Traces: cloudformation__codecommit.deploy-codecommit-repository-identity-and-deletion.
+
+=== Cause 3 of 3: a repository whose KmsKeyId names a key that does not exist is created, so the stack succeeds where AWS rolls it back ===
+AWS: Smithy CreateRepository takes kmsKeyId (pattern ^[a-zA-Z0-9:/_-]+$) and models EncryptionKeyNotFoundException (errorKind client, httpError 400 [defaulted]) alongside EncryptionKeyAccessDeniedException / EncryptionKeyDisabledException / EncryptionKeyInvalidIdException. Recorded behavior: a well-formed key ARN of the caller's own account that does not resolve to a key is refused with HTTP 400 and the message 'KMS key <keyArn> is not found' (fixed text 'KMS key ' + the ARN exactly as supplied + ' is not found'); CloudFormation then records a CREATE_FAILED event on the repository's logical id whose ResourceStatusReason is 'Resource handler returned message: "KMS key <keyArn> is not found (Service: CodeCommit, Status Code: 400, Request ID: <id>) (SDK Attempt Count: <n>)" (RequestToken: <token>, HandlerErrorCode: InvalidRequest)' — fixed text plus the key ARN from the request and the per-run request id/token, which are not part of the requirement — and the stack settles ROLLBACK_COMPLETE with no repository of that name reachable (GetRepository then answers RepositoryDoesNotExistException).
+Emulator: the stack reaches CREATE_COMPLETE. The repository is created and encrypted-at-rest with a key id that resolves to nothing; no CREATE_FAILED event and no rollback occur.
+Why: an encryption misconfiguration — the one class of mistake that must never deploy — is accepted silently. A caller sees a healthy stack and a healthy repository whose CMK does not exist, and the negative deploy path (rollback, handler error code InvalidRequest, absence of the resource) is unobservable.
+Fix: kmsKeyId existence validation in the codecommit service's CreateRepository handler (raise EncryptionKeyNotFoundException/400 with AWS's sentence before the repository is recorded), and the AWS::CodeCommit::Repository provider in cloudformation must surface that client error as a resource CREATE_FAILED with HandlerErrorCode InvalidRequest so the stack rolls back.
+Traces: cloudformation__codecommit.deploy-codecommit-repository-invalid-kms-key-rejected.
+
+Note: no open issue carries either of these two checks' replay keys. Open issue 20261023T072048Z-codecommit-10-behavioral-root-causes-three-operations-answer.md reports that CFN-deployed CodeCommit repositories never existed; in this replay the deployed repository DOES exist and answers GetRepository, so these three causes are net-new. Open issue 20261107T223907Z-codecommit-the-announced-cloneurlhttp-is-served-over-tls.md is about the certificate on the announced clone URL, not about CloudFormation publishing a different URL than CodeCommit does.
+
+## Evidence
+Check cloudformation__codecommit.deploy-codecommit-repository-identity-and-deletion (mismatch): assertion 'outputs and template ... != GetRepository ...'. The 7-tuple (Ref, GetAtt Name, GetAtt Arn, GetAtt CloneUrlHttp, GetAtt CloneUrlSsh, name, description) came back as ('<repo-name>', '<repo-name>', 'arn:aws:codecommit:us-west-2:<account>:<repo-name>', 'https://codecommit.us-west-2.amazonaws.com/v1/repos/<repo-name>', 'ssh://codecommit.us-west-2.amazonaws.com/v1/repos/<repo-name>', '<repo-name>', '<description>') while GetRepository's repositoryMetadata gave ('<repositoryId uuid>', '<repo-name>', 'arn:aws:codecommit:us-west-2:<account>:<repo-name>', 'https://<emulator-host:port>/v1/repos/<repo-name>', 'ssh://<emulator-host>/v1/repos/<repo-name>', '<repo-name>', '<description>'). Arn, Name and description already agree; element 1 (Ref vs repositoryId) and elements 4-5 (clone URLs) diverge.
+
+Check cloudformation__codecommit.deploy-codecommit-repository-invalid-kms-key-rejected (mismatch): assertion "missing-key stack ended 'CREATE_COMPLETE'" where AWS ends ROLLBACK_COMPLETE. Expected, before the check even reaches its message grading: a CREATE_FAILED row for logical id 'Repo' whose reason parses to message 'KMS key arn:<partition>:kms:<region>:<account>:key/00000000-0000-0000-0000-000000000000 is not found (Service: CodeCommit, Status Code: 400, Request ID: <id>) (SDK Attempt Count: <n>)' with HandlerErrorCode 'InvalidRequest', then GetRepository(<bad repo name>) answering RepositoryDoesNotExistException. Actual: CREATE_COMPLETE, i.e. the repository exists with the nonexistent key.
+
+## Steps to Reproduce
+1. Boot the emulator from this checkout and point botocore at it.
+2. CreateStack with a template declaring one AWS::CodeCommit::Repository (RepositoryName=R, RepositoryDescription=D) and Outputs for {"Ref": "Repo"}, GetAtt Repo.Name, Repo.Arn, Repo.CloneUrlHttp, Repo.CloneUrlSsh; wait for CREATE_COMPLETE.
+3. Compare the Ref output with codecommit.get_repository(repositoryName=R)['repositoryMetadata']['repositoryId'] — expect equality; observe the Ref output is the repository NAME (cause 1).
+4. Compare the CloneUrlHttp/CloneUrlSsh outputs with the same metadata's cloneUrlHttp/cloneUrlSsh — expect byte equality on a host the emulator serves; observe the outputs name codecommit.<region>.amazonaws.com while the API names the emulator's own endpoint (cause 2).
+5. CreateStack with a template whose AWS::CodeCommit::Repository sets KmsKeyId to arn:<partition>:kms:<region>:<account>:key/00000000-0000-0000-0000-000000000000 — expect the Repo resource CREATE_FAILED with HandlerErrorCode InvalidRequest and message 'KMS key <that arn> is not found (Service: CodeCommit, Status Code: 400, ...)', the stack ROLLBACK_COMPLETE and GetRepository answering RepositoryDoesNotExistException; observe CREATE_COMPLETE and a live repository (cause 3).
+6. Re-replay both check ids in trace_ids; both must pass.
