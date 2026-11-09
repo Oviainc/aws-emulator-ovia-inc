@@ -17,6 +17,8 @@ mod agentcore_stack_outputs;
 mod appconfig_resource_types;
 #[path = "all/application_auto_scaling_resources.rs"]
 mod application_auto_scaling_resources;
+#[path = "all/bedrock_knowledge_base_identity.rs"]
+mod bedrock_knowledge_base_identity;
 #[path = "all/bucket_analytics_configurations.rs"]
 mod bucket_analytics_configurations;
 #[path = "all/bucket_intelligent_tiering_configurations.rs"]

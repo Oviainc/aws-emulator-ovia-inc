@@ -601,10 +601,10 @@ async fn a_check_of_a_type_drift_detection_is_not_supported_for_is_refused() {
             "    Properties:\n",
             "      AlarmName: detect-one-unsupported-signal\n",
             "  Escalation:\n",
-            "    Type: AWS::Bedrock::KnowledgeBase\n",
+            "    Type: AWS::Bedrock::Agent\n",
             "    Properties:\n",
-            "      Name: detect-one-unsupported-kb\n",
-            "      RoleArn: arn:aws:iam::000000000000:role/detect-one-unsupported\n",
+            "      AgentName: detect-one-unsupported-agent\n",
+            "      AgentResourceRoleArn: arn:aws:iam::000000000000:role/detect-one-unsupported\n",
         ),
     )
     .await;
@@ -616,9 +616,9 @@ async fn a_check_of_a_type_drift_detection_is_not_supported_for_is_refused() {
             "AWS::CloudWatch::Alarm",
         ),
         (
-            "a knowledge base, which nothing here provisions",
+            "an agent, which nothing here provisions",
             "Escalation",
-            "AWS::Bedrock::KnowledgeBase",
+            "AWS::Bedrock::Agent",
         ),
     ] {
         let (status, body) = detect_resource_drift(&router, stack, logical_id).await;

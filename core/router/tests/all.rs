@@ -1201,6 +1201,11 @@ mod cloudformation_apigateway_access_control;
 // or earlier in the tail, where their own entry records why they were placed there: two
 // concurrent changes appending one entry is a redefinition that stops this target from
 // compiling, so the duplicate lines are gone and ONE declaration of each stands.
+// Declared in the appended tail, which is where every new suite inserts its lines: the
+// knowledge base a stack declares, which has to exist in Amazon Bedrock Agent under the
+// identifier that service minted for it — the one the stack publishes.
+#[path = "all/cloudformation_provisions_a_bedrock_knowledge_base.rs"]
+mod cloudformation_provisions_a_bedrock_knowledge_base;
 // Declared here, in the appended tail: what an invocation PRINTS, through the metric filter on
 // its log group, the alarm over that metric, the SNS action and the queues subscribed to it.
 #[path = "all/lambda_log_metric_filter_drives_the_alarm_chain.rs"]
@@ -1220,6 +1225,11 @@ mod cloudformation_provisions_bedrock_guardrails;
 // target's own work product and the un-permitted sibling's dead letter.
 #[path = "all/cloudformation_events_rule_lambda_target_permission_boundary.rs"]
 mod cloudformation_events_rule_lambda_target_permission_boundary;
+// Three suites that stood here — `events_sns_lambda_delivery_observed_in_logs`,
+// `agent_registry_signing_name_routing` and `cloudformation_domain_access_policy_revision` —
+// are each ALREADY declared in the sorted head above, where their own entry records why they
+// were placed there: two `mod` items for one name is a redefinition that stops this target
+// compiling, so one declaration of each stands and the duplicates are gone.
 // Declared in the appended tail: a deployed method whose integration is an `AWS` call on a
 // QUEUE, served by making that call — across API Gateway, Amazon SQS and IAM on one engine.
 #[path = "all/apigateway_sqs_service_integration.rs"]

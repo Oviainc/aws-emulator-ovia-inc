@@ -1666,6 +1666,11 @@ mod launch_instance_type_catalog;
 // refuses.
 #[path = "all/import_key_pair.rs"]
 mod import_key_pair;
+// Three suites that stood here — `ebs_direct_api_snapshots`,
+// `instance_sql_ha_history_states` and `describe_reserved_instances_offerings` — are each
+// ALREADY declared above, where their own entry records why they were placed there: two
+// `mod` items for one name is a redefinition that stops this target compiling, so one
+// declaration of each stands and the duplicates are gone.
 // How an idempotency conflict is WORDED: the Network Access Analyzer / Reachability Analyzer
 // actions answer that surface's own sentence beside `IdempotentParameterMismatch`, while the
 // older resource creates of this service answer theirs. Declared at the tail of this file,

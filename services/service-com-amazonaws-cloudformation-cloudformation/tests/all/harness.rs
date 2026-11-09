@@ -169,6 +169,19 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             Arc::clone(&engine),
         ),
     );
+    // Amazon Bedrock Agent's build-time control plane, for the `AWS::Bedrock::KnowledgeBase`
+    // a stack really creates there: a suite that deploys one reads the knowledge base back
+    // through that service's own wire, by the id the stack publishes. (Amazon S3 Vectors is
+    // deliberately NOT mounted beside it — `rolled_back_resource_records.rs` is the suite
+    // that pins what a stack does when an owning service cannot be reached — so the vector
+    // store a knowledge base binds to here is one that needs no second service, and the
+    // S3-Vectors-backed knowledge base is
+    // `core/router/tests/all/cloudformation_provisions_a_bedrock_knowledge_base.rs`.)
+    router.register_service(
+        service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     (router, engine)
 }
 

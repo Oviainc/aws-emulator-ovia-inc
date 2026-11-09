@@ -475,7 +475,8 @@ use super::template::{
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
     APIGATEWAYV2_STAGE, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT, BATCH_COMPUTE_ENVIRONMENT,
-    BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, BEDROCK_GUARDRAIL, CLOUDWATCH_DASHBOARD,
+    BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, BEDROCK_GUARDRAIL, BEDROCK_KNOWLEDGE_BASE,
+    CLOUDWATCH_DASHBOARD,
     CLOUDWATCH_METRIC_STREAM, CODEARTIFACT_DOMAIN, CODEARTIFACT_REPOSITORY,
     CODEBUILD_PROJECT,
     CODEBUILD_REPORT_GROUP, CODECOMMIT_REPOSITORY, CODEDEPLOY_APPLICATION,
@@ -838,6 +839,13 @@ pub(super) enum Provisioner {
     /// the ARN the type publishes, so both are read off that create's own answer and the
     /// ARN is the identity a `Ref` resolves to.
     BedrockGuardrail,
+    /// `AWS::Bedrock::KnowledgeBase`: a knowledge base of Amazon Bedrock Agent's build-time
+    /// control plane, which `CreateKnowledgeBase` creates under the name the template states,
+    /// `UpdateKnowledgeBase` changes and `DeleteKnowledgeBase` removes. That service MINTS
+    /// the ten-character `knowledgeBaseId` the type publishes — the handle every
+    /// knowledge-base API takes — so it is read off that create's own answer and is the
+    /// identity a `Ref` resolves to.
+    BedrockKnowledgeBase,
     /// `AWS::BedrockAgentCore::WorkloadIdentity`: a workload identity of the Amazon Bedrock
     /// AgentCore control plane, which `CreateWorkloadIdentity` creates under the name the
     /// template states, `UpdateWorkloadIdentity` changes and `DeleteWorkloadIdentity`
@@ -988,6 +996,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         BACKUP_PLAN => Some(Provisioner::BackupPlan),
         BACKUP_SELECTION => Some(Provisioner::BackupSelection),
         BEDROCK_GUARDRAIL => Some(Provisioner::BedrockGuardrail),
+        BEDROCK_KNOWLEDGE_BASE => Some(Provisioner::BedrockKnowledgeBase),
         BEDROCK_AGENTCORE_WORKLOAD_IDENTITY => {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
         }
@@ -1420,6 +1429,13 @@ impl Provisioner {
             Self::BedrockGuardrail => {
                 create_bedrock_guardrail(ctx, region, resource, propagated).await
             }
+            // `AWS::Bedrock::KnowledgeBase` publishes `Tags` as a MAP, which is the shape
+            // `CreateKnowledgeBase`'s own `tags` member takes, so a knowledge base a stack
+            // creates carries the tags CloudFormation gives it beside the ones the
+            // declaration asks for.
+            Self::BedrockKnowledgeBase => {
+                create_bedrock_knowledge_base(ctx, region, resource, propagated).await
+            }
             // `AWS::BedrockAgentCore::WorkloadIdentity` publishes `Tags`, and
             // `CreateWorkloadIdentity` takes a tag MAP of its own, so an identity a stack
             // creates carries the tags CloudFormation gives it beside the ones the
@@ -1657,6 +1673,12 @@ impl Provisioner {
             // you can … add nodes" (`CreateCluster` / `Cluster$status`), so the resource's
             // creation is finished once that service reports it `ACTIVE`.
             Self::EksCluster => eks_cluster_readiness(ctx, region, physical_resource_id).await,
+            // `CreateKnowledgeBase` answers 202 with the knowledge base `CREATING` — "the
+            // knowledge base is being created", in which it cannot be queried — so the
+            // resource's creation is finished once Amazon Bedrock Agent reports it `ACTIVE`.
+            Self::BedrockKnowledgeBase => {
+                knowledge_base_readiness(ctx, region, physical_resource_id).await
+            }
             _ => Ok(Readiness::Ready),
         }
     }
@@ -1700,6 +1722,12 @@ impl Provisioner {
                     .map(|cluster| eks_cluster_attributes(&cluster))
                     .unwrap_or_default())
             }
+            // A knowledge base's `Status` and `UpdatedAt` are not the ones its create
+            // answered with once that service has brought it up, so the type's attributes
+            // are read off the knowledge base again when it reports it `ACTIVE`.
+            Self::BedrockKnowledgeBase => {
+                knowledge_base_ready_attributes(ctx, region, physical_resource_id).await
+            }
             _ => Ok(BTreeMap::new()),
         }
     }
@@ -1741,6 +1769,12 @@ impl Provisioner {
             // deletion is finished once that service no longer holds it.
             Self::KinesisStream => {
                 kinesis_stream_removal(ctx, region, physical_resource_id).await
+            }
+            // `DeleteKnowledgeBase` answers 202 with the knowledge base `DELETING` — "the
+            // knowledge base is being deleted" — so it is still there when the delete
+            // answers and the deletion is finished once that service no longer holds it.
+            Self::BedrockKnowledgeBase => {
+                knowledge_base_removal(ctx, region, physical_resource_id).await
             }
             _ => Ok(Removal::Gone),
         }
@@ -1935,6 +1969,14 @@ impl Provisioner {
             Self::BedrockGuardrail => update_bedrock_guardrail(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // `UpdateKnowledgeBase` takes a knowledge base's id together with the whole
+            // configuration it is to carry, so a changed declaration is applied to the
+            // knowledge base the stack created rather than replacing it; its identity is the
+            // id Amazon Bedrock Agent minted, which an update leaves alone. A changed tag
+            // map is no part of that call, which that arm reports as not applied.
+            Self::BedrockKnowledgeBase => {
+                update_bedrock_knowledge_base(ctx, region, resource, declared).await
+            }
             Self::BedrockAgentCoreWorkloadIdentity => {
                 update_workload_identity(ctx, region, resource, declared)
                     .await
@@ -2441,6 +2483,11 @@ impl Provisioner {
             Self::BedrockGuardrail => {
                 delete_bedrock_guardrail(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the knowledge base by the id Amazon Bedrock Agent minted
+            // for it, which is this resource's physical id.
+            Self::BedrockKnowledgeBase => {
+                delete_bedrock_knowledge_base(ctx, region, physical_resource_id).await
+            }
             Self::BedrockAgentCoreWorkloadIdentity => {
                 delete_workload_identity(ctx, region, physical_resource_id).await
             }
@@ -2822,6 +2869,11 @@ impl Provisioner {
             Self::BedrockGuardrail => {
                 describe_bedrock_guardrail(ctx, region, physical_resource_id).await
             }
+            // Amazon Bedrock Agent's own read of the knowledge base the stack created, by
+            // the id it minted for it.
+            Self::BedrockKnowledgeBase => {
+                describe_bedrock_knowledge_base(ctx, region, physical_resource_id).await
+            }
             // Amazon Redshift's own read of the subnet group the stack created, by the name
             // it was created under.
             Self::RedshiftClusterSubnetGroup => {
@@ -2862,6 +2914,7 @@ impl Provisioner {
 mod tests;
 mod config_recording;
 mod bedrock_guardrails;
+mod bedrock_knowledge_bases;
 mod data_and_storage;
 mod iam_identities;
 mod application_services;
@@ -2872,6 +2925,7 @@ use platform_services::*;
 pub(crate) use application_services::*;
 use config_recording::*;
 use bedrock_guardrails::*;
+use bedrock_knowledge_bases::*;
 use iam_identities::*;
 use data_and_storage::*;
 

@@ -1232,6 +1232,35 @@ pub(super) fn return_values(
             );
             (arn, attributes)
         }
+        // Amazon Bedrock Agent's build-time control plane: the knowledge base an
+        // `AWS::Bedrock::KnowledgeBase` declares. "Ref returns the knowledge base ID" (the
+        // type's primary identifier); Fn::GetAtt reads `KnowledgeBaseId`,
+        // `KnowledgeBaseArn`, `Status`, `CreatedAt` and `UpdatedAt`. That service MINTS the
+        // id — `CreateKnowledgeBase` answers a `knowledgeBaseId` of `^[0-9a-zA-Z]{10}$`,
+        // which is what every knowledge-base API takes and which the knowledge base's NAME
+        // (`^([0-9a-zA-Z][_-]?){1,100}$`) is not — so the two values here are STAND-INS of
+        // the forms that service's own model fixes, and `super::provisioning` re-points them
+        // at what the create really answered
+        // ([`super::provisioner::Provisioner::BedrockKnowledgeBase`]). The status and the two
+        // instants are that service's to report and are not computed here: they reach the
+        // resource off its create's own answer.
+        BEDROCK_KNOWLEDGE_BASE => {
+            let id = service_assigned_label(
+                BEDROCK_KNOWLEDGE_BASE_ID_SALT,
+                name,
+                BEDROCK_KNOWLEDGE_BASE_ID_DIGITS,
+            );
+            attributes.insert(
+                "KnowledgeBaseArn".to_string(),
+                ::emulator_server::emulator_arn(
+                    BEDROCK_ARN_NAMESPACE,
+                    region,
+                    &format!("knowledge-base/{id}"),
+                ),
+            );
+            attributes.insert("KnowledgeBaseId".to_string(), id.clone());
+            (id, attributes)
+        }
         // "Ref returns the name"; Fn::GetAtt: Name, WorkloadIdentityArn. A workload
         // identity is named, not id'd: `CreateWorkloadIdentity` takes a `name`
         // (`^[A-Za-z0-9_.-]+$`) and answers that name plus the ARN, whose shape the model
@@ -1640,6 +1669,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         ELB_LISTENER => &["ListenerArn"],
         ELB_LISTENER_RULE => &["IsDefault", "RuleArn"],
         BEDROCK_GUARDRAIL => &["GuardrailArn", "GuardrailId", "Version"],
+        BEDROCK_KNOWLEDGE_BASE => &["KnowledgeBaseArn", "KnowledgeBaseId"],
         "AWS::BedrockAgentCore::Memory" => &["MemoryArn", "MemoryId"],
         "AWS::BedrockAgentCore::Runtime" => {
             &["AgentRuntimeArn", "AgentRuntimeId", "AgentRuntimeVersion"]
@@ -1895,6 +1925,13 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // `guardrailIdentifier` — a pattern the name itself does not satisfy — so neither
         // the id nor the ARN can be computed from the template.
         || resource_type == BEDROCK_GUARDRAIL
+        // An Amazon Bedrock KNOWLEDGE BASE is the same case: `CreateKnowledgeBase` takes the
+        // knowledge base's NAME and answers the `knowledgeBaseId` Amazon Bedrock Agent minted
+        // (`^[0-9a-zA-Z]{10}$`, exactly ten alphanumeric characters), "Ref returns the
+        // knowledge base ID", and that id is the `knowledgeBaseId` every knowledge-base API
+        // takes — a pattern no name CloudFormation decides can satisfy — so the identifier in
+        // force is the one that service answered.
+        || resource_type == BEDROCK_KNOWLEDGE_BASE
         // An Amazon EC2 VPC, a subnet of one and a security group of one are three more:
         // `CreateVpc`, `CreateSubnet` and `CreateSecurityGroup` take no identifier at all —
         // EC2 assigns each resource an id of its own published form — and "Ref returns the
@@ -2014,6 +2051,12 @@ const BEDROCK_GUARDRAIL_ID_DIGITS: usize = 12;
 /// The version a freshly created guardrail carries: `CreateGuardrail`'s `version` is
 /// `^DRAFT$` ("This value will always be DRAFT").
 const BEDROCK_GUARDRAIL_DRAFT_VERSION: &str = "DRAFT";
+
+/// The salt the knowledge-base-id stand-in is derived under, and how many characters it
+/// carries: a `knowledgeBaseId` is `^[0-9a-zA-Z]{10}$`, so the stand-in is exactly ten
+/// alphanumeric characters and carries no separator.
+const BEDROCK_KNOWLEDGE_BASE_ID_SALT: &str = "bedrock/knowledge-base";
+const BEDROCK_KNOWLEDGE_BASE_ID_DIGITS: usize = 10;
 
 /// The `AWS::<cloudFormationName>::<Resource>` types of the two OpenSearch Serverless
 /// resources a stack creates. The middle segment is that service's own

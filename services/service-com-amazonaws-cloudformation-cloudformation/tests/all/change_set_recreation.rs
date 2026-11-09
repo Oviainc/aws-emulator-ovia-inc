@@ -24,7 +24,9 @@ use service_com_amazonaws_cloudformation_cloudformation::state::change_plan::{
     change_source, evaluation, policy_action, replacement, requires_recreation,
 };
 use crate::change_set_lifecycle::settle_the_store;
-use crate::stack_lifecycle::{call, create_stack, member, router_with_engine, xml_blocks, xml_text};
+use crate::stack_lifecycle::{
+    call, create_stack, member, router_with_engine, wait_for_the_transition, xml_blocks, xml_text,
+};
 
 /// The embedding model the deployed revision's knowledge base reads.
 const FIRST_MODEL: &str = "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v1";
@@ -37,6 +39,10 @@ const SECOND_MODEL: &str =
 /// takes a knowledge base's id together with a new `name` and its whole
 /// `knowledgeBaseConfiguration` on `UpdateKnowledgeBase`, beside an Amazon SNS topic, whose
 /// owning API has no call that renames a topic.
+///
+/// The knowledge base is really created in Amazon Bedrock Agent by the deployment
+/// (`state::provisioner::bedrock_knowledge_bases`), so the declaration carries the vector
+/// store that create requires of a self-managed `VECTOR` knowledge base.
 fn base_template() -> String {
     format!(
         r#"{{"Resources":{{
@@ -45,7 +51,15 @@ fn base_template() -> String {
                 "Description":"the escalation knowledge base",
                 "RoleArn":"arn:aws:iam::000000000000:role/recreation-kb",
                 "KnowledgeBaseConfiguration":{{"Type":"VECTOR",
-                   "VectorKnowledgeBaseConfiguration":{{"EmbeddingModelArn":"{FIRST_MODEL}"}}}}}}}},
+                   "VectorKnowledgeBaseConfiguration":{{"EmbeddingModelArn":"{FIRST_MODEL}"}}}},
+                "StorageConfiguration":{{"Type":"OPENSEARCH_SERVERLESS",
+                   "OpensearchServerlessConfiguration":{{
+                      "CollectionArn":"arn:aws:aoss:us-east-1:000000000000:collection/recreation",
+                      "VectorIndexName":"recreation-index",
+                      "FieldMapping":{{
+                         "VectorField":"bedrock-knowledge-base-default-vector",
+                         "TextField":"AMAZON_BEDROCK_TEXT_CHUNK",
+                         "MetadataField":"AMAZON_BEDROCK_METADATA"}}}}}}}}}},
              "Notify":{{"Type":"AWS::SNS::Topic","Properties":{{
                 "TopicName":"recreation-notify","DisplayName":"the stack's own"}}}}}}}}"#
     )
@@ -234,6 +248,10 @@ async fn a_change_set_reports_what_each_changed_property_does_to_the_resource() 
             code, 200,
             "case {name:?}: the stack the change set is for must be created, got {code} {body}"
         );
+        // The knowledge base its owning service creates comes up `CREATING`, and the stack's
+        // own create is held open until that service reports it `ACTIVE`, so the deployment
+        // is given past that instant before the change set is asked for.
+        wait_for_the_transition().await;
         settle_the_store(&router, &engine).await;
 
         let (code, body) = call(
