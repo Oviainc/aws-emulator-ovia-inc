@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePaymentManager
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePaymentManager`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePaymentManager::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -203,18 +194,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePaymentManager` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePaymentManagerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePaymentManager"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePaymentManagerErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the payment manager store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // The model states this rule in prose on the operation, so the framework's
+        // constraint walk cannot refuse it: "If you specify CUSTOM_JWT as the
+        // authorizerType, you must provide an authorizerConfiguration." The other
+        // authorizer type carries no configuration of its own and the model states
+        // nothing about supplying one with it, so a configuration sent alongside it
+        // is stored and reported rather than refused.
+        if input.authorizer_type == crate::state::AUTHORIZER_TYPE_CUSTOM_JWT
+            && input.authorizer_configuration.is_none()
+        {
+            return Err(CreatePaymentManagerErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    crate::state::AUTHORIZER_CONFIGURATION_MEMBER,
+                    &format!(
+                        "is required when authorizerType is {}",
+                        crate::state::AUTHORIZER_TYPE_CUSTOM_JWT
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the payment
+        // manager that token first produced, rather than minting a second one: "If
+        // this token matches a previous request, the service ignores the request, but
+        // doesn't return an error."
+        if let Some(payment_manager_id) =
+            store.replayed_payment_manager_result(Self::NAME, input.client_token.as_deref())
+        {
+            // `replayed_payment_manager_result` answers only for a manager the store
+            // still holds, so this lookup cannot miss.
+            if let Some(record) = store.payment_managers.get(&payment_manager_id) {
+                return Ok(record.create_output(now));
+            }
+        }
+
+        // The store this request would grow is bounded, so a caller looping on create
+        // meets the modelled quota instead of this process's memory limit.
+        if store.payment_managers.len() >= crate::state::MAX_PAYMENT_MANAGERS {
+            return Err(
+                CreatePaymentManagerErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} payment managers",
+                            crate::state::MAX_PAYMENT_MANAGERS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The model documents no uniqueness rule for `name` (unlike the gateway and
+        // the browser, whose names "must be unique within your account"), so a
+        // repeated name is a second manager with its own minted id rather than a
+        // conflict.
+        let payment_manager_id = store.mint_payment_manager_id(&input.name, now);
+        let record = crate::state::PaymentManagerRecord {
+            payment_manager_arn: crate::state::payment_manager_arn(&region, &payment_manager_id),
+            payment_manager_id: payment_manager_id.clone(),
+            name: input.name,
+            description: input.description,
+            authorizer_type: input.authorizer_type,
+            authorizer_configuration: input.authorizer_configuration,
+            role_arn: input.role_arn,
+            kms_key_arn: input.kms_key_arn,
+            workload_identity_details: Some(WorkloadIdentityDetails {
+                workload_identity_arn: crate::state::workload_identity_arn(
+                    &region,
+                    &payment_manager_id,
+                ),
+            }),
+            tags: crate::state::sorted_map(input.tags),
+            created_at: now,
+            updated_at: now,
+            // A new payment manager is created, not ready: the transition to READY is
+            // owed by the clock, not by this call.
+            transient_status: crate::state::PAYMENT_MANAGER_STATUS_CREATING.to_string(),
+            settled_status: crate::state::PAYMENT_MANAGER_STATUS_READY.to_string(),
+            settles_at: now + crate::state::PAYMENT_MANAGER_SETTLE_DELAY,
+        };
+        let output = record.create_output(now);
+
+        store.remember_payment_manager_client_token(
+            Self::NAME,
+            input.client_token,
+            &payment_manager_id,
+        );
+        store.payment_managers.insert(payment_manager_id, record);
+
+        Ok(output)
     }
 }

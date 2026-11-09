@@ -62,6 +62,10 @@
 //!   committed to it ([`ConfigurationBundleVersionRecord`]), so a create and
 //!   every later read of the bundle or of one of its versions answer from one
 //!   store;
+//! * the payment manager (`/payments/managers/`): one [`PaymentManagerRecord`]
+//!   per `paymentManagerId`, holding the authorizer, role and encryption
+//!   configuration `CreatePaymentManager` persisted and the status the clock
+//!   owes it, so `GetPaymentManager` reports exactly that;
 //! * the resource-based policy (`/resourcepolicy/`): the one document a
 //!   runtime or a gateway carries, keyed by the resource the policy's ARN
 //!   names, so `PutResourcePolicy`, `GetResourcePolicy` and
@@ -1803,6 +1807,11 @@ mod token_vault_secrets;
 /// `crate::state::…` for it exactly as it does for the object-storage and IAM
 /// resolutions beside it.
 pub mod runtime_logs;
+/// The payment manager this account holds: the record `CreatePaymentManager`
+/// persists, the ARN and id forms it is addressed by and the status the clock owes
+/// it. Re-exported, so a handler names `crate::state::…` for it exactly as it does
+/// for the resources beside it.
+pub mod payment_managers;
 /// The API key credential providers of this account's token vault: the record a
 /// create persists, the ARNs it mints and the Secrets Manager secret the API key
 /// itself lives in. Re-exported, so a handler names `crate::state::…` for it
@@ -1818,6 +1827,7 @@ pub use gateway_rate_limits::*;
 pub use gateway_target_synchronization::*;
 pub use memory_strategies::*;
 pub use payment_credential_providers::*;
+pub use payment_managers::*;
 pub use policies::*;
 pub use resource_policies::*;
 pub use runtime_logs::*;
@@ -3086,6 +3096,7 @@ impl ConfigurationBundleRecord {
 /// [`MAX_CONFIGURATION_BUNDLES`] the configuration bundles (and with them their
 /// 1:1 name index), [`MAX_VERSIONS_PER_CONFIGURATION_BUNDLE`] the versions one
 /// bundle accumulates,
+/// [`MAX_PAYMENT_MANAGERS`] the payment managers,
 /// [`MAX_RATE_LIMITS_PER_GATEWAY`](gateway_rate_limits::MAX_RATE_LIMITS_PER_GATEWAY)
 /// the rate limits one gateway holds,
 /// [`MAX_POLICY_ENGINES`](policies::MAX_POLICY_ENGINES) the policy engines and
@@ -3286,6 +3297,19 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// were first recorded, so the oldest record is the one evicted at the
     /// ceiling.
     configuration_bundle_idempotency_order: VecDeque<String>,
+    /// Every payment manager, keyed by `paymentManagerId` — the identifier every
+    /// payment-manager route addresses it by. The key order is the deterministic
+    /// list order a payment-manager listing pages over.
+    pub payment_managers: BTreeMap<String, PaymentManagerRecord>,
+    /// `<operation>/<clientToken>` -> the payment manager that token first
+    /// produced, so a replayed `CreatePaymentManager` answers with its first
+    /// result instead of minting a second manager. Separate from the maps above
+    /// because the record is validated against a different store; the key
+    /// carries the operation for the same reason as there.
+    payment_manager_idempotency: BTreeMap<String, String>,
+    /// The keys of [`Self::payment_manager_idempotency`] in the order they were
+    /// first recorded, so the oldest record is the one evicted at the ceiling.
+    payment_manager_idempotency_order: VecDeque<String>,
     /// Every payment credential provider of this account, keyed by `name` — the
     /// identifier every payment-credential-provider operation addresses it by,
     /// none of them carrying any other. The key order is the deterministic list

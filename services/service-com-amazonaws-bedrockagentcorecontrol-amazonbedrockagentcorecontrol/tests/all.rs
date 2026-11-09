@@ -79,6 +79,8 @@ mod memory_namespace_key_reference_wording;
 mod memory_read_reflects_last_mutation;
 #[path = "all/memory_update_and_read_projection.rs"]
 mod memory_update_and_read_projection;
+#[path = "all/payment_manager_lifecycle.rs"]
+mod payment_manager_lifecycle;
 #[path = "all/payment_credential_provider.rs"]
 mod payment_credential_provider;
 #[path = "all/policy_engine_creation.rs"]

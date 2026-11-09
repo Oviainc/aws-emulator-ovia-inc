@@ -17,7 +17,15 @@ pub struct GetPaymentManagerInput {
     pub payment_manager_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#GetPaymentManagerResponse")]
+/// `GetPaymentManagerResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `lastUpdatedAt` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="GetPaymentManager")`), and the derive
+/// does not put that trait on a member schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetPaymentManagerOutput {
     pub payment_manager_arn: String,
@@ -34,4 +42,53 @@ pub struct GetPaymentManagerOutput {
     pub tags: Option<std::collections::HashMap<String, String>>,
     pub kms_key_arn: Option<String>,
 }
+
+agentcore_schema_and_codec!(
+    GetPaymentManagerOutput,
+    GET_PAYMENT_MANAGER_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#GetPaymentManagerResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "GetPaymentManagerResponse",
+    (
+        M_PAYMENT_MANAGER_ARN,
+        payment_manager_arn,
+        "paymentManagerArn",
+        0,
+        req,
+        string
+    ),
+    (
+        M_PAYMENT_MANAGER_ID,
+        payment_manager_id,
+        "paymentManagerId",
+        1,
+        req,
+        string
+    ),
+    (M_NAME, name, "name", 2, req, string),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (M_AUTHORIZER_TYPE, authorizer_type, "authorizerType", 4, req, string),
+    (
+        M_AUTHORIZER_CONFIGURATION,
+        authorizer_configuration,
+        "authorizerConfiguration",
+        5,
+        opt,
+        union_of(AuthorizerConfiguration)
+    ),
+    (M_ROLE_ARN, role_arn, "roleArn", 6, req, string),
+    (
+        M_WORKLOAD_IDENTITY_DETAILS,
+        workload_identity_details,
+        "workloadIdentityDetails",
+        7,
+        opt,
+        struct_of(WorkloadIdentityDetails)
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 8, req, date_time),
+    (M_LAST_UPDATED_AT, last_updated_at, "lastUpdatedAt", 9, req, date_time),
+    (M_STATUS, status, "status", 10, req, string),
+    (M_TAGS, tags, "tags", 11, opt, map_of_string),
+    (M_KMS_KEY_ARN, kms_key_arn, "kmsKeyArn", 12, opt, string),
+);
 
