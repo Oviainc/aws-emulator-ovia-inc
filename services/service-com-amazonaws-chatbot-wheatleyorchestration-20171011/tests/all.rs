@@ -21,6 +21,8 @@ mod chime_webhook_configuration;
 mod chime_webhook_configuration_delete;
 #[path = "all/chime_webhook_configuration_update.rs"]
 mod chime_webhook_configuration_update;
+#[path = "all/chime_webhook_configuration_update_refusals.rs"]
+mod chime_webhook_configuration_update_refusals;
 #[path = "all/custom_action.rs"]
 mod custom_action;
 #[path = "all/custom_action_authorization.rs"]
