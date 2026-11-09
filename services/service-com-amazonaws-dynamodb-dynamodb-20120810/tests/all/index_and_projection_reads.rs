@@ -641,8 +641,8 @@ async fn an_index_query_pages_through_the_index_order() {
         );
     }
 
-    // A starting key from ANOTHER index partition than the condition selects is the
-    // caller's mistake, not an empty page.
+    // A starting key from ANOTHER index partition than the condition selects lies outside
+    // the boundaries the condition draws: the caller's mistake, not an empty page.
     let (status, refused) = call(
         &router,
         "Query",
@@ -660,7 +660,7 @@ async fn an_index_query_pages_through_the_index_order() {
     );
     assert_eq!(
         message(&refused),
-        "The provided starting key does not match the key condition's partition key",
+        "The provided starting key is outside query boundaries based on provided conditions",
         "case a starting key from another index partition: got {refused}"
     );
 }

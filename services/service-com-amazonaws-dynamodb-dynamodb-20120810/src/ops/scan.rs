@@ -13,9 +13,10 @@
 //! last page from a full one — "If LastEvaluatedKey is not empty, it does not
 //! necessarily mean that there is more data in the result set", so a page that ends
 //! exactly on the last item is free to report none. A parallel scan
-//! (`Segment`/`TotalSegments`) hands each worker a disjoint share of the table's
-//! items, so the segments together evaluate every item exactly once
-//! ([`Segmentation`]).
+//! (`Segment`/`TotalSegments`) divides the key space being walked into one block of
+//! PARTITIONS per segment, so the segments together evaluate every item exactly once and
+//! every item sharing a partition key is evaluated by one of them ([`Segmentation`],
+//! [`Partitions`]).
 //!
 //! `FilterExpression` is applied AFTER the page has been read — "a filter
 //! expression is applied after a Scan finishes but before the results are returned"
@@ -570,13 +571,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(lift)?;
 
-        // Segment membership is decided from each row's position in that total order,
+        // Which PARTITION of the walked key space each row sits in, which is what the
+        // segments of a parallel scan are shared out by ([`Partitions`]).
+        let partitions = Partitions::of(&candidates, index.as_ref());
+        // Segment membership is decided from the row's partition in that total order,
         // NOT from the position within one page, so a later page of the same segment
         // sees the same share of what is scanned.
         let evaluated = candidates
             .iter()
             .enumerate()
-            .filter(|(position, _)| segmentation.owns(*position))
+            .filter(|(position, _)| partitions.owned_by(*position, segmentation))
             .map(|(_, row)| row)
             // "Use this value to start a new operation, EXCLUDING this value in the
             // new request" (`Scan$LastEvaluatedKey`). A scan always walks forward.
@@ -721,12 +725,12 @@ const SEGMENT_NOT_BELOW_TOTAL_SEGMENTS_MESSAGE: &str =
 ///
 /// "TotalSegments represents the total number of segments into which the Scan
 /// operation will be divided ... Segment identifies an individual segment to be
-/// scanned by an application worker" (`Scan$TotalSegments` / `Scan$Segment`). The
-/// contract is that the segments together cover the table and no two of them cover
-/// the same item — WHICH item falls in which segment is not part of it — so this
-/// store shares the items out by their position in the one stored key order. A
-/// request that names neither member is the sequential scan: one segment, holding
-/// everything.
+/// scanned by an application worker" (`Scan$TotalSegments` / `Scan$Segment`). What is
+/// divided is the table's or index's KEY SPACE, so a segment is a block of PARTITIONS
+/// ([`Partitions`]): the segments together cover every item exactly once, no two of them
+/// cover the same item, and every item sharing a partition key is evaluated by one
+/// segment. A request that names neither member is the sequential scan: one segment,
+/// holding everything.
 #[derive(Debug, Clone, Copy)]
 struct Segmentation {
     segment: usize,
@@ -769,9 +773,76 @@ impl Segmentation {
         }
     }
 
-    /// Whether the item at `position` in the table's key order belongs to this
-    /// request's segment.
-    fn owns(&self, position: usize) -> bool {
-        position % self.total == self.segment
+    /// Whether the partition at `partition` of the `partitions` the walk covers belongs
+    /// to this request's segment.
+    ///
+    /// The segments divide the key space into as many CONTIGUOUS blocks of partitions as
+    /// there are segments, so a request that names fewer partitions than segments leaves
+    /// the trailing segments with nothing to evaluate, and the blocks together cover
+    /// every partition exactly once.
+    fn owns(&self, partition: usize, partitions: usize) -> bool {
+        if self.total <= 1 {
+            return true;
+        }
+        if partitions == 0 {
+            return false;
+        }
+        partition.saturating_mul(self.total) / partitions == self.segment
+    }
+}
+
+/// Which PARTITION of the walked key space each row of a scan's walk sits in.
+///
+/// A parallel scan divides the TABLE OR INDEX, not the row list: "DynamoDB divides the
+/// table or index into TotalSegments segments" and a page of one segment resumes from
+/// "the same segment whose previous Scan returned the corresponding value of
+/// LastEvaluatedKey" (`Scan$ExclusiveStartKey`) — a segment is therefore a block of the
+/// KEY SPACE, which keeps every row that shares a partition key in one segment and makes
+/// a segment's share a contiguous run of the walk. Built once per request from the walk
+/// this scan reads ([`crate::state::ReadPosition::partition`]), in that walk's order, so
+/// every page of a segment sees the same share.
+#[derive(Debug)]
+struct Partitions {
+    /// One entry per row of the walk, in walk order: which partition of the key space
+    /// that row falls in, numbered from 0 in walk order.
+    of_row: Vec<usize>,
+    /// How many distinct partitions the walk covers.
+    count: usize,
+}
+
+impl Partitions {
+    /// Number the partitions the walk covers. Rows sharing a partition key are
+    /// contiguous in either walk — the table's items are ordered partition-first
+    /// ([`crate::state::ItemKey`]) and an index's entries by the index key
+    /// ([`crate::state::IndexItemKey`]) — so one pass over the walk numbers them.
+    fn of(
+        candidates: &[(crate::state::ReadPosition<'_>, &crate::state::Item)],
+        index: Option<&crate::state::SecondaryIndex<'_>>,
+    ) -> Self {
+        let mut of_row: Vec<usize> = Vec::with_capacity(candidates.len());
+        let mut count = 0usize;
+        let mut previous: Option<&[crate::state::AttributeValueKey]> = None;
+        for (position, _) in candidates {
+            let partition = position.partition(index);
+            if previous.is_some_and(|previous| previous != partition) {
+                count = count.saturating_add(1);
+            }
+            of_row.push(count);
+            previous = Some(partition);
+        }
+        Self {
+            of_row,
+            count: if candidates.is_empty() {
+                0
+            } else {
+                count.saturating_add(1)
+            },
+        }
+    }
+
+    /// Whether the row at `position` in the walk falls in `segmentation`'s share of the
+    /// key space.
+    fn owned_by(&self, position: usize, segmentation: Segmentation) -> bool {
+        segmentation.owns(self.of_row.get(position).copied().unwrap_or(0), self.count)
     }
 }

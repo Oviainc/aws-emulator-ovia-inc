@@ -107,9 +107,13 @@ pub const MISSING_KEY_VALUE_MESSAGE: &str = "One of the required keys was not gi
 
 /// How an `ExclusiveStartKey` that is not a key of the schema being paged is
 /// refused. A resume token is not an item selector: a caller gets it from the
-/// previous page's `LastEvaluatedKey`, so AWS states the token INVALID rather
-/// than reporting the key-schema mismatch it words for a `Key` member.
-pub const START_KEY_INVALID_MESSAGE: &str = "The provided starting key is invalid";
+/// previous page's `LastEvaluatedKey`, so AWS states the TOKEN invalid and then
+/// says WHY after a colon — the same key-schema sentence a `Key` member is
+/// refused with ([`KEY_SCHEMA_MISMATCH_MESSAGE`]), which is what tells the caller
+/// its token's attributes are not this schema's key rather than the token being
+/// malformed. Both halves are fixed text, naming no attribute of either side.
+pub const START_KEY_INVALID_MESSAGE: &str =
+    "The provided starting key is invalid: The provided key element does not match the schema";
 
 /// Which request member a primary key is being read out of.
 ///

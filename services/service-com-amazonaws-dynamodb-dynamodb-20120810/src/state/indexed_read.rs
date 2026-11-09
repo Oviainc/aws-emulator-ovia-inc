@@ -20,8 +20,8 @@ use super::projection::{project_paths, projected_paths, projection_expression_pa
 use crate::ops::types::{ConsumedCapacity, KeySchemaElement};
 use crate::state::{
     consumed_capacity, consumed_index_capacity, enum_value_requirement, expression_conflict,
-    invalid_member, unknown_index_named, DocumentPath, IndexItemKey, Item, ItemKey, RequestError,
-    SecondaryIndex, Substitutions, Table,
+    invalid_member, unknown_index_named, AttributeValueKey, DocumentPath, IndexItemKey, Item,
+    ItemKey, RequestError, SecondaryIndex, Substitutions, Table,
 };
 
 /// How a strongly consistent read of a GLOBAL secondary index is refused: "The
@@ -446,6 +446,34 @@ pub enum ReadResume {
 }
 
 impl ReadPosition<'_> {
+    /// The PARTITION-key component of this row's place in the key space being walked:
+    /// the table's partition key value, or the `HASH` values of the index's key when the
+    /// walk is `index`'s.
+    ///
+    /// A list rather than a value because an index may declare several partition-key
+    /// elements ([`crate::state::MAX_INDEX_PARTITION_KEYS`]), and an index key lays its
+    /// `HASH` values first ([`Table::index_item_key`]). Two rows that agree here are in
+    /// the same partition of the key space, which is what a parallel `Scan` divides into
+    /// segments.
+    pub fn partition(&self, index: Option<&SecondaryIndex<'_>>) -> &[AttributeValueKey] {
+        match self {
+            Self::Table(key) => std::slice::from_ref(&key.partition),
+            Self::Index(key) => {
+                let leading = index
+                    .map(|index| {
+                        index
+                            .key_schema
+                            .iter()
+                            .filter(|element| element.key_type == "HASH")
+                            .count()
+                    })
+                    .unwrap_or(1)
+                    .clamp(1, key.index.len().max(1));
+                key.index.get(..leading).unwrap_or(&key.index)
+            }
+        }
+    }
+
     /// Whether this row comes strictly PAST the place a previous page stopped at, in the
     /// direction this read walks: "Use this value to start a new operation, EXCLUDING
     /// this value in the new request" (`LastEvaluatedKey`), which for a descending read

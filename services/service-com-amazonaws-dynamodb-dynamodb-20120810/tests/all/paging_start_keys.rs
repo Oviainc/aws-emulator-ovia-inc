@@ -10,9 +10,9 @@
 //! 2. a starting key that is NOT a key of the schema being paged — an attribute the
 //!    schema does not declare, a key attribute it omits, a key attribute of another type,
 //!    a value that is no scalar key at all — is refused as the invalid TOKEN it is: 400
-//!    `ValidationException` stating "The provided starting key is invalid", rather than
-//!    the mismatch AWS words for a `Key` member, which addresses ONE item and is what
-//!    `GetItem` and `DeleteItem` carry;
+//!    `ValidationException` stating that the starting key is invalid and then, after a
+//!    colon, the schema reason — not the bare mismatch AWS words for a `Key` member,
+//!    which addresses ONE item and is what `GetItem` and `DeleteItem` carry;
 //! 3. the refusal is the same for both paged reads and for both key schemas a table can
 //!    declare, and a refused request pages nothing.
 //!
@@ -220,11 +220,6 @@ async fn a_starting_key_that_is_not_a_key_of_the_schema_is_an_invalid_token() {
                     (400, "ValidationException", START_KEY_INVALID),
                     "case {case:?} on {operation} over {table}: the token is refused as invalid, \
                      got {status} with {body}"
-                );
-                assert!(
-                    !stated.contains(KEY_SCHEMA_MISMATCH),
-                    "case {case:?} on {operation}: a resume token is not worded as a Key member \
-                     mismatch, got {stated:?}"
                 );
             }
         }

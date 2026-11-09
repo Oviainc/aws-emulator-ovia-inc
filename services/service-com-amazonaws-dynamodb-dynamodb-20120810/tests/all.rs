@@ -151,12 +151,16 @@ mod restore_table_from_backup;
 mod scan_filter_value_types_and_segments;
 #[path = "all/scan_indexes_and_projections.rs"]
 mod scan_indexes_and_projections;
+#[path = "all/scan_segment_partitions.rs"]
+mod scan_segment_partitions;
 #[path = "all/select_rules_and_policy_resources.rs"]
 mod select_rules_and_policy_resources;
 #[path = "all/result_filter_expressions.rs"]
 mod result_filter_expressions;
 #[path = "all/restore_table_to_point_in_time.rs"]
 mod restore_table_to_point_in_time;
+#[path = "all/start_key_boundary_refusals.rs"]
+mod start_key_boundary_refusals;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_checkpoint_resume.rs"]
