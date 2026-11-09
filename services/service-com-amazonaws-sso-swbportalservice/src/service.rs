@@ -21,8 +21,11 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly, or one this service answers before the framework reads it. The default
+//!   returns `None`, so every request resolves through the generated routing table.
+//!   Return `Some(op)` to serve one yourself. The portal answers its authentication
+//!   refusal here, because that refusal precedes reading anything else of the request
+//!   (see [`session_gate`]).
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -40,9 +43,11 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+mod session_gate;
+
+use session_gate::SessionGate;
 use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 /// This service's modeled endpoint prefix (`portal.sso`), as `OPERATIONS.md` and the
 /// model's `awsService` trait give it. Used by [`EmulatedService::can_handle`] to claim
@@ -235,11 +240,12 @@ fn presented_access_token(req: &aws_smithy_runtime_api::http::Request) -> Option
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The SAME shared engine the generated entry threaded into every operation, kept
-    /// here too because this file's authentication gate has to resolve a presented token
-    /// against the one store the handlers read (see [`Self::presents_a_usable_session`]).
-    /// Never a store of its own: it is the `Arc` the router handed to `new`.
-    engine: Arc<Eng>,
+    /// The portal's authentication gate, on the SAME shared engine the generated entry
+    /// threaded into every operation: it resolves a presented token against the one store
+    /// the handlers read, and serves the refusal to a request that presents no usable
+    /// session. Both seams below ask it, so the two cannot disagree (see
+    /// [`session_gate`]).
+    session_gate: SessionGate<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -249,31 +255,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
-            engine,
+            session_gate: SessionGate::new(engine),
         }
-    }
-
-    /// Whether `req` presents a sign-in session this service still serves at the moment
-    /// it is asked.
-    ///
-    /// `false` covers every way a request can fail to present one — no access-token
-    /// header at all, or one naming a session that is unknown, logged out or expired —
-    /// because the portal authenticates a caller by that session and distinguishes none
-    /// of them. It is the same question [`crate::state::ComAmazonawsSsoSwbportalserviceState::session`]
-    /// answers for a handler, asked of a request that has not reached one.
-    fn presents_a_usable_session(&self, req: &aws_smithy_runtime_api::http::Request) -> bool {
-        let Some(token) = presented_access_token(req) else {
-            return false;
-        };
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            // UNREACHABLE with the engine the router mounts (see the note in
-            // `ops/list_accounts.rs`): with no store to resolve the token against there
-            // is nothing to authenticate it with, so the gate claims nothing here and
-            // the framework's own answer stands.
-            return true;
-        };
-        let state = state.lock();
-        state.session(token, SystemTime::now()).is_some()
     }
 }
 
@@ -325,12 +308,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // AUTHENTICATION FIRST, for a request the model DOES name an operation for. This
+        // is the one seam that sees the whole request before the framework reads any of
+        // it, and the portal's authentication precedes reading anything else: everything
+        // this service answers comes out of the sign-in session the request's bearer
+        // token names, so a request presenting no usable session is an unauthenticated
+        // request and is refused as one — whatever else it did or did not carry. Asked
+        // any later, the rule could not hold: the framework validates the request's
+        // modelled members before a handler runs, so a value outside a declared bound
+        // would be worded by `override_refusal` below while the handler's own gate never
+        // ran.
+        //
+        // Only a request the model names an operation for is claimed here. One that
+        // names none — a path this service does not bind, or a route missing a
+        // `@required` http-bound member — still falls to `override_routing_error` below,
+        // which answers the same rule from the other side.
+        let routing_key = self
+            .entry
+            .wire_protocol(req)
+            .protocol()
+            .routing_key(req)
+            .ok()?;
+        self.entry.routing_table().get(routing_key)?;
+        (!self.session_gate.presents_a_usable_session(req))
+            .then_some(&self.session_gate as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -339,6 +340,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // be missing or out of range" — rather than the framework's generic
         // `ValidationException`. The status (400) is the protocol's and matches the
         // modelled `@httpError`. Both the code and the message are replaced together.
+        //
+        // A request presenting no usable session never reaches this seam: the gate in
+        // `override_operation` above answers it first, so what is left to word here is a
+        // request from an AUTHENTICATED caller that this service will not read.
         if let Refusal::Invalid(violations) = refusal {
             return Some(Refused {
                 code: "InvalidRequestException".to_string(),
@@ -346,8 +351,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                     .unwrap_or_else(|| "the request is not valid".to_string()),
             });
         }
-        // Every other refusal class (an unauthenticated caller) keeps the
-        // framework's default wording: this service's model declares no error for it.
+        // The only other refusal class is the EMULATOR's own request authentication
+        // refusing the caller, which is not this service's sign-in session: the portal's
+        // modelled authentication refusal (`UnauthorizedException`, 401, worded by
+        // `crate::state::unauthorized_session`) is answered before any value of the
+        // request is read — by the gate in `override_operation` above, by
+        // `override_routing_error` below, and by every handler — so restating it here
+        // would reword somebody else's refusal as this service's.
         None
     }
 
@@ -368,7 +378,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // absent member IS the credential: an absent credential is not a malformed
         // parameter, and it is exactly the case no handler's own gate can answer,
         // because the router never selects a route without it.
-        if !self.presents_a_usable_session(req) {
+        if !self.session_gate.presents_a_usable_session(req) {
             return crate::state::unauthorized_response(self.entry.protocol());
         }
 

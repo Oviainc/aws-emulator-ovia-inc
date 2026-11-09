@@ -19,11 +19,15 @@
 //! modelled answer is asserted instead. The recorded case (one route, one credential) is
 //! one cell of that table.
 //!
-//! A request carrying a VALUE outside a modelled constraint is not a row here: that
-//! value is refused by the framework's own boundary validation, which runs over a
-//! request the router already matched to an operation and so never reaches this
-//! service's credential gate. `portal_session.rs` pins those `max_result` rows (0, 101,
-//! -1 — one past each published bound) as the modelled 400 they are.
+//! A request carrying a VALUE outside a modelled constraint is not a row here either,
+//! but for a reason of its own: that value is refused by the framework's own boundary
+//! validation, which runs over a request the router already matched to an operation, so
+//! no handler — and no handler's own gate — runs for it, and the rule above has to be
+//! answered before the framework reads the request at all.
+//! `authentication_precedes_reading.rs` sweeps that half, the same classes of unusable
+//! credential against a `max_result` outside the modelled range; `portal_session.rs`
+//! pins those `max_result` rows (0, 101, -1 — one past each published bound) as the
+//! modelled 400 an AUTHENTICATED caller earns.
 
 use super::portal_session::{body_json, body_text, error_code, error_message, Portal};
 use bytes::Bytes;

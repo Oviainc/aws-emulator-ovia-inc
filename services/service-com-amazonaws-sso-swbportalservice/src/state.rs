@@ -74,12 +74,14 @@ pub fn unauthorized_session() -> crate::ops::types::UnauthorizedException {
 /// The SAME refusal as [`unauthorized_session`], already rendered as a wire response in
 /// this service's own protocol envelope.
 ///
-/// A request that presents no bearer credential at all never reaches a handler: the REST
-/// router selects a route only when every `@required` http-bound member is on the
-/// request, so the absent credential ends the request before any handler's gate could
-/// run. `crate::service` answers that case through here, so the authentication refusal a
-/// caller sees is the same one whether the credential was absent or merely named no
-/// usable session.
+/// Two classes of request never reach a handler's own gate, and this is what answers
+/// both. A request presenting no bearer credential at all matches no route — the REST
+/// router selects one only when every `@required` http-bound member is on the request —
+/// and a request carrying a value outside a modelled constraint is refused by the
+/// framework's boundary validation, which runs before any handler. `crate::service`
+/// answers each through here, so the authentication refusal a caller sees is the same one
+/// whether its credential was absent, named no usable session, or came alongside a value
+/// this service would not have read.
 ///
 /// The status and the `__type` come from the model, not from a literal here:
 /// `UnauthorizedException` carries its own `@httpError` and is a common error of all four
