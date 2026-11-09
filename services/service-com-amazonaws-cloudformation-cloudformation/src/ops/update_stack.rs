@@ -1050,6 +1050,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // exported output values in force in the Region this request is signed for,
             // read before the stack is resolved so the two cannot disagree about them.
             let exports = store.exported_values(&request_region);
+            // ...and the outputs an `Fn::GetStackOutput` in it reads off the stacks of that
+            // Region, read in the same breath and for the same reason.
+            let stack_outputs = store.stack_output_values(&request_region);
             // ...and which of this stack's exports another live stack IMPORTS, read in the
             // same breath and for the same reason: an export in use is PINNED, so an update
             // that would stop publishing it, or publish another value under it, is the one
@@ -1166,7 +1169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // carries: its resources and its outputs are re-evaluated from the new body
             // and the merged parameters, each resource the deployment acts on reports its
             // own events, and all of it is reported once the update completes.
-            let cannot_deploy = stack.deploy_template(&exports).err();
+            let cannot_deploy = stack.deploy_template(&exports, &stack_outputs).err();
             // The update starts now and settles to UPDATE_COMPLETE once the clock makes
             // that due; the stack id never changes.
             stack.begin_transition(
@@ -1243,7 +1246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .as_ref()
                         .map(|failure| failure.reason.clone())
                 })
-                .or_else(|| stack.unresolved_import_failure());
+                .or_else(|| stack.unresolved_cross_stack_failure());
             (
                 stack.stack_id.clone(),
                 stack.region.clone(),

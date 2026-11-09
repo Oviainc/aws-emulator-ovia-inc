@@ -3617,6 +3617,16 @@ fn intrinsic(
             let name = text(argument, scope, depth + 1, budget)?;
             scope.imports.get(&name).cloned().map(Resolved::Text)
         }
+        // `Fn::GetStackOutput` reads one OUTPUT of another stack of the account and Region
+        // the deployment runs in, by the stack and the output key rather than by an export
+        // name — so the output it reads needs no `Export` declaration. The value is the one
+        // that output carries where the template is deployed, which the reading stack then
+        // keeps ([`super::stack_outputs`]); a reference naming no output of any stack of
+        // that Region resolves to no value, the same as any other unresolvable expression.
+        super::stack_outputs::FN_GET_STACK_OUTPUT => {
+            let reference = stack_output_reference(argument, scope, depth, budget)?;
+            scope.stack_outputs.get(&reference).cloned().map(Resolved::Text)
+        }
         // "Fn::Join appends a set of values into a single value, separated by the
         // specified delimiter": [delimiter, [values]].
         "Fn::Join" => {

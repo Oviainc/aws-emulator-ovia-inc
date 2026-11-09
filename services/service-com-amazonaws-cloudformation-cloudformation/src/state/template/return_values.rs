@@ -3657,6 +3657,12 @@ pub struct Scope<'a> {
     /// does not carry is not exported in the account and Region the deployment runs in, so
     /// the import resolves to nothing.
     pub imports: &'a BTreeMap<String, String>,
+    /// The other stacks' output values an `Fn::GetStackOutput` resolves against, keyed by
+    /// the reference that reads one: "the value of an output of another stack", read by the
+    /// stack and the output key rather than by an export name. A reference this map does not
+    /// carry reads an output no stack of the account and Region holds, so it resolves to
+    /// nothing — see [`crate::state::stack_outputs`].
+    pub stack_outputs: &'a crate::state::stack_outputs::Values,
 }
 
 /// Evaluate every output a template declares, in `OutputKey` order (the protocol fixes no
@@ -3708,7 +3714,7 @@ pub fn evaluate_outputs(
 /// parameter decides is the export name it really resolved to.
 ///
 /// DECLARATION ORDER, because a deployment that cannot resolve an import reports the FIRST
-/// one it could not ([`super::StoredStack::unresolved_import_failure`]), which is the one
+/// one it could not ([`super::StoredStack::unresolved_cross_stack_failure`]), which is the one
 /// the template names first — the index the names also feed is keyed by name, so the order
 /// is nothing to it.
 pub fn imported_export_names(
@@ -3763,6 +3769,103 @@ pub(super) fn collect_imports(
         }
         _ => {}
     }
+}
+
+/// Every other stack's output a template READS with an `Fn::GetStackOutput`, as the pair
+/// (stack, output key) each reference resolves to, in the order the template declares them
+/// and without repeats.
+///
+/// The reading stack's half of that relation: it is what the deployment resolves against
+/// the Region's own table and then KEEPS ([`crate::state::stack_outputs`]), so it is
+/// computed where the template is deployed, from the document that really deploys, and
+/// charged to that deployment's own budget like every other pass over a caller-sized body.
+/// An argument that is itself an expression is evaluated, so a reference whose stack or
+/// output key a parameter decides is the pair it really names.
+///
+/// DECLARATION ORDER, for the reason [`imported_export_names`] is in it: a deployment that
+/// cannot resolve one reports the FIRST it could not.
+pub fn stack_output_reads(
+    template: &Template,
+    scope: &Scope<'_>,
+    budget: &mut Budget,
+) -> Vec<crate::state::stack_outputs::Reference> {
+    let mut found = Vec::new();
+    for resource in &template.resources {
+        collect_stack_output_reads(&resource.declaration, scope, 0, budget, &mut found);
+    }
+    for output in &template.outputs {
+        collect_stack_output_reads(&output.value, scope, 0, budget, &mut found);
+        if let Some(export_name) = &output.export_name {
+            collect_stack_output_reads(export_name, scope, 0, budget, &mut found);
+        }
+    }
+    found
+}
+
+/// Collect every `Fn::GetStackOutput` reference inside one declaration, bounded by the
+/// deployment's depth limit and its shared budget, exactly as [`collect_imports`] is: ONE
+/// pass over the node, each reference answered once, at the position it was first named.
+fn collect_stack_output_reads(
+    value: &Value,
+    scope: &Scope<'_>,
+    depth: usize,
+    budget: &mut Budget,
+    found: &mut Vec<crate::state::stack_outputs::Reference>,
+) {
+    if depth > MAX_INTRINSIC_DEPTH || budget.spend(1).is_none() {
+        return;
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_stack_output_reads(item, scope, depth + 1, budget, found);
+            }
+        }
+        Value::Object(members) => {
+            for (name, argument) in members {
+                if name == crate::state::stack_outputs::FN_GET_STACK_OUTPUT {
+                    if let Some(reference) =
+                        stack_output_reference(argument, scope, depth + 1, budget)
+                    {
+                        if !found.contains(&reference) {
+                            found.push(reference);
+                        }
+                    }
+                }
+                collect_stack_output_reads(argument, scope, depth + 1, budget, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The stack and the output one `Fn::GetStackOutput` argument names:
+/// `{"StackName": <stack>, "OutputName": <output>}`, the two members the function takes.
+/// Each is evaluated the way every other function's arguments are, so a member spelled by an
+/// expression names what it resolves to.
+///
+/// `None` for an argument that names neither member, which is no reference at all — the
+/// same answer every other expression this evaluator cannot read gives.
+pub(super) fn stack_output_reference(
+    argument: &Value,
+    scope: &Scope<'_>,
+    depth: usize,
+    budget: &mut Budget,
+) -> Option<crate::state::stack_outputs::Reference> {
+    let members = argument.as_object()?;
+    let stack = text(
+        members.get(crate::state::stack_outputs::STACK_NAME)?,
+        scope,
+        depth + 1,
+        budget,
+    )?;
+    let output = text(
+        members.get(crate::state::stack_outputs::OUTPUT_NAME)?,
+        scope,
+        depth + 1,
+        budget,
+    )?;
+    Some(crate::state::stack_outputs::Reference::new(stack, output))
 }
 
 /// An evaluated expression: CloudFormation's intrinsic functions produce either a string

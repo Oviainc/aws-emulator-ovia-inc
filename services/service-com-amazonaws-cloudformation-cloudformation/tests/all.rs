@@ -363,6 +363,8 @@ mod stack_input_contracts;
 mod stack_lifecycle;
 #[path = "all/stack_not_found_wording.rs"]
 mod stack_not_found_wording;
+#[path = "all/stack_output_reads.rs"]
+mod stack_output_reads;
 #[path = "all/stack_output_resolution.rs"]
 mod stack_output_resolution;
 #[path = "all/stack_own_subnets_db_subnet_group.rs"]

@@ -34,6 +34,7 @@ use crate::stack_lifecycle::{
 use service_com_amazonaws_cloudformation_cloudformation::state::resource_types::{
     is_published, is_recognized,
 };
+use service_com_amazonaws_cloudformation_cloudformation::state::stack_outputs;
 use service_com_amazonaws_cloudformation_cloudformation::state::template::{
     self, published_attribute_names, Budget, Scope, StackScope, IMPLEMENTED_RESOURCE_TYPES,
     S3VECTORS_INDEX, S3VECTORS_VECTOR_BUCKET,
@@ -92,6 +93,7 @@ fn provisioned(template_body: &str, parameters: &[(&str, &str)]) -> BTreeMap<Str
     let mappings = Value::Null;
     let conditions = Value::Null;
     let imports = BTreeMap::new();
+    let stack_outputs = stack_outputs::Values::new();
     let scope = Scope {
         stack: StackScope {
             region: REGION,
@@ -105,6 +107,7 @@ fn provisioned(template_body: &str, parameters: &[(&str, &str)]) -> BTreeMap<Str
         mappings: &mappings,
         conditions: &conditions,
         imports: &imports,
+        stack_outputs: &stack_outputs,
     };
     let mut budget = Budget::new();
     template::provision(&parsed.0, &scope, &mut budget)

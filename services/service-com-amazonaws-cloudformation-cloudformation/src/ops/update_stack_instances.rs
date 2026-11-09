@@ -165,7 +165,7 @@ struct Deployment {
     cannot_deploy: Option<String>,
     /// Why CLOUDFORMATION refused this instance's deployment before anything was asked of
     /// any owning service: its template imports an export nothing publishes in the
-    /// instance's Region ([`crate::state::StoredStack::unresolved_import_failure`]).
+    /// instance's Region ([`crate::state::StoredStack::unresolved_cross_stack_failure`]).
     refused: Option<String>,
     /// The stack identity and tags CloudFormation gives each resource it provisions.
     provenance: crate::state::provisioning::StackProvenance,
@@ -519,6 +519,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect()
         };
 
+        // ...and what an `Fn::GetStackOutput` in it reads, per TARGET Region and for the
+        // same reason: the outputs of the stacks of the Region the instance is deployed in.
+        let stack_outputs_by_region: ::std::collections::BTreeMap<
+            String,
+            crate::state::stack_outputs::Values,
+        > = {
+            let store = state.lock();
+            exports_by_region
+                .keys()
+                .map(|target_region| {
+                    (
+                        target_region.clone(),
+                        store.stack_output_values(target_region),
+                    )
+                })
+                .collect()
+        };
+
         // ...and which physical names the live stacks of each of those Regions MANAGE, read
         // under the same kind of short lock and shared by every instance deployed into that
         // Region ([`crate::state::physical_name::ManagedNames`]): a resource one of these
@@ -634,6 +652,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for one instance's template evaluation rather than for every instance's, and a
         // cancellation has an await point to land on in every iteration.
         let no_exports = ::std::collections::BTreeMap::new();
+        let no_stack_outputs = crate::state::stack_outputs::Values::new();
         // The values in force and the processed stage the template takes under them, computed
         // off the lock and reused while the next instance resolves the same values — which
         // every instance of one override list does, so the ordinary request reads the template
@@ -683,6 +702,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let prepared = {
                 let mut store = state.lock();
                 let exports = exports_by_region.get(&plan.region).unwrap_or(&no_exports);
+                let stack_outputs = stack_outputs_by_region
+                    .get(&plan.region)
+                    .unwrap_or(&no_stack_outputs);
                 // Which physical names the live stacks of the instance's Region manage, read
                 // once per Region above: a resource this deployment CREATES under a name
                 // another stack owns fails in CloudFormation's own words
@@ -706,7 +728,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     stack.set_template_body(template_body.clone(), resolved.processed.clone());
                     stack.parameters = resolved.in_force.clone();
                     stack.last_updated_time = Some(now);
-                    let cannot_deploy = stack.deploy_template(exports).err();
+                    let cannot_deploy = stack.deploy_template(exports, stack_outputs).err();
                     stack.begin_transition(
                         now,
                         status::UPDATE_IN_PROGRESS,
@@ -731,7 +753,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // stack": an export name nothing publishes in the instance's own
                         // Region has no value to import, so CloudFormation refuses this
                         // deployment before anything is asked of the owning services.
-                        refused: stack.unresolved_import_failure(),
+                        refused: stack.unresolved_cross_stack_failure(),
                         provenance: crate::state::provisioning::StackProvenance {
                             managed_names: managed,
                             ..stack.provenance()

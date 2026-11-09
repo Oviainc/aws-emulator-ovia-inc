@@ -46,6 +46,12 @@
 //! derived from the stacks themselves rather than from an index of their own, so an export
 //! and its importers appear when a deployment completes and go when the stack goes.
 //!
+//! An export is not the only way one stack reads another's output: `Fn::GetStackOutput`
+//! reads one by the STACK and the output key, so it needs no `Export` at all
+//! ([`stack_outputs`]). That reference is resolved where the template is deployed and KEPT
+//! by the reading stack ([`StoredStack::stack_outputs`]) rather than re-read, which is what
+//! makes the value the reader reports its own deployment's.
+//!
 //! ## Bounds
 //!
 //! Every growth site in this store is bounded, because a caller chooses both how many
@@ -355,6 +361,10 @@ pub mod resource_inventory;
 /// Which exported output values another live stack IMPORTS, and what a stack operation
 /// that would withdraw one answers.
 pub mod exports;
+
+/// Reading one OUTPUT of another stack of the same Region, which is what the
+/// `Fn::GetStackOutput` function this service resolves answers.
+pub mod stack_outputs;
 
 /// The Hook invocations planned for one change set, which `DescribeChangeSetHooks`
 /// reports.
@@ -1757,8 +1767,21 @@ pub struct PendingDeployment {
     /// "The intrinsic function Fn::ImportValue returns the value of an output exported by
     /// another stack": a name no live stack of that Region exports has no value to return,
     /// so the deployment cannot be carried out at all — which is what
-    /// [`StoredStack::unresolved_import_failure`] words for the operation driving it.
+    /// [`StoredStack::unresolved_cross_stack_failure`] words for the operation driving it.
     pub unresolved_imports: Vec<String>,
+    /// The other stacks' output values this deployment's template READ with an
+    /// `Fn::GetStackOutput`, keyed by the reference that read one
+    /// ([`stack_outputs::Values`]). Resolved where the template is deployed and KEPT by the
+    /// stack, so the reading stack goes on reporting the value as of its own deployment —
+    /// which is why it travels with the deployment the way the imports above do.
+    pub stack_outputs: stack_outputs::Values,
+    /// The output references this deployment's template reads that NO live stack of its
+    /// account and Region carries, in the order the template reads them.
+    ///
+    /// Such a reference has no value to return, so the deployment cannot be carried out at
+    /// all — which is what [`StoredStack::unresolved_cross_stack_failure`] words for the
+    /// operation driving it, as it does for an unresolved import.
+    pub unresolved_stack_outputs: Vec<stack_outputs::Reference>,
     /// The resource-signal waits the template being deployed declares
     /// ([`wait_conditions::declared`]), each with the resources whose creation waits on
     /// it. Computed where the template is READ, outside the store lock;
@@ -2740,9 +2763,19 @@ impl ComAmazonawsCloudformationCloudformationState {
         exports
     }
 
-    /// The names of the live stacks of one Region that IMPORT `export_name`, in creation
-    /// order.
+    /// Every output value a deployment in one Region can read with an `Fn::GetStackOutput`,
+    /// keyed by the reference that reads one ([`stack_outputs::values_in`]).
     ///
+    /// Read where a template is DEPLOYED, exactly as [`Self::exported_values`] is: that
+    /// function reads another stack's output by the stack and the output key rather than by
+    /// an export name, so what it resolves against is every output of every live stack of
+    /// the account and Region the deployment runs in.
+    pub fn stack_output_values(&self, region: &str) -> stack_outputs::Values {
+        stack_outputs::values_in(self.live_stacks(region))
+    }
+
+    /// The names of the live stacks of one Region that IMPORT `export_name`, in creation
+    /// order.    ///
     /// `ListImports` "lists all stacks that are importing an exported output value": a
     /// stack imports one when the template it deployed resolved a `Fn::ImportValue` for
     /// that name ([`StoredStack::imports`]), so it enters the index when its deployment

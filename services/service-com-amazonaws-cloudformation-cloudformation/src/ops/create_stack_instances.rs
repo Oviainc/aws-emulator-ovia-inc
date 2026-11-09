@@ -137,7 +137,7 @@ struct Prepared {
     /// failed before any owning service was asked for a resource.
     cannot_deploy: Option<String>,
     /// Why CLOUDFORMATION refused this instance's deployment before anything was asked of
-    /// any owning service ([`crate::state::StoredStack::unresolved_import_failure`]).
+    /// any owning service ([`crate::state::StoredStack::unresolved_cross_stack_failure`]).
     refused: Option<String>,
 }
 
@@ -157,7 +157,7 @@ struct Deployment {
     cannot_deploy: Option<String>,
     /// Why CLOUDFORMATION refused this instance's deployment before anything was asked of
     /// any owning service: its template imports an export nothing publishes in the
-    /// instance's Region ([`crate::state::StoredStack::unresolved_import_failure`]).
+    /// instance's Region ([`crate::state::StoredStack::unresolved_cross_stack_failure`]).
     refused: Option<String>,
     /// The stack identity and tags CloudFormation gives each created resource.
     provenance: crate::state::provisioning::StackProvenance,
@@ -517,18 +517,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instance is deployed IN, the way any other stack of that Region does. Read under
         // ONE short lock, before any template is evaluated, so the evaluations below happen
         // with the store UNLOCKED.
-        let exports_by_region: ::std::collections::BTreeMap<
-            String,
-            ::std::collections::BTreeMap<String, String>,
-        > = {
+        let (exports_by_region, stack_outputs_by_region): (
+            ::std::collections::BTreeMap<String, ::std::collections::BTreeMap<String, String>>,
+            ::std::collections::BTreeMap<String, crate::state::stack_outputs::Values>,
+        ) = {
             let mut store = state.lock();
             store.settle(now);
-            regions
-                .iter()
-                .map(|target_region| {
-                    (target_region.clone(), store.exported_values(target_region))
-                })
-                .collect()
+            (
+                regions
+                    .iter()
+                    .map(|target_region| {
+                        (target_region.clone(), store.exported_values(target_region))
+                    })
+                    .collect(),
+                // ...and what an `Fn::GetStackOutput` in it reads, per TARGET Region and for
+                // the same reason: the outputs of the stacks of the Region the instance is
+                // deployed in.
+                regions
+                    .iter()
+                    .map(|target_region| {
+                        (
+                            target_region.clone(),
+                            store.stack_output_values(target_region),
+                        )
+                    })
+                    .collect(),
+            )
         };
 
         // Each instance's stack: created in the TARGET Region, from the stack set's
@@ -537,6 +551,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reason `CreateStack` evaluates its template off it: reading a caller-sized body is
         // work the request paid for, and no other CloudFormation request should wait on it.
         let no_exports = ::std::collections::BTreeMap::new();
+        let no_stack_outputs = crate::state::stack_outputs::Values::new();
         let mut prepared: Vec<Prepared> = Vec::new();
         for account in &accounts {
             for target_region in &regions {
@@ -553,7 +568,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stack.capabilities = capabilities.clone();
                 stack.tags = tags.clone();
                 let exports = exports_by_region.get(target_region).unwrap_or(&no_exports);
-                let cannot_deploy = stack.deploy_template(exports).err();
+                let stack_outputs = stack_outputs_by_region
+                    .get(target_region)
+                    .unwrap_or(&no_stack_outputs);
+                let cannot_deploy = stack.deploy_template(exports, stack_outputs).err();
                 stack.begin_transition(
                     now,
                     status::CREATE_IN_PROGRESS,
@@ -568,7 +586,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // stack": an export name nothing publishes in the instance's own Region has
                 // no value to import, so CloudFormation refuses this deployment before
                 // anything is asked of the services that own the resources.
-                let refused = stack.unresolved_import_failure();
+                let refused = stack.unresolved_cross_stack_failure();
                 prepared.push(Prepared {
                     stack,
                     account: account.clone(),

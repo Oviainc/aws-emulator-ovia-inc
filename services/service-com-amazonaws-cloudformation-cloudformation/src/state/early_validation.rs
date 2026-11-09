@@ -142,6 +142,9 @@ pub fn named_resources(
 ) -> Vec<NamedResource> {
     let no_resources = BTreeMap::new();
     let no_imports = BTreeMap::new();
+    // A stated name is built from the template, its parameters and the stack's own identity;
+    // a cross-stack read is no part of that, so neither table carries anything here.
+    let no_stack_outputs = super::stack_outputs::Values::new();
     let parameter_types = super::ssm_parameters::parameter_types_in_force(template);
     let scope = template::Scope {
         stack,
@@ -151,6 +154,7 @@ pub fn named_resources(
         mappings: &template.mappings,
         conditions: &template.conditions,
         imports: &no_imports,
+        stack_outputs: &no_stack_outputs,
     };
     // ONE budget for the whole template, as a deployment evaluates a whole template out of
     // one: the work this check can be asked for is bounded.

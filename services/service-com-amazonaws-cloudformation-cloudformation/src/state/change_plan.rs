@@ -323,6 +323,13 @@ pub fn computed_changes(
     // claims to know.
     let before_parameters = parameter_values(current.template, current.parameters);
     let before_types = super::ssm_parameters::parameter_types_in_force(current.template);
+    // Neither side reads another stack's output: an `Fn::GetStackOutput` is resolved where a
+    // template is DEPLOYED and kept by the stack that read it
+    // ([`super::stack_outputs`]), so what one would read next is not something this
+    // comparison claims to know — and resolving both sides against the same (empty) table is
+    // what keeps a reference that did not change out of the plan, exactly as the shared
+    // `imports` map does for an import.
+    let no_stack_outputs = super::stack_outputs::Values::new();
     let before = template::Scope {
         stack: current.stack,
         parameters: &before_parameters,
@@ -331,6 +338,7 @@ pub fn computed_changes(
         mappings: &current.template.mappings,
         conditions: &current.template.conditions,
         imports: current.imports,
+        stack_outputs: &no_stack_outputs,
     };
     let after_parameters = parameter_values(submitted, submitted_parameters);
     let after_types = super::ssm_parameters::parameter_types_in_force(submitted);
@@ -342,6 +350,7 @@ pub fn computed_changes(
         mappings: &submitted.mappings,
         conditions: &submitted.conditions,
         imports: current.imports,
+        stack_outputs: &no_stack_outputs,
     };
     let declared_resources: BTreeSet<&str> = submitted
         .resources

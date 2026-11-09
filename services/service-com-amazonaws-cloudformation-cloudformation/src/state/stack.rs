@@ -212,6 +212,12 @@ pub struct StoredStack {
     /// template was deployed. A stack that imports an export is what `ListImports` reports
     /// for that export name, and what makes the exporting stack's export in use.
     pub imports: BTreeMap<String, String>,
+    /// The other stacks' output values this stack's deployed template READ with an
+    /// `Fn::GetStackOutput`, keyed by the reference that read one: resolved once where the
+    /// template was deployed and KEPT here, so the stack goes on reporting the value as of
+    /// its own deployment rather than whatever the publishing stack carries now
+    /// ([`super::stack_outputs`]).
+    pub stack_outputs: super::stack_outputs::Values,
     /// The identifier each resource this stack ADOPTED already existed under, keyed by
     /// logical id ([`resource_import`]): what executing an IMPORT change set took over
     /// ([`resource_import::adopt_identifier`]).
@@ -316,6 +322,7 @@ impl StoredStack {
             retained_event_properties_bytes: 0,
             signals: ::std::collections::VecDeque::new(),
             imports: BTreeMap::new(),
+            stack_outputs: super::stack_outputs::Values::new(),
             adopted: BTreeMap::new(),
             drift_status: DRIFT_STATUS_NOT_CHECKED.to_string(),
             drift_last_check: None,
@@ -407,11 +414,16 @@ impl StoredStack {
     /// deployment runs in, keyed by export name: what its template's `Fn::ImportValue`
     /// references resolve against. The deployment keeps the ones it really imported, which
     /// is the stack's entry in the index `ListImports` reports.
+    /// `stack_outputs` is the other half of the cross-stack relation: every output value a
+    /// template deployed in that Region can read with an `Fn::GetStackOutput`
+    /// ([`super::stack_outputs::Values`]). The deployment keeps the ones it really read, so
+    /// the stack reports them as of its own deployment.
     pub fn deploy_template(
         &mut self,
         exports: &BTreeMap<String, String>,
+        stack_outputs: &super::stack_outputs::Values,
     ) -> Result<(), String> {
-        self.deploy_template_adopting(exports, &BTreeMap::new())
+        self.deploy_template_adopting(exports, stack_outputs, &BTreeMap::new())
     }
 
     /// [`Self::deploy_template`] for a deployment that ADOPTS resources that already exist:
@@ -428,6 +440,7 @@ impl StoredStack {
     pub fn deploy_template_adopting(
         &mut self,
         exports: &BTreeMap<String, String>,
+        stack_output_values: &super::stack_outputs::Values,
         adopting: &BTreeMap<String, String>,
     ) -> Result<(), String> {
         for (logical_id, identifier) in adopting {
@@ -484,6 +497,7 @@ impl StoredStack {
             mappings: &declared.mappings,
             conditions: &declared.conditions,
             imports: exports,
+            stack_outputs: stack_output_values,
         };
         let mut resources = template::provision(&declared, &scope, &mut budget);
         let by_logical_id: BTreeMap<String, StoredResource> = resources
@@ -641,10 +655,27 @@ impl StoredStack {
                 // "Fn::ImportValue returns the value of an output exported by another
                 // stack": no live stack of this account and Region exports that name, so
                 // there is no value to import and the deployment cannot be carried out
-                // ([`Self::unresolved_import_failure`]).
+                // ([`Self::unresolved_cross_stack_failure`]).
                 None => {
                     unresolved_imports.push(name);
                 }
+            }
+        }
+        // Which outputs of OTHER stacks this template really reads, resolved against the
+        // same scope: only those belong on the stack, and the stack KEEPS them, so what it
+        // reports is the value as of its own deployment.
+        let read = template::stack_output_reads(&declared, &scope, &mut budget);
+        let mut unresolved_stack_outputs = Vec::new();
+        let mut read_stack_outputs = super::stack_outputs::Values::new();
+        for reference in read {
+            match stack_output_values.get(&reference) {
+                Some(value) => {
+                    read_stack_outputs.insert(reference, value.clone());
+                }
+                // No live stack of this account and Region carries that output, so there is
+                // no value to read and the deployment cannot be carried out
+                // ([`Self::unresolved_cross_stack_failure`]).
+                None => unresolved_stack_outputs.push(reference),
             }
         }
         // An adoption is the stack's record of a resource's identity only while the stack
@@ -658,6 +689,8 @@ impl StoredStack {
             outputs,
             imports,
             unresolved_imports,
+            stack_outputs: read_stack_outputs,
+            unresolved_stack_outputs,
             wait_conditions,
             // Nothing has been acted on yet: this deployment has not started.
             attempted: BTreeSet::new(),
@@ -672,28 +705,36 @@ impl StoredStack {
 // ---------------------------------------------------------------------------
 
 impl StoredStack {
-    /// The reason a deployment whose template names an export NOTHING publishes cannot be
-    /// carried out, or `None` when every `Fn::ImportValue` of the deployment in flight
-    /// resolved.
+    /// The reason a deployment whose template names a CROSS-STACK VALUE that is not there
+    /// cannot be carried out, or `None` when every cross-stack reference of the deployment
+    /// in flight resolved.
     ///
-    /// "The intrinsic function Fn::ImportValue returns the value of an output exported by
-    /// another stack": the import's value is the one that export carries in the account and
-    /// Region the deployment runs in, so a name no live stack of that Region exports leaves
-    /// the declaration carrying it with no value at all. CloudFormation cannot deploy such a
-    /// template — it refuses the deployment before anything is asked of the service that
-    /// owns the resource, which is why the reason is CloudFormation's OWN diagnostic
-    /// ([`provisioning::Materialised::failure`]) and names the export rather than a resource
-    /// that tried and failed.
+    /// Two references read a value another stack holds, and neither has one to read when
+    /// what it names is absent:
     ///
-    /// One name is reported — the FIRST the template names, which is the import the
-    /// deployment could not resolve first.
-    pub fn unresolved_import_failure(&self) -> Option<String> {
-        let name = self
-            .pending_deployment
-            .as_ref()?
-            .unresolved_imports
-            .first()?;
-        Some(no_export_named(name))
+    /// * "The intrinsic function Fn::ImportValue returns the value of an output exported by
+    ///   another stack": the import's value is the one that export carries in the account and
+    ///   Region the deployment runs in, so a name no live stack of that Region exports leaves
+    ///   the declaration carrying it with no value at all;
+    /// * `Fn::GetStackOutput` reads one output of a named stack of that Region, so a
+    ///   reference naming no such output leaves the declaration carrying it with no value
+    ///   either ([`super::stack_outputs::no_output_named`]).
+    ///
+    /// CloudFormation cannot deploy such a template — it refuses the deployment before
+    /// anything is asked of the service that owns the resource, which is why the reason is
+    /// CloudFormation's OWN diagnostic ([`provisioning::Materialised::failure`]) and names
+    /// the reference rather than a resource that tried and failed.
+    ///
+    /// One reference is reported — the FIRST the template names, which is the one the
+    /// deployment could not resolve first; the imports come first because they are resolved
+    /// first.
+    pub fn unresolved_cross_stack_failure(&self) -> Option<String> {
+        let deployment = self.pending_deployment.as_ref()?;
+        if let Some(name) = deployment.unresolved_imports.first() {
+            return Some(no_export_named(name));
+        }
+        let reference = deployment.unresolved_stack_outputs.first()?;
+        Some(super::stack_outputs::no_output_named(reference))
     }
 
     /// Redirect the PENDING transition to a FAILURE: the terminal status the operation in
@@ -788,6 +829,12 @@ impl StoredStack {
             Some(deployment) => deployment.imports.clone(),
             None => self.imports.clone(),
         };
+        // The other stacks' outputs this stack READ, taken from the same side: an output
+        // reading one reports the value the deployment that read it resolved.
+        let stack_outputs = match &self.pending_deployment {
+            Some(deployment) => deployment.stack_outputs.clone(),
+            None => self.stack_outputs.clone(),
+        };
         let mut budget = template::Budget::new();
         let outputs = self.evaluated_outputs(
             &declared,
@@ -804,6 +851,7 @@ impl StoredStack {
                 mappings: &declared.mappings,
                 conditions: &declared.conditions,
                 imports: &imports,
+                stack_outputs: &stack_outputs,
             },
             &resources,
             &mut budget,
@@ -845,6 +893,7 @@ impl StoredStack {
             return BTreeMap::new();
         };
         let imports = deployment.imports.clone();
+        let stack_outputs = deployment.stack_outputs.clone();
         let mut resources = deployment.resources.clone();
         let in_force: BTreeMap<String, StoredResource> = resources
             .iter()
@@ -866,6 +915,7 @@ impl StoredStack {
                 mappings: &declared.mappings,
                 conditions: &declared.conditions,
                 imports: &imports,
+                stack_outputs: &stack_outputs,
             };
             template::resolve_properties(&declared, &mut resources, &scope, &mut budget);
             template::unresolved_attributes(&declared, &scope, &mut budget)
@@ -1591,6 +1641,9 @@ impl StoredStack {
             // A stack that holds no resources any more consumes nobody's export: it drops
             // out of the cross-stack reference index `ListImports` reports.
             self.imports.clear();
+            // Nothing of this stack reads another's output any more either: the
+            // declarations that read one are gone with the resources and the outputs.
+            self.stack_outputs.clear();
         } else if let Some(deployment) = deployed {
             // The create or update completed: the template it deployed is what the stack
             // reports resources and outputs for from here on.
@@ -1604,6 +1657,9 @@ impl StoredStack {
             // The imports the template that finished deploying resolved are the stack's
             // from here on: that is what makes it an importer of those exports.
             self.imports = deployment.imports;
+            // The other stacks' outputs that template read are the stack's from here on,
+            // which is what makes the value it reports its OWN deployment's.
+            self.stack_outputs = deployment.stack_outputs;
             // The relation the template that finished deploying describes is the stack's
             // from here on, which is what its deletion walks.
             self.resource_dependencies = deployment.dependencies;

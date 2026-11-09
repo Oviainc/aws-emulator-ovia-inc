@@ -479,18 +479,34 @@ const DOCUMENTED_FUNCTIONS: [&str; 25] = [
     "Fn::ToJsonString",
 ];
 
-/// Whether `name` is one of the functions a template may use — the loop directive included,
-/// which carries its own loop name after the function's
+/// Whether `name` is one of the functions a template may use: a documented one, one the
+/// service advertises as supported and resolves itself ([`SERVICE_RESOLVED_FUNCTIONS`]), or
+/// the loop directive, which carries its own loop name after the function's
 /// ([`super::template::FOR_EACH_PREFIX`]).
 fn is_documented_function(name: &str) -> bool {
-    DOCUMENTED_FUNCTIONS.contains(&name) || name.starts_with(template::FOR_EACH_PREFIX)
+    DOCUMENTED_FUNCTIONS.contains(&name)
+        || SERVICE_RESOLVED_FUNCTIONS.contains(&name)
+        || name.starts_with(template::FOR_EACH_PREFIX)
 }
 
+/// The functions the service resolves ITSELF that are not in the published "Intrinsic
+/// function reference", and that a template may therefore use even though that reference
+/// does not list them: the service advertises them as supported ([`ADVERTISED_FUNCTIONS`]),
+/// and a function advertised as supported is one a template may spell.
+///
+/// Only the ones this service really resolves are here: `Fn::GetStackOutput`, whose value is
+/// one output of another stack of the account and Region
+/// ([`super::stack_outputs`]). The other advertised names this service resolves no value
+/// for stay refused by name, since a template may not deploy with a function nothing
+/// resolved.
+const SERVICE_RESOLVED_FUNCTIONS: [&str; 1] = [super::stack_outputs::FN_GET_STACK_OUTPUT];
+
 /// The roster the "unsupported function" refusal advertises, in the order the service lists
-/// it: the three functions the SERVICE resolves for itself (which no template may use, and
-/// which appear only because the refusal reports the whole set it resolves), then the value
-/// functions, the condition functions — `Condition` among them, which is how a condition
-/// names another — then the rule functions, and `Fn::Sub` and `Fn::Cidr` last.
+/// it: the three functions the SERVICE resolves for itself — one of which a template may
+/// really use ([`SERVICE_RESOLVED_FUNCTIONS`]), while the other two appear because the
+/// refusal reports the whole set the service resolves — then the value functions, the
+/// condition functions — `Condition` among them, which is how a condition names another —
+/// then the rule functions, and `Fn::Sub` and `Fn::Cidr` last.
 ///
 /// FIXED text, independent of the template the refusal answers: nothing of the request
 /// reaches it but the offending function's name. That is why it is a roster of its own

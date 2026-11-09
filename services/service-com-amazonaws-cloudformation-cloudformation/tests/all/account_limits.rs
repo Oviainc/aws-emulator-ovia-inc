@@ -133,7 +133,11 @@ fn seed_resources(engine: &Arc<engine::InMemoryEngine>, total: usize) {
         // The seeded template declares no transform, so its processed stage is the body
         // itself and the deployment cannot be refused for want of one; the result is
         // asserted through the record count below either way.
-        let deployed = stack.deploy_template(&std::collections::BTreeMap::new());
+        let deployed = stack.deploy_template(
+            &std::collections::BTreeMap::new(),
+            &service_com_amazonaws_cloudformation_cloudformation::state::stack_outputs::Values::new(
+            ),
+        );
         assert!(
             deployed.is_ok(),
             "case \"seeding {count} resources\": the seeded template must deploy, got \

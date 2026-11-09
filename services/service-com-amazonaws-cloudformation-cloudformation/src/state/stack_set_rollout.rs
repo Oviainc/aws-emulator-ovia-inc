@@ -37,6 +37,9 @@ pub struct Revision<'a> {
     /// The exported values in force in the instance's own Region, which its template's
     /// `Fn::ImportValue` references resolve against.
     pub exports: &'a BTreeMap<String, String>,
+    /// The outputs of the live stacks of the instance's own Region, which an
+    /// `Fn::GetStackOutput` in its template reads ([`super::stack_outputs::Values`]).
+    pub stack_outputs: &'a super::stack_outputs::Values,
     /// The physical names the live stacks of the instance's own Region manage, read once per
     /// Region by the caller and shared by every instance deployed into it: a resource this
     /// redeployment CREATES under a name another stack owns fails in CloudFormation's own
@@ -84,7 +87,7 @@ pub struct Rollout {
     pub cannot_deploy: Option<String>,
     /// Why CLOUDFORMATION refused this redeployment before anything was asked of any owning
     /// service: the template imports an export nothing publishes in the instance's Region
-    /// ([`super::StoredStack::unresolved_import_failure`]).
+    /// ([`super::StoredStack::unresolved_cross_stack_failure`]).
     pub refused: Option<String>,
     /// The stack identity and tags CloudFormation gives each resource it acts on.
     pub provenance: super::provisioning::StackProvenance,
@@ -132,7 +135,9 @@ pub fn redeploy(
         stack.capabilities = revision.capabilities.to_vec();
         stack.tags = revision.tags.to_vec();
         stack.last_updated_time = Some(now);
-        let cannot_deploy = stack.deploy_template(revision.exports).err();
+        let cannot_deploy = stack
+            .deploy_template(revision.exports, revision.stack_outputs)
+            .err();
         stack.begin_transition(
             now,
             status::UPDATE_IN_PROGRESS,
@@ -145,9 +150,10 @@ pub fn redeploy(
         }
         // "Fn::ImportValue returns the value of an output exported by another stack": an
         // export name nothing publishes in the instance's own Region has no value to
-        // import, so CloudFormation refuses this redeployment before anything is asked of
-        // the services that own the resources.
-        let refused = stack.unresolved_import_failure();
+        // import, and neither has an output no stack of that Region carries, so
+        // CloudFormation refuses this redeployment before anything is asked of the services
+        // that own the resources.
+        let refused = stack.unresolved_cross_stack_failure();
         Some(Rollout {
             account: account.to_string(),
             region: region.to_string(),

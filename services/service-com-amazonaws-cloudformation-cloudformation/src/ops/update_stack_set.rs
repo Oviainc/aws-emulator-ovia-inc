@@ -755,6 +755,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .collect();
             let no_exports = ::std::collections::BTreeMap::new();
+            // ...and what an `Fn::GetStackOutput` in it reads, per TARGET Region and for the
+            // same reason: the outputs of the stacks of the Region the instance lives in.
+            let stack_outputs_by_region: ::std::collections::BTreeMap<
+                String,
+                crate::state::stack_outputs::Values,
+            > = exports_by_region
+                .keys()
+                .map(|target_region| {
+                    (
+                        target_region.clone(),
+                        store.stack_output_values(target_region),
+                    )
+                })
+                .collect();
+            let no_stack_outputs = crate::state::stack_outputs::Values::new();
             // ...and which physical names the live stacks of each of those Regions MANAGE:
             // one read per Region, shared by every instance redeployed into it
             // ([`crate::state::physical_name::ManagedNames`]).
@@ -781,6 +796,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     exports: exports_by_region
                         .get(&instance.region)
                         .unwrap_or(&no_exports),
+                    stack_outputs: stack_outputs_by_region
+                        .get(&instance.region)
+                        .unwrap_or(&no_stack_outputs),
                     managed: managed_by_region
                         .get(&instance.region)
                         .unwrap_or(&no_managed_names),

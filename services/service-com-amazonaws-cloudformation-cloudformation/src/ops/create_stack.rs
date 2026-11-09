@@ -745,12 +745,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ends in the modelled CREATE_FAILED with it.
         //
         // What a `Fn::ImportValue` resolves against is read first, under its own short
-        // lock: the exported output values in force in this Region. Evaluating the
+        // lock: the exported output values in force in this Region, beside the outputs an
+        // `Fn::GetStackOutput` reads off the stacks of that Region. Evaluating the
         // caller-sized template then happens off that lock, as everything above it does.
-        let exports = {
+        let (exports, stack_outputs) = {
             let mut store = state.lock();
             store.settle(now);
-            store.exported_values(&region)
+            (
+                store.exported_values(&region),
+                store.stack_output_values(&region),
+            )
         };
         let cannot_deploy = if transform_failure.is_some() {
             // Processing the template failed, so the create never reached the stage that
@@ -759,7 +763,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stack.deploy_nothing();
             None
         } else {
-            stack.deploy_template(&exports).err()
+            stack.deploy_template(&exports, &stack_outputs).err()
         };
         // "The intrinsic function Fn::ImportValue returns the value of an output exported by
         // another stack": an export name no live stack of this account and Region publishes
@@ -784,7 +788,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_ref()
                     .map(|failure| failure.reason.clone())
             })
-            .or_else(|| stack.unresolved_import_failure());
+            .or_else(|| stack.unresolved_cross_stack_failure());
 
         // The store lock is taken for the write and RELEASED at the end of this block:
         // the calls that create the stack's resources run after it, and each of those

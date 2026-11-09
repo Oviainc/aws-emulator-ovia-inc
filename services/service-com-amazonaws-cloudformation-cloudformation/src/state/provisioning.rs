@@ -1374,7 +1374,7 @@ pub async fn settle_expired_wait_failures<Eng: Send + Sync + 'static>(
 ///
 /// `refused` is a refusal CLOUDFORMATION itself reached before this walk — the deployment's
 /// template imports an export nothing publishes
-/// ([`super::StoredStack::unresolved_import_failure`]) — and it is answered exactly as the
+/// ([`super::StoredStack::unresolved_cross_stack_failure`]) — and it is answered exactly as the
 /// gate above answers one of its own: the walk is not entered, nothing is asked of any
 /// owning service, and [`Materialised::failure`] is that diagnostic. `None` is a deployment
 /// CloudFormation has nothing against, which is every rollback and every revert.

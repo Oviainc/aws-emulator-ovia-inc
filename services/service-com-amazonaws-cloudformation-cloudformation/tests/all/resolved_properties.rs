@@ -50,6 +50,8 @@ fn deployed(body: &str, parameters: &[(&str, &str)]) -> Vec<StoredResource> {
     let parameter_types = declared.parameter_types();
     let no_resources: BTreeMap<String, StoredResource> = BTreeMap::new();
     let no_imports: BTreeMap<String, String> = BTreeMap::new();
+    let no_stack_outputs =
+        service_com_amazonaws_cloudformation_cloudformation::state::stack_outputs::Values::new();
     // The deployment's scope before any resource is resolved, exactly as
     // `StoredStack::deploy_template` builds it.
     let declaring = Scope {
@@ -60,6 +62,7 @@ fn deployed(body: &str, parameters: &[(&str, &str)]) -> Vec<StoredResource> {
         mappings: &declared.mappings,
         conditions: &declared.conditions,
         imports: &no_imports,
+        stack_outputs: &no_stack_outputs,
     };
     let mut resources = template::provision(&declared, &declaring, &mut budget);
     let by_logical_id: BTreeMap<String, StoredResource> = resources

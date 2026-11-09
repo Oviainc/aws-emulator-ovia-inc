@@ -23,6 +23,7 @@ fn computed_attributes(resource_type: &str) -> BTreeMap<String, String> {
     let mappings = Value::Null;
     let conditions = Value::Null;
     let imports = BTreeMap::new();
+    let stack_outputs = crate::state::stack_outputs::Values::new();
     let scope = Scope {
         stack,
         parameters: &parameters,
@@ -31,6 +32,7 @@ fn computed_attributes(resource_type: &str) -> BTreeMap<String, String> {
         mappings: &mappings,
         conditions: &conditions,
         imports: &imports,
+        stack_outputs: &stack_outputs,
     };
     let mut budget = Budget::new();
     let declared = DeclaredResource {
@@ -106,6 +108,7 @@ fn named(resource_type: &str, properties: Value) -> String {
     let mappings = Value::Null;
     let conditions = Value::Null;
     let imports = BTreeMap::new();
+    let stack_outputs = crate::state::stack_outputs::Values::new();
     let scope = Scope {
         stack,
         parameters: &parameters,
@@ -114,6 +117,7 @@ fn named(resource_type: &str, properties: Value) -> String {
         mappings: &mappings,
         conditions: &conditions,
         imports: &imports,
+        stack_outputs: &stack_outputs,
     };
     let mut budget = Budget::new();
     let declared = DeclaredResource {

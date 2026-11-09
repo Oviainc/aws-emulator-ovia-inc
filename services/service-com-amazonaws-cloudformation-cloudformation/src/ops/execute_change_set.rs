@@ -312,6 +312,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // What a `Fn::ImportValue` in the change set's template resolves against: the
             // exported output values in force in the Region this request is signed for.
             let exports = store.exported_values(&request_region);
+            // ...and the outputs an `Fn::GetStackOutput` in it reads off the stacks of that
+            // Region, read in the same breath and for the same reason.
+            let stack_outputs = store.stack_output_values(&request_region);
             // ...and which of the stack's own exports another live stack IMPORTS: an export
             // in use is PINNED, so an execution that would withdraw one is cancelled rather
             // than carried out ([`crate::state::exports`]).
@@ -636,7 +639,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let adopted_identifiers =
                 crate::state::resource_import::adopted_identifiers(&planned_changes);
             let cannot_deploy = stack
-                .deploy_template_adopting(&exports, &adopted_identifiers)
+                .deploy_template_adopting(&exports, &stack_outputs, &adopted_identifiers)
                 .err();
             // "After the call successfully completes, CloudFormation starts updating the
             // stack": a CREATE change set creates the stack it had left in
@@ -707,7 +710,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // deployment before anything is asked of the services that own the resources —
             // the execution then fails naming the export and is rolled back below.
             let refused_deployment =
-                withdraws_an_export_in_use.or_else(|| stack.unresolved_import_failure());
+                withdraws_an_export_in_use.or_else(|| stack.unresolved_cross_stack_failure());
             let region = stack.region.clone();
             let declared = stack.current_resources().to_vec();
             // A resource the plan ADOPTS already exists in the service that owns it, and
