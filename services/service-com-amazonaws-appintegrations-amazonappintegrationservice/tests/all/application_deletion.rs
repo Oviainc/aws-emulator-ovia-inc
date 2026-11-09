@@ -218,6 +218,86 @@ async fn a_deleted_application_is_reported_as_not_found_by_every_later_read() {
 }
 
 #[tokio::test]
+async fn each_delete_removes_exactly_the_application_it_addresses() {
+    // The complement invariant, over a fleet rather than a single resource: rows differ
+    // in how many applications the store holds and in the order the deletes address
+    // them, because a delete removes the ONE resource its identifier names — so after
+    // every call the applications already deleted read as not found and every other one
+    // still reads back under its own Name.
+    let rows: Vec<(&str, usize, Vec<usize>)> = vec![
+        ("one application", 1, vec![0]),
+        ("two, in creation order", 2, vec![0, 1]),
+        ("five, in reverse order", 5, vec![4, 3, 2, 1, 0]),
+        ("five, interleaved", 5, vec![2, 0, 4, 1, 3]),
+        (
+            "ten, the even ones first",
+            10,
+            vec![0, 2, 4, 6, 8, 9, 7, 5, 3, 1],
+        ),
+    ];
+
+    for (label, count, order) in rows {
+        let emulator = Emulator::new();
+        let mut ids = Vec::new();
+        let mut arns = Vec::new();
+        for index in 0..count {
+            let created = create(
+                &emulator,
+                application_body(&format!("fleet-app-{index}"), "fleet-namespace", json!({})),
+            )
+            .await;
+            assert_eq!(
+                created.status, 200,
+                "case {label:?}: expected create {index} to answer HTTP 200, got {} / {}",
+                created.status, created.body
+            );
+            ids.push(created.string("Id").expect("the create reported an Id"));
+            arns.push(created.string("Arn").expect("the create reported an ARN"));
+        }
+
+        let mut gone = vec![false; count];
+        for (step, target) in order.iter().enumerate() {
+            // The identifier form alternates with the step, so the invariant is not
+            // pinned under one of the two forms only.
+            let identifier = if step % 2 == 0 {
+                ids[*target].clone()
+            } else {
+                arns[*target].clone()
+            };
+            let reply = delete(&emulator, &identifier, None).await;
+            assert_eq!(
+                reply.status, 200,
+                "case {label:?} / step {step}: expected HTTP 200 deleting {identifier}, got {} / {}",
+                reply.status, reply.body
+            );
+            gone[*target] = true;
+
+            for (index, id) in ids.iter().enumerate() {
+                let case = format!("{label} / step {step} / application {index}");
+                let read = get(&emulator, id).await;
+                if gone[index] {
+                    assert_not_found(&case, &read, id);
+                } else {
+                    assert_eq!(
+                        read.status, 200,
+                        "case {case:?}: expected the surviving application to still be \
+                         readable, got {} / {}",
+                        read.status, read.body
+                    );
+                    let expected = format!("fleet-app-{index}");
+                    assert_eq!(
+                        read.string("Name").as_deref(),
+                        Some(expected.as_str()),
+                        "case {case:?}: expected Name {expected:?}, got {:?}",
+                        read.string("Name")
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_delete_frees_the_name_namespace_pair_and_the_client_token() {
     // Rows differ in the token the create carried (`ClientToken` is `len 1..2048`) and
     // in the name and namespace form: what a delete frees is the resource's identity,
