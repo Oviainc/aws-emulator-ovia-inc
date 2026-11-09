@@ -234,7 +234,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing is left outstanding for the clock to materialise.
         let accepted_status = snapshot.status;
         match snapshot.status {
-            SnapshotStatus::Pending => snapshot.status = SnapshotStatus::Completed,
+            SnapshotStatus::Pending => {
+                snapshot.status = SnapshotStatus::Completed;
+                // WHEN the seal was applied, stamped by the call that applied it: this
+                // call is what completes the snapshot ("Completing the snapshot changes
+                // the status to completed"), so the instant is this one and never a
+                // later reader's. It is the completion time the EC2 side of the same
+                // snapshot reports (`Snapshot$CompletionTime`, "the time stamp when the
+                // snapshot was completed").
+                snapshot.completed_at = Some(now);
+            }
             // Already sealed: completing it again changes nothing, so the stored status
             // is the answer.
             SnapshotStatus::Completed => {}

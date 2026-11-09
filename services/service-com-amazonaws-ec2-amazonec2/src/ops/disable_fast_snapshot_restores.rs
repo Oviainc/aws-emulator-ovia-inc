@@ -204,7 +204,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut successful = Vec::new();
         let mut unsuccessful = Vec::new();
         for snapshot_id in &requested.snapshot_ids {
-            if !store.snapshots.contains_key(snapshot_id) {
+            // A snapshot of this account is one its id names on EITHER side of the one
+            // snapshot resource the EBS direct APIs and EC2 describe, so an id this store
+            // holds nothing under is resolved against that side before it is reported
+            // unresolvable.
+            if !store.snapshots.contains_key(snapshot_id)
+                && !crate::state::direct_api_snapshot_exists(&*self.engine, snapshot_id)
+            {
                 let (code, message) = unresolvable_snapshot_id_error(snapshot_id);
                 unsuccessful.push(DisableFastSnapshotRestoreErrorItem {
                     fast_snapshot_restore_state_errors: Some(

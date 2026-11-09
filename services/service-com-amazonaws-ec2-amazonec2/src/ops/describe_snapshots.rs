@@ -1,14 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSnapshots
-//! IMPLEMENTED: reports the EBS snapshots `crate::state` holds, narrowed by `SnapshotIds`,
-//! `OwnerIds`, `RestorableByUserIds` and the documented filters, and paged by
-//! `MaxResults`/`NextToken`. This is the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports every EBS snapshot the account holds — the ones `crate::state` holds
+//! and the ones the EBS direct APIs hold — narrowed by `SnapshotIds`, `OwnerIds`,
+//! `RestorableByUserIds` and the documented filters, and paged by `MaxResults`/`NextToken`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! A snapshot's `State`, `Progress` and `CompletionTime` are facts of its AGE, derived by
 //! [`crate::state::SnapshotRecord::view_at`] off the instant the clock owes the `pending`
 //! to `completed` move: this read observes that move without writing anything, so two calls
 //! one after the other cannot disagree and a read never changes what a later caller sees.
+//!
+//! The snapshots the EBS DIRECT APIs hold are reported here too, and resolved here too: the
+//! EBS direct APIs and EC2 describe ONE snapshot resource and that API models no read of a
+//! snapshot's state, so this is the read that reports a snapshot `ebs:StartSnapshot` minted.
+//! They are read out of THAT service's own store through
+//! [`crate::state::direct_api_snapshots`], never copied into this one, and they are narrowed,
+//! filtered and paged by exactly the same rules as the snapshots this service's own creates
+//! made.
 //!
 //! ## Shape of an operation
 //!
@@ -304,6 +313,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = require_service_state(&*self.engine)?;
         let store = state.lock();
         let account = ::engine::emulator_account_id();
+        // ONE instant for the whole answer, for the same reason the monotonic one below is
+        // read once: a call that straddles a transition's due instant must not report two
+        // snapshots at different phases of the same clock.
+        let observed = ::std::time::SystemTime::now();
+        // The snapshots the OTHER side of this one resource holds, projected onto the shape
+        // this operation reports — read under this store's guard, which is the lock order
+        // every operation of this service keeps (see [`crate::state::direct_api_snapshots`]).
+        let direct_api = crate::state::direct_api_snapshots(&*self.engine, observed);
 
         // "If you specify an invalid snapshot ID, an error is returned": a value that is
         // not a snapshot id at all and a well-formed one the account holds no snapshot for
@@ -315,10 +332,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // here: every snapshot this store holds is owned by the calling account, which has
         // implicit create volume permissions for the snapshots it owns, so a stored
         // snapshot is always one the caller may see.
-        if let Some(unresolvable) = requested_ids
-            .iter()
-            .find(|snapshot_id| !store.snapshots.contains_key(snapshot_id.as_str()))
-        {
+        if let Some(unresolvable) = requested_ids.iter().find(|snapshot_id| {
+            !store.snapshots.contains_key(snapshot_id.as_str())
+                && !direct_api.contains_key(snapshot_id.as_str())
+        }) {
             return Err(unresolvable_snapshot_id(unresolvable));
         }
 
@@ -341,36 +358,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::Instant::now();
         let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
         let mut selected: Vec<SnapshotView> = Vec::new();
+        // The narrowing a request's members put on one snapshot, and the filters it put on
+        // one — the SAME two tests for a snapshot of either side of this resource, so
+        // neither side can be selected by a rule the other is not.
+        let asked_about = |snapshot: &SnapshotView| {
+            narrowed_in(snapshot, requested_ids, owner_ids, restorable_by, account)
+        };
         for record in store.snapshots.values() {
             if budget.exhausted() {
                 break;
             }
             // The id and owner narrowings are read off the stored record, so a snapshot the
-            // request did not ask about costs no projection and no comparison at all.
-            if !requested_ids.is_empty()
-                && !requested_ids
-                    .iter()
-                    .any(|id| record.view.snapshot_id.as_deref() == Some(id.as_str()))
-            {
-                continue;
-            }
-            // "If you specify one or more snapshot owners using the OwnerIds option, only
-            // snapshots from the specified owners and for which you have access are
-            // returned", and "if you specify a list of restorable users, only snapshots
-            // with create snapshot permissions for those users are returned" — each list
-            // joined with an OR inside itself and with an AND against the other members.
-            if !owner_ids.is_empty()
-                && !owner_ids
-                    .iter()
-                    .any(|owner| owner_matches(&record.view, owner, account))
-            {
-                continue;
-            }
-            if !restorable_by.is_empty()
-                && !restorable_by
-                    .iter()
-                    .any(|user| restorable_by_matches(&record.view, user, account))
-            {
+            // request did not ask about costs no projection and no comparison at all: the
+            // members they read are the stored ones rather than the age-derived ones.
+            if !asked_about(&record.view) {
                 continue;
             }
             let snapshot = record.view_at(now);
@@ -384,6 +385,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             if selected_by_filters {
                 selected.push(snapshot);
+            }
+        }
+        // The snapshots of the EBS direct APIs, under the same two tests. A snapshot this
+        // store ALSO holds under that id is reported from this store's record alone, so one
+        // snapshot is never reported twice.
+        for (snapshot_id, snapshot) in &direct_api {
+            if budget.exhausted() {
+                break;
+            }
+            if store.snapshots.contains_key(snapshot_id) || !asked_about(snapshot) {
+                continue;
+            }
+            if crate::state::matches_every_filter(&selectors, &mut budget, &|name| {
+                filter_values(snapshot, name)
+            }) {
+                selected.push(snapshot.clone());
             }
         }
         // A spent budget means the answer is INCOMPLETE, which is not something to report
@@ -439,6 +456,51 @@ const SNAPSHOT_OWNER_ALIAS_AMAZON: &str = "amazon";
 /// The `RestorableByUserIds` term that names every account: "or `all` for public snapshots"
 /// (`DescribeSnapshots`).
 const RESTORABLE_BY_ALL: &str = "all";
+
+/// Is `snapshot` one the request's own members asked about — its `SnapshotIds`, `OwnerIds`
+/// and `RestorableByUserIds`, each list joined with an OR inside itself and with an AND
+/// against the others?
+///
+/// "If you specify one or more snapshot IDs, only snapshots that have the specified IDs are
+/// returned", "if you specify one or more snapshot owners using the OwnerIds option, only
+/// snapshots from the specified owners and for which you have access are returned", and "if
+/// you specify a list of restorable users, only snapshots with create snapshot permissions
+/// for those users are returned" (`DescribeSnapshots`). An empty list narrows nothing.
+///
+/// The ONE definition of that narrowing, so the snapshots of this service's own store and the
+/// snapshots of the EBS direct APIs are selected by the same test. It reads only members a
+/// stored record carries as it stands, so a caller may apply it before projecting a snapshot's
+/// age-derived members.
+fn narrowed_in(
+    snapshot: &SnapshotView,
+    requested_ids: &[String],
+    owner_ids: &[String],
+    restorable_by: &[String],
+    account: &str,
+) -> bool {
+    if !requested_ids.is_empty()
+        && !requested_ids
+            .iter()
+            .any(|id| snapshot.snapshot_id.as_deref() == Some(id.as_str()))
+    {
+        return false;
+    }
+    if !owner_ids.is_empty()
+        && !owner_ids
+            .iter()
+            .any(|owner| owner_matches(snapshot, owner, account))
+    {
+        return false;
+    }
+    if !restorable_by.is_empty()
+        && !restorable_by
+            .iter()
+            .any(|user| restorable_by_matches(snapshot, user, account))
+    {
+        return false;
+    }
+    true
+}
 
 /// Is `term` something `OwnerIds` may carry — "a combination of Amazon Web Services account
 /// IDs, self, and amazon" (`DescribeSnapshotsRequest$OwnerIds`)?

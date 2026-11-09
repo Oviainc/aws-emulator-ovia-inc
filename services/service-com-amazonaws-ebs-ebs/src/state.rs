@@ -167,6 +167,13 @@ pub struct Snapshot {
     pub volume_size: i64,
     pub block_size: i32,
     pub start_time: SystemTime,
+    /// When `CompleteSnapshot` sealed this snapshot, or `None` for one it has not sealed.
+    ///
+    /// Stamped by the call that applies the seal, so the instant is the one the snapshot
+    /// completed AT rather than the one somebody first looked at it. The EBS direct APIs
+    /// report no completion time of their own — `ec2:DescribeSnapshots` is the read that
+    /// carries it (`Snapshot$CompletionTime`).
+    pub completed_at: Option<SystemTime>,
     /// When the snapshot's `Timeout` elapses: also the instant the block tokens it
     /// hands out stop being valid, which is what `ListSnapshotBlocks$ExpiryTime`
     /// reports ("The time when the `BlockToken` expires").

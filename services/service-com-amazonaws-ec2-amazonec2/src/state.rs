@@ -2018,6 +2018,13 @@ pub use scheduled_instances::*;
 pub mod snapshots;
 pub use snapshots::*;
 
+/// The snapshots the EBS DIRECT APIs hold, projected onto this service's `Snapshot` shape:
+/// the two APIs describe one snapshot resource, so an EC2 read resolves and reports a
+/// snapshot minted on that side too. In a module of its own, re-exported so a handler reaches
+/// them as `crate::state::<item>` like every other primitive here.
+pub mod direct_api_snapshots;
+pub use direct_api_snapshots::*;
+
 /// The fast snapshot restores the account holds — what one (snapshot, Availability Zone)
 /// pair is stored as, the lifecycle the clock owes it and the one reading of the request
 /// members an enable and a disable share — in a module of its own, re-exported so a handler

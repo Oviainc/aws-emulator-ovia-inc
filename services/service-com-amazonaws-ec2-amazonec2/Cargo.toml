@@ -35,6 +35,10 @@ base64 = "0.22"
 # carrying a fractional part where Rust's own rendering drops it, and the ONE
 # evaluation of IAM policy documents the authorization gate decides a request with.
 service-common = { path = "../common" }
+# The EBS DIRECT APIs and EC2 describe ONE snapshot resource: a snapshot `ebs:StartSnapshot`
+# minted is read back through `ec2:DescribeSnapshots`, so this service reads THAT service's
+# own state accessor rather than keeping a second copy of its snapshots.
+service-com-amazonaws-ebs-ebs = { workspace = true }
 # The IAM store holds the identity-based policies of the principal a request speaks
 # for, and the STS store resolves which principal that is: the authorization gate
 # reads both services' OWN state accessors rather than keeping a second copy of

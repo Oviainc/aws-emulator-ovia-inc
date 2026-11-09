@@ -369,15 +369,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
 
-        // The copy's source is a snapshot of this account's store, which is keyed by
-        // snapshot id alone: a stored snapshot carries no Region member, so nothing about
-        // resolving one depends on a Region (see rule 2 in this module's docs). An id the
-        // store holds no snapshot under is one this copy cannot resolve, and is refused with
-        // the same answer as a value that is not a snapshot id at all.
+        // The copy's source is a snapshot of this account, which is keyed by snapshot id
+        // alone: a stored snapshot carries no Region member, so nothing about resolving one
+        // depends on a Region (see rule 2 in this module's docs). A snapshot the EBS DIRECT
+        // APIs hold is a snapshot of this account too — the two APIs describe one resource —
+        // so an id this store holds nothing under is resolved against that side before it is
+        // refused, with the same answer as a value that is not a snapshot id at all.
         let source = store
             .snapshots
             .get(&input.source_snapshot_id)
             .map(|record| record.view.clone())
+            .or_else(|| {
+                crate::state::direct_api_snapshot(
+                    &*self.engine,
+                    &input.source_snapshot_id,
+                    ::std::time::SystemTime::now(),
+                )
+            })
             .ok_or_else(unresolvable_source_snapshot_id)?;
 
         // "Copies of encrypted snapshots are encrypted, even if you omit this parameter and

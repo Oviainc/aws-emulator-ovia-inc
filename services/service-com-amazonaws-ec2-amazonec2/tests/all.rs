@@ -15,6 +15,13 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The ONE snapshot resource the EBS direct APIs and EC2 both describe: a snapshot
+// `ebs:StartSnapshot` minted reported and resolved on the EC2 side through its whole
+// lifecycle, the narrowings that select it, and the refusal that stays for an id nothing
+// holds. Declared beside `prefix_lists` for the reason the note above gives: the sorted
+// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/ebs_direct_api_snapshots.rs"]
+mod ebs_direct_api_snapshots;
 // The IPv6 address pools the account holds: the pool a BYOIP IPv6 provision creates under
 // the id the range reports, the blocks it holds in address order, the narrowing its
 // documented filters and `PoolIds` do, the pages `DescribeIpv6Pools` cuts the store into,

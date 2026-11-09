@@ -386,6 +386,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             volume_size: input.volume_size,
             block_size: SNAPSHOT_BLOCK_SIZE_BYTES,
             start_time: now,
+            // "The new snapshot enters the pending state after the request completes": no
+            // seal has been applied yet, so there is no completion instant to report.
+            completed_at: None,
             expiry_time: expiry_from_timeout(now, timeout_minutes),
             description: input.description.clone(),
             tags: input
