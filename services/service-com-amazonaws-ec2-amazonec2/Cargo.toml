@@ -29,20 +29,30 @@ hex = { workspace = true }
 jpeg-encoder = "0.6"
 # The 8x8 monochrome console font that screen's text is drawn with.
 font8x8 = "0.3"
-# `GetConsoleScreenshotResult$ImageData` carries the image as base64 text.
+# `GetConsoleScreenshotResult$ImageData` carries the image as base64 text, and the body of
+# the armoured public key file an import may carry is base64 too.
 base64 = "0.22"
 # The 2048-bit RSA key pair `CreateKeyPair` generates: the operation hands the caller the
 # private half, so the key has to be a real key.
 aws-lc-rs = "1"
 # The PKCS#1 `RSAPrivateKey` an RSA key pair's PEM private key is ("an unencrypted PEM
-# encoded PKCS#1 private key"), read out of the PKCS#8 `aws-lc-rs` encodes a key as.
-pkcs1 = { version = "0.7", features = ["pem"] }
+# encoded PKCS#1 private key"), read out of the PKCS#8 `aws-lc-rs` encodes a key as; its
+# `pkcs8` feature carries the `rsaEncryption` algorithm identifier an imported RSA public
+# key's DER `SubjectPublicKeyInfo` is written under.
+pkcs1 = { version = "0.7", features = ["pem", "pkcs8"] }
 # Reads that PKCS#8 structure, whose `privateKey` IS the PKCS#1 one.
 pkcs8 = "0.10"
+# The `SubjectPublicKeyInfo` an imported RSA public key's fingerprint is taken over
+# (RFC 5280).
+spki = { version = "0.7", default-features = false, features = ["alloc"] }
 # The SHA-1 digest an RSA key pair's fingerprint is (`KeyPair$KeyFingerprint`).
 sha1 = "0.10"
+# The MD5 digest an IMPORTED RSA key pair's fingerprint is instead ("the MD5 public key
+# fingerprint as specified in section 4 of RFC4716", `KeyPairInfo$KeyFingerprint`).
+md-5 = "0.10"
 # The OpenSSH key formats: an Ed25519 key pair, the PEM private key and the one-line public
-# key OpenSSH writes for one, and the base64 SHA-256 fingerprint it prints for it.
+# key OpenSSH writes for one, the base64 SHA-256 fingerprint it prints for it, and the
+# public key an `ImportKeyPair` carries.
 ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "getrandom"] }
 # The SSH wire encoding of a key's own components, which the PuTTY private key file a
 # `ppk` key format asks for is built out of.
@@ -69,6 +79,13 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The import tests build the public key material they send and read the base64 digest an
+# ED25519 import's fingerprint carries.
+base64 = "0.22"
+# The import tests compute the expected MD5 fingerprint of an imported RSA key over a DER
+# `SubjectPublicKeyInfo` they write by hand, so the value is cross-checked against the
+# standard rather than against the handler's own encoder.
+md-5 = "0.10"
 # The integration tests wait out a clock-owed transition with `tokio::time::sleep`,
 # which needs the timer driver on top of the workspace's tokio features.
 tokio = { workspace = true, features = ["time"] }

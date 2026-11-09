@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportKeyPair
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportKeyPair`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportKeyPair::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: stores the PUBLIC half of a key pair the caller created with a third-party
+//! tool, in the ONE key pair store this service has
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::key_pairs`], the same store
+//! `CreateKeyPair` writes to), so the pair it mints is reported by `DescribeKeyPairs` under
+//! the id, type and fingerprint this call answers.
+//!
+//! "You give Amazon Web Services only the public key. The private key is never transferred
+//! between you and Amazon Web Services", so nothing here holds or derives a private key.
+//! The service owns the pair's id and its creation instant, and the key type and
+//! fingerprint are what the MATERIAL decides
+//! ([`crate::state::read_public_key_material`]) — the fingerprint rule being the one the
+//! model states for an imported pair, which is not the rule a generated pair's fingerprint
+//! follows. The caller owns only the name, the material and the tags: a name the account
+//! already holds is `InvalidKeyPair.Duplicate`, exactly as it is for a create, and material
+//! that is not an RSA or ED25519 public key EC2 can read is `InvalidKeyPair.Format`.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +85,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -145,18 +154,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportKeyPair` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportKeyPairErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportKeyPair"))
+        // Nothing about a key pair depends on the Region the request was signed for: the
+        // record carries no Region member and no ARN, the same reading `CreateKeyPair` takes
+        // of the store the two share.
+        let _ = ctx;
+
+        // "A unique name for the key pair" (`$KeyName`) — required, and the model lets a
+        // client omit it (`clientOptional`), so an empty name is refused rather than stored
+        // as a pair nothing can name. The bounds are the ones EC2 publishes on a key pair
+        // name whichever call supplies it ("constraints: up to 255 ASCII characters",
+        // `CreateKeyPairRequest$KeyName`), read through the ONE helper that states them, so
+        // the import and the create cannot word that rule two ways.
+        let key_name = input.key_name.as_str();
+        state::validate_key_pair_name(key_name)?;
+
+        // "The public key" (`$PublicKeyMaterial`) — required for the same reason, so an
+        // empty blob is a missing parameter rather than a key that cannot be read.
+        if input.public_key_material.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::missing_parameter(
+                "The request must contain the parameter PublicKeyMaterial",
+            ));
+        }
+        // What the material IS decides the pair's type and fingerprint: this operation
+        // "imports the public key from an RSA or ED25519 key pair that you created using a
+        // third-party tool", and material that is not such a key is refused rather than
+        // stored as a pair whose fingerprint stands for nothing.
+        let Some(imported) = state::read_public_key_material(&input.public_key_material) else {
+            return Err(state::invalid_key_pair_format());
+        };
+
+        // "The tags to apply to the imported key pair" (`$TagSpecifications`) — the shared
+        // reader refuses a specification naming any other resource type and holds the tag
+        // payload to the same documented bounds every create of this crate holds its tags
+        // to, so one rule has one implementation.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_KEY_PAIR,
+            Self::NAME,
+        )?;
+
+        let spec = state::KeyPairSpec {
+            key_name: key_name.to_string(),
+            key_type: imported.key_type,
+            key_fingerprint: imported.key_fingerprint,
+            public_key: imported.public_key,
+            tags,
+            created_at: ::std::time::SystemTime::now(),
+        };
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "A unique name for the key pair": a name the account already holds a pair under is
+        // refused, so one name never resolves to two pairs — the same check, in the same
+        // domain, `CreateKeyPair` makes.
+        if store.key_pair_id_for_name(key_name).is_some() {
+            return Err(state::invalid_key_pair_duplicate());
+        }
+        // A count ceiling first ("you can have up to 5,000 key pairs per Amazon Web Services
+        // Region", `CreateKeyPair`), then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds the name, the key material and the tags a
+        // caller chose the length of. ONE formula for the charge — the same helper
+        // `insert_key_pair` charges — so the budget this reserves cannot drift from what the
+        // insert takes.
+        if !store.has_key_pair_capacity() {
+            return Err(state::key_pair_limit_exceeded());
+        }
+        let payload_bytes = state::key_pair_spec_bytes(&spec);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "if you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // One write: `insert_key_pair` derives the id and stores the record, so this handler
+        // never invents one, and it answers the record AS IT WAS STORED — so `ImportKeyPair`
+        // and `DescribeKeyPairs` cannot report one key pair differently. The public key
+        // material is not part of this operation's output shape (`ImportKeyPairResult`), so
+        // only the members that shape declares are reported.
+        let stored = store
+            .insert_key_pair(spec)
+            .ok_or_else(state::key_pair_limit_exceeded)?;
+
+        Ok(ImportKeyPairOutput {
+            key_fingerprint: stored.info.key_fingerprint.clone(),
+            key_name: stored.info.key_name.clone(),
+            key_pair_id: stored.info.key_pair_id.clone(),
+            tags: stored.info.tags.clone(),
+        })
     }
 }

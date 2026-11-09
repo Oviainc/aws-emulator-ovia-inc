@@ -1660,6 +1660,29 @@ mod account_attributes;
 // each refuse a type the service does not publish, naming the value. Declared at the tail of
 #[path = "all/launch_instance_type_catalog.rs"]
 mod launch_instance_type_catalog;
+// The PUBLIC key an `ImportKeyPair` carries: the `KeyType` and `KeyFingerprint` that
+// material decides for each algorithm and length, both public-key forms the import
+// requirements name, the pair read back through `DescribeKeyPairs`, and what the import
+// refuses.
+#[path = "all/import_key_pair.rs"]
+mod import_key_pair;
+// The ONE snapshot resource the EBS direct APIs and EC2 both describe: a snapshot
+// `ebs:StartSnapshot` minted reported and resolved on the EC2 side through its whole
+// lifecycle, the narrowings that select it, and the refusal that stays for an id nothing
+// holds. Declared beside `prefix_lists` for the reason the note above gives: the sorted
+#[path = "all/ebs_direct_api_snapshots.rs"]
+mod ebs_direct_api_snapshots;
+// Every SQL Server High Availability state an enabled instance HAS HELD, over the period the
+// request asks about.
+#[path = "all/instance_sql_ha_history_states.rs"]
+mod instance_sql_ha_history_states;
+// Which Reserved Instance offerings the service publishes for a Region — the product of the
+// places one can be used, the product descriptions, the offering classes, the payment options
+// and the terms — how each is priced from its own terms, how the narrowing members, the
+// documented filters, the offering ids and the pages select from it, and that the describe is a
+// read whose ids the exchange operations resolve. Declared at the tail of this file, which is
+#[path = "all/describe_reserved_instances_offerings.rs"]
+mod describe_reserved_instances_offerings;
 // How an idempotency conflict is WORDED: the Network Access Analyzer / Reachability Analyzer
 // actions answer that surface's own sentence beside `IdempotentParameterMismatch`, while the
 // older resource creates of this service answer theirs. Declared at the tail of this file,

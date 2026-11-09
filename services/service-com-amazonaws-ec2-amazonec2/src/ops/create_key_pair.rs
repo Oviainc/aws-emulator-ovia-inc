@@ -175,27 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // "A unique name for the key pair. Constraints: Up to 255 ASCII characters"
-        // (`$KeyName`). The member targets a plain `String`, so the boundary validator
-        // enforces neither bound; a name outside them is refused here rather than stored.
+        // (`$KeyName`), through the ONE reading of that sentence this crate has — the same
+        // one `ImportKeyPair` holds the name it is given to.
         let key_name = input.key_name.as_str();
-        if key_name.is_empty() {
-            return Err(Scaffolded::missing_parameter(
-                "The request must contain the parameter KeyName",
-            ));
-        }
-        if key_name.chars().count() > state::MAX_KEY_PAIR_NAME_CHARS {
-            return Err(state::invalid_parameter_value(format!(
-                "Value ({key_name}) for parameter keyName is invalid. \
-                 A key pair name accepts at most {max} characters",
-                max = state::MAX_KEY_PAIR_NAME_CHARS,
-            )));
-        }
-        if !key_name.is_ascii() {
-            return Err(state::invalid_parameter_value(format!(
-                "Value ({key_name}) for parameter keyName is invalid. \
-                 A key pair name accepts ASCII characters only"
-            )));
-        }
+        state::validate_key_pair_name(key_name)?;
 
         // "The type of key pair. Default: rsa" (`$KeyType`) and "the format of the key
         // pair. Default: pem" (`$KeyFormat`), each one member of its modelled catalog. Both

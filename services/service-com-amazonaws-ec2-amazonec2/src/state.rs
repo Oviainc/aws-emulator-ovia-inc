@@ -1913,6 +1913,13 @@ pub use key_pairs::*;
 pub mod key_pair_material;
 pub use key_pair_material::*;
 
+/// The PUBLIC key material an `ImportKeyPair` carries: what counts as a key EC2 can take,
+/// which `KeyType` it is, and the fingerprint an IMPORTED key of that type is published
+/// with. Re-exported, so a handler reaches them as `crate::state::<item>` like every other
+/// primitive of this module.
+pub mod key_pair_import;
+pub use key_pair_import::*;
+
 /// A VPC's ROUTE TABLES and the ATTACHMENT an internet gateway of one carries: the store,
 /// the ids, the byte charge and the error channel `CreateRouteTable`, `CreateRoute`,
 /// `AssociateRouteTable`, `AttachInternetGateway` and `DescribeRouteTables` share. The

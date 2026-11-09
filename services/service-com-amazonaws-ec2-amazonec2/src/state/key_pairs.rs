@@ -34,6 +34,36 @@ pub const RESOURCE_TYPE_KEY_PAIR: &str = "key-pair";
 /// "Up to 255 ASCII characters" (`CreateKeyPairRequest$KeyName`).
 pub const MAX_KEY_PAIR_NAME_CHARS: usize = 255;
 
+/// Refuse a key pair name outside what EC2 publishes for one: "a unique name for the key
+/// pair. Constraints: up to 255 ASCII characters" (`CreateKeyPairRequest$KeyName`).
+///
+/// The ONE reading of that sentence, so the two calls that take a key pair name from a
+/// caller — `CreateKeyPair` and `ImportKeyPair` — hold it to one rule in one wording rather
+/// than two that can drift. The three clauses are reported apart, because a name the request
+/// left empty, one longer than the maximum and one carrying a character outside ASCII are
+/// different mistakes: the member is modelled as a plain `String`, so the boundary validator
+/// enforces none of them.
+pub fn validate_key_pair_name<E>(key_name: &str) -> Result<(), Scaffolded<E>> {
+    if key_name.is_empty() {
+        return Err(Scaffolded::missing_parameter(
+            "The request must contain the parameter KeyName",
+        ));
+    }
+    if key_name.chars().count() > MAX_KEY_PAIR_NAME_CHARS {
+        return Err(invalid_parameter_value(format!(
+            "Value ({key_name}) for parameter keyName is invalid. \
+             A key pair name accepts at most {MAX_KEY_PAIR_NAME_CHARS} characters"
+        )));
+    }
+    if !key_name.is_ascii() {
+        return Err(invalid_parameter_value(format!(
+            "Value ({key_name}) for parameter keyName is invalid. \
+             A key pair name accepts ASCII characters only"
+        )));
+    }
+    Ok(())
+}
+
 /// The largest number of key pairs this store holds.
 ///
 /// "You can have up to 5,000 key pairs per Amazon Web Services Region" (`CreateKeyPair`).

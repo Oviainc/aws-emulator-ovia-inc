@@ -223,7 +223,10 @@ fn rsa_public_key(key: &::pkcs1::RsaPrivateKey<'_>) -> Option<::ssh_key::PublicK
 /// `public_key` as the one-line OpenSSH public key `<algorithm> <base64 blob>` a
 /// `known_hosts` or `authorized_keys` entry carries — the form "the public key material"
 /// (`KeyPairInfo$PublicKey`) takes.
-fn openssh_public_key_line(public_key: &::ssh_key::PublicKey) -> Option<String> {
+///
+/// Shared with [`super::key_pair_import`], which stores an IMPORTED key in the same form, so
+/// one spelling of a stored public key has one implementation.
+pub fn openssh_public_key_line(public_key: &::ssh_key::PublicKey) -> Option<String> {
     Some(public_key.to_openssh().ok()?.trim_end().to_string())
 }
 
@@ -329,7 +332,10 @@ fn base64_lines(blob: &[u8]) -> Vec<String> {
 
 /// `bytes` as the colon-separated lowercase hex pairs EC2 publishes an RSA key
 /// fingerprint in.
-fn colon_separated_hex(bytes: &[u8]) -> String {
+///
+/// Shared with [`super::key_pair_import`], which renders an IMPORTED RSA key pair's MD5
+/// fingerprint in the same form, so one rendering has one implementation.
+pub fn colon_separated_hex(bytes: &[u8]) -> String {
     bytes
         .iter()
         .map(|byte| format!("{byte:02x}"))
