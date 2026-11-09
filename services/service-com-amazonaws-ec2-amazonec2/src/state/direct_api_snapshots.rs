@@ -22,6 +22,12 @@
 //! completed in time), exactly as the EBS store's own materialisation compares it, so this
 //! read observes that move without writing to another service's state.
 //!
+//! The ONE write is the DELETE ([`delete_direct_api_snapshot`]): `ec2:DeleteSnapshot`
+//! "deletes the specified snapshot" of the account, the EBS direct APIs model no delete of
+//! their own, and one resource with one record has one removal — so the delete removes that
+//! record through the owning crate's own removal rather than hiding the snapshot behind a
+//! tombstone of this service's.
+//!
 //! LOCK ORDER: an EC2 operation takes its OWN store first and the EBS store second (every
 //! function here is called with the EC2 store already locked, or with none locked at all),
 //! and no EBS handler reads this service's store — so the two orders cannot invert.
@@ -101,6 +107,30 @@ pub fn direct_api_snapshot_exists<Eng: Send + Sync + 'static>(
 ) -> bool {
     ebs_store::service_state(engine)
         .is_some_and(|state| state.lock().snapshots.contains_key(snapshot_id))
+}
+
+/// Delete the snapshot the EBS direct APIs hold under `snapshot_id`, answering whether one
+/// was there to delete.
+///
+/// The ONE write this module makes, and the only one it can make: the EBS direct APIs model
+/// no delete of their own, while `ec2:DeleteSnapshot` "deletes the specified snapshot" of the
+/// account — and a snapshot minted through the direct APIs is a snapshot of that account. The
+/// record it removes is the one that service keeps, through that crate's own removal
+/// ([`ebs_store::ComAmazonawsEbsEbsState::remove_snapshot`]), so the delete takes the
+/// snapshot's blocks and the `ClientToken` rows that named it too and leaves no copy of it
+/// anywhere.
+///
+/// `false` for a snapshot those APIs do not hold, including on an engine the EBS service is
+/// not mounted on — the caller has already resolved the id and answers the not-found refusal
+/// for it.
+pub fn delete_direct_api_snapshot<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    snapshot_id: &str,
+) -> bool {
+    ebs_store::service_state(engine).is_some_and(|state| {
+        let mut store = state.lock();
+        store.remove_snapshot(snapshot_id).is_some()
+    })
 }
 
 /// One snapshot of the EBS direct-API store as the `Snapshot` shape, as of `now`.

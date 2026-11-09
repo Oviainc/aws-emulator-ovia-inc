@@ -141,6 +141,18 @@ pub fn snapshot_limit_exceeded<E>(message: impl Into<String>) -> crate::scaffold
     crate::scaffolded::Scaffolded::service_error(SNAPSHOT_LIMIT_EXCEEDED, 400, message)
 }
 
+/// Refuse a delete of a snapshot a registered AMI still restores a device from: HTTP 400
+/// `InvalidSnapshot.InUse`, naming the snapshot and the image that has to be deregistered
+/// first — the two resources the caller has to act on, as
+/// [`ComAmazonawsEc2Amazonec2State::image_using_snapshot`] resolves the second.
+pub fn snapshot_in_use<E>(snapshot_id: &str, image_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        super::INVALID_SNAPSHOT_IN_USE,
+        400,
+        format!("The snapshot {snapshot_id} is currently in use by {image_id}"),
+    )
+}
+
 /// One stored EBS snapshot: the modelled [`SnapshotView`] every operation that reports one
 /// answers with, plus the instant the clock owes it its `pending` -> `completed` move.
 ///
@@ -232,6 +244,23 @@ impl ComAmazonawsEc2Amazonec2State {
     /// of an instance, so the question is about the whole set and not about one record.
     pub fn has_snapshot_capacity(&self, count: usize) -> bool {
         self.snapshots.len().saturating_add(count) <= MAX_STORED_SNAPSHOTS
+    }
+
+    /// Remove the snapshot `snapshot_id` names, and everything stored only with it.
+    ///
+    /// The mirror of [`Self::insert_snapshot`]: the caller-chosen bytes the record was
+    /// charged for are given back to the store's budget, and the fast snapshot restores of
+    /// the snapshot go with it — a restore is a property of the (snapshot, zone) pair, so a
+    /// snapshot the account no longer holds can have none.
+    pub fn remove_snapshot(&mut self, snapshot_id: &str) -> Option<SnapshotRecord> {
+        let record = self.snapshots.remove(snapshot_id)?;
+        self.release_stored_bytes(snapshot_payload_bytes(
+            record.view.tags.as_deref().unwrap_or_default(),
+            record.view.description.as_deref(),
+        ));
+        self.fast_snapshot_restores
+            .retain(|_, restore| restore.snapshot_id != snapshot_id);
+        Some(record)
     }
 
     /// Store `view` as a snapshot that was started at `started_at` and reaches `completed`

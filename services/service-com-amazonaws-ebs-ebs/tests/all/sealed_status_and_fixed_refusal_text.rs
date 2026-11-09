@@ -151,9 +151,12 @@ async fn completing_a_snapshot_applies_the_seal_every_later_reader_then_sees() {
             "case {case:?}: the refusal must name the snapshot as the rejected input, got {}",
             refused.json()
         );
-        assert!(
-            member(&refused, "Message").contains("completed"),
-            "case {case:?}: the refusal must say the snapshot has been completed, got {}",
+        // Rule 3: the sentence is fixed text — it interpolates neither the snapshot id nor
+        // the block the write carried.
+        assert_eq!(
+            member(&refused, "Message"),
+            "Snapshot is already completed",
+            "case {case:?}: the refusal must carry the sealed-snapshot sentence, got {}",
             refused.json()
         );
 

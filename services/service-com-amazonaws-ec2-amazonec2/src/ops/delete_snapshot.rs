@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the one snapshot its `SnapshotId` names — whichever of the two APIs
+//! that describe the account's snapshots minted it — so every later read of that id answers
+//! `InvalidSnapshot.NotFound` rather than reporting a snapshot that is no longer there.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +152,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::{
+            delete_direct_api_snapshot, direct_api_snapshot_exists, dry_run_operation,
+            internal_error, require_service_state, snapshot_in_use, unresolvable_snapshot_id,
+        };
+
+        // A snapshot is named by id alone, so nothing here depends on the Region the request
+        // was signed for; the store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let state_handle = require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "Deletes the specified snapshot": an id this account holds no snapshot for is a
+        // refusal, not a no-op — a caller that deletes twice has to be able to tell the
+        // deletion it performed from one it did not, and a waiter polling for the snapshot to
+        // be gone needs the not-found answer to stop. WHICH refusal says so is a fact of the
+        // id's form, through the crate's one classification of an unresolvable snapshot id.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSnapshot"))
+        // The snapshot is looked for on BOTH sides of the one snapshot resource this account
+        // has: its own store, and the snapshots the EBS direct APIs hold (see
+        // [`crate::state::direct_api_snapshots`]), which `DescribeSnapshots` reports from the
+        // same two places. Taken under this store's guard, which is the lock order every
+        // operation of this service keeps.
+        let stored_here = store.snapshots.contains_key(&input.snapshot_id);
+        let stored_in_direct_api = !stored_here
+            && direct_api_snapshot_exists(&*self.engine, &input.snapshot_id);
+        if !stored_here && !stored_in_direct_api {
+            return Err(unresolvable_snapshot_id(&input.snapshot_id));
+        }
+
+        // "You cannot delete a snapshot of the root device of an EBS volume used by a
+        // registered AMI. You must first deregister the AMI before you can delete the
+        // snapshot" (`DeleteSnapshot`): a snapshot an AMI of the account still restores a
+        // device from is refused, and the refusal names the image to deregister first.
+        if let Some(image_id) = store.image_using_snapshot(&input.snapshot_id) {
+            return Err(snapshot_in_use(&input.snapshot_id, &image_id));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(dry_run_operation());
+        }
+
+        // Each side removes its OWN record: `remove_snapshot` gives the stored bytes back to
+        // this store's budget and takes the snapshot's fast snapshot restores with it, and
+        // the direct-API delete removes the record that service keeps, along with its blocks.
+        let removed = if stored_here {
+            store.remove_snapshot(&input.snapshot_id).is_some()
+        } else {
+            delete_direct_api_snapshot(&*self.engine, &input.snapshot_id)
+        };
+        if !removed {
+            return Err(internal_error(
+                "the snapshot checked a moment ago could not be removed",
+            ));
+        }
+        Ok(DeleteSnapshotOutput)
     }
 }

@@ -329,6 +329,67 @@ impl ComAmazonawsEbsEbsState {
             .min();
     }
 
+    /// Remove the snapshot `snapshot_id` names, and everything stored only with it.
+    ///
+    /// A snapshot that is no longer stored can keep nothing that pointed at it: the
+    /// `ClientToken` rows that replay a `StartSnapshot` answer name its id, so they go
+    /// with it (a token whose snapshot is gone mints a new one rather than replaying a
+    /// snapshot no read resolves), its blocks travel on the record itself, and the
+    /// transition schedule is recomputed because the removed snapshot may have been the
+    /// one whose `Timeout` fell due first.
+    ///
+    /// This store models no delete of its own — the EBS direct APIs declare none — so the
+    /// caller is `ec2:DeleteSnapshot`, which deletes the snapshot of the account whichever
+    /// API minted it.
+    pub fn remove_snapshot(&mut self, snapshot_id: &str) -> Option<Snapshot> {
+        let removed = self.snapshots.remove(snapshot_id)?;
+        self.client_tokens
+            .retain(|_, record| record.snapshot_id != snapshot_id);
+        self.refresh_transition_schedule();
+        Some(removed)
+    }
+
+    /// The snapshot `snapshot_id` names and every snapshot it descends from, nearest
+    /// first.
+    ///
+    /// A snapshot's lineage is the chain its `ParentSnapshotId` walks
+    /// (`StartSnapshotRequest$ParentSnapshotId`, "the ID of the parent snapshot"), so this
+    /// is that chain with the snapshot itself at its head. An id no snapshot is stored
+    /// under is still the head of its own chain: a parent that has since been deleted is
+    /// part of the lineage of every snapshot taken from it.
+    ///
+    /// The walk stops on an id already seen and at the store's own ceiling on snapshots,
+    /// so it is bounded however the records point at one another.
+    pub fn snapshot_ancestry(&self, snapshot_id: &str) -> Vec<String> {
+        let mut chain: Vec<String> = Vec::new();
+        let mut next = Some(snapshot_id.to_string());
+        while let Some(id) = next {
+            if chain.contains(&id) || chain.len() >= MAX_STORED_SNAPSHOTS {
+                break;
+            }
+            next = self
+                .snapshots
+                .get(&id)
+                .and_then(|snapshot| snapshot.parent_snapshot_id.clone());
+            chain.push(id);
+        }
+        chain
+    }
+
+    /// Whether the two snapshots are "of the same volume/snapshot lineage"
+    /// (`ListChangedBlocks`): one is the other, one descends from the other, or both
+    /// descend from one snapshot.
+    ///
+    /// Their [`ancestries`](Self::snapshot_ancestry) meeting at any id is exactly that
+    /// condition; two snapshots each started with no parent meet nowhere, so they are
+    /// unrelated however alike their contents are.
+    pub fn snapshots_share_lineage(&self, first_snapshot_id: &str, second_snapshot_id: &str) -> bool {
+        let first_ancestry = self.snapshot_ancestry(first_snapshot_id);
+        self.snapshot_ancestry(second_snapshot_id)
+            .iter()
+            .any(|id| first_ancestry.contains(id))
+    }
+
     /// The blocks this store currently holds across every snapshot.
     pub fn stored_block_count(&self) -> usize {
         self.snapshots
@@ -525,6 +586,24 @@ pub fn invalid_block_data_length_message(data_length: i32) -> String {
 pub fn block_index_beyond_volume_message(block_index: i32) -> String {
     format!("Block index {block_index} is beyond the volume size extent")
 }
+
+/// The message `ListChangedBlocks` answers with when the two snapshots a comparison names
+/// are not "of the same volume/snapshot lineage" (`ListChangedBlocks`).
+///
+/// A request-derived template naming BOTH ids, in the order the request named them
+/// (`FirstSnapshotId` then `SecondSnapshotId`), and nothing else: `The snapshot <first> and
+/// <second> are not related.`
+pub fn unrelated_snapshots_message(first_snapshot_id: &str, second_snapshot_id: &str) -> String {
+    format!("The snapshot {first_snapshot_id} and {second_snapshot_id} are not related.")
+}
+
+/// The message `PutSnapshotBlock` answers with when the snapshot the write names has
+/// already been sealed: "You cannot write new blocks to a snapshot after it has been
+/// completed" (`CompleteSnapshot`).
+///
+/// FIXED and request-independent: the sentence states the condition of the snapshot and
+/// echoes neither its id nor the block the write carried, as the live service words it.
+pub const SNAPSHOT_ALREADY_COMPLETED_MESSAGE: &str = "Snapshot is already completed";
 
 /// The message `PutSnapshotBlock` answers with when the block payload the request
 /// DECLARED cannot be read off it.

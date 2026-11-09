@@ -121,7 +121,7 @@ use crate::state::{
     malformed_snapshot_id_message, snapshot_not_found_message,
     unsupported_checksum_algorithm_message, BlockEntry, CHECKSUM_ALGORITHM_SHA256,
     FAILED_TO_READ_BLOCK_DATA_MESSAGE, MAX_STORED_BLOCKS_PER_SNAPSHOT, MAX_STORED_BLOCKS_TOTAL,
-    SNAPSHOT_BLOCK_SIZE_BYTES,
+    SNAPSHOT_ALREADY_COMPLETED_MESSAGE, SNAPSHOT_BLOCK_SIZE_BYTES,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -264,10 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // applies, so a snapshot whose completion was accepted takes no further block.
         let write_refusal = (!snapshot.accepts_writes()).then(|| {
             if snapshot.is_sealed() {
-                format!(
-                    "snapshot {} has been completed; blocks can only be written to a pending snapshot",
-                    input.snapshot_id
-                )
+                SNAPSHOT_ALREADY_COMPLETED_MESSAGE.to_string()
             } else {
                 format!(
                     "snapshot {} is {}; blocks can only be written to a pending snapshot",

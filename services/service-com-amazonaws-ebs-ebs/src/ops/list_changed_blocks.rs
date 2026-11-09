@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListChangedBlocks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListChangedBlocks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListChangedBlocks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: compares the blocks of two snapshots of one lineage out of
+//! [`crate::state`] and reports the indexes whose content differs, with each side's own
+//! block token. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +100,22 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeSet;
+use std::time::SystemTime;
+
+use crate::state::{
+    decode_page_token, encode_page_token, is_well_formed_snapshot_id,
+    malformed_snapshot_id_message, snapshot_not_found_message, unrelated_snapshots_message,
+    Snapshot,
+};
+
+/// The page size used when the request names no `MaxResults`.
+///
+/// The model bounds `MaxResults` at `range 100..10000` and documents no default, so the
+/// smallest page a caller may ask for is what an unasked-for page carries: it keeps the
+/// response bounded without inventing a larger limit than the model names anywhere.
+const DEFAULT_MAX_RESULTS: i32 = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -178,18 +189,216 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListChangedBlocks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListChangedBlocksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        // The only write a listing performs: materialising a transition the clock had
+        // already made due, which was owed whether or not anybody listed.
+        store.apply_due_transitions(now);
+
+        let page_size = usize::try_from(input.max_results.unwrap_or(DEFAULT_MAX_RESULTS))
+            .unwrap_or(0);
+
+        // The snapshot the URI names, resolved first because every other member is read
+        // relative to it. The READ path sees only a snapshot whose content is final
+        // ([`crate::state::Snapshot::is_readable`]), for the reason `ListSnapshotBlocks`
+        // records: a snapshot still being written has no final set of blocks to compare.
+        let second = resolve(&store, "secondSnapshotId", &input.second_snapshot_id)?;
+
+        // `FirstSnapshotId` is optional on the wire ("The FirstSnapshotID parameter must
+        // be specified with a SecondSnapshotId parameter", which the required
+        // `@httpLabel` second id already guarantees), and a comparison against NO
+        // snapshot has nothing to leave out: every block the second snapshot holds
+        // differs from a lineage that holds none, so each is reported with no
+        // `FirstBlockToken` — "this value is absent if the first snapshot does not have
+        // the changed block that is on the second snapshot" (`ChangedBlock`).
+        let first = match input.first_snapshot_id.as_deref() {
+            Some(first_snapshot_id) => Some(resolve(&store, "firstSnapshotId", first_snapshot_id)?),
+            None => None,
+        };
+
+        // "Returns information about the blocks that are different between two Amazon
+        // Elastic Block Store snapshots OF THE SAME VOLUME/SNAPSHOT LINEAGE": two
+        // snapshots that share no ancestor cannot be compared at all, which is the
+        // modelled `UNRELATED_SNAPSHOTS` reason.
+        if let Some(first_snapshot_id) = input.first_snapshot_id.as_deref() {
+            if !store.snapshots_share_lineage(first_snapshot_id, &input.second_snapshot_id) {
+                return Err(validation(
+                    "UNRELATED_SNAPSHOTS",
+                    unrelated_snapshots_message(first_snapshot_id, &input.second_snapshot_id),
+                ));
+            }
+        }
+
+        // The comparison itself: a block index is CHANGED when the two snapshots do not
+        // hold the same content at it — one holds a block the other does not, or both
+        // hold one and the stored checksums of their bytes differ. Each side's token is
+        // the one that side hands out for that index, so a caller can read either
+        // version back through `GetSnapshotBlock`; the side that holds no block at the
+        // index reports no token for it.
+        let changed: Vec<ChangedBlock> = changed_indexes(first, second)
+            .into_iter()
+            .map(|block_index| ChangedBlock {
+                block_index: Some(block_index),
+                first_block_token: first
+                    .and_then(|snapshot| snapshot.blocks.get(&block_index))
+                    .map(|entry| entry.block_token.clone()),
+                second_block_token: second
+                    .blocks
+                    .get(&block_index)
+                    .map(|entry| entry.block_token.clone()),
+            })
+            .collect();
+
+        // `NextToken` wins over `StartingBlockIndex`: "If you specify NextToken, then
+        // StartingBlockIndex is ignored."
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListChangedBlocks"))
+        // A `NextToken` this service issued always names a changed index of the snapshot
+        // the URI names (it is minted from the first changed index the previous page did
+        // not report), so the token is checked against the comparison just computed, not
+        // merely decoded: a value that names another snapshot, or an index this
+        // comparison does not report, is refused.
+        let starting_block_index = match input.next_token.as_deref() {
+            Some(token) => decode_page_token(token)
+                .filter(|(token_snapshot_id, next_index)| {
+                    *token_snapshot_id == input.second_snapshot_id
+                        && changed
+                            .iter()
+                            .any(|block| block.block_index == Some(*next_index))
+                })
+                .map(|(_, next_index)| next_index)
+                .ok_or_else(|| {
+                    validation(
+                        "INVALID_PAGE_TOKEN",
+                        format!(
+                            "NextToken is not a page token this service issued for snapshot {}",
+                            input.second_snapshot_id
+                        ),
+                    )
+                })?,
+            None => input.starting_block_index.unwrap_or(0),
+        };
+
+        // "The list in the response will start from this block index or the next valid
+        // block index in the snapshots" (`StartingBlockIndex`), and the comparison is
+        // already in ascending index order, so the page is the run that starts there.
+        let mut remaining = changed
+            .iter()
+            .skip_while(|block| block.block_index.unwrap_or_default() < starting_block_index);
+        let page: Vec<ChangedBlock> = remaining.by_ref().take(page_size).cloned().collect();
+        // A `NextToken` only when a further changed block really remains. It carries the
+        // next block INDEX, not a page cursor, so a client that changes `MaxResults`
+        // midway through pagination still resumes exactly where the previous page
+        // stopped.
+        let next_token = remaining.next().map(|block| {
+            encode_page_token(
+                &second.snapshot_id,
+                block.block_index.unwrap_or_default(),
+            )
+        });
+
+        Ok(ListChangedBlocksOutput {
+            changed_blocks: Some(page),
+            // "The time when the `BlockToken` expires": the tokens this answer hands out
+            // are of BOTH snapshots, so the one instant it reports is the earliest at
+            // which any of them stops resolving.
+            expiry_time: Some(::aws_smithy_types::DateTime::from(
+                first.map_or(second.expiry_time, |snapshot| {
+                    snapshot.expiry_time.min(second.expiry_time)
+                }),
+            )),
+            // The size of the volume and of the blocks the comparison is of, read off the
+            // snapshot the request named: a snapshot taken from a parent is of that
+            // parent's volume, so the two sides agree on both.
+            volume_size: Some(second.volume_size),
+            block_size: Some(second.block_size),
+            next_token,
+        })
     }
+}
+
+/// The stored snapshot `snapshot_id` names, as the READ path resolves one.
+///
+/// The refusals are the ones every operation of this service makes for a snapshot id it
+/// cannot resolve: a value that is not even shaped like a snapshot id is a malformed
+/// PARAMETER naming the member it arrived in, and a well-formed id that resolves to
+/// nothing — or to a snapshot whose content is not final — is the snapshot not-found 404.
+fn resolve<'store>(
+    store: &'store crate::state::ComAmazonawsEbsEbsState,
+    parameter: &str,
+    snapshot_id: &str,
+) -> Result<&'store Snapshot, ListChangedBlocksError> {
+    if let Some(snapshot) = store
+        .snapshots
+        .get(snapshot_id)
+        .filter(|snapshot| snapshot.is_readable())
+    {
+        return Ok(snapshot);
+    }
+    if !is_well_formed_snapshot_id(snapshot_id) {
+        return Err(validation(
+            "INVALID_SNAPSHOT_ID",
+            malformed_snapshot_id_message(parameter, snapshot_id),
+        ));
+    }
+    Err(not_found(snapshot_not_found_message(snapshot_id)))
+}
+
+/// Every block index at which `first` and `second` do not hold the same content,
+/// ascending.
+///
+/// The union of the two block maps, minus the indexes both hold the same bytes at —
+/// compared through the checksum each entry stores for its own bytes, which is a digest of
+/// exactly those bytes. `first` being absent compares the second snapshot against a
+/// lineage holding no block, so every index it holds is changed.
+fn changed_indexes(first: Option<&Snapshot>, second: &Snapshot) -> Vec<i32> {
+    let mut indexes: BTreeSet<i32> = second.blocks.keys().copied().collect();
+    if let Some(first) = first {
+        indexes.extend(first.blocks.keys().copied());
+    }
+    indexes
+        .into_iter()
+        .filter(|block_index| {
+            let second_block = second.blocks.get(block_index);
+            let first_block = first.and_then(|snapshot| snapshot.blocks.get(block_index));
+            match (first_block, second_block) {
+                (Some(first_block), Some(second_block)) => {
+                    first_block.checksum != second_block.checksum
+                }
+                // An index only one of them holds is a block the other does not have.
+                _ => true,
+            }
+        })
+        .collect()
+}
+
+/// The modelled server error for an engine that holds no state for this service.
+fn no_state() -> ListChangedBlocksError {
+    ListChangedBlocksErrorModeled::InternalServerException(InternalServerException {
+        message: Some(
+            "the com-amazonaws-ebs-ebs service is mounted on an engine that holds no state"
+                .to_string(),
+        ),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400) with one of `ValidationExceptionReason`'s
+/// values.
+fn validation(reason: &str, message: String) -> ListChangedBlocksError {
+    ListChangedBlocksErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+        reason: Some(reason.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) for an absent snapshot.
+fn not_found(message: String) -> ListChangedBlocksError {
+    ListChangedBlocksErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        reason: Some("SNAPSHOT_NOT_FOUND".to_string()),
+    })
+    .into()
 }

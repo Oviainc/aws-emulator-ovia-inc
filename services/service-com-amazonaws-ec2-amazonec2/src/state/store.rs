@@ -856,6 +856,13 @@ pub const INVALID_VOLUME_ID_MALFORMED: &str = "InvalidVolumeID.Malformed";
 /// snapshot for.
 pub const INVALID_SNAPSHOT_ID_NOT_FOUND: &str = "InvalidSnapshot.NotFound";
 
+/// EC2's error code for a delete of a snapshot something of the account still depends on:
+/// "You cannot delete a snapshot of the root device of an EBS volume used by a registered
+/// AMI. You must first deregister the AMI before you can delete the snapshot"
+/// (`DeleteSnapshot`). A dependency another resource holds is not something the request
+/// got wrong, which is why this is neither an `InvalidParameterValue` nor a not-found.
+pub const INVALID_SNAPSHOT_IN_USE: &str = "InvalidSnapshot.InUse";
+
 /// EC2's error code for a snapshot id that is not shaped like one, answered BEFORE the
 /// id is looked up — the same ordering `require_known_volume` keeps for a volume id.
 pub const INVALID_SNAPSHOT_ID_MALFORMED: &str = "InvalidSnapshotID.Malformed";

@@ -26,7 +26,6 @@ mod key_pairs;
 // `ebs:StartSnapshot` minted reported and resolved on the EC2 side through its whole
 // lifecycle, the narrowings that select it, and the refusal that stays for an id nothing
 // holds. Declared beside `prefix_lists` for the reason the note above gives: the sorted
-// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/ebs_direct_api_snapshots.rs"]
 mod ebs_direct_api_snapshots;
 // The IPv6 address pools the account holds: the pool a BYOIP IPv6 provision creates under
@@ -61,8 +60,6 @@ mod vpc_block_public_access_options;
 // the order of a launch's two counts, the one attribute type a modify names, the attributes
 // a reset acts on, and the hardware a Dedicated Host can be configured for — each in EC2's
 // own sentence for that violation class, with the bound the operation publishes in it.
-// Declared beside `prefix_lists` for the reason the note above gives: the sorted
-// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/published_parameter_limits.rs"]
 mod published_parameter_limits;
 // EC2 as a regional service: a stored resource is reported only in the Region it was created
@@ -118,8 +115,6 @@ mod replace_network_acl_association;
 // request is signed for — the /16, a default subnet in every Availability Zone of that Region
 // and the VPC's default security group — and the `DefaultVpcAlreadyExists` refusal a Region
 // that already has one answers. Declared beside `prefix_lists` for the reason the note above
-// gives: the sorted neighbourhood and the tail of this file are where every new ec2 suite
-// inserts its lines.
 #[path = "all/create_default_vpc.rs"]
 mod create_default_vpc;
 // What `ReplaceNetworkAclEntry` overwrites: the one rule a network ACL holds at a rule number
@@ -1640,7 +1635,6 @@ mod delete_launch_template_resolution;
 // and the terms — how each is priced from its own terms, how the narrowing members, the
 // documented filters, the offering ids and the pages select from it, and that the describe is a
 // read whose ids the exchange operations resolve. Declared at the tail of this file, which is
-// where every new ec2 suite inserts its lines.
 #[path = "all/describe_reserved_instances_offerings.rs"]
 mod describe_reserved_instances_offerings;
 // The tag filter family on the describes of a taggable resource: `tag:<key>`, `tag-key` and
@@ -1653,10 +1647,6 @@ mod capacity_reservation_tag_filters;
 // first.
 #[path = "all/launch_template_versions.rs"]
 mod launch_template_versions;
-// What `DescribeAccountAttributes` reports about the ACCOUNT: every attribute the operation
-// documents with the value the account holds for it, `default-vpc` asserted against the VPC
-// the same Region's `DescribeVpcs` reports, the narrowing `AttributeNames` does, and the
-// refusals for a name that is no account attribute and for a dry run. Declared beside
 #[path = "all/account_attributes.rs"]
 mod account_attributes;
 // The published instance-type catalog every call that PLACES an instance is held to: a launch,
@@ -1675,3 +1665,8 @@ mod network_insights_idempotency_wording;
 // the template then report, and the refusals that move nothing.
 #[path = "all/modify_launch_template_default_version.rs"]
 mod modify_launch_template_default_version;
+// What `DeleteSnapshot` removes — a snapshot of either side of the ONE snapshot resource this
+// account has, the EC2 one and the EBS direct-API one — what it refuses, and what the rest of
+// the lifecycle then sees. Declared at the tail of this file, which is where every new ec2
+#[path = "all/delete_snapshot.rs"]
+mod delete_snapshot;

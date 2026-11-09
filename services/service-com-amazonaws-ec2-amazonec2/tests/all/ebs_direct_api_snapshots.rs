@@ -49,7 +49,7 @@ const UNKNOWN_SNAPSHOT_ID: &str = "snap-0123456789abcdef0";
 /// Both services on ONE engine, which is what makes the two sides of the snapshot resource
 /// the same resource. The engine is handed back so the one row that needs a `Timeout` the
 /// clock has already passed can move the instant the EBS store recorded for it.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -60,7 +60,7 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// One EBS direct-API request: the service is picked by the `ebs` signing name in the
 /// credential scope, exactly as a client's signer writes it.
-async fn ebs_send(
+pub(crate) async fn ebs_send(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -89,7 +89,7 @@ async fn ebs_send(
 }
 
 /// `ebs:StartSnapshot`, answering the `SnapshotId` it minted.
-async fn start_snapshot(router: &MultiServiceRouter, case: &str, body: serde_json::Value) -> String {
+pub(crate) async fn start_snapshot(router: &MultiServiceRouter, case: &str, body: serde_json::Value) -> String {
     let (status, answer) = ebs_send(
         router,
         "POST",
@@ -123,7 +123,7 @@ fn block_bytes(index: i32) -> Vec<u8> {
 }
 
 /// `ebs:PutSnapshotBlock` of one whole block at `index`.
-async fn put_block(router: &MultiServiceRouter, case: &str, snapshot_id: &str, index: i32) {
+pub(crate) async fn put_block(router: &MultiServiceRouter, case: &str, snapshot_id: &str, index: i32) {
     let data = block_bytes(index);
     let checksum = ::aws_smithy_types::base64::encode(Sha256::digest(&data));
     let (status, answer) = ebs_send(
@@ -146,7 +146,7 @@ async fn put_block(router: &MultiServiceRouter, case: &str, snapshot_id: &str, i
 }
 
 /// `ebs:CompleteSnapshot`, which seals the snapshot.
-async fn complete_snapshot(
+pub(crate) async fn complete_snapshot(
     router: &MultiServiceRouter,
     case: &str,
     snapshot_id: &str,

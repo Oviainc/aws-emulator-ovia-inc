@@ -1446,6 +1446,33 @@ impl ComAmazonawsEc2Amazonec2State {
             .and_then(|ebs| ebs.snapshot_id.clone())
     }
 
+    /// The id of a registered AMI of this account that restores one of its devices from
+    /// `snapshot_id`, or `None` when no image does.
+    ///
+    /// Read off the stored [`Image`] records, whose block device mappings carry the
+    /// snapshot each EBS device is restored from: "You cannot delete a snapshot of the
+    /// root device of an EBS volume used by a registered AMI. You must first deregister the
+    /// AMI before you can delete the snapshot" (`DeleteSnapshot`), so this is the image a
+    /// delete of that snapshot has to name. An image the Recycle Bin holds is DEREGISTERED
+    /// ("it can be restored before its retention period expires", `DeregisterImage`), so it
+    /// is not one of the registered AMIs this answers with.
+    ///
+    /// The lowest image id that uses the snapshot, the store being ordered by id, so one
+    /// snapshot used by several images is always reported against the same one.
+    pub fn image_using_snapshot(&self, snapshot_id: &str) -> Option<String> {
+        self.images
+            .iter()
+            .find(|(_, image)| {
+                image
+                    .block_device_mappings
+                    .iter()
+                    .flatten()
+                    .filter_map(|mapping| mapping.ebs.as_ref())
+                    .any(|ebs| ebs.snapshot_id.as_deref() == Some(snapshot_id))
+            })
+            .map(|(image_id, _)| image_id.clone())
+    }
+
     /// Give the store the public images Amazon publishes ([`published_image_specs`]), and
     /// answer their ids.
     ///
