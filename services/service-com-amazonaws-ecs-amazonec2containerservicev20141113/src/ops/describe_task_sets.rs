@@ -269,19 +269,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                     None => {
                         // "The Amazon Resource Name (ARN) of the failed resource": the
-                        // failure names the task set the reference MEANT, so an ARN
-                        // reference is resolved to its id first and the ARN rebuilt from
-                        // it rather than wrapped in another one.
+                        // cluster and the service segments of a stored task set's ARN say
+                        // which service the task set exists IN, which a task set that
+                        // resolves to nothing is held by none of — so the entry names it
+                        // by the id the reference carried, alone under the resource type
+                        // ([`crate::state::unresolved_task_set_failure`]).
                         let id = crate::state::task_set_id_from_reference(reference);
-                        if seen.insert(id.clone()) {
-                            failures.push(crate::state::missing_failure(
-                                &crate::state::task_set_arn(
-                                    &region,
-                                    &cluster_name,
-                                    &service_name,
-                                    &id,
-                                ),
-                            ));
+                        if seen.insert(id) {
+                            failures
+                                .push(crate::state::unresolved_task_set_failure(&region, reference));
                         }
                     }
                 }

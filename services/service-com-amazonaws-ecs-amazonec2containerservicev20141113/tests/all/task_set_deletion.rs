@@ -352,9 +352,12 @@ async fn a_deleted_task_set_drains_away_and_is_then_reported_missing() {
         );
         assert_eq!(
             list(&gone, "failures", case),
-            vec![json!({ "arn": arn, "reason": "MISSING" })],
-            "case {case:?}: expected one MISSING failure for the task set the request \
-             named, got {gone}"
+            vec![json!({
+                "arn": format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task-set/{id}"),
+                "reason": "MISSING",
+            })],
+            "case {case:?}: expected one MISSING failure naming the task set the request \
+             named by its id alone, got {gone}"
         );
 
         // The task sets the service does still hold are reported, in creation order, and

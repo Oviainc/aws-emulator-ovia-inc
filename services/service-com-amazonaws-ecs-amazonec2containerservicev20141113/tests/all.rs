@@ -201,6 +201,8 @@ mod task_provisioning;
 mod task_set_creation;
 #[path = "all/task_set_deletion.rs"]
 mod task_set_deletion;
+#[path = "all/task_set_reports.rs"]
+mod task_set_reports;
 #[path = "all/task_sets.rs"]
 mod task_sets;
 #[path = "all/task_state_change_events.rs"]

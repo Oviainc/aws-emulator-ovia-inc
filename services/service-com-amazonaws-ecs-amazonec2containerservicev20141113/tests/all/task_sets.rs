@@ -520,13 +520,19 @@ async fn describe_task_sets_narrows_to_the_references_it_names() {
     );
 
     // A reference that names no task set of this service is a MISSING failure rather
-    // than a refusal of the whole batch — in either reference form, and the failure
-    // names the task set the reference meant rather than wrapping an ARN in another.
+    // than a refusal of the whole batch — in either reference form, and the failure names
+    // that task set by the id the reference carried, alone under the resource type, since
+    // a task set that resolves to nothing exists in no service to qualify it by
+    // ([`crate::task_set_reports`] is the table of reference forms).
     let unknown = "ecs-svc/0000000000000009999";
-    let unknown_arn = format!(
+    let unknown_arn = format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task-set/{unknown}");
+    let qualified_arn = format!(
         "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task-set/{cluster}/{service_name}/{unknown}"
     );
-    for (form, reference) in [("an unknown id", unknown.to_string()), ("an unknown ARN", unknown_arn.clone())] {
+    for (form, reference) in [
+        ("an unknown id", unknown.to_string()),
+        ("an unknown ARN", qualified_arn.clone()),
+    ] {
         let mixed = describe_task_sets(
             &router,
             cluster,

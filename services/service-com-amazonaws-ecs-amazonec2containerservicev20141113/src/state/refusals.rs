@@ -1609,6 +1609,9 @@ pub fn task_set_service_arn(region: &str, service_name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("service/{service_name}"))
 }
 
+/// The resource type a task-set ARN names.
+pub const TASK_SET_RESOURCE_TYPE: &str = "task-set";
+
 /// The ARN of a task set:
 /// `arn:aws:ecs:<region>:<account>:task-set/<cluster>/<service>/<task set id>`. The id a
 /// task set carries already has its own `ecs-svc/` prefix, so the ARN ends with it.
@@ -1621,8 +1624,37 @@ pub fn task_set_arn(
     ::engine::emulator_arn(
         ARN_NAMESPACE,
         region,
-        &format!("task-set/{cluster_name}/{service_name}/{task_set_id}"),
+        &format!("{TASK_SET_RESOURCE_TYPE}/{cluster_name}/{service_name}/{task_set_id}"),
     )
+}
+
+/// The task-set ARN a task set that exists in NO service is named by: the id alone under
+/// the resource type (`arn:aws:ecs:<region>:<account>:task-set/<id>`), with neither a
+/// cluster nor a service segment in the resource part.
+///
+/// The cluster and service segments of [`task_set_arn`] name the service a task set
+/// exists IN, which only a stored task set has, so an answer about a task set this
+/// service holds none of names it by its id alone.
+pub fn unqualified_task_set_arn(region: &str, task_set_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{TASK_SET_RESOURCE_TYPE}/{task_set_id}"),
+    )
+}
+
+/// The `MISSING` [`Failure`] a task-set batch read reports for a reference that resolves
+/// to no task set: the id the entry named ([`task_set_id_from_reference`], whichever of
+/// the member's two forms the entry took) under [`unqualified_task_set_arn`].
+///
+/// A read answers about a task set it did not find, so the entry names that task set
+/// alone and never the service the request looked for it in — which is also what lets a
+/// caller correlate the entry back to the identifier it submitted however it spelled it.
+pub fn unresolved_task_set_failure(region: &str, reference: &str) -> Failure {
+    missing_failure(&unqualified_task_set_arn(
+        region,
+        &task_set_id_from_reference(reference),
+    ))
 }
 
 /// The CLUSTER and the service NAME a `service`/`services` entry refers to.
