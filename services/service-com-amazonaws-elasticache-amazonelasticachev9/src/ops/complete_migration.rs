@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CompleteMigration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CompleteMigration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: completes the data migration INTO the one target the request names — the
+//! replication group or the serverless cache — reading and writing the single stored copy
+//! of the migration that target carries (`crate::state::MigrationRecord`), the same copy
+//! `StartMigration` opens and `StopMigration` will stop. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CompleteMigration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A target whose migration is not in flight has no cutover to perform, which is the
+//! refusal every call that is not a completion gets.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +170,200 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CompleteMigration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CompleteMigrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CompleteMigration"))
+        // A mutation: "Completes the migration of data." The migration it completes
+        // is the one recorded on the stored target, so the answer, a later read of
+        // that target and the refusal a second completion gets all come from the
+        // same record. `ctx` carries nothing this operation needs: each target is
+        // named by its own identity and the ARNs the answer reports were minted when
+        // the target was created.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+        // "Forces the migration to stop without ensuring that data is in sync": the
+        // member bypasses the DATA-IN-SYNC check, which is the `MigrationHealthFault`
+        // channel ("The migration is not healthy … set Force to true to bypass this
+        // check"). Nothing in this emulator makes an open migration unhealthy, so
+        // there is no health check for it to bypass — and it is NOT a way to complete
+        // a migration that is not in flight, which is why the refusals below do not
+        // read it.
+        let _ = input.force;
+
+        match (
+            input.replication_group_id.as_deref(),
+            input.serverless_cache_name.as_deref(),
+        ) {
+            // "The ID of the replication group to which data is being migrated" and
+            // "the name of the serverless cache to which data is being migrated" are
+            // the two targets a migration can have, so a request naming both names
+            // two migrations for one cutover.
+            (Some(_), Some(_)) => Err(invalid_combination(
+                "ReplicationGroupId and ServerlessCacheName cannot both be named: a migration \
+                 has one target.",
+            )),
+            (None, None) => Err(invalid_value(
+                "Either ReplicationGroupId or ServerlessCacheName must be provided to name the \
+                 target of the migration.",
+            )),
+            (Some(replication_group_id), None) => {
+                // The identifier before the group is resolved: a value past the
+                // bound this service states names no group it could have stored, so
+                // the refusal reports the bound rather than the group being absent —
+                // through the one template every identifier refusal of this service
+                // goes through, worded as `StartMigration` words the same member.
+                if let Some(message) = crate::state::identifier_refusal(
+                    "Cluster ID",
+                    "ReplicationGroupIdentifier",
+                    replication_group_id,
+                    crate::state::CLUSTER_ID_MAX_LEN,
+                ) {
+                    return Err(invalid_value(message));
+                }
+                // A group id is stored folded to lower case, so the group this
+                // request resolves is the one held under the lowercased id.
+                let key = replication_group_id.to_ascii_lowercase();
+                let mut store = state.lock();
+                // The status change the clock owes the group is materialised first,
+                // so what this call reads is the group THIS instant owes.
+                let Some(group) = store.settled_replication_group_mut(&key, now) else {
+                    return Err(CompleteMigrationErrorModeled::ReplicationGroupNotFoundFault(
+                        ReplicationGroupNotFoundFault {
+                            message: Some(crate::state::replication_group_not_found_message(
+                                replication_group_id,
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                // A cutover exists only inside a migration that is MIGRATING: the
+                // group has to carry an open one whose data sync is in flight, and
+                // it has to be provisioned and idle, because the work that
+                // establishes the sync is work the service carries out after the
+                // `StartMigration` that began it. Any other state is the one
+                // modelled parameter refusal, which says exactly that and says to
+                // retry once the service has got there.
+                let migrating = group.status == crate::state::STATUS_AVAILABLE
+                    && group
+                        .migration
+                        .as_ref()
+                        .is_some_and(crate::state::MigrationRecord::is_migrating);
+                if !migrating {
+                    return Err(invalid_value(
+                        crate::state::MIGRATION_NOT_MIGRATING_MESSAGE,
+                    ));
+                }
+
+                // Nothing below refuses anything: the migration is CLOSED on the
+                // stored group — it is no longer open, so a second completion is
+                // refused and a further `StartMigration` may begin one — and the
+                // group answers `modifying` until the clock settles it, the cutover
+                // being work the service carries out after the call.
+                group.migration = None;
+                group.begin_transition(crate::state::STATUS_MODIFYING, now);
+                store.record_event(
+                    crate::state::SOURCE_TYPE_REPLICATION_GROUP,
+                    &key,
+                    "Migration of data to the replication group completed",
+                    now,
+                );
+
+                let Some(replication_group) = store.modeled_replication_group(&key) else {
+                    // Unreachable: resolved under this same lock above.
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        crate::state::STORE_UNAVAILABLE,
+                    ));
+                };
+                Ok(CompleteMigrationOutput {
+                    replication_group: Some(replication_group),
+                    serverless_cache: None,
+                })
+            }
+            (None, Some(serverless_cache_name)) => {
+                // A serverless cache's name "is stored as a lowercase string", so
+                // the cache this request resolves is the one held under the
+                // lowercased name.
+                let name = serverless_cache_name.to_ascii_lowercase();
+                let mut store = state.lock();
+                // A cache whose removal the clock has carried through is gone, and
+                // one owed `available` is available now: the record read here is the
+                // one this instant owes.
+                let Some(cache) = store.settled_serverless_cache_mut(&name, now) else {
+                    return Err(CompleteMigrationErrorModeled::ServerlessCacheNotFoundFault(
+                        ServerlessCacheNotFoundFault {
+                            message: Some(format!(
+                                "Serverless cache with name {serverless_cache_name} not found."
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                // The cache's own modelled fault for "not currently under
+                // migration": a cache carrying no migration has no data sync to cut
+                // over, and `PrepareMigration` is what opens one on it.
+                let Some(migration) = cache.migration.as_ref() else {
+                    return Err(
+                        CompleteMigrationErrorModeled::ServerlessCacheNotUnderMigrationFault(
+                            ServerlessCacheNotUnderMigrationFault {
+                                message: Some(format!(
+                                    "Serverless cache {name} is not currently under migration."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                // One that carries a migration which is not migrating is the same
+                // refusal the replication group gets, for the same reason: there is
+                // no data sync in flight to complete.
+                if !migration.is_migrating() {
+                    return Err(invalid_value(
+                        crate::state::MIGRATION_NOT_MIGRATING_MESSAGE,
+                    ));
+                }
+
+                // Nothing below refuses anything. The migration is closed on the
+                // stored cache; the cache itself stays available — clients read and
+                // write through its endpoint across the cutover — so no status
+                // change is owed on it, exactly as `StartMigration` owes none.
+                cache.migration = None;
+                let serverless_cache = cache.to_modeled();
+                store.record_event(
+                    crate::state::SOURCE_TYPE_SERVERLESS_CACHE,
+                    &name,
+                    "Migration of data to the serverless cache completed",
+                    now,
+                );
+
+                Ok(CompleteMigrationOutput {
+                    replication_group: None,
+                    serverless_cache: Some(serverless_cache),
+                })
+            }
+        }
     }
+}
+
+/// The modelled refusal for a parameter value this operation cannot accept:
+/// `InvalidParameterValueException` ("The value for a parameter is invalid"),
+/// HTTP 400.
+fn invalid_value(message: impl Into<String>) -> CompleteMigrationError {
+    CompleteMigrationErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled refusal for two members of this request that cannot be named
+/// together: `InvalidParameterCombinationException` ("Two or more incompatible
+/// parameters were specified"), HTTP 400.
+fn invalid_combination(message: impl Into<String>) -> CompleteMigrationError {
+    CompleteMigrationErrorModeled::InvalidParameterCombinationException(
+        InvalidParameterCombinationException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
 }

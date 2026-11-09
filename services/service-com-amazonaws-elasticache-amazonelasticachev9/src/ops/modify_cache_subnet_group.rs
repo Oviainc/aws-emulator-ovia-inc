@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyCacheSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyCacheSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: changes the description and the subnets of a stored cache subnet group,
+//! resolving every identifier the request names against the subnets Amazon EC2 holds for
+//! the account, and answers the group as the store then holds it. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyCacheSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The group is the one `CreateCacheSubnetGroup` created and `DescribeCacheSubnetGroups`
+//! reports, so this writer writes the copy those two read rather than a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +69,8 @@
 //! * `CacheSubnetQuotaExceededFault` (HTTP 400) — The request cannot be processed because it
 //!   would exceed the allowed number of subnets in a cache subnet group.
 //! * `InvalidSubnet` (HTTP 400) — An invalid subnet identifier was specified.
+//! * `InvalidParameterValueException` (HTTP 400) — widened in through `extra_errors` (see
+//!   below): the value for a parameter is invalid.
 //! * `SubnetInUse` (HTTP 400) — The requested subnet is being used by another cache subnet
 //!   group.
 //! * `SubnetNotAllowedFault` (HTTP 400) — At least one subnet ID does not match the other
@@ -92,11 +92,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-elasticache-amazonelast
 // here — hence the `ModifyCacheSubnetGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.elasticache#ModifyCacheSubnetGroup")]
+// `InvalidParameterValueException` is widened in through `extra_errors`: this SERVICE models
+// that shape (a client error, `@httpError` 400 — "The value for a parameter is invalid") and
+// the other two cache subnet group operations declare it, while this operation's own error
+// list does not. It is the class ElastiCache refuses a subnet identifier that names nothing,
+// and a name no group could carry, with — and both refusals are worded here exactly as
+// `CreateCacheSubnetGroup` and `DeleteCacheSubnetGroup` word them, so the three operations
+// state one rule in one way.
+#[smithy_macros::operation_error(
+    "com.amazonaws.elasticache#ModifyCacheSubnetGroup",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum ModifyCacheSubnetGroupErrorModeled {
     CacheSubnetGroupNotFoundFault(CacheSubnetGroupNotFoundFault),
     CacheSubnetQuotaExceededFault(CacheSubnetQuotaExceededFault),
+    InvalidParameterValueException(InvalidParameterValueException),
     InvalidSubnet(InvalidSubnet),
     SubnetInUse(SubnetInUse),
     SubnetNotAllowedFault(SubnetNotAllowedFault),
@@ -153,18 +164,213 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyCacheSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyCacheSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyCacheSubnetGroup"))
+        // "Modifies an existing cache subnet group": a mutation of the one stored
+        // group, answered with that group as the store holds it afterwards.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // Same identity rule as the create and the delete: `CacheSubnetGroupName`
+        // "is stored as a lowercase string", so the name this request resolves
+        // against the store is its lowercased form.
+        let name = input.cache_subnet_group_name.to_ascii_lowercase();
+        // The FORM of the name before it is resolved against anything: a value the
+        // member's own constraint does not admit ("Must contain no more than 255
+        // alphanumeric characters or hyphens") names no group this account could
+        // hold, so it is reported as the bad parameter it is rather than as a group
+        // that does not exist. The member carries no modelled `@length` or
+        // `@pattern`, so the rule is enforced here, in the sentence the one helper
+        // for it states.
+        if !crate::state::is_valid_subnet_group_name(&name) {
+            return Err(invalid_value(
+                crate::state::invalid_subnet_group_name_message(&input.cache_subnet_group_name),
+            ));
+        }
+
+        // "The EC2 subnet IDs for the cache subnet group" is OPTIONAL on a modify:
+        // a request that names none changes only the description, and the group
+        // keeps the subnets it holds.
+        let requested_subnet_ids = input.subnet_ids.clone().unwrap_or_default();
+        let replaces_subnets = !requested_subnet_ids.is_empty();
+        if replaces_subnets {
+            if let Some(bad) = requested_subnet_ids
+                .iter()
+                .find(|id| !crate::state::is_subnet_id(id))
+            {
+                return Err(ModifyCacheSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                    message: Some(format!("Invalid value {bad} for SubnetIds: not a subnet id.")),
+                })
+                .into());
+            }
+            // One subnet cannot be in the group twice.
+            let mut seen = ::std::collections::BTreeSet::new();
+            if let Some(repeated) = requested_subnet_ids
+                .iter()
+                .find(|id| !seen.insert((*id).clone()))
+            {
+                return Err(ModifyCacheSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                    message: Some(format!(
+                        "Invalid value {repeated} for SubnetIds: a subnet may appear only once \
+                         in a cache subnet group."
+                    )),
+                })
+                .into());
+            }
+            // The group is bounded; see `crate::state::SUBNETS_PER_GROUP`. Checked
+            // BEFORE the identifiers are resolved, which is what holds one request
+            // to one hop into the service that owns subnets.
+            if requested_subnet_ids.len() > crate::state::SUBNETS_PER_GROUP {
+                return Err(
+                    ModifyCacheSubnetGroupErrorModeled::CacheSubnetQuotaExceededFault(
+                        CacheSubnetQuotaExceededFault {
+                            message: Some(format!(
+                                "{} subnets were supplied; a cache subnet group holds at most {}.",
+                                requested_subnet_ids.len(),
+                                crate::state::SUBNETS_PER_GROUP
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        // The group the request names has to exist before anything else about the
+        // request is resolved: a modify of a group this account does not hold is
+        // that absence, whatever the rest of the request says — and it is settled
+        // here rather than below so a call naming no group of this account does not
+        // pay a hop into another service for subnets nothing would be placed in.
+        // The lock is taken for the lookup alone and the record is resolved AGAIN
+        // under the lock that writes it, so nothing is decided on a stale read.
+        if !state.lock().cache_subnet_groups.contains_key(&name) {
+            return Err(
+                ModifyCacheSubnetGroupErrorModeled::CacheSubnetGroupNotFoundFault(
+                    CacheSubnetGroupNotFoundFault {
+                        message: Some(crate::state::delete_subnet_group_not_found_message(
+                            &input.cache_subnet_group_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Every identifier the request names is resolved against the subnets the
+        // ACCOUNT has, which is Amazon EC2's answer and nobody else's
+        // (`crate::state::ec2_subnets`, asked over the in-process callback) — the
+        // same resolution `CreateCacheSubnetGroup` applies, so a group cannot be
+        // modified onto a subnet it could not have been created on. Resolved while
+        // the store is NOT locked, because resolving it is a call into another
+        // service.
+        let resolved = if replaces_subnets {
+            let requested: Vec<&str> = requested_subnet_ids.iter().map(String::as_str).collect();
+            match crate::state::ec2_subnets::resolve_requested_subnets(ctx, &region, &requested)
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(unresolved) => {
+                    let unresolved: Vec<&str> = unresolved.iter().map(String::as_str).collect();
+                    return Err(invalid_value(crate::state::invalid_subnets_message(
+                        &unresolved,
+                    )));
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        // A group is where a cluster is placed and a cluster sits in ONE VPC, so
+        // the resolved subnets must all belong to one VPC — the fault the model
+        // declares for exactly that, in the sentence its own documentation states
+        // ("At least one subnet ID does not match the other subnet IDs"), followed
+        // by which identifier belongs where, read off EC2's records.
+        let placement = resolved.first().cloned().unwrap_or_default();
+        if let Some(mismatched) = resolved
+            .iter()
+            .find(|subnet| subnet.vpc_id != placement.vpc_id)
+        {
+            return Err(ModifyCacheSubnetGroupErrorModeled::SubnetNotAllowedFault(
+                SubnetNotAllowedFault {
+                    message: Some(format!(
+                        "At least one subnet ID does not match the other subnet IDs: {} belongs \
+                         to {} and {} belongs to {}.",
+                        mismatched.subnet_id,
+                        mismatched.vpc_id,
+                        placement.subnet_id,
+                        placement.vpc_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // One lock spans the lookup and the write, so of two concurrent modifies of
+        // one group the second reads what the first wrote.
+        let mut store = state.lock();
+        let Some(group) = store.cache_subnet_groups.get_mut(&name) else {
+            return Err(
+                ModifyCacheSubnetGroupErrorModeled::CacheSubnetGroupNotFoundFault(
+                    CacheSubnetGroupNotFoundFault {
+                        message: Some(crate::state::delete_subnet_group_not_found_message(
+                            &input.cache_subnet_group_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "A description of the cache subnet group" — an absent member leaves the
+        // description the group carries, and a named one is normalised the way
+        // every description of this service is (`crate::state::stored_description`).
+        if let Some(description) = input.cache_subnet_group_description.as_deref() {
+            group.description = crate::state::stored_description(description);
+        }
+        if replaces_subnets {
+            // The subnets REPLACE the ones the group held: the member names the
+            // subnets the group is to have, not ones to add to the set. Their zones
+            // and their VPC come from the records EC2 answered with, never from
+            // anything built here.
+            group.subnets = resolved
+                .into_iter()
+                .map(|subnet| crate::state::SubnetRecord {
+                    subnet_identifier: subnet.subnet_id,
+                    availability_zone: subnet.availability_zone,
+                })
+                .collect();
+            group.vpc_id = placement.vpc_id;
+        }
+        // Modifying a cache subnet group is one of the events this service records,
+        // under the source type its create and its delete record it under; see
+        // `crate::state::EventRecord`.
+        store.record_event(
+            crate::state::SOURCE_TYPE_CACHE_SUBNET_GROUP,
+            &name,
+            "Cache subnet group modified",
+            now,
+        );
+
+        // Read back out of the store, so the response is the persisted group rather
+        // than the request echoed.
+        Ok(ModifyCacheSubnetGroupOutput {
+            cache_subnet_group: store
+                .cache_subnet_groups
+                .get(&name)
+                .map(crate::state::CacheSubnetGroupRecord::to_modeled),
+        })
     }
+}
+
+/// The modelled refusal for a parameter value this operation cannot accept:
+/// `InvalidParameterValueException` ("The value for a parameter is invalid"),
+/// HTTP 400 — widened into this operation's error channel above.
+fn invalid_value(message: impl Into<String>) -> ModifyCacheSubnetGroupError {
+    ModifyCacheSubnetGroupErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
 }

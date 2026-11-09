@@ -405,8 +405,9 @@ async fn every_change_this_service_makes_is_reported_as_an_event() {
                 Step::Settle,
             ],
             // `ServerlessCacheName` "is stored as a lowercase string", and
-            // `ServerlessCache$Status` is spelled in upper case ("The allowed
-            // values are CREATING, AVAILABLE, …").
+            // `ServerlessCache$Status` is spelled on the wire in lower case, the
+            // same lifecycle spelling every other resource of this service
+            // reports (`crate::harness`'s suites read those values back).
             expected: &[
                 (
                     "serverless-cache",
@@ -416,7 +417,7 @@ async fn every_change_this_service_makes_is_reported_as_an_event() {
                 (
                     "serverless-cache",
                     "events-serverless",
-                    "Serverless cache status changed from CREATING to AVAILABLE",
+                    "Serverless cache status changed from creating to available",
                 ),
             ],
         },

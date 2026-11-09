@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyReplicationGroupShardConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyReplicationGroupShardConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyReplicationGroupShardConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: changes how many node groups (shards) a cluster mode enabled replication
+//! group has — adding shards, removing shards and repartitioning the keyspace across
+//! whatever shards the group ends up with — over the one stored copy of the group
+//! (`crate::state::reshard_replication_group`). This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +183,310 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyReplicationGroupShardConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyReplicationGroupShardConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyReplicationGroupShardConfiguration"))
+        // A mutation: the shards it reconfigures are the ONE stored copy every other
+        // operation of this group reads, so the answer and a later
+        // `DescribeReplicationGroups` cannot disagree. `ctx` carries nothing this
+        // operation needs: the group is named by its id and its ARN and endpoints
+        // were minted when it was created.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The identifier before the group is resolved: a value past the bound this
+        // service states names no group it could have stored, so the refusal reports
+        // the bound rather than the group being absent.
+        if let Some(message) = crate::state::identifier_refusal(
+            "Replication Group ID",
+            "ReplicationGroupIdentifier",
+            &input.replication_group_id,
+            crate::state::LOOKUP_IDENTIFIER_MAX_LEN,
+        ) {
+            return Err(invalid_value(message));
+        }
+        // "Indicates that the shard reconfiguration process begins immediately. At
+        // present, the only permitted value for this parameter is true": a request
+        // that asks for the change to be deferred asks for something the service
+        // does not offer, so the value is refused rather than ignored.
+        if !input.apply_immediately {
+            return Err(invalid_value(
+                "Invalid value false for ApplyImmediately: the shard reconfiguration process \
+                 begins immediately, so the only permitted value is true.",
+            ));
+        }
+        // The shard count the group is to end up with, held to the published bounds
+        // before anything is resolved: a group has at least one shard, and at most
+        // `NodeGroupsPerReplicationGroupQuotaExceededFault`'s documented maximum.
+        let requested_shards = input.node_group_count;
+        if requested_shards < 1 {
+            return Err(invalid_value(format!(
+                "Invalid value {requested_shards} for NodeGroupCount: a replication group has at \
+                 least one node group (shard)."
+            )));
+        }
+        if requested_shards > crate::state::MAX_NODE_GROUPS {
+            return Err(
+                ModifyReplicationGroupShardConfigurationErrorModeled::NodeGroupsPerReplicationGroupQuotaExceededFault(
+                    NodeGroupsPerReplicationGroupQuotaExceededFault {
+                        message: Some(format!(
+                            "{requested_shards} node groups (shards) were requested; a single \
+                             replication group holds at most {}.",
+                            crate::state::MAX_NODE_GROUPS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // ONE lock spans every check below and the write, so of two concurrent
+        // reshards of the same group exactly one finds it `available` and the other
+        // is refused with the state fault: the winner leaves the group `modifying`
+        // before the loser can read it.
+        let mut store = state.lock();
+        // The status change the clock owes the group is materialised first, so what
+        // this call reads and gates on is the group THIS instant owes.
+        let group_id = input.replication_group_id.to_ascii_lowercase();
+        let Some(group) = store.settled_replication_group_mut(&group_id, now) else {
+            return Err(
+                ModifyReplicationGroupShardConfigurationErrorModeled::ReplicationGroupNotFoundFault(
+                    ReplicationGroupNotFoundFault {
+                        message: Some(crate::state::replication_group_not_found_message(
+                            &input.replication_group_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "The name of the Valkey or Redis OSS (cluster mode ENABLED) cluster
+        // (replication group) on which the shards are to be configured": a group
+        // whose data is not partitioned across shards has one keyspace and one
+        // shard, so there is no shard configuration of it to change.
+        if !group.cluster_enabled {
+            return Err(invalid_value(format!(
+                "Invalid value {} for ReplicationGroupId: shards can only be configured on a \
+                 cluster mode enabled replication group.",
+                input.replication_group_id
+            )));
+        }
+        // The same gate every change to a group applies: one still `creating`,
+        // already `modifying` (a reshard of its own included) or on its way out
+        // cannot take another change.
+        if group.status != crate::state::STATUS_AVAILABLE {
+            return Err(
+                ModifyReplicationGroupShardConfigurationErrorModeled::InvalidReplicationGroupStateFault(
+                    InvalidReplicationGroupStateFault {
+                        message: Some(crate::state::replication_group_modify_state_refusal()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let held: Vec<String> = group
+            .node_groups
+            .iter()
+            .map(|shard| shard.node_group_id.clone())
+            .collect();
+        let current_shards = i32::try_from(held.len()).unwrap_or(0);
+        let to_remove = input.node_groups_to_remove.clone().unwrap_or_default();
+        let to_retain = input.node_groups_to_retain.clone().unwrap_or_default();
+        let resharding = input.resharding_configuration.clone().unwrap_or_default();
+        let scale_in = requested_shards < current_shards;
+        let scale_out = requested_shards > current_shards;
+
+        // "If the value of NodeGroupCount is less than the current number of node
+        // groups (shards), then either NodeGroupsToRemove or NodeGroupsToRetain is
+        // required" — and the two name the same selection from the two sides, so one
+        // of them, never both and never neither.
+        if scale_in && (to_remove.is_empty() == to_retain.is_empty()) {
+            return Err(invalid_combination(
+                crate::state::SCALE_IN_SELECTION_MESSAGE,
+            ));
+        }
+        // Neither list means anything on a request that does not take shards away:
+        // there is nothing to remove or to retain, so naming one asks for a
+        // selection this call cannot apply.
+        if !scale_in && (!to_remove.is_empty() || !to_retain.is_empty()) {
+            return Err(invalid_combination(format!(
+                "NodeGroupsToRemove and NodeGroupsToRetain select the node groups (shards) a \
+                 scale-in keeps, so neither can be named with NodeGroupCount \
+                 ({requested_shards}), which the group already has or exceeds."
+            )));
+        }
+        // "You can specify this parameter only if the value of NodeGroupCount is
+        // greater than the current number of node groups (shards)": the zones it
+        // names are the zones of the shards being ADDED.
+        if !resharding.is_empty() && !scale_out {
+            return Err(invalid_combination(format!(
+                "ReshardingConfiguration names the Availability Zones of the node groups \
+                 (shards) being added, so it can only be given when NodeGroupCount \
+                 ({requested_shards}) is greater than the {current_shards} node groups the \
+                 replication group has."
+            )));
+        }
+        if requested_shards == current_shards {
+            return Err(invalid_value(format!(
+                "Invalid value {requested_shards} for NodeGroupCount: the replication group \
+                 already has {current_shards} node groups (shards)."
+            )));
+        }
+
+        // Which shards the group keeps. Every id a list names has to name a shard of
+        // THIS group, and the selection has to leave exactly the requested count —
+        // "ElastiCache will attempt to remove all node groups listed by
+        // NodeGroupsToRemove" / "all node groups except those listed by
+        // NodeGroupsToRetain".
+        let retained: Vec<String> = if scale_in {
+            let named: &[String] = if to_remove.is_empty() {
+                &to_retain
+            } else {
+                &to_remove
+            };
+            let member = if to_remove.is_empty() {
+                "NodeGroupsToRetain"
+            } else {
+                "NodeGroupsToRemove"
+            };
+            let mut seen = ::std::collections::BTreeSet::new();
+            for node_group_id in named {
+                if !held.contains(node_group_id) {
+                    return Err(invalid_value(format!(
+                        "Invalid value {node_group_id} for {member}: the replication group has no \
+                         such node group (shard)."
+                    )));
+                }
+                if !seen.insert(node_group_id.clone()) {
+                    return Err(invalid_value(format!(
+                        "Invalid value {node_group_id} for {member}: a node group (shard) may be \
+                         named only once."
+                    )));
+                }
+            }
+            let retained: Vec<String> = if to_remove.is_empty() {
+                held.iter()
+                    .filter(|id| named.contains(id))
+                    .cloned()
+                    .collect()
+            } else {
+                held.iter()
+                    .filter(|id| !named.contains(id))
+                    .cloned()
+                    .collect()
+            };
+            if i32::try_from(retained.len()).unwrap_or(0) != requested_shards {
+                return Err(invalid_value(format!(
+                    "Invalid value for {member}: it leaves {} node groups (shards), which must \
+                     equal NodeGroupCount ({requested_shards}).",
+                    retained.len()
+                )));
+            }
+            retained
+        } else {
+            held.clone()
+        };
+
+        // Which shards the group gains, and where their member clusters go: "If you
+        // omit this parameter ElastiCache selects availability zones for you", so a
+        // request that names fewer configurations than it adds shards has the rest
+        // placed by the service.
+        let mut added: Vec<crate::state::NewNodeGroup> = Vec::new();
+        if scale_out {
+            let adding = usize::try_from(requested_shards - current_shards).unwrap_or(0);
+            if resharding.len() > adding {
+                return Err(invalid_combination(format!(
+                    "ReshardingConfiguration configures {} node groups (shards), which cannot \
+                     exceed the {adding} being added.",
+                    resharding.len()
+                )));
+            }
+            for offset in 0..adding {
+                let configuration = resharding.get(offset);
+                let preferred_availability_zones = configuration
+                    .and_then(|configuration| configuration.preferred_availability_zones.clone())
+                    .unwrap_or_default();
+                added.push(crate::state::NewNodeGroup {
+                    // The id a configuration names is the shard it configures, and a
+                    // configuration that names none takes the next id the group has
+                    // free.
+                    node_group_id: configuration
+                        .and_then(|configuration| configuration.node_group_id.clone())
+                        .filter(|node_group_id| !node_group_id.is_empty())
+                        .unwrap_or_else(|| store.next_node_group_id(&group_id, offset)),
+                    preferred_availability_zones,
+                });
+            }
+            // An id a configuration names has to be free: one the group already holds, or
+            // one another configuration of this same request already took, would be a
+            // second shard with one identity — and its member cluster ids, derived from
+            // the group and the shard, would collide with the first's.
+            let mut seen = ::std::collections::BTreeSet::new();
+            if let Some(taken) = added.iter().find(|shard| {
+                held.contains(&shard.node_group_id) || !seen.insert(shard.node_group_id.clone())
+            }) {
+                return Err(invalid_value(format!(
+                    "Invalid value {} for ReshardingConfiguration: a node group (shard) with \
+                     that id is already named.",
+                    taken.node_group_id
+                )));
+            }
+        }
+
+        // Nothing below refuses anything: the shards are reconfigured on the stored
+        // group, the keyspace is repartitioned across them, the member clusters of a
+        // shard that went are gone and those of a shard that arrived exist, and the
+        // group answers `modifying` until the clock settles it.
+        store.reshard_replication_group(&group_id, &retained, &added, now);
+        store.record_event(
+            crate::state::SOURCE_TYPE_REPLICATION_GROUP,
+            &group_id,
+            format!(
+                "Shard configuration of the replication group changed to {requested_shards} node \
+                 groups"
+            ),
+            now,
+        );
+
+        let Some(replication_group) = store.modeled_replication_group(&group_id) else {
+            // Unreachable: resolved under this same lock above.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        Ok(ModifyReplicationGroupShardConfigurationOutput {
+            replication_group: Some(replication_group),
+        })
     }
+}
+
+/// The modelled refusal for a parameter value this operation cannot accept:
+/// `InvalidParameterValueException` ("The value for a parameter is invalid"),
+/// HTTP 400.
+fn invalid_value(
+    message: impl Into<String>,
+) -> ModifyReplicationGroupShardConfigurationError {
+    ModifyReplicationGroupShardConfigurationErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
+}
+
+/// The modelled refusal for members of this request that cannot hold together:
+/// `InvalidParameterCombinationException` ("Two or more incompatible parameters
+/// were specified"), HTTP 400.
+fn invalid_combination(
+    message: impl Into<String>,
+) -> ModifyReplicationGroupShardConfigurationError {
+    ModifyReplicationGroupShardConfigurationErrorModeled::InvalidParameterCombinationException(
+        InvalidParameterCombinationException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
 }

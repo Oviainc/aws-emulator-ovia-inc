@@ -183,6 +183,7 @@ mod parameters;
 mod reserved_nodes;
 mod cache_clusters;
 mod replication_groups;
+mod shard_configuration;
 mod engine_versions;
 mod serverless_caches;
 mod migrations;
@@ -192,6 +193,7 @@ pub use migrations::*;
 pub use serverless_caches::*;
 pub use engine_versions::*;
 pub use replication_groups::*;
+pub use shard_configuration::*;
 pub use cache_clusters::*;
 pub use reserved_nodes::*;
 pub use parameters::*;
@@ -731,6 +733,15 @@ pub fn replication_group_modify_state_refusal() -> String {
 /// already matches, naming neither the shard nor the group.
 pub const REPLICA_COUNT_UNCHANGED_MESSAGE: &str =
     "Requested new replica count already matches current number of replicas.";
+
+/// How ElastiCache refuses a SCALE-IN of a replication group's shards that does
+/// not select which shards it keeps, or that selects them from both sides at
+/// once: `NodeGroupsToRemove` and `NodeGroupsToRetain` are the two sides of one
+/// selection ("either NodeGroupsToRemove or NodeGroupsToRetain is required"), so
+/// a scale-in names exactly one of them.
+pub const SCALE_IN_SELECTION_MESSAGE: &str =
+    "Node groups to remove or node groups to retain must be specified for a scale-in call but \
+     not both.";
 
 /// The `SourceType` values this service records an event under, from the
 /// model's `SourceType` enum (`smithy_query(query="shape",shape="SourceType")`:
@@ -1354,14 +1365,16 @@ pub fn placement_subnet_group_not_found_message(name: &str) -> String {
     format!("Cache subnet group '{name}' does not exist.")
 }
 
-/// How ElastiCache words a cache subnet group `DeleteCacheSubnetGroup` cannot
-/// find: `Cache Subnet Group <name> does not exist.`
+/// How ElastiCache words a cache subnet group a WRITE cannot find:
+/// `Cache Subnet Group <name> does not exist.`
 ///
 /// The fixed text is `Cache Subnet Group ` and ` does not exist.`; the one
 /// variable part is the `CacheSubnetGroupName` exactly as the request spelled it,
-/// because the message is built from the request. This operation's wording is its
-/// own: the describe that resolves the same member answers `Cache subnet group
-/// <name> not found.`, so the two cannot be served by one template.
+/// because the message is built from the request. One helper for the two
+/// operations that address the group itself by name and change it
+/// (`DeleteCacheSubnetGroup`, `ModifyCacheSubnetGroup`), so they cannot word one
+/// fault two ways; the describe that resolves the same member answers `Cache
+/// subnet group <name> not found.`, which is its own wording.
 pub fn delete_subnet_group_not_found_message(name: &str) -> String {
     format!("Cache Subnet Group {name} does not exist.")
 }

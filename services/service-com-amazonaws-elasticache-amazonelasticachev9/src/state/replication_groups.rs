@@ -15,6 +15,16 @@ pub const MAX_CACHE_CLUSTERS_PER_GROUP: i32 = 6;
 /// as `ReplicasPerNodeGroup` documents it: "Valid values are 0 to 5."
 pub const MAX_REPLICAS_PER_NODE_GROUP: i32 = 5;
 
+/// How many replicas a node group (shard) gets when the request asks for
+/// AUTOMATIC FAILOVER but names no replica count of its own: one per shard.
+///
+/// Automatic failover promotes a replica, so a shard needs one to promote —
+/// "If AutomaticFailoverEnabled is true, the value of [NumCacheClusters] must be
+/// at least 2", a primary plus this one replica. The count is what the service
+/// DEFAULTS to for the requested mode, which is why a request that enables
+/// failover without naming `ReplicasPerNodeGroup` is served rather than refused.
+pub const REPLICAS_PER_NODE_GROUP_FOR_FAILOVER: i32 = 1;
+
 /// The smallest `NewReplicaCount` `IncreaseReplicaCount` accepts: an increase
 /// ends with at least one replica, so a request to end with none asks this
 /// operation for something it cannot do.

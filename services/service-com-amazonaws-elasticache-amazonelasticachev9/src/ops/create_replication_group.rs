@@ -591,9 +591,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     clusters - 1
                 }
                 (None, Some(replicas)) => replicas,
-                // "If AutomaticFailoverEnabled is false you can omit this
-                // parameter (it will default to 1)": one cluster, the primary.
-                (None, None) => 0,
+                // Nothing in the request sets the count, so the SERVICE's
+                // default for the topology the request asked for applies, and it
+                // applies BEFORE the combination checks below — an optional
+                // member the request omits is defaulted, never validated as
+                // absent.
+                //
+                // For a cluster mode DISABLED group the count is
+                // `NumCacheClusters`, which documents both its default and its
+                // failover rule ("The default is 1 … If AutomaticFailoverEnabled
+                // is true, the value of this parameter must be at least 2"), so
+                // the primary alone is what an omitted count asks for there. For
+                // a cluster mode ENABLED group the count is
+                // `ReplicasPerNodeGroup`, which states no such minimum, so a
+                // request that enables automatic failover without naming one
+                // gets the mode-appropriate default: a replica in every shard to
+                // promote ([`crate::state::REPLICAS_PER_NODE_GROUP_FOR_FAILOVER`]).
+                (None, None) => {
+                    if cluster_enabled && input.automatic_failover_enabled == Some(true) {
+                        crate::state::REPLICAS_PER_NODE_GROUP_FOR_FAILOVER
+                    } else {
+                        0
+                    }
+                }
             };
 
         // Per shard: how many replicas it has.
@@ -752,8 +772,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `KmsKeyId` is "the ID of the KMS key used to encrypt the disk in the
         // cluster" and the group REPORTS it for the rest of its life, so the
         // identifier the request named is resolved to the key's own ARN before it
-        // is stored; see `crate::state::kms_key`. Resolved before the store is
-        // locked, because resolving it is a call into KMS.
+        // is stored; see `crate::state::kms_key`. That resolution asks KMS over the
+        // emulator's own IN-PROCESS callback transport — no socket is opened, no
+        // name is resolved and nothing leaves the process — and it runs here rather
+        // than below because the store must not be locked across a hop into another
+        // operation of this same emulator. The Region it is asked in is read as a
+        // Region label first, so caller-supplied text never reaches an authority.
         let kms_key_id =
             crate::state::kms_key::stored_key_id(ctx, &region, input.kms_key_id).await;
         let now = ::std::time::SystemTime::now();

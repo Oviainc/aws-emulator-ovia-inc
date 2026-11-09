@@ -138,8 +138,8 @@ const ERROR_CASES: &[ErrorCase] = &[
     },
     ErrorCase {
         case: "a scaffolded operation, which answers the 501 channel",
-        action: "CompleteMigration",
-        params: &[("ReplicationGroupId", "no-such-replication-group")],
+        action: "StopMigration",
+        params: &[("ServerlessCacheName", "no-such-serverless-cache")],
         status: 501,
         code: "NotImplemented",
     },

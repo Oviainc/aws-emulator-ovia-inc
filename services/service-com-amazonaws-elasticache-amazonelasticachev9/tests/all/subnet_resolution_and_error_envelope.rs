@@ -183,8 +183,8 @@ async fn every_error_envelope_names_the_request_it_answers() {
         (
             // A scaffolded operation: the 501 is an error too.
             "an operation nobody has written yet",
-            "ModifyCacheSubnetGroup",
-            params(&[("CacheSubnetGroupName", "envelope-group")]),
+            "StopMigration",
+            params(&[("ServerlessCacheName", "envelope-serverless")]),
             501,
             "NotImplemented",
         ),

@@ -2,21 +2,27 @@
 
 use super::*;
 
-/// `ServerlessCache$Status`'s values this slice writes and reads: "The current
-/// status of the serverless cache. The allowed values are CREATING, AVAILABLE,
-/// DELETING, CREATE-FAILED and MODIFYING." The member is a plain `String`
-/// rather than an enum, so these are the spellings.
-pub const SERVERLESS_STATUS_CREATING: &str = "CREATING";
+/// `ServerlessCache$Status`'s values this slice writes and reads: the lifecycle
+/// the member describes ("The current status of the serverless cache"), spelled
+/// the way the API puts it on the wire.
+///
+/// The member is a plain `String` rather than an enum, so the spelling is not
+/// modelled, and the wire value a client compares against is LOWER case — the
+/// same spelling every other resource of this service reports its lifecycle in
+/// ([`STATUS_CREATING`] and its siblings, which the serverless SNAPSHOT already
+/// uses). The member's prose lists the values shouted; the wire does not, and a
+/// client waiting for `available` is waiting for the wire value.
+pub const SERVERLESS_STATUS_CREATING: &str = STATUS_CREATING;
 /// See [`SERVERLESS_STATUS_CREATING`]. What a cache answers while ElastiCache
 /// works a `ModifyServerlessCache` through
 /// ([`ServerlessCacheRecord::begin_modification`]).
-pub const SERVERLESS_STATUS_MODIFYING: &str = "MODIFYING";
+pub const SERVERLESS_STATUS_MODIFYING: &str = STATUS_MODIFYING;
 /// See [`SERVERLESS_STATUS_CREATING`].
-pub const SERVERLESS_STATUS_AVAILABLE: &str = "AVAILABLE";
+pub const SERVERLESS_STATUS_AVAILABLE: &str = STATUS_AVAILABLE;
 /// See [`SERVERLESS_STATUS_CREATING`]. What a cache answers between the
 /// `DeleteServerlessCache` that started its deletion and the removal the clock
 /// owes it ([`ServerlessCacheRecord::pending_deletion`]).
-pub const SERVERLESS_STATUS_DELETING: &str = "DELETING";
+pub const SERVERLESS_STATUS_DELETING: &str = STATUS_DELETING;
 
 /// How long a serverless cache stays `CREATING` (or `MODIFYING`) before the
 /// clock owes it `AVAILABLE`, and how long one stays `DELETING` before the clock

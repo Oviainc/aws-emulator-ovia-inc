@@ -23,6 +23,17 @@ pub const MIGRATION_STATUS_STOPPED: &str = "stopped";
 /// `InvalidServerlessCacheStateFault`").
 pub const MIGRATION_STATUS_CUTOVER: &str = "cutover";
 
+/// How ElastiCache refuses a `CompleteMigration` on a target whose data
+/// migration is not in flight: the cutover it asks for only exists while data is
+/// being migrated, and the work that gets a target there is work the service
+/// carries out after the call that started it — which is what "retry later"
+/// states.
+///
+/// One sentence, stated once, for the one operation that completes a migration.
+pub const MIGRATION_NOT_MIGRATING_MESSAGE: &str =
+    "The replication group must be in migrating state to complete the migration. Please retry \
+     later.";
+
 /// `MigrationSummary$CutoverMode` when ElastiCache cuts over by itself, which is
 /// what `StartMigration$AutoCutover` asks for: "whether ElastiCache
 /// automatically attempts to complete the migration after data sync is
@@ -105,6 +116,17 @@ impl MigrationRecord {
     /// already syncing or in cutover is past that point.
     pub fn can_begin_sync(&self) -> bool {
         self.status == MIGRATION_STATUS_PREPARED || self.status == MIGRATION_STATUS_STOPPED
+    }
+
+    /// Whether this migration is MIGRATING: its data sync is in flight
+    /// ([`MIGRATION_STATUS_SYNCING`]) or its cutover already under way
+    /// ([`MIGRATION_STATUS_CUTOVER`]), which is the phase a `CompleteMigration`
+    /// can cut over from. A migration that has only been prepared, or that a
+    /// `StopMigration` left stopped, is not migrating: there is no sync to
+    /// complete, and the request is refused with
+    /// [`MIGRATION_NOT_MIGRATING_MESSAGE`].
+    pub fn is_migrating(&self) -> bool {
+        self.status == MIGRATION_STATUS_SYNCING || self.status == MIGRATION_STATUS_CUTOVER
     }
 
     /// This record as the modelled `MigrationSummary`.

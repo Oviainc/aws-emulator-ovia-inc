@@ -236,3 +236,16 @@ mod identifier_length_precedence;
 // placement that names no cache subnet group of this account is refused with.
 #[path = "all/subnet_placement_resolves_against_ec2.rs"]
 mod subnet_placement_resolves_against_ec2;
+
+// Appended for the same reason: the `ModifyCacheSubnetGroup` suite, the shard-configuration
+// suite (`ModifyReplicationGroupShardConfiguration` and the replica count a cluster mode
+// enabled create defaults to), the `CompleteMigration` suite and the suite about the
+// spelling of the lifecycle a client polls on.
+#[path = "all/cache_subnet_group_modify.rs"]
+mod cache_subnet_group_modify;
+#[path = "all/shard_configuration.rs"]
+mod shard_configuration;
+#[path = "all/migration_completion.rs"]
+mod migration_completion;
+#[path = "all/serverless_lifecycle_spelling.rs"]
+mod serverless_lifecycle_spelling;
