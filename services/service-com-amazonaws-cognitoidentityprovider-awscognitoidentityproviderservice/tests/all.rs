@@ -57,6 +57,8 @@ mod authentication_refusal_classes;
 mod authentication_refusal_wire;
 #[path = "all/authentication_success_shape.rs"]
 mod authentication_success_shape;
+#[path = "all/case_insensitive_user_resolution.rs"]
+mod case_insensitive_user_resolution;
 #[path = "all/change_password.rs"]
 mod change_password;
 #[path = "all/client_secret_not_found_message.rs"]

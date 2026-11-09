@@ -379,9 +379,12 @@ impl Searched {
     fn ignores_case(self, case_sensitive: bool) -> bool {
         match self {
             Self::UserStatus => true,
-            Self::Username
-            | Self::Attribute("preferred_username")
-            | Self::Attribute("email") => !case_sensitive,
+            Self::Username => !case_sensitive,
+            Self::Attribute(name)
+                if crate::state::CASE_INSENSITIVE_ALIAS_ATTRIBUTES.contains(&name) =>
+            {
+                !case_sensitive
+            }
             _ => false,
         }
     }

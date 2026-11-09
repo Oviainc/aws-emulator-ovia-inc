@@ -215,6 +215,18 @@ impl RiskConfiguration {
     }
 }
 
+/// The attributes a pool that compares usernames WITHOUT case compares without
+/// case too.
+///
+/// Setting `UsernameConfiguration.CaseSensitive` to `false` "also enables both
+/// `preferred_username` and `email` alias to be case insensitive, in addition to
+/// the `username` attribute" (this service's model), so these are the two values
+/// beside the username itself that name their holder in any capitalization —
+/// whether the holder is being resolved ([`UserPool::names_attribute_value`]) or
+/// searched for (`ListUsers.Filter`). The ONE place the set is named, so the
+/// lookups and the server-side search cannot disagree about it.
+pub const CASE_INSENSITIVE_ALIAS_ATTRIBUTES: [&str; 2] = ["email", "preferred_username"];
+
 /// The user-pool endpoint a request is SERVED on, as a URL: the endpoint the
 /// request REACHED this service at ([`serves_pool`]), and the published regional
 /// endpoint for a request that reached none this emulator serves the pool at.
@@ -359,6 +371,31 @@ impl UserPool {
         }
     }
 
+    /// Whether the value `stored` under this pool's sign-in or alias attribute
+    /// `name` is the value `submitted` names.
+    ///
+    /// `UsernameConfiguration.CaseSensitive` set to `false` "also enables both
+    /// `preferred_username` and `email` alias to be case insensitive, in
+    /// addition to the `username` attribute" (this service's model), so in such
+    /// a pool a value of either of those attributes names its holder in any
+    /// capitalization, exactly as the username itself does
+    /// ([`UserPool::user_key`]). Every other attribute's value, and every value
+    /// of a pool that compares usernames case-sensitively, names its holder only
+    /// as it was stored. The comparison alone folds case: the STORED spelling is
+    /// untouched, so a read still reports the value the write submitted.
+    ///
+    /// Asked once per candidate user of a lookup, so the folded comparison
+    /// streams the two values rather than lower-casing either into a new string.
+    pub fn names_attribute_value(&self, name: &str, stored: &str, submitted: &str) -> bool {
+        if self.case_sensitive() || !CASE_INSENSITIVE_ALIAS_ATTRIBUTES.contains(&name) {
+            return stored == submitted;
+        }
+        stored
+            .chars()
+            .flat_map(char::to_lowercase)
+            .eq(submitted.chars().flat_map(char::to_lowercase))
+    }
+
     /// The stored user `username` names, by username, by `sub` or by a sign-in
     /// name of this pool ([`UserPool::sign_in_name_holder_key`]).
     pub fn user(&self, username: &str) -> Option<&User> {
@@ -437,7 +474,10 @@ impl UserPool {
     /// so it resolves whatever its verified flag says; an alias attribute's
     /// value resolves only while it is the user's ACTIVE alias
     /// ([`User::alias_is_active`]), since an unconfirmed alias names no user
-    /// yet. At most one user holds a given sign-in value, and the lowest-ordered
+    /// yet. Each value is compared the way this pool compares that attribute
+    /// ([`UserPool::names_attribute_value`]), so a pool that compares usernames
+    /// without case resolves an email or `preferred_username` sign-in value in
+    /// any capitalization. At most one user holds a given sign-in value, and the lowest-ordered
     /// key answers, so the lookup is stable whatever order the users are held
     /// in. The work is bounded by the attributes the POOL configures, not by
     /// anything the caller sends.
@@ -457,7 +497,7 @@ impl UserPool {
                 .filter(|(_, user)| {
                     user.attributes
                         .get(name)
-                        .is_some_and(|stored| stored == value)
+                        .is_some_and(|stored| self.names_attribute_value(name, stored, value))
                         && (!only_while_active || user.alias_is_active(name))
                 })
                 .map(|(key, _)| key.clone())
@@ -1002,7 +1042,10 @@ impl UserPool {
     /// the same one at once: for `email` and `phone_number` the value is an
     /// alias only while the user's matching verified flag says the value was
     /// confirmed, and an alias attribute with no such flag counts whatever its
-    /// value (see [`User::alias_is_active`]).
+    /// value (see [`User::alias_is_active`]). The value is compared the way this
+    /// pool compares that attribute ([`UserPool::names_attribute_value`]), so a
+    /// pool that compares usernames without case holds one alias for every
+    /// capitalization of it.
     pub fn alias_taken(&self, name: &str, value: &str, except_username: &str) -> bool {
         !self.alias_holder_keys(name, value, except_username).is_empty()
     }
@@ -1026,7 +1069,7 @@ impl UserPool {
                     && user
                         .attributes
                         .get(name)
-                        .is_some_and(|stored| stored == value)
+                        .is_some_and(|stored| self.names_attribute_value(name, stored, value))
                     && user.alias_is_active(name)
             })
             .map(|(key, _)| key.clone())
