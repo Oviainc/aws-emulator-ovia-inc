@@ -90,6 +90,11 @@ aws-sdk-lambda = { version = "1", default-features = false }
 # answer from, so this service authorizes a request against the documents really in force
 # (`service::request_authorization`).
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The CloudWatch metric store is where a bucket's `AWS/S3` request metrics live: the datapoints
+# a served request contributes are appended to that service's own series — the ones
+# `GetMetricStatistics` and the alarm evaluation read — rather than to a second copy of them
+# (`service::request_metrics`).
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

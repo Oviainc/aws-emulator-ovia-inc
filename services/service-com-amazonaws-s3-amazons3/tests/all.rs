@@ -297,6 +297,8 @@ mod refusal_codes;
 mod refusal_detail_members;
 #[path = "all/request_integrity_headers.rs"]
 mod request_integrity_headers;
+#[path = "all/request_metrics.rs"]
+mod request_metrics;
 #[path = "all/request_time_skew.rs"]
 mod request_time_skew;
 #[path = "all/refusal_messages_published.rs"]

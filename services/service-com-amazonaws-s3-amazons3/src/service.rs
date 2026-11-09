@@ -87,6 +87,9 @@ pub mod post_object;
 // principal and the bucket's own policy let it perform the action it asks for — see
 // `service/request_authorization.rs`.
 pub mod request_authorization;
+// The `AWS/S3` request metrics a bucket's own metrics configurations publish about the
+// requests this service serves on its objects — see `service/request_metrics.rs`.
+pub mod request_metrics;
 pub mod sigv4;
 pub mod wire;
 
@@ -1021,6 +1024,13 @@ const TAGGING_DIRECTIVE_HEADER: &str = "x-amz-tagging-directive";
 /// The table also holds the one operation this service serves that the model does not
 /// declare at all — the BROWSER-FORM upload ([`post_object`]) — because this is where the
 /// operations this service resolves itself are kept.
+///
+/// And it is where the operations whose answers are COUNTED into the addressed bucket's
+/// `AWS/S3` request metrics are served from, each wrapped in
+/// [`request_metrics::Metered`]: this is the one table `override_operation` resolves an
+/// operation out of before the generated one, so a wrapped operation is reached by both
+/// address forms and by nothing else. An operation that is both wrapped here for its refusal
+/// and counted is served as ONE entry, the door inside the counting.
 fn front_door<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
 ) -> smithy_server_runtime::OperationRoutingTable {
@@ -1056,26 +1066,38 @@ fn front_door<Eng: Send + Sync + 'static>(
             .wording_uri(configuration_id_wording),
         ),
     );
+    // The two copies are the operations this service serves BOTH behind a door and with
+    // their answers counted into the addressed bucket's request metrics: a copy writes the
+    // destination object, so it is a `PUT` request of that object's bucket
+    // ([`request_metrics`]). One entry per operation, so the door and the counting are the
+    // same served operation rather than two.
     table.add_operation(
         crate::ops::copy_object::CopyObject::<Eng>::NAME,
-        Box::new(
+        Box::new(request_metrics::Metered::new(
             FrontDoor::worded(
                 crate::ops::copy_object::CopyObject::new(Arc::clone(engine)),
                 submitted_value_wording,
             )
             .wording_uri(uri_value_wording),
-        ),
+            Arc::clone(engine),
+            request_metrics::RequestKind::Put,
+        )),
     );
     table.add_operation(
         crate::ops::upload_part_copy::UploadPartCopy::<Eng>::NAME,
-        Box::new(
+        Box::new(request_metrics::Metered::new(
             FrontDoor::worded(
                 crate::ops::upload_part_copy::UploadPartCopy::new(Arc::clone(engine)),
                 submitted_value_wording,
             )
             .wording_uri(uri_value_wording),
-        ),
+            Arc::clone(engine),
+            request_metrics::RequestKind::Put,
+        )),
     );
+    // And the operations whose answers are counted and nothing else: the object data plane
+    // and the listings of what a bucket holds.
+    request_metrics::serve_metered(&mut table, engine);
     // The BROWSER-FORM upload, which is not a modelled operation at all: no routing-table
     // entry is bound to `POST /{Bucket}`, so such a request resolved to nothing and the
     // framework answered it as unwritten. It is held in this table because that is where

@@ -2156,7 +2156,11 @@ fn element_text(document: &[u8], element: &str) -> Option<String> {
 /// [`crate::scaffolded`]), so one request's address is read once, here, rather than per
 /// handler. The decode and the query read are the ones [`super::sigv4`] already owns, so a
 /// request's address is read one way wherever it is read.
-fn addressed_object(
+///
+/// `pub(super)`: the request-metric fold reads the object a counted request addressed through
+/// this same one ([`super::request_metrics`]), so the key a filter is judged against is the
+/// key the request's own answer was named by.
+pub(super) fn addressed_object(
     path: &str,
     query: &str,
 ) -> Option<crate::state::addressed_bucket::AddressedObject> {
