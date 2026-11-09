@@ -210,25 +210,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "all of the services that are associated with a Cloud Map namespace": the
-        // namespace is Cloud Map's resource, so whether this listing has a namespace to
-        // walk is read from THAT service's store — before this one is locked, so the
-        // cross-service read holds no guard of ours
-        // ([`crate::state::cloud_map_holds_namespace`]).
-        let in_cloud_map = crate::state::cloud_map_holds_namespace(&*self.engine, &input.namespace)
+        // namespace is Cloud Map's resource, and a service stored the reference it joined by
+        // — a name, an ARN or the id an ARN ends with. Which services are in the namespace
+        // the request names is therefore decided by the RECORD each reference resolves to,
+        // so the references are collected under our guard and resolved once the guard is
+        // dropped ([`crate::state::cloud_map_namespace_ids`]).
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+        let known_here = guard.knows_namespace(&input.namespace);
+        // A service the caller deleted is no longer one of the namespace's services, the
+        // same rule `ListServices` lists a cluster's services under.
+        let joined: Vec<(String, String)> = guard
+            .services
+            .values()
+            .filter(|service| service.is_active())
+            .filter_map(|service| {
+                guard
+                    .service_namespace(service)
+                    .map(|namespace| (service.arn.clone(), namespace))
+            })
+            .collect();
+        drop(guard);
+
+        let references = joined
+            .iter()
+            .map(|(_, namespace)| namespace.clone())
+            .chain(::std::iter::once(input.namespace.clone()));
+        let resolved = crate::state::cloud_map_namespace_ids(&*self.engine, references)
             .ok_or_else(|| {
                 ListServicesByNamespaceErrorModeled::ServerException(ServerException {
                     message: Some("the Cloud Map store is unavailable".to_string()),
                 })
             })?;
 
-        let mut guard = state.lock();
-        guard.advance_clock(::std::time::SystemTime::now());
-
         // A namespace nothing in this account holds is not a namespace this listing can
         // walk, and this operation models that condition as its own error. A namespace
         // Cloud Map holds IS one, however few ECS services have joined it — "no services in
         // it" is an empty list, not a missing namespace.
-        if !in_cloud_map && !guard.knows_namespace(&input.namespace) {
+        let in_cloud_map = resolved
+            .get(&input.namespace)
+            .cloned()
+            .flatten()
+            .is_some();
+        if !in_cloud_map && !known_here {
             return Err(
                 ListServicesByNamespaceErrorModeled::NamespaceNotFoundException(
                     NamespaceNotFoundException {
@@ -241,20 +265,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "This list might include services in different clusters": the namespace, not the
         // cluster, is what selects here — every ACTIVE service whose Service Connect
-        // namespace is the one named, whichever cluster it was created in.
-        let wanted = crate::state::namespace_key(&input.namespace);
-        let mut matching: Vec<String> = guard
-            .services
-            .values()
-            // A service the caller deleted is no longer one of the namespace's services,
-            // the same rule `ListServices` lists a cluster's services under.
-            .filter(|service| service.is_active())
-            .filter(|service| {
-                guard
-                    .service_namespace(service)
-                    .is_some_and(|namespace| crate::state::namespace_key(&namespace) == wanted)
+        // namespace IS the one named, whichever cluster it was created in and whichever of
+        // the namespace's spellings each of them used
+        // ([`crate::state::namespace_identity`]).
+        let wanted = crate::state::namespace_identity(&input.namespace, &resolved);
+        let mut matching: Vec<String> = joined
+            .into_iter()
+            .filter(|(_, namespace)| {
+                crate::state::namespace_identity(namespace, &resolved) == wanted
             })
-            .map(|service| service.arn.clone())
+            .map(|(arn, _)| arn)
             .collect();
         // A service ARN is `service/<cluster>/<name>`, so sorting the ARNs totally orders
         // services across clusters and gives paging a stable sequence to walk.

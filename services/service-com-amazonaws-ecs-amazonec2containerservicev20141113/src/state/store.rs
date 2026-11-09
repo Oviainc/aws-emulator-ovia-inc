@@ -3377,17 +3377,29 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         })
     }
 
-    /// The capacity providers that tasks of `cluster_name` which have not stopped were
-    /// placed with, collected in ONE pass over the task map.
+    /// The capacity providers of `cluster_name` whose CAPACITY its tasks are still running
+    /// on, collected in ONE pass over the task map.
     ///
     /// `PutClusterCapacityProviders`: "You can only disassociate an existing capacity
-    /// provider from a cluster if it's not being used by any existing tasks" — this is
-    /// that use, gathered once so a caller's provider list cannot multiply the scan.
+    /// provider from a cluster if it's not being used by any existing tasks" — the use that
+    /// blocks a disassociation is a task running on capacity the provider stands up, which
+    /// is a provider the ACCOUNT created over an Auto Scaling group or Amazon ECS Managed
+    /// Instances. The two providers Amazon ECS publishes for every account
+    /// ([`MANAGED_CAPACITY_PROVIDERS`]) stand nothing up for the cluster — "The Fargate
+    /// capacity providers are available to all accounts and only need to be associated with a
+    /// cluster to be used" — so their association is what a future placement is resolved
+    /// against and not capacity a running task sits on, and dropping one is served while its
+    /// tasks run on.
+    ///
+    /// A provider no task of the cluster runs on may be dropped however many services still
+    /// name it in a strategy, since the drop is what those services' next placement is
+    /// resolved against.
     pub fn capacity_providers_in_use(&self, cluster_name: &str) -> HashSet<String> {
         self.tasks
             .values()
             .filter(|task| task.cluster_name == cluster_name && task.is_active())
             .filter_map(|task| task.capacity_provider_name.clone())
+            .filter(|provider| !MANAGED_CAPACITY_PROVIDERS.contains(&provider.as_str()))
             .collect()
     }
 

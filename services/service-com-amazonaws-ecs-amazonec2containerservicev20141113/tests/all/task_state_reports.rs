@@ -582,15 +582,15 @@ async fn the_instants_only_the_agent_observes_are_stored_as_reported() {
 
 #[tokio::test]
 async fn a_resolved_report_records_each_container_attachment_and_managed_agent_it_names() {
-    // The rows span the stage a container entry reports, the state an attachment entry
-    // reports (`Attachment$status`: "Valid values are PRECREATED, CREATED, ATTACHING,
-    // ATTACHED, DETACHING, DETACHED, DELETED, and FAILED") and the status a managed-agent
-    // entry reports (`ManagedAgentStateChange$status` is an unconstrained string, so the
-    // agent's own word is stored as given). Each row reports against a fresh task.
+    // The rows span the stage a container entry reports and the status a managed-agent entry
+    // reports (`ManagedAgentStateChange$status` is an unconstrained string, so the agent's
+    // own word is stored as given). The attachment entry reports the one state the agent
+    // plane accepts (`ATTACHED`); the states it refuses are the subject of
+    // [`crate::attachment_state_reports`]. Each row reports against a fresh task.
     let rows: [(&str, &str, &str, &str); 3] = [
-        ("a task coming up", "RUNNING", "ATTACHING", "PENDING"),
+        ("a task coming up", "RUNNING", "ATTACHED", "PENDING"),
         ("a task that is up", "RUNNING", "ATTACHED", "RUNNING"),
-        ("a task going away", "STOPPED", "DETACHED", "STOPPED"),
+        ("a task going away", "STOPPED", "ATTACHED", "STOPPED"),
     ];
 
     for (case, container_status, attachment_status, agent_status) in rows {

@@ -127,6 +127,8 @@ mod primary_task_set;
 mod probe_monitoring;
 #[path = "all/reserved_tag_prefix.rs"]
 mod reserved_tag_prefix;
+#[path = "all/resource_scoping_and_agent_plane.rs"]
+mod resource_scoping_and_agent_plane;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/service_delete_drain.rs"]

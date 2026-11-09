@@ -489,10 +489,49 @@ pub const MAX_NAMESPACE_LENGTH: usize = 1024;
 /// them one of the four the class excludes.
 pub const NAMESPACE_PATTERN: &str = r#"^[!-~&&[^<>/"]]{1,1024}$"#;
 
-/// Whether `namespace` is a value [`NAMESPACE_PATTERN`] accepts: printable ASCII (`!`
-/// through `~`, so no space and no control character) less `<`, `>`, `/` and `"`, and
-/// between one and [`MAX_NAMESPACE_LENGTH`] of them.
+/// The Cloud Map service namespace an ARN of a namespace is named under
+/// (`arn:aws:servicediscovery:<region>:<account>:namespace/<id>`), as
+/// [`is_namespace_arn`] reads it back.
+pub const NAMESPACE_ARN_SERVICE: &str = "servicediscovery";
+
+/// The resource type of a Cloud Map namespace ARN.
+pub const NAMESPACE_ARN_RESOURCE_TYPE: &str = "namespace";
+
+/// Whether `reference` is a full Cloud Map namespace ARN —
+/// `arn:<partition>:servicediscovery:<region>:<account>:namespace/<id>`.
+///
+/// A SYNTAX question, not a lookup: whether the account holds that namespace is the
+/// namespace store's answer ([`cloud_map_holds_namespace`]), so an ARN of another Region
+/// names a namespace nothing here holds rather than a malformed value.
+pub fn is_namespace_arn(reference: &str) -> bool {
+    // The ONE parse of a caller-supplied ARN (`service_common::arn`): the vendor says the
+    // namespace is Cloud Map's, and the resource names one namespace of it.
+    let Some(parsed) = ::service_common::arn::parse(reference) else {
+        return false;
+    };
+    if parsed.vendor != NAMESPACE_ARN_SERVICE || parsed.account.is_empty() {
+        return false;
+    }
+    ::service_common::arn::resource_id_of_type(reference, NAMESPACE_ARN_RESOURCE_TYPE)
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// Whether `namespace` is a value a `namespace` member takes: "The namespace name or full
+/// Amazon Resource Name (ARN) of the Cloud Map namespace", so either of the two FORMS the
+/// member documents.
+///
+/// A NAME is one [`NAMESPACE_PATTERN`] accepts: printable ASCII (`!` through `~`, so no
+/// space and no control character) less `<`, `>`, `/` and `"`, and between one and
+/// [`MAX_NAMESPACE_LENGTH`] of them. An ARN is the other form the member names
+/// ([`is_namespace_arn`]) — it carries the `/` and the `:` no name may, so it is read as the
+/// ARN it is rather than refused as a name that is not one.
 pub fn is_namespace_reference(namespace: &str) -> bool {
+    is_namespace_arn(namespace) || is_namespace_name(namespace)
+}
+
+/// Whether `namespace` is a NAME [`NAMESPACE_PATTERN`] accepts — the one half of
+/// [`is_namespace_reference`] the pattern governs.
+pub fn is_namespace_name(namespace: &str) -> bool {
     let length = namespace.chars().count();
     (1..=MAX_NAMESPACE_LENGTH).contains(&length)
         && namespace
@@ -708,6 +747,18 @@ pub fn member_words(member_path: &str) -> String {
     words
 }
 
+/// `InvalidParameterException$message` for a member whose value is not one of the values
+/// Amazon ECS accepts there: the member as the sentence names it, and the accepted values
+/// between brackets, comma-separated with no spaces.
+///
+/// The ONE place this service words that refusal, whichever member earns it — the member's
+/// own name for the members the recorded sentences spell that way (`instanceId length`,
+/// `attachmentStatus`), and the camelCase-split words [`member_words`] renders for the
+/// modelled enum members ([`enum_value_message`]).
+pub fn value_set_message(member: &str, accepted: &[&str]) -> String {
+    format!("{member} should be one of [{}]", accepted.join(","))
+}
+
 /// `InvalidParameterException$message` for a member whose value is not one its modelled
 /// enum names: the member in the words above, and the values it does accept in ascending
 /// order between brackets.
@@ -717,11 +768,7 @@ pub fn member_words(member_path: &str) -> String {
 pub fn enum_value_message(member_path: &str, accepted: &[String]) -> String {
     let mut ascending: Vec<&str> = accepted.iter().map(String::as_str).collect();
     ascending.sort_unstable();
-    format!(
-        "{} should be one of [{}]",
-        member_words(member_path),
-        ascending.join(",")
-    )
+    value_set_message(&member_words(member_path), &ascending)
 }
 
 /// The member a task listing names the desired status it filters on, as the words a
@@ -1425,6 +1472,10 @@ pub fn service_linked_role_arn() -> String {
     ::engine::emulator_arn("iam", "", SERVICE_LINKED_ROLE_RESOURCE)
 }
 
+/// The ARN resource type a service revision is named under, as the resource segment of
+/// [`service_revision_arn`].
+pub const SERVICE_REVISION_RESOURCE_TYPE: &str = "service-revision";
+
 /// The ARN of a service revision:
 /// `arn:aws:ecs:<region>:<account>:service-revision/<cluster>/<service>/<id>`.
 pub fn service_revision_arn(
@@ -1436,7 +1487,7 @@ pub fn service_revision_arn(
     ::engine::emulator_arn(
         ARN_NAMESPACE,
         region,
-        &format!("service-revision/{cluster_name}/{service_name}/{revision_id}"),
+        &format!("{SERVICE_REVISION_RESOURCE_TYPE}/{cluster_name}/{service_name}/{revision_id}"),
     )
 }
 
@@ -1657,19 +1708,32 @@ pub fn unresolved_task_set_failure(region: &str, reference: &str) -> Failure {
     ))
 }
 
+/// The ARN resource type a SERVICE is named under, as the resource segment of
+/// [`service_arn`] and the one [`cluster_and_service_from_reference`] reads back.
+pub const SERVICE_RESOURCE_TYPE: &str = "service";
+
 /// The CLUSTER and the service NAME a `service`/`services` entry refers to.
 ///
 /// Every such member accepts "the short name or full Amazon Resource Name (ARN)" of the
 /// service, and a service ARN carries the cluster that hosts it
 /// (`service/<cluster>/<name>`), so an ARN names the cluster as well as the service. A
 /// short name, or the old single-segment ARN form, names no cluster.
+///
+/// The ARN is read through the project's ONE parse of a caller-supplied ARN
+/// (`service_common::arn`), the same reading [`cluster_from_scoped_arn`] gives every other
+/// cluster-scoped resource, so a value that is not an ARN is the short name it is.
 pub fn cluster_and_service_from_reference(reference: &str) -> (Option<String>, String) {
-    match reference.rsplit_once(":service/") {
-        Some((_, tail)) => match tail.split_once('/') {
-            Some((cluster, name)) => (Some(cluster.to_string()), name.to_string()),
-            None => (None, tail.to_string()),
-        },
-        None => (None, reference.trim().to_string()),
+    let reference = reference.trim();
+    let Some(resource) =
+        ::service_common::arn::resource_id_of_type(reference, SERVICE_RESOURCE_TYPE)
+    else {
+        return (None, reference.to_string());
+    };
+    match resource.split_once('/') {
+        Some((cluster_name, service_name)) => {
+            (Some(cluster_name.to_string()), service_name.to_string())
+        }
+        None => (None, resource.to_string()),
     }
 }
 
@@ -2701,35 +2765,70 @@ pub fn target_group_type_refusal(
     None
 }
 
-/// Whether the Cloud Map (service discovery) service holds the namespace `reference`
-/// refers to, read from THAT service's own store through the one shared engine — so a
-/// namespace created over its API is seen here with no propagation step and no second copy
-/// of it kept in this service's state.
+/// The Cloud Map namespace each of `references` names, as the IDENTITY two references of the
+/// SAME namespace share: the id of the namespace record that service holds for it, and
+/// `None` for a reference it holds no namespace for.
 ///
 /// A Cloud Map namespace is not an Amazon ECS resource: `ServiceConnectConfiguration
 /// $namespace` is "The namespace name or full Amazon Resource Name (ARN) of the Cloud Map
-/// namespace", so what resolves one is the namespace's own store, whether or not any ECS
-/// service has joined it yet. The reference may be a name or an ARN, and the id in an ARN
-/// is what a namespace is stored under ([`namespace_key`]), so both forms are looked up.
+/// namespace", and the id an ARN ends with is a third spelling of the same thing — so what
+/// decides whether two references name ONE namespace is the record they resolve to and not
+/// the text they are written in. Read from THAT service's own store through the one shared
+/// engine, so a namespace created over its API is seen here with no propagation step: a name
+/// is matched against the namespace's own name and against the `HttpName` its instances are
+/// discovered under, and an ARN or a bare id against the id the record is held by
+/// ([`namespace_key`]).
 ///
-/// `None` when that store is unreachable (the engine is not the shared in-memory one),
-/// which a handler answers with the same modelled server error it uses for its own store
-/// being unreachable.
+/// `None` — the whole answer — when that store is unreachable (the engine is not the shared
+/// in-memory one), which a handler answers with the same modelled server error it uses for
+/// its own store being unreachable.
 ///
 /// LOCK ORDER: this takes the Cloud Map store's lock, holds no other while it does, and
 /// hands back an owned value — so it is called with NO guard of this service's store held,
 /// which is what keeps a lock cycle between the two stores unreachable.
-pub fn cloud_map_holds_namespace<Eng: Send + Sync + 'static>(
+pub fn cloud_map_namespace_ids<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    reference: &str,
-) -> Option<bool> {
+    references: impl IntoIterator<Item = String>,
+) -> Option<HashMap<String, Option<String>>> {
     let state =
         ::service_com_amazonaws_servicediscovery_route53autonaming_v20170314::state::service_state(
             engine,
         )?;
     let store = state.lock();
-    let key = namespace_key(reference);
-    Some(store.namespaces.contains_key(key) || store.namespace_by_http_name(key).is_some())
+    Some(
+        references
+            .into_iter()
+            .map(|reference| {
+                let key = namespace_key(&reference);
+                let by_id = store.namespaces.get(key).map(|held| held.id.clone());
+                let resolved = by_id.or_else(|| {
+                    store
+                        .namespaces
+                        .values()
+                        .find(|held| {
+                            held.name == key || held.http_name.as_deref() == Some(key)
+                        })
+                        .map(|held| held.id.clone())
+                });
+                (reference, resolved)
+            })
+            .collect(),
+    )
+}
+
+/// The identity a namespace reference is COMPARED by: the id
+/// [`cloud_map_namespace_ids`] resolved it to, and otherwise the reference's own key
+/// ([`namespace_key`]).
+///
+/// The fallback is what keeps two references to a namespace this emulator holds no record of
+/// — one a service stored and one a listing asks for — grouping together when they are
+/// written the same way, rather than matching nothing at all.
+pub fn namespace_identity(reference: &str, resolved: &HashMap<String, Option<String>>) -> String {
+    resolved
+        .get(reference)
+        .cloned()
+        .flatten()
+        .unwrap_or_else(|| namespace_key(reference).to_string())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

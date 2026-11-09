@@ -224,6 +224,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
+        // The values the report NAMES are the ones the agent plane accepts: the stage it
+        // reports the task at, and the state each attachment entry reports. Checked before
+        // the store is locked and before anything is resolved — a report that cannot be read
+        // at all is refused for what it says
+        // ([`crate::state::agent_report_task_status_violation`],
+        // [`crate::state::agent_report_attachment_status_violation`]).
+        if let Some(message) =
+            crate::state::agent_report_task_status_violation(input.status.as_deref())
+        {
+            return Err(invalid_parameter(message));
+        }
+        if let Some(message) = crate::state::agent_report_attachment_status_violation(
+            input
+                .attachments
+                .iter()
+                .flatten()
+                .map(|change| change.status.as_str()),
+        ) {
+            return Err(invalid_parameter(message));
+        }
+
         // The caller-sized members each container entry carries are bounded at the size
         // their own docs state — before the store is locked, and before anything is
         // stored, which is where the same members are bounded when the agent reports one
@@ -247,6 +268,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::MAX_CONTAINER_REASON_LENGTH,
                 )));
             }
+        }
+        // The report's own `managedAgents` list is caller-sized too, so it is bounded here
+        // at [`crate::state::MAX_MANAGED_AGENTS`] — before the store is locked, and before
+        // any entry is resolved — which is what keeps the work one report asks for finite.
+        // WHICH agent each entry names is the model's own question:
+        // `ManagedAgentStateChange$managedAgentName` targets the `ManagedAgentName` enum, so
+        // a name outside it never reaches this handler and no report can mint a record under
+        // a name of its own.
+        if input
+            .managed_agents
+            .as_ref()
+            .is_some_and(|agents| agents.len() > crate::state::MAX_MANAGED_AGENTS)
+        {
+            return Err(invalid_parameter(crate::state::at_most_items_message(
+                "managed agents",
+                crate::state::MAX_MANAGED_AGENTS,
+            )));
         }
 
         let mut guard = state.lock();
@@ -280,6 +318,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::TASK_NOT_FOUND_MESSAGE.to_string(),
             ));
         };
+
+        // "This action is only used by the Amazon ECS agent, and it is not intended for use
+        // outside of the agent": the agent that reports a task's state is the one running on
+        // the capacity that HOSTS it, and a Fargate task's agent is Amazon's own — nothing a
+        // caller of this API holds credentials for. Such a report cannot have come from it,
+        // so it is refused as the unauthorized call it is, before anything is recorded
+        // ([`crate::state::agent_plane_denies_report`]).
+        if crate::state::agent_plane_denies_report(task) {
+            return Err(
+                SubmitTaskStateChangeErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message: Some(
+                        crate::state::AGENT_INSTANCE_NOT_VERIFIED_MESSAGE.to_string(),
+                    ),
+                })
+                .into(),
+            );
+        }
 
         // Every nested reference the report carries is resolved BEFORE any of them is
         // recorded, so a report carrying one unknown reference stores nothing: it is

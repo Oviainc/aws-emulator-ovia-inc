@@ -20,6 +20,10 @@
 //!   attachment id no stored attachment of that cluster carries is refused with
 //!   `InvalidParameterException` naming THAT id, and a report that resolves whole is
 //!   recorded and acknowledged.
+//! * The state a report may NAME is `ATTACHED` alone — Amazon ECS takes the interface as far
+//!   as `ATTACHING` itself, so the attach the agent completed is the one state change it
+//!   sends — and every other value is refused with the out-of-set sentence
+//!   (`attachmentStatus should be one of [ATTACHED]`).
 //! * The id is the one the reference names whichever form it takes — a full attachment ARN
 //!   or the bare id — because both name the same attachment.
 //! * The report is all or nothing: a batch carrying one unknown attachment records none of
@@ -276,22 +280,28 @@ async fn an_interface_reports_the_subnet_its_launch_configured() {
 }
 
 #[tokio::test]
-async fn the_agent_report_records_the_state_it_names_and_is_acknowledged() {
-    // The rows span the statuses `Attachment$status` documents ("Valid values are
-    // PRECREATED, CREATED, ATTACHING, ATTACHED, DETACHING, DETACHED, DELETED, and
-    // FAILED") and the two forms the reference takes, so the recorded status is asserted
-    // to be the one the report named and the resolution to be insensitive to the form.
-    let statuses = [
-        "CREATED",
-        "ATTACHING",
-        "ATTACHED",
-        "DETACHING",
-        "DETACHED",
-        "DELETED",
-        "FAILED",
+async fn a_report_records_the_attach_it_acknowledges_and_refuses_every_other_state() {
+    // `AttachmentStateChange$status` is an unconstrained string in the model, and the state
+    // the agent plane accepts in a report is `ATTACHED` alone: Amazon ECS creates the
+    // interface and takes it as far as `ATTACHING` itself, so the attach the agent completed
+    // is the one state change it sends. The rows span the other states `Attachment$status`
+    // documents ("Valid values are PRECREATED, CREATED, ATTACHING, ATTACHED, DETACHING,
+    // DETACHED, DELETED, and FAILED") plus a value that set does not name at all, and the
+    // two forms the reference takes — the accepted state is recorded, every other is refused
+    // and records nothing.
+    let rows: [(&str, bool); 9] = [
+        ("ATTACHED", true),
+        ("PRECREATED", false),
+        ("CREATED", false),
+        ("ATTACHING", false),
+        ("DETACHING", false),
+        ("DETACHED", false),
+        ("DELETED", false),
+        ("FAILED", false),
+        ("NOT_A_STATUS", false),
     ];
 
-    for status in statuses {
+    for (status, accepted) in rows {
         for form in ["the full ARN", "the bare id"] {
             let case = &format!("{status} by {form}");
             let (router, task_arn, id) = fixture_with_an_attachment(case).await;
@@ -300,14 +310,47 @@ async fn the_agent_report_records_the_state_it_names_and_is_acknowledged() {
             } else {
                 id.clone()
             };
+            let request = json!({
+                "cluster": CLUSTER,
+                "attachments": [{ "attachmentArn": reference, "status": status }],
+            });
+
+            // The state the attachment holds before the report, so a refused report can be
+            // asserted to have changed nothing.
+            let before = string(
+                &only_attachment(&describe_task(&router, CLUSTER, &task_arn, case).await, case),
+                "status",
+                case,
+            );
+
+            if !accepted {
+                let (code, message) =
+                    refusal(&router, "SubmitAttachmentStateChanges", request, case).await;
+                assert_eq!(
+                    (code.as_str(), message.as_str()),
+                    (
+                        "InvalidParameterException",
+                        "attachmentStatus should be one of [ATTACHED]"
+                    ),
+                    "case {case:?}: expected the out-of-set refusal, got {code} with \
+                     {message:?}"
+                );
+                let attachment = only_attachment(
+                    &describe_task(&router, CLUSTER, &task_arn, case).await,
+                    case,
+                );
+                assert_eq!(
+                    attachment["status"].as_str(),
+                    Some(before.as_str()),
+                    "case {case:?}: a refused report must record nothing, got {attachment}"
+                );
+                continue;
+            }
 
             let acknowledged = ok(
                 &router,
                 "SubmitAttachmentStateChanges",
-                json!({
-                    "cluster": CLUSTER,
-                    "attachments": [{ "attachmentArn": reference, "status": status }],
-                }),
+                request,
                 case,
             )
             .await;

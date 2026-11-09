@@ -147,7 +147,6 @@ async fn a_capacity_provider_the_account_holds_none_of_is_refused_and_stores_no_
         "setup",
     )
     .await;
-
     // The rows differ along how the strategy spells the provider (a short name, an ARN),
     // how many entries it carries, and whether the provider is one nothing created, one
     // Amazon ECS publishes for every account (`FARGATE`, `FARGATE_SPOT`), one this account

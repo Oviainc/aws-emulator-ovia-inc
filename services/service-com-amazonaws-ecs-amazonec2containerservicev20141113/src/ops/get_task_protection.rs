@@ -211,6 +211,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The cluster is resolved first, and then every entry has to be INSIDE it: a task
+        // ARN carries the cluster that holds the task (`task/<cluster>/<id>`), so an entry
+        // naming another cluster than the request's `cluster` names two scopes at once —
+        // and so names no task at all. That is a bad parameter rather than a task that
+        // could not be found ([`crate::state::cluster_from_scoped_arn`]), the same way the
+        // write side of task protection reads these entries.
+        if crate::state::foreign_cluster_reference(
+            references.iter().map(String::as_str),
+            crate::state::TASK_RESOURCE_TYPE,
+            &cluster_name,
+        )
+        .is_some()
+        {
+            return Err(GetTaskProtectionErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        crate::state::CLUSTER_IDENTIFIERS_MISMATCH_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
         // A request that names no task asks about the whole cluster, so every task of it
         // a protection call may act on is reported; one that names tasks is answered
         // entry by entry, and the same id repeated names one task.

@@ -22,13 +22,14 @@
 //!   runs it — the instant it starts there.
 //! * `SubmitAttachmentStateChanges` is "sent to acknowledge that an attachment changed
 //!   states", so the agent's word is what the record holds, and an agent that reports the
-//!   interface in place connects the task at that instant; Amazon ECS carries the
-//!   progression on from wherever the report left it.
+//!   interface in place connects the task at that instant. The state a report may name is
+//!   `ATTACHED` alone — Amazon ECS takes the interface as far as `ATTACHING` itself — and a
+//!   report naming any other state is refused and leaves the progression to the clock.
 //!
 //! The rows differ along which launch path placed the task (`RunTask`, `StartTask`, a
 //! service's own scheduler), along the network mode (every value of the model's
-//! `NetworkMode` enum), and along the status the agent reports (every value
-//! `Attachment$status` lists).
+//! `NetworkMode` enum), and along the status the report names (the one it accepts, and every
+//! other value `Attachment$status` lists).
 //!
 //! Nothing here reaches into the state struct: every value asserted is read back through
 //! `DescribeTasks`, so a response that is not computed from persisted state cannot pass.
@@ -39,7 +40,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    awsvpc_network_configuration, cluster_with_capacity, create_cluster, list, ok,
+    awsvpc_network_configuration, cluster_with_capacity, create_cluster, list, ok, refusal,
     register_capacity, service, string, AWSVPC_START,
 };
 use crate::task_lifecycle::container;
@@ -126,11 +127,6 @@ fn detail(attachment: &Value, name: &str) -> Option<String> {
         .iter()
         .find(|entry| entry["name"].as_str() == Some(name))
         .and_then(|entry| entry["value"].as_str().map(str::to_string))
-}
-
-/// Which of `order` `status` is, or `None` for a status that order does not name.
-fn rank(order: &[&str], status: &str) -> Option<usize> {
-    order.iter().position(|named| *named == status)
 }
 
 /// Append `status` to `seen` when it is not the one already at the end of it: the ordered
@@ -428,8 +424,10 @@ async fn a_task_that_was_allocated_no_interface_is_connected_once_it_runs() {
 async fn an_agent_report_moves_the_interface_and_amazon_ecs_carries_on_from_there() {
     // The rows span every status `Attachment$status` documents ("Valid values are
     // PRECREATED, CREATED, ATTACHING, ATTACHED, DETACHING, DETACHED, DELETED, and
-    // FAILED"): the record holds the status the agent reported, and the task is CONNECTED
-    // exactly when that status says its interface is in place.
+    // FAILED"). The agent plane accepts ONE of them in a report — `ATTACHED`, the attach the
+    // agent completed — so that row is taken and connects the task, and every other row is
+    // refused with the out-of-set sentence and leaves the interface where Amazon ECS's own
+    // progression had it, for the clock to carry on.
     let statuses = [
         "PRECREATED",
         "CREATED",
@@ -452,65 +450,77 @@ async fn an_agent_report_moves_the_interface_and_amazon_ecs_carries_on_from_ther
         let family = format!("agentattach{index}");
         register(&router, &family, "awsvpc", case).await;
         let task_arn = launch(&router, Launch::RunTask, &family, case).await;
-        let attachment_id = string(
-            &only_attachment(&describe(&router, &task_arn, case).await, case),
-            "id",
-            case,
-        );
+        let created = only_attachment(&describe(&router, &task_arn, case).await, case);
+        let attachment_id = string(&created, "id", case);
+        let status_before = string(&created, "status", case);
 
-        let acknowledged = ok(
-            &router,
-            "SubmitAttachmentStateChanges",
-            json!({
-                "cluster": CLUSTER,
-                "attachments": [{ "attachmentArn": attachment_id, "status": reported }],
-            }),
-            case,
-        )
-        .await;
-        assert_eq!(
-            acknowledged["acknowledgment"].as_str(),
-            Some("ACK"),
-            "case {case:?}: the agent is told the report was taken, got {acknowledged}"
-        );
+        let request = json!({
+            "cluster": CLUSTER,
+            "attachments": [{ "attachmentArn": attachment_id, "status": reported }],
+        });
+        if reported == "ATTACHED" {
+            let acknowledged = ok(
+                &router,
+                "SubmitAttachmentStateChanges",
+                request,
+                case,
+            )
+            .await;
+            assert_eq!(
+                acknowledged["acknowledgment"].as_str(),
+                Some("ACK"),
+                "case {case:?}: the agent is told the report was taken, got {acknowledged}"
+            );
+        } else {
+            let (code, message) =
+                refusal(&router, "SubmitAttachmentStateChanges", request, case).await;
+            assert_eq!(
+                (code.as_str(), message.as_str()),
+                (
+                    "InvalidParameterException",
+                    "attachmentStatus should be one of [ATTACHED]"
+                ),
+                "case {case:?}: expected the out-of-set refusal, got {code} with {message:?}"
+            );
+        }
 
         let read = describe(&router, &task_arn, case).await;
         let attachment = only_attachment(&read, case);
+        let expected_now = if reported == "ATTACHED" {
+            "ATTACHED"
+        } else {
+            status_before.as_str()
+        };
         assert_eq!(
             attachment["status"].as_str(),
-            Some(reported),
-            "case {case:?}: the record holds the status the agent reported, got {attachment}"
+            Some(expected_now),
+            "case {case:?}: expected the interface at {expected_now:?} after the report, got \
+             {attachment}"
         );
         assert_eq!(
             read["connectivity"].as_str(),
-            (reported == "ATTACHED").then_some(CONNECTED),
-            "case {case:?}: a task is CONNECTED exactly when the agent has reported its \
-             interface in place, got {read}"
+            (expected_now == "ATTACHED").then_some(CONNECTED),
+            "case {case:?}: a task is CONNECTED exactly when its interface is in place, got \
+             {read}"
         );
         reported_rows.push((case, router, task_arn));
     }
 
-    // And Amazon ECS carries the progression on from wherever the report left it: a
-    // status its own progression passes through is taken onward to ATTACHED, and one it
-    // does not is the agent's last word on the attachment.
+    // And Amazon ECS carries the progression on from wherever it is: every interface it is
+    // still attaching reaches ATTACHED, whether the agent's report was taken or refused.
     tokio::time::sleep(POLL_BUDGET).await;
     for (case, router, task_arn) in &reported_rows {
         let settled = describe(router, task_arn, case).await;
         let attachment = only_attachment(&settled, case);
-        let expected = if rank(&ATTACH_STATUSES, case).is_some() {
-            "ATTACHED"
-        } else {
-            case
-        };
         assert_eq!(
             attachment["status"].as_str(),
-            Some(expected),
-            "case {case:?}: expected the interface at {expected:?} once the clock had run, \
-             got {attachment}"
+            Some("ATTACHED"),
+            "case {case:?}: expected the interface ATTACHED once the clock had run, got \
+             {attachment}"
         );
         assert_eq!(
             settled["connectivity"].as_str(),
-            (expected == "ATTACHED").then_some(CONNECTED),
+            Some(CONNECTED),
             "case {case:?}: connectivity follows the interface the task holds, got {settled}"
         );
     }

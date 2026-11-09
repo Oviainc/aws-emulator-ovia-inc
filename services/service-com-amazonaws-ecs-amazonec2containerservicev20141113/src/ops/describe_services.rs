@@ -211,24 +211,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name repeated names the same service, so it is one answer, not one per entry.
         let mut seen = ::std::collections::HashSet::new();
         for reference in &input.services {
-            // A service ARN carries the cluster that hosts it. An entry naming another
-            // cluster names nothing in the cluster being described, which is a MISSING
-            // failure rather than a refusal.
+            // A service ARN carries the cluster that hosts it, so an ARN names the cluster
+            // too, while `cluster` is what names it otherwise. Naming two different
+            // clusters in one entry names no service at all, which is the bad parameter it
+            // is rather than a `MISSING` failure — the refusal `DeleteService` and
+            // `UpdateService` answer a cross-cluster `service` reference with
+            // ([`crate::state::SERVICE_NOT_WITHIN_CLUSTER_MESSAGE`]).
             let (arn_cluster, name) = crate::state::cluster_and_service_from_reference(reference);
+            if let Some(from_arn) = arn_cluster.as_deref() {
+                if from_arn != cluster_name {
+                    return Err(DescribeServicesErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                crate::state::SERVICE_NOT_WITHIN_CLUSTER_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            }
             if !seen.insert(name.clone()) {
                 continue;
             }
-            let entry_cluster = arn_cluster.unwrap_or_else(|| cluster_name.clone());
-            let found = if entry_cluster == cluster_name {
-                guard.services.get(&(cluster_name.clone(), name.clone()))
-            } else {
-                None
-            };
-            match found {
+            match guard.services.get(&(cluster_name.clone(), name.clone())) {
                 Some(service) => services.push(guard.service_view(service, fields)),
                 None => failures.push(crate::state::missing_failure(&crate::state::service_arn(
                     &region,
-                    &entry_cluster,
+                    &cluster_name,
                     &name,
                 ))),
             }

@@ -234,31 +234,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "A capacity provider must be associated with the cluster to be used in a
         // capacity provider strategy" — and this call is what associates them, so the
-        // strategy may only name providers this same request associates. Membership is
-        // probed through a set, so the check costs one pass over each list rather than
-        // one pass per entry.
+        // strategy may only name providers this same request associates
+        // ([`crate::state::unassociated_default_strategy`]).
+        if let Some(message) = crate::state::unassociated_default_strategy(
+            &input.capacity_providers,
+            &input.default_capacity_provider_strategy,
+        ) {
+            return Err(
+                PutClusterCapacityProvidersErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Membership of the association is probed through a set below as well, so the
+        // disassociation check costs one pass over each list rather than one per entry.
         let associated: ::std::collections::HashSet<&str> = input
             .capacity_providers
             .iter()
             .map(String::as_str)
             .collect();
-        for item in &input.default_capacity_provider_strategy {
-            if !associated.contains(item.capacity_provider.as_str()) {
-                return Err(
-                    PutClusterCapacityProvidersErrorModeled::InvalidParameterException(
-                        InvalidParameterException {
-                            message: Some(format!(
-                                "defaultCapacityProviderStrategy names capacity provider \
-                                 {:?}, which is not among the capacityProviders associated \
-                                 with the cluster",
-                                item.capacity_provider
-                            )),
-                        },
-                    )
-                    .into(),
-                );
-            }
-        }
 
         // `CapacityProviderStrategyItem$base`: "Only one capacity provider in a capacity
         // provider strategy can have a base defined." `base` is a non-boxed integer whose

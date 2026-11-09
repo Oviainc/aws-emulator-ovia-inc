@@ -494,6 +494,10 @@ struct FailureRow {
 async fn an_arn_that_names_no_stored_deployment_is_a_missing_failure() {    let router = service();
     let case = "setup";
     cluster_with_capacity(&router, CLUSTER, case).await;
+    // A second cluster that holds no service, so a row can name a deployment of a cluster
+    // that EXISTS and does not hold it — which is the `MISSING` failure. An ARN under a
+    // cluster this account holds no record of is refused instead, asserted below.
+    cluster_with_capacity(&router, "elsewhere", case).await;
     register_definition(&router, "demofamily", case).await;
     let created = create_service(&router, "web", "demofamily:1", 1, None, case).await;
     let stored = string(&created, "currentServiceDeployment", case);
@@ -585,6 +589,25 @@ async fn an_arn_that_names_no_stored_deployment_is_a_missing_failure() {    let 
             row.described
         );
     }
+
+    // "The specified cluster wasn't found": a service-deployment ARN names the cluster
+    // whose service the rollout belongs to, so an ARN under a cluster this account holds no
+    // record of leaves this read nothing to report on at all.
+    let case = "an ARN under a cluster that was never created";
+    let (code, message) = refusal(
+        &router,
+        "DescribeServiceDeployments",
+        json!({
+            "serviceDeploymentArns": [deployment_arn("never-created", "web", &stored_id)],
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        ("ClusterNotFoundException", "Cluster not found."),
+        "case {case:?}: unexpected refusal {code} / {message}"
+    );
 
     // "You can specify a maximum of 20 ARNs": one past the bound is refused, and nothing
     // of the batch is answered.

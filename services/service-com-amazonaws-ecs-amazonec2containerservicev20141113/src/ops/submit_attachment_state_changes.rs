@@ -180,6 +180,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
         let now = ::std::time::SystemTime::now();
 
+        // The state each entry reports is one the agent plane accepts: Amazon ECS takes the
+        // interface as far as `ATTACHING` itself, and the attach the agent completed is the
+        // one state change it sends
+        // ([`crate::state::agent_report_attachment_status_violation`]). Checked before the
+        // store is locked and before anything is resolved.
+        if let Some(message) = crate::state::agent_report_attachment_status_violation(
+            input.attachments.iter().map(|change| change.status.as_str()),
+        ) {
+            return Err(
+                SubmitAttachmentStateChangesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -220,6 +238,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             };
             resolved.push((task_arn, attachment_id, change.status.clone()));
+        }
+
+        // "This action is only used by the Amazon ECS agent, and it is not intended for use
+        // outside of the agent": the agent that reports an attachment's state is the one
+        // running on the capacity that HOSTS the task the attachment belongs to, and a
+        // Fargate task's agent is Amazon's own — nothing a caller of this API holds
+        // credentials for. Such a report cannot have come from it, so it is refused before
+        // anything is recorded, the same gate the other agent reports are held to
+        // ([`crate::state::agent_plane_denies_report`]).
+        if resolved.iter().any(|(task_arn, _, _)| {
+            guard
+                .tasks
+                .get(task_arn)
+                .is_some_and(crate::state::agent_plane_denies_report)
+        }) {
+            return Err(
+                SubmitAttachmentStateChangesErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(
+                            crate::state::AGENT_INSTANCE_NOT_VERIFIED_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
         }
 
         for (task_arn, attachment_id, status) in resolved {

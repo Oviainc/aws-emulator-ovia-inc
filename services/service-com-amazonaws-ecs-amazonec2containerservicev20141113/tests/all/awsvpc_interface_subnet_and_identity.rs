@@ -489,20 +489,22 @@ async fn an_awsvpc_interface_sits_in_a_configured_subnet_and_keeps_its_own_ident
 
 #[tokio::test]
 async fn an_agent_report_moves_the_status_and_leaves_the_interface_identity_alone() {
-    // The rows span statuses from every part of `Attachment$status`'s own list ("Valid
-    // values are PRECREATED, CREATED, ATTACHING, ATTACHED, DETACHING, DETACHED, DELETED,
-    // and FAILED"): one on the progression Amazon ECS takes an interface through, one past
-    // the end of it, and one that ends it. Whichever the agent reports, the interface it
-    // reports on keeps the id, the MAC address and the address it was created with — those
-    // belong to the interface, not to the state of its attachment.
-    let reported_statuses = ["CREATED", "ATTACHED", "DETACHED", "FAILED"];
+    // The agent plane accepts one state in a report — `ATTACHED`, the attach the agent
+    // completed — so the rows differ along the LAUNCH the reported-on interface came from
+    // rather than along the state reported: each row runs its own family into its own pair
+    // of subnets, and whichever interface the agent reports on keeps the id, the MAC address
+    // and the address it was created with, because those belong to the interface and not to
+    // the state of its attachment.
+    const REPORTED: &str = "ATTACHED";
+    const LAUNCHES: usize = 4;
 
     let router = service();
     create_cluster(&router, CLUSTER, "setup").await;
     register_capacity(&router, CLUSTER, "setup").await;
 
-    for (index, reported) in reported_statuses.into_iter().enumerate() {
-        let case = reported;
+    for index in 0..LAUNCHES {
+        let case = &format!("{REPORTED} of launch {index}");
+        let case = case.as_str();
         let family = format!("ifaceack{index}");
         register(&router, &family, case).await;
         let subnets = subnet_ids(0x100 + index as u64 * 0x10, 2);
@@ -530,7 +532,7 @@ async fn an_agent_report_moves_the_status_and_leaves_the_interface_identity_alon
             "SubmitAttachmentStateChanges",
             json!({
                 "cluster": CLUSTER,
-                "attachments": [{ "attachmentArn": attachment_id, "status": reported }],
+                "attachments": [{ "attachmentArn": attachment_id, "status": REPORTED }],
             }),
             case,
         )
@@ -539,7 +541,7 @@ async fn an_agent_report_moves_the_status_and_leaves_the_interface_identity_alon
         let acknowledged = only_attachment(&describe(&router, &task_arn, case).await, case);
         assert_eq!(
             acknowledged["status"].as_str(),
-            Some(reported),
+            Some(REPORTED),
             "case {case:?}: the record holds the status the agent reported, got \
              {acknowledged}"
         );

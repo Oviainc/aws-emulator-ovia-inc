@@ -373,16 +373,6 @@ async fn a_task_protection_failure_names_the_identifier_the_request_sent() {
             expected_reason: MISSING,
         },
         FailureRow {
-            case: "a task ARN of another cluster of this endpoint",
-            reference: format!(
-                "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/elsewhere/{TASK_ID}"
-            ),
-            expected_arn: format!(
-                "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/elsewhere/{TASK_ID}"
-            ),
-            expected_reason: MISSING,
-        },
-        FailureRow {
             case: "a standalone task this cluster holds",
             reference: running.clone(),
             expected_arn: running.clone(),
@@ -419,5 +409,26 @@ async fn a_task_protection_failure_names_the_identifier_the_request_sent() {
                 "case {case:?}: a task the call cannot act on protects nothing, got {body}"
             );
         }
+    }
+
+    // A task ARN names the cluster that holds the task, so an entry naming ANOTHER cluster
+    // than the request's `cluster` is not a failure of that entry: it names two scopes at
+    // once, which is no task at all, and the call is refused.
+    let elsewhere = format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/elsewhere/{TASK_ID}");
+    for operation in ["GetTaskProtection", "UpdateTaskProtection"] {
+        let case = format!("{operation}: a task ARN of another cluster of this endpoint");
+        let mut request = json!({ "cluster": CLUSTER, "tasks": [elsewhere.clone()] });
+        if operation == "UpdateTaskProtection" {
+            request["protectionEnabled"] = json!(true);
+        }
+        let (code, message) = refusal(&router, operation, request, &case).await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (
+                "InvalidParameterException",
+                "Invalid identifier: cluster identifiers mismatch"
+            ),
+            "case {case:?}: expected the cross-cluster refusal, got {code} with {message:?}"
+        );
     }
 }

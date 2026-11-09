@@ -183,6 +183,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
+        // A service-deployment ARN carries the cluster whose service the rollout belongs to
+        // (`service-deployment/<cluster>/<service>/<id>`), so this read resolves that
+        // cluster before it reports on anything — exactly as every operation that takes a
+        // `cluster` member does. A cluster this account holds no record of leaves the read
+        // nothing to answer about, which is the condition `ClusterNotFoundException` states;
+        // an ARN under a cluster that IS there and names no stored rollout is the `MISSING`
+        // failure below ([`crate::state::names_a_missing_cluster`]).
+        if guard.names_a_missing_cluster(
+            input.service_deployment_arns.iter().map(String::as_str),
+            crate::state::SERVICE_DEPLOYMENT_RESOURCE_TYPE,
+        ) {
+            return Err(
+                DescribeServiceDeploymentsErrorModeled::ClusterNotFoundException(
+                    ClusterNotFoundException {
+                        message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let mut service_deployments = Vec::new();
         let mut failures = Vec::new();
         // A deployment is reported once however many times the request names it: the same

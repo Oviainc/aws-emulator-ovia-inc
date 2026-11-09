@@ -184,6 +184,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
+        // A service-revision ARN carries the cluster whose service the revision belongs to
+        // (`service-revision/<cluster>/<service>/<id>`), so this read resolves that cluster
+        // before it reports on anything, exactly as its sibling `DescribeServiceDeployments`
+        // does: a cluster this account holds no record of leaves the read nothing to answer
+        // about, which is the condition `ClusterNotFoundException` states, while an ARN
+        // under a cluster that IS there and names no stored revision is the `MISSING`
+        // failure below ([`crate::state::names_a_missing_cluster`]).
+        if guard.names_a_missing_cluster(
+            input.service_revision_arns.iter().map(String::as_str),
+            crate::state::SERVICE_REVISION_RESOURCE_TYPE,
+        ) {
+            return Err(
+                DescribeServiceRevisionsErrorModeled::ClusterNotFoundException(
+                    ClusterNotFoundException {
+                        message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let mut service_revisions = Vec::new();
         let mut failures = Vec::new();
         // A revision is reported once however many times the request names it: the same

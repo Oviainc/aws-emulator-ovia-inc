@@ -300,6 +300,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A `capacityProviders` list associates providers with the cluster as it is
+        // created, so its `defaultCapacityProviderStrategy` may only name providers the
+        // same call associates — the rule a later association is held to
+        // ([`crate::state::unassociated_default_strategy`]).
+        if let Some(message) = crate::state::unassociated_default_strategy(
+            input.capacity_providers.as_deref().unwrap_or_default(),
+            input
+                .default_capacity_provider_strategy
+                .as_deref()
+                .unwrap_or_default(),
+        ) {
+            return Err(CreateClusterErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 

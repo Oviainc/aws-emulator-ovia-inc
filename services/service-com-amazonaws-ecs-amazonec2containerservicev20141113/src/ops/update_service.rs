@@ -410,10 +410,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(UpdateServiceErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!(
-                            "the service ARN names cluster {from_arn:?} but cluster \
-                             {requested:?} was requested"
-                        )),
+                        message: Some(
+                            crate::state::SERVICE_NOT_WITHIN_CLUSTER_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());

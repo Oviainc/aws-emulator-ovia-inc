@@ -261,6 +261,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The cluster is resolved first, and then every entry has to be INSIDE it: a task
+        // ARN carries the cluster that holds the task
+        // (`task/<cluster>/<id>`), so an entry naming another cluster than the request's
+        // `cluster` names two scopes at once — and so names no task at all. That is a bad
+        // parameter rather than a task that could not be found
+        // ([`crate::state::cluster_from_scoped_arn`]), so the call is refused whole and
+        // nothing is protected.
+        if crate::state::foreign_cluster_reference(
+            input.tasks.iter().map(String::as_str),
+            crate::state::TASK_RESOURCE_TYPE,
+            &cluster_name,
+        )
+        .is_some()
+        {
+            return Err(UpdateTaskProtectionErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        crate::state::CLUSTER_IDENTIFIERS_MISMATCH_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
         // "Specify true to mark a task for protection and false to unset protection":
         // protecting a task records when the protection expires, and unsetting it takes
         // the expiry off — the one place `protectionEnabled` is read from.

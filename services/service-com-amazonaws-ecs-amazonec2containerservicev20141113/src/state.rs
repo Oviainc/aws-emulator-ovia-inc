@@ -163,6 +163,16 @@ pub use vpc_resolution::*;
 mod service_discovery;
 pub use service_discovery::*;
 
+/// The SCOPE a request's references have to be inside: the cluster an ARN of a
+/// cluster-scoped resource carries, and what the call that sets a cluster's capacity-provider
+/// association may leave behind.
+mod resource_scoping;
+pub use resource_scoping::*;
+
+/// What a `Submit*StateChange` report may say, and whose report it can be.
+mod agent_plane;
+pub use agent_plane::*;
+
 pub use request_arn::{
     foreign_arn_segment, is_cluster_arn, names_another_account, names_another_region,
     request_arn_resource_violation, request_arn_violation, ForeignArnSegment,
@@ -2199,6 +2209,17 @@ pub const MAX_NETWORK_BINDINGS: usize = 100;
 /// max characters) human-readable string to provide additional details about a running or
 /// stopped container."
 pub const MAX_CONTAINER_REASON_LENGTH: usize = 255;
+
+/// How many MANAGED AGENT entries one agent report may carry, and so the most a container
+/// could hold.
+///
+/// A managed agent is one Amazon ECS runs inside the container for a feature the task asked
+/// for, and `ManagedAgentStateChange$managedAgentName` targets the model's `ManagedAgentName`
+/// enum — so a report can only ever name an agent that enum lists, and the record for one is
+/// minted once. This bounds the caller-sized LIST itself, which is the work a single report
+/// can ask for: EMULATOR-CHOSEN, for the same reason as [`MAX_TASKS`], and a few times the
+/// one agent the model names.
+pub const MAX_MANAGED_AGENTS: usize = 8;
 
 /// `InvalidParameterException$message` for a `desiredCount` below the zero its own doc
 /// bounds it at ("The desired number of instantiations of the task definition to keep
