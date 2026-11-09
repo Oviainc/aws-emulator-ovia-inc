@@ -858,6 +858,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // mounting is the one the stored `AuthType` names, so a URL restricted to
         // authenticated callers is served only to a request the emulator verified a
         // signature for (see [`function_url`]).
+        //
+        // Every such request is NAMED, including a CORS preflight the addressed URL's own
+        // configuration answers: naming it is what keeps the front door's own checks in
+        // front of this plane — the refusal of a request whose browser-set headers say a
+        // browser sent it from another site, and the signature verification of an `AWS_IAM`
+        // URL — so nothing this service serves steps around them.
         if let Some(target) = self.function_urls_anonymous.target(req) {
             return Some(
                 if self.function_urls_aws_iam.serves_auth_type(&target.auth_type) {

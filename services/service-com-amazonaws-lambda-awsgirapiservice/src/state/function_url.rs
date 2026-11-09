@@ -209,6 +209,11 @@ pub struct FunctionUrlTarget {
     pub auth_type: String,
     /// The `InvokeMode` the URL serves in, as stored.
     pub invoke_mode: String,
+    /// The `Cors` settings the URL was configured with, as stored, and absent when it was
+    /// configured with none — which is what decides whether this endpoint answers a
+    /// browser's preflight itself or hands it to the function
+    /// ([`crate::service::function_url`]).
+    pub cors: Option<Cors>,
     /// The path within the URL, which is the `rawPath` of the request the handler is given.
     pub request_path: String,
     /// The region the ADDRESS named, for the addressings that carry one.
@@ -236,6 +241,7 @@ pub fn held_function_url(
                 qualifier: qualifier.clone(),
                 auth_type: config.auth_type.clone(),
                 invoke_mode: config.invoke_mode.clone(),
+                cors: config.cors.clone(),
                 request_path: normalized_path(addressed.request_path),
                 addressed_region: addressed.region.map(str::to_string),
             })

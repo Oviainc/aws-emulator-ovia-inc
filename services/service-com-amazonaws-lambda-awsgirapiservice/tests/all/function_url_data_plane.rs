@@ -63,15 +63,15 @@ const SLACK: Duration = Duration::from_millis(200);
 const ACCOUNT: &str = "000000000000";
 
 /// What a dispatched request answered.
-struct Answer {
-    status: u16,
-    headers: http::HeaderMap,
-    body: bytes::Bytes,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) body: bytes::Bytes,
 }
 
 impl Answer {
     /// The body as JSON, or `Value::Null` for an empty body.
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         if self.body.is_empty() {
             return Value::Null;
         }
@@ -80,11 +80,11 @@ impl Answer {
         })
     }
 
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
-    fn header(&self, name: &str) -> Option<String> {
+    pub(crate) fn header(&self, name: &str) -> Option<String> {
         self.headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -102,13 +102,13 @@ impl Answer {
     }
 
     /// The status and the body, for a failure message.
-    fn summary(&self) -> String {
+    pub(crate) fn summary(&self) -> String {
         format!("{} {}", self.status, self.text())
     }
 }
 
 /// One service mounted on its own engine, reached the way the production router reaches it.
-fn router_on(engine: &std::sync::Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn router_on(engine: &std::sync::Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(std::sync::Arc::clone(engine)));
@@ -116,7 +116,7 @@ fn router_on(engine: &std::sync::Arc<engine::InMemoryEngine>) -> MultiServiceRou
 }
 
 /// Dispatch one request to `host`, with the headers `headers` names.
-async fn send(
+pub(crate) async fn send(
     router: &MultiServiceRouter,
     method: &str,
     host: &str,
@@ -144,7 +144,12 @@ async fn send(
 }
 
 /// One CONTROL-plane call, signed the way the harness signs them.
-async fn control(router: &MultiServiceRouter, method: &str, uri: &str, body: &Value) -> Answer {
+pub(crate) async fn control(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: &Value,
+) -> Answer {
     let payload = if body.is_null() {
         Vec::new()
     } else {
@@ -165,7 +170,7 @@ async fn control(router: &MultiServiceRouter, method: &str, uri: &str, body: &Va
 }
 
 /// Create a function whose package RUNS `source`, and wait out the provisioning window.
-async fn given_function(router: &MultiServiceRouter, name: &str, source: &str) {
+pub(crate) async fn given_function(router: &MultiServiceRouter, name: &str, source: &str) {
     let created = control(
         router,
         "POST",
@@ -223,7 +228,7 @@ async fn given_url(
 }
 
 /// `AddPermission` on the function `function` names, at `qualifier`.
-async fn grant(
+pub(crate) async fn grant(
     router: &MultiServiceRouter,
     function: &str,
     qualifier: Option<&str>,
@@ -245,19 +250,35 @@ async fn grant(
     );
 }
 
-/// `CreateFunctionUrlConfig` alone, granting nothing.
+/// `CreateFunctionUrlConfig` alone, granting nothing and configuring no CORS.
 async fn given_url_without_grant(
     router: &MultiServiceRouter,
     function: &str,
     qualifier: Option<&str>,
     auth_type: &str,
 ) -> Endpoint {
+    given_configured_url(router, function, qualifier, auth_type, &Value::Null).await
+}
+
+/// `CreateFunctionUrlConfig` alone, with the `Cors` settings `cors` names — absent for
+/// `Value::Null`, which is a URL configured with none.
+pub(crate) async fn given_configured_url(
+    router: &MultiServiceRouter,
+    function: &str,
+    qualifier: Option<&str>,
+    auth_type: &str,
+    cors: &Value,
+) -> Endpoint {
     let query = qualifier.map_or_else(String::new, |value| format!("?Qualifier={value}"));
+    let mut body = json!({ "AuthType": auth_type });
+    if !cors.is_null() {
+        body["Cors"] = cors.clone();
+    }
     let created = control(
         router,
         "POST",
         &format!("/2021-10-31/functions/{function}/url{query}"),
-        &json!({ "AuthType": auth_type }),
+        &body,
     )
     .await;
     assert_eq!(
@@ -286,11 +307,11 @@ async fn given_url_without_grant(
 }
 
 /// The endpoint one function URL publishes.
-struct Endpoint {
+pub(crate) struct Endpoint {
     /// The host the URL is addressed at.
-    host: String,
+    pub(crate) host: String,
     /// The url id that host's first label carries.
-    url_id: String,
+    pub(crate) url_id: String,
 }
 
 /// One request to the function URL, addressed HOST-STYLE the way AWS publishes it.

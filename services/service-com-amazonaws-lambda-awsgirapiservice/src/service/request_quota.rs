@@ -25,6 +25,16 @@
 //! operation with no row has no body quota this emulator knows of and is never refused
 //! here.
 //!
+//! # What this emulator can and cannot refuse here
+//!
+//! The refusal is the SERVICE's, so it is answered to every request that reaches this
+//! service: an in-process caller's (another emulated service calling this one over the
+//! callback) as much as a client's. A request far larger than that is not this layer's to
+//! answer at all — the core buffers at most a fixed number of bytes of a request body on the
+//! production serve path and answers a status-only `413` before any service is handed the
+//! request — so the operations whose published quota is above that cap are refused by the
+//! core, with no error code, however this table is written.
+//!
 //! # Why it is stated here
 //!
 //! The check is on the request's BODY, before it is read as that operation's input: a body
@@ -85,6 +95,32 @@ const BODY_QUOTAS: &[BodyQuota] = &[
     BodyQuota {
         operation: "AddPermission",
         max_bytes: 5_120,
+    },
+    // The operations that carry an ARCHIVE INLINE — a deployment package
+    // (`FunctionCode$ZipFile` on a create, `UpdateFunctionCodeRequest$ZipFile` on an update)
+    // or a layer archive (`LayerVersionContentInput$ZipFile`) — each have a published
+    // request quota of their own, and AWS's `413` for each of them names that operation's
+    // own number. They are stated per operation rather than as one shared constant because
+    // the numbers differ: the quota is on the whole REQUEST, so it is neither the account's
+    // `CodeSizeZipped` limit ("the maximum size of a deployment package when it's uploaded
+    // directly to Lambda", `crate::state::CODE_SIZE_ZIPPED_LIMIT`) nor a fixed multiple of
+    // it — an archive travels inline as base64, 4 bytes per 3 (RFC 4648 §4), and each
+    // operation's request carries different members around it.
+    //
+    // The number in each row is the one AWS's own refusal for that operation states, and it
+    // is quoted into the sentence verbatim ([`too_large_message`]), so a row may not be
+    // "rounded" to a neighbouring quota.
+    BodyQuota {
+        operation: "CreateFunction",
+        max_bytes: 69_905_067,
+    },
+    BodyQuota {
+        operation: "UpdateFunctionCode",
+        max_bytes: 70_167_211,
+    },
+    BodyQuota {
+        operation: "PublishLayerVersion",
+        max_bytes: 70_167_211,
     },
 ];
 
@@ -236,6 +272,10 @@ mod tests {
 
     /// One row per size class, at and around every quota this table holds: the quota itself
     /// and one byte under it are accepted, one byte over it and far over it are refused.
+    ///
+    /// Each size is stated as an OFFSET from the row's own quota rather than as a multiple
+    /// of it, so a row whose quota is tens of megabytes is exercised at its boundary without
+    /// building a body several times that size.
     #[test]
     fn a_body_is_refused_exactly_past_its_operations_quota() {
         for quota in BODY_QUOTAS {
@@ -244,7 +284,7 @@ mod tests {
                 ("one byte under the quota", quota.max_bytes - 1, false),
                 ("exactly the quota", quota.max_bytes, false),
                 ("one byte over the quota", quota.max_bytes + 1, true),
-                ("far over the quota", quota.max_bytes * 4, true),
+                ("far over the quota", quota.max_bytes + 4_096, true),
             ];
             for (case, body_bytes, refused) in cases {
                 let stated = refusing_body(quota.operation, &request(*body_bytes, None));

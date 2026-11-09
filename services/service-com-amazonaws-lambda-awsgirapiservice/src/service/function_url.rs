@@ -45,16 +45,24 @@
 //! ## What this plane reads of the configuration, and what it does not
 //!
 //! It reads the two members that decide WHO is served and WHAT serves them: `AuthType` and
-//! the qualifier the URL is attached to. `FunctionUrlConfig$Cors` — "The cross-origin
-//! resource sharing (CORS) settings for your function URL" — decorates the response of a
-//! BROWSER request and is not read here: a URL that configures CORS still serves its
-//! handler's own response, exactly as a URL that configures none does, and applying those
-//! settings belongs to the CORS slice rather than to the request-and-result mapping this
-//! module implements. `InvokeMode` is read only as the stored value the control plane
-//! reports: a `RESPONSE_STREAM` URL is served through the same BUFFERED mapping, because the
-//! response-streaming half of a function URL (the handler wrapper that writes a stream, and
-//! the metadata prelude that shapes it) is a runtime capability this emulator's engines do
-//! not supply yet.
+//! the qualifier the URL is attached to, and `FunctionUrlConfig$Cors` — "The cross-origin
+//! resource sharing (CORS) settings for your function URL" — which is the ENDPOINT's own
+//! setting and so is applied here rather than by the handler ([`cors`]): a CORS PREFLIGHT is
+//! answered by this plane itself with the permission the configuration grants and NOTHING
+//! invoked, and the answer to every other request carries that permission for an origin the
+//! configuration admits. A request whose origin it does not admit is served exactly as one
+//! carrying no origin is — the headers are what a browser enforces with, so nothing of the
+//! function's answer is withheld for them. `InvokeMode` is read only as the stored value the
+//! control plane reports: a `RESPONSE_STREAM` URL is served through the same BUFFERED
+//! mapping, because the response-streaming half of a function URL (the handler wrapper that
+//! writes a stream, and the metadata prelude that shapes it) is a runtime capability this
+//! emulator's engines do not supply yet.
+//!
+//! A preflight carries an `Origin`, and the emulator's front door refuses a request whose
+//! browser-set headers say a browser sent it from another site before any operation of this
+//! service runs. That guard stays in front of this plane: a preflight it admits is answered
+//! here, and one it refuses never reaches this plane at all — a property of this emulator,
+//! which serves a developer's machine, rather than of the service it emulates.
 
 use std::sync::Arc;
 
@@ -65,6 +73,10 @@ use smithy_server_runtime::{BoxFuture, ErasedOperation, OperationContext, Servic
 /// The event one request becomes and the response one result becomes — the documented
 /// payload format 2.0; see the module's own header.
 pub mod event;
+
+/// What the endpoint's own `Cors` settings make of a request, and what it answers a
+/// browser's PREFLIGHT; see the module's own header.
+mod cors;
 
 use event::{mapped_result, url_event, CallerIdentity, Mapped, UrlRequest};
 
@@ -209,7 +221,9 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
     }
 
     /// Serve one request: run the function the URL is attached to with the event the
-    /// request becomes, and answer what the run produced.
+    /// request becomes, and answer what the run produced — with the endpoint's own CORS
+    /// permission on the answer, and ANSWERING a preflight itself rather than running
+    /// anything for it (see [`cors`]).
     async fn serve(&self, req: &RtRequest, ctx: &OperationContext<'_>) -> RtResponse {
         let Some(target) = self.target(req) else {
             // The URL was resolved when the request was CLAIMED; a configuration deleted
@@ -220,6 +234,31 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
                 "The function URL this request addressed does not exist.",
             );
         };
+        // The endpoint's own `Cors` settings, which decide the answer to a preflight whole
+        // and decorate the answer to everything else. A URL configured with none states no
+        // permission at all, and its preflight is a request like any other.
+        if let Some(configured) = target.cors.as_ref() {
+            if let Some(asked) = cors::preflight_of(req) {
+                return cors::answered_preflight(configured, &asked);
+            }
+        }
+        let permitted = target
+            .cors
+            .as_ref()
+            .map_or_else(Vec::new, |configured| cors::decoration(configured, req));
+        let mut response = self.invoked(&target, req, ctx).await;
+        cors::decorate(&mut response, &permitted);
+        response
+    }
+
+    /// The answer the INVOCATION of the function `target`'s URL is attached to produces —
+    /// every answer of this plane except the preflight the endpoint answers itself.
+    async fn invoked(
+        &self,
+        target: &crate::state::FunctionUrlTarget,
+        req: &RtRequest,
+        ctx: &OperationContext<'_>,
+    ) -> RtResponse {
         let request_id = crate::state::mint_request_id();
         // The request's own bytes, read ONCE: the event the function is invoked with carries
         // them, so a body this plane cannot read is a request it cannot turn into an
@@ -245,7 +284,7 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             request_id: &request_id,
             received: ::std::time::SystemTime::now(),
         };
-        let mut prepared = match self.prepare(&target, &incoming, ctx) {
+        let mut prepared = match self.prepare(target, &incoming, ctx) {
             Ok(prepared) => prepared,
             Err(response) => return *response,
         };

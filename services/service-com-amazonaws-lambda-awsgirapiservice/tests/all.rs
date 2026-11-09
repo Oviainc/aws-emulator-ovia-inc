@@ -189,6 +189,8 @@ mod function_scaling_config_default;
 mod function_update_window_conflict;
 #[path = "all/function_url_config.rs"]
 mod function_url_config;
+#[path = "all/function_url_cors.rs"]
+mod function_url_cors;
 #[path = "all/function_url_data_plane.rs"]
 mod function_url_data_plane;
 #[path = "all/function_url_deletion.rs"]
@@ -239,6 +241,8 @@ mod handler_sdk_idempotency_token;
 mod handler_sdk_service_inventory;
 #[path = "all/handler_secret_sdk.rs"]
 mod handler_secret_sdk;
+#[path = "all/inline_archive_request_quota.rs"]
+mod inline_archive_request_quota;
 #[path = "all/invocation_concurrency.rs"]
 mod invocation_concurrency;
 #[path = "all/invocation_count_series.rs"]
