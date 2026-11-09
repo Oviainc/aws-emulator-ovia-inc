@@ -17,7 +17,15 @@ pub struct GetPolicyEngineInput {
     pub policy_engine_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#GetPolicyEngineResponse")]
+/// `GetPolicyEngineResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `updatedAt` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="GetPolicyEngine")`), and the derive does
+/// not put that trait on a member schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetPolicyEngineOutput {
     pub policy_engine_id: String,
@@ -30,4 +38,21 @@ pub struct GetPolicyEngineOutput {
     pub description: Option<String>,
     pub status_reasons: Vec<String>,
 }
+
+agentcore_schema_and_codec!(
+    GetPolicyEngineOutput,
+    GET_POLICY_ENGINE_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#GetPolicyEngineResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "GetPolicyEngineResponse",
+    (M_POLICY_ENGINE_ID, policy_engine_id, "policyEngineId", 0, req, string),
+    (M_NAME, name, "name", 1, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 2, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 3, req, date_time),
+    (M_POLICY_ENGINE_ARN, policy_engine_arn, "policyEngineArn", 4, req, string),
+    (M_STATUS, status, "status", 5, req, string),
+    (M_ENCRYPTION_KEY_ARN, encryption_key_arn, "encryptionKeyArn", 6, opt, string),
+    (M_DESCRIPTION, description, "description", 7, opt, string),
+    (M_STATUS_REASONS, status_reasons, "statusReasons", 8, req, list_of_string),
+);
 

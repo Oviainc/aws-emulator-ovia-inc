@@ -81,6 +81,8 @@ mod memory_read_reflects_last_mutation;
 mod memory_update_and_read_projection;
 #[path = "all/payment_credential_provider.rs"]
 mod payment_credential_provider;
+#[path = "all/policy_engine_creation.rs"]
+mod policy_engine_creation;
 #[path = "all/policy_plane.rs"]
 mod policy_plane;
 #[path = "all/payment_credential_provider_external_secret.rs"]
