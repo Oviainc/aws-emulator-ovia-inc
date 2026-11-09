@@ -47,6 +47,8 @@ mod ip_set_address_order;
 mod ip_set_canonicalization;
 #[path = "all/ip_set_listing.rs"]
 mod ip_set_listing;
+#[path = "all/ip_set_membership_order.rs"]
+mod ip_set_membership_order;
 #[path = "all/ip_set_mutations.rs"]
 mod ip_set_mutations;
 #[path = "all/list_resources_for_web_acl.rs"]

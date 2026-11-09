@@ -83,31 +83,35 @@ fn canonical_ipv6_cidr(address: &str) -> Option<String> {
 
 /// `members` in the order the set holds them: the order a read reports.
 ///
-/// The set is held in a hash table, so the order its members are enumerated in is
-/// the table's: an entry sits in the bucket its own hash
-/// ([`address_bucket_hash`]) selects, buckets are enumerated in ascending order,
-/// and two entries that select one bucket keep the order they were added in. The
-/// table has [`ADDRESS_TABLE_MIN_BUCKETS`] buckets and doubles whenever the
-/// membership would fill more than
+/// The set is laid out in a table, so the order its members are enumerated in is
+/// the table's: an entry sits in the slot its own hash ([`address_bucket_hash`])
+/// selects, and the slots are enumerated in ascending order. The table has
+/// [`ADDRESS_TABLE_MIN_BUCKETS`] buckets and doubles whenever the membership would
+/// fill more than
 /// [`ADDRESS_TABLE_LOAD_NUMERATOR`]/[`ADDRESS_TABLE_LOAD_DENOMINATOR`] of it, so a
 /// set's layout is fixed by its size and its members' values alone.
 ///
-/// The consequence is the rule this exists for: the order is a function of the
+/// Two entries can select one bucket, and then the bucket alone does not say which
+/// of them comes first; what decides it is their own values, compared as the
+/// strings they are stored as. The position each held in the request decides
+/// nothing — which is the rule this exists for: the order is a function of the
 /// MEMBERSHIP, not of the request. The same addresses submitted in any order are
-/// stored in one order, and reading a set twice reports one order.
+/// stored in one order, whichever write path stored them, and reading a set twice
+/// reports one order.
 pub fn address_set_order(members: Vec<String>) -> Vec<String> {
     let buckets = address_table_buckets(members.len());
-    let mut ordered: Vec<(usize, usize, String)> = members
+    let mut ordered: Vec<(usize, String)> = members
         .into_iter()
-        .enumerate()
-        .map(|(added, member)| (address_bucket(&member, buckets), added, member))
+        .map(|member| (address_bucket(&member, buckets), member))
         .collect();
-    // By bucket, then by the order the entries were added: the two keys the table
-    // enumerates by.
-    ordered.sort_by_key(|(bucket, added, _member)| (*bucket, *added));
+    // By bucket, then by the entry's own value: the two keys the layout is a
+    // function of, which is the pair order on these entries. Neither depends on
+    // the order the request listed them in, and the entries are distinct, so no
+    // two compare equal and the sort needs no stability.
+    ordered.sort_unstable();
     ordered
         .into_iter()
-        .map(|(_bucket, _added, member)| member)
+        .map(|(_bucket, member)| member)
         .collect()
 }
 
