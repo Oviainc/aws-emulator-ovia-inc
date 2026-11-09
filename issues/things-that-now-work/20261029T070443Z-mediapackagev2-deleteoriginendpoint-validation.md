@@ -97,3 +97,37 @@ Test coverage: `tests/all/resource_tags.rs:567-583` deletes an origin endpoint t
 4. `GET /channelGroup/grp/channel/chn/originEndpoint/ep/harvestJob/job1` — observe 404 with `ResourceTypeNotFound: ORIGIN_ENDPOINT`: the job record, its tags, its ETag and its status are gone.
 5. `GET /tags/<the job ARN from step 2>` — observe 404; the job can no longer be read or untagged.
 6. For the contrast one level up: with an endpoint present, `DELETE /channelGroup/grp/channel/chn/` answers 409 `ConflictException` / `RESOURCE_IN_USE` from `children_attached`, and the channel is left stored.
+
+## Resolution
+
+The report's central claim does not hold: the Evidence section above says "the model declares
+`ConflictException` (HTTP 409) for `DeleteOriginEndpoint`", and it does not.
+`smithy_query(query="operation", operation="DeleteOriginEndpoint")` lists exactly
+`AccessDeniedException` (403), `InternalServerException` (500), `ThrottlingException` (429) and
+`ValidationException` (400) for that operation, while the same query for `DeleteChannel` and
+`DeleteChannelGroup` lists `ConflictException` (409) on both — which is why those two refuse while
+a child is left and this one does not. The operation's own documentation states the containment
+rule one level UP ("You must delete all endpoints from a channel before you can delete the
+channel") and states no obstacle below the endpoint.
+
+The rule, as the model states it: a delete answers the children-attached 409 only at the levels
+whose model declares `ConflictException` for that delete; a delete whose modelled error set
+declares none is unconditional and idempotent, and removes the resource together with the records
+persisted ON it — here the endpoint's policy and its harvest jobs, neither of which is addressable
+except under the endpoint's own path (every harvest-job operation binds a URI below it, and the
+job's ARN spells the same containment), so neither can outlive it.
+
+The emulator's behaviour was therefore already correct and is unchanged. What changed is the
+documentation that had stated the rule more widely than the model does — the `state` module doc
+and the `OriginEndpoint::harvest_jobs` field doc, plus the handler's header and the comment at the
+removal — and a new suite, `tests/all/delete_origin_endpoint_cascade.rs`, that pins the rule: a
+table of eight rows spanning what the endpoint holds when the delete arrives (none, one, two,
+three and five harvest jobs; caller-named and service-named; a cancelled job beside live ones; a
+job whose scheduled window is already open; with and without an attached policy), each asserting
+the modelled 200, the idempotent repeat, the 404s for the endpoint, its policy and each job (plus
+each job's minted ARN through the tagging front end), that the group's `ListHarvestJobs` then
+reports none of them, that the channel and group survive, and that an endpoint created again under
+that name carries no policy and no job; a sibling-endpoint case showing the removal is scoped to
+the endpoint named; and a per-level case driving all three deletes with a child present (409
+naming "channels", 409 naming "origin endpoints", 200), then showing both refused deletes succeed
+once the endpoint is gone.

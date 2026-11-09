@@ -160,3 +160,5 @@ mod entity_tag_encoding;
 mod ingest_endpoint_hosts;
 #[path = "all/harvest_destination.rs"]
 mod harvest_destination;
+#[path = "all/delete_origin_endpoint_cascade.rs"]
+mod delete_origin_endpoint_cascade;

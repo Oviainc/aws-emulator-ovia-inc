@@ -4,7 +4,10 @@
 //!
 //! MediaPackage v2 is a three-level containment hierarchy — channel group -> channel
 //! -> origin endpoint — so the store nests the same way: a channel cannot exist
-//! without its group, and deleting a parent that still has children is refused. Every
+//! without its group, and deleting a parent that still has children is refused wherever
+//! the model declares `ConflictException` for that delete — the group's and the channel's.
+//! The origin endpoint's delete declares none, so it is unconditional: it takes the
+//! records persisted ON the endpoint (its policy, its harvest jobs) with it. Every
 //! derived value a response carries (ARN, egress domain, ingest URL, manifest URL,
 //! ETag, timestamps) is computed by the call that WRITES the record - a create, or an
 //! update - and persisted, so every later read reproduces it byte for byte and no
@@ -1363,6 +1366,14 @@ pub struct OriginEndpoint {
     /// sub-resource it takes no part in the endpoint's ETag.
     pub policy: Option<EndpointPolicy>,
     /// Every harvest job created against this endpoint, keyed by job name.
+    ///
+    /// A job is addressed only THROUGH its endpoint — every harvest-job operation binds a
+    /// URI under the endpoint's path, and the job's ARN spells the same containment — so a
+    /// job cannot outlive the endpoint it was created against and is persisted on it. That
+    /// is also why the endpoint's delete takes the jobs with it rather than refusing while
+    /// any is left: the model declares no `ConflictException` for `DeleteOriginEndpoint`,
+    /// while the two deletes above it declare one and answer it
+    /// ([`children_attached`]).
     pub harvest_jobs: BTreeMap<String, HarvestJobRecord>,
 }
 

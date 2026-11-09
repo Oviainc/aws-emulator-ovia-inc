@@ -5,6 +5,12 @@
 //! `GetOriginEndpoint` reports it as absent. Idempotent: deleting an endpoint (or a
 //! parent) that is not there succeeds and changes nothing.
 //!
+//! UNCONDITIONAL: this is the one delete of the three whose model declares no
+//! `ConflictException` (see the error enum below), so there is no children-attached
+//! refusal to make and the endpoint goes together with everything persisted ON it — its
+//! policy and its harvest jobs, neither of which is addressable except through the
+//! endpoint's own path.
+//!
 //! `handle` below is the implementation; `crate::state` holds the store it writes.
 //!
 //! ## Shape of an operation
@@ -166,6 +172,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@idempotent`: the operation's promise is that the endpoint is gone when it
         // returns, so an absent endpoint — or an absent parent — is already that state
         // and succeeds without an error.
+        //
+        // Nothing the endpoint holds can refuse this delete: the model declares no
+        // `ConflictException` for it, while `DeleteChannelGroup` and `DeleteChannel` do
+        // declare one and answer it while a child of theirs is left
+        // (`crate::state::children_attached`). Removing the record is therefore the whole
+        // operation, and it takes the endpoint's policy and its harvest jobs with it —
+        // both are persisted on the endpoint and reachable only under its path.
         if let Some(channel) = store
             .channel_group_mut(&region, &input.channel_group_name)
             .and_then(|group| group.channels.get_mut(&input.channel_name))
