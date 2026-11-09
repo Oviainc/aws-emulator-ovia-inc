@@ -920,3 +920,144 @@ async fn an_update_applies_the_members_it_states_and_leaves_the_rest() {
          {read:?}"
     );
 }
+
+/// An update writes to the authorizer its URI addresses and to nothing else: it moves
+/// that record's `lastModifiedDate` to the instant of the write, leaves the
+/// `creationDate` its create stamped where it was, and leaves every other authorizer the
+/// account holds exactly as a client read it a moment earlier.
+///
+/// The rows span what that rule generalises over — which member the update states, how
+/// many it states at once, whether the value it states differs from the one the record
+/// already carries, a request that states no member at all, and which of several
+/// authorizers it addresses — over names that differ in form and length within the
+/// `authorizerName` `@pattern` (`^[\w=,@-]+$`, from the model's `AuthorizerName`).
+#[tokio::test]
+async fn an_update_writes_only_to_the_authorizer_it_addresses() {
+    let emulator = Emulator::new();
+
+    // Three authorizers in one account: a plain word, a one-character name, and a long
+    // name carrying every punctuation character the pattern admits.
+    let names = ["alpha", "b", "Long-Authorizer_Name=42,@x"];
+    for (index, name) in names.iter().enumerate() {
+        let created = emulator
+            .create(
+                name,
+                &json!({
+                    "authorizerFunctionArn":
+                        format!("arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:f{index}"),
+                    "tokenKeyName": "token",
+                    "status": "ACTIVE",
+                }),
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {name:?}: CreateAuthorizer must succeed, got {created:?}"
+        );
+    }
+
+    /// One row of the table: a case name, the authorizer the update addresses, and the
+    /// body it sends.
+    struct Row {
+        case: &'static str,
+        target: &'static str,
+        body: Value,
+    }
+
+    let rows: Vec<Row> = vec![
+        Row {
+            case: "the status flips to the other value",
+            target: names[0],
+            body: json!({"status": "INACTIVE"}),
+        },
+        Row {
+            case: "the status the record already carries, stated again",
+            target: names[0],
+            body: json!({"status": "INACTIVE"}),
+        },
+        Row {
+            case: "a new function ARN",
+            target: names[1],
+            body: json!({
+                "authorizerFunctionArn":
+                    format!("arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:replacement"),
+            }),
+        },
+        Row {
+            case: "signing public keys, a token key name and the caching flag together",
+            target: names[2],
+            body: json!({
+                "tokenKeyName": "other-token",
+                "tokenSigningPublicKeys": {"KEY": "-----BEGIN PUBLIC KEY-----pem"},
+                "enableCachingForHttp": true,
+            }),
+        },
+        Row {
+            case: "a request that states no member",
+            target: names[2],
+            body: json!({}),
+        },
+    ];
+
+    for Row { case, target, body } in rows {
+        // What a client reads of every authorizer in the account before the update.
+        let mut before: Vec<(&str, Value)> = Vec::new();
+        for name in names {
+            let read = emulator.describe(name).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?}: {name:?} must be readable before the update, got {read:?}"
+            );
+            before.push((name, read.description().cloned().unwrap_or(Value::Null)));
+        }
+
+        let window_opens = now_epoch_seconds();
+        let updated = emulator.update(target, &body).await;
+        assert_eq!(
+            updated.status, 200,
+            "case {case:?}: expected HTTP 200 from UpdateAuthorizer, got {updated:?}"
+        );
+        let window_closes = now_epoch_seconds();
+
+        for (name, was) in &before {
+            let read = emulator.describe(name).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?}: {name:?} must still be readable after the update, got {read:?}"
+            );
+            let now = read.description().cloned().unwrap_or(Value::Null);
+
+            if *name != target {
+                assert_eq!(
+                    &now, was,
+                    "case {case:?}: an update of {target:?} must leave {name:?} exactly as it \
+                     was ({was:?}), got {now:?}"
+                );
+                continue;
+            }
+
+            assert_eq!(
+                now.get("creationDate"),
+                was.get("creationDate"),
+                "case {case:?}: the update must leave creationDate as the create stamped it \
+                 ({was:?}), got {now:?}"
+            );
+            let created_at = read.member_epoch("creationDate").unwrap_or_else(|| {
+                panic!("case {case:?}: the description reported no creationDate: {read:?}")
+            });
+            let last_modified = read.member_epoch("lastModifiedDate").unwrap_or_else(|| {
+                panic!("case {case:?}: the description reported no lastModifiedDate: {read:?}")
+            });
+            assert!(
+                (window_opens - 1.0..=window_closes + 1.0).contains(&last_modified),
+                "case {case:?}: lastModifiedDate {last_modified} is outside the window of the \
+                 update [{window_opens}, {window_closes}], got {now:?}"
+            );
+            assert!(
+                last_modified >= created_at,
+                "case {case:?}: lastModifiedDate {last_modified} is before creationDate \
+                 {created_at}, got {now:?}"
+            );
+        }
+    }
+}
