@@ -154,7 +154,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // IAM first, on the custom action the request addresses: the decision is taken
+        // before the store is read or written, so a refused caller changes nothing and is
+        // told nothing about whether the action exists.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.custom_action_arn,
+        )?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteCustomActionErrorModeled::InternalServiceError(InternalServiceError {
                 message: Some("the chatbot configuration store is unavailable".to_string()),

@@ -51,6 +51,10 @@ use std::sync::Arc;
 /// renderer cannot express.
 pub mod wire;
 
+/// Whether IAM lets a request perform the action it asks for: the authorization step the
+/// operations that act on a custom action run before they read or write the store.
+pub mod authorization;
+
 /// The error code AWS Chatbot answers a request whose input does not satisfy a modeled
 /// constraint with.
 ///

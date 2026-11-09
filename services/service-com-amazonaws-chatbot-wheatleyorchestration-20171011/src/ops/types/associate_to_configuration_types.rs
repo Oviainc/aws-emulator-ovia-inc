@@ -11,7 +11,18 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-chatbot-wheatleyorchestration-20171011.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.chatbot#AssociateToConfigurationRequest")]
+// `skip_validation = ["Resource"]`: AWS Chatbot takes the resource-scoped AUTHORIZATION
+// decision on this member before it judges the member's ARN shape, so a `Resource` outside
+// the modelled `@pattern` is answered 403 `UnauthorizedException` and not as a client-input
+// failure. A modelled constraint is refused at the centralized boundary, BEFORE the handler
+// runs, and this service words every boundary refusal as `InvalidRequestException` (400,
+// `crate::service`) — which would invert the two decisions — so the constraint comes off
+// here and the ARN is judged by the handler, through
+// `crate::state::is_mintable_custom_action_arn`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.chatbot#AssociateToConfigurationRequest",
+    skip_validation = ["Resource"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct AssociateToConfigurationInput {
     pub resource: String,

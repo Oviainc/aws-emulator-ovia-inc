@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssociations`'s real behaviour. Implement it here — this is
+//!
+//! Lists the resources linked to a channel configuration — the links
+//! `AssociateToConfiguration` records and `DisassociateFromConfiguration` removes. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING operation: it answers from the store and writes nothing. A configuration
+//! holding no association answers an EMPTY list rather than a refusal, whichever kind of
+//! chat configuration the ARN names and whether or not this account holds one under it —
+//! the model gives this operation no error at all to refuse with, and an account that has
+//! associated nothing has nothing to report.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +75,27 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The opaque `NextToken` a page ends on: the ARN of the last resource it carried.
+///
+/// A cursor is a position in the scan, which is an associated resource's own ARN; base64
+/// keeps it opaque to a caller while leaving it a value the next request can carry back.
+/// The codec is the one the framework already vends (`aws_smithy_types::base64`), as the
+/// configuration listings of this service use it.
+fn encode_next_token(last_resource: &str) -> String {
+    ::aws_smithy_types::base64::encode(last_resource)
+}
+
+/// The resource ARN a `NextToken` resumes after, or `None` when the token is not one this
+/// service issued: a cursor is always a custom-action ARN of this account, so anything else
+/// — unparseable, not UTF-8, a cursor from another listing, or a string a caller made up —
+/// names no position in the scan.
+fn decode_next_token(token: &str) -> Option<String> {
+    let cursor = String::from_utf8(::aws_smithy_types::base64::decode(token).ok()?).ok()?;
+    cursor
+        .starts_with(&crate::state::custom_action_arn_prefix())
+        .then_some(cursor)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -85,9 +107,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chatbot-wheatleyorchest
 // here — hence the `ListAssociationsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.chatbot#ListAssociations")]
+// `InvalidRequestException` is widened in through `extra_errors`: this SERVICE models it
+// (`@error("client")` `@httpError(400)`, and the association operations list it) while the
+// model's `errors` list for ListAssociations is empty, and it is the class this service
+// refuses a client-input failure with — here, a `NextToken` that is not a cursor this
+// service issued.
+#[smithy_macros::operation_error(
+    "com.amazonaws.chatbot#ListAssociations",
+    extra_errors = ["InvalidRequestException"]
+)]
 #[derive(Debug)]
 pub enum ListAssociationsErrorModeled {
+    InvalidRequestException(InvalidRequestException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -141,18 +172,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssociations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no error at all, so there is no modelled failure to
+            // answer an engine carrying no store with; an account whose store cannot be
+            // read holds no association to report.
+            return Ok(ListAssociationsOutput {
+                associations: Vec::new(),
+                next_token: None,
+            });
+        };
+
+        // A token this service did not issue cannot name a position in the scan.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token).ok_or_else(|| {
+                ListAssociationsErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: Some(
+                        "NextToken is not a pagination token issued by this service".to_string(),
+                    ),
+                })
+            })?),
+            None => None,
+        };
+        // A caller that names no page size still gets a bounded page: the response can
+        // never carry everything the store holds.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+
+        let store = state.lock();
+        // One past the page: whether that extra resource exists is exactly whether the
+        // caller needs a token to come back for more.
+        let mut page: Vec<String> = store
+            .associated_resources(&input.chat_configuration)
+            // The scan resumes strictly after the cursor, so no resource is reported on two
+            // pages.
+            .filter(|resource| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|cursor| *resource > cursor)
+            })
+            .take(page_size + 1)
+            .map(str::to_string)
+            .collect();
+        let next_token = if page.len() > page_size {
+            page.pop();
+            page.last().map(|resource| encode_next_token(resource))
+        } else {
+            None
+        };
+
+        Ok(ListAssociationsOutput {
+            associations: page
+                .into_iter()
+                .map(|resource| AssociationListing { resource })
+                .collect(),
+            next_token,
+        })
     }
 }

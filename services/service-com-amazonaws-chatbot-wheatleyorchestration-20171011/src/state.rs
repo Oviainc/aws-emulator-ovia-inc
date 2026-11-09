@@ -15,9 +15,12 @@
 //! [`authorize_microsoft_teams_team`]), because no operation in this model creates one.
 //!
 //! It owns the calling account's AWS Chatbot preferences too
-//! ([`AccountPreferencesRecord`]), which are account-scoped rather than per-resource.
+//! ([`AccountPreferencesRecord`]), which are account-scoped rather than per-resource, and
+//! the resources LINKED to each channel configuration
+//! (`ComAmazonawsChatbotWheatleyorchestration20171011State::associate_resource`), which
+//! are what `ListAssociations` reports.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
     AccountPreferences, ChimeWebhookConfiguration, ConfiguredTeam, CustomAction,
@@ -29,7 +32,12 @@ use crate::ops::types::{
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// The `chatbot` ARN service namespace (`OPERATIONS.md`: "ARN namespace: chatbot").
-const ARN_SERVICE: &str = "chatbot";
+///
+/// It is also this service's IAM action prefix — an action is `chatbot:<OperationName>`
+/// ("Actions defined by AWS Chatbot", IAM Service Authorization Reference) — so the
+/// authorization gate ([`crate::service::authorization`]) names actions through this one
+/// constant rather than spelling the namespace a second time.
+pub const ARN_SERVICE: &str = "chatbot";
 
 /// The ARN resource-path segment naming the chat client a configuration configures: a
 /// Slack channel, or an Amazon Chime webhook. A chat configuration ARN is
@@ -46,6 +54,15 @@ pub const STATE_ENABLED: &str = "ENABLED";
 /// The most tags a chat configuration can carry: the model's `TagList` is
 /// `length 0..200`, so a merge that would exceed it is refused.
 pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// The most resources ONE channel configuration can hold associations to.
+///
+/// The model carries no number for it, so this bound is the emulator's own: it is what
+/// keeps repeated `AssociateToConfiguration` calls from growing the emulator's memory
+/// without limit. Past it an associate is refused the way AWS Chatbot refuses a stored
+/// total that has reached its cap — the modelled client-input error class, wording
+/// nothing (see `crate::ops::tag_resource`).
+pub const MAX_ASSOCIATIONS_PER_CONFIGURATION: usize = MAX_PAGE_SIZE;
 
 /// The largest page a listing serves, and the page it serves when the caller names no
 /// `MaxResults`: the model's own `MaxResults` maximum
@@ -156,6 +173,11 @@ pub fn is_mintable_custom_action_arn(arn: &str) -> bool {
 /// class, which is fixed — it names neither the request's ARN nor the account, because the
 /// decision is made against the ARN before anything is looked up.
 pub const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
+
+/// The message a SERVER-side refusal carries: AWS Chatbot's recorded text for this error
+/// class, which is entirely fixed — the service states the failure and names nothing of the
+/// request in it.
+pub const INTERNAL_SERVER_ERROR_MESSAGE: &str = "Internal Server Error";
 
 /// The message a custom-action operation (`GetCustomAction`) refuses an ARN this account
 /// holds no action under with.
@@ -277,6 +299,19 @@ pub struct ComAmazonawsChatbotWheatleyorchestration20171011State {
     /// an account that has authorized none has none to report, so nothing is seeded
     /// here.
     microsoft_teams_authorizations: BTreeMap<String, MicrosoftTeamsConfiguredTeamRecord>,
+    /// The resources LINKED to each channel configuration, keyed by the configuration's
+    /// `ChatConfigurationArn` and holding the `ResourceIdentifier` of every resource
+    /// associated with it.
+    ///
+    /// A `BTreeSet` because an association is a LINK and not a count: associating the same
+    /// resource twice leaves the configuration linked to it exactly once, and the set's
+    /// order is one stable total order `ListAssociations` can paginate over and resume from
+    /// an opaque token.
+    ///
+    /// A configuration with no associations holds no entry here rather than an empty set,
+    /// so disassociating the last resource leaves the map as a configuration that was never
+    /// associated with anything.
+    resource_associations: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Default for ComAmazonawsChatbotWheatleyorchestration20171011State {
@@ -291,6 +326,7 @@ impl Default for ComAmazonawsChatbotWheatleyorchestration20171011State {
                 .collect(),
             account_preferences: AccountPreferencesRecord::default(),
             microsoft_teams_authorizations: BTreeMap::new(),
+            resource_associations: BTreeMap::new(),
         }
     }
 }
@@ -443,6 +479,82 @@ impl ComAmazonawsChatbotWheatleyorchestration20171011State {
         self.microsoft_teams_authorizations
             .insert(team_id.to_string(), record.clone());
         record
+    }
+
+    /// Whether the chat configuration `chat_configuration_arn` names is one this account
+    /// holds that can HOST an association to a resource.
+    ///
+    /// A custom action is surfaced to a user as an alias they type, or a button they press,
+    /// in a chat CHANNEL — so a channel configuration is what hosts the link. An Amazon
+    /// Chime webhook configuration is a webhook DESTINATION with no channel to surface
+    /// either in, and AWS Chatbot answers an association against one with its modelled
+    /// server error rather than linking anything; an ARN this account holds no
+    /// configuration under cannot host the link either.
+    ///
+    /// A Microsoft Teams channel configuration hosts one exactly as a Slack channel
+    /// configuration does, but no operation of this model creates one yet (the create is
+    /// still a scaffold), so the store holds none to answer for; the day it does, it joins
+    /// the lookup here.
+    pub fn hosts_resource_associations(&self, chat_configuration_arn: &str) -> bool {
+        self.slack_channel_configurations
+            .contains_key(chat_configuration_arn)
+    }
+
+    /// Link `resource` to the channel configuration `chat_configuration_arn`, and answer
+    /// whether the configuration is now linked to it.
+    ///
+    /// IDEMPOTENT: linking a resource the configuration already holds changes nothing and
+    /// still answers `true`. `false` means the link was NOT made because the configuration
+    /// already holds [`MAX_ASSOCIATIONS_PER_CONFIGURATION`] resources — nothing is stored
+    /// in that case, so a refused associate leaves no partial state behind.
+    pub fn associate_resource(&mut self, chat_configuration_arn: &str, resource: &str) -> bool {
+        let linked = self
+            .resource_associations
+            .entry(chat_configuration_arn.to_string())
+            .or_default();
+        if linked.contains(resource) {
+            return true;
+        }
+        if linked.len() >= MAX_ASSOCIATIONS_PER_CONFIGURATION {
+            // An entry this call created and did not fill would read as a configuration
+            // with an empty association set; drop it so the store is exactly as it was.
+            if linked.is_empty() {
+                self.resource_associations.remove(chat_configuration_arn);
+            }
+            return false;
+        }
+        linked.insert(resource.to_string());
+        true
+    }
+
+    /// Unlink `resource` from the channel configuration `chat_configuration_arn`, and
+    /// answer whether a link was there to remove.
+    ///
+    /// IDEMPOTENT: a resource the configuration never held is simply not linked
+    /// afterwards, which is what the caller asked for, so this answers `false` rather than
+    /// failing.
+    pub fn disassociate_resource(&mut self, chat_configuration_arn: &str, resource: &str) -> bool {
+        let Some(linked) = self.resource_associations.get_mut(chat_configuration_arn) else {
+            return false;
+        };
+        let removed = linked.remove(resource);
+        if linked.is_empty() {
+            self.resource_associations.remove(chat_configuration_arn);
+        }
+        removed
+    }
+
+    /// The resources linked to the channel configuration `chat_configuration_arn`, in one
+    /// stable total order; empty for a configuration holding no association.
+    pub fn associated_resources(
+        &self,
+        chat_configuration_arn: &str,
+    ) -> impl Iterator<Item = &str> + '_ {
+        self.resource_associations
+            .get(chat_configuration_arn)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
     }
 }
 
@@ -853,6 +965,13 @@ pub fn chime_webhook_configuration_arn(region: &str, configuration_name: &str) -
 /// issued from a string a caller made up.
 pub fn slack_channel_configuration_arn_prefix(region: &str) -> String {
     slack_channel_configuration_arn(region, "")
+}
+
+/// The prefix every custom-action ARN of this account starts with: the same ARN with an
+/// empty action name. As for the configuration prefixes, this is what tells a pagination
+/// token this service issued from a string a caller made up.
+pub fn custom_action_arn_prefix() -> String {
+    custom_action_arn("")
 }
 
 /// The prefix every Amazon Chime webhook configuration ARN in `region` starts with: the

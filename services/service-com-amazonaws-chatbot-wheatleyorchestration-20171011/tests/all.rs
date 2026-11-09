@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_preferences.rs"]
 mod account_preferences;
+#[path = "all/associations.rs"]
+mod associations;
 #[path = "all/chime_webhook_configuration.rs"]
 mod chime_webhook_configuration;
 #[path = "all/chime_webhook_configuration_delete.rs"]
@@ -21,10 +23,14 @@ mod chime_webhook_configuration_delete;
 mod chime_webhook_configuration_update;
 #[path = "all/custom_action.rs"]
 mod custom_action;
+#[path = "all/custom_action_authorization.rs"]
+mod custom_action_authorization;
 #[path = "all/custom_action_delete.rs"]
 mod custom_action_delete;
 #[path = "all/custom_action_fail_closed.rs"]
 mod custom_action_fail_closed;
+#[path = "all/custom_action_listing.rs"]
+mod custom_action_listing;
 #[path = "all/custom_action_update.rs"]
 mod custom_action_update;
 #[path = "all/error_message_member.rs"]

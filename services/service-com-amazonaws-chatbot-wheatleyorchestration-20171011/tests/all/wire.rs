@@ -20,11 +20,18 @@ pub const REGION: &str = "us-east-1";
 /// Another region, so account-wide reach can be told apart from per-region state.
 pub const OTHER_REGION: &str = "us-west-2";
 
-/// A SigV4 credential scope naming this service and `region`; `MultiServiceRouter`
-/// routes on the scope's service name and the handlers read the region from it.
-pub fn authorization(region: &str) -> String {
+/// The access key id the suites sign with unless they name another: a key neither STS nor
+/// IAM holds a record for, which is the position AWS account root credentials are in — so
+/// the authorization gate (`service::authorization`) does not bound it and a suite that is
+/// not about WHO called reads the operation's own answer.
+pub const DEFAULT_ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+
+/// A SigV4 credential scope naming this service and `region`, presenting `access_key_id`;
+/// `MultiServiceRouter` routes on the scope's service name, the handlers read the region
+/// from it, and the authorization gate resolves the principal from the key id.
+pub fn authorization_as(access_key_id: &str, region: &str) -> String {
     format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/chatbot/aws4_request, \
+        "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/chatbot/aws4_request, \
          SignedHeaders=host;x-amz-date, Signature=deadbeef"
     )
 }
@@ -79,12 +86,24 @@ pub async fn post(
     path: &str,
     body: &Value,
 ) -> Answer {
+    post_as(router, DEFAULT_ACCESS_KEY_ID, region, path, body).await
+}
+
+/// POST `body` to `path` on `router`, signed for `region` with `access_key_id` — which is
+/// what names the principal the request speaks for.
+pub async fn post_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    region: &str,
+    path: &str,
+    body: &Value,
+) -> Answer {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://chatbot.{region}.amazonaws.com{path}"))
         .header("host", format!("chatbot.{region}.amazonaws.com"))
         .header("content-type", "application/json")
-        .header("authorization", authorization(region))
+        .header("authorization", authorization_as(access_key_id, region))
         .body(bytes::Bytes::from(body.to_string()))
         .expect("build the request");
     let response = router.dispatch(request).await;

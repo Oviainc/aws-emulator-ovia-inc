@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateToConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateToConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateToConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Links a resource — a custom action — to a channel configuration, which is what makes
+//! the action reachable as an alias or a button in that channel. This is the ONLY file to
+//! touch for this operation.
+//!
+//! ## The order the checks run in
+//!
+//! 1. **IAM**, for the principal the request's credentials speak for
+//!    ([`crate::service::authorization`]): a principal no identity-based policy allows
+//!    `chatbot:AssociateToConfiguration` on the custom action for is refused
+//!    `AccessDeniedException` (403) and nothing is linked.
+//! 2. **The resource-scoped authorization check on `Resource`**, BEFORE that member's ARN
+//!    shape is judged: an ARN no custom action of this account can be minted under names
+//!    no target in the account's namespace, so the request fails closed with the modelled
+//!    `UnauthorizedException` (403, [`crate::state::UNAUTHORIZED_MESSAGE`]) — the member's
+//!    modelled `@pattern` is therefore off the boundary (`skip_validation` on
+//!    `AssociateToConfigurationRequest`), since a boundary refusal would answer the
+//!    client-input class instead and so invert the two decisions.
+//! 3. **The target**: a channel configuration that can HOST the link
+//!    (`ComAmazonawsChatbotWheatleyorchestration20171011State::hosts_resource_associations`).
+//!    Anything else — an Amazon Chime webhook configuration, which is a webhook
+//!    destination with no channel to surface an action in, or an ARN this account holds no
+//!    configuration under — is refused with the modelled server error
+//!    `InternalServiceError` (500, [`crate::state::INTERNAL_SERVER_ERROR_MESSAGE`]),
+//!    leaving no partial association behind.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +157,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateToConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateToConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateToConfiguration"))
+        // IAM first, on the custom action the request names: a principal the account's
+        // policies do not allow this action for is told so without the request reaching
+        // the store at all.
+        crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME, &input.resource)?;
+
+        // The resource-scoped authorization decision, taken before the `Resource` member's
+        // ARN shape is judged: an ARN outside the form this account's custom actions are
+        // minted under names no target in its namespace, so the request fails closed.
+        if !crate::state::is_mintable_custom_action_arn(&input.resource) {
+            return Err(AssociateToConfigurationErrorModeled::UnauthorizedException(
+                UnauthorizedException {
+                    message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateToConfigurationErrorModeled::InternalServiceError(InternalServiceError {
+                message: Some(crate::state::INTERNAL_SERVER_ERROR_MESSAGE.to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // A target that cannot host the link is refused with the server error class, whose
+        // message is entirely fixed. Taken BEFORE anything is written, so every caller of
+        // a concurrent burst is refused alike and the configuration is left with no
+        // association.
+        if !store.hosts_resource_associations(&input.chat_configuration) {
+            return Err(
+                AssociateToConfigurationErrorModeled::InternalServiceError(InternalServiceError {
+                    message: Some(crate::state::INTERNAL_SERVER_ERROR_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // Past the per-configuration bound nothing is linked, and the refusal is the one
+        // this service answers a stored total that has reached its cap with: the modelled
+        // client-input class, wording nothing (see `crate::ops::tag_resource`).
+        if !store.associate_resource(&input.chat_configuration, &input.resource) {
+            return Err(
+                AssociateToConfigurationErrorModeled::InvalidRequestException(
+                    InvalidRequestException { message: None },
+                )
+                .into(),
+            );
+        }
+
+        Ok(AssociateToConfigurationOutput {})
     }
 }
