@@ -469,6 +469,12 @@ pub const UNSCOPED_RESOURCE_ID: &str = "unknown";
 /// bound CHOSEN for the emulator, like [`MAX_MANAGED_THINGS`], not a published AWS quota.
 pub const MAX_EVENT_LOG_CONFIGURATIONS: usize = 1_000;
 
+/// The most `EventLogConfigurationSummary` items one `ListEventLogConfigurations` page
+/// carries, and the page size an absent `MaxResults` gets, for the same reason and on the
+/// same terms as [`MANAGED_THING_PAGE_LIMIT`]: a caller reaches the rest of the store
+/// through the `NextToken`, so one response stays bounded however many records are stored.
+pub const EVENT_LOG_CONFIGURATION_PAGE_LIMIT: usize = 100;
+
 /// How a resource this service identifies by a NAME rather than by a generated id is
 /// keyed: the region its creating request was signed for, and the name that request
 /// carried.

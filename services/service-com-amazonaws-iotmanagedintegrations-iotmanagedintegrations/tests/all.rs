@@ -47,6 +47,8 @@ mod enum_value_set_rendering;
 mod error_message_wording;
 #[path = "all/event_log_configuration_lifecycle.rs"]
 mod event_log_configuration_lifecycle;
+#[path = "all/event_log_configuration_listing.rs"]
+mod event_log_configuration_listing;
 #[path = "all/event_log_configuration_update_isolation.rs"]
 mod event_log_configuration_update_isolation;
 #[path = "all/hub_configuration.rs"]
