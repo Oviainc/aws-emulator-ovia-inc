@@ -8,6 +8,9 @@
 //! each call mints its own — two requests carrying the same configuration address two
 //! independent locations.
 //!
+//! A request whose credential parameters do not satisfy the dependencies the members
+//! document is refused before anything is stored — see `credential_parameter_refusal`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -201,12 +204,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        if let Some(message) = secret_combination_refusal(&input) {
+        // Evaluated before the store is reached, so a request that breaks one of the
+        // credential rules persists nothing at all.
+        if let Some(message) = credential_parameter_refusal(&input) {
             return Err(CreateLocationAzureBlobErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     message: Some(message),
-                    error_code: None,
-                    datasync_error_code: None,
+                    error_code: Some(crate::state::INVALID_PARAMETER_CODE.to_string()),
+                    datasync_error_code: Some(crate::state::INVALID_PARAMETER_CODE.to_string()),
                 },
             )
             .into());
@@ -301,18 +306,30 @@ const DEFAULT_BLOB_TYPE: &str = "BLOCK";
 /// objects into the hot tier unless the request asks for one of the colder ones.
 const DEFAULT_ACCESS_TIER: &str = "HOT";
 
-/// The refusal a request earns by combining the credential parameters in a way this
-/// operation does not accept, if any.
+/// The authentication method that makes a location's access depend on a credential, as
+/// the modelled `AzureBlobAuthenticationType` enum spells it (`NONE | SAS`).
+const SAS_AUTHENTICATION_TYPE: &str = "SAS";
+
+/// The refusal a request earns from the credential parameters it names, if any.
 ///
-/// Both secret-configuration members document the same rule: a request provides either
-/// `CmkSecretConfig` together with the `SasConfiguration` whose token DataSync then puts
-/// in the secret it manages, or `CustomSecretConfig` on its own, naming a secret the
-/// caller already manages — never both, and never one without its partner.
-fn secret_combination_refusal(input: &CreateLocationAzureBlobInput) -> Option<String> {
+/// Two rules, both of them dependencies between members that the shapes alone cannot
+/// state. A location that authenticates with a shared access signature only reaches its
+/// container with that signature, so the request has to say where the signature is —
+/// inline in `SasConfiguration`, or in the secret `CustomSecretConfig` names; a request
+/// selecting that authentication method and naming no credential at all describes a
+/// location DataSync could never use. And the two secret-configuration members document
+/// how the credential members combine: either `CmkSecretConfig` together with the
+/// `SasConfiguration` whose token DataSync then puts in the secret it manages, or
+/// `CustomSecretConfig` on its own, naming a secret the caller already manages — never
+/// both, and never one without its partner.
+fn credential_parameter_refusal(input: &CreateLocationAzureBlobInput) -> Option<String> {
     let cmk = input.cmk_secret_config.is_some();
     let custom = input.custom_secret_config.is_some();
     let sas = input.sas_configuration.is_some();
 
+    if input.authentication_type == SAS_AUTHENTICATION_TYPE && !sas && !cmk && !custom {
+        return Some(MISSING_SAS_CREDENTIAL_REFUSAL.to_string());
+    }
     if cmk && custom {
         return Some(format!(
             "{CREDENTIAL_PARAMETER_RULE} Do not provide both parameters for the same request."
@@ -330,6 +347,13 @@ fn secret_combination_refusal(input: &CreateLocationAzureBlobInput) -> Option<St
     }
     None
 }
+
+/// How DataSync words the refusal of a location that authenticates with a shared access
+/// signature whose request names no credential: the whole sentence is fixed text for
+/// this refusal class, with no request- or state-derived part.
+const MISSING_SAS_CREDENTIAL_REFUSAL: &str = "Invalid parameter: SasConfiguration or \
+     CustomConfiguration needs to be provided when authentication type is SAS for Azure \
+     Blob locations..";
 
 /// The rule both secret-configuration members document, as they word it, and the first
 /// sentence of every refusal above.

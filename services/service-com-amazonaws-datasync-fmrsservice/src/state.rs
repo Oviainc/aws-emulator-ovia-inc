@@ -875,6 +875,14 @@ pub fn default_server_port(server_protocol: &str) -> i32 {
 /// it there.
 pub const LOCATION_NOT_FOUND_CODE: &str = "LocationNotFound";
 
+/// The class discriminator DataSync reports for a request whose parameters it will not
+/// accept — a member outside the values the operation takes, or a dependency between
+/// members that the shapes alone cannot state.
+///
+/// Carried by both code members of the modelled client error, like every other refusal
+/// class of this service.
+pub const INVALID_PARAMETER_CODE: &str = "InvalidParameter";
+
 /// Why resolving a `LocationArn` against this service's state refused the request.
 ///
 /// Carries what the modelled client error reports: the message, and the class
