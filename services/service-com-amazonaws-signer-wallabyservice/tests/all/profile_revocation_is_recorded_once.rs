@@ -156,8 +156,6 @@ struct Repeat {
     effective_time: i64,
     /// The identity that signs it.
     access_key: &'static str,
-    /// Name the profile's FIRST version rather than its latest.
-    names_older_version: bool,
 }
 
 /// A profile to revoke once and then revoke again, with the repeats to perform.
@@ -181,7 +179,6 @@ fn repeat_cases() -> Vec<RepeatCase> {
                 reason: "second call",
                 effective_time: 2_000_000_000,
                 access_key: FIRST_REVOKER_KEY,
-                names_older_version: false,
             }],
         },
         // EARLIER than the recorded one.
@@ -193,7 +190,6 @@ fn repeat_cases() -> Vec<RepeatCase> {
                 reason: "re-revoked from an earlier instant",
                 effective_time: 1_000_000_000,
                 access_key: FIRST_REVOKER_KEY,
-                names_older_version: false,
             }],
         },
         // The SAME effective instant, a different reason: the reason must not be
@@ -206,7 +202,6 @@ fn repeat_cases() -> Vec<RepeatCase> {
                 reason: "x",
                 effective_time: 1_700_000_000,
                 access_key: FIRST_REVOKER_KEY,
-                names_older_version: false,
             }],
         },
         // Three repeats, including the epoch and a far-future instant: the record
@@ -220,34 +215,18 @@ fn repeat_cases() -> Vec<RepeatCase> {
                     reason: "second call",
                     effective_time: 0,
                     access_key: FIRST_REVOKER_KEY,
-                    names_older_version: false,
                 },
                 Repeat {
                     reason: "third call",
                     effective_time: 4_000_000_000,
                     access_key: OTHER_REVOKER_KEY,
-                    names_older_version: true,
                 },
                 Repeat {
                     reason: "fourth call",
                     effective_time: 1_600_000_001,
                     access_key: FIRST_REVOKER_KEY,
-                    names_older_version: false,
                 },
             ],
-        },
-        // The repeat names an OLDER version of the same profile: still the same
-        // already-revoked profile, so still nothing to restate.
-        RepeatCase {
-            name: "Repeat_Older_Version",
-            first_reason: "revoked on the latest version",
-            first_effective_time: 1_500_000_000,
-            repeats: vec![Repeat {
-                reason: "revoked again on an older version",
-                effective_time: 1_900_000_000,
-                access_key: FIRST_REVOKER_KEY,
-                names_older_version: true,
-            }],
         },
         // The repeat is signed by ANOTHER identity: the recorded revoker is the
         // one that ended trust, not the latest caller.
@@ -259,7 +238,6 @@ fn repeat_cases() -> Vec<RepeatCase> {
                 reason: "revoked by somebody else",
                 effective_time: 1_850_000_000,
                 access_key: OTHER_REVOKER_KEY,
-                names_older_version: false,
             }],
         },
     ]
@@ -273,27 +251,19 @@ async fn a_repeated_revoke_leaves_the_first_record_standing() {
     let router = emulator();
 
     for case in repeat_cases() {
-        // Two puts, so the profile has an older version a repeat can name.
-        let first_put = put_profile(&router, case.name).await;
+        let created = put_profile(&router, case.name).await;
         assert_eq!(
-            first_put.status, 200,
+            created.status, 200,
             "case {}: seeding the profile: {} {:?}",
-            case.name, first_put.status, first_put.body
+            case.name, created.status, created.body
         );
-        let older_version = first_put.str_member("profileVersion");
-        let latest_put = put_profile(&router, case.name).await;
-        assert_eq!(
-            latest_put.status, 200,
-            "case {}: re-versioning the profile: {} {:?}",
-            case.name, latest_put.status, latest_put.body
-        );
-        let latest_version = latest_put.str_member("profileVersion");
+        let version = created.str_member("profileVersion");
 
         let first = revoke_profile(
             &router,
             FIRST_REVOKER_KEY,
             case.name,
-            &latest_version,
+            &version,
             case.first_reason,
             case.first_effective_time,
         )
@@ -339,16 +309,11 @@ async fn a_repeated_revoke_leaves_the_first_record_standing() {
         );
 
         for (ordinal, repeat) in case.repeats.iter().enumerate() {
-            let version = if repeat.names_older_version {
-                &older_version
-            } else {
-                &latest_version
-            };
             let again = revoke_profile(
                 &router,
                 repeat.access_key,
                 case.name,
-                version,
+                &version,
                 repeat.reason,
                 repeat.effective_time,
             )
@@ -391,9 +356,8 @@ async fn a_repeated_revoke_leaves_the_first_record_standing() {
             // keeps the version it had.
             assert_eq!(
                 after.str_member("profileVersion"),
-                latest_version,
-                "case {} repeat {ordinal}: expected the profile to keep its latest version, got \
-                 {:?}",
+                version,
+                "case {} repeat {ordinal}: expected the profile to keep its version, got {:?}",
                 case.name,
                 after.body["profileVersion"]
             );

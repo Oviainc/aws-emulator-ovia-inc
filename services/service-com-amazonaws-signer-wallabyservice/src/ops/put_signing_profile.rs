@@ -2,15 +2,15 @@
 
 //! @op PutSigningProfile
 //!
-//! Implemented: creates, or re-versions, the signing profile `profileName` names
-//! in [`crate::state::ComAmazonawsSignerWallabyserviceState::profiles`]. Every
+//! Implemented: creates the signing profile `profileName` names in
+//! [`crate::state::ComAmazonawsSignerWallabyserviceState::profiles`]. Every
 //! member of the answer is read back out of the stored record.
 //!
-//! Re-versioning keeps the profile's identity (same ARN, same creation time, same
-//! opaque id) and its version history, and it keeps the profile's revocation too:
-//! a name a `RevokeSigningProfile` moved to `Revoked` is still revoked after this
-//! call, with the same record of from which instant, why and by whom trust ended,
-//! so no version that revocation covers reads back as trusted again.
+//! A signing-profile name is taken by the create that first used it and is never
+//! released: a second create under a name this region's endpoint already holds a
+//! profile for is refused 400 `ValidationException` and leaves that profile — its
+//! version, its version ARN and its status — untouched, whatever lifecycle status
+//! it now holds.
 //!
 //! The answer also carries a `tags` member the model does not declare, holding
 //! the created profile's resource identity (`resourceArn`, `internalId`) — see
@@ -314,26 +314,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // A profile keeps its identity across puts — same name, same ARN, same
-        // creation time — and gains a version per put, so the version this call
-        // returns is new even for a name that already exists. "Same name" is
-        // per REGION: this put re-versions the profile of this region's endpoint,
-        // and creates a new one when only another region holds that name.
-        let existing = store.profile(&region, &input.profile_name);
-        let created_at = existing.map_or(now, |profile| profile.created_at);
-        let mut versions = existing
-            .map(|profile| profile.versions.clone())
-            .unwrap_or_default();
-        // The opaque profile token is the profile's identity, not the version's:
-        // a name already in the store keeps the token it was created with, and a
-        // name that is new gets one minted now.
-        let existing_token = existing.map(|profile| profile.profile_token.clone());
+        // This operation CREATES a signing profile, and the name it creates it
+        // under is taken for good by the create that first used it: a second
+        // create naming a profile this endpoint already holds is refused for the
+        // name rather than storing a second profile or another version of the
+        // one stored. The name stays taken whatever lifecycle status that
+        // profile now holds — a `Canceled` or `Revoked` profile is still a
+        // profile of that name — because the store keeps its record. Refused
+        // HERE, before anything is written, so the stored profile's version, its
+        // version ARN and everything a client has pinned to them are left
+        // exactly as the create that took the name left them. "That name" is per
+        // REGION: Signer is regional, so this create is refused only by a
+        // profile of this region's endpoint, and a name only another region
+        // holds is free here.
+        if store.profile(&region, &input.profile_name).is_some() {
+            return Err(PutSigningProfileErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::profile_name_taken_message(
+                        &input.profile_name,
+                    )),
+                    code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let created_at = now;
         let profile_version = store.mint_profile_version();
-        versions.push(profile_version.clone());
-        let profile_token = match existing_token {
-            Some(token) => token,
-            None => store.mint_profile_token(),
-        };
+        // The opaque profile token is the profile's identity, minted by the one
+        // create that can ever store a profile under this name.
+        let profile_token = store.mint_profile_token();
 
         let arn = crate::state::profile_arn(&input.profile_name, &region);
         let profile_version_arn = format!("{arn}/{profile_version}");
@@ -360,16 +370,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default()
                 .into_iter()
                 .collect(),
-            // A profile this call created or re-versioned can sign: nothing in
-            // the request holds it back, and only `CancelSigningProfile` /
-            // `RevokeSigningProfile` move it off `Active`. A name that is
-            // already REVOKED is the one exception, and it is not decided here:
-            // the store carries that profile's revocation — its `Revoked`
-            // status, the reason it reports and the one revocation record — onto
-            // whatever replaces it
-            // ([`crate::state::ComAmazonawsSignerWallabyserviceState::insert_profile`]),
-            // because trust that has already ended is not restored by writing to
-            // the profile again.
+            // A profile this call created can sign: nothing in the request
+            // holds it back, and only `CancelSigningProfile` /
+            // `RevokeSigningProfile` move it off `Active`.
             status: crate::state::PROFILE_STATUS_ACTIVE.to_string(),
             // `statusReason` reports why a profile is not active, so an active
             // one carries none — and an active one has not been revoked, so it
@@ -378,7 +381,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             revocation_record: None,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             created_at,
-            versions,
             // The key pair this version's payload signatures are made under is
             // minted by the first `SignPayload` that signs with it, and nothing
             // this call stores is signed with it yet.

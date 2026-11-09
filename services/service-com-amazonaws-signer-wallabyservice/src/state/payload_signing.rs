@@ -13,9 +13,8 @@
 //! look like one.
 //!
 //! The key pair belongs to the signing profile VERSION whose signatures it makes:
-//! a profile signs under the material of the version that was current when the
-//! signature was made, and a later `PutSigningProfile` mints another version with
-//! its own pair. The pair therefore lives on that version's own record
+//! a profile signs under the material of the version it holds. The pair therefore
+//! lives on that version's own record
 //! ([`SigningProfileRecord::payload_signing_key`]) and needs no store of its own.
 //! The private half is only ever read here, to make a signature; nothing puts it in
 //! a response, a log or a file, and [`PayloadSigningKey`]'s own `Debug` keeps it out
@@ -150,6 +149,18 @@ impl PayloadSigningKey {
     pub fn public_key_info(&self) -> &[u8] {
         &self.public_key_der
     }
+
+    /// The signature of `payload` under this pair, with the PUBLIC half a
+    /// verifier checks it against — the two halves of one answer, for a caller
+    /// that writes both into a signature envelope
+    /// ([`super::code_signing::signature_envelope`]).
+    ///
+    /// `None` for the reason [`Self::signature`] answers `None`: the provider
+    /// refused to sign, so the caller reports that nothing was signed rather than
+    /// handing over bytes that are not a signature.
+    pub fn signature_and_public_key(&self, payload: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        Some((self.signature(payload)?, self.public_key_der.clone()))
+    }
 }
 
 /// The ECDSA scheme a profile's payload signatures are made under: the encryption
@@ -224,9 +235,7 @@ impl SigningProfileRecord {
     ///
     /// Minted on first use and then kept for as long as the version's record lives:
     /// every signature of one profile version is made under one pair, so a client
-    /// holding the public half can verify every signature that version made. A
-    /// `PutSigningProfile` that re-versions the name replaces the record, and the
-    /// new version's first signature mints its own pair.
+    /// holding the public half can verify every signature that version made.
     ///
     /// `None` when this profile's platform names no signature scheme the provider
     /// implements ([`profile_signing_algorithm`]): there is then no key to sign
@@ -238,5 +247,25 @@ impl SigningProfileRecord {
                 Some(generate_payload_signing_key(profile_signing_algorithm(self)?)?);
         }
         self.payload_signing_key.as_ref()
+    }
+
+    /// The key pair the signatures of THIS version of the profile are made under,
+    /// taken OUT of the record — minting it when this version has signed nothing
+    /// yet.
+    ///
+    /// For a caller that has to sign without the store guard held, which a
+    /// code-signing job does: signing a whole object is CPU-bound work, and
+    /// running it while holding the lock over shared state would make one
+    /// caller's object the latency of every other caller's request
+    /// ([`super::code_signing::signed_artifact`] is where it runs instead). The
+    /// copy stays inside this process for the length of that one job: nothing
+    /// puts it in a response, a log or a file, and [`PayloadSigningKey`]'s own
+    /// `Debug` keeps the private half out of a formatted record.
+    ///
+    /// `None` for the reason [`Self::payload_signing_key`] answers `None`: this
+    /// profile's platform names no signature scheme the provider implements, so
+    /// there is no key to sign with.
+    pub fn signing_key_copy(&mut self) -> Option<PayloadSigningKey> {
+        self.payload_signing_key().cloned()
     }
 }

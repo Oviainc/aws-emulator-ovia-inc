@@ -7,6 +7,13 @@
 //! whose platform is published for the payload (container-image) workflow rather than
 //! this S3 one is refused instead.
 //!
+//! The job then DOES its work: the source object is read out of Amazon S3, signed
+//! under the profile version's key pair and written back at the destination as the
+//! signed artifact ([`crate::state::code_signing`]). What that work produced is
+//! what the completion the clock owes the job reports — `Succeeded` with a
+//! `signedObject` naming an object Amazon S3 serves, or `Failed` with the reason
+//! nothing was signed and no `signedObject` at all.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -202,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // when calling the StartSigningJob operation." The model cannot express
         // that `s3` is the only member either structure can carry, so a request
         // naming neither is refused here.
-        if input.source.s3.is_none() {
+        let Some(source) = input.source.s3.clone() else {
             return Err(StartSigningJobErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(
@@ -212,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
+        };
         if input
             .destination
             .s3
@@ -250,120 +257,242 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Signer is regional: a job signs with a profile of the region whose
         // endpoint started it, and the job belongs to that region too.
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
 
-        // `@idempotencyToken`: "All calls after the first that use this token
-        // return the same response as the first call." So a repeated token
-        // answers with the job it already started rather than starting a second.
-        if let Some(job) = store.job_for_token(&region, &input.client_request_token) {
-            return Ok(StartSigningJobOutput {
-                job_id: Some(job.job_id.clone()),
-                job_owner: Some(job.job_owner.clone()),
-            });
-        }
+        // Everything this call decides against the STORE is decided here, under
+        // the guard — including storing the job and claiming its idempotency
+        // token; the signing itself reads and writes Amazon S3, which is a call
+        // out of this handler and so is made with no guard held.
+        let (profile_name, platform_id, profile_version_arn, job_id) = {
+            let mut store = state.lock();
 
-        // `profileOwner` names the account that owns the profile. This emulator
-        // presents exactly one account, so any other owner's profile resolves to
-        // no profile at all.
-        if let Some(owner) = input.profile_owner.as_deref() {
-            if owner != ::engine::emulator_account_id() {
+            // `@idempotencyToken`: "All calls after the first that use this token
+            // return the same response as the first call." So a repeated token
+            // answers with the job it already started rather than starting a
+            // second.
+            if let Some(job) = store.job_for_token(&region, &input.client_request_token) {
+                return Ok(StartSigningJobOutput {
+                    job_id: Some(job.job_id.clone()),
+                    job_owner: Some(job.job_owner.clone()),
+                });
+            }
+
+            // `profileOwner` names the account that owns the profile. This
+            // emulator presents exactly one account, so any other owner's profile
+            // resolves to no profile at all.
+            if let Some(owner) = input.profile_owner.as_deref() {
+                if owner != ::engine::emulator_account_id() {
+                    return Err(profile_not_found(
+                        crate::state::signing_profile_owner_not_found_message(
+                            &input.profile_name,
+                            owner,
+                        ),
+                    ));
+                }
+            }
+
+            let Some(profile) = store.profile(&region, &input.profile_name).cloned() else {
                 return Err(profile_not_found(
-                    crate::state::signing_profile_owner_not_found_message(
-                        &input.profile_name,
-                        owner,
+                    crate::state::signing_profile_not_found_message(&input.profile_name),
+                ));
+            };
+            if !profile.can_sign() {
+                return Err(profile_cannot_sign(
+                    crate::state::profile_status_error_code(&profile.status),
+                    format!(
+                        "Signing profile {} is {} and cannot perform new signing jobs",
+                        profile.profile_name, profile.status
                     ),
                 ));
             }
-        }
 
-        let Some(profile) = store.profile(&region, &input.profile_name).cloned() else {
-            return Err(profile_not_found(
-                crate::state::signing_profile_not_found_message(&input.profile_name),
-            ));
-        };
-        if !profile.can_sign() {
-            return Err(profile_cannot_sign(
-                crate::state::profile_status_error_code(&profile.status),
-                format!(
-                    "Signing profile {} is {} and cannot perform new signing jobs",
-                    profile.profile_name, profile.status
-                ),
-            ));
-        }
+            // This operation runs ONE of AWS Signer's two signing workflows — the
+            // S3 source/destination one its documentation describes — and a
+            // signing platform is published for one workflow only
+            // ([`crate::state::SigningWorkflow`]): a profile on a platform
+            // published for the payload workflow is signed through `SignPayload`
+            // instead, so this call is refused for the platform rather than
+            // starting a job nothing in that workflow would ever run over S3.
+            // Judged after the profile's status, which refuses a profile that
+            // could start no job on any workflow, and before anything is written.
+            if !crate::state::platform_signs_through(&profile.platform_id, WORKFLOW) {
+                return Err(StartSigningJobErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::workflow_unsupported_message(
+                            WORKFLOW,
+                            &profile.platform_id,
+                        )),
+                        code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
+                    },
+                )
+                .into());
+            }
 
-        // This operation runs ONE of AWS Signer's two signing workflows — the S3
-        // source/destination one its documentation describes — and a signing
-        // platform is published for one workflow only
-        // ([`crate::state::SigningWorkflow`]): a profile on a platform published
-        // for the payload workflow is signed through `SignPayload` instead, so
-        // this call is refused for the platform rather than starting a job
-        // nothing in that workflow would ever run over S3. Judged after the
-        // profile's status, which refuses a profile that could start no job on
-        // any workflow, and before anything is written.
-        const WORKFLOW: crate::state::SigningWorkflow =
-            crate::state::SigningWorkflow::CodeSigningJob;
-        if !crate::state::platform_signs_through(&profile.platform_id, WORKFLOW) {
-            return Err(StartSigningJobErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(crate::state::workflow_unsupported_message(
-                        WORKFLOW,
-                        &profile.platform_id,
-                    )),
-                    code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
-                },
-            )
-            .into());
-        }
+            // The job is STORED now, before its work runs, and the
+            // `clientRequestToken` is recorded with it: the token is what makes a
+            // repeated call answer with this job instead of starting a second
+            // one, so it is claimed under the same guard that found it free.
+            // What the job runs with is fixed here too, read off the profile as
+            // it stands.
+            let job_id = store.mint_job_id();
+            let profile_name = profile.profile_name.clone();
+            let platform_id = profile.platform_id.clone();
+            let profile_version_arn = profile.profile_version_arn.clone();
+            let job = crate::state::SigningJobRecord {
+                job_id: job_id.clone(),
+                region: region.clone(),
+                profile_name: profile.profile_name,
+                profile_version: profile.profile_version,
+                platform_id: profile.platform_id,
+                platform_display_name: profile.platform_display_name,
+                signing_material: profile.signing_material,
+                // The period the signature this job produces is valid for, taken
+                // from the profile version the job signs with.
+                signature_validity_period: profile.signature_validity_period,
+                signing_parameters: profile.signing_parameters,
+                overrides: profile.overrides,
+                source: Some(input.source),
+                destination: Some(input.destination.clone()),
+                // The signed object is reported once the completion falls due,
+                // and only for a job whose artifact was written (see
+                // [`crate::state::SigningJobRecord::settle`]).
+                signed_object: None,
+                status: crate::state::JOB_STATUS_IN_PROGRESS.to_string(),
+                status_reason: None,
+                created_at: now,
+                completed_at: None,
+                // Nothing is owed yet: the clock starts owing this job its
+                // terminal status when the work that decides it has finished
+                // (below), so a job is never past due before anything was done.
+                completion_due: None,
+                pending_outcome: None,
+                requested_by,
+                job_owner: ::engine::emulator_account_id().to_string(),
+                job_invoker,
+                client_request_token: Some(input.client_request_token.clone()),
+                // A freshly started job's signature is trusted: the revocation
+                // record is what `RevokeSignature` writes, and only when it is
+                // called.
+                revocation_record: None,
+            };
+            store.insert_job(job);
+            store.record_job_token(&region, &input.client_request_token, job_id.clone());
 
-        // What the job runs with is fixed now: a later `PutSigningProfile` on the
-        // same name mints another version, and this job keeps reporting the one
-        // it started under.
-        let job_id = store.mint_job_id();
-        let job = crate::state::SigningJobRecord {
-            job_id: job_id.clone(),
-            region: region.clone(),
-            profile_name: profile.profile_name,
-            profile_version: profile.profile_version,
-            platform_id: profile.platform_id,
-            platform_display_name: profile.platform_display_name,
-            signing_material: profile.signing_material,
-            // The period the signature this job produces is valid for, taken
-            // from the profile version the job signs with: a later write to the
-            // same profile cannot move the expiry of a signature already made.
-            signature_validity_period: profile.signature_validity_period,
-            signing_parameters: profile.signing_parameters,
-            overrides: profile.overrides,
-            source: Some(input.source),
-            destination: Some(input.destination),
-            // The signed object exists once the signing finishes, so it is
-            // written by the completion the clock owes this job.
-            signed_object: None,
-            status: crate::state::JOB_STATUS_IN_PROGRESS.to_string(),
-            status_reason: None,
-            created_at: now,
-            completed_at: None,
-            completion_due: Some(now + crate::state::JOB_COMPLETION_SPAN),
-            requested_by,
-            job_owner: ::engine::emulator_account_id().to_string(),
-            job_invoker,
-            client_request_token: Some(input.client_request_token.clone()),
-            // A freshly started job's signature is trusted: the revocation record
-            // is what `RevokeSignature` writes, and only when it is called.
-            revocation_record: None,
+            (profile_name, platform_id, profile_version_arn, job_id)
         };
 
-        store.insert_job(job);
-        store.record_job_token(&region, &input.client_request_token, job_id.clone());
+        // THE JOB'S WORK: the source object is read out of Amazon S3, signed
+        // under the profile version's key pair and written back as the signed
+        // artifact. Its outcome — the artifact's location, or the sentence saying
+        // nothing was signed — is what the completion the clock owes the job
+        // reports, so until it is recorded below the job is `InProgress` and the
+        // clock owes it nothing.
+        let outcome = match sign_source_object(
+            ctx,
+            &state,
+            &StartedJob {
+                region: &region,
+                source: &source,
+                destination: &input.destination,
+                profile_name: &profile_name,
+                platform_id: &platform_id,
+                profile_version_arn: &profile_version_arn,
+                job_id: &job_id,
+            },
+        )
+        .await
+        {
+            Ok(signed_object) => crate::state::code_signing::JobOutcome::Signed(signed_object),
+            Err(reason) => crate::state::code_signing::JobOutcome::Failed(reason),
+        };
+
+        // The work has finished, so the clock starts owing the job its terminal
+        // status from HERE: a job whose work took longer than the span is not
+        // already past due the instant its outcome is known.
+        let completion_due = ::std::time::SystemTime::now() + crate::state::JOB_COMPLETION_SPAN;
+        let mut store = state.lock();
 
         // Reported out of the stored record, so this answer is what
-        // `DescribeSigningJob` resolves.
-        let stored = store
-            .jobs
-            .get(&job_id)
-            .expect("the job just inserted is in the store");
+        // `DescribeSigningJob` resolves. A job the store has since dropped (it
+        // keeps a bounded number of them) has nothing to record the outcome on,
+        // and the answer is still the job this call started.
+        let Some(stored) = store.record_job_outcome(&job_id, outcome, completion_due) else {
+            return Ok(StartSigningJobOutput {
+                job_id: Some(job_id),
+                job_owner: Some(::engine::emulator_account_id().to_string()),
+            });
+        };
         Ok(StartSigningJobOutput {
             job_id: Some(stored.job_id.clone()),
             job_owner: Some(stored.job_owner.clone()),
         })
     }
+}
+
+/// The workflow this operation serves: AWS Signer's two signing workflows take
+/// different operations, and this is the S3 source/destination one.
+const WORKFLOW: crate::state::SigningWorkflow = crate::state::SigningWorkflow::CodeSigningJob;
+
+/// The job this call started, as the work that signs it needs it: the region it
+/// belongs to, the object it signs, where the artifact goes, and what it signs
+/// with — each read off the stored record's own members.
+struct StartedJob<'a> {
+    region: &'a str,
+    source: &'a S3Source,
+    destination: &'a Destination,
+    profile_name: &'a str,
+    platform_id: &'a str,
+    profile_version_arn: &'a str,
+    job_id: &'a str,
+}
+
+/// Do the job's work: read the source object, sign it under the profile
+/// version's key pair, and write the signed artifact at the destination.
+///
+/// `Ok` is where the artifact landed — an object Amazon S3 serves, because this
+/// is the call that wrote it. `Err` is the `statusReason` the job reports for
+/// having signed nothing: a source object Amazon S3 would not hand over, one that
+/// is not a readable archive, a profile whose platform names no signature scheme
+/// this emulator can sign under, or a destination that would not take the
+/// artifact.
+///
+/// The store guard is taken only to reach the profile's key pair, and never
+/// across a call into Amazon S3 nor across the signing itself, which runs on a
+/// blocking worker ([`crate::state::code_signing::signed_artifact`]).
+async fn sign_source_object(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    state: &::engine::ServiceState<crate::state::ComAmazonawsSignerWallabyserviceState>,
+    job: &StartedJob<'_>,
+) -> Result<SignedObject, String> {
+    let source_bytes =
+        crate::state::code_signing::read_source_object(ctx, job.region, job.source).await?;
+    // The key pair of the profile version this job signs with, minted by this
+    // call when the version has signed nothing yet. Taken out of the record under
+    // the guard and no more: the signing happens off it.
+    let key = {
+        let mut store = state.lock();
+        store
+            .profile_mut(job.region, job.profile_name)
+            .and_then(crate::state::SigningProfileRecord::signing_key_copy)
+            .ok_or_else(|| {
+                format!(
+                    "No signature could be produced for signing profile {} on platform {}",
+                    job.profile_name, job.platform_id
+                )
+            })?
+    };
+    let artifact = crate::state::code_signing::signed_artifact(
+        source_bytes,
+        key,
+        job.profile_version_arn.to_string(),
+        job.job_id.to_string(),
+    )
+    .await?;
+    crate::state::code_signing::write_signed_object(
+        ctx,
+        job.region,
+        job.destination,
+        job.job_id,
+        artifact,
+    )
+    .await
 }

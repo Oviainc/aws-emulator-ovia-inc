@@ -20,7 +20,7 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -32,6 +32,26 @@ sha2 = { workspace = true }
 # signature `SignPayload` answers with is made by this library, over the caller's
 # payload, under the signing profile version's key pair.
 aws-lc-rs = "1"
+# A code-signing job READS the object it signs out of Amazon S3 and WRITES the
+# signed artifact back there, over the in-process callback into this same
+# emulator (`state::code_signing`): this is the client that builds, signs and
+# parses those two calls, which bind their input to a path, a query and headers
+# rather than to a body. It is constructed through the one shared builder every
+# service reaches S3 with (`service-common`'s `s3_client`).
+aws-sdk-s3 = { version = "1", default-features = false }
+service-common = { path = "../common" }
+# The source of a code-signing job is a .zip archive, and the signed artifact is
+# that archive with the signature envelope added as one entry. Read and written
+# with `deflate` alone — no other compression method is linked in — and never
+# extracted to a host path.
+zip = { version = "9", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+# Amazon S3 beside signer in the test router: a code-signing job reads the object
+# it signs out of S3 and writes the signed artifact back there, so the suites that
+# start a job seed and read those objects through S3's own front door
+# (`tests/all/code_signing_objects.rs`).
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

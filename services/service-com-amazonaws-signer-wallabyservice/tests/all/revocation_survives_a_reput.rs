@@ -1,33 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! A signing profile's revocation survives a later write to that profile, end to
-//! end over HTTP.
+//! A signing profile's revocation survives every later attempt to write to that
+//! profile, end to end over HTTP.
 //!
 //! The rule under test: a revocation is a fact about trust that has ALREADY
-//! ended, so no later write to the profile restores that trust — a
-//! `PutSigningProfile` on a name that is `Revoked` re-versions the profile and
-//! replaces what the request carries, and the profile still reads back `Revoked`,
-//! with the same `statusReason` and the same one revocation record
-//! (`revocationEffectiveFrom`, `revokedAt`, `revokedBy`) the revoking call wrote.
+//! ended, and a signing-profile name is taken for good by the create that first
+//! used it — so no later `PutSigningProfile` can replace a revoked profile with a
+//! trusted one. Each such create is refused `400 ValidationException`, and the
+//! revoked profile reads back unchanged: the same `Revoked` status, the same
+//! `statusReason`, the same one revocation record
+//! (`revocationEffectiveFrom`, `revokedAt`, `revokedBy`), the same identity (ARN,
+//! `profileToken`) and the same version it was revoked at.
 //! `revocationEffectiveFrom` is the instant after which signatures stop being
 //! trusted (`smithy_query(query="doc", shape="RevokeSigningProfileRequest",
-//! member="effectiveTime")`), so `GetRevocationStatus` still reports every
-//! version the profile has had as revoked for a signature made at or after it —
-//! including the version the write itself minted — and still reports none of them
-//! for a signature made before it.
+//! member="effectiveTime")`), so `GetRevocationStatus` still reports the
+//! profile's version as revoked for a signature made at or after it, and still
+//! reports nothing for one made before it.
 //!
-//! A profile nobody revoked has nothing to carry: a re-put of it leaves it
+//! A profile nobody revoked is just as untouched by the refused create: it stays
 //! `Active`, with no `statusReason`, no revocation record and nothing revoked.
 //!
-//! The rows differ along what the rule generalises over: how many writes arrive
+//! The rows differ along what the rule generalises over: how many creates arrive
 //! after the revocation, which platform each of them names (the same one, or
-//! another published one, which is what proves the write took effect), which
-//! version of the profile the revocation status is asked for (the one the revoke
-//! named, an older one, and one minted after it), where the signature's timestamp
-//! falls relative to the effective instant (one second before, exactly on it, one
-//! second after), the reason recorded (including `RevocationReasonString`'s
-//! `@length` minimum of 1 and maximum of 500), the effective instant, and the
-//! region the requests are signed for.
+//! another published one), where the signature's timestamp falls relative to the
+//! effective instant (one second before, exactly on it, one second after), the
+//! reason recorded (including `RevocationReasonString`'s `@length` minimum of 1
+//! and maximum of 500), the effective instant, and the region the requests are
+//! signed for.
 
 use std::sync::Arc;
 
@@ -48,6 +47,13 @@ const ACCOUNT_ID: &str = "000000000000";
 /// An ACM certificate ARN for `signingMaterial`, so a profile can be created on
 /// every published platform, including the ones that require it.
 const CERTIFICATE_ARN: &str = "arn:aws:acm:us-west-2:000000000000:certificate/abc";
+
+/// The status a second create under a name this endpoint already holds answers,
+/// and the error shape and `code` it carries: a refusal of the request's own
+/// values.
+const TAKEN_NAME_STATUS: u16 = 400;
+/// The error shape that refusal is answered in.
+const TAKEN_NAME_SHAPE: &str = "ValidationException";
 
 /// One emulator: a router carrying only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
@@ -76,6 +82,11 @@ struct Answer {
 impl Answer {
     fn str_member(&self, member: &str) -> String {
         self.body[member].as_str().unwrap_or_default().to_string()
+    }
+
+    /// The wire error shape (`__type`), or the empty string on a success.
+    fn shape(&self) -> &str {
+        self.body["__type"].as_str().unwrap_or_default()
     }
 
     /// The `revokedEntities` list, as the strings it carries.
@@ -197,8 +208,9 @@ async fn revocation_status_of(
         .expect("an epoch-based instant renders as date-time");
     // An SDK sends `:` and `/` unescaped on the query string, which is how an ARN
     // and an ISO 8601 instant arrive.
-    let job_arn =
-        format!("arn:aws:signer:{region}:{ACCOUNT_ID}:/signing-jobs/no-such-job-of-this-endpoint");
+    let job_arn = format!(
+        "arn:aws:signer:{region}:{ACCOUNT_ID}:/signing-jobs/00000000-0000-0000-0000-000000000000"
+    );
     let hash = {
         use sha2::Digest;
         format!(
@@ -214,17 +226,17 @@ async fn revocation_status_of(
     call(router, region, "GET", &uri, None).await
 }
 
-/// One revoked profile, and the writes that arrive after its revocation.
+/// One revoked profile, and the creates that are attempted after its revocation.
 struct Case {
     name: &'static str,
     region: &'static str,
     /// The platform the profile is created on.
     platform: &'static str,
-    /// The platform each write that lands AFTER the revocation names — one entry
-    /// per write, so a row also varies how many of them there are. Every id is a
-    /// published one (`SIGNING_PLATFORM_CATALOG`), so the write is accepted and
-    /// the stored `platformId` is what shows it took effect.
-    reputs: &'static [&'static str],
+    /// The platform each create that arrives AFTER the revocation names — one
+    /// entry per attempt, so a row also varies how many of them there are. Every
+    /// id is a published one (`SIGNING_PLATFORM_CATALOG`), so nothing but the
+    /// taken name can refuse the call.
+    attempts: &'static [&'static str],
     /// The reason the ONE revocation records.
     reason: String,
     /// The instant the revocation takes effect, as epoch seconds.
@@ -233,35 +245,36 @@ struct Case {
 
 fn cases() -> Vec<Case> {
     vec![
-        // One write, naming the SAME platform: the smallest re-put there is.
+        // One attempt, naming the SAME platform: the smallest repeated create
+        // there is.
         Case {
-            name: "Revoked_Then_Reput_Same_Platform",
+            name: "Revoked_Then_Recreated_Same_Platform",
             region: "us-west-2",
             platform: "AWSLambda-SHA384-ECDSA",
-            reputs: &["AWSLambda-SHA384-ECDSA"],
+            attempts: &["AWSLambda-SHA384-ECDSA"],
             reason: "key compromised".to_string(),
             effective_epoch_secs: 1_700_000_000,
         },
-        // One write naming ANOTHER published platform, and the shortest reason
+        // One attempt naming ANOTHER published platform, and the shortest reason
         // `RevocationReasonString` admits (`@length(min: 1)`).
         Case {
-            name: "Revoked_Then_Reput_Other_Platform",
+            name: "Revoked_Then_Recreated_Other_Platform",
             region: "eu-west-1",
             platform: "Notation-OCI-SHA384-ECDSA",
-            reputs: &["AWSIoTDeviceManagement-SHA256-ECDSA"],
+            attempts: &["AWSIoTDeviceManagement-SHA256-ECDSA"],
             reason: "x".to_string(),
             effective_epoch_secs: 1_000_000_000,
         },
-        // Three writes, across platforms, and the longest reason that shape
-        // admits (`@length(max: 500)`): the record is kept, not kept once.
+        // Three attempts, across platforms, and the longest reason that shape
+        // admits (`@length(max: 500)`): the name stays taken however often the
+        // create is retried.
         Case {
-            name: "Revoked_Then_Reput_Three_Times",
+            name: "Revoked_Then_Recreated_Three_Times",
             region: "us-east-1",
             // The revoke is seeded on this platform, so it is one that publishes
-            // the revocation capability; the writes that follow it name platforms
-            // that do not, which the revocation already recorded outlives.
+            // the revocation capability.
             platform: "AWSLambda-SHA384-ECDSA",
-            reputs: &[
+            attempts: &[
                 "AmazonFreeRTOS-Default",
                 "AmazonFreeRTOS-TI-CC3220SF",
                 "AWSIoTDeviceManagement-SHA256-ECDSA",
@@ -271,49 +284,40 @@ fn cases() -> Vec<Case> {
         },
         // A far-future effective instant, in a fourth region.
         Case {
-            name: "Revoked_Then_Reput_Future_Effective",
+            name: "Revoked_Then_Recreated_Future_Effective",
             region: "ap-southeast-1",
             platform: "AWSLambda-SHA384-ECDSA",
-            reputs: &["Notation-OCI-SHA384-ECDSA"],
+            attempts: &["Notation-OCI-SHA384-ECDSA"],
             reason: "certificate material leaked".to_string(),
             effective_epoch_secs: 4_000_000_000,
         },
     ]
 }
 
-/// A `PutSigningProfile` on a revoked profile re-versions it without restoring
-/// trust: the profile stays `Revoked` with the one record the revoke wrote, and
-/// every version it has had — the revoked one, the older ones and the ones the
-/// writes minted — is still reported as revoked for a signature made at or after
-/// the effective instant, and still not reported for one made before it.
+/// A `PutSigningProfile` under a revoked profile's name is refused and restores
+/// no trust: the profile stays `Revoked` with the one record the revoke wrote and
+/// the one version it was revoked at, which is still reported as revoked for a
+/// signature made at or after the effective instant and still not reported for
+/// one made before it.
 #[tokio::test]
-async fn a_reput_of_a_revoked_profile_keeps_its_revocation() {
+async fn a_recreate_of_a_revoked_profile_keeps_its_revocation() {
     for case in cases() {
         let router = emulator();
 
-        // Two versions before the revoke, so the profile already has an older
-        // one the revocation covers.
-        let first = put_profile(&router, case.region, case.name, case.platform).await;
+        let created = put_profile(&router, case.region, case.name, case.platform).await;
         assert_eq!(
-            first.status, 200,
+            created.status, 200,
             "case {:?}: seeding the profile: {} {:?}",
-            case.name, first.status, first.body
+            case.name, created.status, created.body
         );
-        let profile_arn = first.str_member("arn");
-        let mut versions = vec![first.str_member("profileVersion")];
-        let second = put_profile(&router, case.region, case.name, case.platform).await;
-        assert_eq!(
-            second.status, 200,
-            "case {:?}: re-versioning the profile: {} {:?}",
-            case.name, second.status, second.body
-        );
-        versions.push(second.str_member("profileVersion"));
+        let profile_arn = created.str_member("arn");
+        let version = created.str_member("profileVersion");
 
         let revoked = revoke_profile(
             &router,
             case.region,
             case.name,
-            versions.last().expect("the profile has a version"),
+            &version,
             &case.reason,
             case.effective_epoch_secs,
         )
@@ -324,7 +328,7 @@ async fn a_reput_of_a_revoked_profile_keeps_its_revocation() {
             case.name, revoked.status, revoked.body
         );
 
-        // The ONE revocation, as the profile reports it before any later write.
+        // The ONE revocation, as the profile reports it before any later create.
         let after_revoke = get_profile(&router, case.region, case.name).await;
         assert_eq!(
             after_revoke.str_member("status"),
@@ -341,154 +345,150 @@ async fn a_reput_of_a_revoked_profile_keeps_its_revocation() {
         );
         let profile_token = after_revoke.str_member("profileToken");
 
-        for (ordinal, platform) in case.reputs.iter().enumerate() {
-            let before_version = get_profile(&router, case.region, case.name)
-                .await
-                .str_member("profileVersion");
-            let reput = put_profile(&router, case.region, case.name, platform).await;
+        for (ordinal, platform) in case.attempts.iter().enumerate() {
+            let attempt = put_profile(&router, case.region, case.name, platform).await;
             assert_eq!(
-                reput.status, 200,
-                "case {:?} write {ordinal}: expected the put to answer 200, got {} {:?}",
-                case.name, reput.status, reput.body
+                attempt.status, TAKEN_NAME_STATUS,
+                "case {:?} attempt {ordinal}: expected HTTP {TAKEN_NAME_STATUS} for the taken \
+                 name, got {} {:?}",
+                case.name, attempt.status, attempt.body
             );
-            let minted = reput.str_member("profileVersion");
-            assert_ne!(
-                minted, before_version,
-                "case {:?} write {ordinal}: expected the put to mint a new version, got {minted:?}",
-                case.name
+            assert_eq!(
+                attempt.shape(),
+                TAKEN_NAME_SHAPE,
+                "case {:?} attempt {ordinal}: expected the error shape {TAKEN_NAME_SHAPE}, got \
+                 {:?}",
+                case.name,
+                attempt.body
             );
-            versions.push(minted.clone());
 
             let got = get_profile(&router, case.region, case.name).await;
-            // The write took effect: the version it minted and the platform it
-            // named are what the profile now reports.
+            // The refused create wrote nothing: the version, the platform, the
+            // status, the reason, the one record and the identity all stand.
             assert_eq!(
                 got.str_member("profileVersion"),
-                minted,
-                "case {:?} write {ordinal}: expected the stored version to be the minted one, \
-                 got {:?}",
+                version,
+                "case {:?} attempt {ordinal}: expected the stored version to be unchanged, got \
+                 {:?}",
                 case.name,
                 got.body["profileVersion"]
             );
             assert_eq!(
                 got.str_member("platformId"),
-                *platform,
-                "case {:?} write {ordinal}: expected the written platform {platform}, got {:?}",
+                case.platform,
+                "case {:?} attempt {ordinal}: expected the created platform {}, got {:?}",
                 case.name,
+                case.platform,
                 got.body["platformId"]
             );
-            // And it restored no trust: the status, the reason and the one
-            // record stand, on the same profile identity.
             assert_eq!(
                 got.str_member("status"),
                 "Revoked",
-                "case {:?} write {ordinal}: expected the profile to stay Revoked, got {:?}",
+                "case {:?} attempt {ordinal}: expected the profile to stay Revoked, got {:?}",
                 case.name,
                 got.body["status"]
             );
             assert_eq!(
                 got.str_member("statusReason"),
                 case.reason,
-                "case {:?} write {ordinal}: expected the revoke's reason to stand, got {:?}",
+                "case {:?} attempt {ordinal}: expected the revoke's reason to stand, got {:?}",
                 case.name,
                 got.body["statusReason"]
             );
             assert_eq!(
                 got.body["revocationRecord"], record,
-                "case {:?} write {ordinal}: expected the one revocation record to stand, got {:?} \
-                 instead of {record:?}",
+                "case {:?} attempt {ordinal}: expected the one revocation record to stand, got \
+                 {:?} instead of {record:?}",
                 case.name, got.body["revocationRecord"]
             );
             assert_eq!(
                 got.str_member("arn"),
                 profile_arn,
-                "case {:?} write {ordinal}: expected the profile ARN to be unchanged, got {:?}",
+                "case {:?} attempt {ordinal}: expected the profile ARN to be unchanged, got {:?}",
                 case.name,
                 got.body["arn"]
             );
             assert_eq!(
                 got.str_member("profileToken"),
                 profile_token,
-                "case {:?} write {ordinal}: expected the profile's id to be unchanged, got {:?}",
+                "case {:?} attempt {ordinal}: expected the profile's id to be unchanged, got {:?}",
                 case.name,
                 got.body["profileToken"]
             );
 
-            // Every version the profile has had, including the one this write
-            // minted, is still revoked from the effective instant on — and still
-            // trusted before it.
-            for version in &versions {
-                let version_arn = format!("{profile_arn}/{version}");
-                for (label, signature_epoch, revoked_then) in [
-                    ("one second before the effective instant", -1, false),
-                    ("exactly on the effective instant", 0, true),
-                    ("one second after the effective instant", 1, true),
-                ] {
-                    let answer = revocation_status_of(
-                        &router,
-                        case.region,
-                        platform,
-                        &version_arn,
-                        case.effective_epoch_secs + signature_epoch,
-                    )
-                    .await;
-                    assert_eq!(
-                        answer.status, 200,
-                        "case {:?} write {ordinal} version {version} {label}: expected \
-                         GetRevocationStatus 200, got {} {:?}",
-                        case.name, answer.status, answer.body
-                    );
-                    let expected: Vec<String> = if revoked_then {
-                        vec![version_arn.clone()]
-                    } else {
-                        Vec::new()
-                    };
-                    assert_eq!(
-                        answer.revoked_entities(),
-                        expected,
-                        "case {:?} write {ordinal} version {version} {label}: expected \
-                         revokedEntities {expected:?}, got {:?}",
-                        case.name,
-                        answer.body["revokedEntities"]
-                    );
-                }
+            // The profile's version is still revoked from the effective instant
+            // on — and still trusted before it.
+            let version_arn = format!("{profile_arn}/{version}");
+            for (label, signature_epoch, revoked_then) in [
+                ("one second before the effective instant", -1, false),
+                ("exactly on the effective instant", 0, true),
+                ("one second after the effective instant", 1, true),
+            ] {
+                let answer = revocation_status_of(
+                    &router,
+                    case.region,
+                    case.platform,
+                    &version_arn,
+                    case.effective_epoch_secs + signature_epoch,
+                )
+                .await;
+                assert_eq!(
+                    answer.status, 200,
+                    "case {:?} attempt {ordinal} {label}: expected GetRevocationStatus 200, got \
+                     {} {:?}",
+                    case.name, answer.status, answer.body
+                );
+                let expected: Vec<String> = if revoked_then {
+                    vec![version_arn.clone()]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(
+                    answer.revoked_entities(),
+                    expected,
+                    "case {:?} attempt {ordinal} {label}: expected revokedEntities {expected:?}, \
+                     got {:?}",
+                    case.name,
+                    answer.body["revokedEntities"]
+                );
             }
         }
     }
 }
 
 /// The other side of the rule: a profile nobody revoked has no revocation to
-/// carry, so a re-put of it reports `Active`, no `statusReason`, no revocation
-/// record, and nothing revoked for any of its versions.
+/// carry, and the refused create leaves it exactly as it was — `Active`, no
+/// `statusReason`, no revocation record, the version it was created with, and
+/// nothing revoked for it.
 #[tokio::test]
-async fn a_reput_of_a_never_revoked_profile_keeps_it_trusted() {
-    // (case, region, the platform of the create, the platform each later write
-    // names) — rows differ in how many writes arrive and whether they change the
-    // platform.
+async fn a_recreate_of_a_never_revoked_profile_keeps_it_trusted() {
+    // (case, region, the platform of the create, the platform each later attempt
+    // names) — rows differ in how many attempts arrive and whether they name
+    // another platform.
     let rows: [(&str, &str, &str, &[&str]); 3] = [
         (
-            "one write, same platform",
+            "one attempt, same platform",
             "us-west-2",
             "AWSLambda-SHA384-ECDSA",
             &["AWSLambda-SHA384-ECDSA"],
         ),
         (
-            "one write, another platform",
+            "one attempt, another platform",
             "eu-west-1",
             "Notation-OCI-SHA384-ECDSA",
             &["AmazonFreeRTOS-Default"],
         ),
         (
-            "two writes",
+            "two attempts",
             "us-east-1",
             "AWSIoTDeviceManagement-SHA256-ECDSA",
             &["AmazonFreeRTOS-TI-CC3220SF", "AWSLambda-SHA384-ECDSA"],
         ),
     ];
 
-    for (case, region, platform, reputs) in rows {
+    for (case, region, platform, attempts) in rows {
         let router = emulator();
-        let name = "Never_Revoked_Then_Reput";
+        let name = "Never_Revoked_Then_Recreated";
         let created = put_profile(&router, region, name, platform).await;
         assert_eq!(
             created.status, 200,
@@ -496,56 +496,58 @@ async fn a_reput_of_a_never_revoked_profile_keeps_it_trusted() {
             created.status, created.body
         );
         let profile_arn = created.str_member("arn");
-        let mut versions = vec![created.str_member("profileVersion")];
+        let version = created.str_member("profileVersion");
 
-        for (ordinal, written) in reputs.iter().enumerate() {
-            let reput = put_profile(&router, region, name, written).await;
+        for (ordinal, written) in attempts.iter().enumerate() {
+            let attempt = put_profile(&router, region, name, written).await;
             assert_eq!(
-                reput.status, 200,
-                "case {case:?} write {ordinal}: expected the put to answer 200, got {} {:?}",
-                reput.status, reput.body
+                attempt.status, TAKEN_NAME_STATUS,
+                "case {case:?} attempt {ordinal}: expected HTTP {TAKEN_NAME_STATUS} for the taken \
+                 name, got {} {:?}",
+                attempt.status, attempt.body
             );
-            versions.push(reput.str_member("profileVersion"));
 
             let got = get_profile(&router, region, name).await;
             assert_eq!(
                 got.str_member("status"),
                 "Active",
-                "case {case:?} write {ordinal}: expected an unrevoked profile to stay Active, \
+                "case {case:?} attempt {ordinal}: expected an unrevoked profile to stay Active, \
                  got {:?}",
                 got.body["status"]
             );
+            assert_eq!(
+                got.str_member("profileVersion"),
+                version,
+                "case {case:?} attempt {ordinal}: expected the stored version to be unchanged, \
+                 got {:?}",
+                got.body["profileVersion"]
+            );
             assert!(
                 got.body["statusReason"].is_null(),
-                "case {case:?} write {ordinal}: expected no statusReason on an Active profile, \
+                "case {case:?} attempt {ordinal}: expected no statusReason on an Active profile, \
                  got {:?}",
                 got.body["statusReason"]
             );
             assert!(
                 got.body["revocationRecord"].is_null(),
-                "case {case:?} write {ordinal}: expected no revocation record on a profile \
+                "case {case:?} attempt {ordinal}: expected no revocation record on a profile \
                  nobody revoked, got {:?}",
                 got.body["revocationRecord"]
             );
 
-            for version in &versions {
-                let version_arn = format!("{profile_arn}/{version}");
-                let answer =
-                    revocation_status_of(&router, region, written, &version_arn, 1_700_000_000)
-                        .await;
-                assert_eq!(
-                    answer.status, 200,
-                    "case {case:?} write {ordinal} version {version}: expected \
-                     GetRevocationStatus 200, got {} {:?}",
-                    answer.status, answer.body
-                );
-                assert!(
-                    answer.revoked_entities().is_empty(),
-                    "case {case:?} write {ordinal} version {version}: expected nothing revoked, \
-                     got {:?}",
-                    answer.body["revokedEntities"]
-                );
-            }
+            let version_arn = format!("{profile_arn}/{version}");
+            let answer =
+                revocation_status_of(&router, region, platform, &version_arn, 1_700_000_000).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?} attempt {ordinal}: expected GetRevocationStatus 200, got {} {:?}",
+                answer.status, answer.body
+            );
+            assert!(
+                answer.revoked_entities().is_empty(),
+                "case {case:?} attempt {ordinal}: expected nothing revoked, got {:?}",
+                answer.body["revokedEntities"]
+            );
         }
     }
 }

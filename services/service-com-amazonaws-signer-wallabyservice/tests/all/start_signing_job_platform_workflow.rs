@@ -393,12 +393,12 @@ async fn the_container_image_refusal_does_not_depend_on_the_request_shape() {
     );
 }
 
-/// The refusal is a judgement about the profile's platform, not about the profile
-/// name: re-putting the same name onto a code-signing platform makes the very same
-/// request succeed, and putting it back onto the container-image platform refuses
-/// it again.
+/// The refusal is a judgement about the profile's PLATFORM, not about the profile
+/// name: with one profile on a container-image platform and another on a
+/// code-signing platform, the very same request is refused for the first and
+/// served for the second — and the refusal names the platform it was refused for.
 #[tokio::test]
-async fn the_same_profile_name_starts_jobs_once_its_platform_signs_through_this_workflow() {
+async fn the_refusal_is_about_the_platform_and_not_the_profile_name() {
     let (router, _engine) = emulator();
     let container = SIGNING_PLATFORM_CATALOG
         .iter()
@@ -411,28 +411,35 @@ async fn the_same_profile_name_starts_jobs_once_its_platform_signs_through_this_
         .find(|id| !is_container_image_platform(id))
         .expect("the published catalog holds a code-signing platform");
 
-    let profile = "Reput_Workflow_Profile";
+    let on_container = "Workflow_Container_Profile";
     assert_eq!(
-        put_profile(&router, profile, container).await.status,
+        put_profile(&router, on_container, container).await.status,
         200,
         "seeding the container-image profile"
     );
-    let refused = start_job(&router, job_request(profile, "tok-before")).await;
+    let refused = start_job(&router, job_request(on_container, "tok-container")).await;
     assert_eq!(
         refused.status, 400,
         "expected the container-image platform to refuse, got {} {:?}",
         refused.status, refused.body
     );
-
     assert_eq!(
-        put_profile(&router, profile, code_signing).await.status,
-        200,
-        "re-putting the profile onto {code_signing}"
+        refused.message(),
+        format!("StartSigningJob is not supported for platform {container}"),
+        "expected the refusal to name the platform it was refused for, got {:?}",
+        refused.body["message"]
     );
-    let accepted = start_job(&router, job_request(profile, "tok-after")).await;
+
+    let on_code_signing = "Workflow_Signing_Profile";
+    assert_eq!(
+        put_profile(&router, on_code_signing, code_signing).await.status,
+        200,
+        "seeding the profile on {code_signing}"
+    );
+    let accepted = start_job(&router, job_request(on_code_signing, "tok-code-signing")).await;
     assert_eq!(
         accepted.status, 200,
-        "expected the re-put profile to start a job on {code_signing}, got {} {:?}",
+        "expected the profile on {code_signing} to start a job, got {} {:?}",
         accepted.status, accepted.body
     );
     let job_id = accepted.str_member("jobId");
@@ -442,25 +449,14 @@ async fn the_same_profile_name_starts_jobs_once_its_platform_signs_through_this_
         "expected the job to carry the platform it was started on"
     );
 
-    assert_eq!(
-        put_profile(&router, profile, container).await.status,
-        200,
-        "re-putting the profile back onto {container}"
-    );
-    let refused_again = start_job(&router, job_request(profile, "tok-again")).await;
+    // And a second refusal for the container-image profile starts nothing and
+    // removes nothing: the job started on the other platform still exists.
+    let refused_again = start_job(&router, job_request(on_container, "tok-container-again")).await;
     assert_eq!(
         refused_again.status, 400,
-        "expected the profile back on {container} to refuse again, got {} {:?}",
+        "expected the container-image profile to refuse again, got {} {:?}",
         refused_again.status, refused_again.body
     );
-    assert_eq!(
-        refused_again.message(),
-        format!("StartSigningJob is not supported for platform {container}"),
-        "expected the refusal to name the platform it is back on, got {:?}",
-        refused_again.body["message"]
-    );
-    // The job started while the name was on a code-signing platform keeps
-    // existing: the refusal starts nothing and removes nothing.
     assert_eq!(
         describe_job(&router, &job_id).await.status,
         200,

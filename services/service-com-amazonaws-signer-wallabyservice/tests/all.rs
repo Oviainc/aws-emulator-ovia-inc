@@ -17,6 +17,9 @@ mod absent_required_query_parameter;
 #[path = "all/cancel_profile_status_transitions.rs"]
 mod cancel_profile_status_transitions;
 
+#[path = "all/code_signing_objects.rs"]
+mod code_signing_objects;
+
 #[path = "all/error_responses.rs"]
 mod error_responses;
 
@@ -58,6 +61,9 @@ mod profile_listing_pagination;
 
 #[path = "all/profile_permissions.rs"]
 mod profile_permissions;
+
+#[path = "all/profile_name_is_reserved.rs"]
+mod profile_name_is_reserved;
 
 #[path = "all/profile_revocation_and_identity.rs"]
 mod profile_revocation_and_identity;
@@ -106,6 +112,9 @@ mod signature_expiry;
 
 #[path = "all/signature_revocation.rs"]
 mod signature_revocation;
+
+#[path = "all/signing_job_artifact.rs"]
+mod signing_job_artifact;
 
 #[path = "all/signing_platform_catalog.rs"]
 mod signing_platform_catalog;

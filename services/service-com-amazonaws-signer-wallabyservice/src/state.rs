@@ -4,15 +4,17 @@
 //!
 //! AWS Signer has two resources, and both live here:
 //!
-//! * a **signing profile** — the code-signing template `PutSigningProfile` mints a
-//!   version of, `GetSigningProfile` / `ListSigningProfiles` report,
-//!   `CancelSigningProfile` moves to `Canceled` and `RevokeSigningProfile` moves
-//!   to `Revoked` (Signer never hard-deletes a profile, so there is no removal
-//!   path);
+//! * a **signing profile** — the code-signing template `PutSigningProfile`
+//!   creates under a name it then holds for good, `GetSigningProfile` /
+//!   `ListSigningProfiles` report, `CancelSigningProfile` moves to `Canceled` and
+//!   `RevokeSigningProfile` moves to `Revoked` (Signer never hard-deletes a
+//!   profile, so there is no removal path);
 //! * a **signing job** — started by `StartSigningJob` against a profile whose
 //!   platform, version and signing material it SNAPSHOTS, reported by
 //!   `DescribeSigningJob`, and carrying the revocation `RevokeSignature` records
-//!   on it once its signature is no longer trusted.
+//!   on it once its signature is no longer trusted. What the job's work produced
+//!   — the signed artifact it wrote at the destination, or the reason it wrote
+//!   none — is what its terminal status reports (see [`code_signing`]).
 //!
 //! Every handler reads and writes the one record below through [`service_state`];
 //! nothing in this service answers from a literal.
@@ -25,8 +27,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Destination, EncryptionAlgorithmOptions, HashAlgorithmOptions, S3SignedObject,
-    SignatureValidityPeriod, SignedObject, SigningConfiguration, SigningImageFormat, SigningJob,
+    Destination, EncryptionAlgorithmOptions, HashAlgorithmOptions, SignatureValidityPeriod,
+    SignedObject, SigningConfiguration, SigningImageFormat, SigningJob,
     SigningJobRevocationRecord, SigningMaterial, SigningPlatform, SigningPlatformOverrides,
     SigningProfile, SigningProfileRevocationRecord, Source,
 };
@@ -92,8 +94,13 @@ pub fn profile_status_error_code(status: &str) -> String {
 /// `SigningStatus`'s values, spelled as the model spells them (see
 /// [`crate::ops::types::SIGNING_STATUS_VALUES`]).
 pub const JOB_STATUS_IN_PROGRESS: &str = "InProgress";
-/// The status a signing job reports once the clock has made its completion due.
+/// The status a signing job reports once its completion is due and it produced
+/// the signed artifact it was started for.
 pub const JOB_STATUS_SUCCEEDED: &str = "Succeeded";
+/// The status a signing job reports once its completion is due and it produced
+/// nothing — the `statusReason` saying why (see
+/// [`code_signing::JobOutcome::Failed`]).
+pub const JOB_STATUS_FAILED: &str = "Failed";
 
 /// The most signing jobs this store keeps.
 ///
@@ -318,13 +325,9 @@ pub struct SigningProfileRecord {
     ///
     /// It lives on the version's own record, so it exists exactly as long as the
     /// version a signature was made under does and nothing else has to be kept in
-    /// step with it: a `PutSigningProfile` that re-versions this name stores a new
-    /// record, whose first payload signature mints the pair of that version (see
-    /// [`payload_signing::PayloadSigningKey`] and [`Self::payload_signing_key`]).
+    /// step with it (see [`payload_signing::PayloadSigningKey`] and
+    /// [`Self::payload_signing_key`]).
     pub payload_signing_key: Option<payload_signing::PayloadSigningKey>,
-    /// Every version this profile has had, oldest first; the last is
-    /// [`Self::profile_version`].
-    pub versions: Vec<String>,
 }
 
 impl SigningProfileRecord {
@@ -431,27 +434,6 @@ impl SigningProfileRecord {
         });
     }
 
-    /// Carry the revocation `previous` holds onto this record, which is about to
-    /// REPLACE it under the same name.
-    ///
-    /// A revocation is a fact about trust that has already ended (see
-    /// [`Self::revoke`]), so nothing a later caller writes to the profile restores
-    /// that trust: a profile that was revoked stays `Revoked` and keeps the one
-    /// record of from which instant, why and by whom trust ended, however much of
-    /// the rest of it the replacing write rebuilds. Every version the profile has
-    /// had therefore stays covered by it — which is what
-    /// [`Self::version_revoked_at`] reports — rather than becoming trusted again
-    /// because the profile was written to. A `previous` nobody has revoked carries
-    /// nothing to keep.
-    pub fn carry_revocation_forward(&mut self, previous: &Self) {
-        if !previous.is_revoked() {
-            return;
-        }
-        self.status = previous.status.clone();
-        self.status_reason = previous.status_reason.clone();
-        self.revocation_record = previous.revocation_record.clone();
-    }
-
     /// This profile's ARN for `version` — the `profileVersionArn` a read of that
     /// version reports, which is the profile's own ARN with the version after it
     /// (see [`Self::profile_version_arn`], the same form for the current one).
@@ -459,22 +441,32 @@ impl SigningProfileRecord {
         format!("{}/{version}", self.arn)
     }
 
+    /// Whether `version` is a version of THIS profile.
+    ///
+    /// A signing-profile name is taken by the create that first used it and is
+    /// never released, so the one create that could ever store a profile under
+    /// this name minted the one version it has: a request naming any other
+    /// version names no version of this profile.
+    pub fn holds_version(&self, version: &str) -> bool {
+        version == self.profile_version
+    }
+
     /// Whether this profile's revocation leaves a signature that `version`
     /// produced at `signature_timestamp` untrusted.
     ///
     /// `RevokeSigningProfile` revokes the PROFILE — it moves the profile itself
     /// to `Revoked` and records ONE revocation record on it — so the revocation
-    /// covers every version the profile has had, from the
-    /// `revocationEffectiveFrom` instant the caller named: "the time when
-    /// revocation becomes effective", so a signature made at or after it is no
-    /// longer trusted while one made before it keeps its validity. A version this
-    /// profile has never had names nothing that record covers.
+    /// covers the version the profile has, from the `revocationEffectiveFrom`
+    /// instant the caller named: "the time when revocation becomes effective", so
+    /// a signature made at or after it is no longer trusted while one made before
+    /// it keeps its validity. A version this profile does not hold
+    /// ([`Self::holds_version`]) names nothing that record covers.
     pub fn version_revoked_at(
         &self,
         version: &str,
         signature_timestamp: &::aws_smithy_types::DateTime,
     ) -> bool {
-        if !self.versions.iter().any(|held| held == version) {
+        if !self.holds_version(version) {
             return false;
         }
         let Some(record) = self.revocation_record.as_ref() else {
@@ -536,9 +528,10 @@ pub struct SigningJobRecord {
     /// [`Self::source`]: a payload-signed job writes no object, so it names no
     /// destination.
     pub destination: Option<Destination>,
-    /// The signed image this job wrote, which exists only for a job that has a
-    /// destination to write one to and has finished writing it (see
-    /// [`Self::settle`]).
+    /// The signed image this job wrote, which exists only for a job that wrote
+    /// one: it is set from the work the job actually did (see [`Self::settle`]
+    /// and [`code_signing::JobOutcome`]), so a job reporting one always names an
+    /// object Amazon S3 serves.
     pub signed_object: Option<SignedObject>,
     pub signing_material: Option<SigningMaterial>,
     pub signing_parameters: BTreeMap<String, String>,
@@ -551,6 +544,16 @@ pub struct SigningJobRecord {
     /// The instant the clock owes this job its terminal status, while it is still
     /// `InProgress`.
     pub completion_due: Option<SystemTime>,
+    /// What this job's work produced, held until the completion the clock owes
+    /// the job falls due ([`Self::settle`]) and the job reports it.
+    ///
+    /// A code-signing job does its work — read the source object, sign it, write
+    /// the artifact — when it is STARTED, and the outcome of that work is what
+    /// decides its terminal status: there is no second actor to run it later, and
+    /// a status is never reported for work nothing did. `None` for a job that is
+    /// already terminal when it is stored (a payload signature exists by the time
+    /// `SignPayload` answers).
+    pub pending_outcome: Option<code_signing::JobOutcome>,
     pub requested_by: Option<String>,
     /// The `signatureValidityPeriod` of the profile version this job signs with,
     /// SNAPSHOTTED when the job started — the period the signature this job
@@ -558,10 +561,10 @@ pub struct SigningJobRecord {
     /// [`Self::signature_expires_at`]).
     ///
     /// Snapshotted for the reason the platform, the profile version and the
-    /// signing material are: a later `PutSigningProfile` on the same name mints
-    /// another version, which may state another period, and this job's signature
-    /// still expires when the period it was made under says. `None` only for a
-    /// job whose profile stated no period at all.
+    /// signing material are: what a job reports it signed with is what it signed
+    /// with, read off the profile as it stood when the job started rather than
+    /// resolved again later. `None` only for a job whose profile stated no
+    /// period at all.
     pub signature_validity_period: Option<SignatureValidityPeriod>,
     pub job_owner: String,
     /// The AWS account that invoked this job — the account whose credentials made
@@ -590,6 +593,11 @@ impl SigningJobRecord {
     /// `completed_at` is the instant the job FELL DUE, not the instant somebody
     /// looked: the work finished whether or not anyone was reading, so two
     /// readers of the same job see the same completion time.
+    ///
+    /// WHICH terminal status it falls to is not decided here: it is the outcome of
+    /// the work the job already did ([`Self::pending_outcome`]), so a job reports
+    /// `Succeeded` and a signed object only where that object was written, and
+    /// `Failed` with the reason otherwise.
     pub fn settle(&mut self, now: SystemTime) {
         let Some(due) = self.completion_due else {
             return;
@@ -597,17 +605,26 @@ impl SigningJobRecord {
         if now < due {
             return;
         }
-        self.status = JOB_STATUS_SUCCEEDED.to_string();
         self.completed_at = Some(due);
-        // The signed image is written to the destination the job names, so a job
-        // that names none wrote none: its signature went back to the caller
-        // instead.
-        let signed_object = self
-            .destination
-            .as_ref()
-            .map(|destination| signed_object_of(destination, &self.job_id));
-        self.signed_object = signed_object;
         self.completion_due = None;
+        // A job the clock owes a completion was stored with the outcome of its
+        // work; a record carrying none produced nothing anybody can point at,
+        // which is this emulator's own fault and still a job that signed nothing.
+        match self
+            .pending_outcome
+            .take()
+            .unwrap_or_else(|| code_signing::JobOutcome::Failed(UNRECORDED_OUTCOME.to_string()))
+        {
+            code_signing::JobOutcome::Signed(signed_object) => {
+                self.status = JOB_STATUS_SUCCEEDED.to_string();
+                self.signed_object = Some(signed_object);
+            }
+            code_signing::JobOutcome::Failed(reason) => {
+                self.status = JOB_STATUS_FAILED.to_string();
+                self.status_reason = Some(reason);
+                self.signed_object = None;
+            }
+        }
     }
 
     /// Record the revocation of the signature this job produced: the job carries
@@ -655,12 +672,16 @@ impl SigningJobRecord {
     /// A signature is valid for the `signatureValidityPeriod` of the profile
     /// version that made it ([`Self::signature_validity_period`], the period
     /// snapshotted when the job started), counted from the instant the signature
-    /// exists at — which is when the job completed, the same instant the signed
-    /// object it covers is written at (see [`Self::settle`]). So a job that has
-    /// produced no signature yet reports no expiry, and once it has, every later
-    /// read reports the same instant: the completion instant is the one the clock
-    /// owed the job, not the one somebody looked at it.
+    /// exists at — which is when the job completed. So a job that has produced no
+    /// signature yet reports no expiry, and neither does one that produced none at
+    /// all: a `Failed` job signed nothing, so there is no signature of it to
+    /// expire. Once a job has signed, every later read reports the same instant:
+    /// the completion instant is the one the clock owed the job, not the one
+    /// somebody looked at it.
     pub fn signature_expires_at(&self) -> Option<::aws_smithy_types::DateTime> {
+        if self.status != JOB_STATUS_SUCCEEDED {
+            return None;
+        }
         let period = self.signature_validity_period.as_ref()?;
         let signed_at = self.completed_at?;
         signature_expiry(signed_at, period).map(to_timestamp)
@@ -702,6 +723,10 @@ pub mod permissions;
 /// signature `SignPayload` answers with.
 pub mod payload_signing;
 
+/// What a code-signing job READS from Amazon S3, what it WRITES there, and the
+/// terminal status that work gives it.
+pub mod code_signing;
+
 /// Per-service state for com-amazonaws-signer-wallabyservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSignerWallabyserviceState {
@@ -739,9 +764,8 @@ impl ComAmazonawsSignerWallabyserviceState {
     /// Mint an unused profile version matching `ProfileVersion`'s
     /// `^[a-zA-Z0-9]{10}$`.
     ///
-    /// Ten base-62 digits of a strictly increasing counter, so no two versions of
-    /// any profile collide and a second `PutSigningProfile` on one name always
-    /// yields a new version.
+    /// Ten base-62 digits of a strictly increasing counter, so the version one
+    /// create mints is never a version another create minted.
     pub fn mint_profile_version(&mut self) -> String {
         self.profile_version_seq = self.profile_version_seq.wrapping_add(1);
         base62_10(self.profile_version_seq)
@@ -802,18 +826,14 @@ impl ComAmazonawsSignerWallabyserviceState {
         self.profiles.get_mut(&profile_key(region, profile_name))
     }
 
-    /// Store `record` as `region`'s profile of that name, replacing whatever that
-    /// region held under it; another region's profile of the same name is left
-    /// alone.
+    /// Store `record` as `region`'s profile of that name.
     ///
-    /// Replacing is not un-revoking: the revocation the replaced profile holds is
-    /// carried onto `record` ([`SigningProfileRecord::carry_revocation_forward`]),
-    /// so no write to a name reported as revoked makes it trusted again.
-    pub fn insert_profile(&mut self, region: &str, mut record: SigningProfileRecord) {
+    /// The caller has already established that the region holds no profile under
+    /// the name ([`profile_name_taken_message`]): a signing-profile name is taken
+    /// by the create that first used it, so nothing here replaces a stored
+    /// profile.
+    pub fn insert_profile(&mut self, region: &str, record: SigningProfileRecord) {
         let key = profile_key(region, &record.profile_name);
-        if let Some(previous) = self.profiles.get(&key) {
-            record.carry_revocation_forward(previous);
-        }
         self.profiles.insert(key, record);
     }
 
@@ -942,6 +962,30 @@ impl ComAmazonawsSignerWallabyserviceState {
     pub fn record_job_token(&mut self, region: &str, client_request_token: &str, job_id: String) {
         self.job_tokens
             .insert((region.to_string(), client_request_token.to_string()), job_id);
+    }
+
+    /// Record what `job_id`'s work produced, and the instant from which the clock
+    /// owes that job its terminal status.
+    ///
+    /// The second half of starting a job: a job is stored before its work runs
+    /// (so the `clientRequestToken` that claimed it resolves straight away and no
+    /// second call repeats the work), and this is what the work's outcome is
+    /// written back through. The due instant is taken from the caller, which
+    /// takes it AFTER the work: a job whose work took longer than the span is not
+    /// already past due the moment its outcome is known.
+    ///
+    /// `None` for a job this store no longer holds — it keeps a bounded number
+    /// ([`MAX_RETAINED_JOBS`]) — which has nothing to record an outcome on.
+    pub fn record_job_outcome(
+        &mut self,
+        job_id: &str,
+        outcome: code_signing::JobOutcome,
+        completion_due: SystemTime,
+    ) -> Option<&SigningJobRecord> {
+        let job = self.jobs.get_mut(job_id)?;
+        job.pending_outcome = Some(outcome);
+        job.completion_due = Some(completion_due);
+        Some(job)
     }
 
     /// Store `job` as one of this store's signing jobs, keeping the store within
@@ -1154,14 +1198,15 @@ pub fn job_region_and_id_in_arn(arn: &str) -> Option<(&str, &str)> {
     (!job_id.is_empty() && !job_id.contains('/')).then_some((region, job_id))
 }
 
-/// Whether `arn` is a well-formed AWS Signer ARN at all — whatever resource it
-/// names, and whether or not such a resource exists.
+/// The refusal prose for a member that carries the ARN of one kind of resource
+/// and was given a value that is not a well-formed ARN of that kind.
 ///
-/// For a member a request carries an ARN in: a value that is not one is a value
-/// this service cannot resolve to any resource of its own, while a Signer ARN
-/// naming nothing stored is a resource that merely does not exist here.
-pub fn is_signer_arn(arn: &str) -> bool {
-    signer_region_and_resource(arn).is_some()
+/// The member is named because that is what the caller has to correct, and the
+/// value is stated whole: an `Arn` member is bounded by the modelled shape's
+/// `@length(20, 2048)`, so it is already limited when the boundary validator
+/// admits it (see [`stated_value`]).
+pub fn invalid_arn_message(member: &str, value: &str) -> String {
+    format!("Invalid {member}: {value}")
 }
 
 /// The region and the resource portion of `arn`, when `arn` is a well-formed AWS
@@ -1394,6 +1439,18 @@ pub fn cancel_refused_message(profile_name: &str) -> String {
     )
 }
 
+/// The refusal prose for a create under a `profileName` this region has already
+/// created a signing profile under.
+///
+/// A signing-profile name is taken by the first create that uses it and is never
+/// released, so the sentence states the condition of the NAME rather than of the
+/// profile's current status: a canceled or revoked profile still holds its name.
+/// `profileName` is bounded by its modelled shape (`ProfileName`,
+/// `@length(2..64)`), so it is stated as it arrived.
+pub fn profile_name_taken_message(profile_name: &str) -> String {
+    format!("Profile with name {profile_name} already exists")
+}
+
 /// The refusal prose for a tagging call on a profile whose status forbids it.
 pub fn tagging_refused_message(profile_name: &str, status: &str) -> String {
     format!(
@@ -1402,18 +1459,10 @@ pub fn tagging_refused_message(profile_name: &str, status: &str) -> String {
     )
 }
 
-/// Where Signer saved the signed code image: the destination bucket, under the
-/// destination prefix, named for the job that produced it.
-pub fn signed_object_of(destination: &Destination, job_id: &str) -> SignedObject {
-    let s3 = destination.s3.as_ref();
-    let prefix = s3.and_then(|s3| s3.prefix.clone()).unwrap_or_default();
-    SignedObject {
-        s3: Some(S3SignedObject {
-            bucket_name: s3.and_then(|s3| s3.bucket_name.clone()),
-            key: Some(format!("{prefix}{job_id}")),
-        }),
-    }
-}
+/// The `statusReason` of a job the store holds no outcome for — a job that
+/// reached its due instant carrying no record of what its work produced, so
+/// nothing can be pointed at as its artifact.
+const UNRECORDED_OUTCOME: &str = "The signing job recorded no outcome for its work";
 
 /// The `category` the AWS-owned code-signing platforms are published in — the
 /// IoT device-management and Lambda ones.

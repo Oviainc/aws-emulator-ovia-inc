@@ -18,9 +18,8 @@
 //!   modelled 404 and nothing else.
 //!
 //! The rows differ along what the rules generalise over: the status the profile
-//! is in when the cancel arrives, how it got there (including a re-put, which
-//! makes a canceled profile `Active` again and leaves a revoked one `Revoked`),
-//! the platform, and the region the request is signed for.
+//! is in when the cancel arrives, how it got there, the platform, and the region
+//! the request is signed for.
 
 use std::sync::Arc;
 
@@ -171,7 +170,7 @@ async fn cancel_profile(router: &MultiServiceRouter, region: &str, name: &str) -
     .await
 }
 
-/// Create (or re-version) a profile on `platform`, answering its current version.
+/// Create a profile on `platform`, answering the version the create minted.
 async fn put_profile(
     router: &MultiServiceRouter,
     region: &str,
@@ -226,11 +225,6 @@ enum Setup {
     Canceled,
     /// Created, then revoked.
     Revoked,
-    /// Created, canceled, then re-put — which re-versions it to `Active`.
-    CanceledThenReput,
-    /// Created, revoked, then re-put — which re-versions it but leaves the
-    /// revocation standing, so it is still `Revoked`.
-    RevokedThenReput,
 }
 
 /// One profile a cancel is sent to.
@@ -257,8 +251,8 @@ impl Case {
 }
 
 /// Every status a stored profile can be in when a cancel arrives
-/// (`SigningProfileStatus` is `Active | Canceled | Revoked`), reached two ways
-/// where a re-put can reach it, across four platforms and four regions.
+/// (`SigningProfileStatus` is `Active | Canceled | Revoked`), across four
+/// platforms and four regions.
 const CASES: &[Case] = &[
     Case {
         name: "Active_Lambda",
@@ -297,23 +291,21 @@ const CASES: &[Case] = &[
         status_after: "Revoked",
     },
     Case {
-        name: "Canceled_Then_Reput",
+        name: "Canceled_In_Another_Region",
         region: "us-west-2",
         platform: "AWSLambda-SHA384-ECDSA",
-        setup: Setup::CanceledThenReput,
-        status_before: "Active",
+        setup: Setup::Canceled,
+        status_before: "Canceled",
         status_after: "Canceled",
     },
     Case {
-        name: "Revoked_Then_Reput",
+        name: "Revoked_Container",
         region: "eu-west-1",
         // Seeded through a revoke, so the platform has to publish the revocation
         // capability (see `profile_revocation_capability.rs`).
         platform: "Notation-OCI-SHA384-ECDSA",
-        setup: Setup::RevokedThenReput,
-        // A re-put re-versions the profile without restoring trust in what the
-        // revocation untrusted, so the revoked status stands — and with it the
-        // refusal of the cancel.
+        setup: Setup::Revoked,
+        // A revocation is already-final, whatever platform the profile is on.
         status_before: "Revoked",
         status_after: "Revoked",
     },
@@ -324,7 +316,7 @@ async fn seed(router: &MultiServiceRouter, case: &Case) {
     let version = put_profile(router, case.region, case.name, case.platform).await;
     match case.setup {
         Setup::Put => {}
-        Setup::Canceled | Setup::CanceledThenReput => {
+        Setup::Canceled => {
             let first = cancel_profile(router, case.region, case.name).await;
             assert_eq!(
                 first.status, SUCCESS_STATUS,
@@ -332,7 +324,7 @@ async fn seed(router: &MultiServiceRouter, case: &Case) {
                 case.name, first.status, first.body
             );
         }
-        Setup::Revoked | Setup::RevokedThenReput => {
+        Setup::Revoked => {
             let revoked = revoke_profile(router, case.region, case.name, &version).await;
             assert_eq!(
                 revoked.status, 204,
@@ -340,12 +332,6 @@ async fn seed(router: &MultiServiceRouter, case: &Case) {
                 case.name, revoked.status, revoked.body
             );
         }
-    }
-    if matches!(
-        case.setup,
-        Setup::CanceledThenReput | Setup::RevokedThenReput
-    ) {
-        put_profile(router, case.region, case.name, case.platform).await;
     }
 
     let got = get_profile(router, case.region, case.name).await;

@@ -220,28 +220,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // Both ARNs name a resource of THIS service, so a value that is not an AWS
-        // Signer ARN at all is refused for the value it carried. A well-formed
-        // Signer ARN is not: the operation models no not-found, so an ARN naming a
-        // resource this endpoint holds none of — another account's, another
-        // region's, an id nothing was created under, a resource of another kind —
-        // is answered as a resource that is simply not revoked.
-        if !crate::state::is_signer_arn(&input.profile_version_arn) {
-            return Err(validation(format!(
-                "{} is not a valid signing profile version ARN",
-                input.profile_version_arn
+        // Both members name a resource of THIS service, and each names a resource
+        // of ONE kind: `profileVersionArn` "The version of a signing profile" and
+        // `jobArn` "The ARN of a signing job". So a value that is not a
+        // well-formed ARN of the kind its member names resolves to no resource
+        // this endpoint could hold and is refused for the value it carried, named
+        // by the member that carried it. A well-formed one is not: the operation
+        // models no not-found, so an ARN naming a resource this endpoint holds
+        // none of — another account's, another region's, an id nothing was
+        // created under — is answered as a resource that is simply not revoked.
+        let Some((_, profile_name, profile_version)) =
+            crate::state::profile_version_in_arn(&input.profile_version_arn)
+        else {
+            return Err(validation(crate::state::invalid_arn_message(
+                PROFILE_VERSION_ARN_QUERY,
+                &input.profile_version_arn,
             )));
-        }
-        if !crate::state::is_signer_arn(&input.job_arn) {
-            return Err(validation(format!(
-                "{} is not a valid signing job ARN",
-                input.job_arn
+        };
+        let Some((_, job_id_named)) = crate::state::job_region_and_id_in_arn(&input.job_arn) else {
+            return Err(validation(crate::state::invalid_arn_message(
+                JOB_ARN_QUERY,
+                &input.job_arn,
             )));
-        }
-        // The profile version and the job id the ARNs name, when they name one at
-        // all; `None` is a resource no record can cover.
-        let profile_version_named = crate::state::profile_version_in_arn(&input.profile_version_arn);
-        let job_named = crate::state::job_region_and_id_in_arn(&input.job_arn);
+        };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
@@ -268,11 +269,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The ARN has to be the one the stored profile's version carries, so a
         // version ARN naming another account's or another partition's profile of
         // the same name names no version this endpoint can report on.
-        if profile_version_named.is_some_and(|(_, profile_name, profile_version)| {
-            store.profile(&region, profile_name).is_some_and(|profile| {
-                profile.version_arn(profile_version) == input.profile_version_arn
-                    && profile.version_revoked_at(profile_version, &input.signature_timestamp)
-            })
+        if store.profile(&region, profile_name).is_some_and(|profile| {
+            profile.version_arn(profile_version) == input.profile_version_arn
+                && profile.version_revoked_at(profile_version, &input.signature_timestamp)
         }) {
             revoked_entities.push(input.profile_version_arn.clone());
         }
@@ -281,11 +280,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries when the signature was revoked and by whom, and no instant from
         // which the revocation takes effect, so the one signature that job
         // produced is untrusted whenever it was made.
-        if job_named.is_some_and(|(_, job_id)| {
-            store
-                .job(&region, job_id)
-                .is_some_and(|job| job.arn() == input.job_arn && job.is_revoked())
-        }) {
+        if store
+            .job(&region, job_id_named)
+            .is_some_and(|job| job.arn() == input.job_arn && job.is_revoked())
+        {
             revoked_entities.push(input.job_arn.clone());
         }
 
@@ -312,6 +310,14 @@ const CERTIFICATE_HASHES_QUERY: &str = "certificateHashes";
 /// The wire name of the `platformId` input member, as `@httpQuery` binds it —
 /// the name a refusal of that member states.
 const PLATFORM_ID_QUERY: &str = "platformId";
+
+/// The wire name of the `profileVersionArn` input member, as `@httpQuery` binds
+/// it — the name a refusal of that member states.
+const PROFILE_VERSION_ARN_QUERY: &str = "profileVersionArn";
+
+/// The wire name of the `jobArn` input member, as `@httpQuery` binds it — the
+/// name a refusal of that member states.
+const JOB_ARN_QUERY: &str = "jobArn";
 
 /// The modelled 400 for a request this operation cannot act on: a
 /// `certificateHashes` carrying nothing, a `platformId` naming no published

@@ -1103,35 +1103,37 @@ async fn a_resource_no_profile_or_policy_holds_is_refused_404() {
 }
 
 #[tokio::test]
-async fn a_new_profile_version_leaves_the_policy_and_its_revision_alone() {
+async fn a_refused_create_leaves_the_policy_and_its_revision_alone() {
     let router = emulator();
-    let first_version = seed_profile(&router, "Versioned_Profile").await;
+    let version = seed_profile(&router, "Versioned_Profile").await;
     let added = add_permission(
         &router,
         "Versioned_Profile",
         json!({
-            "statementId": "pinned-to-the-first-version",
+            "statementId": "pinned-to-the-profile-version",
             "action": GRANTABLE_ACTIONS[0],
             "principal": "123456789012",
-            "profileVersion": first_version,
+            "profileVersion": version,
         }),
     )
     .await;
     let before = list_permissions(&router, "Versioned_Profile").await;
 
-    // A second put mints a new version of the SAME profile; the policy is a
-    // resource of the profile, not of one of its versions.
-    let second_version = seed_profile(&router, "Versioned_Profile").await;
-    assert_ne!(
-        second_version, first_version,
-        "a second PutSigningProfile must mint a new version, got {second_version} twice"
+    // A second `PutSigningProfile` under the profile's name is refused — the name
+    // is taken by the create that first used it — and the policy, which is a
+    // resource of the profile rather than of the request, is untouched by it.
+    let refused = put_profile(&router, "Versioned_Profile").await;
+    assert_eq!(
+        refused.status, 400,
+        "expected the repeated create to be refused, got {} {:?}",
+        refused.status, refused.body
     );
 
     let after = list_permissions(&router, "Versioned_Profile").await;
     assert_eq!(
         after.permissions(),
         before.permissions(),
-        "expected the policy to survive a new profile version, got {:?} after {:?}",
+        "expected the policy to survive the refused create, got {:?} after {:?}",
         after.permissions(),
         before.permissions()
     );

@@ -77,12 +77,17 @@ fn signed_for(region: &str) -> String {
     )
 }
 
-/// One emulator: a router carrying only this service, over one shared engine.
+/// One emulator: this service and Amazon S3 over one shared engine.
+///
+/// A signing job of this workflow reads the object it signs out of Amazon S3 and
+/// writes the signed artifact back there, so the suite that seeds jobs mounts S3
+/// beside signer and seeds those objects through S3's own front door.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    super::code_signing_objects::mount_object_storage(&mut router, &engine);
     router
 }
 
@@ -168,21 +173,36 @@ async fn put_profile(router: &MultiServiceRouter, name: &str, platform_id: &str)
     .await
 }
 
-async fn start_job(router: &MultiServiceRouter, region: &str, profile_name: &str) -> Answer {
+async fn start_job(
+    router: &MultiServiceRouter,
+    region: &str,
+    profile_name: &str,
+    source_version: &str,
+) -> Answer {
     call(
         router,
         region,
         "POST",
         "/signing-jobs",
         Some(json!({
-            "source": { "s3": { "bucketName": "src", "key": "code.bin", "version": "1" } },
-            "destination": { "s3": { "bucketName": "dst" } },
+            "source": { "s3": {
+                "bucketName": SOURCE_BUCKET,
+                "key": SOURCE_KEY,
+                "version": source_version,
+            } },
+            "destination": { "s3": { "bucketName": DESTINATION_BUCKET } },
             "profileName": profile_name,
             "clientRequestToken": format!("tok-{region}-{profile_name}"),
         })),
     )
     .await
 }
+
+/// The source bucket a seeded job signs out of, the key in it, and the bucket the
+/// signed artifact is written to.
+const SOURCE_BUCKET: &str = "src";
+const SOURCE_KEY: &str = "code.zip";
+const DESTINATION_BUCKET: &str = "dst";
 
 async fn describe_job(router: &MultiServiceRouter, region: &str, job_id: &str) -> Answer {
     call(
@@ -211,8 +231,8 @@ async fn revoke_signature(
     .await
 }
 
-/// Seed a profile on `platform_id` and a signing job started from it, answering
-/// the job's id.
+/// Seed a profile on `platform_id`, the Amazon S3 objects a job of it reads and
+/// writes, and a signing job started from it — answering the job's id.
 async fn seed_job(router: &MultiServiceRouter, profile_name: &str, platform_id: &str) -> String {
     let put = put_profile(router, profile_name, platform_id).await;
     assert_eq!(
@@ -220,7 +240,15 @@ async fn seed_job(router: &MultiServiceRouter, profile_name: &str, platform_id: 
         "seeding profile {profile_name} on {platform_id}: got {} {:?}",
         put.status, put.body
     );
-    let started = start_job(router, REGION, profile_name).await;
+    let version = super::code_signing_objects::seed_signing_objects(
+        router,
+        REGION,
+        SOURCE_BUCKET,
+        SOURCE_KEY,
+        DESTINATION_BUCKET,
+    )
+    .await;
+    let started = start_job(router, REGION, profile_name, &version).await;
     assert_eq!(
         started.status, 200,
         "seeding a job from {profile_name}: got {} {:?}",

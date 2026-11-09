@@ -272,9 +272,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The signature is made over the caller's own payload bytes, under the key
-        // pair of the profile VERSION that is current now — the same version the
-        // job below records, so a later `PutSigningProfile` on this name cannot
-        // change what this signature was made with.
+        // pair of the profile VERSION the profile holds — the same version the job
+        // below records.
         let Some(signature) = profile
             .payload_signing_key()
             .and_then(|key| key.signature(&input.payload))
@@ -284,11 +283,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.profile_name, profile.platform_id
             )));
         };
-        // What the job reports it signed WITH is fixed now, member by member: a
-        // later `PutSigningProfile` on this name mints another version, and this
-        // job keeps reporting the one it signed under. Taken field by field rather
-        // than by cloning the profile, so the version's key material is never
-        // copied out of the record that holds it.
+        // What the job reports it signed WITH is snapshotted now, member by
+        // member: the job keeps reporting the profile version it signed under.
+        // Taken field by field rather than by cloning the profile, so the
+        // version's key material is never copied out of the record that holds it.
         //
         // The signature exists by the time this call answers, so the job that made
         // it is already terminal: nothing is owed to it by the clock, and the signed
@@ -316,6 +314,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             completed_at: Some(now),
             completion_due: None,
+            // Already terminal: the signature exists by the time this call
+            // answers, so there is no later outcome to report.
+            pending_outcome: None,
             requested_by,
             job_owner: ::engine::emulator_account_id().to_string(),
             job_invoker,

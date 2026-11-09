@@ -21,9 +21,9 @@
 //!   signatures and models no revocation of a certificate;
 //! * an entity this endpoint holds no record for — another region's resource,
 //!   another account's ARN, an id nothing was created under, a profile version
-//!   the profile never had — is not revoked, and so is a well-formed Signer ARN
-//!   naming a resource of another kind, while a value that is no Signer ARN at
-//!   all, or a `platformId` outside the published catalog, is the modelled 400;
+//!   the profile does not hold — is not revoked, while a value that is not a
+//!   well-formed ARN of the resource its own member names, or a `platformId`
+//!   outside the published catalog, is the modelled 400;
 //! * asking changes nothing: a second call answers the same list, and the
 //!   profile and job the question named read back unchanged;
 //! * a request that leaves a required query parameter out is the modelled 400
@@ -675,34 +675,20 @@ async fn a_profile_revocation_applies_from_its_effective_instant() {
     }
 }
 
-/// A profile's revocation covers every version it has had, and no version it has
-/// never had — and the records the answer is read from are the ones the profile
-/// and the job report.
+/// A profile's revocation covers the version it holds, and no version it does
+/// not — and the records the answer is read from are the ones the profile and the
+/// job report.
 #[tokio::test]
 async fn every_version_of_a_revoked_profile_is_revoked() {
     let router = emulator();
     let platform_id = job_signing_platform(0);
-    let first = seed(&router, REGION, "Versioned_Profile", platform_id).await;
-
-    // A second put of the same name mints a second version of the same profile.
-    let second = put_profile(&router, REGION, &first.profile_name, platform_id).await;
-    assert_eq!(
-        second.status, 200,
-        "putting a second version: got {} {:?}",
-        second.status, second.body
-    );
-    let second_version = second.str_member("profileVersion");
-    let second_version_arn = second.str_member("profileVersionArn");
-    assert_ne!(
-        second_version, first.profile_version,
-        "a second put must mint a new version, got {second_version:?} twice"
-    );
+    let seeded = seed(&router, REGION, "Versioned_Profile", platform_id).await;
 
     let revoked = revoke_profile(
         &router,
         REGION,
-        &first.profile_name,
-        &second_version,
+        &seeded.profile_name,
+        &seeded.profile_version,
         BASE_EPOCH_SECS,
     )
     .await;
@@ -713,7 +699,7 @@ async fn every_version_of_a_revoked_profile_is_revoked() {
     );
 
     // The profile reports the revocation that the answers below are read from.
-    let profile = get_profile(&router, REGION, &first.profile_name).await;
+    let profile = get_profile(&router, REGION, &seeded.profile_name).await;
     assert_eq!(
         profile.str_member("status"),
         "Revoked",
@@ -729,13 +715,16 @@ async fn every_version_of_a_revoked_profile_is_revoked() {
     // (case, the profile version ARN the request names, whether it is revoked)
     let unheld_version_arn = format!(
         "arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-profiles/{}/ZZZZZZZZZZ",
-        first.profile_name
+        seeded.profile_name
     );
     let rows: Vec<(&str, &str, bool)> = vec![
-        ("the version the revoke named", &second_version_arn, true),
-        ("an earlier version of it", &first.profile_version_arn, true),
         (
-            "a version the profile never had",
+            "the version the revoke named",
+            &seeded.profile_version_arn,
+            true,
+        ),
+        (
+            "a version the profile does not hold",
             &unheld_version_arn,
             false,
         ),
@@ -749,7 +738,7 @@ async fn every_version_of_a_revoked_profile_is_revoked() {
             at_offset_millis(0),
             platform_id,
             profile_version_arn,
-            &first.job_arn,
+            &seeded.job_arn,
             &hashes,
         )
         .await;
@@ -809,17 +798,6 @@ async fn entities_this_endpoint_holds_no_record_for_are_not_revoked() {
     );
     let unknown_job_arn = job_arn_for(REGION, ACCOUNT_ID, "00000000-0000-0000-0000-000000000000");
     let other_account_job_arn = job_arn_for(REGION, OTHER_ACCOUNT_ID, &here.job_id);
-    // Well-formed Signer ARNs that name a resource of another KIND, or carry a
-    // version outside `ProfileVersion`'s `^[a-zA-Z0-9]{10}$`: Signer ARNs, so not
-    // refused, and no revocable resource, so not revoked either.
-    let profile_arn_without_version = format!(
-        "arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-profiles/{}",
-        here.profile_name
-    );
-    let short_version_arn = format!(
-        "arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-profiles/{}/v1",
-        here.profile_name
-    );
     let rows: Vec<(&str, &str, &str, &str)> = vec![
         (
             "a profile name nothing was created under",
@@ -845,18 +823,6 @@ async fn entities_this_endpoint_holds_no_record_for_are_not_revoked() {
             &here.profile_version_arn,
             &here.job_arn,
         ),
-        (
-            "a profile ARN carrying no version, and a job ARN naming a profile",
-            REGION,
-            &profile_arn_without_version,
-            &here.profile_version_arn,
-        ),
-        (
-            "a version outside the modelled profile-version form",
-            REGION,
-            &short_version_arn,
-            &unknown_job_arn,
-        ),
     ];
 
     let hashes = vec![certificate_hash("child", "root")];
@@ -879,8 +845,9 @@ async fn entities_this_endpoint_holds_no_record_for_are_not_revoked() {
     }
 }
 
-/// A value that is no AWS Signer ARN at all, and a `platformId` outside the
-/// published catalog, are the modelled 400 — naming the value that was refused.
+/// A value that is not a well-formed ARN of the resource ITS MEMBER names, and a
+/// `platformId` outside the published catalog, are the modelled 400 — naming the
+/// value that was refused.
 #[tokio::test]
 async fn values_naming_no_signer_resource_are_refused() {
     let router = emulator();
@@ -902,6 +869,20 @@ async fn values_naming_no_signer_resource_are_refused() {
         seeded.job_id
     );
     let not_an_arn = "x".repeat(32);
+    // A Signer ARN whose resource portion names no resource of this service at
+    // all, and ARNs of the WRONG KIND for the member that carries them: a
+    // `profileVersionArn` is the ARN of a signing profile VERSION and a `jobArn`
+    // the ARN of a signing job, so neither admits the other's form.
+    let shapeless_signer_arn =
+        format!("arn:aws:signer:{REGION}:{ACCOUNT_ID}:not-a-real-arn-shape");
+    let profile_arn_without_version = format!(
+        "arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-profiles/{}",
+        seeded.profile_name
+    );
+    let short_version_arn = format!(
+        "arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-profiles/{}/v1",
+        seeded.profile_name
+    );
     let rows: Vec<(&str, &str, &str, &str, &str)> = vec![
         (
             "a profileVersionArn of another service",
@@ -944,6 +925,48 @@ async fn values_naming_no_signer_resource_are_refused() {
             &seeded.profile_version_arn,
             &seeded.job_arn,
             "NoSuchPlatform-SHA256-ECDSA",
+        ),
+        (
+            "a profileVersionArn whose resource names nothing of this service",
+            &seeded.platform_id,
+            &shapeless_signer_arn,
+            &seeded.job_arn,
+            &shapeless_signer_arn,
+        ),
+        (
+            "a jobArn whose resource names nothing of this service",
+            &seeded.platform_id,
+            &seeded.profile_version_arn,
+            &shapeless_signer_arn,
+            &shapeless_signer_arn,
+        ),
+        (
+            "a profileVersionArn carrying no version",
+            &seeded.platform_id,
+            &profile_arn_without_version,
+            &seeded.job_arn,
+            &profile_arn_without_version,
+        ),
+        (
+            "a profileVersionArn whose version is outside the modelled form",
+            &seeded.platform_id,
+            &short_version_arn,
+            &seeded.job_arn,
+            &short_version_arn,
+        ),
+        (
+            "a jobArn carrying a signing profile's ARN",
+            &seeded.platform_id,
+            &seeded.profile_version_arn,
+            &seeded.profile_version_arn,
+            &seeded.profile_version_arn,
+        ),
+        (
+            "a profileVersionArn carrying a signing job's ARN",
+            &seeded.platform_id,
+            &seeded.job_arn,
+            &seeded.job_arn,
+            &seeded.job_arn,
         ),
     ];
 

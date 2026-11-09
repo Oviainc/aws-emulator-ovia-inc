@@ -287,8 +287,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         // `profileVersion` names WHICH version of the profile is revoked, so a
-        // version this profile has never had names no revocable resource.
-        if !profile.versions.contains(&input.profile_version) {
+        // version this profile does not hold names no revocable resource.
+        if !profile.holds_version(&input.profile_version) {
             return Err(profile_version_not_found(
                 &input.profile_name,
                 &input.profile_version,

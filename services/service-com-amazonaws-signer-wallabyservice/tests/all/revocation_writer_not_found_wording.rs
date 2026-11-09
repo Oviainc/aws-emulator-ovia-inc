@@ -84,6 +84,19 @@ fn emulator() -> MultiServiceRouter {
     router
 }
 
+/// The same emulator with Amazon S3 mounted beside signer on the one shared
+/// engine — what the case that seeds a real, Succeeded signing job needs, because
+/// such a job reads the object it signs out of S3 and writes the signed artifact
+/// back there.
+fn emulator_with_object_storage() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    super::code_signing_objects::mount_object_storage(&mut router, &engine);
+    router
+}
+
 /// What the emulator answered: the status and the body as JSON.
 struct Answer {
     status: u16,
@@ -433,14 +446,18 @@ fn absent_job_ids() -> Vec<(&'static str, String)> {
 /// THAT job does.
 #[tokio::test]
 async fn revoking_an_unknown_signature_states_the_job_id_and_writes_nothing() {
-    let router = emulator();
+    let router = emulator_with_object_storage();
     seed_profile(&router, "Job_Profile").await;
+    let version = super::code_signing_objects::seed_signing_objects(
+        &router, REGION, "src", "code.zip", "dst",
+    )
+    .await;
     let started = call(
         &router,
         "POST",
         "/signing-jobs",
         Some(json!({
-            "source": { "s3": { "bucketName": "src", "key": "code.bin", "version": "1" } },
+            "source": { "s3": { "bucketName": "src", "key": "code.zip", "version": version } },
             "destination": { "s3": { "bucketName": "dst" } },
             "profileName": "Job_Profile",
             "clientRequestToken": "tok-job-profile",

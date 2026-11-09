@@ -351,7 +351,10 @@ async fn a_success_that_reports_a_document_answers_two_hundred() {
         Row {
             case: "PutSigningProfile",
             method: "PUT",
-            uri: "/signing-profiles/Document_Profile".to_string(),
+            // A name nothing has created yet: a signing-profile name is taken by
+            // the create that first used it, so the create that answers a
+            // document is one under a free name.
+            uri: "/signing-profiles/Document_Profile_Created".to_string(),
             body: Some(json!({ "platformId": PLATFORM_ID })),
         },
         Row {

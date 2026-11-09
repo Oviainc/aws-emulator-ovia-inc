@@ -68,14 +68,23 @@ const DEFAULT_VALIDITY_MONTHS: u32 = 135;
 /// completion the clock owes it is due however slow the host is.
 const SETTLE_SLACK: Duration = Duration::from_millis(250);
 
-/// One emulator: a router carrying only this service, over one shared engine.
+/// One emulator: this service and Amazon S3 over one shared engine — a signing
+/// job of this workflow reads the object it signs out of S3 and writes the signed
+/// artifact back there, so a job that signs needs both front doors.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    super::code_signing_objects::mount_object_storage(&mut router, &engine);
     router
 }
+
+/// The source bucket a job here signs out of, the key in it, and the bucket the
+/// signed artifact is written to.
+const SOURCE_BUCKET: &str = "src";
+const SOURCE_KEY: &str = "code.zip";
+const DESTINATION_BUCKET: &str = "dst";
 
 /// What the emulator answered: the HTTP status and the JSON body.
 struct Answer {
@@ -161,14 +170,29 @@ async fn put_profile(router: &MultiServiceRouter, name: &str, period: Option<Val
 }
 
 /// Start a signing job against `profile_name`, answering its job id.
+///
+/// The source object is seeded first, so the job signs something and reaches the
+/// terminal status whose expiry these cases are about.
 async fn start_job(router: &MultiServiceRouter, profile_name: &str, token: &str) -> String {
+    let version = super::code_signing_objects::seed_signing_objects(
+        router,
+        REGION,
+        SOURCE_BUCKET,
+        SOURCE_KEY,
+        DESTINATION_BUCKET,
+    )
+    .await;
     let answer = call(
         router,
         "POST",
         "/signing-jobs",
         Some(json!({
-            "source": { "s3": { "bucketName": "src", "key": "code.bin", "version": "1" } },
-            "destination": { "s3": { "bucketName": "dst", "prefix": "signed/" } },
+            "source": { "s3": {
+                "bucketName": SOURCE_BUCKET,
+                "key": SOURCE_KEY,
+                "version": version,
+            } },
+            "destination": { "s3": { "bucketName": DESTINATION_BUCKET, "prefix": "signed/" } },
             "profileName": profile_name,
             "clientRequestToken": token,
         })),
@@ -414,19 +438,20 @@ async fn a_running_job_reports_no_expiry_and_a_completed_one_reports_a_stable_in
     );
 }
 
-/// The validity period is snapshotted when the job starts: a later write to the
-/// profile mints another version with another period, which moves no expiry an
-/// existing signature carries and is the period the NEXT job signs under.
+/// The validity period is snapshotted when the job starts: a job's expiry is
+/// counted in the period of the profile version it signed with, so a job started
+/// from another profile stating another period carries that period's expiry and
+/// neither job's expiry moves the other's.
 #[tokio::test]
 async fn the_period_a_signature_expires_under_is_the_one_its_job_started_with() {
     let router = emulator();
     put_profile(
         &router,
-        "Expiry_Snapshot",
+        "Expiry_Snapshot_Days",
         Some(json!({ "value": 10, "type": UNIT_DAYS })),
     )
     .await;
-    let first_job = start_job(&router, "Expiry_Snapshot", "tok-expiry-snapshot-1").await;
+    let first_job = start_job(&router, "Expiry_Snapshot_Days", "tok-expiry-snapshot-1").await;
     tokio::time::sleep(JOB_COMPLETION_SPAN + SETTLE_SLACK).await;
 
     let before = describe_job(&router, &first_job).await;
@@ -445,10 +470,10 @@ async fn the_period_a_signature_expires_under_is_the_one_its_job_started_with() 
         "case first: expected ten days on from the completion, got {first_expiry}"
     );
 
-    // Another version of the same profile, stating a different period.
+    // Another profile, stating a different period.
     put_profile(
         &router,
-        "Expiry_Snapshot",
+        "Expiry_Snapshot_Years",
         Some(json!({ "value": 3, "type": UNIT_YEARS })),
     )
     .await;
@@ -456,11 +481,11 @@ async fn the_period_a_signature_expires_under_is_the_one_its_job_started_with() 
     assert_eq!(
         reread.instant("signatureExpiresAt"),
         Some(first_expiry),
-        "case rewritten profile: expected the existing signature to keep its expiry, got {:?}",
+        "case another profile: expected the existing signature to keep its expiry, got {:?}",
         reread.body
     );
 
-    let second_job = start_job(&router, "Expiry_Snapshot", "tok-expiry-snapshot-2").await;
+    let second_job = start_job(&router, "Expiry_Snapshot_Years", "tok-expiry-snapshot-2").await;
     tokio::time::sleep(JOB_COMPLETION_SPAN + SETTLE_SLACK).await;
     let after = describe_job(&router, &second_job).await;
     let second_completed = after
@@ -476,6 +501,13 @@ async fn the_period_a_signature_expires_under_is_the_one_its_job_started_with() 
         whole_second(second_expiry),
         counted_to(whole_second(second_completed), 3, UNIT_YEARS),
         "case second: expected three years on from the completion, got {second_expiry}"
+    );
+    assert_eq!(
+        describe_job(&router, &first_job)
+            .await
+            .instant("signatureExpiresAt"),
+        Some(first_expiry),
+        "case first after the second job: expected its own expiry to stand"
     );
 }
 

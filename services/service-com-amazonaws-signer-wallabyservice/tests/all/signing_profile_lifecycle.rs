@@ -7,9 +7,10 @@
 //! path a client takes. The rules under test are the ones Signer states for these
 //! two resources:
 //!
-//! * a profile's members, version, status and ARN are whatever the last
-//!   `PutSigningProfile` stored, and every later read computes its answer from
-//!   that record;
+//! * a profile's members, version, status and ARN are whatever the
+//!   `PutSigningProfile` that created it stored — the name it was created under
+//!   stays taken, so no later create replaces it — and every later read computes
+//!   its answer from that record;
 //! * a job's platform, profile version, signing material, source and destination
 //!   are the ones SNAPSHOTTED when it started, whatever the profile does later.
 //!
@@ -77,6 +78,18 @@ fn emulator() -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));
+    router
+}
+
+/// The same emulator with Amazon S3 mounted beside signer on the one shared
+/// engine — what a case that starts a signing job needs, because the job reads
+/// the object it signs out of S3 and writes the signed artifact back there.
+fn emulator_with_object_storage() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    super::code_signing_objects::mount_object_storage(&mut router, &engine);
     router
 }
 
@@ -470,70 +483,90 @@ async fn every_validity_type_round_trips() {
     }
 }
 
-/// Every put mints a NEW version of the same profile, and the profile keeps its
-/// name and ARN. The invariant is uniqueness, so it is checked over a run of puts
-/// rather than over one pair.
+/// Every create mints a version no other profile holds, and a create under a name
+/// already taken mints nothing at all. The invariant is uniqueness, so it is
+/// checked over a run of creates rather than over one pair.
 #[tokio::test]
-async fn each_put_mints_a_new_version_of_the_same_profile() {
+async fn each_create_mints_a_version_no_other_profile_holds() {
     let router = emulator();
-    const PUTS: usize = 30;
+    // Fewer creates than one page of `ListSigningProfiles` holds
+    // (`PROFILE_PAGE_LIMIT`), so the listing below is the whole store.
+    const CREATES: usize = 12;
 
-    let mut versions = Vec::with_capacity(PUTS);
-    for ordinal in 0..PUTS {
-        let put = put_profile(
-            &router,
-            "Reversioned_Profile",
-            json!({
-                "platformId": "AWSLambda-SHA384-ECDSA",
-                "signingMaterial": signing_material(),
-                "signingParameters": { "generation": ordinal.to_string() },
-            }),
-        )
-        .await;
+    let mut versions = Vec::with_capacity(CREATES);
+    let mut names = Vec::with_capacity(CREATES);
+    for ordinal in 0..CREATES {
+        let name = format!("Versioned_Profile_{ordinal}");
+        let request = json!({
+            "platformId": "AWSLambda-SHA384-ECDSA",
+            "signingMaterial": signing_material(),
+            "signingParameters": { "generation": ordinal.to_string() },
+        });
+        let put = put_profile(&router, &name, request.clone()).await;
         assert_eq!(
             put.status, 200,
-            "put {ordinal}: expected 200, got {} {:?}",
+            "create {ordinal}: expected 200, got {} {:?}",
             put.status, put.body
         );
         let version = put.str_member("profileVersion");
         assert!(
             matches_profile_version_pattern(&version),
-            "put {ordinal}: expected a 10-character alphanumeric profileVersion, got {version:?}"
+            "create {ordinal}: expected a 10-character alphanumeric profileVersion, got \
+             {version:?}"
         );
         assert!(
             !versions.contains(&version),
-            "put {ordinal}: expected a new version, got {version:?} which was already minted: {versions:?}"
+            "create {ordinal}: expected a version no other profile holds, got {version:?} which \
+             was already minted: {versions:?}"
         );
         assert_eq!(
             put.str_member("arn"),
-            format!("arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-profiles/Reversioned_Profile"),
-            "put {ordinal}: expected the profile ARN to be stable, got {:?}",
+            format!("arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-profiles/{name}"),
+            "create {ordinal}: expected the profile ARN to name the profile, got {:?}",
             put.body["arn"]
         );
+
+        // The same name again: the name is taken, so nothing is minted for it.
+        let again = put_profile(&router, &name, request).await;
+        assert_eq!(
+            again.status, 400,
+            "create {ordinal}: expected the repeated create to be refused, got {} {:?}",
+            again.status, again.body
+        );
+        assert!(
+            again.body["profileVersion"].is_null(),
+            "create {ordinal}: expected the refusal to mint no version, got {:?}",
+            again.body["profileVersion"]
+        );
+
         versions.push(version);
+        names.push(name);
     }
 
-    // The profile reports its LAST version, and the members of its last put.
-    let got = get_profile(&router, "Reversioned_Profile").await;
-    let last = versions.last().expect("the run made at least one put");
-    assert_eq!(
-        &got.str_member("profileVersion"),
-        last,
-        "expected the latest version {last:?}, got {:?}",
-        got.body["profileVersion"]
-    );
-    assert_eq!(
-        got.body["signingParameters"],
-        json!({ "generation": (PUTS - 1).to_string() }),
-        "expected the last put's signingParameters, got {:?}",
-        got.body["signingParameters"]
-    );
-    // And exactly one record exists for the name, however many puts it took.
+    // Each profile reports the version its own create minted, and the members
+    // that create carried.
+    for (ordinal, name) in names.iter().enumerate() {
+        let got = get_profile(&router, name).await;
+        assert_eq!(
+            &got.str_member("profileVersion"),
+            &versions[ordinal],
+            "profile {name}: expected the version its create minted, got {:?}",
+            got.body["profileVersion"]
+        );
+        assert_eq!(
+            got.body["signingParameters"],
+            json!({ "generation": ordinal.to_string() }),
+            "profile {name}: expected its own create's signingParameters, got {:?}",
+            got.body["signingParameters"]
+        );
+    }
+    // And exactly one record exists per name, however many creates were sent.
     let listed = listed_names(&list_profiles(&router, "").await);
+    let mut expected = names.clone();
+    expected.sort();
     assert_eq!(
-        listed,
-        vec!["Reversioned_Profile".to_string()],
-        "expected one profile record after {PUTS} puts, got {listed:?}"
+        listed, expected,
+        "expected one profile record per name after {CREATES} creates, got {listed:?}"
     );
 }
 
@@ -728,9 +761,9 @@ async fn start_signing_job_is_idempotent_and_describe_reports_the_stored_job() {
         second.body
     );
 
-    // A later put of the same profile mints a new version; the job keeps the one
-    // it started under.
-    let reput = put_profile(
+    // A later create under the same profile name is refused — the name is taken —
+    // and the job keeps reporting the version it started under.
+    let refused = put_profile(
         &router,
         "Job_Profile",
         json!({
@@ -739,10 +772,10 @@ async fn start_signing_job_is_idempotent_and_describe_reports_the_stored_job() {
         }),
     )
     .await;
-    assert_ne!(
-        reput.str_member("profileVersion"),
-        first_version,
-        "expected the second put to mint a new version"
+    assert_eq!(
+        refused.status, 400,
+        "expected the repeated create to be refused, got {} {:?}",
+        refused.status, refused.body
     );
 
     let described = describe_job(&router, &job_id).await;
@@ -807,7 +840,7 @@ async fn start_signing_job_is_idempotent_and_describe_reports_the_stored_job() {
 /// reader.
 #[tokio::test]
 async fn a_signing_job_completes_once_the_clock_makes_it_due() {
-    let router = emulator();
+    let router = emulator_with_object_storage();
     assert_eq!(
         put_profile(
             &router,
@@ -822,10 +855,25 @@ async fn a_signing_job_completes_once_the_clock_makes_it_due() {
         200
     );
 
+    // The object the job signs, and the bucket it writes the artifact to: a job
+    // of this workflow reads one and writes the other.
+    let version = super::code_signing_objects::seed_signing_objects(
+        &router,
+        REGION,
+        "src-bucket",
+        "code.zip",
+        "dst-bucket",
+    )
+    .await;
+
     let started = start_job(
         &router,
         json!({
-            "source": { "s3": { "bucketName": "src-bucket", "key": "code.bin", "version": "1" } },
+            "source": { "s3": {
+                "bucketName": "src-bucket",
+                "key": "code.zip",
+                "version": version,
+            } },
             "destination": { "s3": { "bucketName": "dst-bucket", "prefix": "signed/" } },
             "profileName": "Completing_Profile",
             "clientRequestToken": "tok-completing",

@@ -247,10 +247,9 @@ impl ProfilePermissionRecord {
 /// their current state.
 ///
 /// The policy is a resource of its own rather than a member of
-/// [`SigningProfileRecord`] because the two have different lifetimes: a
-/// `PutSigningProfile` on an existing name REPLACES the profile record (minting a
-/// new version), while the profile's policy and its revision chain survive that
-/// put untouched.
+/// [`SigningProfileRecord`] because it is addressed and revised on its own: a
+/// grant is written and revoked against the profile's NAME, through a revision
+/// chain of its own that no write to the profile record moves.
 ///
 /// `Default` is the EMPTY policy: no statements, and a revision id no mint ever
 /// produces (minted ones are UUID-shaped), so it is only ever used as the thing a

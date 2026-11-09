@@ -642,8 +642,9 @@ async fn the_same_profile_name_in_two_regions_is_two_independent_profiles() {
         );
     }
 
-    // A second put in one region re-versions that region's profile only.
-    let reput_in = rows[2].region;
+    // A second create in one region is refused there — the name is taken — and
+    // leaves every region's profile, including that one's, exactly as it was.
+    let recreated_in = rows[2].region;
     let before: Vec<String> = {
         let mut seen = Vec::new();
         for row in &rows {
@@ -655,35 +656,28 @@ async fn the_same_profile_name_in_two_regions_is_two_independent_profiles() {
         }
         seen
     };
-    let reput = put_profile(
+    let refused = put_profile(
         &router,
-        reput_in,
+        recreated_in,
         PROFILE_NAME,
         json!({ "platformId": PLATFORM_ID }),
     )
     .await;
     assert_eq!(
-        reput.status, 200,
-        "case re-put in {reput_in}: expected 200, got {} {:?}",
-        reput.status, reput.body
+        refused.status, 400,
+        "case re-create in {recreated_in}: expected the taken name to be refused, got {} {:?}",
+        refused.status, refused.body
     );
     for (row, was) in rows.iter().zip(before) {
         let now = get_profile(&router, row.region, PROFILE_NAME)
             .await
             .str_member("profileVersion");
-        if row.region == reput_in {
-            assert_ne!(
-                now, was,
-                "case {} after the re-put there: expected a new profileVersion, still {now}",
-                row.region
-            );
-        } else {
-            assert_eq!(
-                now, was,
-                "case {} after the re-put in {reput_in}: expected profileVersion {was}, got {now}",
-                row.region
-            );
-        }
+        assert_eq!(
+            now, was,
+            "case {} after the refused create in {recreated_in}: expected profileVersion {was}, \
+             got {now}",
+            row.region
+        );
     }
 }
 

@@ -273,13 +273,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // The grant is written against a profile, and against one of that
-        // profile's versions when it names one.
+        // The grant is written against a profile, and against that profile's
+        // version when it names one.
         let Some(profile) = store.profile(&region, &input.profile_name) else {
             return Err(profile_not_found(&input.profile_name));
         };
         if let Some(version) = input.profile_version.as_deref() {
-            if !profile.versions.iter().any(|known| known == version) {
+            if !profile.holds_version(version) {
                 return Err(profile_version_not_found(&input.profile_name, version));
             }
         }

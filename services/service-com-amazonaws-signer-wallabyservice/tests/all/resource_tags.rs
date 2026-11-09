@@ -707,8 +707,8 @@ struct TaggingStatusCase {
     refusal_status: Option<u16>,
 }
 
-/// One row per status a profile can be in when a tagging call arrives, plus the
-/// row that reaches `Active` again through a re-put — the statuses are
+/// One row per status a profile can be in when a tagging call arrives, plus a
+/// second `Active` profile in another region — the statuses are
 /// `SigningProfileStatus`'s values (`smithy_query(query="shape",
 /// shape="SigningProfileStatus")`: `Active | Canceled | Revoked`).
 fn tagging_status_cases() -> [TaggingStatusCase; 4] {
@@ -732,8 +732,8 @@ fn tagging_status_cases() -> [TaggingStatusCase; 4] {
             refusal_status: Some(400),
         },
         TaggingStatusCase {
-            case: "Canceled then re-put",
-            profile: "Reput_Tagging",
+            case: "Active after a refused create",
+            profile: "Recreated_Tagging",
             stored_status: "Active",
             refusal_status: None,
         },
@@ -774,7 +774,7 @@ async fn the_profiles_status_decides_which_tagging_calls_it_admits() {
                     revoked.body
                 );
             }
-            "Canceled" | "Canceled then re-put" => {
+            "Canceled" => {
                 assert_eq!(
                     cancel_profile(&router, name).await.status,
                     204,
@@ -783,11 +783,24 @@ async fn the_profiles_status_decides_which_tagging_calls_it_admits() {
             }
             _ => {}
         }
-        if case == "Canceled then re-put" {
-            // A put re-versions the profile and a re-versioned profile is
-            // `Active`, so the tagging route admits it again: the gate follows
-            // the STORED status, not the profile's history.
-            seed_profile(&router, name).await;
+        if case == "Active after a refused create" {
+            // The name is taken, so the second create is refused and the stored
+            // profile — and with it the tagging route's gate — is untouched: the
+            // gate follows the STORED status.
+            let refused = put_profile(
+                &router,
+                name,
+                json!({
+                    "platformId": "AWSLambda-SHA384-ECDSA",
+                    "signingMaterial": { "certificateArn": CERTIFICATE_ARN },
+                }),
+            )
+            .await;
+            assert_eq!(
+                refused.status, 400,
+                "case {case:?}: expected the repeated create to be refused, got {} {:?}",
+                refused.status, refused.body
+            );
         }
 
         // What the store holds now, so the rest of the row is a statement about

@@ -197,9 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A canceled profile is the one status the modelled bad request names, and
         // it names the CALL rather than the write: this operation is one of the
         // tagging APIs, so it is refused for that status like the other two. The
-        // gate reads the status the store holds NOW, so a later
-        // `PutSigningProfile` re-versions the profile back to `Active` and the
-        // same read is admitted again.
+        // gate reads the status the store holds NOW.
         if let Some((message, code)) = profile.tagging_refusal() {
             return Err(bad_request(message, code));
         }

@@ -80,14 +80,23 @@ const MAX_RESULTS_FLOOR: i32 = 1;
 /// `MaxResults`'s modelled maximum (the same `@range`).
 const MAX_RESULTS_CEILING: i32 = 25;
 
-/// One emulator: a router carrying only this service, over one shared engine.
+/// One emulator: this service and Amazon S3 over one shared engine — a job of
+/// this workflow reads the object it signs out of S3 and writes the signed
+/// artifact back there, so a job that reaches `Succeeded` needs both front doors.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    super::code_signing_objects::mount_object_storage(&mut router, &engine);
     router
 }
+
+/// The source bucket a seeded job signs out of, the key in it, and the bucket the
+/// signed artifact is written to.
+const SOURCE_BUCKET: &str = "src";
+const SOURCE_KEY: &str = "code.zip";
+const DESTINATION_BUCKET: &str = "dst";
 
 /// What the emulator answered: the HTTP status and the JSON body.
 struct Answer {
@@ -203,20 +212,35 @@ async fn put_profile(router: &MultiServiceRouter, region: &str, name: &str, plat
 }
 
 /// Start a signing job in `region` against `profile_name`, answering its job id.
+///
+/// The Amazon S3 objects the job reads and writes are seeded first, so the job
+/// signs something and reaches the terminal status these listings report.
 async fn start_job(
     router: &MultiServiceRouter,
     region: &str,
     profile_name: &str,
     token: &str,
 ) -> String {
+    let version = super::code_signing_objects::seed_signing_objects(
+        router,
+        region,
+        SOURCE_BUCKET,
+        SOURCE_KEY,
+        DESTINATION_BUCKET,
+    )
+    .await;
     let answer = call(
         router,
         region,
         "POST",
         "/signing-jobs",
         Some(json!({
-            "source": { "s3": { "bucketName": "src", "key": "code.bin", "version": "1" } },
-            "destination": { "s3": { "bucketName": "dst", "prefix": "signed/" } },
+            "source": { "s3": {
+                "bucketName": SOURCE_BUCKET,
+                "key": SOURCE_KEY,
+                "version": version,
+            } },
+            "destination": { "s3": { "bucketName": DESTINATION_BUCKET, "prefix": "signed/" } },
             "profileName": profile_name,
             "clientRequestToken": token,
         })),

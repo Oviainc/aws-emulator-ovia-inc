@@ -310,8 +310,8 @@ enum OutOfActive {
     /// `RevokeSigningProfile`.
     Revoke,
     /// `RevokeSigningProfile`, and then another `PutSigningProfile` under the same
-    /// name: a revocation is carried forward, so the name is still `Revoked`.
-    RevokeThenPut,
+    /// name — which the taken name refuses, so the profile is still `Revoked`.
+    RevokeThenRefusedCreate,
 }
 
 /// A profile out of `Active` signs no payload: the modelled 400 names the profile
@@ -342,7 +342,7 @@ async fn a_profile_out_of_active_signs_no_payload() {
         ),
         (
             "revoked and then written again under the same name",
-            OutOfActive::RevokeThenPut,
+            OutOfActive::RevokeThenRefusedCreate,
             STATUS_REVOKED,
             payload_of(4096),
         ),
@@ -378,7 +378,7 @@ async fn a_profile_out_of_active_signs_no_payload() {
                     moved.status, moved.body
                 );
             }
-            OutOfActive::Revoke | OutOfActive::RevokeThenPut => {
+            OutOfActive::Revoke | OutOfActive::RevokeThenRefusedCreate => {
                 // `RevokeSigningProfile` models no output either.
                 let moved = revoke_profile(&router, &name, &version).await;
                 assert_eq!(
@@ -388,12 +388,12 @@ async fn a_profile_out_of_active_signs_no_payload() {
                 );
             }
         }
-        if matches!(mover, OutOfActive::RevokeThenPut) {
-            let reput = put_profile(&router, &name, platform_id).await;
+        if matches!(mover, OutOfActive::RevokeThenRefusedCreate) {
+            let refused_create = put_profile(&router, &name, platform_id).await;
             assert_eq!(
-                reput.status, 200,
-                "case {case:?}: re-putting the profile must succeed, got {} {:?}",
-                reput.status, reput.body
+                refused_create.status, 400,
+                "case {case:?}: a create under the taken name must be refused, got {} {:?}",
+                refused_create.status, refused_create.body
             );
         }
 

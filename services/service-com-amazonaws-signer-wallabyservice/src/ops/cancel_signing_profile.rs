@@ -237,11 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (a 400 whose `code` names the status that forbade it). A profile
         // already `Canceled` is left where it is and the call reports success,
         // because the status it asks for is the one the profile is in. The status
-        // read is the one the store holds NOW, not the profile's history: a later
-        // `PutSigningProfile` re-versions a canceled profile and makes it
-        // `Active` again, and then a cancel moves it once more — while a revoked
-        // one reads back `Revoked` after a re-put too, because the store carries
-        // its revocation forward, and the refusal stands.
+        // read is the one the store holds NOW: a profile's name is taken for
+        // good by the create that used it, so nothing re-creates a revoked
+        // profile as an `Active` one and the refusal stands for as long as the
+        // profile does.
         if profile.is_revoked() {
             let code = crate::state::profile_status_error_code(&profile.status);
             let message = crate::state::cancel_refused_message(&profile.profile_name);

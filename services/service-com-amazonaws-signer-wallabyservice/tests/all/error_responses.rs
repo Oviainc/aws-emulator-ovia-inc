@@ -540,15 +540,16 @@ async fn signing_material_is_required_exactly_on_the_platforms_that_publish_it()
 #[tokio::test]
 async fn a_cancel_moves_only_a_profile_its_source_status_holds_for() {
     // One row per status a profile can be in when the cancel arrives, plus the
-    // row that is re-put after a revoke. 204 is the recorded success for this
-    // DELETE; 400 with the code naming the status is the recorded refusal.
+    // row whose create is repeated after a revoke. 204 is the recorded success
+    // for this DELETE; 400 with the code naming the status is the recorded
+    // refusal.
     let rows: [(&str, &str, u16, &str, &str); 4] = [
         ("Active", "Active_Cancel", 204, "Canceled", ""),
         ("Canceled", "Canceled_Cancel", 204, "Canceled", ""),
         ("Revoked", "Revoked_Cancel", 400, "Revoked", "ProfileRevoked"),
         (
-            "Revoked then re-put",
-            "Reput_Cancel",
+            "Revoked then re-created",
+            "Recreated_Cancel",
             400,
             "Revoked",
             "ProfileRevoked",
@@ -566,7 +567,7 @@ async fn a_cancel_moves_only_a_profile_its_source_status_holds_for() {
                     "case {status_before}: the first cancel must succeed"
                 );
             }
-            "Revoked" | "Revoked then re-put" => {
+            "Revoked" | "Revoked then re-created" => {
                 let revoked =
                     revoke_profile(&router, name, &version, "key-compromise", 1_700_000_000).await;
                 assert_eq!(
@@ -577,10 +578,23 @@ async fn a_cancel_moves_only_a_profile_its_source_status_holds_for() {
             }
             _ => {}
         }
-        if status_before == "Revoked then re-put" {
-            // A put re-versions the profile, and the revocation it already
-            // carries stands — so this one is still `Revoked`.
-            seed_profile(&router, name).await;
+        if status_before == "Revoked then re-created" {
+            // The name is taken for good, so the create is refused and the
+            // revoked profile stands — and is still refused the cancel.
+            let refused = put_profile(
+                &router,
+                name,
+                json!({
+                    "platformId": "AWSLambda-SHA384-ECDSA",
+                    "signingMaterial": { "certificateArn": CERTIFICATE_ARN },
+                }),
+            )
+            .await;
+            assert_eq!(
+                refused.status, 400,
+                "case {status_before}: expected the repeated create to be refused, got {} {:?}",
+                refused.status, refused.body
+            );
         }
 
         let answer = cancel_profile(&router, name).await;

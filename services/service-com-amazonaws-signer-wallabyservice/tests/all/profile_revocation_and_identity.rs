@@ -332,8 +332,9 @@ async fn create_and_read_report_the_whole_profile() {
     }
 }
 
-/// A profile keeps ONE opaque id for its whole life: every version of it reports
-/// the same `profileToken`, and two profiles never share one.
+/// A profile keeps ONE opaque id for its whole life: the create reports it, every
+/// read reports the same one, and two profiles never share one — and a refused
+/// second create under the name mints no new id.
 #[tokio::test]
 async fn the_profile_token_is_the_profile_identity() {
     let router = emulator();
@@ -342,7 +343,8 @@ async fn the_profile_token_is_the_profile_identity() {
     for ordinal in 0..5 {
         let name = format!("Token_Profile_{ordinal}");
         let mut seen: Option<String> = None;
-        // Three puts of the SAME name: each mints a new version, none a new id.
+        // One create, then two more under the same name: the name is taken, so
+        // the later ones are refused and report no id at all.
         for put_ordinal in 0..3 {
             let put = put_profile(
                 &router,
@@ -353,21 +355,29 @@ async fn the_profile_token_is_the_profile_identity() {
                 }),
             )
             .await;
+            let expected_status = if put_ordinal == 0 { 200 } else { 400 };
             assert_eq!(
-                put.status, 200,
-                "case {name} put {put_ordinal}: expected 200, got {} {:?}",
+                put.status, expected_status,
+                "case {name} put {put_ordinal}: expected {expected_status}, got {} {:?}",
                 put.status, put.body
             );
             let reported = put.body["tags"]["internalId"]
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
-            match &seen {
-                None => seen = Some(reported),
-                Some(first) => assert_eq!(
-                    &reported, first,
-                    "case {name} put {put_ordinal}: expected the profile to keep id {first}, got {reported}"
-                ),
+            if put_ordinal == 0 {
+                assert!(
+                    !reported.is_empty(),
+                    "case {name}: expected the create to report an id, got {:?}",
+                    put.body
+                );
+                seen = Some(reported);
+            } else {
+                assert!(
+                    reported.is_empty(),
+                    "case {name} put {put_ordinal}: expected the refusal to report no id, got \
+                     {reported:?}"
+                );
             }
         }
 
@@ -375,7 +385,7 @@ async fn the_profile_token_is_the_profile_identity() {
         assert_eq!(
             Some(&token),
             seen.as_ref(),
-            "case {name}: expected GetSigningProfile to report the id the creates did"
+            "case {name}: expected GetSigningProfile to report the id the create did"
         );
         assert!(
             !tokens.contains(&token),
@@ -387,15 +397,12 @@ async fn the_profile_token_is_the_profile_identity() {
 
 /// One revocation to perform and what it must report. The rows differ along the
 /// reason's length (both published bounds of `RevocationReasonString`'s
-/// `@length(min: 1, max: 500)`), the effective time's relation to now, and whether
-/// the version revoked is the profile's first or its latest.
+/// `@length(min: 1, max: 500)`) and the effective time's relation to now.
 struct RevocationCase {
     name: &'static str,
     reason: String,
     /// The `effectiveTime` to send, as epoch seconds.
     effective_time: i64,
-    /// Revoke the version the FIRST put minted rather than the latest.
-    revoke_first_version: bool,
 }
 
 fn revocation_cases() -> Vec<RevocationCase> {
@@ -404,28 +411,24 @@ fn revocation_cases() -> Vec<RevocationCase> {
             name: "Revoked_Rotating_Key",
             reason: "rotate-signing-key".to_string(),
             effective_time: 1_767_225_600,
-            revoke_first_version: false,
         },
         // `RevocationReasonString`'s @length minimum of 1.
         RevocationCase {
             name: "Revoked_Shortest_Reason",
             reason: "x".to_string(),
             effective_time: 0,
-            revoke_first_version: false,
         },
         // Its @length maximum of 500.
         RevocationCase {
             name: "Revoked_Longest_Reason",
             reason: "r".repeat(500),
             effective_time: 2_000_000_000,
-            revoke_first_version: false,
         },
-        // An older version of a re-versioned profile is revocable too.
+        // A fourth reason and a fourth effective instant.
         RevocationCase {
-            name: "Revoked_Older_Version",
+            name: "Revoked_Compromised_Material",
             reason: "compromised certificate material".to_string(),
             effective_time: 1_700_000_000,
-            revoke_first_version: true,
         },
     ]
 }
@@ -438,35 +441,18 @@ async fn revoke_records_the_transition_and_every_read_reports_it() {
     let router = emulator();
 
     for case in revocation_cases() {
-        let first = put_profile(
+        let created = put_profile(
             &router,
             case.name,
             json!({ "platformId": "AWSLambda-SHA384-ECDSA", "tags": { "owner": "platform" } }),
         )
         .await;
         assert_eq!(
-            first.status, 200,
+            created.status, 200,
             "case {}: seeding the profile: {:?}",
-            case.name, first.body
+            case.name, created.body
         );
-        let first_version = first.str_member("profileVersion");
-        let latest = put_profile(
-            &router,
-            case.name,
-            json!({ "platformId": "AWSLambda-SHA384-ECDSA", "tags": { "owner": "platform" } }),
-        )
-        .await;
-        assert_eq!(
-            latest.status, 200,
-            "case {}: re-versioning the profile: {:?}",
-            case.name, latest.body
-        );
-        let latest_version = latest.str_member("profileVersion");
-        let version = if case.revoke_first_version {
-            first_version.clone()
-        } else {
-            latest_version.clone()
-        };
+        let version = created.str_member("profileVersion");
 
         // Before the revoke the profile is Active with nothing revoked.
         let before = get_profile(&router, case.name).await;
@@ -546,8 +532,8 @@ async fn revoke_records_the_transition_and_every_read_reports_it() {
         // The profile keeps everything else it had: a revoke is not a rewrite.
         assert_eq!(
             after.str_member("profileVersion"),
-            latest_version,
-            "case {}: expected the profile to keep its latest version, got {:?}",
+            version,
+            "case {}: expected the profile to keep its version, got {:?}",
             case.name,
             after.body["profileVersion"]
         );

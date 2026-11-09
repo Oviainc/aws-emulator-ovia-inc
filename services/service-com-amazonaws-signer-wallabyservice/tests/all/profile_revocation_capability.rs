@@ -274,34 +274,27 @@ fn unsupported_message(platform_id: &str) -> String {
 /// One revocation request shape to send on every published platform. The rows
 /// differ along the reason's length (both published bounds of
 /// `RevocationReasonString`'s `@length(min: 1, max: 500)`), where the effective
-/// instant sits, which of the profile's versions the request names, and the
-/// region the request is signed for.
+/// instant sits, and the region the request is signed for.
 struct RequestShape {
     name: &'static str,
     region: &'static str,
-    /// Whether the request names the profile's FIRST version rather than its
-    /// current one — both are versions the profile has had, so both are revocable.
-    first_version: bool,
     reason: String,
     effective_epoch_secs: i64,
 }
 
 fn request_shapes() -> Vec<RequestShape> {
     vec![
-        // The latest version, a reason of ordinary length, a past instant.
+        // A reason of ordinary length, a past instant.
         RequestShape {
-            name: "latest_version",
+            name: "ordinary_reason",
             region: REGION,
-            first_version: false,
             reason: "the signing material is no longer trusted".to_string(),
             effective_epoch_secs: 1_700_000_000,
         },
-        // An older version of the same profile, the shortest reason the shape
-        // admits, in another region.
+        // The shortest reason the shape admits, in another region.
         RequestShape {
-            name: "first_version_shortest_reason",
+            name: "shortest_reason",
             region: "eu-west-1",
-            first_version: true,
             reason: "x".to_string(),
             effective_epoch_secs: 1_000_000_000,
         },
@@ -310,7 +303,6 @@ fn request_shapes() -> Vec<RequestShape> {
         RequestShape {
             name: "longest_reason_future_instant",
             region: "ap-southeast-1",
-            first_version: false,
             reason: "y".repeat(500),
             effective_epoch_secs: 4_000_000_000,
         },
@@ -336,7 +328,6 @@ async fn profile_revocation_follows_the_platforms_published_revocation_support()
             let region = shape.region;
             let name = format!("Cap_{}", platform_id.replace('-', "_"));
 
-            // Two versions, so a row can name an older one as well as the current.
             let created = put_profile(&router, region, &name, platform_id).await;
             assert_eq!(
                 created.status, 200,
@@ -344,19 +335,7 @@ async fn profile_revocation_follows_the_platforms_published_revocation_support()
                 created.status, created.body
             );
             let profile_arn = created.str_member("arn");
-            let first_version = created.str_member("profileVersion");
-            let reput = put_profile(&router, region, &name, platform_id).await;
-            assert_eq!(
-                reput.status, 200,
-                "case {case:?}: re-versioning the profile: {} {:?}",
-                reput.status, reput.body
-            );
-            let latest_version = reput.str_member("profileVersion");
-            let version = if shape.first_version {
-                first_version.clone()
-            } else {
-                latest_version.clone()
-            };
+            let version = created.str_member("profileVersion");
 
             // The capability as the service itself publishes it.
             let platform = get_platform(&router, region, platform_id).await;
