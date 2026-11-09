@@ -62,6 +62,10 @@
 //!   committed to it ([`ConfigurationBundleVersionRecord`]), so a create and
 //!   every later read of the bundle or of one of its versions answer from one
 //!   store;
+//! * the dataset (`/datasets/`): one [`DatasetRecord`] per `datasetId`, holding
+//!   the configuration `CreateDataset` persisted and the examples its source
+//!   yielded into the DRAFT working copy, so a create and every later read of
+//!   the dataset answer from one store;
 //! * the payment manager (`/payments/managers/`): one [`PaymentManagerRecord`]
 //!   per `paymentManagerId`, holding the authorizer, role and encryption
 //!   configuration `CreatePaymentManager` persisted and the status the clock
@@ -1774,6 +1778,11 @@ impl MemoryRecord {
 /// names `crate::state::…` for it exactly as it does for the gateway that holds
 /// the limits.
 pub mod gateway_rate_limits;
+/// The evaluation dataset: the record a create persists, the examples its
+/// source yields into the DRAFT working copy, and the ARN and statuses it
+/// carries. Re-exported, so a handler names `crate::state::…` for it exactly as
+/// it does for the resources beside it.
+pub mod datasets;
 /// What a requested memory strategy becomes before it is stored: the union
 /// member it was read off, the namespace list the rule gives it, its validated
 /// record expiry and the `MemoryStrategy` every operation that reports one
@@ -1823,6 +1832,7 @@ pub mod api_key_credential_providers;
 /// `crate::state::…` for it exactly as it does for the target record itself.
 pub mod gateway_target_synchronization;
 pub use api_key_credential_providers::*;
+pub use datasets::*;
 pub use gateway_rate_limits::*;
 pub use gateway_target_synchronization::*;
 pub use memory_strategies::*;
@@ -3297,6 +3307,25 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// were first recorded, so the oldest record is the one evicted at the
     /// ceiling.
     configuration_bundle_idempotency_order: VecDeque<String>,
+    /// Every dataset, keyed by `datasetId` — the identifier every dataset route
+    /// addresses it by, each holding the examples ingested into its DRAFT
+    /// working copy. The key order is the deterministic list order a dataset
+    /// listing pages over.
+    pub datasets: BTreeMap<String, DatasetRecord>,
+    /// `datasetName` -> `datasetId`, so a duplicate name at create time is a
+    /// `ConflictException` ("Must be unique within the account") rather than a
+    /// second dataset later reads cannot tell apart. One entry per stored
+    /// dataset.
+    pub dataset_names: BTreeMap<String, String>,
+    /// `<operation>/<clientToken>` -> the dataset that token first produced, so
+    /// a replayed `CreateDataset` answers with its first result instead of
+    /// minting a second dataset. Separate from the maps above because the record
+    /// is validated against a different store; the key carries the operation for
+    /// the same reason as there.
+    dataset_idempotency: BTreeMap<String, String>,
+    /// The keys of [`Self::dataset_idempotency`] in the order they were first
+    /// recorded, so the oldest record is the one evicted at the ceiling.
+    dataset_idempotency_order: VecDeque<String>,
     /// Every payment manager, keyed by `paymentManagerId` — the identifier every
     /// payment-manager route addresses it by. The key order is the deterministic
     /// list order a payment-manager listing pages over.

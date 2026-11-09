@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a dataset and PERSISTS it in [`crate::state`]: the name it is addressed by,
+//! the schema type, description, KMS key and tags the caller supplied, and the examples
+//! its `source` yielded into the DRAFT working copy. Every later read of the dataset
+//! comes from that record.
+//!
+//! The create is ASYNCHRONOUS: it reports `CREATING`, and the clock owes the transition
+//! to the status the ingestion earned — `ACTIVE`, or `CREATE_FAILED` for a source that
+//! yielded no examples — which `GetDataset` reports from then on.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +176,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataset"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDatasetErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the dataset store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // The examples the source yields, read BEFORE the store is locked: an
+        // Amazon S3 source names a JSONL file in the caller's own bucket, which
+        // this emulator reads out of its own object storage, so the number of
+        // examples the dataset reports is the number it really holds.
+        let ingestion = crate::state::ingest_dataset_source(ctx, &region, &input.source).await;
+
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the
+        // dataset that token first produced, rather than minting a second one:
+        // "If this token matches a previous request, the service ignores the
+        // request, but doesn't return an error."
+        if let Some(dataset_id) =
+            store.replayed_dataset_result(Self::NAME, input.client_token.as_deref())
+        {
+            if let Some(record) = store.datasets.get(&dataset_id) {
+                return Ok(record.create_output(now));
+            }
+        }
+
+        // The name "must be unique within the account", so a repeated name is a
+        // conflict rather than a second dataset later reads cannot tell apart.
+        if let Some(existing) = store.dataset_names.get(&input.dataset_name) {
+            return Err(CreateDatasetErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "a dataset named {} already exists (datasetId {existing})",
+                    input.dataset_name
+                )),
+            })
+            .into());
+        }
+
+        // The store this request would grow is bounded, so a caller looping on
+        // create meets the modelled quota instead of this process's memory limit.
+        if store.datasets.len() >= crate::state::MAX_DATASETS {
+            return Err(CreateDatasetErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} datasets",
+                        crate::state::MAX_DATASETS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let dataset_id = store.mint_dataset_id(&input.dataset_name, now);
+        let client_token = input.client_token.clone();
+        let record = crate::state::DatasetRecord::created(
+            &region,
+            dataset_id.clone(),
+            input,
+            ingestion,
+            now,
+        );
+        // "Always CREATING immediately after this call": the status the
+        // ingestion earned is owed by the clock, not reported by this call.
+        let output = record.create_output(now);
+
+        store
+            .dataset_names
+            .insert(record.dataset_name.clone(), dataset_id.clone());
+        store.remember_dataset_client_token(Self::NAME, client_token, &dataset_id);
+        store.datasets.insert(dataset_id, record);
+
+        Ok(output)
     }
 }

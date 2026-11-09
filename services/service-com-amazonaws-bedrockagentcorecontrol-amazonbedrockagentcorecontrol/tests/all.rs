@@ -35,6 +35,8 @@ mod configuration_bundle_deletion;
 mod configuration_bundle_lifecycle;
 #[path = "all/control_plane_preconditions.rs"]
 mod control_plane_preconditions;
+#[path = "all/dataset_lifecycle.rs"]
+mod dataset_lifecycle;
 #[path = "all/gateway_dependent_children.rs"]
 mod gateway_dependent_children;
 #[path = "all/gateway_endpoint_url.rs"]
