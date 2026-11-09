@@ -38,7 +38,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_route53_awsdnsv20130401::ops::types::R_R_TYPE_VALUES;
 use service_com_amazonaws_route53_awsdnsv20130401::state::{
-    MAX_TRAFFIC_POLICY_VERSION, NO_SUCH_TRAFFIC_POLICY_MESSAGE, TRAFFIC_POLICY_FORMAT_VERSION,
+    MAX_TRAFFIC_POLICY_VERSION, TRAFFIC_POLICY_FORMAT_VERSION,
 };
 
 use crate::hosted_zone_records::{call, escape_xml, router, Reply, ENDPOINT};
@@ -46,6 +46,7 @@ use crate::traffic_policies::{
     create_policy, document_with_start_endpoint, document_with_start_rule, get_policy, policy_count,
     policy_of, PolicyView,
 };
+use crate::traffic_policy_not_found_envelope::assert_identity_only;
 
 /// `TrafficPolicyComment` is `len 0..1024`
 /// (smithy_query(query="shape",shape="TrafficPolicyComment")).
@@ -376,21 +377,10 @@ async fn an_id_that_names_no_policy_is_refused() {
             "case {case:?}: expected HTTP 404 for an id that names no policy, got {} with body {}",
             reply.status, reply.body
         );
-        assert_eq!(
-            reply.error_code(),
-            "NoSuchTrafficPolicy",
-            "case {case:?}: expected NoSuchTrafficPolicy, got body {}",
-            reply.body
-        );
-        // Route 53 words this refusal as one fixed sentence about the resource
-        // class, taking no part of it from the request, so every id above is
-        // refused with the same message.
-        assert_eq!(
-            reply.first("Error/Message"),
-            Some(NO_SUCH_TRAFFIC_POLICY_MESSAGE),
-            "case {case:?}: expected the message {NO_SUCH_TRAFFIC_POLICY_MESSAGE:?}; body {}",
-            reply.body
-        );
+        // Route 53 reports a traffic policy it does not hold by its code alone,
+        // so every id above is refused with the same body: `Type` and `Code`
+        // and no `Message` element.
+        assert_identity_only(&reply, case, "NoSuchTrafficPolicy");
     }
 
     // The policy that does exist still holds only the version it was created

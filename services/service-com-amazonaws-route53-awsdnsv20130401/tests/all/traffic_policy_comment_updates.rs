@@ -30,13 +30,12 @@ use std::collections::BTreeMap;
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_route53_awsdnsv20130401::state::NO_SUCH_TRAFFIC_POLICY_MESSAGE;
-
 use crate::hosted_zone_records::{call, escape_xml, router, Reply};
 use crate::traffic_policies::{
     create_policy, document_with_start_endpoint, document_with_start_rule, get_policy,
     policy_count, policy_of, PolicyView,
 };
+use crate::traffic_policy_not_found_envelope::assert_identity_only;
 use crate::traffic_policy_versions::create_version;
 
 /// `TrafficPolicyComment` is `len 0..1024`
@@ -50,7 +49,11 @@ const VERSION_MIN: i64 = 1;
 const VERSION_MAX: i64 = 1000;
 
 /// Send one `UpdateTrafficPolicyComment` for `(id, version)`.
-async fn update_comment(
+///
+/// `pub(crate)` so the suite asserting the shape of the traffic-policy
+/// not-found body drives this operation through the SAME request rather than
+/// growing a second copy of it.
+pub(crate) async fn update_comment(
     router: &MultiServiceRouter,
     id: &str,
     version: &str,
@@ -371,21 +374,10 @@ async fn an_id_or_version_the_store_does_not_hold_is_refused() {
              got {} with body {}",
             reply.status, reply.body
         );
-        assert_eq!(
-            reply.error_code(),
-            "NoSuchTrafficPolicy",
-            "case {case:?}: expected NoSuchTrafficPolicy, got body {}",
-            reply.body
-        );
-        // Route 53 words this refusal as one fixed sentence about the resource
-        // class, so both halves of `(Id, Version)`, in every form above, are
-        // refused with the same message.
-        assert_eq!(
-            reply.first("Error/Message"),
-            Some(NO_SUCH_TRAFFIC_POLICY_MESSAGE),
-            "case {case:?}: expected the message {NO_SUCH_TRAFFIC_POLICY_MESSAGE:?}, got body {}",
-            reply.body
-        );
+        // Route 53 reports a traffic policy it does not hold by its code alone,
+        // so both halves of `(Id, Version)`, in every form above, are refused
+        // with the same body: `Type` and `Code` and no `Message` element.
+        assert_identity_only(&reply, case, "NoSuchTrafficPolicy");
     }
 
     assert_versions_read_back(&router, &held, "after the refusals").await;

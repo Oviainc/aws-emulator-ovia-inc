@@ -35,9 +35,7 @@
 
 use service_com_amazonaws_route53_awsdnsv20130401::ops::list_traffic_policy_versions::DEFAULT_PAGE_SIZE;
 use service_com_amazonaws_route53_awsdnsv20130401::ops::types::R_R_TYPE_VALUES;
-use service_com_amazonaws_route53_awsdnsv20130401::state::{
-    MAX_TRAFFIC_POLICY_VERSION, NO_SUCH_TRAFFIC_POLICY_MESSAGE,
-};
+use service_com_amazonaws_route53_awsdnsv20130401::state::MAX_TRAFFIC_POLICY_VERSION;
 
 use crate::hosted_zone_records::{router, Reply, ENDPOINT};
 use crate::traffic_policies::{
@@ -45,6 +43,7 @@ use crate::traffic_policies::{
     policy_count, policy_of, PolicyView,
 };
 use crate::traffic_policy_deletion::{delete_policy, policy_with_versions};
+use crate::traffic_policy_not_found_envelope::assert_identity_only;
 use crate::traffic_policy_version_listing::list_versions;
 use crate::traffic_policy_versions::create_version;
 
@@ -308,23 +307,9 @@ async fn an_id_no_policy_was_minted_under_is_refused() {
                  body {}",
                 reply.status, reply.body
             );
-            assert_eq!(
-                reply.error_code(),
-                "NoSuchTrafficPolicy",
-                "case {case:?}: expected NoSuchTrafficPolicy, got {:?}; body {}",
-                reply.error_code(),
-                reply.body
-            );
-            // Route 53 words this refusal as one fixed sentence about the
-            // resource class, taking no part of it from the request.
-            assert_eq!(
-                reply.first("Error/Message"),
-                Some(NO_SUCH_TRAFFIC_POLICY_MESSAGE),
-                "case {case:?}: expected the message {NO_SUCH_TRAFFIC_POLICY_MESSAGE:?}, got \
-                 {:?}; body {}",
-                reply.first("Error/Message"),
-                reply.body
-            );
+            // Route 53 reports a traffic policy it does not hold by its code
+            // alone: `Type` and `Code`, with no `Message` element.
+            assert_identity_only(&reply, case, "NoSuchTrafficPolicy");
         }
     }
 

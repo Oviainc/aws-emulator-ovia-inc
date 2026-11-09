@@ -2831,36 +2831,30 @@ pub fn apply_tag_changes(
 /// The ONE place this service words that refusal, so every operation addressed
 /// at a traffic policy answers a missing one identically — whichever half of
 /// `(Id, Version)` the store does not hold, and whether the request named a
-/// version at all. Route 53 words this refusal as one fixed sentence about the
-/// resource class, with no part of it taken from the request, so the message
-/// takes no argument: a caller learns WHAT it asked about from its own request.
-pub fn no_such_traffic_policy() -> NoSuchTrafficPolicy {
-    NoSuchTrafficPolicy {
-        message: Some(NO_SUCH_TRAFFIC_POLICY_MESSAGE.to_string()),
-    }
-}
-
-/// The sentence `NoSuchTrafficPolicy` carries.
+/// version at all.
 ///
-/// `pub` so a test asserts the wording through the constant the handlers answer
-/// with rather than a second copy of the text.
-pub const NO_SUCH_TRAFFIC_POLICY_MESSAGE: &str = "The policy does not exist.";
+/// MESSAGELESS: Route 53 reports a traffic policy or a traffic policy instance
+/// it does not hold as the error's identity alone — the `Error` element carries
+/// `Type` and `Code` and no `Message` child — so this shape's optional `message`
+/// member is left unset and the serializer emits no element for it. The error
+/// shape's documentation states the RULE the refusal reports, not a sentence
+/// Route 53 sends, so answering it as documentation text would put an element on
+/// the wire the service never sends.
+pub fn no_such_traffic_policy() -> NoSuchTrafficPolicy {
+    NoSuchTrafficPolicy { message: None }
+}
 
 /// The modelled `NoSuchTrafficPolicyInstance` (HTTP 404) for a request that
 /// names no traffic policy instance in this store.
 ///
 /// The ONE place this service words that refusal, beside
 /// [`no_such_traffic_policy`], so every operation addressed at a traffic policy
-/// instance answers a missing one identically. REQUEST-DERIVED: it names the id
-/// the request asked about, which is what lets a caller tell which of a batch of
-/// ids was the missing one. The shape's own documentation states the rule it
-/// reports: "No traffic policy instance exists with the specified ID."
-pub fn no_such_traffic_policy_instance(requested_id: &str) -> NoSuchTrafficPolicyInstance {
-    NoSuchTrafficPolicyInstance {
-        message: Some(format!(
-            "No traffic policy instance exists with ID {requested_id}"
-        )),
-    }
+/// instance answers a missing one identically. MESSAGELESS for the same reason,
+/// and it takes no argument because a refusal with no message has nothing to
+/// take from the request: a caller learns WHAT it asked about from its own
+/// request.
+pub fn no_such_traffic_policy_instance() -> NoSuchTrafficPolicyInstance {
+    NoSuchTrafficPolicyInstance { message: None }
 }
 
 /// The one sentence this service refuses a DNS name that the hosted zone the

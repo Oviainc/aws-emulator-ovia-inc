@@ -134,6 +134,11 @@ mod traffic_policy_instance_deletion;
 mod traffic_policy_instances;
 #[path = "all/traffic_policy_listing.rs"]
 mod traffic_policy_listing;
+// Declared beside the traffic-policy suites: this one is the BODY shape the two
+// traffic-policy not-found refusals answer with, across every operation that
+// binds them.
+#[path = "all/traffic_policy_not_found_envelope.rs"]
+mod traffic_policy_not_found_envelope;
 #[path = "all/traffic_policy_version_listing.rs"]
 mod traffic_policy_version_listing;
 #[path = "all/traffic_policy_versions.rs"]

@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove(&input.id)
             .ok_or_else(|| {
                 DeleteTrafficPolicyInstanceErrorModeled::NoSuchTrafficPolicyInstance(
-                    no_such_traffic_policy_instance(&input.id),
+                    no_such_traffic_policy_instance(),
                 )
             })?;
 

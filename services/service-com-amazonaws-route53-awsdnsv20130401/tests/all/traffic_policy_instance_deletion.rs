@@ -31,6 +31,7 @@ use service_com_amazonaws_route53_awsdnsv20130401::state::TRAFFIC_POLICY_INSTANC
 use crate::hosted_zone_records::{call, create_zone_ok, router, Reply};
 use crate::traffic_policies::{create_policy, document_with_start_endpoint, policy_of};
 use crate::traffic_policy_instances::{create_instance, get_instance, instance_count};
+use crate::traffic_policy_not_found_envelope::assert_identity_only;
 
 /// How much longer than [`TRAFFIC_POLICY_INSTANCE_PROPAGATION`] a row waits
 /// before it deletes an instance it wants to find already applied, so the case
@@ -270,26 +271,9 @@ async fn deleting_an_instance_removes_it_and_the_record_sets_it_created() {
         );
 
         // The instance is gone: the read that reported it now reports the
-        // modelled refusal, naming the id that was asked about.
+        // modelled refusal, by its code alone.
         let read = get_instance(&router, &id).await;
-        assert_eq!(
-            read.status, 404,
-            "case {case:?}: expected 404 from GetTrafficPolicyInstance after the delete, \
-             got {} with body {}",
-            read.status, read.body
-        );
-        assert_eq!(
-            read.error_code(),
-            "NoSuchTrafficPolicyInstance",
-            "case {case:?}: expected NoSuchTrafficPolicyInstance; body {}",
-            read.body
-        );
-        assert!(
-            read.first("Error/Message")
-                .is_some_and(|message| message.contains(id.as_str())),
-            "case {case:?}: the refusal must name the id that was asked about; body {}",
-            read.body
-        );
+        assert_identity_only(&read, case, "NoSuchTrafficPolicyInstance");
 
         // A second delete of the same id has nothing left to delete.
         let again = delete_instance(&router, &id).await;
@@ -422,24 +406,9 @@ async fn a_delete_naming_no_instance_is_refused_and_deletes_nothing() {
 
     for (case, id) in &rows {
         let reply = delete_instance(&router, id).await;
-        assert_eq!(
-            reply.status, 404,
-            "case {case:?}: expected HTTP 404, got {} with body {}",
-            reply.status, reply.body
-        );
-        assert_eq!(
-            reply.error_code(),
-            "NoSuchTrafficPolicyInstance",
-            "case {case:?}: expected NoSuchTrafficPolicyInstance; body {}",
-            reply.body
-        );
-        assert!(
-            reply
-                .first("Error/Message")
-                .is_some_and(|message| message.contains(id.as_str())),
-            "case {case:?}: the refusal must name the id that was asked about; body {}",
-            reply.body
-        );
+        // A traffic policy instance the account does not hold is reported by its
+        // code alone: `Type` and `Code`, with no `Message` element.
+        assert_identity_only(&reply, case, "NoSuchTrafficPolicyInstance");
     }
 
     // One past the published bound of `TrafficPolicyInstanceId`: the model

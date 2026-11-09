@@ -51,6 +51,7 @@ use crate::hosted_zone_records::{
 use crate::traffic_policies::{
     create_policy, document_with_start_endpoint, document_with_start_rule, policy_of,
 };
+use crate::traffic_policy_not_found_envelope::assert_identity_only;
 use crate::traffic_policy_versions::create_version;
 
 /// The published maximum of `TTL` (`range 0..2147483647`,
@@ -692,14 +693,21 @@ async fn a_create_naming_something_the_account_does_not_hold_is_refused() {
             row.code,
             reply.body
         );
-        assert!(
-            reply
-                .first("Error/Message")
-                .is_some_and(|message| !message.is_empty()),
-            "case {:?}: the refusal must say why; body {}",
-            row.case,
-            reply.body
-        );
+        // A traffic policy the account does not hold is reported by its code
+        // alone — `Type` and `Code` and no `Message` — while every other
+        // refusal here says why.
+        if row.code == "NoSuchTrafficPolicy" {
+            assert_identity_only(&reply, row.case, row.code);
+        } else {
+            assert!(
+                reply
+                    .first("Error/Message")
+                    .is_some_and(|message| !message.is_empty()),
+                "case {:?}: the refusal must say why; body {}",
+                row.case,
+                reply.body
+            );
+        }
     }
 
     // Nothing was persisted by any of them.
@@ -915,24 +923,9 @@ async fn an_id_that_names_no_instance_is_refused() {
 
     for (case, id) in &rows {
         let reply = get_instance(&router, id).await;
-        assert_eq!(
-            reply.status, 404,
-            "case {case:?}: expected HTTP 404, got {} with body {}",
-            reply.status, reply.body
-        );
-        assert_eq!(
-            reply.error_code(),
-            "NoSuchTrafficPolicyInstance",
-            "case {case:?}: expected NoSuchTrafficPolicyInstance; body {}",
-            reply.body
-        );
-        assert!(
-            reply
-                .first("Error/Message")
-                .is_some_and(|message| message.contains(id.as_str())),
-            "case {case:?}: the refusal must name the id that was asked about; body {}",
-            reply.body
-        );
+        // A traffic policy instance the account does not hold is reported by its
+        // code alone: `Type` and `Code`, with no `Message` element.
+        assert_identity_only(&reply, case, "NoSuchTrafficPolicyInstance");
     }
 
     // The instance the account does hold still reads.

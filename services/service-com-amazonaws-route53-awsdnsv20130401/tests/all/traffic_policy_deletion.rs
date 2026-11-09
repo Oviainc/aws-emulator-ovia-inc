@@ -43,8 +43,6 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_route53_awsdnsv20130401::state::NO_SUCH_TRAFFIC_POLICY_MESSAGE;
-
 use crate::hosted_zone_records::{call, create_zone_ok, router, Reply};
 use crate::traffic_policies::{
     create_policy, document_with_start_endpoint, document_with_start_rule, get_policy,
@@ -52,6 +50,7 @@ use crate::traffic_policies::{
 };
 use crate::traffic_policy_instance_deletion::delete_instance;
 use crate::traffic_policy_instances::create_instance;
+use crate::traffic_policy_not_found_envelope::assert_identity_only;
 use crate::traffic_policy_versions::create_version;
 
 /// The one sentence `TrafficPolicyInUse` reports, which names neither the
@@ -174,30 +173,9 @@ async fn listed_policies(router: &MultiServiceRouter, case: &str) -> Vec<(String
 }
 
 /// Assert that `(id, version)` is refused as a traffic policy version the
-/// account does not hold, with the one fixed sentence Route 53 words that
-/// refusal as.
+/// account does not hold — the refusal Route 53 reports by its code alone.
 fn assert_no_such_policy(case: &str, reply: &Reply) {
-    assert_eq!(
-        reply.status, 404,
-        "case {case:?}: expected HTTP 404 for a traffic policy version the account does not \
-         hold, got {} with body {}",
-        reply.status, reply.body
-    );
-    assert_eq!(
-        reply.error_code(),
-        "NoSuchTrafficPolicy",
-        "case {case:?}: expected NoSuchTrafficPolicy, got {:?}; body {}",
-        reply.error_code(),
-        reply.body
-    );
-    assert_eq!(
-        reply.first("Error/Message"),
-        Some(NO_SUCH_TRAFFIC_POLICY_MESSAGE),
-        "case {case:?}: expected the message {NO_SUCH_TRAFFIC_POLICY_MESSAGE:?}, got {:?}; \
-         body {}",
-        reply.first("Error/Message"),
-        reply.body
-    );
+    assert_identity_only(reply, case, "NoSuchTrafficPolicy");
 }
 
 // ---------------------------------------------------------------------------
