@@ -56,6 +56,27 @@ pub const EXPORT_FORMAT_ION: &str = "ION";
 /// export was requested, so nothing sleeps and no read writes.
 pub const EXPORT_CLIENT_TOKEN_WINDOW: Duration = Duration::from_secs(8 * 60 * 60);
 
+/// The `ExportConflictException` sentence a `ClientToken` replayed with a CHANGED
+/// parameter is refused with: "if you submit a request with the same client token but a
+/// change in other parameters within the 8-hour idempotency window, DynamoDB returns an
+/// ExportConflictException" (`ExportTableToPointInTime$ClientToken`).
+///
+/// Fixed text with no variable part: the refusal states that a duplicate request with
+/// conflicting parameters was detected, and names neither the token nor the parameter
+/// that changed.
+pub const EXPORT_CONFLICT_MESSAGE: &str =
+    "Export conflict: Duplicate request detected with conflicting parameters";
+
+/// The `InvalidExportTimeException` sentence an `ExportTime` the export cannot be taken
+/// at is refused with.
+///
+/// Fixed text with no variable part, and one sentence for every such instant: "you can
+/// export data from any time within the point in time recovery window" (the
+/// `ExportTableToPointInTime` doc), so an instant before the table existed, one in the
+/// future and one that has fallen out of that window are all simply invalid — the refusal
+/// states that and nothing about which of them it was.
+pub const INVALID_EXPORT_TIME_MESSAGE: &str = "Export Time is invalid";
+
 /// The most exports this emulator will hold IN ONE REGION.
 ///
 /// This emulator's own ceiling, like the backup catalogue's ([`MAX_BACKUPS_PER_REGION`]):

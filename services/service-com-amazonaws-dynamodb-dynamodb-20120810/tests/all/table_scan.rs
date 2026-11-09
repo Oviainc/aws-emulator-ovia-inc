@@ -693,7 +693,7 @@ async fn a_scan_request_the_service_refuses() {
             json!({"TableName": &table.name, "ConditionalOperator": "AND"}),
             400,
             "ValidationException",
-            "ConditionalOperator can only be used together with ScanFilter",
+            "ConditionalOperator cannot be used without Filter or Expected",
         ),
         (
             "a ProjectionExpression beside the legacy AttributesToGet it replaces",
@@ -723,7 +723,7 @@ async fn a_scan_request_the_service_refuses() {
             json!({"TableName": &table.name, "Select": "ALL_PROJECTED_ATTRIBUTES"}),
             400,
             "ValidationException",
-            "can be used only when Scanning using an IndexName",
+            "can be used only when Querying using an IndexName",
         ),
     ];
 

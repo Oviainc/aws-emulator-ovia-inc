@@ -173,7 +173,9 @@ async fn select_and_a_projection_are_held_to_each_other_in_the_words_aws_uses() 
             "a scan of an index's projection without an index",
             "Scan",
             json!({"Select": "ALL_PROJECTED_ATTRIBUTES"}),
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Scanning using an IndexName"
+            // The sentence is the rule's own, so a Scan is refused in the SAME words a
+            // Query is: nothing in it is taken from the operation that was called.
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
                 .to_string(),
         ),
     ];
@@ -1157,8 +1159,8 @@ async fn one_update_carries_one_index_lifecycle_action_and_names_the_index_it_de
          {status} with {answered}"
     );
 
-    // Deleting an index the table carries none of is the REQUEST's own mistake — the
-    // table it addresses is there — so it is a validation refusal naming the index.
+    // Deleting an index the table carries none of addresses the INDEX as the resource it
+    // removes, so it is the control plane's lookup miss over both names.
     for absent in ["by-nothing", "ByRankk"] {
         let (status, answered) = call(
             &router,
@@ -1169,13 +1171,13 @@ async fn one_update_carries_one_index_lifecycle_action_and_names_the_index_it_de
         .await;
         assert_eq!(
             (status, error_code(&answered).as_str()),
-            (400, "ValidationException"),
-            "case deleting the absent index {absent:?}: expected 400 ValidationException, got \
-             {status} with {answered}"
+            (400, "ResourceNotFoundException"),
+            "case deleting the absent index {absent:?}: expected 400 ResourceNotFoundException, \
+             got {status} with {answered}"
         );
         assert_eq!(
             message(&answered),
-            format!("Attempting to delete an index which does not exist: {absent}"),
+            format!("Requested resource not found: Index {absent} for table {table}"),
             "case deleting the absent index {absent:?}: got {}",
             message(&answered)
         );

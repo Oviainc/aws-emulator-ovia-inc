@@ -48,7 +48,10 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_dynamodb_dynamodb_20120810::ops::types::S3_SSE_ALGORITHM_VALUES;
 use service_com_amazonaws_dynamodb_dynamodb_20120810::state;
 
-use crate::emulator::{call, call_in, describe_when_active, error_code, message, ok, REGION};
+use crate::emulator::{
+    call, call_in, describe_when_active, error_code, export_arn, message, ok, restorable_window,
+    REGION,
+};
 
 /// A second region, for the rule that an export record is addressable only from the
 /// endpoint whose region it was taken in.
@@ -185,37 +188,9 @@ async fn set_recovery(router: &MultiServiceRouter, name: &str, enabled: bool) ->
     .await
 }
 
-/// The restorable window `name` reports right now: `(earliest, latest)` as the
-/// continuous-backups reader states them, which is the window an export is held to.
-async fn restorable_window(router: &MultiServiceRouter, name: &str) -> (f64, f64) {
-    let described = ok(
-        router,
-        "DescribeContinuousBackups",
-        json!({"TableName": name}),
-    )
-    .await;
-    let recovery = &described["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"];
-    (
-        recovery["EarliestRestorableDateTime"]
-            .as_f64()
-            .unwrap_or_default(),
-        recovery["LatestRestorableDateTime"]
-            .as_f64()
-            .unwrap_or_default(),
-    )
-}
-
 /// The `ExportDescription` of either operation's response.
 fn description(body: &Value) -> Value {
     body["ExportDescription"].clone()
-}
-
-/// The ARN a response's export is recorded under.
-fn export_arn(body: &Value) -> String {
-    description(body)["ExportArn"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// An `ExportTableToPointInTime` body for `table` with no member but the two required
@@ -573,8 +548,8 @@ async fn a_point_in_time_outside_the_recovery_window_is_refused() {
         );
         assert_eq!(
             message(&answered),
-            "The specified ExportTime is outside of the point in time recovery window",
-            "case {case:?}: the refusal states what the model states for this error"
+            "Export Time is invalid",
+            "case {case:?}: the refusal states the fixed sentence this error carries"
         );
     }
 }

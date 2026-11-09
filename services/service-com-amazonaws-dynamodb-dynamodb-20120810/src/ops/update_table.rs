@@ -541,16 +541,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(lift)?;
         // Only the attribute definitions some key schema still uses are kept, so a
-        // repeated UpdateTable cannot grow the stored list, and a definition the
-        // request declares for no key at all is refused the way CreateTable refuses it.
-        let definitions = retained_definitions(
-            declared,
-            table,
-            &indexes,
-            &vector_indexes,
-            &declared_definitions,
-        )
-        .map_err(lift)?;
+        // repeated UpdateTable cannot grow the stored list: the stored list tracks the
+        // LIVE keys of the table and of the indexes it carries after this update.
+        let definitions = retained_definitions(declared, table, &indexes, &vector_indexes);
         // What this request asks of the table's stream, decided against the STORED
         // stream: "You receive a ResourceInUseException if you try to enable a stream
         // on a table that already has a stream, or if you try to disable a stream on
@@ -1182,6 +1175,9 @@ fn validated_vector_index_updates(
 /// The table's provisioned throughput after the update: "When switching from
 /// pay-per-request to provisioned capacity, initial provisioned capacity values must be
 /// set" (`UpdateTable$BillingMode`), and a `PAY_PER_REQUEST` table carries none.
+///
+/// A pair the table ALREADY has is no move at all, and is refused rather than applied
+/// ([`crate::state::throughput_unchanged_message`]).
 fn resolve_table_throughput(
     table: &crate::state::Table,
     billing_mode: &str,
@@ -1206,6 +1202,27 @@ fn resolve_table_throughput(
             ));
         }
         return Ok(None);
+    }
+    // A request that re-states the pair the table is already provisioned for asks for no
+    // change, whatever else the call carries: refused before anything is written, so the
+    // table is not transitioned for work there is none of. Only a pair the REQUEST named
+    // is held to this: a call that leaves the member out keeps the table's own pair, and
+    // keeping a value is not requesting it.
+    if let (Some(requested), Some(current)) =
+        (&input.provisioned_throughput, &table.provisioned_throughput)
+    {
+        if requested.read_capacity_units == current.read_capacity_units
+            && requested.write_capacity_units == current.write_capacity_units
+        {
+            return Err(crate::state::RequestError::Validation(
+                crate::state::throughput_unchanged_message(
+                    "the table",
+                    "the table",
+                    current,
+                    requested,
+                ),
+            ));
+        }
     }
     match input
         .provisioned_throughput
@@ -1290,21 +1307,24 @@ fn merged_definitions(
 /// update.
 ///
 /// This is what bounds the stored list: it can never hold more entries than those
-/// schemas name, however many `UpdateTable` calls declare definitions. A definition the
-/// REQUEST declared that no schema uses is refused rather than dropped silently,
-/// which is the same rule `CreateTable` applies ("Some AttributeDefinitions are not
-/// used in any KeySchema"); a definition that was stored and whose index this same
-/// request deleted is simply dropped, since removing an index removes its keys.
+/// schemas name, however many `UpdateTable` calls declare definitions. A declaration no
+/// schema uses is DROPPED rather than refused, which is where this parts from
+/// `CreateTable`: there the member describes the whole key surface of the table being
+/// created, so an unused entry contradicts the request ("Some AttributeDefinitions are
+/// not used in any KeySchema"), while here it only has to "include the key element(s) of
+/// the new index" (`UpdateTable$AttributeDefinitions`) — a declaration beyond that asks
+/// for nothing, so the update carries on and the stored list tracks the live keys. A
+/// definition that was stored and whose index this same request deleted is dropped by
+/// the same rule, since removing an index removes its keys.
 ///
-/// The used attributes are collected ONCE into a set, so the check costs one hash per
+/// The used attributes are collected ONCE into a set, so the filter costs one hash per
 /// definition rather than a walk over every schema.
 fn retained_definitions(
     declared: Vec<AttributeDefinition>,
     table: &crate::state::Table,
     indexes: &[crate::state::GlobalSecondaryIndex],
     vector_indexes: &[crate::state::VectorIndex],
-    requested: &[AttributeDefinition],
-) -> Result<Vec<AttributeDefinition>, crate::state::RequestError> {
+) -> Vec<AttributeDefinition> {
     let used: ::std::collections::HashSet<&str> = table
         .key_schema
         .iter()
@@ -1322,18 +1342,10 @@ fn retained_definitions(
                 .flat_map(crate::state::VectorIndex::consumed_attributes),
         )
         .collect();
-    for definition in requested {
-        if !used.contains(definition.attribute_name.as_str()) {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Some AttributeDefinitions are not used in any KeySchema: {}",
-                definition.attribute_name
-            )));
-        }
-    }
-    Ok(declared
+    declared
         .into_iter()
         .filter(|definition| used.contains(definition.attribute_name.as_str()))
-        .collect())
+        .collect()
 }
 
 /// Every attribute an index this request CREATES keys on must be declared BY THIS
@@ -1345,11 +1357,11 @@ fn retained_definitions(
 /// already holds: the sentence is that `AttributeDefinitions` must include the new
 /// index's key elements, so an update that leaves the member out — or leaves one of the
 /// new key attributes out of it — has not declared the index's key, whatever the table
-/// happens to define already. AWS states it as a parameter-value sentence naming the
-/// INDEX whose definitions are missing, since an update addresses one index at a time,
-/// and the rest of the sentence is fixed.
+/// happens to define already. The refusal is the one sentence a key attribute with no
+/// definition is stated with wherever a schema declares one
+/// ([`super::create_table::undefined_schema_keys`]), over the index's own key schema and
+/// the definitions the request declared — the two lists the rule is about.
 fn check_index_definitions(
-    index_name: &str,
     key_schema: &[KeySchemaElement],
     requested_definitions: &[AttributeDefinition],
 ) -> Result<(), crate::state::RequestError> {
@@ -1364,10 +1376,10 @@ fn check_index_definitions(
     {
         return Ok(());
     }
-    Err(crate::state::RequestError::Validation(format!(
-        "One or more parameter values were invalid: AttributeDefinitions is not specified for \
-         index: {index_name}"
-    )))
+    Err(super::create_table::undefined_schema_keys(
+        key_schema,
+        requested_definitions,
+    ))
 }
 
 /// The table's global secondary indexes after the update.
@@ -1376,6 +1388,11 @@ fn check_index_definitions(
 /// `Delete` removes one, and an `Update` moves one's provisioned throughput and leaves
 /// it `UPDATING` for the same span. A switch of the table's billing mode carries its
 /// indexes with it, because an index's capacity mode is the table's.
+///
+/// `definitions` are the ones in force for the updated table — the stored ones plus the
+/// ones this request declares ([`merged_definitions`]) — and `requested_definitions` are
+/// the ones the REQUEST carried, which is the list an index this call CREATES must have
+/// its key attributes declared in ([`check_index_definitions`]).
 fn resolve_indexes(
     table: &crate::state::Table,
     billing_mode: &str,
@@ -1416,11 +1433,7 @@ fn resolve_indexes(
                     crate::state::MAX_GLOBAL_SECONDARY_INDEXES
                 )));
             }
-            check_index_definitions(
-                &create.index_name,
-                &create.key_schema,
-                requested_definitions,
-            )?;
+            check_index_definitions(&create.key_schema, requested_definitions)?;
             super::create_table::validated_index_key_schema(
                 &create.index_name,
                 &create.key_schema,
@@ -1462,14 +1475,16 @@ fn resolve_indexes(
             let before = indexes.len();
             indexes.retain(|index| index.name != delete.index_name);
             if indexes.len() == before {
-                // An index name the table carries no index under is the REQUEST's own
-                // mistake — the table it addresses is there — so it is a validation
-                // refusal naming the action that could not be applied and the name it
-                // named, not a missing resource.
-                return Err(crate::state::RequestError::Validation(format!(
-                    "Attempting to delete an index which does not exist: {}",
-                    delete.index_name
-                )));
+                // A `Delete` addresses the INDEX as the resource it removes, so a name
+                // the table carries no index under is a lookup miss rather than a
+                // malformed request: the control plane's not-found sentence over both
+                // names, which is what lets a client treat an index it has already
+                // deleted as deleted. The stored indexes are left exactly as they were,
+                // because `handle` writes nothing until this whole list resolves.
+                return Err(crate::state::lifecycle_index_not_found(
+                    &table.name,
+                    &delete.index_name,
+                ));
             }
         }
         if let Some(change) = &update.update {
@@ -1477,7 +1492,10 @@ fn resolve_indexes(
                 .iter_mut()
                 .find(|index| index.name == change.index_name)
             else {
-                return Err(crate::state::index_not_found(
+                // An `Update` addresses the index the same way a `Delete` does, so the
+                // miss is reported with the same sentence: one index-lifecycle surface,
+                // one wording.
+                return Err(crate::state::lifecycle_index_not_found(
                     &table.name,
                     &change.index_name,
                 ));
@@ -1501,6 +1519,25 @@ fn resolve_indexes(
                     .clone()
                     .or_else(|| index.provisioned_throughput.clone()),
             )?;
+            // The same rule the table's own capacity is held to: a pair the index is
+            // already provisioned for is no move, so the entry that re-states it is
+            // refused instead of leaving the index UPDATING for work there is none of.
+            if let (Some(requested), Some(current)) =
+                (&change.provisioned_throughput, &index.provisioned_throughput)
+            {
+                if requested.read_capacity_units == current.read_capacity_units
+                    && requested.write_capacity_units == current.write_capacity_units
+                {
+                    return Err(crate::state::RequestError::Validation(
+                        crate::state::throughput_unchanged_message(
+                            &format!("the index {}", change.index_name),
+                            "the index",
+                            current,
+                            requested,
+                        ),
+                    ));
+                }
+            }
             if let (Some(before), Some(after)) = (&index.provisioned_throughput, &throughput) {
                 index.throughput_history.record(now, before, after);
             }
@@ -1540,7 +1577,7 @@ fn resolve_indexes(
 /// A `Delete` addresses the index AS THE RESOURCE it changes, so a name the table carries
 /// no vector index for is a lookup miss rather than a malformed request: it is refused
 /// with the control plane's not-found sentence over both names
-/// ([`crate::state::vector_index_not_found`]), and because this resolves the whole list
+/// ([`crate::state::lifecycle_index_not_found`]), and because this resolves the whole list
 /// before `handle` writes anything, the stored indexes are left exactly as they were.
 ///
 /// An index removed from a table is removed outright, by the same rule a secondary index
@@ -1568,7 +1605,7 @@ fn resolve_vector_indexes(
         let before = indexes.len();
         indexes.retain(|index| index.name != delete.index_name);
         if indexes.len() == before {
-            return Err(crate::state::vector_index_not_found(
+            return Err(crate::state::lifecycle_index_not_found(
                 &table.name,
                 &delete.index_name,
             ));

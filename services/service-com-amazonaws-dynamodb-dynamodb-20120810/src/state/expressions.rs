@@ -2944,6 +2944,17 @@ pub fn check_expression_parameter_mix(
     Err(expression_conflict_between(&legacy, &expression))
 }
 
+/// How a `ConditionalOperator` sent with no map for it to combine is refused.
+///
+/// The member says how the ENTRIES of the legacy map beside it are combined — "AND - If
+/// all of the conditions evaluate to true" (`ConditionalOperator`) — so a request that
+/// sends it alone states how to combine nothing, whichever surface it arrived on. One
+/// fixed sentence for all of them, naming both kinds of map the member can combine (a
+/// read's filter and a write's `Expected`) rather than the one member the calling
+/// operation would have carried.
+pub const CONDITIONAL_OPERATOR_WITHOUT_MAP_MESSAGE: &str =
+    "ConditionalOperator cannot be used without Filter or Expected";
+
 /// Whether the condition a conditional write states is satisfied by the stored item.
 ///
 /// One entry point for all three single-item writes: each states its condition the
@@ -2973,7 +2984,7 @@ pub fn write_condition_satisfied(
         (None, None) => {
             if conditional_operator.is_some() {
                 return Err(RequestError::Validation(
-                    "ConditionalOperator can only be used together with Expected".to_string(),
+                    CONDITIONAL_OPERATOR_WITHOUT_MAP_MESSAGE.to_string(),
                 ));
             }
             Ok(true)

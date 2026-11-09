@@ -215,6 +215,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let table = store
                 .table(&region, &name)
                 .map_err(|error| lift(&name, error))?;
+            // "Providing a ClientToken makes the call to ExportTableToPointInTimeInput
+            // idempotent, meaning that multiple identical calls have the same effect as one
+            // single call" (`$ClientToken`): a token that still stands for an export
+            // answers with that export rather than starting a second one, and the same
+            // token with any other parameters is the conflict the operation models.
+            //
+            // Settled BEFORE anything is asked of the request's own members, and after only
+            // the lookup of the table it addresses: what a replayed token decides is whether
+            // this call starts work at all, so a replay that changed a parameter is the
+            // modelled conflict whatever that parameter is, and an identical replay answers
+            // the export the token stands for however the table has moved on since.
+            if let Some(token) = input.client_token.as_deref() {
+                if let Some(started) = store.export_for_client_token(&region, token, now) {
+                    // A RECORDED export carries neither of the two members below: a
+                    // request naming one is refused before anything is recorded
+                    // ([`unsupported_capability`]), so a replay that names either one
+                    // differs from the export the token stands for by construction, and
+                    // the members the record does keep are compared on the record itself.
+                    let names_unrecorded = input.filter_specification.is_some()
+                        || input.incremental_export_specification.is_some();
+                    if !names_unrecorded
+                        && started.table_name == name
+                        && started.request == request
+                    {
+                        return Ok(ExportTableToPointInTimeOutput {
+                            export_description: Some(started.describe(now)),
+                        });
+                    }
+                    return Err(export_conflict());
+                }
+            }
             // "The table must have point in time recovery enabled, and you can export data
             // from any time within the point in time recovery window" (this operation's
             // doc): a table whose recovery is off has no such window, so there is no point
@@ -230,28 +261,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A capability this emulator cannot write real exported data for is refused as
             // "not written yet" rather than accepted and answered with a record of the
             // export the caller did not ask for. AFTER the modelled refusals above: what
-            // the request asks of a table with no point in time to export from is beside
-            // the point.
+            // the request asks of a table with no point in time to export from, or of a
+            // token that already stands for another export, is beside the point.
             if let Some(capability) = unsupported_capability(&input, &request) {
                 return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                     "ExportTableToPointInTime with {capability}"
                 )));
-            }
-
-            // "Providing a ClientToken makes the call to ExportTableToPointInTimeInput
-            // idempotent, meaning that multiple identical calls have the same effect as one
-            // single call" (`$ClientToken`): a token that still stands for an export
-            // answers with that export rather than starting a second one, and the same
-            // token with any other parameters is the conflict the operation models.
-            if let Some(token) = input.client_token.as_deref() {
-                if let Some(started) = store.export_for_client_token(&region, token, now) {
-                    if started.table_name == name && started.request == request {
-                        return Ok(ExportTableToPointInTimeOutput {
-                            export_description: Some(started.describe(now)),
-                        });
-                    }
-                    return Err(export_conflict(token));
-                }
             }
             // The catalogue is budgeted like every other growth site in this store, by the
             // records it holds ([`crate::state::MAX_EXPORTS_PER_REGION`]).
@@ -498,17 +513,18 @@ fn recovery_unavailable(table: &str) -> ExportTableToPointInTimeError {
     .into()
 }
 
-/// The modelled refusal of an `ExportTime` outside the table's recovery window, worded as
-/// the model states the error: "The specified ExportTime is outside of the point in time
-/// recovery window" (`InvalidExportTimeException`).
+/// The modelled refusal of an `ExportTime` the export cannot be taken at:
+/// `InvalidExportTimeException`, HTTP 400, with the fixed sentence DynamoDB answers every
+/// such instant with — [`crate::state::INVALID_EXPORT_TIME_MESSAGE`].
 ///
-/// The window's own bounds are NOT echoed: they move with the clock, and
+/// The sentence carries no variable part and names no CLASS of bad instant: an instant
+/// before the table existed, one in the future and one that has fallen out of the
+/// recovery window are the same refusal, so nothing here distinguishes them. The window's
+/// own bounds are not echoed either: they move with the clock, and
 /// `DescribeContinuousBackups` is where a caller reads them.
 fn invalid_export_time() -> ExportTableToPointInTimeError {
     ExportTableToPointInTimeErrorModeled::InvalidExportTimeException(InvalidExportTimeException {
-        message: Some(
-            "The specified ExportTime is outside of the point in time recovery window".to_string(),
-        ),
+        message: Some(crate::state::INVALID_EXPORT_TIME_MESSAGE.to_string()),
     })
     .into()
 }
@@ -516,13 +532,12 @@ fn invalid_export_time() -> ExportTableToPointInTimeError {
 /// The modelled refusal of a `ClientToken` that already stands for a DIFFERENT export:
 /// "If you submit a request with the same client token but a change in other parameters
 /// within the 8-hour idempotency window, DynamoDB returns an ExportConflictException"
-/// (`$ClientToken`). The message is built from the request: the token it reused.
-fn export_conflict(client_token: &str) -> ExportTableToPointInTimeError {
+/// (`$ClientToken`). The sentence is the fixed one DynamoDB answers that conflict with
+/// ([`crate::state::EXPORT_CONFLICT_MESSAGE`]) and echoes no part of the request: the
+/// token the caller reused is the one it just sent.
+fn export_conflict() -> ExportTableToPointInTimeError {
     ExportTableToPointInTimeErrorModeled::ExportConflictException(ExportConflictException {
-        message: Some(format!(
-            "There is already an in progress or completed export with the same client token \
-             and different parameters: {client_token}"
-        )),
+        message: Some(crate::state::EXPORT_CONFLICT_MESSAGE.to_string()),
     })
     .into()
 }

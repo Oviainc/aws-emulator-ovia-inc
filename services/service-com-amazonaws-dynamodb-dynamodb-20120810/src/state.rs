@@ -2893,16 +2893,18 @@ pub fn index_not_found(table: &str, index: &str) -> RequestError {
     ))
 }
 
-/// The `ResourceNotFoundException` message a VECTOR index the addressed table does not
-/// carry is refused with.
+/// The `ResourceNotFoundException` message the INDEX-LIFECYCLE surface refuses an index
+/// the addressed table does not carry with.
 ///
 /// Same rule as [`index_not_found`] — "the operation tried to access a nonexistent table
 /// or index" (the `ResourceNotFoundException` doc), named by both the index and the table
-/// it was looked for in — and a different SENTENCE, because the surface that changes a
-/// table's vector indexes words it with the index name first and the table after it. One
-/// sentence per surface rather than one shared one: a message is part of each surface's
-/// contract, so the surfaces that answer the other wording keep it.
-pub fn vector_index_not_found(table: &str, index: &str) -> RequestError {
+/// it was looked for in — and a different SENTENCE, because the surface that adds and
+/// removes a table's indexes words it with the index name first and the table after it.
+/// `UpdateTable`'s secondary-index and vector-index deletes share it: one index-lifecycle
+/// surface, one sentence. One sentence per surface rather than one shared across all of
+/// them: a message is part of each surface's contract, so the surfaces that answer the
+/// other wording keep it.
+pub fn lifecycle_index_not_found(table: &str, index: &str) -> RequestError {
     RequestError::NotFound(format!(
         "Requested resource not found: Index {index} for table {table}"
     ))

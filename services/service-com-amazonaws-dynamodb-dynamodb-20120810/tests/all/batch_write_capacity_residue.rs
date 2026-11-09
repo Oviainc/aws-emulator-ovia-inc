@@ -52,6 +52,10 @@ const DRAIN_ATTEMPTS: usize = 20;
 /// the pause above, whichever ceiling held it back.
 const DRAIN_WRITE_UNITS: i64 = 4000;
 
+/// The read units a drained table is given beside them: the figure [`give_capacity`] both
+/// compares the table against and asks for, so the two cannot drift apart.
+const DRAIN_READ_UNITS: i64 = 2000;
+
 /// The fixed sentence a refused write carries, as the Developer Guide states it for a
 /// table that has spent the throughput it is provisioned for.
 const THROUGHPUT_EXCEEDED: &str = "The level of configured provisioned throughput for the \
@@ -191,12 +195,23 @@ async fn stored_keys(router: &smithy_server_runtime::MultiServiceRouter, table: 
 }
 
 /// Raise `table` to a capacity that covers anything this suite asks of it.
+///
+/// A table already provisioned for that pair has the capacity, and asking an `UpdateTable`
+/// for the pair already in force is refused as the no-op it is, so the raise is only sent
+/// when it moves something.
 async fn give_capacity(router: &smithy_server_runtime::MultiServiceRouter, table: &str) {
+    let described = ok(router, "DescribeTable", json!({"TableName": table})).await;
+    let in_force = &described["Table"]["ProvisionedThroughput"];
+    if in_force["ReadCapacityUnits"] == json!(DRAIN_READ_UNITS)
+        && in_force["WriteCapacityUnits"] == json!(DRAIN_WRITE_UNITS)
+    {
+        return;
+    }
     ok(
         router,
         "UpdateTable",
         json!({"TableName": table, "BillingMode": "PROVISIONED",
-               "ProvisionedThroughput": {"ReadCapacityUnits": 2000,
+               "ProvisionedThroughput": {"ReadCapacityUnits": DRAIN_READ_UNITS,
                                          "WriteCapacityUnits": DRAIN_WRITE_UNITS}}),
     )
     .await;
@@ -253,7 +268,8 @@ fn rows() -> Vec<Row> {
     let on_demand = json!({"BillingMode": "PAY_PER_REQUEST"});
     let provisioned = |write: i64| {
         json!({"BillingMode": "PROVISIONED",
-               "ProvisionedThroughput": {"ReadCapacityUnits": 2000, "WriteCapacityUnits": write}})
+               "ProvisionedThroughput": {"ReadCapacityUnits": DRAIN_READ_UNITS,
+                                         "WriteCapacityUnits": write}})
     };
     vec![
         Row {

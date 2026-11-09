@@ -83,9 +83,12 @@ impl<'a> ReadFilter<'a> {
             }
             (None, None) => {
                 if conditional_operator.is_some() {
-                    return Err(RequestError::Validation(format!(
-                        "ConditionalOperator can only be used together with {legacy_member}"
-                    )));
+                    // The member combines the entries of the legacy filter map, so a
+                    // request that sends it with no map states how to combine nothing:
+                    // the one sentence every surface carrying the member states.
+                    return Err(RequestError::Validation(
+                        crate::state::CONDITIONAL_OPERATOR_WITHOUT_MAP_MESSAGE.to_string(),
+                    ));
                 }
                 Ok(Self::Unfiltered)
             }

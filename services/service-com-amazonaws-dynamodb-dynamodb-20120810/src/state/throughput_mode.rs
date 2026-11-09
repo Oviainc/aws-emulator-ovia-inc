@@ -43,3 +43,37 @@ pub fn index_capacity_required_message(index_name: &str) -> String {
          WriteCapacityUnits must be specified for index: {index_name}"
     )
 }
+
+/// The refusal of a capacity move that MOVES NOTHING: a request that asks for the
+/// read/write pair already in force asks for no change at all.
+///
+/// "The provisioned throughput settings of the table" and of an index
+/// (`UpdateTable$ProvisionedThroughput`, `UpdateGlobalSecondaryIndexAction$ProvisionedThroughput`)
+/// are what such a request re-states, and a decrease of the table's capacity is a counted,
+/// rationed action ("NumberOfDecreasesToday" —
+/// `ProvisionedThroughputDescription$NumberOfDecreasesToday`), so a call that would spend
+/// one of those on a value that does not differ is permanently invalid rather than applied:
+/// AWS refuses it, and the table is not transitioned.
+///
+/// The sentence states the pair in force and the pair requested, so the caller can see
+/// from the message alone that the two are equal; everything else about it is fixed text.
+/// `subject` is the resource the request addressed — the table, or the index it named —
+/// and `holder` is what the two capacity figures are reported as provisioned for.
+pub fn throughput_unchanged_message(
+    subject: &str,
+    holder: &str,
+    current: &crate::ops::types::ProvisionedThroughput,
+    requested: &crate::ops::types::ProvisionedThroughput,
+) -> String {
+    format!(
+        "The provisioned throughput for {subject} will not change. The requested value equals \
+         the current value. Current ReadCapacityUnits provisioned for {holder}: {}. Requested \
+         ReadCapacityUnits: {}. Current WriteCapacityUnits provisioned for {holder}: {}. \
+         Requested WriteCapacityUnits: {}. Refer to the Amazon DynamoDB Developer Guide for \
+         current limits and how to request higher limits.",
+        current.read_capacity_units,
+        requested.read_capacity_units,
+        current.write_capacity_units,
+        requested.write_capacity_units
+    )
+}

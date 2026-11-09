@@ -490,6 +490,38 @@ pub fn index_named(description: &Value, name: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// The restorable window `name` reports right now: `(earliest, latest)` as the
+/// continuous-backups reader states them, which is the window a point in time named for
+/// that table is held to.
+///
+/// Shared by every suite that names an instant inside or outside it, so they all read the
+/// bounds from the one reader that publishes them.
+pub async fn restorable_window(router: &MultiServiceRouter, name: &str) -> (f64, f64) {
+    let described = ok(
+        router,
+        "DescribeContinuousBackups",
+        json!({"TableName": name}),
+    )
+    .await;
+    let recovery = &described["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"];
+    (
+        recovery["EarliestRestorableDateTime"]
+            .as_f64()
+            .unwrap_or_default(),
+        recovery["LatestRestorableDateTime"]
+            .as_f64()
+            .unwrap_or_default(),
+    )
+}
+
+/// The ARN the export in an `ExportDescription`-bearing response is recorded under.
+pub fn export_arn(body: &Value) -> String {
+    body["ExportDescription"]["ExportArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// The `message` a refusal carries, under either of the casings a client reads it by.
 pub fn message(body: &Value) -> String {
     body.get("message")

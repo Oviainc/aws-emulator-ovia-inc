@@ -456,7 +456,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // item carries is decided here too: the defaults differ between a table scan
         // and an index scan ([`resolve_selection`]).
         let selection = crate::state::resolve_selection(
-            crate::state::Reader::Scan,
             input.select.as_deref(),
             crate::state::stated_projection_member(
                 input.projection_expression.as_deref(),

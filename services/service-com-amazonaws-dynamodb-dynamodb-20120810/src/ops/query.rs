@@ -424,7 +424,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(lift)?;
         let selection = crate::state::resolve_selection(
-            crate::state::Reader::Query,
             input.select.as_deref(),
             crate::state::stated_projection_member(
                 input.projection_expression.as_deref(),
@@ -1131,10 +1130,21 @@ fn key_comparisons(input: &QueryInput) -> Result<Vec<Comparison>, crate::state::
 /// One entry of the legacy `KeyConditions` map. "For KeyConditions, only the
 /// following comparison operators are supported: EQ | LE | LT | GE | GT |
 /// BEGINS_WITH | BETWEEN" (the `Condition` doc).
+///
+/// Two different rules are broken by two different entries, and each is reported as
+/// itself. The number of operands an entry gives is part of the OPERATOR's own definition
+/// — "the number of values in the list depends on the ComparisonOperator being used"
+/// (`Condition$AttributeValueList`) — so it holds for every operator the service defines
+/// and is settled first, by the one statement of that rule every legacy condition map of
+/// this service meets ([`crate::state::check_legacy_comparison`]). Only an entry that is
+/// well formed as a comparison is then held to the SHORTER set of operators a key
+/// condition may be stated with.
 fn legacy_comparison(
     attribute: &str,
     condition: &Condition,
 ) -> Result<Comparison, crate::state::RequestError> {
+    let operands = condition.attribute_value_list.clone().unwrap_or_default();
+    crate::state::check_legacy_comparison(&condition.comparison_operator, &operands)?;
     let operator = match condition.comparison_operator.as_str() {
         "EQ" => Operator::Equal,
         "LT" => Operator::LessThan,
@@ -1154,15 +1164,7 @@ fn legacy_comparison(
     Ok(Comparison {
         attribute: attribute.to_string(),
         operator,
-        // The operand count is part of each legacy operator's definition, so an entry
-        // given the wrong number of them is refused the way every legacy condition map
-        // of this service refuses one ([`crate::state::check_legacy_comparison`]) — one
-        // sentence for that defect whichever member carried the map.
-        operands: {
-            let operands = condition.attribute_value_list.clone().unwrap_or_default();
-            crate::state::check_legacy_comparison(&condition.comparison_operator, &operands)?;
-            operands
-        },
+        operands,
     })
 }
 

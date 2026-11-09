@@ -105,29 +105,6 @@ pub enum Selection {
     Count,
 }
 
-/// Which reader is applying the `Select` rules.
-///
-/// Two of those refusals name the operation the caller called — "Allowed only when
-/// querying an index" (`Query$Select`) is a rule about the CALL — so the sentence
-/// carries the verb of that call rather than one reader's verb for both.
-#[derive(Debug, Clone, Copy)]
-pub enum Reader {
-    /// `Query`: one partition of the schema it was pointed at.
-    Query,
-    /// `Scan`: every entry of it.
-    Scan,
-}
-
-impl Reader {
-    /// How a refusal names what this reader was doing.
-    fn verb(self) -> &'static str {
-        match self {
-            Self::Query => "Querying",
-            Self::Scan => "Scanning",
-        }
-    }
-}
-
 /// How a refusal of the `Select`/projection pair names what was asked for: `COUNT`
 /// "returns the number of matching items, rather than the matching items themselves"
 /// (`Query$Select`), which AWS's sentence words as the count itself; every other value
@@ -155,7 +132,6 @@ fn select_target(select: &str) -> &str {
 /// `Select` it stated. The envelope is part of the refusal recorded for these three
 /// clauses — a reader tempted to state them bare should check that recording first.
 pub fn resolve_selection(
-    reader: Reader,
     select: Option<&str>,
     projection_member: Option<&'static str>,
     requested: Option<Vec<DocumentPath>>,
@@ -197,10 +173,12 @@ pub fn resolve_selection(
         Some("COUNT") => Ok(Selection::Count),
         Some("ALL_PROJECTED_ATTRIBUTES") if on_index => Ok(Selection::AllProjected),
         // "ALL_PROJECTED_ATTRIBUTES - Allowed only when querying an index": the read has
-        // no index projection to report when it was pointed at the table itself.
+        // no index projection to report when it was pointed at the table itself. The
+        // sentence states that ONE rule, with the verb the rule itself is written in —
+        // the refusal is the same sentence whichever read made the request, and nothing
+        // in it is taken from the operation the caller called.
         Some(other) => Err(super::refused(format!(
-            "{other} can be used only when {} using an IndexName",
-            reader.verb()
+            "{other} can be used only when Querying using an IndexName"
         ))),
     }
 }
