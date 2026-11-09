@@ -251,8 +251,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             // Every address the endpoint carries is a socket Ground Station connects a
-            // stream to, so each port it names has to be one a transport can address and
-            // each MTU it is framed at one the documented range allows, and the name it is
+            // stream to, so its IPv4 host part has to parse as an address, each port it
+            // names has to be one a transport can address and each MTU it is framed at one
+            // the documented range allows, and the name it is
             // selected by has to be one no other endpoint of this group took: both rules
             // belong to every create of a dataflow endpoint group, so both are held in
             // `crate::state`.

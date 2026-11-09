@@ -83,6 +83,8 @@ mod dataflow_endpoint_mtu;
 mod empty_list_filters;
 #[path = "all/ended_contact_takes_no_version.rs"]
 mod ended_contact_takes_no_version;
+#[path = "all/endpoint_ipv4_addresses.rs"]
+mod endpoint_ipv4_addresses;
 #[path = "all/ephemeris_az_el_validation.rs"]
 mod ephemeris_az_el_validation;
 #[path = "all/ephemeris_catalog.rs"]

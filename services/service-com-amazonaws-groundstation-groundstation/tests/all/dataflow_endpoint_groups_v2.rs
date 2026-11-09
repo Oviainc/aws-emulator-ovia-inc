@@ -60,14 +60,18 @@ const PORT: i32 = 55888;
 const RANGE: (i32, i32) = (55000, 55100);
 
 /// `POST /dataflowEndpointGroupV2`.
-async fn create_group_v2(router: &MultiServiceRouter, body: Value) -> Reply {
+///
+/// `pub(crate)` here and on [`uplink`] and [`downlink`]: the sibling addressing suite holds
+/// this create's endpoints to the same rules from this one set of builders rather than
+/// keeping a second copy of them.
+pub(crate) async fn create_group_v2(router: &MultiServiceRouter, body: Value) -> Reply {
     send(router, "POST", "/dataflowEndpointGroupV2", Some(body)).await
 }
 
 /// One `CreateEndpointDetails` naming an uplink AWS Ground Station Agent endpoint: the
 /// address Ground Station sends the uplink stream to, and the agent's own address and port
 /// range (`smithy_query(query="shape", shape="UplinkConnectionDetails")`).
-fn uplink(name: &str, port: i32, range: (i32, i32)) -> Value {
+pub(crate) fn uplink(name: &str, port: i32, range: (i32, i32)) -> Value {
     json!({"uplinkAwsGroundStationAgentEndpoint": {
         "name": name,
         "dataflowDetails": {"agentConnectionDetails": {
@@ -89,7 +93,7 @@ fn uplink(name: &str, port: i32, range: (i32, i32)) -> Value {
 /// One `CreateEndpointDetails` naming a downlink AWS Ground Station Agent endpoint: the
 /// agent's own address and port range, and the address the downlink stream leaves from
 /// (`smithy_query(query="shape", shape="DownlinkConnectionDetails")`).
-fn downlink(name: &str, port: i32, range: (i32, i32)) -> Value {
+pub(crate) fn downlink(name: &str, port: i32, range: (i32, i32)) -> Value {
     json!({"downlinkAwsGroundStationAgentEndpoint": {
         "name": name,
         "dataflowDetails": {"agentConnectionDetails": {

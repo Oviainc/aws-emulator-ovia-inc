@@ -196,7 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `IpV4Address` — `smithy_query(query="shape", shape="IpAddressList")`), and that
         // shape's pattern only holds them to four dot-separated runs of up to three
         // digits: `256.0.0.1` satisfies the pattern the boundary validator applies and is
-        // still not an address the agent can be reached on, so the value is parsed here.
+        // still not an address the agent can be reached on, so the value is parsed
+        // (`crate::state::is_ipv4_address`, which every member this service types as an
+        // `IpV4Address` is held to).
         for (member, addresses) in [
             (
                 "discoveryData.publicIpAddresses",
@@ -207,7 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.discovery_data.private_ip_addresses,
             ),
         ] {
-            if let Some(address) = addresses.iter().find(|address| !is_ipv4_address(address)) {
+            if let Some(address) = addresses
+                .iter()
+                .find(|address| !crate::state::is_ipv4_address(address))
+            {
                 return Err(invalid_parameter(
                     member,
                     format!(
@@ -304,12 +309,3 @@ fn invalid_parameter(parameter: &str, message: String) -> RegisterAgentError {
     .into()
 }
 
-/// Whether `value` is a dotted-quad IPv4 address.
-///
-/// The model's `IpV4Address` pattern already held the value to four dot-separated runs of
-/// one to three digits, so what is left is whether those digits name an address at all,
-/// which `std::net::Ipv4Addr`'s own parser answers (the same check
-/// `service-com-amazonaws-cloudhsm-cloudhsmfrontendservice` makes of an IP it is given).
-fn is_ipv4_address(value: &str) -> bool {
-    value.parse::<::std::net::Ipv4Addr>().is_ok()
-}

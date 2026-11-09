@@ -2305,13 +2305,14 @@ pub const MTU_MIN: i32 = 1400;
 /// See [`MTU_MIN`].
 pub const MTU_MAX: i32 = 1500;
 
-/// Refuse an endpoint any of whose addresses names a port no socket can be addressed by,
-/// or sizes its MTU outside the bytes a dataflow endpoint's MTU can take.
+/// Refuse an endpoint any of whose addresses is not an address a stream can be sent to: a
+/// host part that is not the IPv4 address its shape says it is, a port no socket can be
+/// addressed by, or an MTU outside the bytes a dataflow endpoint's MTU can take.
 ///
-/// Walks every port- and mtu-valued member reachable from one `EndpointDetails`, whichever
-/// endpoint member describes it: a `DataflowEndpoint`'s own `address`, an agent endpoint's
-/// `egressAddress`/`ingressAddress`, and the connection pair an uplink or downlink agent
-/// endpoint's `dataflowDetails` carries (`smithy_query(query="closure",
+/// Walks every address-, port- and mtu-valued member reachable from one `EndpointDetails`,
+/// whichever endpoint member describes it: a `DataflowEndpoint`'s own `address`, an agent
+/// endpoint's `egressAddress`/`ingressAddress`, and the connection pair an uplink or
+/// downlink agent endpoint's `dataflowDetails` carries (`smithy_query(query="closure",
 /// operation="CreateDataflowEndpointGroup")`). `path` is how a refusal spells the item, and
 /// each member is appended to it, so the message names the exact address at fault.
 ///
@@ -2379,13 +2380,17 @@ fn check_connection(
     check_mtu(&format!("{path}.mtu"), connection.mtu)
 }
 
-/// Refuse a `RangedConnectionDetails` whose socket address names an unusable port range:
-/// either bound outside the ports a socket can be addressed by, or a range that runs
-/// backwards and so holds no port at all.
+/// Refuse a `RangedConnectionDetails` whose socket address is not an address at all: a
+/// `name` that is not an IPv4 address, a port-range bound outside the ports a socket can be
+/// addressed by, or a range that runs backwards and so holds no port at all.
 fn check_ranged_connection(
     path: &str,
     connection: &RangedConnectionDetails,
 ) -> Result<(), InvalidParameterException> {
+    check_ipv4_address(
+        &format!("{path}.socketAddress.name"),
+        &connection.socket_address.name,
+    )?;
     let range_path = format!("{path}.socketAddress.portRange");
     let range = &connection.socket_address.port_range;
     check_port(&format!("{range_path}.minimum"), range.minimum)?;
@@ -2401,6 +2406,40 @@ fn check_ranged_connection(
         ));
     }
     Ok(())
+}
+
+/// Refuse one value held to the model's `IpV4Address` that is not an IPv4 address, naming
+/// where it was carried.
+///
+/// `RangedSocketAddress$name` is an `IpV4Address` (`smithy_query(query="shape",
+/// shape="RangedSocketAddress")`), and that shape's pattern only holds a value to four
+/// dot-separated runs of up to three digits, so a value whose octets run past 255 clears
+/// the boundary validator and is still not an address a contact's stream can be carried
+/// over. The sibling member of the same socket address — `SocketAddress$name` — is a plain
+/// modelled `String` ("Name of a socket address"), not an `IpV4Address`, so a name carried
+/// there is held to no address syntax.
+fn check_ipv4_address(path: &str, value: &str) -> Result<(), InvalidParameterException> {
+    if is_ipv4_address(value) {
+        return Ok(());
+    }
+    Err(invalid_parameter(
+        path,
+        format!(
+            "{value} is not an IPv4 address; each of the four octets of an IPv4 address is \
+             between 0 and 255"
+        ),
+    ))
+}
+
+/// Whether `value` is a dotted-quad IPv4 address.
+///
+/// The model's `IpV4Address` pattern already held the value to four dot-separated runs of
+/// one to three digits, so what is left is whether those digits name an address at all,
+/// which `std::net::Ipv4Addr`'s own parser answers. Held here because every member this
+/// service types as an `IpV4Address` — an agent's discovery addresses and the ingress
+/// socket address of an agent-carried dataflow endpoint — is parsed the same way.
+pub fn is_ipv4_address(value: &str) -> bool {
+    value.parse::<::std::net::Ipv4Addr>().is_ok()
 }
 
 /// Refuse one port value outside [`PORT_MIN`]..=[`PORT_MAX`], naming where it was carried.
