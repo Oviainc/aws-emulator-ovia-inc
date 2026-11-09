@@ -9,15 +9,15 @@
 //! (`/gateways/{gatewayIdentifier}/rate-limits/{rateLimitId}`), so the batch
 //! write and every later read answer from this one shape and cannot drift.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    BatchPutLimitEntry, GatewayRateLimitDetail, GetGatewayRateLimitOutput, LimitEntry,
-    ValidationException,
+    BatchPutLimitEntry, CreateGatewayRateLimitOutput, GatewayRateLimitDetail,
+    GetGatewayRateLimitOutput, LimitEntry, ValidationException,
 };
 
-use super::{field_validation_failed, timestamp};
+use super::{field_validation_failed, gateway_status_conflict, timestamp, GatewayRecord};
 
 /// `GatewayRateLimitStatus` members this service drives. The enum's full value
 /// list is `CREATING | ACTIVE | UPDATING | DELETING`
@@ -86,11 +86,33 @@ impl GatewayRateLimitRecord {
         replacing: Option<&Self>,
         now: SystemTime,
     ) -> Self {
+        Self::written(
+            rate_limit_id,
+            submitted.description,
+            submitted.dimension_keys,
+            submitted.entries,
+            replacing,
+            now,
+        )
+    }
+
+    /// The same record, from the members a write carries rather than from the
+    /// batch write's own entry shape: the single create submits one rate limit
+    /// member by member, the batch write submits a list of them, and both store
+    /// it here so neither can date or status a rate limit differently.
+    pub fn written(
+        rate_limit_id: String,
+        description: Option<String>,
+        dimension_keys: Vec<String>,
+        entries: Vec<LimitEntry>,
+        replacing: Option<&Self>,
+        now: SystemTime,
+    ) -> Self {
         Self {
             rate_limit_id,
-            description: submitted.description,
-            dimension_keys: submitted.dimension_keys,
-            entries: submitted.entries,
+            description,
+            dimension_keys,
+            entries,
             created_at: replacing.map_or(now, |previous| previous.created_at),
             updated_at: now,
             transient_status: if replacing.is_some() {
@@ -149,6 +171,96 @@ impl GatewayRateLimitRecord {
             updated_at: detail.updated_at,
         }
     }
+
+    /// This rate limit as `CreateGatewayRateLimit`'s response envelope, which
+    /// declares the same members [`Self::get_output`] does, read off the same
+    /// record: what the create reports is what the next read reports.
+    pub fn create_output(
+        &self,
+        gateway_identifier: &str,
+        now: SystemTime,
+    ) -> CreateGatewayRateLimitOutput {
+        let detail = self.detail(gateway_identifier, now);
+        CreateGatewayRateLimitOutput {
+            rate_limit_id: detail.rate_limit_id,
+            gateway_identifier: detail.gateway_identifier,
+            description: detail.description,
+            dimension_keys: detail.dimension_keys,
+            entries: detail.entries,
+            status: detail.status,
+            created_at: detail.created_at,
+            updated_at: detail.updated_at,
+        }
+    }
+}
+
+/// The dimension a rule entry names that a rate limit scoped by `declared` does
+/// not itself declare, if any.
+///
+/// The rule the model states in prose, so the boundary constraint walk cannot
+/// refuse it: "Keys must match the parent rate limit's dimension keys"
+/// (`smithy_query doc shape=LimitEntry member=dimensions`). Every write of a
+/// rate limit applies it — the batch write over each submitted entry, the single
+/// create over the one it stores — so the two cannot disagree about which rule
+/// entries a rate limit can hold.
+pub fn undeclared_dimension<'a>(
+    declared: &BTreeSet<&str>,
+    entries: &'a [LimitEntry],
+) -> Option<&'a str> {
+    entries
+        .iter()
+        .flat_map(|rule| rule.dimensions.keys())
+        .map(String::as_str)
+        .find(|dimension| !declared.contains(dimension))
+}
+
+/// The rate limit already held by this gateway that is scoped by exactly the
+/// dimension keys `dimension_keys`, if one is.
+///
+/// "Must be unique per gateway—no two rate limits can share the same dimension
+/// keys" (`smithy_query doc shape=CreateGatewayRateLimitRequest
+/// member=dimensionKeys`): the keys are compared as a SET, for the reason
+/// [`refusal_for_batch`] compares them that way — the list's order decides how a
+/// wildcard may be used inside one rate limit, while two limits scoped by the
+/// same keys in a different order still share those keys.
+pub fn rate_limit_sharing_dimension_keys<'a>(
+    rate_limits: &'a BTreeMap<String, GatewayRateLimitRecord>,
+    dimension_keys: &[String],
+) -> Option<&'a GatewayRateLimitRecord> {
+    let submitted: BTreeSet<&str> = dimension_keys.iter().map(String::as_str).collect();
+    rate_limits.values().find(|held| {
+        held.dimension_keys
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<&str>>()
+            == submitted
+    })
+}
+
+/// The refusal a write of one gateway's rate limits owes when the gateway it
+/// addresses cannot take one, or `None` when it can.
+///
+/// A gateway whose deletion has been accepted is on its way out on the clock and
+/// takes no further configuration, so a write of its rate limits is refused with
+/// the status the caller has to wait out — worded by the one helper every gateway
+/// operation this service refuses on status shares.
+///
+/// The TRANSIENT status the clock owes a gateway a transition OUT of (`CREATING`
+/// after a create, `UPDATING` after an update) is NOT a refusal: a rate limit
+/// carries a clock-owed status of its own, so a caller configures the throttling
+/// of a gateway as soon as the gateway exists rather than waiting it out, which
+/// is what the service these operations emulate does.
+///
+/// Shared by every write of the set — the single create and the batch write — so
+/// the two cannot put different preconditions on the same gateway.
+pub fn refusal_for_gateway(
+    operation: &str,
+    gateway: &GatewayRecord,
+    now: SystemTime,
+) -> Option<ValidationException> {
+    gateway
+        .is_deleting()
+        .then(|| gateway_status_conflict(operation, gateway.status_at(now)))
 }
 
 /// Refuse a submitted set that cannot BE one gateway's rate-limit set, with the
@@ -192,22 +304,16 @@ pub fn refusal_for_batch(submitted: &[BatchPutLimitEntry]) -> Option<ValidationE
                 ),
             ));
         }
-        for rule in &entry.entries {
-            if let Some(unknown) = rule
-                .dimensions
-                .keys()
-                .find(|dimension| !declared.contains(dimension.as_str()))
-            {
-                return Some(field_validation_failed(
-                    RATE_LIMITS_MEMBER,
-                    &format!(
-                        "names the dimension {unknown} in a rule entry of the rate limit with the \
-                         dimension keys {}; a rule entry's dimensions are the rate limit's own \
-                         dimension keys",
-                        keys.join(", ")
-                    ),
-                ));
-            }
+        if let Some(unknown) = undeclared_dimension(&declared, &entry.entries) {
+            return Some(field_validation_failed(
+                RATE_LIMITS_MEMBER,
+                &format!(
+                    "names the dimension {unknown} in a rule entry of the rate limit with the \
+                     dimension keys {}; a rule entry's dimensions are the rate limit's own \
+                     dimension keys",
+                    keys.join(", ")
+                ),
+            ));
         }
     }
     None

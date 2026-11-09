@@ -1013,6 +1013,32 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
         }
     }
 
+    /// The (gateway, rate limit) a previous request to `operation` carrying this
+    /// `clientToken` produced, if the record is still held and what it names
+    /// still exists.
+    ///
+    /// The same idempotency record [`Self::remember_gateway_client_token`]
+    /// writes, read for a RATE LIMIT rather than a target: the key carries the
+    /// operation name, so a token remembered by a rate-limit write is never
+    /// resolved against the gateway's targets, and a record whose rate limit has
+    /// since been deleted is no replay at all \u2014 the next request carrying that
+    /// token is served as a fresh one.
+    pub fn replayed_gateway_rate_limit_result(
+        &self,
+        operation: &str,
+        client_token: Option<&str>,
+    ) -> Option<(String, String)> {
+        let (gateway_id, rate_limit_id) = self
+            .gateway_idempotency
+            .get(&token_key(operation, client_token?))?;
+        let rate_limit_id = rate_limit_id.as_ref()?;
+        let gateway = self.gateways.get(gateway_id)?;
+        gateway
+            .rate_limits
+            .contains_key(rate_limit_id)
+            .then(|| (gateway_id.clone(), rate_limit_id.clone()))
+    }
+
     /// The (policy engine, policy) a previous request to `operation` carrying
     /// this `clientToken` produced, if the record is still held and what it names
     /// still exists.

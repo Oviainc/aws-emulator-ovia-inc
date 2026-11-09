@@ -51,6 +51,8 @@ mod gateway_mcp_endpoint;
 mod gateway_mutation;
 #[path = "all/gateway_rate_limit_batch.rs"]
 mod gateway_rate_limit_batch;
+#[path = "all/gateway_rate_limit_creation.rs"]
+mod gateway_rate_limit_creation;
 #[path = "all/gateway_target_deletion.rs"]
 mod gateway_target_deletion;
 #[path = "all/gateway_target_listing.rs"]

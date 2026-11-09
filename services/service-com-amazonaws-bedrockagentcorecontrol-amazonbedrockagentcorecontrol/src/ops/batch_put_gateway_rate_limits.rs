@@ -213,18 +213,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
             )
         })?;
-        // A rate limit is enforced BY the gateway, so the gateway has to be ready
-        // to enforce it: while it is still in the transient status the clock owes
-        // a transition for, or on its way out in `DELETING`, it takes no rate
-        // limit, and the caller is told which status to wait out. The refusal is
-        // worded by the one helper every gateway operation this service refuses
-        // on status shares.
-        let status = gateway.status_at(now);
-        if status != crate::state::STATUS_READY {
-            return Err(BatchPutGatewayRateLimitsErrorModeled::ValidationException(
-                crate::state::gateway_status_conflict(Self::NAME, status),
-            )
-            .into());
+        // A rate limit is enforced BY the gateway, so the gateway has to exist and
+        // not be on its way out. The one precondition every write of a gateway's
+        // rate limits puts on it, shared with the single create: a gateway the
+        // clock is still moving through a transient status TAKES a rate limit,
+        // because the limit carries a clock-owed status of its own.
+        if let Some(refusal) = crate::state::refusal_for_gateway(Self::NAME, gateway, now) {
+            return Err(
+                BatchPutGatewayRateLimitsErrorModeled::ValidationException(refusal).into(),
+            );
         }
         // The set one gateway holds is bounded, so a caller cannot grow this
         // process's memory without bound. `BatchPutLimitEntries` is itself

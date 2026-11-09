@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGatewayRateLimit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGatewayRateLimit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGatewayRateLimit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds ONE rate limit to the gateway the path names, stored in [`crate::state`] beside
+//! the gateway that enforces it, and reports it with the status the clock owes it: a new
+//! rate limit is `CREATING` until the transition to `ACTIVE` comes due. A mutation — the
+//! limit it writes is the one every later read of that gateway reports.
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +184,166 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGatewayRateLimit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGatewayRateLimitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGatewayRateLimit"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateGatewayRateLimitErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the gateway store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A gateway whose deletion the clock has already made due is gone before
+        // this call looks for it: the removal was owed at this instant whether or
+        // not anybody called.
+        store.expire_deleted_gateways_and_targets(now);
+
+        // A replayed request carrying the same `clientToken` answers with the rate
+        // limit that token first created, rather than adding a second one: "if this
+        // token matches a previous request, the service ignores the request, but
+        // doesn't return an error".
+        if let Some((gateway_id, rate_limit_id)) =
+            store.replayed_gateway_rate_limit_result(Self::NAME, input.client_token.as_deref())
+        {
+            if let Some(record) = store
+                .gateways
+                .get(&gateway_id)
+                .and_then(|gateway| gateway.rate_limits.get(&rate_limit_id))
+            {
+                return Ok(record.create_output(&gateway_id, now));
+            }
+        }
+
+        // A rule entry's dimensions are the rate limit's own dimension keys, so a
+        // rule naming a dimension this limit is not scoped by is refused before
+        // anything is written — by the one helper the batch write applies to each
+        // entry it stores, so the two writes cannot disagree about what a rate
+        // limit may hold.
+        let declared: ::std::collections::BTreeSet<&str> =
+            input.dimension_keys.iter().map(String::as_str).collect();
+        if let Some(unknown) = crate::state::undeclared_dimension(&declared, &input.entries) {
+            return Err(CreateGatewayRateLimitErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    ENTRIES_MEMBER,
+                    &format!(
+                        "names the dimension {unknown} in a rule entry; a rule entry's \
+                         dimensions are the rate limit's own dimension keys {}",
+                        input.dimension_keys.join(", ")
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
+            CreateGatewayRateLimitErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
+            )
+        })?;
+        // A rate limit is enforced BY the gateway, so the gateway has to exist and
+        // not be on its way out. The one precondition every write of a gateway's
+        // rate limits puts on it, decided in `crate::state` so the single create
+        // and the batch write cannot drift: a gateway the clock is still moving
+        // through a transient status TAKES a rate limit, because the limit carries
+        // a clock-owed status of its own.
+        if let Some(refusal) = crate::state::refusal_for_gateway(Self::NAME, gateway, now) {
+            return Err(CreateGatewayRateLimitErrorModeled::ValidationException(refusal).into());
+        }
+        let gateway_id = gateway.gateway_id.clone();
+        // An id the caller supplies names a rate limit to CREATE, so an id the
+        // gateway already holds is a conflict with that limit rather than a second
+        // limit under one id (the batch write, which REPLACES the whole set, is
+        // where a known id is an upsert instead).
+        if let Some(rate_limit_id) = input
+            .rate_limit_id
+            .as_ref()
+            .filter(|rate_limit_id| gateway.rate_limits.contains_key(*rate_limit_id))
+        {
+            return Err(CreateGatewayRateLimitErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "gateway {gateway_id} already holds a rate limit with the rateLimitId \
+                         {rate_limit_id}"
+                    )),
+                },
+            )
+            .into());
+        }
+        // "Must be unique per gateway—no two rate limits can share the same
+        // dimension keys": a second limit over the same scope would leave which of
+        // the two throttles a request undecidable, so it is refused as a conflict
+        // with the limit that already holds that scope.
+        if let Some(held) = crate::state::rate_limit_sharing_dimension_keys(
+            &gateway.rate_limits,
+            &input.dimension_keys,
+        ) {
+            return Err(CreateGatewayRateLimitErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "gateway {gateway_id} already holds the rate limit {} with the dimension \
+                         keys {}; no two rate limits of a gateway can share the same dimension \
+                         keys",
+                        held.rate_limit_id,
+                        input.dimension_keys.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+        // The rate limits one gateway holds are bounded, so a caller looping on
+        // create meets the modelled quota instead of this process's memory limit.
+        if gateway.rate_limits.len() >= crate::state::MAX_RATE_LIMITS_PER_GATEWAY {
+            return Err(
+                CreateGatewayRateLimitErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "gateway {gateway_id} already holds the maximum of {} rate limits",
+                            crate::state::MAX_RATE_LIMITS_PER_GATEWAY
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "An optional customer-defined identifier for the rate limit. If not
+        // provided, the system generates one."
+        let rate_limit_id = match input.rate_limit_id {
+            Some(rate_limit_id) => rate_limit_id,
+            None => store.mint_gateway_rate_limit_id(
+                &gateway_id,
+                &input.dimension_keys.join("/"),
+                // This call writes ONE rate limit, so no id is being minted
+                // beside it that the store does not hold yet.
+                &::std::collections::BTreeSet::new(),
+                now,
+            ),
+        };
+        let record = crate::state::GatewayRateLimitRecord::written(
+            rate_limit_id.clone(),
+            input.description,
+            input.dimension_keys,
+            input.entries,
+            // Nothing is being replaced: the id named no rate limit of this
+            // gateway, so the limit is created at `now` and reports `CREATING`
+            // until the clock owes it `ACTIVE`.
+            None,
+            now,
+        );
+        let output = record.create_output(&gateway_id, now);
+        if let Some(gateway) = store.gateways.get_mut(&gateway_id) {
+            gateway.updated_at = now;
+            gateway.rate_limits.insert(rate_limit_id.clone(), record);
+        }
+        store.remember_gateway_client_token(
+            Self::NAME,
+            input.client_token,
+            &gateway_id,
+            Some(&rate_limit_id),
+        );
+
+        Ok(output)
     }
 }
+
+/// The request member a refused rule entry names.
+const ENTRIES_MEMBER: &str = "entries";

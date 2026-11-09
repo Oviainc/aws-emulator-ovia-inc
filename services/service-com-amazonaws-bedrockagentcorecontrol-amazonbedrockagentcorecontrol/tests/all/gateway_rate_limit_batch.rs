@@ -606,8 +606,9 @@ async fn concurrent_writers_leave_exactly_one_submitted_set() {
 }
 
 /// A gateway identifier no gateway of this account holds is the modelled 404, and a
-/// gateway that has not settled yet is refused the modelled 400 — the batch writes nothing
-/// in either case.
+/// gateway whose deletion has been accepted is refused the modelled 400 — the batch writes
+/// nothing in either case. A gateway the clock is still creating TAKES the batch: a rate
+/// limit carries a clock-owed status of its own.
 #[tokio::test]
 async fn the_batch_resolves_its_gateway_first() {
     let router = router();
@@ -648,14 +649,30 @@ async fn the_batch_resolves_its_gateway_first() {
         "setup: the gateway must be created, got {} ({})",
         created.status, created.body
     );
-    let creating = batch_put(&router, &text(&created.body, "gatewayId"), &body).await;
+    let gateway_id = text(&created.body, "gatewayId");
+    let creating = batch_put(&router, &gateway_id, &body).await;
     assert_eq!(
-        (creating.status, error_code(&creating.body).as_str()),
+        creating.status, 200,
+        "a gateway the clock is still creating takes the batch, got {} ({})",
+        creating.status, creating.body
+    );
+
+    // A gateway on its way out takes no further configuration.
+    tokio::time::sleep(PAST_SETTLE).await;
+    let deleted = send(&router, "DELETE", &format!("/gateways/{gateway_id}/"), None).await;
+    assert_eq!(
+        deleted.status, 202,
+        "setup: the gateway's deletion must be accepted, got {} ({})",
+        deleted.status, deleted.body
+    );
+    let deleting = batch_put(&router, &gateway_id, &body).await;
+    assert_eq!(
+        (deleting.status, error_code(&deleting.body).as_str()),
         (400, "ValidationException"),
-        "a gateway the clock is still creating takes no rate limit, got {} {} ({})",
-        creating.status,
-        error_code(&creating.body),
-        creating.body
+        "a gateway on its way out takes no rate limit, got {} {} ({})",
+        deleting.status,
+        error_code(&deleting.body),
+        deleting.body
     );
 }
 
