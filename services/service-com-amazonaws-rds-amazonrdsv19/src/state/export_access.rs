@@ -34,8 +34,8 @@ pub enum ExportRoleDefect {
     NotAssumable,
     /// The role is assumable, but nothing grants it the object write the export performs,
     /// or the destination bucket's own policy denies it: the modelled
-    /// `IamRoleMissingPermissionsFault`, "The IAM role requires additional permissions to
-    /// export to an Amazon S3 bucket".
+    /// `IamRoleMissingPermissionsFault`, which both halves of the decision are refused with
+    /// in the one wording [`super::export_role_missing_permissions_message`] builds.
     MissingPermissions,
 }
 

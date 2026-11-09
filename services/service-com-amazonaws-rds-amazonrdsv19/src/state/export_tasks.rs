@@ -158,12 +158,18 @@ pub fn export_role_not_found_message(role_arn: &str) -> String {
 }
 
 /// What an `IamRoleMissingPermissionsFault` carries: the role can be assumed but is not
-/// granted the object write the export performs, naming the action and the bucket.
+/// authorized to perform the object write the export makes on the destination bucket.
+///
+/// Amazon RDS words this fault as ONE statement of the authorization that is missing — the
+/// role, the action and the bucket — and nothing else: the two variable parts are the
+/// request's `IamRoleArn` and `S3BucketName`, and the action is the object write the export
+/// performs ([`super::EXPORT_OBJECT_WRITE_ACTION`]). It prescribes no remedy and says
+/// nothing about WHICH policy withheld the authorization, so both halves of the decision —
+/// a role whose own policies do not grant the write, and a destination bucket whose policy
+/// denies it — report the same sentence.
 pub fn export_role_missing_permissions_message(role_arn: &str, bucket: &str) -> String {
     format!(
-        "The IAM role {role_arn} requires additional permissions to export to the Amazon S3 \
-         bucket {bucket}: the role's policy must allow {} on the objects of that bucket, and \
-         the bucket policy must not deny it.",
+        "The IAM role {role_arn} isn't authorized to call {} on the S3 bucket {bucket}.",
         super::EXPORT_OBJECT_WRITE_ACTION
     )
 }

@@ -27,7 +27,8 @@
 //!   key KMS holds nothing under is `KMSKeyNotAccessibleFault`, an identifier already
 //!   running is `ExportTaskAlreadyExistsFault`, an `ExportOnly` entry outside the published
 //!   forms is `InvalidExportOnlyFault`, and a source this region holds nothing under is
-//!   that source's own not-found fault.
+//!   that source's own not-found fault. Each refusal also carries the SENTENCE the service
+//!   words that fault as, with the request's own values in its variable parts.
 //!
 //! Each rule is asserted over a TABLE spanning what it generalises over: the feature names
 //! of three engine families plus an engine that publishes none, both resource kinds
@@ -1363,6 +1364,140 @@ async fn a_denying_bucket_policy_refuses_the_export() {
         .await,
         400,
         "IamRoleMissingPermissions",
+    );
+}
+
+/// One row of the missing-permissions table: the case, the role the export is asked to run
+/// under and the destination bucket, which are the two values the refusal's sentence names.
+struct MissingPermissionsRow {
+    case: &'static str,
+    role_arn: String,
+    bucket: String,
+}
+
+/// Rule: the `IamRoleMissingPermissionsFault` refusal carries Amazon RDS's own fixed
+/// sentence for that error class, whose only variable parts are the request's `IamRoleArn`
+/// and `S3BucketName` — whichever half of the authorization decision withheld the object
+/// write.
+///
+/// The rows span what the rule generalises over: the role's own policies not granting the
+/// write (one role carrying no policy at all, one granted it on a DIFFERENT bucket, one
+/// whose name is much longer) and the destination bucket's policy explicitly denying it, so
+/// both halves and both variable parts vary across the table.
+#[tokio::test]
+async fn the_missing_permissions_refusal_carries_the_service_s_own_sentence() {
+    let fixture = export_fixture("emu-export-message", "rds-export-message-role").await;
+    let router = &fixture.router;
+
+    // A role the export principal may assume that carries no identity policy at all.
+    let bare = role(
+        router,
+        "rds-export-msg-bare",
+        st::EXPORT_SERVICE_PRINCIPAL,
+        None,
+    )
+    .await;
+    // The same, under a much longer role name: the ARN is taken from the request whatever
+    // its length.
+    let long_name = role(
+        router,
+        "rds-export-msg-role-with-a-rather-longer-name-than-the-others",
+        st::EXPORT_SERVICE_PRINCIPAL,
+        None,
+    )
+    .await;
+    // A role granted the write on the FIXTURE's bucket only, asked to write another one.
+    let other_bucket = "emu-export-msg-other";
+    create_bucket(router, other_bucket, REGION).await;
+    let elsewhere = role(
+        router,
+        "rds-export-msg-elsewhere",
+        st::EXPORT_SERVICE_PRINCIPAL,
+        Some(put_object_policy(&fixture.bucket)),
+    )
+    .await;
+    // And a bucket whose own policy DENIES the write to a role whose identity policy grants
+    // it: the other half of the decision.
+    let deny_bucket = "emu-export-msg-deny";
+    create_bucket(router, deny_bucket, REGION).await;
+    let denied = role(
+        router,
+        "rds-export-msg-denied",
+        st::EXPORT_SERVICE_PRINCIPAL,
+        Some(put_object_policy(deny_bucket)),
+    )
+    .await;
+    s3(router)
+        .put_bucket_policy()
+        .bucket(deny_bucket)
+        .policy(deny_policy(deny_bucket, &denied))
+        .send()
+        .await
+        .expect("the emulated Amazon S3 takes the bucket policy");
+
+    let rows = [
+        MissingPermissionsRow {
+            case: "a role carrying no identity policy",
+            role_arn: bare,
+            bucket: fixture.bucket.clone(),
+        },
+        MissingPermissionsRow {
+            case: "a role with a long name carrying no identity policy",
+            role_arn: long_name,
+            bucket: fixture.bucket.clone(),
+        },
+        MissingPermissionsRow {
+            case: "a role granted the write on another bucket only",
+            role_arn: elsewhere,
+            bucket: other_bucket.to_string(),
+        },
+        MissingPermissionsRow {
+            case: "a bucket policy denying the role the write",
+            role_arn: denied,
+            bucket: deny_bucket.to_string(),
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let body = expect_error(
+            row.case,
+            call(
+                router,
+                "StartExportTask",
+                &params![
+                    "ExportTaskIdentifier" => format!("emu-export-msg-{index}"),
+                    "SourceArn" => fixture.snapshot_arn,
+                    "S3BucketName" => row.bucket,
+                    "IamRoleArn" => row.role_arn,
+                    "KmsKeyId" => fixture.key_id,
+                ],
+            )
+            .await,
+            400,
+            "IamRoleMissingPermissions",
+        );
+        // The sentence Amazon RDS words this fault as, with the role and the bucket of THIS
+        // request in it and nothing else.
+        let expected = format!(
+            "The IAM role {} isn't authorized to call s3:PutObject on the S3 bucket {}.",
+            row.role_arn, row.bucket
+        );
+        let message = text(&body, "Message");
+        assert_eq!(
+            message, expected,
+            "case {:?}: expected the refusal message {expected:?}, got {message:?}",
+            row.case
+        );
+    }
+
+    // Nothing was accepted: a refused export records no task.
+    let described = expect_ok(
+        "no task was recorded",
+        call(router, "DescribeExportTasks", &params!["MaxRecords" => 20]).await,
+    );
+    assert!(
+        subtrees(&described, "ExportTask").is_empty(),
+        "a refused export records no task, got {described}"
     );
 }
 
