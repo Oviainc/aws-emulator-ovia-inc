@@ -16,6 +16,23 @@ Issue-Commit: 34977689197ee7e7ec3a117f2c4937da4e6f0436
 
 # ECS: the refusals of four request classes AWS answers are still open — one create probe the emulator still accepts, one leaked service, one listing refusal whose predicate is unidentified, and one fixture blocked in EC2 (4 of 6 causes)
 
+> _RESOLUTION: the four causes are answered. The probes the emulator ANSWERED and AWS
+> REFUSES are now refused — a `networkConfiguration` naming a subnet Amazon VPC holds none
+> of (resolved against Amazon EC2's own records) or naming no subnet at all, a
+> `capacityProviderStrategy` naming a capacity provider the cluster is not associated with,
+> and a placement whose revision was never validated against the infrastructure the
+> placement names (a `launchType` or the Fargate capacity providers of its strategy) — so
+> the work they leaked no longer holds the teardown open: `DeleteCluster` and `DeleteService`
+> pass in every unit. `ListTasks` is answered where AWS answers it: the `desiredStatus`
+> filter is resolved against its value set without regard to case, a `containerInstance`
+> filter that matches nothing is an empty listing rather than a refusal, and a filter that
+> has to be the only one a listing carries is refused beside another. Six refusal sentences
+> that were emulator-authored now read as AWS words them. What remains in these fixtures
+> belongs to other open reports: the enum-set wording of the `launchType` refusal and the
+> rest of `20261103T150504Z-ecs-validation-refusals-use-emulator-authored-wording-instead`,
+> the Cloud Map validation-message ordering, and the Fargate task state machine of
+> `20261106T135659Z-ecs-fargate-tasks-and-deployments-never-advance-task.md`._
+
 > _Split out of `issues/things-that-now-work/20261103T150504Z-ecs-refuses-six-request-classes-aws-accepts-answering.md`, whose causes 4 (`ListServicesByNamespace` for a Cloud Map namespace with no ECS service in it) and 5 (`UpdateService` with a partial `deploymentConfiguration`) are fixed, and whose causes 1 and 2 are fixed for the step each was filed against (the bound step `ecs-ecscm-traj-create-service-launch-mistakes#task#11` is answered 200, and the `DeleteCluster` teardown passes in 2 of its 4 units). This report carries the replay keys that do NOT pass, re-filed here so they are not recorded as working. Everything below is what that fix established about them; a later fixer starts from here rather than from scratch._
 
 ## Operation

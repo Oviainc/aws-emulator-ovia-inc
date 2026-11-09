@@ -351,6 +351,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?
         };
 
+        // The subnets an `awsvpc` placement names are Amazon VPC's own records, so they are
+        // resolved against the Amazon EC2 store BEFORE this service's store is locked (the
+        // lock order in [`crate::state::vpc_resolution`]); the verdict is answered where
+        // the configuration's other rules are, below.
+        let unresolved_subnet = crate::state::unresolved_subnet_refusal(
+            &*self.engine,
+            &region,
+            input.network_configuration.as_ref(),
+        );
+
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -370,7 +380,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // be created": a provider name this account holds none of places no task, so the
         // create is refused and no task set is stored
         // ([`crate::state::capacity_provider_strategy_refusal`]).
-        if let Some(message) = guard.capacity_provider_strategy_refusal(&requested_strategy, &region)
+        if let Some(message) =
+            guard.capacity_provider_strategy_refusal(&requested_strategy, &cluster_name, &region)
         {
             return Err(CreateTaskSetErrorModeled::InvalidParameterException(
                 InvalidParameterException {
@@ -458,6 +469,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // And the subnets it names have to be subnets this account holds: the tasks' own
+        // elastic network interfaces are created in them, so a task set placed into a subnet
+        // Amazon VPC has none of cannot be created and nothing is stored
+        // ([`crate::state::unresolved_subnet_refusal`]).
+        if let Some(message) = unresolved_subnet {
+            return Err(CreateTaskSetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // The registries this task set attaches are held to the same rule `CreateService`
         // and `UpdateService` hold theirs to, against the same revision
         // ([`crate::state::service_registry_binding_violation`]).
@@ -473,17 +496,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // A revision is placed with a launch type only where it was validated against it
-        // (`TaskDefinition$compatibilities`).
-        if let Some(launch_type) = input.launch_type.as_deref() {
-            if let Err(message) = crate::state::validate_launch_type(&definition, launch_type) {
-                return Err(CreateTaskSetErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message),
-                    },
-                )
-                .into());
-            }
+        // A revision is placed on the infrastructure it was validated against
+        // (`TaskDefinition$compatibilities`), whichever way the request named it — its
+        // `launchType` or the capacity providers its strategy names
+        // ([`crate::state::validate_placement_launch_type`]).
+        if let Err(message) = crate::state::validate_placement_launch_type(
+            &definition,
+            input.launch_type.as_deref(),
+            &requested_strategy,
+        ) {
+            return Err(CreateTaskSetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
         // The Fargate platform versions are published per OPERATING SYSTEM, so which of
         // them exist for this task set is decided by the family its revision declares: a

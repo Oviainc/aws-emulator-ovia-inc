@@ -32,7 +32,10 @@
 //! * `NetworkMode` — bridge, host, awsvpc, none
 //! * `TaskDefinitionStatus` — ACTIVE, INACTIVE, DELETE_IN_PROGRESS
 //! * `SortOrder` — ASC, DESC
-//! * `DesiredStatus` — RUNNING, PENDING, STOPPED
+//! * `DesiredStatus` — RUNNING, PENDING, STOPPED (the one set below that is matched without
+//!   regard to ASCII case, since Amazon ECS serves a task listing whose `desiredStatus`
+//!   names a member in another case; `crate::task_listing_filters` pins that, and the row
+//!   here sends a value outside the set in every case)
 //!
 //! The closing section drives the rest of the recorded check: the refused create leaves no
 //! service behind, and the same request with the value spelled as the set spells it is
@@ -314,9 +317,12 @@ async fn a_value_outside_an_enumerated_members_set_is_refused_naming_the_member_
             "sort should be one of [ASC,DESC]",
         ),
         (
-            "a lower-case desiredStatus filter on a list",
+            // The one filter whose value set Amazon ECS does NOT hold to the exact
+            // spelling: a lower-case spelling of a member is served, so a value outside
+            // the set in EVERY case is what this row sends.
+            "a desiredStatus filter outside the set on a list",
             "ListTasks",
-            json!({ "cluster": CLUSTER, "desiredStatus": "running" }),
+            json!({ "cluster": CLUSTER, "desiredStatus": "DEACTIVATING" }),
             "desired status should be one of [PENDING,RUNNING,STOPPED]",
         ),
     ];

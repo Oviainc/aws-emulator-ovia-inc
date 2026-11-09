@@ -300,6 +300,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
+        // The subnets an `awsvpc` placement names are Amazon VPC's own records, so they are
+        // resolved against the Amazon EC2 store BEFORE this service's store is locked (the
+        // lock order in [`crate::state::vpc_resolution`]); the verdict is answered where
+        // the configuration's other rules are, below.
+        let unresolved_subnet = crate::state::unresolved_subnet_refusal(
+            &*self.engine,
+            &region,
+            input.network_configuration.as_ref(),
+        );
+
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -362,6 +372,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &definition.network_mode,
             input.network_configuration.as_ref(),
         ) {
+            return Err(StartTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // And the subnets it names have to be subnets this account holds: the task's own
+        // elastic network interface is created in one of them, so a placement into a subnet
+        // Amazon VPC has none of cannot be made and no task is stored
+        // ([`crate::state::unresolved_subnet_refusal`]).
+        if let Some(message) = unresolved_subnet {
             return Err(StartTaskErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message),

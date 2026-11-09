@@ -46,10 +46,29 @@ const FAMILY: &str = "boundfamily";
 const CONTAINER: &str = "app";
 const CONTAINER_PORT: i64 = 80;
 
+/// The subnet the services of this suite are placed in, in the account's own Amazon EC2
+/// store: an `awsvpc` placement is resolved against those records — the interface the task
+/// is given is created IN the subnet it names — so a service placed in one needs the
+/// account to hold it. Written through the fixture every suite naming a subnet literally
+/// shares ([`crate::ec2_network::register_network`]).
+const SUBNET: &str = "subnet-0123456789abcdef0";
+
+/// The second subnet the load balancers of this suite are spread over.
+const SECOND_SUBNET: &str = "subnet-0123456789abcdef1";
+
+/// The VPC both subnets are in, and the one the target groups below are created in.
+const VPC: &str = "vpc-0123456789abcdef0";
+
 /// One emulator carrying ECS and both Elastic Load Balancing models over ONE shared
 /// engine, exactly as the production router builds them.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    crate::ec2_network::register_network(
+        &engine,
+        VPC,
+        &[SUBNET, SECOND_SUBNET],
+        &format!("{REGION}a"),
+    );
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -148,7 +167,7 @@ async fn orphan_target_group(router: &MultiServiceRouter, name: &str) -> String 
             ("Protocol", "HTTP"),
             ("Port", "80"),
             ("TargetType", "ip"),
-            ("VpcId", "vpc-0123456789abcdef0"),
+            ("VpcId", VPC),
         ],
     )
     .await;
@@ -178,8 +197,8 @@ async fn attach(router: &MultiServiceRouter, load_balancer_name: &str, target_gr
         "CreateLoadBalancer",
         &[
             ("Name", load_balancer_name),
-            ("Subnets.member.1", "subnet-0123456789abcdef0"),
-            ("Subnets.member.2", "subnet-0123456789abcdef1"),
+            ("Subnets.member.1", SUBNET),
+            ("Subnets.member.2", SECOND_SUBNET),
         ],
     )
     .await;
@@ -265,7 +284,7 @@ async fn create_service(
             "launchType": "EC2",
             "networkConfiguration": {
                 "awsvpcConfiguration": {
-                    "subnets": ["subnet-0123456789abcdef0"],
+                    "subnets": [SUBNET],
                     "securityGroups": ["sg-0123456789abcdef0"],
                 }
             },

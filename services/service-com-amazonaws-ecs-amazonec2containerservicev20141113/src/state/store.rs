@@ -2291,7 +2291,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     }
 
     /// The refusal a `capacityProviderStrategy` a request NAMES earns, or `None` when every
-    /// entry of it names a capacity provider this account holds.
+    /// entry of it names a capacity provider the placement's own cluster may use.
     ///
     /// `CapacityProviderStrategyItem$capacityProvider` is "The short name or full Amazon
     /// Resource Name (ARN) of the capacity provider", and the item's own doc states what has
@@ -2299,21 +2299,63 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// the capacity provider must already be created" — a provider nothing created, and that
     /// is not one Amazon ECS manages ([`Self::capacity_provider`]), places no task, so the
     /// request is refused and nothing is stored. The sentence names the FIRST such entry,
-    /// the one entry the caller has to change first.
+    /// the one entry the caller has to change first. A provider that WAS created still
+    /// places nothing in a cluster it is not associated with, which is
+    /// [`Self::unassociated_capacity_provider_refusal`].
     ///
     /// The strategy a CLUSTER holds as its default is not checked here: it was resolved
     /// against the same set when it was set on the cluster.
     pub fn capacity_provider_strategy_refusal(
         &self,
         strategy: &[CapacityProviderStrategyItem],
+        cluster_name: &str,
         region: &str,
     ) -> Option<String> {
-        strategy.iter().find_map(|item| {
-            let name = capacity_provider_name_from_reference(&item.capacity_provider);
-            self.capacity_provider(&name, region)
-                .is_none()
-                .then(|| capacity_provider_not_found_message(&item.capacity_provider))
-        })
+        strategy
+            .iter()
+            .find_map(|item| {
+                let name = capacity_provider_name_from_reference(&item.capacity_provider);
+                self.capacity_provider(&name, region)
+                    .is_none()
+                    .then(|| capacity_provider_not_found_message(&item.capacity_provider))
+            })
+            .or_else(|| self.unassociated_capacity_provider_refusal(strategy, cluster_name))
+    }
+
+    /// The refusal a `capacityProviderStrategy` earns when an entry names a capacity
+    /// provider that is not one of the cluster's own, or `None` when every entry is.
+    ///
+    /// A capacity provider places tasks in a cluster only once it is ASSOCIATED with that
+    /// cluster: `PutClusterCapacityProviders` takes "the capacity providers to associate
+    /// with the cluster", and `Cluster$capacityProviders` is the list it leaves behind — so
+    /// a placement whose strategy names anything outside that list has no capacity to place
+    /// on, whether the name is one the account holds or one nothing created
+    /// ([`CAPACITY_PROVIDER_NOT_ASSOCIATED_MESSAGE`]). The providers Amazon ECS manages for
+    /// every account ([`MANAGED_CAPACITY_PROVIDERS`]) are associated the same way as any
+    /// other, so a cluster that was never given them cannot place on them either.
+    pub fn unassociated_capacity_provider_refusal(
+        &self,
+        strategy: &[CapacityProviderStrategyItem],
+        cluster_name: &str,
+    ) -> Option<String> {
+        let held: Vec<String> = self
+            .clusters
+            .get(cluster_name)
+            .map(|cluster| {
+                cluster
+                    .capacity_providers
+                    .iter()
+                    .map(|reference| capacity_provider_name_from_reference(reference))
+                    .collect()
+            })
+            .unwrap_or_default();
+        strategy
+            .iter()
+            .any(|item| {
+                let name = capacity_provider_name_from_reference(&item.capacity_provider);
+                !held.contains(&name)
+            })
+            .then(|| CAPACITY_PROVIDER_NOT_ASSOCIATED_MESSAGE.to_string())
     }
 
     /// The cluster an operation may act IN: one that exists and has not been deleted.

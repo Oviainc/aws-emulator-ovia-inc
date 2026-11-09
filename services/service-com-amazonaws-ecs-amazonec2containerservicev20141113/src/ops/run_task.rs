@@ -301,8 +301,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let count = input.count.unwrap_or(1);
         // "You can specify up to 10 tasks for each call."
-        if let Some(message) = crate::state::integer_bound_message(
-            "count",
+        if let Some(message) = crate::state::task_count_bound_message(
             count,
             crate::state::MIN_RUN_TASK_COUNT,
             crate::state::MAX_RUN_TASK_COUNT,
@@ -393,6 +392,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The subnets an `awsvpc` placement names are Amazon VPC's own records, so they
+        // are resolved against the Amazon EC2 store BEFORE this service's store is locked
+        // (the lock order in [`crate::state::vpc_resolution`]); the verdict is answered
+        // where the configuration's other rules are, below.
+        let unresolved_subnet = crate::state::unresolved_subnet_refusal(
+            &*self.engine,
+            &region,
+            input.network_configuration.as_ref(),
+        );
+
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -409,11 +418,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cluster_arn = cluster.arn.clone();
         let cluster_default_strategy = cluster.default_capacity_provider_strategy.clone();
 
-        // "If a capacityProviderStrategy is specified, the capacity providers must already
-        // be created": a provider name this account holds none of places no task, so the
-        // run is refused and no task is created
-        // ([`crate::state::capacity_provider_strategy_refusal`]).
-        if let Some(message) = guard.capacity_provider_strategy_refusal(&strategy, &region) {
+        // A capacity provider places this task only in a cluster it is ASSOCIATED with, so
+        // a strategy naming one outside the cluster's own list places nothing and the run is
+        // refused with no task created. A run states that condition in the cluster's terms
+        // whatever the name resolves to in the account
+        // ([`crate::state::unassociated_capacity_provider_refusal`]), where a create states
+        // an unresolvable name in the account's.
+        if let Some(message) = guard.unassociated_capacity_provider_refusal(&strategy, &cluster_name)
+        {
             return Err(RunTaskErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message),
@@ -464,6 +476,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // And the subnets it names have to be subnets this account holds: the task's own
+        // elastic network interface is created in one of them, so a placement into a subnet
+        // Amazon VPC has none of cannot be made and no task is stored
+        // ([`crate::state::unresolved_subnet_refusal`]).
+        if let Some(message) = unresolved_subnet {
+            return Err(RunTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // ECS Exec signs its session with the TASK's role, so a run that enables it needs
         // one to resolve — from this run's own `overrides`, else from the revision
         // ([`crate::state::resolved_task_role_arn`]).
@@ -480,19 +504,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A revision is placed with a launch type only where it was validated against
-        // it (`TaskDefinition$compatibilities`), so a request that asks for one the
-        // stored revision does not support is refused before any task is created.
-        if let Some(launch_type) = input.launch_type.as_deref() {
-            if let Err(message) = crate::state::validate_launch_type(&definition, launch_type) {
-                return Err(RunTaskErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message),
-                    },
-                )
-                .into());
-            }
-        }
+        // A revision is placed on the infrastructure it was validated against
+        // (`TaskDefinition$compatibilities`), which is decided on the RESOLVED placement
+        // below, once the cluster's default strategy has been applied.
 
         let requested = usize::try_from(count).unwrap_or(usize::MAX);
         if guard.tasks.len() + requested > crate::state::MAX_TASKS {
@@ -520,6 +534,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => (Some(crate::state::DEFAULT_LAUNCH_TYPE.to_string()), None),
             },
         };
+
+        // A revision is placed on the infrastructure it was validated against
+        // (`TaskDefinition$compatibilities`), whichever way the placement named that
+        // infrastructure — its `launchType`, the capacity providers its strategy names, or
+        // the cluster's default strategy, which is what a placement naming neither runs on
+        // — so a placement the stored revision does not support is refused before any task
+        // is created ([`crate::state::validate_placement_launch_type`]). Decided on the
+        // resolved placement below, where the cluster's default has been applied.
+        if let Err(message) = crate::state::validate_placement_launch_type(
+            &definition,
+            input.launch_type.as_deref(),
+            &effective_strategy,
+        ) {
+            return Err(RunTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // A public IP is attached to the task's OWN elastic network interface, which only
         // the Fargate infrastructure does — so whether this run may ask for one is decided

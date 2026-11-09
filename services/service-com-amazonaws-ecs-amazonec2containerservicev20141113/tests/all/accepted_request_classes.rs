@@ -88,12 +88,31 @@ fn create_service_request(cluster: &str, name: &str, extra: Value) -> Value {
 // A capacity provider this account holds none of
 // ---------------------------------------------------------------------------
 
-/// One row of the capacity-provider table: the strategy a request names, and the provider
-/// reference the refusal must name — `None` for a strategy that resolves.
+/// One row of the capacity-provider table: the strategy a request names, and the whole
+/// sentence the refusal must carry — `None` for a strategy that resolves.
 struct StrategyRow {
     case: &'static str,
     strategy: Value,
     refused: Option<String>,
+}
+
+/// The sentence a strategy naming a provider the ACCOUNT holds none of earns, for the
+/// reference the request spelled.
+fn not_found(reference: &str) -> String {
+    format!(
+        "The specified capacity provider {reference} was not found. Specify a valid capacity \
+         provider and try again."
+    )
+}
+
+/// The sentence a strategy naming a provider the account holds but the CLUSTER does not
+/// earns: a provider places tasks in a cluster only once it is associated with it
+/// (`PutClusterCapacityProviders`), so the sentence is about the pair and names neither.
+fn not_associated() -> String {
+    "The specified capacity provider strategy cannot contain a capacity provider that is \
+     not associated with the cluster. Associate the capacity provider with the cluster or \
+     specify a valid capacity provider and try again."
+        .to_string()
 }
 
 #[tokio::test]
@@ -102,12 +121,28 @@ async fn a_capacity_provider_the_account_holds_none_of_is_refused_and_stores_no_
     let cluster = "providerscope";
     cluster_with_capacity(&router, cluster, "setup").await;
     register_fargate_capable(&router, "setup").await;
+    for name in ["real-provider", "unassociated-provider"] {
+        ok(
+            &router,
+            "CreateCapacityProvider",
+            json!({
+                "name": name,
+                "autoScalingGroupProvider": { "autoScalingGroupArn": format!("asg-{name}") },
+            }),
+            "setup",
+        )
+        .await;
+    }
+    // A placement uses the providers its CLUSTER holds, so the ones these rows place on are
+    // associated with it through the operation that associates one; `unassociated-provider`
+    // is deliberately left out of the list.
     ok(
         &router,
-        "CreateCapacityProvider",
+        "PutClusterCapacityProviders",
         json!({
-            "name": "real-provider",
-            "autoScalingGroupProvider": { "autoScalingGroupArn": "asg-real" },
+            "cluster": cluster,
+            "capacityProviders": ["FARGATE", "FARGATE_SPOT", "real-provider"],
+            "defaultCapacityProviderStrategy": [],
         }),
         "setup",
     )
@@ -115,13 +150,13 @@ async fn a_capacity_provider_the_account_holds_none_of_is_refused_and_stores_no_
 
     // The rows differ along how the strategy spells the provider (a short name, an ARN),
     // how many entries it carries, and whether the provider is one nothing created, one
-    // Amazon ECS publishes for every account (`FARGATE`, `FARGATE_SPOT`) or one this
-    // account created.
+    // Amazon ECS publishes for every account (`FARGATE`, `FARGATE_SPOT`), one this account
+    // created and associated with the cluster, or one it created and did not.
     let rows = [
         StrategyRow {
             case: "a name nothing was created under",
             strategy: json!([{ "capacityProvider": "never-created", "weight": 1 }]),
-            refused: Some("never-created".to_string()),
+            refused: Some(not_found("never-created")),
         },
         StrategyRow {
             case: "an unknown name beside a created one",
@@ -129,19 +164,32 @@ async fn a_capacity_provider_the_account_holds_none_of_is_refused_and_stores_no_
                 { "capacityProvider": "real-provider", "weight": 1 },
                 { "capacityProvider": "also-never-created", "weight": 1 },
             ]),
-            refused: Some("also-never-created".to_string()),
+            refused: Some(not_found("also-never-created")),
         },
         StrategyRow {
             case: "an ARN of a provider nothing holds",
             strategy: json!([
                 { "capacityProvider": capacity_provider_arn("arn-never-created"), "weight": 1 },
             ]),
-            refused: Some(capacity_provider_arn("arn-never-created")),
+            refused: Some(not_found(&capacity_provider_arn("arn-never-created"))),
         },
         StrategyRow {
             case: "a name that only looks like a managed provider",
             strategy: json!([{ "capacityProvider": "FARGATE_SPOTS", "weight": 1 }]),
-            refused: Some("FARGATE_SPOTS".to_string()),
+            refused: Some(not_found("FARGATE_SPOTS")),
+        },
+        StrategyRow {
+            case: "a provider this account created but the cluster does not hold",
+            strategy: json!([{ "capacityProvider": "unassociated-provider", "weight": 1 }]),
+            refused: Some(not_associated()),
+        },
+        StrategyRow {
+            case: "an associated provider beside one the cluster does not hold",
+            strategy: json!([
+                { "capacityProvider": "real-provider", "weight": 1 },
+                { "capacityProvider": "unassociated-provider", "weight": 1 },
+            ]),
+            refused: Some(not_associated()),
         },
         StrategyRow {
             case: "the managed Fargate providers",
@@ -174,21 +222,15 @@ async fn a_capacity_provider_the_account_holds_none_of_is_refused_and_stores_no_
         )
         .await;
         match &row.refused {
-            Some(reference) => {
+            Some(expected) => {
                 assert_eq!(
                     status, 400,
                     "case {case:?}: expected the create to be refused, got {status} with {body}"
                 );
                 assert_eq!(
                     body["message"].as_str(),
-                    Some(
-                        format!(
-                            "The specified capacity provider {reference} was not found. Specify \
-                             a valid capacity provider and try again."
-                        )
-                        .as_str()
-                    ),
-                    "case {case:?}: expected the refusal to name {reference:?}, got {body}"
+                    Some(expected.as_str()),
+                    "case {case:?}: expected the refusal to read {expected:?}, got {body}"
                 );
                 // A refused create stores nothing: the name is still free, which is what
                 // lets the client correct the request and try again.

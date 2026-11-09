@@ -83,7 +83,8 @@ fn build_router() -> MultiServiceRouter {
 }
 
 /// Put the VPC and the two subnets the literal-id rows name into the account's own
-/// Amazon EC2 store, as the modelled shapes that service reports.
+/// Amazon EC2 store, through the fixture every suite naming a subnet literally shares
+/// ([`crate::ec2_network::register_network`]).
 ///
 /// A Resolver endpoint's IP addresses are placed IN subnets of the caller's VPC, which
 /// Route 53 Resolver resolves against that store, so a stack that names those subnets
@@ -91,33 +92,12 @@ fn build_router() -> MultiServiceRouter {
 /// declare `AWS::EC2::*` resources themselves need none of this, because the stack creates
 /// them through Amazon EC2's own API.
 fn register_literal_network(engine: &engine::InMemoryEngine) {
-    use service_com_amazonaws_ec2_amazonec2 as ec2;
-
-    let ec2_state = ec2::state::service_state(engine)
-        .expect("the in-memory engine carries the account's Amazon EC2 store");
-    let mut store = ec2_state.lock();
-    store.vpcs.insert(
-        LITERAL_VPC_ID.to_string(),
-        ec2::ops::types::Vpc {
-            vpc_id: Some(LITERAL_VPC_ID.to_string()),
-            cidr_block: Some("10.0.0.0/16".to_string()),
-            state: Some(ec2::state::VPC_STATE_AVAILABLE.to_string()),
-            ..Default::default()
-        },
+    crate::ec2_network::register_network(
+        engine,
+        LITERAL_VPC_ID,
+        &LITERAL_SUBNET_IDS,
+        "us-east-1a",
     );
-    for (index, subnet_id) in LITERAL_SUBNET_IDS.iter().enumerate() {
-        store.subnets.insert(
-            (*subnet_id).to_string(),
-            ec2::ops::types::Subnet {
-                subnet_id: Some((*subnet_id).to_string()),
-                vpc_id: Some(LITERAL_VPC_ID.to_string()),
-                cidr_block: Some(format!("10.0.{index}.0/24")),
-                availability_zone: Some("us-east-1a".to_string()),
-                state: Some(ec2::state::SUBNET_STATE_AVAILABLE.to_string()),
-                ..Default::default()
-            },
-        );
-    }
 }
 
 /// A SigV4 `Authorization` header whose credential scope names `service` in `region`,

@@ -632,6 +632,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?
         };
 
+        // The subnets an `awsvpc` placement names are Amazon VPC's own records, so they are
+        // resolved against the Amazon EC2 store BEFORE this service's store is locked (the
+        // lock order in [`crate::state::vpc_resolution`]); the verdict is answered where
+        // the configuration's other rules are, below.
+        let unresolved_subnet = crate::state::unresolved_subnet_refusal(
+            &*self.engine,
+            &region,
+            input.network_configuration.as_ref(),
+        );
+
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -658,7 +668,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account holds, and a name none of them carries places nothing — so the create is
         // refused and no service is stored
         // ([`crate::state::capacity_provider_strategy_refusal`]).
-        if let Some(message) = guard.capacity_provider_strategy_refusal(&requested_strategy, &region)
+        if let Some(message) =
+            guard.capacity_provider_strategy_refusal(&requested_strategy, &cluster_name, &region)
         {
             return Err(CreateServiceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
@@ -740,6 +751,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // And the subnets it names have to be subnets this account holds: the tasks'
+            // own elastic network interfaces are created in them, so a service placed into
+            // a subnet Amazon VPC has none of cannot be created and nothing is stored
+            // ([`crate::state::unresolved_subnet_refusal`]).
+            if let Some(message) = unresolved_subnet {
+                return Err(CreateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
             // ECS Exec signs its session with the TASK's role, so a service that enables
             // it needs the revision to declare one: a service carries no `overrides`, so
             // the revision is the only place its tasks' role can come from.
@@ -789,11 +812,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A revision is placed with a launch type only where it was validated against
-        // it (`TaskDefinition$compatibilities`), so a service that asks for one the
-        // stored revision does not support is refused before anything is stored.
-        if let (Some(found), Some(launch_type)) = (&definition, input.launch_type.as_deref()) {
-            if let Err(message) = crate::state::validate_launch_type(found, launch_type) {
+        // A revision is placed on the infrastructure it was validated against
+        // (`TaskDefinition$compatibilities`), whichever way the placement named that
+        // infrastructure — its `launchType`, the capacity providers its strategy names, or
+        // the cluster's default strategy, which is what a service naming neither runs on —
+        // so a service that asks for one the stored revision does not support is refused
+        // before anything is stored ([`crate::state::validate_placement_launch_type`]).
+        let placement_strategy: &[CapacityProviderStrategyItem] = if requested_strategy.is_empty() {
+            &cluster_default_strategy
+        } else {
+            &requested_strategy
+        };
+        if let Some(found) = &definition {
+            if let Err(message) = crate::state::validate_placement_launch_type(
+                found,
+                input.launch_type.as_deref(),
+                placement_strategy,
+            ) {
                 return Err(CreateServiceErrorModeled::InvalidParameterException(
                     InvalidParameterException {
                         message: Some(message),

@@ -48,6 +48,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Amazon VPC's own records: an ECS service of the `awsvpc` network mode is placed in
+# subnets Amazon ECS resolves against this store, so the suites that analyse one hold the
+# subnet their placement names.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

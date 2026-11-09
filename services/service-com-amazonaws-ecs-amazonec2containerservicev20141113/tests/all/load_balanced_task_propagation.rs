@@ -87,6 +87,9 @@ const POLL_BUDGET: Duration = AWSVPC_START.saturating_add(Duration::from_secs(6)
 /// so no ECS request below is routed any differently for their presence.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    // The services and tasks below are placed in an `awsvpc` subnet, which Amazon ECS
+    // resolves against Amazon VPC's records ([`crate::ecs_wire::seed_awsvpc_subnets`]).
+    crate::ecs_wire::seed_awsvpc_subnets(&engine);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -386,14 +389,13 @@ async fn register_definition(
     .await;
 }
 
-/// The `networkConfiguration` every service and task below launches with. The subnet and
-/// security group are EC2-shaped but held by no mounted EC2 store, which is what makes the
-/// registration's Availability Zone absent rather than invented — the zone is the subnet's
-/// property, and nothing here holds that subnet.
+/// The `networkConfiguration` every service and task below launches with: the subnet the
+/// harness holds in the account's Amazon VPC records, since a placement into the `awsvpc`
+/// mode is resolved against them, and an EC2-shaped security group.
 fn network_configuration() -> Value {
     json!({
         "awsvpcConfiguration": {
-            "subnets": ["subnet-0123456789abcdef0"],
+            "subnets": [crate::ecs_wire::AWSVPC_SUBNET],
             "securityGroups": ["sg-0123456789abcdef0"],
         }
     })

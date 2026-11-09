@@ -36,15 +36,68 @@ pub(crate) const AWSVPC_START: std::time::Duration = std::time::Duration::from_m
         + 400,
 );
 
-/// A router with just this service mounted on a fresh engine.
+/// A router with just this service mounted on a fresh engine, and the one Amazon VPC subnet
+/// every `awsvpc` placement of these suites names ([`AWSVPC_SUBNET`]) in the account's
+/// records.
 pub(crate) fn service() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    seed_awsvpc_subnets(&engine);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
         service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(engine),
     );
     router
+}
+
+/// The subnet id every `awsvpc` placement below names
+/// ([`awsvpc_network_configuration`]), one of the ids the harness puts in the account's
+/// Amazon VPC records ([`seed_awsvpc_subnets`]).
+pub(crate) const AWSVPC_SUBNET: &str = "subnet-0123456789abcdef0";
+
+/// The fixed subnet ids the suites of this binary name beside [`AWSVPC_SUBNET`]: a second
+/// one for a configuration that names two, and the ones the load-balancer suites place
+/// their services in.
+const AWSVPC_SUBNETS: [&str; 5] = [
+    AWSVPC_SUBNET,
+    "subnet-0123456789abcdef1",
+    "subnet-0abc1234ecs0lb",
+    "subnet-0abc1234ecs0lb0",
+    "subnet-0abc1234ecs0lb1",
+];
+
+/// How far the `subnet-<17 hexadecimal digits>` family the interface suites draw distinct
+/// ids from runs ([`seed_awsvpc_subnets`] holds every id up to it).
+const AWSVPC_SUBNET_FAMILY_END: u64 = 0x200;
+
+/// Put the subnets these suites place into in the account's Amazon VPC records, in
+/// [`SIGNED_REGION`].
+///
+/// A placement into the `awsvpc` network mode is resolved against those records — the
+/// interface the task is given is created IN the subnet it names, so a placement naming a
+/// subnet the account does not hold is refused. The records are written into the Amazon EC2
+/// service's own store, where Amazon VPC's records live, because these suites mount only
+/// Amazon ECS (and, for some, one other service): there is no Amazon EC2 endpoint in their
+/// router to create them through, and the ids have to be the fixed ones the requests and
+/// their assertions name, which `CreateSubnet` — which mints its own — cannot give. A suite
+/// that drives the Amazon EC2 API itself builds its network through that API instead
+/// ([`crate::image_pull_placement`]).
+pub(crate) fn seed_awsvpc_subnets(engine: &engine::InMemoryEngine) {
+    let ec2 = service_com_amazonaws_ec2_amazonec2::state::service_state(engine)
+        .expect("the shared engine carries the Amazon EC2 store");
+    let mut store = ec2.lock();
+    let family = (0..=AWSVPC_SUBNET_FAMILY_END).map(|value| format!("subnet-{value:017x}"));
+    for subnet_id in AWSVPC_SUBNETS.iter().map(|id| (*id).to_string()).chain(family) {
+        store.subnets.insert(
+            subnet_id.clone(),
+            service_com_amazonaws_ec2_amazonec2::ops::types::Subnet {
+                subnet_id: Some(subnet_id),
+                availability_zone: Some(format!("{SIGNED_REGION}a")),
+                state: Some("available".to_string()),
+                ..Default::default()
+            },
+        );
+    }
 }
 
 /// One `awsJson1_1` call, returning the HTTP status and the parsed response body.
@@ -254,12 +307,13 @@ pub(crate) fn present_count(body: &Value, member: &str, case: &str) -> Option<i6
 /// The `networkConfiguration` every launch of an `awsvpc` task definition has to carry:
 /// an `awsvpc` task gets its own elastic network interface, so `CreateService`,
 /// `UpdateService` and `RunTask` must say which subnets and security groups it takes
-/// (`AwsVpcConfiguration$subnets`/`$securityGroups`). The ids are EC2-shaped but never
-/// resolved: ECS stores the configuration it is given.
+/// (`AwsVpcConfiguration$subnets`/`$securityGroups`). The subnet is [`AWSVPC_SUBNET`], which
+/// the harness holds in the account's Amazon VPC records: a placement is resolved against
+/// them, so a subnet nothing holds is refused.
 pub(crate) fn awsvpc_network_configuration() -> Value {
     json!({
         "awsvpcConfiguration": {
-            "subnets": ["subnet-0123456789abcdef0"],
+            "subnets": [AWSVPC_SUBNET],
             "securityGroups": ["sg-0123456789abcdef0"],
         }
     })
@@ -329,9 +383,11 @@ pub(crate) async fn register_definition(
 
 /// A router carrying this service AND the Cloud Map (service discovery) service over ONE
 /// shared engine — the two stores every cross-service registry rule reads across, mounted
-/// the way the production router mounts them.
+/// the way the production router mounts them. Holds [`AWSVPC_SUBNET`] too, so a placement
+/// of these suites resolves the subnet it names.
 pub(crate) fn emulator_with_cloud_map() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    seed_awsvpc_subnets(&engine);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(

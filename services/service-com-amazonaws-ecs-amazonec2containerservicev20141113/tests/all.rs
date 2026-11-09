@@ -117,6 +117,8 @@ mod managed_instances_monitoring_spelling;
 mod name_pattern_refusals;
 #[path = "all/page_size_range_refusals.rs"]
 mod page_size_range_refusals;
+#[path = "all/placement_resolution.rs"]
+mod placement_resolution;
 #[path = "all/primary_task_set.rs"]
 mod primary_task_set;
 // Pins the Managed Instances launch template's `monitoring` option; the module name
@@ -189,6 +191,8 @@ mod task_interface_allocation;
 mod task_interface_attach_and_connectivity;
 #[path = "all/task_lifecycle.rs"]
 mod task_lifecycle;
+#[path = "all/task_listing_filters.rs"]
+mod task_listing_filters;
 #[path = "all/task_override_and_size_validation.rs"]
 mod task_override_and_size_validation;
 #[path = "all/task_provisioning.rs"]

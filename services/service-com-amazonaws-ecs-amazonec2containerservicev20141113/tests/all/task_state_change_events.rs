@@ -71,6 +71,9 @@ const QUIET_BUDGET: Duration = AWSVPC_START.saturating_add(Duration::from_secs(1
 /// router mounts them.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    // The tasks of this suite are placed in an `awsvpc` subnet, which a placement is
+    // resolved against ([`crate::ecs_wire::seed_awsvpc_subnets`]).
+    crate::ecs_wire::seed_awsvpc_subnets(&engine);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(

@@ -48,19 +48,19 @@ fn expected_message(instance_id: &str) -> String {
 /// an unresolvable one with `InvalidParameterException`:
 ///
 /// * `DeregisterContainerInstance$containerInstance` (required),
-/// * `ListTasks$containerInstance` (the placement filter),
 /// * `RegisterContainerInstance$containerInstanceArn` ("the ARN of the container instance
 ///   (if it was previously registered)").
 ///
 /// `DescribeContainerInstances` is NOT one of them: it reports an unresolvable reference
 /// as a `Failure` with reason `MISSING` instead of refusing the call, which
-/// [`crate::container_instances`] pins. `StartTask`, `UpdateContainerInstancesState` and
-/// `UpdateContainerAgent` are still scaffolded (HTTP 501), so they resolve nothing yet.
-const REQUESTS: [OperationRow; 3] = [
+/// [`crate::container_instances`] pins. Neither is `ListTasks`: its `containerInstance` is
+/// a FILTER, and a filter selects what it matches — an id no instance of the cluster
+/// carries is matched by no task of it, so that listing is answered with the tasks that do
+/// match (none), which [`crate::task_listing_filters`] pins. `StartTask`,
+/// `UpdateContainerInstancesState` and `UpdateContainerAgent` are still scaffolded (HTTP
+/// 501), so they resolve nothing yet.
+const REQUESTS: [OperationRow; 2] = [
     ("DeregisterContainerInstance", |reference| {
-        json!({ "cluster": CLUSTER, "containerInstance": reference })
-    }),
-    ("ListTasks", |reference| {
         json!({ "cluster": CLUSTER, "containerInstance": reference })
     }),
     // A registration presents the identity document and its signature whatever else it

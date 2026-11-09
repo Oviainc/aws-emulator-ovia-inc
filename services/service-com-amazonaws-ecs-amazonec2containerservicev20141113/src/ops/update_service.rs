@@ -533,6 +533,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?
         };
 
+        // The subnets this update NAMES are Amazon VPC's own records, so they are resolved
+        // against the Amazon EC2 store BEFORE this service's store is locked (the lock order
+        // in [`crate::state::vpc_resolution`]); an update that names none moves the service
+        // into no new subnet, so there is nothing to resolve for it.
+        let unresolved_subnet = crate::state::unresolved_subnet_refusal(
+            &*self.engine,
+            &region,
+            input.network_configuration.as_ref(),
+        );
+
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -587,6 +597,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::capacity_provider_strategy_refusal`]).
         if let Some(message) = guard.capacity_provider_strategy_refusal(
             input.capacity_provider_strategy.as_deref().unwrap_or(&[]),
+            &cluster_name,
             &region,
         ) {
             return Err(UpdateServiceErrorModeled::InvalidParameterException(
@@ -718,6 +729,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // And the subnets it names have to be subnets this account holds: the tasks'
+            // own elastic network interfaces are created in them, so an update that moves
+            // the service into a subnet Amazon VPC has none of is refused and nothing of it
+            // is written ([`crate::state::unresolved_subnet_refusal`]).
+            if let Some(message) = unresolved_subnet {
+                return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
             if let Some(message) = crate::state::execute_command_violation(
                 effective_execute_command,
                 definition.task_role_arn.as_deref(),
@@ -767,17 +790,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A revision is placed with a launch type only where it was validated against it
+        // A revision is placed on the infrastructure it was validated against
         // (`TaskDefinition$compatibilities`), so an update that moves the service onto a
-        // revision its launch type does not support is refused, as its create was. A
-        // request that moves the service onto a capacity-provider strategy takes the
-        // launch type off it, so there is none left to check.
-        let effective_launch_type = match input.capacity_provider_strategy.as_deref() {
-            Some(strategy) if !strategy.is_empty() => None,
-            _ => snapshot.launch_type.as_deref(),
-        };
-        if let (Some(found), Some(launch_type)) = (&definition, effective_launch_type) {
-            if let Err(message) = crate::state::validate_launch_type(found, launch_type) {
+        // revision its placement does not support is refused, as its create was. A request
+        // that moves the service onto a capacity-provider strategy takes the launch type
+        // off it, and the strategy it moves to is where the tasks then run
+        // ([`crate::state::validate_placement_launch_type`]).
+        let (effective_launch_type, effective_strategy) =
+            match input.capacity_provider_strategy.as_deref() {
+                Some(strategy) if !strategy.is_empty() => (None, strategy),
+                _ => (snapshot.launch_type.as_deref(), [].as_slice()),
+            };
+        if let Some(found) = &definition {
+            if let Err(message) = crate::state::validate_placement_launch_type(
+                found,
+                effective_launch_type,
+                effective_strategy,
+            ) {
                 return Err(UpdateServiceErrorModeled::InvalidParameterException(
                     InvalidParameterException {
                         message: Some(message),

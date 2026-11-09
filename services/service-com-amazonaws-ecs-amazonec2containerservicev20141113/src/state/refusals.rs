@@ -267,6 +267,39 @@ pub fn validate_launch_type(
     ))
 }
 
+/// Check the launch type a placement's tasks will actually RUN with against the launch
+/// types `definition` supports, answering the message an `InvalidParameterException`
+/// carries when it is not one of them.
+///
+/// A placement says where its tasks run in one of two ways —
+/// "A task can use either a launch type or a capacity provider strategy" — and the
+/// revision has to support the infrastructure either way names, since it is the same
+/// infrastructure. A `launchType` says it outright and is what the tasks then run with; a
+/// placement that names none runs on the capacity providers of its strategy, and the
+/// Fargate ones place on Fargate ("When you use Fargate, the capacity providers are FARGATE
+/// or FARGATE_SPOT", [`places_on_fargate`]), so a revision that was never validated against
+/// the Fargate launch type cannot be placed through them either. A placement that names
+/// neither runs on the capacity registered to the cluster, which every revision is
+/// validated against ([`DEFAULT_VALIDATED_LAUNCH_TYPES`]), so there is nothing to check.
+pub fn validate_placement_launch_type(
+    definition: &TaskDefinitionRecord,
+    launch_type: Option<&str>,
+    strategy: &[CapacityProviderStrategyItem],
+) -> Result<(), String> {
+    let placed = match launch_type {
+        // A launch type the request named is where the tasks run, whatever strategy the
+        // cluster holds as its default: that default applies only to a placement that names
+        // neither.
+        Some(launch_type) => Some(launch_type),
+        None if places_on_fargate(None, strategy) => Some(LAUNCH_TYPE_FARGATE),
+        None => None,
+    };
+    match placed {
+        Some(launch_type) => validate_launch_type(definition, launch_type),
+        None => Ok(()),
+    }
+}
+
 /// The platform version a request asks for, if it names one at all: a blank member
 /// names no platform version, so it reads the same as an absent one ("If one isn't
 /// specified, the LATEST platform version is used").
@@ -689,6 +722,69 @@ pub fn enum_value_message(member_path: &str, accepted: &[String]) -> String {
         member_words(member_path),
         ascending.join(",")
     )
+}
+
+/// The member a task listing names the desired status it filters on, as the words a
+/// refusal of it carries are built from ([`member_words`]).
+pub const DESIRED_STATUS_MEMBER: &str = "desiredStatus";
+
+/// The members of a task listing that identify the tasks to report BY THEMSELVES, so each
+/// of them is the only filter its listing may carry.
+///
+/// `ListTasksRequest$startedBy` states the rule outright — "When you specify startedBy as
+/// the filter, it must be the only filter that you use" — and `$serviceName`, which selects
+/// "tasks that belong to that service", is the other filter Amazon ECS holds to it: a
+/// service's tasks are the service's, so there is nothing for a second filter to narrow.
+pub const EXCLUSIVE_TASK_FILTERS: [&str; 2] = ["serviceName", "startedBy"];
+
+/// The refusal a task listing earns when it carries one of [`EXCLUSIVE_TASK_FILTERS`]
+/// BESIDE another filter, or `None` when it carries at most one filter.
+///
+/// `filters` is every filter member of the request paired with whether the request carried
+/// it. `cluster` is not among them — it scopes the listing to a cluster rather than
+/// selecting tasks within one — and neither are `maxResults`/`nextToken`, which page what
+/// the filters selected, nor `desiredStatus`, which every listing filters on whether or not
+/// the request named it ("The default status filter is RUNNING").
+///
+/// The sentence names the exclusive member at fault, in the member's own spelling, and
+/// nothing else of the request.
+pub fn exclusive_task_filter_violation(filters: &[(&str, bool)]) -> Option<String> {
+    let present = || filters.iter().filter(|(_, carried)| *carried);
+    if present().count() < 2 {
+        return None;
+    }
+    let exclusive = EXCLUSIVE_TASK_FILTERS
+        .iter()
+        .find(|member| present().any(|(carried, _)| carried == *member))?;
+    Some(format!("cannot specify {exclusive} with other arguments"))
+}
+
+/// The desired status a task LISTING filters on, resolved from the value the request
+/// carried — or the refusal a value that names no desired status at all earns.
+///
+/// `ListTasksRequest$desiredStatus` is "The task desired status to use when filtering the
+/// ListTasks results", and "The default status filter is RUNNING", so a request that names
+/// none filters on RUNNING. A request that names one is resolved against the member's value
+/// set WITHOUT regard to ASCII case — Amazon ECS serves a lower-case spelling of a member
+/// and answers the tasks of that desired status — and the status a stored task carries is
+/// the set's own spelling, so the resolved filter is that member rather than the string the
+/// request spelled. A value the set holds in no case names no desired status, which is what
+/// the member's own refusal reports ([`enum_value_message`]).
+pub fn resolved_desired_status_filter(requested: Option<&str>) -> Result<String, String> {
+    let Some(requested) = requested else {
+        return Ok(STATUS_RUNNING.to_string());
+    };
+    crate::ops::types::DESIRED_STATUS_VALUES
+        .iter()
+        .find(|accepted| accepted.eq_ignore_ascii_case(requested))
+        .map(|accepted| (*accepted).to_string())
+        .ok_or_else(|| {
+            let accepted: Vec<String> = crate::ops::types::DESIRED_STATUS_VALUES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect();
+            enum_value_message(DESIRED_STATUS_MEMBER, &accepted)
+        })
 }
 
 /// The member of a Managed Instances launch template that names which of the two
@@ -2087,32 +2183,6 @@ pub fn defaulted_network_configuration(
     Some(NetworkConfiguration {
         awsvpc_configuration,
     })
-}
-
-/// The refusal a launch earns when its `networkConfiguration` does not agree with the
-/// network mode of the task definition it runs, or `None` when the two agree.
-///
-/// The rule, which the model cannot express because `networkConfiguration` is optional on
-/// every launch: a task definition in the `awsvpc` network mode gets its own elastic
-/// network interface, so the launch has to say which subnets and security groups that
-/// interface takes — and a task definition in any other mode has no interface of its own
-/// to configure, so a network configuration is not a thing that launch can carry.
-///
-/// Shared by every operation that launches a task from a stored revision, so `RunTask`
-/// and `CreateService` cannot answer differently about the same pair.
-pub fn network_configuration_violation(
-    network_mode: &str,
-    network_configuration: Option<&NetworkConfiguration>,
-) -> Option<String> {
-    // `NetworkConfiguration` carries exactly one member, `awsvpcConfiguration`, so a
-    // configuration without it configures no interface and is not one.
-    let configured = network_configuration
-        .is_some_and(|configuration| configuration.awsvpc_configuration.is_some());
-    match (network_mode == NETWORK_MODE_AWSVPC, configured) {
-        (true, false) => Some(AWSVPC_NETWORK_CONFIGURATION_REQUIRED_MESSAGE.to_string()),
-        (false, true) => Some(NETWORK_CONFIGURATION_NOT_VALID_MESSAGE.to_string()),
-        _ => None,
-    }
 }
 
 /// `InvalidParameterException$message` for a launch that carries a `networkConfiguration`

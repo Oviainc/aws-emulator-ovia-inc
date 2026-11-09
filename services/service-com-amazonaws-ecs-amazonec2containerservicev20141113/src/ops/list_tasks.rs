@@ -221,6 +221,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .service_name
             .as_deref()
             .map(crate::state::service_name_from_reference);
+        // "When you specify startedBy as the filter, it must be the only filter that you
+        // use": a filter that identifies the tasks by itself is refused beside another one
+        // ([`crate::state::exclusive_task_filter_violation`]).
+        if let Some(message) = crate::state::exclusive_task_filter_violation(&[
+            ("serviceName", input.service_name.is_some()),
+            ("startedBy", input.started_by.is_some()),
+            ("family", input.family.is_some()),
+            ("containerInstance", input.container_instance.is_some()),
+            ("launchType", input.launch_type.is_some()),
+            ("daemonName", input.daemon_name.is_some()),
+        ]) {
+            return Err(ListTasksErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // An ARN is a WHOLE identifier, Region and account included, so both segments are
         // checked before the identifier is resolved
@@ -236,11 +254,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
         // "The default status filter is RUNNING, which shows tasks that Amazon ECS has
-        // set the desired status to RUNNING."
-        let desired_status = input
-            .desired_status
-            .clone()
-            .unwrap_or_else(|| crate::state::STATUS_RUNNING.to_string());
+        // set the desired status to RUNNING" — and the value a request DOES name is
+        // resolved against the member's value set without regard to case, which is what
+        // this listing's filter is held to rather than the boundary's exact match
+        // ([`crate::state::resolved_desired_status_filter`]).
+        let desired_status =
+            match crate::state::resolved_desired_status_filter(input.desired_status.as_deref()) {
+                Ok(status) => status,
+                Err(message) => {
+                    return Err(ListTasksErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(message),
+                        },
+                    )
+                    .into())
+                }
+            };
 
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
@@ -271,31 +300,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Specifying a containerInstance limits the results to tasks that belong to
-        // that container instance." An id that names no REGISTERED instance names
-        // nothing in the cluster, which the modelled error reports.
-        let mut host_instance_arn = None;
-        if let Some(reference) = input.container_instance.as_deref() {
-            let arn = crate::state::container_instance_arn_from_reference(
-                &region,
-                &cluster_name,
-                reference,
-            );
-            if guard
-                .container_instances
-                .get(&arn)
-                .is_none_or(|instance| instance.cluster_name != cluster_name)
-            {
-                return Err(ListTasksErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(crate::state::container_instance_not_found_message(
-                            reference,
-                        )),
-                    },
-                )
-                .into());
-            }
-            host_instance_arn = Some(arn);
-        }
+        // that container instance." A FILTER selects what it matches: an id that names no
+        // instance registered in the cluster is matched by no task of it, so the listing is
+        // answered with the tasks that do match — none — rather than refused. (An
+        // operation that has to RESOLVE such a reference to act on the instance refuses it:
+        // `crate::state::container_instance_not_found_message`.)
+        let host_instance_arn = input.container_instance.as_deref().map(|reference| {
+            crate::state::container_instance_arn_from_reference(&region, &cluster_name, reference)
+        });
 
         let mut matching: Vec<String> = guard
             .tasks

@@ -1413,7 +1413,14 @@ async fn list_tasks_filters_and_pages_over_stored_tasks() {
         ("family worker", json!({ "family": "worker" }), vec!["worker-ci"]),
         ("startedBy ci", json!({ "startedBy": "ci" }), vec!["web-ci", "worker-ci"]),
         ("launchType FARGATE", json!({ "launchType": "FARGATE" }), vec!["web-cron"]),
-        ("family and startedBy", json!({ "family": "web", "startedBy": "cron" }), vec!["web-cron"]),
+        // Two filters together, neither of them one that has to be the only filter a
+        // listing carries (`crate::task_listing_filters` drives those): the desired status
+        // every listing filters on, beside the family.
+        (
+            "family and desiredStatus",
+            json!({ "family": "web", "desiredStatus": "RUNNING" }),
+            vec!["web-ci", "web-cron"],
+        ),
     ];
     for (case, filter, expected) in filters {
         let mut request = json!({ "cluster": "demo" });
@@ -1471,8 +1478,10 @@ async fn list_tasks_filters_and_pages_over_stored_tasks() {
         );
     }
 
-    // A name that matches no service in the cluster names nothing, and neither does an
-    // id that names no registered container instance.
+    // A name that matches no service in the cluster names nothing — a listing by service
+    // resolves the service it reports on. An id that names no registered container instance
+    // is a FILTER that matches nothing instead, which the listing answers as the empty
+    // result it is ([`crate::task_listing_filters`] pins that).
     refused(
         &router,
         "ListTasks",
@@ -1481,14 +1490,18 @@ async fn list_tasks_filters_and_pages_over_stored_tasks() {
         "serviceName filter",
     )
     .await;
-    refused(
+    let listed = ok(
         &router,
         "ListTasks",
         json!({ "cluster": "demo", "containerInstance": "nosuchinstance" }),
-        "InvalidParameterException",
         "containerInstance filter",
     )
     .await;
+    assert!(
+        list(&listed, "taskArns", "containerInstance filter").is_empty(),
+        "case \"containerInstance filter\": an id no instance carries matches no task, got \
+         {listed}"
+    );
 }
 
 #[tokio::test]

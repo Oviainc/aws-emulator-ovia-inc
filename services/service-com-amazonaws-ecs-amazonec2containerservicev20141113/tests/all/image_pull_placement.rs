@@ -462,8 +462,11 @@ async fn a_task_is_stopped_when_its_placement_cannot_reach_the_image_registry() 
 
     // The rows: the placement a task is launched into, the image it runs, and whether the
     // image can be fetched from there. `assignPublicIp` matters only where the route out
-    // is an internet gateway, which is itself one of the rows.
-    let rows: [(&str, &str, &str, &str, bool); 10] = [
+    // is an internet gateway, which is itself one of the rows. Every row places into a
+    // subnet this account HOLDS: a placement naming one Amazon VPC has no subnet for is
+    // refused outright rather than launched ([`crate::task_listing_filters`] pins that), so
+    // there is no fetch to decide for it.
+    let rows: [(&str, &str, &str, &str, bool); 9] = [
         (
             "isolated subnet, public registry",
             "publicimage",
@@ -526,15 +529,6 @@ async fn a_task_is_stopped_when_its_placement_cannot_reach_the_image_registry() 
             &network.reached_by_endpoints,
             "DISABLED",
             false,
-        ),
-        (
-            // A subnet Amazon EC2 holds nothing for is no evidence of a blocked path, so
-            // the launch is not refused the fetch.
-            "a subnet this emulator holds no network facts about",
-            "publicimage",
-            "subnet-0123456789abcdef0",
-            "DISABLED",
-            true,
         ),
     ];
 

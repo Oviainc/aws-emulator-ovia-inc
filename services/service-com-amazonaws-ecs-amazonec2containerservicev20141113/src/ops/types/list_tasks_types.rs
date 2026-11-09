@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ecs-amazonec2containerservicev20141113.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ecs#ListTasksRequest")]
+// `skip_validation = ["desiredStatus"]`: Amazon ECS does NOT hold this listing FILTER to
+// the exact spelling of its `DesiredStatus` value set — a request filtering on a
+// lower-case spelling of a member is served, with the tasks of that desired status in
+// `taskArns`. The member's value set is still enforced, by the handler and without regard
+// to ASCII case ([`crate::state::resolved_desired_status_filter`]), which the boundary
+// walk cannot do for a body member.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.ecs#ListTasksRequest",
+    skip_validation = ["desiredStatus"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListTasksInput {
     pub cluster: Option<String>,

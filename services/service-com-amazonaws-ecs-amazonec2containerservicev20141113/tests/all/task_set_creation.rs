@@ -103,6 +103,20 @@ async fn create_task_set_resolves_its_capacity_from_the_request_then_from_the_cl
         case,
     )
     .await;
+    // The other cluster holds the same provider WITHOUT making it its default: a placement
+    // uses the providers its cluster holds, and these rows differ along what the request
+    // and the cluster's default contribute rather than along which providers are available.
+    ok(
+        &router,
+        "PutClusterCapacityProviders",
+        json!({
+            "cluster": without_default,
+            "capacityProviders": [MANAGED_PROVIDER],
+            "defaultCapacityProviderStrategy": [],
+        }),
+        case,
+    )
+    .await;
     register_definition(&router, PLAIN_FAMILY, case).await;
     register_fargate_definition(&router, FARGATE_FAMILY, case).await;
 
@@ -345,8 +359,7 @@ async fn create_task_set_refuses_each_condition_it_models_and_creates_nothing() 
                 ],
             }),
             code: "InvalidParameterException",
-            message: "Specifying both a launch type and capacity provider strategy is not \
-                      supported. Remove one and try again."
+            message: "You may choose a capacity provider or a launch type but not both."
                 .to_string(),
         },
         RefusalCase {

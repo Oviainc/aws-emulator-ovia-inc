@@ -152,6 +152,12 @@ pub use task_interfaces::*;
 mod image_pull;
 pub use image_pull::*;
 
+/// The Amazon VPC networking an `awsvpc` placement names, resolved against the task
+/// definition it places: what a launch of such a revision has to say, and what a launch of
+/// any other revision may not.
+mod vpc_resolution;
+pub use vpc_resolution::*;
+
 /// The Cloud Map instances Amazon ECS registers for the tasks of a service that names a
 /// `serviceRegistries` entry.
 mod service_discovery;
@@ -916,6 +922,23 @@ pub fn integer_bound_message(member: &str, value: i32, min: i32, max: i32) -> Op
     }
 }
 
+/// `InvalidParameterException$message` for a `RunTask` `count` outside the inclusive range
+/// its own doc states ("You can specify up to 10 tasks for each call"), or `None` when the
+/// count is inside it.
+///
+/// Amazon ECS states a COUNT the way it states every other count of this API
+/// ([`DESIRED_COUNT_NEGATIVE_MESSAGE`]): the count named in words, the one bound the value
+/// crossed, and nothing of the value the request carried.
+pub fn task_count_bound_message(count: i32, min: i32, max: i32) -> Option<String> {
+    if count < min {
+        Some(format!("Task count can not be lesser than {min}"))
+    } else if count > max {
+        Some(format!("Task count can not be greater than {max}"))
+    } else {
+        None
+    }
+}
+
 /// `InvalidParameterException$message` for a `maxResults` outside the inclusive page-size
 /// range its own doc states ("This value can be between 1 and 100"). Amazon ECS states the
 /// RANGE the page size has to fall in and echoes neither the value the request carried nor
@@ -1127,6 +1150,19 @@ pub const CAPACITY_PROVIDER_NOT_FOUND_MESSAGE: &str =
     "The specified capacity provider was not found. Specify a valid capacity provider and \
      try again.";
 
+/// `InvalidParameterException$message` for a PLACEMENT whose `capacityProviderStrategy`
+/// names a capacity provider that exists but is not one of the cluster's own.
+///
+/// A capacity provider has to be ASSOCIATED with a cluster before the cluster's placements
+/// may use it: `PutClusterCapacityProviders` is what associates one ("the capacity
+/// providers to associate with the cluster"), and `Cluster$capacityProviders` is the list it
+/// leaves behind. One fixed sentence, naming neither the provider nor the cluster, with the
+/// same remediation clause [`CAPACITY_PROVIDER_NOT_FOUND_MESSAGE`] closes on.
+pub const CAPACITY_PROVIDER_NOT_ASSOCIATED_MESSAGE: &str =
+    "The specified capacity provider strategy cannot contain a capacity provider that is \
+     not associated with the cluster. Associate the capacity provider with the cluster or \
+     specify a valid capacity provider and try again.";
+
 /// `InvalidParameterException$message` for a PLACEMENT request — one that says where its
 /// tasks run with a `capacityProviderStrategy` — naming a capacity provider this account
 /// holds none of.
@@ -1150,8 +1186,7 @@ pub fn capacity_provider_not_found_message(reference: &str) -> String {
 /// One fixed sentence, naming neither member's value, answered by every operation that
 /// takes the pair.
 pub const LAUNCH_TYPE_WITH_CAPACITY_PROVIDER_STRATEGY_MESSAGE: &str =
-    "Specifying both a launch type and capacity provider strategy is not supported. Remove \
-     one and try again.";
+    "You may choose a capacity provider or a launch type but not both.";
 
 /// The inclusive range `CapacityProviderStrategyItem$base` admits, from the member's own
 /// `@range` trait and its doc ("The valid range is 0 to 100,000").

@@ -164,16 +164,18 @@ async fn an_integer_outside_its_documented_range_is_refused_naming_the_bound_it_
             "expiresInMinutes must be at most 2880",
         ),
         (
+            // A `RunTask` count is a COUNT, which this API words as it words every other
+            // count of it (`DesiredCount can not be lesser than 0`).
             "count below the range",
             "RunTask",
             json!({ "cluster": CLUSTER, "taskDefinition": FAMILY, "count": 0 }),
-            "count must be at least 1",
+            "Task count can not be lesser than 1",
         ),
         (
             "count one above the range",
             "RunTask",
             json!({ "cluster": CLUSTER, "taskDefinition": FAMILY, "count": 11 }),
-            "count must be at most 10",
+            "Task count can not be greater than 10",
         ),
         (
             "a list page below the range",

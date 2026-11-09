@@ -271,6 +271,10 @@ mod signer_revocation_status_across_services;
 // the sorted `e…` span (where the other ecs/elbv2 suites land) are both regions concurrently
 #[path = "all/ecs_awsvpc_configuration_over_an_ec2_network.rs"]
 mod ecs_awsvpc_configuration_over_an_ec2_network;
+// The ONE Amazon VPC seeding fixture the suites whose requests name a subnet literally
+// share, so no suite writes a second copy of those records.
+#[path = "all/ec2_network.rs"]
+mod ec2_network;
 // the sorted `l…` span are both regions concurrently landing suites add their line to.
 #[path = "all/log_alarm_scheduled_query.rs"]
 mod log_alarm_scheduled_query;

@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    count, create_cluster, list, ok, refusal, register_capacity, register_definition, service,
-    string,
+    awsvpc_network_configuration, count, create_cluster, list, ok, refusal, register_capacity,
+    register_definition, service, string,
 };
 
 /// Long enough for one clock-owed task transition (`state::TRANSITION_SPAN` is 500 ms) to
@@ -141,6 +141,26 @@ async fn run_task_starts_a_task_in_provisioning_only_while_its_capacity_is_still
     let router = service();
     let family = "parked";
     register_definition(&router, family, "setup").await;
+    // A revision is placed only on infrastructure it was validated against, and the Fargate
+    // row below places through a Fargate provider: that needs a revision whose parameters
+    // support Fargate (the `awsvpc` network mode with a task-level size).
+    let fargate_family = "parkedfargate";
+    ok(
+        &router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": fargate_family,
+            "networkMode": "awsvpc",
+            "cpu": "256",
+            "memory": "512",
+            "requiresCompatibilities": ["FARGATE"],
+            "containerDefinitions": [
+                crate::task_lifecycle::container("web", "public.ecr.aws/nginx/nginx:latest"),
+            ],
+        }),
+        "setup",
+    )
+    .await;
 
     // The rows differ along everything the rule generalises over: whether the capacity the
     // placement needs has to be ACQUIRED (the provider's managed scaling, across the whole
@@ -192,11 +212,15 @@ async fn run_task_starts_a_task_in_provisioning_only_while_its_capacity_is_still
             expected: None,
         },
         Row {
+            // A Fargate placement acquires no container instance, so nothing of the
+            // CLUSTER's capacity is outstanding for it. What such a task does wait on is
+            // its own elastic network interface, which the `awsvpc` mode Fargate requires
+            // gives it: that is the step `PROVISIONING` reports here.
             case: "a Fargate provider acquires no container instance",
             placement: Placement::FargateProvider,
             capacity_registered: false,
             count: 1,
-            expected: Some("PENDING"),
+            expected: Some("PROVISIONING"),
         },
         Row {
             case: "EC2 launch type onto registered capacity",
@@ -238,8 +262,23 @@ async fn run_task_starts_a_task_in_provisioning_only_while_its_capacity_is_still
                 Some(provider)
             }
             Placement::FargateProvider => {
+                // A cluster uses the providers it HOLDS, so the Fargate provider this row
+                // places on is associated with its cluster first.
+                ok(
+                    &router,
+                    "PutClusterCapacityProviders",
+                    json!({
+                        "cluster": cluster,
+                        "capacityProviders": ["FARGATE"],
+                        "defaultCapacityProviderStrategy": [],
+                    }),
+                    case,
+                )
+                .await;
                 request["capacityProviderStrategy"] =
                     json!([{ "capacityProvider": "FARGATE", "weight": 1 }]);
+                request["taskDefinition"] = json!(fargate_family);
+                request["networkConfiguration"] = awsvpc_network_configuration();
                 Some("FARGATE".to_string())
             }
             Placement::Ec2LaunchType => {

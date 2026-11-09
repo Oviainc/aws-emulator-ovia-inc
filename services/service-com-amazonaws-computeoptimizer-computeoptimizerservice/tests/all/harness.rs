@@ -84,12 +84,54 @@ pub(crate) fn emulator_with_analysed_services() -> MultiServiceRouter {
     emulator_with_analysed_services_and_engine().0
 }
 
+/// The subnet the analysed ECS services are placed in ([`ANALYSED_SUBNET`]), and the VPC it
+/// is in, in the account's own Amazon EC2 store.
+///
+/// An ECS service of the `awsvpc` network mode — which a Fargate service is — is placed in
+/// subnets Amazon ECS RESOLVES against Amazon VPC's records before it creates the service,
+/// so a suite that creates one has to hold the subnet its placement names. The records are
+/// the modelled shapes that service reports.
+fn register_analysed_network(engine: &engine::InMemoryEngine) {
+    use service_com_amazonaws_ec2_amazonec2 as ec2;
+
+    let ec2_state = ec2::state::service_state(engine)
+        .expect("the in-memory engine carries the account's Amazon EC2 store");
+    let mut store = ec2_state.lock();
+    store.vpcs.insert(
+        ANALYSED_VPC.to_string(),
+        ec2::ops::types::Vpc {
+            vpc_id: Some(ANALYSED_VPC.to_string()),
+            cidr_block: Some("10.0.0.0/16".to_string()),
+            state: Some(ec2::state::VPC_STATE_AVAILABLE.to_string()),
+            ..Default::default()
+        },
+    );
+    store.subnets.insert(
+        ANALYSED_SUBNET.to_string(),
+        ec2::ops::types::Subnet {
+            subnet_id: Some(ANALYSED_SUBNET.to_string()),
+            vpc_id: Some(ANALYSED_VPC.to_string()),
+            cidr_block: Some("10.0.0.0/24".to_string()),
+            availability_zone: Some(format!("{REGION}a")),
+            state: Some(ec2::state::SUBNET_STATE_AVAILABLE.to_string()),
+            ..Default::default()
+        },
+    );
+}
+
+/// The subnet every analysed ECS service below is placed in.
+pub(crate) const ANALYSED_SUBNET: &str = "subnet-0123456789abcdef0";
+
+/// The VPC [`ANALYSED_SUBNET`] is in.
+const ANALYSED_VPC: &str = "vpc-0123456789abcdef0";
+
 /// The same emulator, with the engine it was built on — for a suite that has to seed a
 /// CloudWatch series of the AWS-reserved namespace space ([`seed_cloudwatch_series`]), which
 /// no client call can write.
 pub(crate) fn emulator_with_analysed_services_and_engine(
 ) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    register_analysed_network(&engine);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));

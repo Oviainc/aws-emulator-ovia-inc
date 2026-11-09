@@ -64,6 +64,9 @@ pub(crate) const VPC: &str = "vpc-0abc1234ecs0lb";
 /// suite that fabricates an ARN would be asserting a refusal it did not mean.
 pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    // The services of this suite are placed in `awsvpc` subnets, which a placement is
+    // resolved against ([`crate::ecs_wire::seed_awsvpc_subnets`]).
+    crate::ecs_wire::seed_awsvpc_subnets(&engine);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(

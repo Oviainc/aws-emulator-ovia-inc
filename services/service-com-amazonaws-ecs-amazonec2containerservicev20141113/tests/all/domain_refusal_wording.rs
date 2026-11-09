@@ -1196,8 +1196,7 @@ async fn naming_both_a_launch_type_and_a_strategy_is_refused_with_one_sentence()
     .await;
 
     /// The sentence a request naming both earns.
-    const BOTH: &str = "Specifying both a launch type and capacity provider strategy is not \
-                        supported. Remove one and try again.";
+    const BOTH: &str = "You may choose a capacity provider or a launch type but not both.";
 
     // The rows differ along the launch type, the provider the strategy names and how many
     // entries it has — and along the operation, since both operations that place work take
