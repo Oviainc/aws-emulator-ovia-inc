@@ -8,9 +8,11 @@
 //! section that drives it is enabled, so this reader derives everything it reports
 //! from that configuration, the build the last change to it started and the clock:
 //!
-//! * an index the configuration does not have — one the account has not enabled, or
-//!   a name that is no fleet index at all — is answered with the modelled
-//!   `ResourceNotFoundException` (404);
+//! * an index name that is not one of the fleet indexes this service recognises
+//!   ([`crate::state::FLEET_INDEX_NAMES`]) is a request this plane cannot act on, and
+//!   is refused `InvalidRequestException` (400) ahead of any lookup;
+//! * one of those names whose configuration section is not enabled — the account has no
+//!   such index — is answered with the modelled `ResourceNotFoundException` (404);
 //! * `indexStatus` is the status of that build until the clock makes the build due,
 //!   and `ACTIVE` from then on;
 //! * `schema` is what the index CONTAINS, added up from the configuration's data
@@ -173,6 +175,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = ::std::time::SystemTime::now();
+        // A name outside the set of indexes this service recognises is not a missing
+        // resource but a request it cannot act on, so it is refused as the modelled
+        // `InvalidRequestException` (400) BEFORE the account's configuration is read —
+        // the 404 below is for a name that IS one of them and is not enabled.
+        if !crate::state::FLEET_INDEX_NAMES.contains(&input.index_name.as_str()) {
+            return Err(DescribeIndexErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::unrecognized_index_name_message(
+                        &input.index_name,
+                    )),
+                },
+            )
+            .into());
+        }
         // A pure read: the description is computed under the lock and the store is
         // left exactly as it was. A build the clock has already made due needs no
         // write to report, because the status is derived from the recorded due

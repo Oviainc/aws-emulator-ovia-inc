@@ -173,14 +173,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(unavailable());
         };
 
-        // Both members are `@required` `@httpLabel`s, so the refusal states the pair
-        // it found no execution for.
-        let not_found = || -> DescribeJobExecutionError {
+        // The two conditions this read can fail on are DISTINGUISHABLE, so each is
+        // worded for the resource it is about: a `jobId` no creator recorded has no
+        // execution anywhere and the refusal names that missing JOB
+        // ([`crate::state::missing_job_execution_job_message`]), while a job that does
+        // exist and has no execution on this thing names the pair it found none for.
+        let missing_execution = || -> DescribeJobExecutionError {
             DescribeJobExecutionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No job execution of job {} exists on thing {}",
-                        input.job_id, input.thing_name
+                    message: Some(crate::state::missing_job_execution_message(
+                        &input.thing_name,
+                        &input.job_id,
                     )),
                 },
             )
@@ -198,7 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in the shared execution store by its own minted `executionId` and read through
         // `GetCommandExecution`, from being reported here as a job execution.
         if !jobs.lock().contains(&input.job_id) {
-            return Err(not_found());
+            return Err(DescribeJobExecutionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::missing_job_execution_job_message(
+                        &input.job_id,
+                    )),
+                },
+            )
+            .into());
         }
 
         let mut store = executions.lock();
@@ -216,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .execution_index(&input.thing_name, &input.job_id, input.execution_number)
             .and_then(|index| store.record(&input.thing_name, index))
         else {
-            return Err(not_found());
+            return Err(missing_execution());
         };
 
         Ok(DescribeJobExecutionOutput {

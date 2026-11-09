@@ -158,8 +158,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A pure read: the record is cloned out as the modelled
         // `AuthorizerDescription`, and a name the store does not hold is the modelled
-        // `ResourceNotFoundException` ("The specified resource does not exist", HTTP
-        // 404) rather than a hollow 200.
+        // `ResourceNotFoundException` (HTTP 404) worded by the authorizer family
+        // ([`crate::state::not_found`]) rather than a hollow 200.
         let store = state.lock();
         let authorizer = store
             .authorizers
@@ -167,9 +167,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DescribeAuthorizerErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Authorizer {} does not exist",
-                            input.authorizer_name
+                        message: Some(crate::state::missing_authorizer_message(
+                            &input.authorizer_name,
                         )),
                     },
                 )

@@ -134,16 +134,6 @@ pub const UNREADABLE_INPUT_FILE_MESSAGE: &str =
 pub const NON_TEXT_INPUT_FILE_MESSAGE: &str =
     "Unable to read the input file: it is not a newline delimited JSON text file.";
 
-/// How this service states that a `taskId` names no thing-registration task.
-///
-/// AWS IoT words a missing resource as "<resource> <name> does not exist", which is the
-/// sentence this service already answers with for the resources it serves (see
-/// [`super::missing_fleet_index_message`] and [`super::missing_ota_update_message`]), so the
-/// id this request asked for is what fills it.
-pub fn missing_thing_registration_task_message(task_id: &str) -> String {
-    format!("Registration task {task_id} does not exist")
-}
-
 /// What `StartThingRegistrationTask` refuses a `roleArn` with when IAM answered that this
 /// service cannot assume it: the role is what AWS IoT reads the input file under, so a role
 /// it cannot assume is a request it cannot perform, and nothing is recorded for it.

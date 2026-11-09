@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let registry = jobs.lock();
             let job = registry.job(&input.job_id).ok_or_else(|| -> Self::Error {
                 GetJobDocumentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!("Job {} does not exist", input.job_id)),
+                    message: Some(crate::state::missing_job_message(&input.job_id)),
                 })
                 .into()
             })?;

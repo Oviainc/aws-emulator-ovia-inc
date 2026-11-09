@@ -41,6 +41,8 @@ mod job_document_read;
 mod job_execution_read;
 #[path = "all/job_targeting.rs"]
 mod job_targeting;
+#[path = "all/not_found_wording.rs"]
+mod not_found_wording;
 #[path = "all/ota_update_deployment.rs"]
 mod ota_update_deployment;
 #[path = "all/ota_update_job_document.rs"]

@@ -176,9 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DescribeThingRegistrationTaskErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
+                        // This family's refusal carries NO variable part: the requested
+                        // id is not echoed back ([`crate::state::not_found`]).
                         message: Some(
-                            crate::state::thing_registration::
-                                missing_thing_registration_task_message(&input.task_id),
+                            crate::state::MISSING_THING_REGISTRATION_TASK_MESSAGE.to_string(),
                         ),
                     },
                 )

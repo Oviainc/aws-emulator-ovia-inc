@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // success reporting a job that does not exist.
             return Err(DescribeJobErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Job {} does not exist", input.job_id)),
+                    message: Some(crate::state::missing_job_message(&input.job_id)),
                 },
             )
             .into());

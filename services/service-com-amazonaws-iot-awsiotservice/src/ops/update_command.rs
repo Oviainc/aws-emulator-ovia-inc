@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(command) = store.commands.get_mut(&input.command_id) else {
             return Err(UpdateCommandErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Command {} does not exist", input.command_id)),
+                    message: Some(crate::state::missing_command_message(&input.command_id)),
                 },
             )
             .into());

@@ -150,9 +150,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DeprecateThingTypeErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Thing type {} does not exist",
-                            input.thing_type_name
+                        message: Some(crate::state::missing_thing_type_message(
+                            &input.thing_type_name,
                         )),
                     },
                 )

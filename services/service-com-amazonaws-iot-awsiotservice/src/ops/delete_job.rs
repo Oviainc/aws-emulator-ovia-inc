@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !registry.contains(&input.job_id) {
             return Err(DeleteJobErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Job {} does not exist", input.job_id)),
+                    message: Some(crate::state::missing_job_message(&input.job_id)),
                 },
             )
             .into());

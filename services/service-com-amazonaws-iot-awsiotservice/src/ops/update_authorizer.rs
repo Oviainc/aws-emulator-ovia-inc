@@ -175,17 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The name addresses the record: a name the store does not hold is the modelled
-        // `ResourceNotFoundException` ("The specified resource does not exist", HTTP 404)
-        // rather than a 200 that changed nothing.
+        // `ResourceNotFoundException` (HTTP 404) worded by the authorizer family
+        // ([`crate::state::not_found`]) rather than a 200 that changed nothing.
         let authorizer = store
             .authorizers
             .get_mut(&input.authorizer_name)
             .ok_or_else(|| {
                 UpdateAuthorizerErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Authorizer {} does not exist",
-                            input.authorizer_name
+                        message: Some(crate::state::missing_authorizer_message(
+                            &input.authorizer_name,
                         )),
                     },
                 )

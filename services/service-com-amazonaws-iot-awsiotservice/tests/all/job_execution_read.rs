@@ -806,36 +806,46 @@ async fn a_pair_with_no_execution_is_not_found() {
         created.status, created.body
     );
 
-    // (case, thing, job, executionNumber)
-    let cases: &[(&str, &str, &str, Option<i64>)] = &[
-        ("a job nobody created", "targeted-thing", "no-such-job", None),
+    // (case, thing, job, executionNumber, the job itself exists)
+    let cases: &[(&str, &str, &str, Option<i64>, bool)] = &[
+        (
+            "a job nobody created",
+            "targeted-thing",
+            "no-such-job",
+            None,
+            false,
+        ),
         (
             "a registered thing the job never targeted",
             "untargeted-thing",
             "existing-job",
             None,
+            true,
         ),
         (
             "a thing that was never registered",
             "no-such-thing",
             "existing-job",
             None,
+            true,
         ),
         (
             "an execution number the device never had",
             "targeted-thing",
             "existing-job",
             Some(9),
+            true,
         ),
         (
             "neither half exists",
             "no-such-thing",
             "no-such-job",
             Some(1),
+            false,
         ),
     ];
 
-    for (case, thing, job, execution_number) in cases {
+    for (case, thing, job, execution_number, job_exists) in cases {
         let read = emulator
             .describe_in(thing, job, *execution_number, REGION)
             .await;
@@ -848,10 +858,22 @@ async fn a_pair_with_no_execution_is_not_found() {
             read.body
         );
         let message = read.message();
-        assert!(
-            message.contains(job) && message.contains(thing),
-            "case {case:?}: the refusal must name {job} and {thing}, got {message:?}"
-        );
+        // The two conditions are distinguishable, so each refusal is about the resource
+        // it is about: a job nobody created is reported as the missing JOB and says
+        // nothing of the thing, while an existing job with no execution on the thing
+        // names the pair it found none for.
+        if *job_exists {
+            assert!(
+                message.contains(job) && message.contains(thing),
+                "case {case:?}: the refusal must name {job} and {thing}, got {message:?}"
+            );
+        } else {
+            assert!(
+                message.contains(job) && !message.contains(thing),
+                "case {case:?}: the refusal must name the missing job {job} and not the \
+                 thing {thing}, got {message:?}"
+            );
+        }
         assert!(
             read.body.get("execution").is_none(),
             "case {case:?}: a refusal reports no execution, got {:?}",

@@ -153,8 +153,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // A pure read of the thing-group registry: the record is cloned out and
-        // reported, and a name the registry does not hold is a 404, never a hollow
-        // 200.
+        // reported, and a name the registry does not hold is a 404 worded by the
+        // thing-group family ([`crate::state::not_found`]), never a hollow 200.
         let store = state.lock();
         let group = store
             .thing_groups
@@ -162,9 +162,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DescribeThingGroupErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Thing group {} does not exist",
-                            input.thing_group_name
+                        message: Some(crate::state::missing_thing_group_message(
+                            &input.thing_group_name,
                         )),
                     },
                 )

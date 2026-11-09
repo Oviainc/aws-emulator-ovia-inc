@@ -1111,8 +1111,9 @@ async fn a_task_whose_input_file_cannot_be_read_fails() {
         );
         assert_eq!(
             described.text("message").as_deref(),
-            Some(format!("Registration task {task_id} does not exist").as_str()),
-            "case {case:?}: expected the service's missing-resource wording, got {}",
+            Some("Task doesn't exist"),
+            "case {case:?}: expected this family's fixed refusal, which carries no part \
+             of the request (not even {task_id}), got {}",
             described.body
         );
     }

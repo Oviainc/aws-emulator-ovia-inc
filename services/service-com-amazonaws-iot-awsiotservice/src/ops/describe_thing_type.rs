@@ -154,8 +154,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // A pure read of the thing-type registry: the record is cloned out and
-        // reported, and a name the registry does not hold is a 404, never a hollow
-        // 200.
+        // reported, and a name the registry does not hold is a 404 worded by the
+        // thing-type family ([`crate::state::not_found`]), never a hollow 200.
         let store = state.lock();
         let thing_type = store
             .thing_types
@@ -163,9 +163,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DescribeThingTypeErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Thing type {} does not exist",
-                            input.thing_type_name
+                        message: Some(crate::state::missing_thing_type_message(
+                            &input.thing_type_name,
                         )),
                     },
                 )

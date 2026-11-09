@@ -156,15 +156,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The name is the authorizer's identity, so the delete is of exactly that
         // record. A name the store does not hold is the modelled
-        // `ResourceNotFoundException` ("The specified resource does not exist", HTTP
-        // 404): unlike `DeleteThing`, nothing this operation documents makes it
+        // `ResourceNotFoundException` (HTTP 404) worded by the authorizer family
+        // ([`crate::state::not_found`]), the same sentence the describe path refuses
+        // with: unlike `DeleteThing`, nothing this operation documents makes it
         // idempotent, and it models the not-found error.
         if store.authorizers.remove(&input.authorizer_name).is_none() {
             return Err(DeleteAuthorizerErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Authorizer {} does not exist",
-                        input.authorizer_name
+                    message: Some(crate::state::missing_authorizer_message(
+                        &input.authorizer_name,
                     )),
                 },
             )

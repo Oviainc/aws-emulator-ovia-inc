@@ -442,7 +442,7 @@ async fn an_unknown_job_id_is_a_404() {
         );
         assert_eq!(
             reply.message(),
-            format!("Job {job_id} does not exist"),
+            format!("Job {job_id} cannot be found."),
             "case {job_id:?}: expected the refusal to name the job, got {:?}",
             reply.body
         );

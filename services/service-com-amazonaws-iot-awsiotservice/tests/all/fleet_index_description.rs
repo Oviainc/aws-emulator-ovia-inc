@@ -11,9 +11,10 @@
 //! The rules under test, none of them specific to one index or one configuration:
 //!
 //! * an index EXISTS for the account exactly while the indexing-configuration
-//!   section that drives it is not `OFF`, so a describe of an index the account has
-//!   not enabled — and of a name that is no fleet index at all — is refused with the
-//!   modelled `ResourceNotFoundException` (404), naming the requested index;
+//!   section that drives it is not `OFF`, so a describe of one of the indexes this
+//!   service recognises that the account has not enabled is refused with the modelled
+//!   `ResourceNotFoundException` (404), naming the requested index, while a name that is
+//!   no fleet index at all is refused `InvalidRequestException` (400) instead;
 //! * `schema` is what the thing index CONTAINS, added up from the configuration's
 //!   data sources: the five values `DescribeIndexResponse$schema` documents
 //!   (`smithy_query(query="doc",shape="DescribeIndexResponse",member="schema")`);
@@ -386,8 +387,9 @@ async fn an_index_exists_exactly_while_its_configuration_section_is_on() {
     }
 }
 
-/// A name that is no fleet index is refused the same way, whatever the account has
-/// enabled, and the refusal names the index that was asked for.
+/// A name that is no fleet index at all is not a missing resource: whatever the account
+/// has enabled, it is refused as a request this plane cannot act on — `400`
+/// `InvalidRequestException` naming the member and the name that was asked for.
 #[tokio::test]
 async fn a_name_that_is_no_fleet_index_is_refused() {
     // Names the modelled `IndexName` pattern accepts (`^[a-zA-Z0-9:_-]+$`) that name
@@ -413,20 +415,20 @@ async fn a_name_that_is_no_fleet_index_is_refused() {
         let reply = emulator.describe_index(index_name).await;
         assert_eq!(
             reply.status,
-            404,
-            "case {index_name}: expected 404, got {} body {}",
+            400,
+            "case {index_name}: expected 400, got {} body {}",
             reply.status,
             reply.text()
         );
         assert_eq!(
             reply.error_code(),
-            "ResourceNotFoundException",
-            "case {index_name}: expected ResourceNotFoundException, got {}",
+            "InvalidRequestException",
+            "case {index_name}: expected InvalidRequestException, got {}",
             reply.text()
         );
         assert_eq!(
             reply.error_message(),
-            format!("Index {index_name} does not exist"),
+            format!("Unrecognized indexName {index_name}"),
             "case {index_name}: the refusal must name the requested index, got {}",
             reply.text()
         );

@@ -755,7 +755,7 @@ async fn a_refused_create_records_no_update_and_no_execution() {
             files: one_file.clone(),
             status: 404,
             code: "ResourceNotFoundException",
-            message_carries: "Thing group fleet-unknown does not exist".to_string(),
+            message_carries: format!("ThingGroup {ACCOUNT_ID}:fleet-unknown not found."),
         },
         RefusalCase {
             case: "a thing group the registry does hold, whose members are unknown",

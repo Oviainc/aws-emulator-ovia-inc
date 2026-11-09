@@ -39,11 +39,90 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The error shape a request-validation refusal names
+//!
+//! AWS IoT refuses a request its validation layer will not accept — a value outside what
+//! the service recognises, ahead of the plane that owns the resource — with
+//! `InvalidRequestException`, and names that shape in `x-amzn-errortype` QUALIFIED with
+//! the service's API doc namespace ([`IOT_DOC_NAMESPACE`]), which is the form a restJson1
+//! client resolves an error shape from. A refusal raised by the plane BEHIND that layer
+//! (a target ARN a creator will not take, a resource that does not exist) names the bare
+//! shape, which is what the framework's serializer already writes.
+//!
+//! `override_operation` below therefore serves the operations whose refusal belongs to
+//! that validation layer behind [`ValidationRefusalErrorType`], which qualifies the
+//! shape name on the way out and changes nothing else about the response.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
+
+/// The header a restJson1 client resolves an error SHAPE from.
+const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
+
+/// The error shape AWS IoT refuses a request its validation layer will not accept with.
+const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
+
+/// The namespace AWS IoT's validation layer qualifies an error-shape name with in
+/// [`ERROR_TYPE_HEADER`], appended after a `:`.
+///
+/// It is the service's published API doc namespace, a fixed string: nothing of a request
+/// or of this emulator's state goes into it.
+const IOT_DOC_NAMESPACE: &str = "http://iot.amazonaws.com/doc/2015-10-02/";
+
+/// One modelled operation whose request-validation refusal is named the way AWS IoT's
+/// validation layer names it: the error shape qualified with [`IOT_DOC_NAMESPACE`].
+///
+/// Nothing else is re-implemented — the request is served by the generated
+/// [`ErasedOperation::run`], which owns deserialize -> validate -> handle -> serialize and
+/// every modelled error — and nothing but the one header is touched, so a success, a
+/// not-found and a server fault answer exactly what they answered before.
+pub struct ValidationRefusalErrorType<O> {
+    operation: O,
+}
+
+impl<O> ValidationRefusalErrorType<O> {
+    /// Serve `operation`, already constructed from the shared engine, behind this
+    /// wrapper.
+    pub fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+impl<O: ErasedOperation> ErasedOperation for ValidationRefusalErrorType<O> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r WireRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, WireResponse> {
+        Box::pin(async move {
+            let mut response = self.operation.run(svc, req, ctx).await;
+            if response.headers().get(ERROR_TYPE_HEADER) == Some(INVALID_REQUEST_EXCEPTION) {
+                response
+                    .headers_mut()
+                    .insert(ERROR_TYPE_HEADER, qualified_invalid_request());
+            }
+            response
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not
+    /// change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
+    }
+}
+
+/// `InvalidRequestException` as AWS IoT's validation layer names it in
+/// [`ERROR_TYPE_HEADER`]: the shape name, a `:`, and the service's API doc namespace.
+fn qualified_invalid_request() -> String {
+    format!("{INVALID_REQUEST_EXCEPTION}:{IOT_DOC_NAMESPACE}")
+}
 
 /// The `com-amazonaws-iot-awsiotservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,6 +131,10 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The fleet-index reader, served behind [`ValidationRefusalErrorType`]: the
+    /// `indexName` this service does not recognise is refused by its validation layer,
+    /// so the refusal names the error shape the way that layer names it.
+    describe_index: ValidationRefusalErrorType<crate::ops::describe_index::DescribeIndex<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +143,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            // The SAME shared engine the entry's own operations were constructed from,
+            // so the wrapped reader reads the one store.
+            describe_index: ValidationRefusalErrorType::new(
+                crate::ops::describe_index::DescribeIndex::new(engine),
+            ),
         }
     }
 }
@@ -87,12 +175,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // The fleet-index reader is served behind `ValidationRefusalErrorType` (see the
+        // module docs): its refusal of an `indexName` this service does not recognise
+        // belongs to the validation layer, which names the error shape qualified with the
+        // service's API doc namespace. Every other request resolves through the generated
+        // routing table.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        (key == crate::ops::describe_index::DescribeIndex::<Eng>::NAME)
+            .then_some(&self.describe_index as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

@@ -274,7 +274,7 @@ impl ThingRegistrationRefusal {
                 format!("the maximum of {MAX_THINGS} things is already reached")
             }
             Self::MissingThingType(thing_type_name) => {
-                format!("Thing type {thing_type_name} does not exist")
+                not_found::missing_thing_type_message(thing_type_name)
             }
             Self::DeprecatedThingType(thing_type_name) => format!(
                 "Can not create new thing with deprecated thing type:{thing_type_name}"
@@ -287,19 +287,6 @@ impl ThingRegistrationRefusal {
             }
         }
     }
-}
-
-/// How this service states that a `thingName` names no thing in the registry.
-///
-/// AWS IoT words it from the REQUEST — the account the call was made for and the name
-/// it asked about — so every operation addressing a single thing refuses a name the
-/// registry does not hold with the same sentence, and none of them hardcodes it.
-pub fn missing_thing_message(thing_name: &str) -> String {
-    format!(
-        "Thing {}:{} not found.",
-        ::engine::emulator_account_id(),
-        thing_name
-    )
 }
 
 /// How this service states that an `expectedVersion` does not match the registry.
@@ -1068,7 +1055,7 @@ impl ComAmazonawsIotAwsiotserviceState {
                  not known"
             ));
         }
-        JobTargetsRefusal::NotFound(format!("Thing group {group_name} does not exist"))
+        JobTargetsRefusal::NotFound(not_found::missing_thing_group_message(group_name))
     }
 
     /// The endpoint identifier recorded for `region`, if an endpoint has been created
@@ -2639,14 +2626,13 @@ pub fn thing_index_schema(configuration: &ThingIndexingConfiguration) -> Option<
     })
 }
 
-/// The `ResourceNotFoundException` message for a fleet index the account does not
-/// have — one it has not enabled, or a name that is no fleet index at all.
+/// The `ResourceNotFoundException` message for a fleet index this account does not have:
+/// one of the indexes this service recognises ([`FLEET_INDEX_NAMES`]) whose configuration
+/// section is not enabled.
 ///
-/// AWS IoT words a missing resource as "<resource> <name> does not exist", which is
-/// the sentence this service already answers with for the resources it serves (see
-/// [`missing_ota_update_message`] and the missing thing group
-/// [`resolve_job_targets`] refuses a job with), so the index this request named is
-/// what fills it — never a name from any one call's recording.
+/// A name that is no fleet index at all is a different refusal — it never reaches a
+/// lookup ([`not_found::unrecognized_index_name_message`]) — so the index this request
+/// named is what fills this one, never a name from any one call's recording.
 pub fn missing_fleet_index_message(index_name: &str) -> String {
     format!("Index {index_name} does not exist")
 }
@@ -2779,6 +2765,18 @@ pub use v2_logging::{
 pub mod audit_configuration;
 pub use audit_configuration::{
     is_audit_check, AccountAuditConfiguration, AuditConfigurationRefusal, AUDIT_CHECK_NAMES,
+};
+
+// How a request that named a resource this service does not hold is REFUSED — the fixed
+// sentence each resource family states such a miss with — lives in `state/not_found.rs`,
+// beside the store accessor for the same reason the rules engine does. Its names are
+// re-exported here so a handler reaches them as `crate::state::<name>`.
+pub mod not_found;
+pub use not_found::{
+    missing_authorizer_message, missing_command_message, missing_job_execution_job_message,
+    missing_job_execution_message, missing_job_message, missing_thing_group_message,
+    missing_thing_message, missing_thing_type_message, unrecognized_index_name_message,
+    MISSING_THING_REGISTRATION_TASK_MESSAGE,
 };
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
