@@ -293,6 +293,8 @@ mod node_runtime_environment;
 mod nodejs_invoke_run;
 #[path = "all/permission_and_policy_refusals.rs"]
 mod permission_and_policy_refusals;
+#[path = "all/permission_principal_and_qualifier_rules.rs"]
+mod permission_principal_and_qualifier_rules;
 #[path = "all/policy_versions_and_resources.rs"]
 mod policy_versions_and_resources;
 #[path = "all/provisioned_concurrency.rs"]

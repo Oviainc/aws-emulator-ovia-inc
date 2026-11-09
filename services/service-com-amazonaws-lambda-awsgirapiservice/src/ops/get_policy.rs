@@ -14,8 +14,12 @@
 //! `ResourceNotFoundException`: there is no document to report, and an empty one would
 //! claim a policy exists. That refusal carries
 //! [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`] — the fixed sentence naming no resource —
-//! while a `FunctionName` that resolves to nothing keeps the resource-identifying form
-//! `crate::state::resolve_function` builds, so a caller can tell the two apart.
+//! and so does a `FunctionName`/`Qualifier` pair that resolves to nothing: this READ is
+//! answered for the document it was asked for, which does not exist in either case, so one
+//! sentence covers both and the refusal repeats nothing of the request. A `Qualifier` the
+//! member's own pattern does not admit is a different answer, and a 400: it is a malformed
+//! REQUEST rather than a resource that does not exist
+//! (`crate::state::resolve_function`).
 //!
 //! The answer also states whether the policy it reports grants PUBLIC access, which is a
 //! property of that document and is named on the rendered response because the on-disk
@@ -165,6 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A `Qualifier` outside the pattern its member declares names no version or alias
+        // at all, so it is refused as the request violation it is, before anything is
+        // looked up (`crate::state::admitted_qualifier`).
+        crate::state::admitted_qualifier(input.qualifier.as_deref())?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetPolicyErrorModeled::ServiceException(ServiceException {
                 r#type: None,
@@ -190,19 +199,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
             }
-            crate::state::ResolveFailure::NotFound(message) => {
+            // A READ of a policy reports one sentence for everything it could not find:
+            // the resolution's own `Function not found: <arn>` form names the resource it
+            // resolved the request to, and this operation does not state it — so the
+            // refusal is the service's fixed not-found sentence, naming nothing of the
+            // request, exactly as the refusal below for a resource that holds no policy.
+            crate::state::ResolveFailure::NotFound(_) => {
                 GetPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     r#type: None,
-                    message: Some(message),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 })
             }
         })?;
 
-        // The function, version or alias resolved, so what is missing is the POLICY, not
-        // the resource the request named: the refusal is the fixed sentence that names no
-        // resource, leaving the resource-identifying form to a request that resolves to
-        // nothing. A caller reconciling grants can then tell "no such function" from
-        // "this function holds no policy yet".
+        // The function, version or alias resolved, so what is missing is the POLICY — and
+        // it is reported with that same fixed sentence: whether the resource or its policy
+        // is what this read could not find, the document it was asked for does not exist.
         let Some(policy) = record.policies.get(&version) else {
             return Err(GetPolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

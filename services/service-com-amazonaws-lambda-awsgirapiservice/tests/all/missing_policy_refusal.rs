@@ -20,6 +20,14 @@
 //! owned by those handlers and their suite, so what the rows below pin for a layer version
 //! is the distinction itself rather than the wording.
 //!
+//! `GetPolicy` is the one reader that does NOT distinguish them, and the rows say so: it is
+//! asked for a document, and a pair that resolves to nothing has no document either, so it
+//! answers the same fixed sentence and names nothing of the request — which is what the
+//! recorded service answers for a function it does not hold (corpus
+//! `simparity-wire-aws-v1`, `lambda-snx-traj-policy-side-reads-and-identifier-mistakes`).
+//! The distinction for the function-policy family is therefore pinned on the REMOVAL,
+//! which answers for the policy it was asked to change.
+//!
 //! The rows differ along what the rule generalises over: the operation (reading a policy,
 //! revoking a statement from one, reading a function URL), the resource kind (a function's
 //! unpublished version, a published version, an alias, a layer version), the form the
@@ -346,14 +354,16 @@ fn cases() -> Vec<Case> {
             identifier: function_arn(URL_LESS),
             refusal: Refusal::MissingSubresource,
         },
-        // The resource itself does not resolve, so the refusal identifies it.
+        // The resource itself does not resolve, so the refusal identifies it — except on
+        // the policy READ, which is asked for a document and has none to report either
+        // way, so it answers its one fixed sentence and identifies nothing.
         Case {
             name: "GetPolicy on a function that does not exist",
             method: "GET",
             uri: format!("/2015-03-31/functions/{UNKNOWN_FUNCTION}/policy"),
             kind: FUNCTION_POLICY,
             identifier: function_arn(UNKNOWN_FUNCTION),
-            refusal: Refusal::Unresolvable,
+            refusal: Refusal::MissingSubresource,
         },
         Case {
             name: "GetPolicy on a version that does not exist",
@@ -361,7 +371,7 @@ fn cases() -> Vec<Case> {
             uri: format!("/2015-03-31/functions/{POLICY_FREE}/policy?Qualifier=9"),
             kind: FUNCTION_POLICY,
             identifier: format!("{}:9", function_arn(POLICY_FREE)),
-            refusal: Refusal::Unresolvable,
+            refusal: Refusal::MissingSubresource,
         },
         Case {
             name: "GetPolicy on an alias that does not exist",
@@ -369,7 +379,7 @@ fn cases() -> Vec<Case> {
             uri: format!("/2015-03-31/functions/{POLICY_FREE}/policy?Qualifier=ghost"),
             kind: FUNCTION_POLICY,
             identifier: format!("{}:ghost", function_arn(POLICY_FREE)),
-            refusal: Refusal::Unresolvable,
+            refusal: Refusal::MissingSubresource,
         },
         Case {
             name: "RemovePermission on a function that does not exist",
@@ -514,7 +524,8 @@ async fn a_missing_policy_is_refused_differently_from_a_missing_resource() {
 
 /// The same function tells the two refusals apart over its own lifetime: it holds no
 /// policy, then holds one, then holds none again once the last statement is revoked — and
-/// the refusal is the fixed sentence both times, while an unknown function's names it.
+/// the READ answers the fixed sentence throughout, whether the function exists or not,
+/// while the REMOVAL answers for the policy it was asked to change.
 #[tokio::test]
 async fn a_functions_policy_refusal_follows_whether_it_holds_a_policy() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -531,10 +542,21 @@ async fn a_functions_policy_refusal_follows_whether_it_holds_a_policy() {
         body_text(&before)
     );
 
+    // A function that does not exist, read at the same moment: the READ is asked for a
+    // document, and there is none either way, so it is the SAME fixed sentence and names
+    // nothing of the request. The removal below is what tells the two states apart.
     let unknown = get_policy(&router, UNKNOWN_FUNCTION, None).await;
+    assert_eq!(
+        (unknown.status, message_of(&unknown)),
+        (NOT_FOUND_STATUS, MISSING_SUBRESOURCE_MESSAGE.to_string()),
+        "case {:?}: expected HTTP {NOT_FOUND_STATUS} and the fixed sentence, got {} {}",
+        "an unknown function at the same moment",
+        unknown.status,
+        body_text(&unknown)
+    );
     assert!(
-        message_of(&unknown).contains(&function_arn(UNKNOWN_FUNCTION)),
-        "case {:?}: expected a refusal naming the function, got {}",
+        !message_of(&unknown).contains(&function_arn(UNKNOWN_FUNCTION)),
+        "case {:?}: the sentence is fixed, so it may not name the function, got {}",
         "an unknown function at the same moment",
         body_text(&unknown)
     );

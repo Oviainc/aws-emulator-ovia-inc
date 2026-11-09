@@ -21,6 +21,10 @@
 //! qualifier is an `InvalidParameterValueException`, because "Lambda does not support
 //! adding policies to version $LATEST".
 //!
+//! One refusal is about the request alone and is therefore answered first: a `Principal`
+//! that names none of the documented identity forms is an `InvalidParameterValueException`
+//! (`crate::state::policy_principal`), because such a grant would be made to nobody.
+//!
 //! `PublicPolicyException` is not answered here: whether a grant counts as public access
 //! depends on the account's block-public-access setting, which this emulator does not
 //! model, so no call is refused for a setting nothing holds.
@@ -235,6 +239,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A `Qualifier` outside the pattern its member declares names no version or alias
+        // at all, so it is refused as the request violation it is, before anything is
+        // looked up (`crate::state::admitted_qualifier`).
+        crate::state::admitted_qualifier(input.qualifier.as_deref())?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(AddPermissionErrorModeled::ServiceException(ServiceException {
                 r#type: None,
@@ -243,6 +252,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx);
+
+        // The grant has to name somebody: `Principal` is "The Amazon Web Services service,
+        // Amazon Web Services account, IAM user, or IAM role that invokes the function",
+        // and a value in none of those forms — a service abbreviated to its short name,
+        // say — denotes no identity at all, so it is refused rather than stored as a grant
+        // nothing can ever match (`crate::state::policy_principal`). The member's own
+        // pattern only forbids whitespace, so this is where the FORM is read, and it is
+        // read before anything is looked up.
+        if !crate::state::is_grantable_principal(&input.principal) {
+            return Err(AddPermissionErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    r#type: None,
+                    message: Some(crate::state::INVALID_PRINCIPAL_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
 
         // The qualifier the request named, as opposed to the `$LATEST` an unqualified
         // request resolves to: it may come from the `FunctionName` or from the

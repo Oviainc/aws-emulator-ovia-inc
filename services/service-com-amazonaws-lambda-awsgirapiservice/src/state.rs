@@ -1136,6 +1136,14 @@ fn json_object(members: &[(&str, String)]) -> String {
     format!("{{{}}}", rendered.join(","))
 }
 
+/// WHICH identities a grant may name, and the refusal a value naming none of them gets;
+/// see the module's own header.
+pub mod policy_principal;
+pub use policy_principal::{
+    is_account_id, is_grantable_principal, is_service_principal, EVERY_PRINCIPAL,
+    INVALID_PRINCIPAL_MESSAGE,
+};
+
 /// The `Principal` of a policy statement for the principal `AddPermission` was given.
 ///
 /// The model documents the forms the member takes — "The Amazon Web Services service,
@@ -1148,13 +1156,16 @@ fn json_object(members: &[(&str, String)]) -> String {
 /// * an IAM user or role is already an ARN, and is used as given;
 /// * anything else is the domain-style identifier of a service principal;
 /// * `*` is every principal, which the language writes as the bare string.
+///
+/// Which of those forms a value IS is read by [`policy_principal`], the same reading that
+/// decides whether a grant may name it at all, so what is admitted and what is written
+/// here cannot disagree.
 #[must_use]
 pub fn principal_json(principal: &str) -> String {
-    if principal == "*" {
+    if principal == EVERY_PRINCIPAL {
         return json_string(principal);
     }
-    let is_account_id = principal.len() == 12 && principal.bytes().all(|byte| byte.is_ascii_digit());
-    if is_account_id {
+    if is_account_id(principal) {
         return json_object(&[(
             "AWS",
             json_string(&format!("arn:aws:iam::{principal}:root")),
@@ -1527,6 +1538,73 @@ pub fn pattern_violation_message(path: &str, value: &str, pattern: &str) -> Stri
     )
 }
 
+/// The model's `NumericLatestPublishedOrAliasQualifier` pattern, which every operation
+/// addressing a function by a `Qualifier` puts on that member
+/// (`smithy_query(query="shape", shape="NumericLatestPublishedOrAliasQualifier")`).
+pub const QUALIFIER_PATTERN: &str = r"^\$(LATEST(\.PUBLISHED)?)|[a-zA-Z0-9-_$]+$";
+
+/// Whether `qualifier` is a value the qualifier pattern admits as a WHOLE value: the
+/// unpublished version ([`VERSION_LATEST`]) or its published reading
+/// ([`VERSION_LATEST_PUBLISHED`]), or a run of the characters a published version number
+/// and an alias name are written with.
+///
+/// A Smithy `@pattern` is a FIND rather than a total match, so the framework's own
+/// constraint walk admits any value that merely CONTAINS what one branch of
+/// [`QUALIFIER_PATTERN`]'s alternation matches — a qualifier carrying a space is admitted
+/// on the run that follows the space. AWS validates the alternation against the whole
+/// value, so this states that reading: a value the alternation does not match end to end
+/// is a validation failure ([`qualifier_message`]) rather than a qualifier to look up.
+#[must_use]
+pub fn is_qualifier(qualifier: &str) -> bool {
+    if qualifier == VERSION_LATEST || qualifier == VERSION_LATEST_PUBLISHED {
+        return true;
+    }
+    !qualifier.is_empty()
+        && qualifier.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'$'
+        })
+}
+
+/// The refusal a `Qualifier` outside [`QUALIFIER_PATTERN`] gets: the validation clause
+/// built from the request — the value, the member path and the expression the value has to
+/// satisfy — which is what the framework's own walk would have stated had the pattern been
+/// a whole-value match.
+///
+/// Every operation spells the member `Qualifier`, which a clause states as `qualifier`.
+#[must_use]
+pub fn qualifier_message(qualifier: &str) -> String {
+    pattern_violation_message("qualifier", qualifier, QUALIFIER_PATTERN)
+}
+
+/// Refuse a `Qualifier` that [`QUALIFIER_PATTERN`] does not admit as a whole value, so an
+/// operation addressing a function by one states the violation before it looks anything
+/// up.
+///
+/// The refusal is the one the framework's own constraint walk answers — 400
+/// `ValidationException` over the clause built from the request — because what is wrong is
+/// the request's SHAPE rather than what the value means. That is the same answer, for the
+/// same reason, that the alias-name pattern gets (`crate::ops::create_alias`): a pattern
+/// the walk cannot decide is decided here and worded as the walk would have worded it.
+///
+/// Generic over the operation's modelled error, so every operation that declares a
+/// `NumericLatestPublishedOrAliasQualifier` states this one way. An operation whose
+/// `Qualifier` targets ANOTHER shape is not one of them — the clause quotes the expression
+/// that member declares, and the function-URL and provisioned-concurrency operations each
+/// declare their own ([`function_url_qualifier_message`] states one of them).
+///
+/// A qualifier the caller left EMPTY is not refused here: it is outside the member's
+/// `@length` minimum, which the boundary walk already states.
+pub fn admitted_qualifier<E>(
+    qualifier: Option<&str>,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    match qualifier.filter(|named| !named.is_empty()) {
+        Some(named) if !is_qualifier(named) => Err(crate::scaffolded::Scaffolded::validation(
+            qualifier_message(named),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Lambda's canonical `ResourceNotFoundException` sentence: the fixed wording the service
 /// answers for a resource that does not exist, naming NOTHING of the request.
 ///
@@ -1542,7 +1620,9 @@ pub fn pattern_violation_message(path: &str, value: &str, pattern: &str) -> Stri
 /// Every other 404 in this service — a function URL, a layer version READ, an event source
 /// mapping, a resource addressed by its TAGS, a function carrying no resource-based policy,
 /// and the function-scaling operations, which word both the name and the qualifier they
-/// could not resolve with this sentence — answers this.
+/// could not resolve with this sentence — answers this. The READ of a function's policy
+/// answers it for the resource as well: `GetPolicy` is asked for a document, so a pair that
+/// resolves to nothing and a resource holding no policy are one answer there.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The resource you requested does not exist.";
 
 /// The refusal a `RevisionId` precondition that did not hold gets on `AddPermission` and
@@ -4093,6 +4173,21 @@ impl PolledEventSource {
 /// because a read reports on the resource it was asked about.
 pub const NO_POLICY_MESSAGE: &str = "No policy is associated with the given resource.";
 
+/// What a REMOVAL answers when the policy it is to act on exists but holds no statement
+/// under the id the request named.
+///
+/// The policy is there, so what is missing is the one statement the request addressed:
+/// the sentence names that statement id — the only part of the request it carries — and
+/// states where it was looked for, which is the resource policy the request addressed
+/// rather than any resource this service could name back. It is therefore the same
+/// sentence for a function's policy and a layer version's, since neither the statement id
+/// nor "the resource policy" is a property of the resource kind, while
+/// [`NO_POLICY_MESSAGE`] is what a removal gets when there is no policy to act on at all.
+#[must_use]
+pub fn statement_not_found_message(statement_id: &str) -> String {
+    format!("Statement {statement_id} is not found in resource policy.")
+}
+
 /// What a READ of a layer version answers when its policy record holds no statement:
 /// every statement it had has been removed, so the version it names is the one that has
 /// no policy left.
@@ -4559,6 +4654,12 @@ pub enum ResolveFailure {
 
 /// Resolve a `FunctionName` (in any of its documented forms, optionally qualified) and
 /// an optional `Qualifier` query parameter to one stored record and one version label.
+///
+/// The pair is read as a REQUEST first and as a resource second: a `FunctionName` in none
+/// of the documented forms is a parameter violation stated before anything is looked up,
+/// as is a `Qualifier` outside the pattern its member declares — which each operation
+/// declaring that member states for itself, because the expression a clause quotes is the
+/// member's ([`admitted_qualifier`]).
 ///
 /// The record is brought up to whatever the clock already made due before it is
 /// handed back, so every caller reports the same lifecycle state at the same instant.

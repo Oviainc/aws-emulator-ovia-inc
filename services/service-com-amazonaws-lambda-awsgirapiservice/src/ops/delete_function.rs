@@ -158,6 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A `Qualifier` outside the pattern its member declares names no version or alias
+        // at all, so it is refused as the request violation it is, before anything is
+        // looked up (`crate::state::admitted_qualifier`).
+        crate::state::admitted_qualifier(input.qualifier.as_deref())?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteFunctionErrorModeled::ServiceException(ServiceException {
                 r#type: None,

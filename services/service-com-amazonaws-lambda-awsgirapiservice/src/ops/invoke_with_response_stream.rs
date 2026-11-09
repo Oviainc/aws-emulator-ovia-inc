@@ -267,6 +267,11 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             return Err(service_error("Lambda state is not reachable on this engine"));
         };
 
+        // A `Qualifier` outside the pattern its member declares names no version or alias
+        // at all, so it is refused as the request violation it is, before anything is
+        // looked up (`crate::state::admitted_qualifier`).
+        crate::state::admitted_qualifier(input.qualifier.as_deref())?;
+
         // "By default, Lambda invokes your function synchronously (i.e. the
         // InvocationType is RequestResponse)" — the one default `Invoke` documents for
         // the same member, and the constraint walk above has already held the value to

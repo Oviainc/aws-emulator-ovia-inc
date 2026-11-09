@@ -225,7 +225,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         })?;
 
-        let resource = resolved.arn;
         // The layer version EXISTS, so a version with no statement to take out is refused
         // for its POLICY rather than reported as an absent resource: there is no policy
         // this removal can act on, whether the version never had one or its statements
@@ -283,10 +282,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 RemoveLayerVersionPermissionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         r#type: None,
-                        message: Some(format!(
-                            "The statement id ({}) provided does not exist on the policy of \
-                             {resource}.",
-                            input.statement_id
+                        message: Some(crate::state::statement_not_found_message(
+                            &input.statement_id,
                         )),
                     },
                 )

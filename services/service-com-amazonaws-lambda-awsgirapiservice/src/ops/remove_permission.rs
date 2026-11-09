@@ -184,6 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A `Qualifier` outside the pattern its member declares names no version or alias
+        // at all, so it is refused as the request violation it is, before anything is
+        // looked up (`crate::state::admitted_qualifier`).
+        crate::state::admitted_qualifier(input.qualifier.as_deref())?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(RemovePermissionErrorModeled::ServiceException(ServiceException {
                 r#type: None,
@@ -218,7 +223,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         })?;
 
-        let resource = record.versioned_arn(&version);
         // The resource the request named resolved, so what a removal finds missing is the
         // POLICY itself, and that is what it reports: a READ of the policy answers for the
         // resource it was asked about, a removal answers for the policy it was asked to
@@ -259,10 +263,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(RemovePermissionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     r#type: None,
-                    message: Some(format!(
-                        "The statement id ({}) provided does not exist on the policy of \
-                         {resource}.",
-                        input.statement_id
+                    message: Some(crate::state::statement_not_found_message(
+                        &input.statement_id,
                     )),
                 },
             )
