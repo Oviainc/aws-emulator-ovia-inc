@@ -209,7 +209,7 @@ pub(crate) fn mark_managed(emulator: &Emulator, table_arn: &str) {
 }
 
 /// The record-expiration configuration the store holds for `table_arn`.
-fn stored_expiration(emulator: &Emulator, table_arn: &str) -> Option<RecordExpiration> {
+pub(crate) fn stored_expiration(emulator: &Emulator, table_arn: &str) -> Option<RecordExpiration> {
     let store = emulator.engine.state::<S3TablesState>();
     let store = store.lock();
     store
