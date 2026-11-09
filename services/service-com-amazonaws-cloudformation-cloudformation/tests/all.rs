@@ -35,6 +35,8 @@ mod bucket_property_updates;
 mod callback_signature;
 #[path = "all/cancelled_update.rs"]
 mod cancelled_update;
+#[path = "all/cdk_asset_function_writes_its_granted_table.rs"]
+mod cdk_asset_function_writes_its_granted_table;
 #[path = "all/cdk_deployed_table_estate.rs"]
 mod cdk_deployed_table_estate;
 #[path = "all/cdk_metadata_resource_type.rs"]

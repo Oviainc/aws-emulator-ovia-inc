@@ -56,16 +56,21 @@ fn event() -> Value {
 
 /// What one Lambda request answered: the status, the headers (the function-error signal lives
 /// there) and the body as JSON.
-struct Answer {
-    status: u16,
-    headers: http::HeaderMap,
-    body: Value,
+///
+/// `pub(crate)` with [`lambda`] because more than one suite of this target reads a function a
+/// stack provisioned back through Lambda's own wire, and there is one spelling of that call:
+/// `cdk_asset_function_writes_its_granted_table.rs` invokes the function a CDK-shaped deploy
+/// created through it.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The `X-Amz-Function-Error` signal, which an invocation that RAN to completion carries
     /// none of.
-    fn function_error(&self) -> Option<String> {
+    pub(crate) fn function_error(&self) -> Option<String> {
         self.headers
             .get("x-amz-function-error")
             .and_then(|value| value.to_str().ok())
@@ -74,7 +79,7 @@ impl Answer {
 }
 
 /// Call one AWS Lambda operation over its restJson1 wire, signed for this suite's Region.
-async fn lambda(
+pub(crate) async fn lambda(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -114,24 +119,33 @@ async fn lambda(
     }
 }
 
-/// A .zip deployment package holding `source` as the one file the declared handler resolves,
-/// written in memory the way a caller uploads one — and base64-encoded, because `ZipFile` is a
-/// blob and a JSON request carries a blob encoded.
-fn encoded_package(source: &str) -> String {
+/// A .zip deployment package holding `source` as the one entry `file` names, written in memory
+/// with the maintained `zip` implementation the way a caller uploads one.
+///
+/// `pub(crate)` because more than one suite of this target archives a package: the suite over
+/// a CDK-shaped deploy stages one as an Amazon S3 asset object
+/// (`cdk_asset_function_writes_its_granted_table.rs`), so there is ONE archive writer here.
+pub(crate) fn package(file: &str, source: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
         let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
         writer
-            .start_file(SOURCE_FILE, options)
+            .start_file(file, options)
             .expect("the archive entry starts");
         writer
             .write_all(source.as_bytes())
             .expect("the archive entry's bytes are written");
         writer.finish().expect("a finished archive");
     }
-    aws_smithy_types::base64::encode(buffer.into_inner())
+    buffer.into_inner()
+}
+
+/// [`package`] holding the one file the declared handler resolves, base64-encoded — because
+/// `ZipFile` is a blob and a JSON request carries a blob encoded.
+fn encoded_package(source: &str) -> String {
+    aws_smithy_types::base64::encode(package(SOURCE_FILE, source))
 }
 
 /// What `GetFunctionConfiguration` reports for `name` right now.
