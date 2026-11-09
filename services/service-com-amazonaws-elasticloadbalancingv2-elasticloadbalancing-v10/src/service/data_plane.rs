@@ -66,12 +66,17 @@
 //! its message body are the response — and so is a `redirect`, whose `Location` is built
 //! by substituting the request's own components into the placeholders the action carries.
 //!
-//! A `forward` names targets this emulator has no server behind: a registered target is an
-//! instance id or an address, and nothing in this emulator listens on it. Neither a body
-//! nor a status is invented for a backend that never ran, so a forward is answered the way
-//! a load balancer answers those two conditions — [`NO_HEALTHY_TARGET_STATUS`] when the
-//! group has no healthy target to send the request to, and [`TARGET_UNREACHABLE_STATUS`]
-//! when it has one and the connection to it cannot be made.
+//! A `forward` to a `lambda` target group IS performed: the registered function is invoked
+//! in process and the client is answered from what the run returned, or with the load
+//! balancer's own `502` when that answer breaks the response contract
+//! ([`super::lambda_target`]).
+//!
+//! A `forward` to any other target group names targets this emulator has no server behind: a
+//! registered target is an instance id or an address, and nothing in this emulator listens
+//! on it. Neither a body nor a status is invented for a backend that never ran, so such a
+//! forward is answered the way a load balancer answers those two conditions —
+//! [`NO_HEALTHY_TARGET_STATUS`] when the group has no target to send the request to, and
+//! [`TARGET_UNREACHABLE_STATUS`] when it has one and the connection to it cannot be made.
 //!
 //! An `authenticate-oidc`, `authenticate-cognito` or `jwt-validation` action needs the
 //! identity provider it names, and this emulator makes no outbound connection to one, so
@@ -86,12 +91,13 @@ use std::time::SystemTime;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
-use smithy_server_runtime::http;
+use smithy_server_runtime::{http, BoxFuture, ErasedOperation, OperationContext, Service};
 
 use crate::ops::types::{Action, RuleCondition};
 use crate::state::{
     service_state, ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState,
-    ListenerRecord, LoadBalancerFamily, LoadBalancerRecord, DEFAULT_FIXED_RESPONSE_CONTENT_TYPE,
+    ListenerRecord, LoadBalancerFamily, LoadBalancerRecord, RegisteredTarget, TargetGroupRecord,
+    DEFAULT_FIXED_RESPONSE_CONTENT_TYPE,
 };
 // How a client ADDRESSES a data plane, from the one reading of it in the tree: the
 // reserved path namespace, the first path segment, the host without its port, the port a
@@ -147,6 +153,13 @@ pub const ACTION_NOT_PERFORMED_STATUS: u16 = 500;
 
 /// The `TargetHealthStateEnum` value a target that can be sent requests reports.
 const HEALTHY_TARGET_STATE: &str = "healthy";
+
+/// The `TargetHealthStateEnum` value a registration of a target group whose health checks
+/// are OFF reports: `unavailable`, "health checks are not enabled for this target group"
+/// (`crate::state::target_health`). Nothing is checking such a target, so nothing marks it
+/// unhealthy either and the load balancer sends it requests. Only a `lambda` target group
+/// reaches it — every other target type is refused a disabled health check at create.
+const HEALTH_CHECKS_DISABLED_STATE: &str = "unavailable";
 
 /// The longest condition value this plane matches a request against: `RuleCondition$Values`
 /// documents a host name and a path pattern as each "up to 128 characters in length", so a
@@ -471,20 +484,24 @@ fn prefixed_addressing(path: &str) -> Option<(&str, &str)> {
 }
 
 /// Everything the rules and the actions are evaluated against: what the client sent.
+///
+/// `pub(super)` because a `forward` to a `lambda` target group hands the request to the
+/// function as an event ([`super::lambda_target`]), which is built out of exactly these
+/// members.
 #[derive(Debug, Default)]
-struct DataPlaneRequest {
-    method: String,
+pub(super) struct DataPlaneRequest {
+    pub(super) method: String,
     /// The path within the load balancer's own endpoint, as [`Resolved`] read it.
-    path: String,
+    pub(super) path: String,
     /// The query string, without the leading `?`.
-    query: String,
+    pub(super) query: String,
     /// The host the client addressed, without its port.
-    host: String,
+    pub(super) host: String,
     /// Every header, with its name lower-cased: a header condition names its header
     /// case-insensitively.
-    headers: Vec<(String, String)>,
+    pub(super) headers: Vec<(String, String)>,
     /// The port the client addressed, when it named one.
-    port: Option<i32>,
+    pub(super) port: Option<i32>,
 }
 
 impl DataPlaneRequest {
@@ -533,21 +550,25 @@ impl DataPlaneRequest {
 
 /// One answer this plane renders: the status, the content type, `Location` and any other
 /// headers it carries, and the body.
+///
+/// `pub(super)` because the answer a `lambda` target's own run produced is one of these
+/// ([`super::lambda_target`]).
 #[derive(Debug, Default)]
-struct Served {
-    status: u16,
-    content_type: Option<String>,
-    location: Option<String>,
-    /// Every other header the answer carries, which is what a web ACL's own custom
-    /// response configures; a listener's actions configure none.
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+pub(super) struct Served {
+    pub(super) status: u16,
+    pub(super) content_type: Option<String>,
+    pub(super) location: Option<String>,
+    /// Every other header the answer carries: what a web ACL's own custom response
+    /// configures, and what a `lambda` target's response named. A listener's actions
+    /// configure none.
+    pub(super) headers: Vec<(String, String)>,
+    pub(super) body: Vec<u8>,
 }
 
 impl Served {
     /// A status with no body: what a load balancer answers for a request it could not pass
     /// on, where no body of its own is this emulator's to invent.
-    fn status(status: u16) -> Self {
+    pub(super) fn status(status: u16) -> Self {
         Self {
             status,
             ..Self::default()
@@ -569,18 +590,26 @@ impl Served {
 
 /// Answer a request this plane claimed, out of the records the control plane holds.
 ///
-/// Reached from `Service::override_routing_error` for a request [`claims_request`]
-/// resolved, so the resolution here repeats that one; a resolution that has gone away
-/// between the two (the load balancer was deleted by another request in between) is a load
-/// balancer no longer serving the name, which is [`PROVISIONING_STATUS`] rather than a
-/// panic.
+/// Reached from the plane `Service::override_operation` hands back for a request
+/// [`claims_request`] resolved, so the resolution here repeats that one; a resolution that
+/// has gone away between the two (the load balancer was deleted by another request in
+/// between) is a load balancer no longer serving the name, which is [`PROVISIONING_STATUS`]
+/// rather than a panic.
 ///
 /// The WEB ACL in front of the load balancer decides the request first ([`super::web_acl`]):
 /// a request it refuses is answered at the edge and none of the listener's actions runs,
 /// and one it allows is matched and answered carrying the headers it inserted. This
 /// service's own store is released before the web ACL is asked, so the two services'
 /// stores are never held at the same time.
-pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
+///
+/// `ctx` is what a `forward` to a `lambda` target group needs: the in-process transport the
+/// function is invoked over ([`super::lambda_target`]). The store's guard is released before
+/// that invocation, so one client's handler cannot stall another client's request.
+pub async fn serve<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    req: &RtRequest,
+    ctx: &OperationContext<'_>,
+) -> RtResponse {
     let uri = parsed_uri(req.uri());
     let Some(resolved) = resolve(engine, &Addressed::of_request(req, &uri)) else {
         return rendered(&Served::status(PROVISIONING_STATUS));
@@ -625,11 +654,34 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
             if let super::web_acl::Decision::Allowed(inserted) = decided {
                 request.insert_headers(inserted);
             }
-            let store = state.lock();
-            let Some(listener) = store.listeners.get(&listener_arn) else {
-                return rendered(&Served::status(PROVISIONING_STATUS));
+            let performed = {
+                let store = state.lock();
+                let Some(listener) = store.listeners.get(&listener_arn) else {
+                    return rendered(&Served::status(PROVISIONING_STATUS));
+                };
+                answered(&store, listener, &request, now)
             };
-            answered(&store, listener, &request, now)
+            match performed {
+                Performed::Answered(served) => served,
+                // The store's guard is released above, so the function RUNS with no lock of
+                // this service's held.
+                Performed::Invoke(forwarded) => {
+                    // The request's own bytes, which the event the function is invoked with
+                    // carries. A body this plane cannot read is not a body it may invent an
+                    // empty one for, so the request reaches no function at all.
+                    let Some(body) = req.body().bytes() else {
+                        tracing::warn!(
+                            load_balancer = %load_balancer_arn,
+                            "the request carries a body this emulator cannot read, so the \
+                             Lambda target was not invoked"
+                        );
+                        return rendered(&Served::status(
+                            super::lambda_target::BAD_GATEWAY_STATUS,
+                        ));
+                    };
+                    super::lambda_target::served(ctx, &forwarded, &request, body).await
+                }
+            }
         }
     };
     // The record of one request this endpoint answered, as a load balancer's own access
@@ -646,6 +698,54 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
         "the load balancer answered a request on the name it published"
     );
     rendered(&served)
+}
+
+/// The data plane as the ROUTER serves it: the operation `Service::override_operation` hands
+/// back for a request addressed to a load balancer this service holds.
+///
+/// A load balancer's own traffic is no modelled operation — no routing key names it — so it
+/// is mounted the way an emulated data plane is: claimed by `Service::can_handle`
+/// ([`claims_parts`]) and served here. It declares NO auth scheme, because a client of the
+/// name a load balancer publishes carries no AWS credential and has none to sign with; that
+/// is the same reach the plane had when it was answered from
+/// `Service::override_routing_error`, which the router reaches before authentication, and it
+/// still claims only a request addressed to a load balancer this store holds. Being an
+/// operation is what hands the plane the in-process transport a `forward` to a `lambda`
+/// target group invokes the function over ([`super::lambda_target`]).
+pub struct DataPlane<Eng> {
+    /// The ONE shared engine this service's operations read and write, so a request served
+    /// here sees exactly the configuration the control plane persisted.
+    engine: ::std::sync::Arc<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> DataPlane<Eng> {
+    /// Mount the plane over the shared engine.
+    pub fn new(engine: ::std::sync::Arc<Eng>) -> Self {
+        Self { engine }
+    }
+
+    /// Whether this plane serves `req`, by the one rule the claim uses
+    /// ([`claims_request`]).
+    pub fn claims(&self, req: &RtRequest) -> bool {
+        claims_request(&*self.engine, req)
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for DataPlane<Eng> {
+    fn run<'r>(
+        &'r self,
+        _svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move { serve(&*self.engine, req, ctx).await })
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // A client that sends traffic to the name a load balancer published presents no AWS
+        // credential: this plane serves the request however it arrived.
+        Some(&[])
+    }
 }
 
 /// The listener the request reached: the one listening on the port the client addressed
@@ -686,7 +786,7 @@ fn answered(
     listener: &ListenerRecord,
     request: &DataPlaneRequest,
     now: SystemTime,
-) -> Served {
+) -> Performed {
     performed(store, listener, matched_actions(listener, request), request, now)
 }
 
@@ -918,6 +1018,16 @@ fn matches_within(pattern: &str, value: &str, case_sensitive: bool, budget: &mut
 const CASE_SENSITIVE: bool = true;
 const CASE_INSENSITIVE: bool = false;
 
+/// What performing the matched action list resolved to.
+#[derive(Debug)]
+enum Performed {
+    /// The answer, computed from the records this service holds and nothing else.
+    Answered(Served),
+    /// The action forwards to a `lambda` target group, so the client is answered from an
+    /// INVOCATION of the function registered with it ([`super::lambda_target`]).
+    Invoke(Box<super::lambda_target::Forwarded>),
+}
+
 /// Perform the matched action list: the terminating action answers the client, and an
 /// action this emulator cannot perform answers [`ACTION_NOT_PERFORMED_STATUS`] rather than
 /// serving what is behind it.
@@ -931,7 +1041,7 @@ fn performed(
     actions: &[Action],
     request: &DataPlaneRequest,
     now: SystemTime,
-) -> Served {
+) -> Performed {
     if let Some(action) = actions
         .iter()
         .find(|action| !is_terminating(&action.r#type))
@@ -941,7 +1051,7 @@ fn performed(
             "the action needs an identity provider this emulator makes no connection to, \
              so the request it guards is not served"
         );
-        return Served::status(ACTION_NOT_PERFORMED_STATUS);
+        return Performed::Answered(Served::status(ACTION_NOT_PERFORMED_STATUS));
     }
     let Some(action) = actions
         .iter()
@@ -950,15 +1060,15 @@ fn performed(
     else {
         // A listener with no default action and a matched rule with no action have nothing
         // to answer with, which no create admits.
-        return Served::status(NO_HEALTHY_TARGET_STATUS);
+        return Performed::Answered(Served::status(NO_HEALTHY_TARGET_STATUS));
     };
     match action.r#type.as_str() {
-        FIXED_RESPONSE_ACTION => fixed_response(action),
-        REDIRECT_ACTION => redirect(action, listener, request),
-        FORWARD_ACTION => forward(store, action, now),
+        FIXED_RESPONSE_ACTION => Performed::Answered(fixed_response(action)),
+        REDIRECT_ACTION => Performed::Answered(redirect(action, listener, request)),
+        FORWARD_ACTION => forward(store, listener, action, now),
         // Unreachable: every type that is not terminating was answered above, and
         // `Action$Type` carries no other terminating one.
-        _ => Served::status(ACTION_NOT_PERFORMED_STATUS),
+        _ => Performed::Answered(Served::status(ACTION_NOT_PERFORMED_STATUS)),
     }
 }
 
@@ -1140,27 +1250,67 @@ fn default_port(protocol: &str) -> Option<&'static str> {
     }
 }
 
-/// What a `forward` answers. The target groups it names are this store's own; a target of
-/// one is a registration this emulator has no server behind, so the answer is the status a
-/// load balancer gives for the condition that holds: no healthy target to choose, or a
-/// target chosen whose connection cannot be made.
-fn forward(store: &ElbState, action: &Action, now: SystemTime) -> Served {
+/// What a `forward` answers. The target groups it names are this store's own, and the
+/// registration it chooses decides what happens next: a `lambda` target group's function is
+/// INVOKED ([`super::lambda_target`]), and a target of any other group is a registration
+/// this emulator has no server behind, so the answer is the status a load balancer gives for
+/// the condition that holds — no target to choose, or a target chosen whose connection
+/// cannot be made.
+fn forward(
+    store: &ElbState,
+    listener: &ListenerRecord,
+    action: &Action,
+    now: SystemTime,
+) -> Performed {
     let named = crate::state::action_target_group_arns(std::slice::from_ref(action));
-    let healthy = named.iter().any(|arn| {
-        store.target_groups.get(arn).is_some_and(|group| {
-            group.targets.values().any(|target| {
-                group.health_of(target, now).state.as_deref() == Some(HEALTHY_TARGET_STATE)
-            })
-        })
-    });
-    if healthy {
-        tracing::warn!(
-            "the target group's healthy target is a registration with no server of this \
-             emulator's behind it, so the connection to it cannot be made"
-        );
-        return Served::status(TARGET_UNREACHABLE_STATUS);
+    let chosen = named
+        .iter()
+        .filter_map(|arn| store.target_groups.get(arn))
+        .find_map(|group| {
+            group
+                .targets
+                .values()
+                .find(|target| receives_requests(group, target, now))
+                .map(|target| (group, target))
+        });
+    let Some((group, target)) = chosen else {
+        return Performed::Answered(Served::status(NO_HEALTHY_TARGET_STATUS));
+    };
+    if group.is_lambda() {
+        // "lambda - Register a single Lambda function as a target": the registration holds
+        // the function's ARN, and the request is served by invoking it.
+        return Performed::Invoke(Box::new(super::lambda_target::Forwarded {
+            function_arn: target.id.clone(),
+            target_group_arn: group.arn.clone(),
+            multi_value_headers: super::lambda_target::multi_value_headers(group),
+            protocol: listener.protocol.clone(),
+            port: listener.port,
+        }));
     }
-    Served::status(NO_HEALTHY_TARGET_STATUS)
+    tracing::warn!(
+        "the target group's healthy target is a registration with no server of this \
+         emulator's behind it, so the connection to it cannot be made"
+    );
+    Performed::Answered(Served::status(TARGET_UNREACHABLE_STATUS))
+}
+
+/// Whether the load balancer may send this registration a request: its reported health says
+/// so.
+///
+/// A target the health checks found [`HEALTHY_TARGET_STATE`] receives requests, and so does
+/// one of a target group whose health checks are OFF ([`HEALTH_CHECKS_DISABLED_STATE`]):
+/// nothing is checking it, so nothing marks it unhealthy either. Every other reported state
+/// — a registration still coming up, one draining, one of a group no load balancer forwards
+/// to — is one the load balancer does not send requests to.
+fn receives_requests(
+    group: &TargetGroupRecord,
+    target: &RegisteredTarget,
+    now: SystemTime,
+) -> bool {
+    matches!(
+        group.health_of(target, now).state.as_deref(),
+        Some(HEALTHY_TARGET_STATE) | Some(HEALTH_CHECKS_DISABLED_STATE)
+    )
 }
 
 /// One rendered answer: the status, its headers and its body, as the wire carries them.
@@ -1194,14 +1344,17 @@ fn rendered(served: &Served) -> RtResponse {
         }
     }
     for (name, value) in &served.headers {
-        if let Err(refused) = response.headers_mut().try_insert(name.clone(), value.clone()) {
-            // A header a web ACL's custom response configures is a stored value, so one
-            // the wire cannot carry is left off the response rather than failing it.
+        if let Err(refused) = response.headers_mut().try_append(name.clone(), value.clone()) {
+            // A header a web ACL's custom response configures, or a `lambda` target's
+            // response named, is a stored or returned value, so one the wire cannot carry is
+            // left off the response rather than failing it. APPENDED, not inserted: a name
+            // the answer carries more than once is sent more than once, which is how several
+            // cookies travel.
             tracing::warn!(
                 header = %name,
                 error = %refused,
-                "the header the web acl's custom response configures cannot be sent on the \
-                 wire and is left off the response"
+                "the header the answer carries cannot be sent on the wire and is left off \
+                 the response"
             );
         }
     }

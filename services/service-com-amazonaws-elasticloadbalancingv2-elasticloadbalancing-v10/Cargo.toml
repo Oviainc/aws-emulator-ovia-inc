@@ -47,6 +47,13 @@ hex = { workspace = true }
 # and the semantics are that service's, and the data plane here asks it for the decision
 # rather than keeping a second reading of a rule tree (`service::web_acl`).
 service-com-amazonaws-wafv2-awswaf-20190729 = { workspace = true }
+# The AWS SDK for Lambda, driven over the in-process callback
+# (`OperationContext::callback`): a `forward` to a `lambda` target group is served by
+# INVOKING the function the registration names, so the data plane calls Lambda's own
+# `Invoke` through this emulator rather than inventing an answer for it
+# (`src/service/lambda_target.rs`). Only the generated client is needed — the emulator
+# supplies the transport.
+aws-sdk-lambda = { version = "1", default-features = false }
 # The CloudWatch metric store, which is where the host-count series a load balancer
 # publishes for the target groups it routes to LIVES: those datapoints are read back through
 # `GetMetricStatistics` / `GetMetricData` / `ListMetrics` and graded by CloudWatch's own alarm
@@ -77,6 +84,18 @@ base64 = "0.22"
 # model behind its front door), so the cycle closes through a dev-dependency, which Cargo
 # allows. Do not "fix" it by moving the front door.
 service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7 = { workspace = true }
+# A `forward` to a `lambda` target group invokes the registered function, and what the client
+# is answered with is what the function's own run returned, so Lambda is mounted beside this
+# service on the suite's own engine and every function a case registers is created through
+# Lambda's OWN API (`tests/all/alb_lambda_target.rs`).
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# That function reports every invocation to a queue through its own SDK, and the suite reads
+# the report back where a client reads it — off the queue, through Amazon SQS's own API — so
+# a row answered without the handler having run fails.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# The .zip deployment package such a function is created from, written in memory the way a
+# caller uploads one — the same reader/writer the Lambda crate's own invoke suites use.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

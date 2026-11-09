@@ -62,8 +62,10 @@
 //! no target service from a request addressed to it and answered `404 UnknownService` for
 //! the one address this service told the caller to use. [`can_handle`](Service::can_handle)
 //! also claims a request addressed to a load balancer this service HOLDS, and
-//! [`override_routing_error`](Service::override_routing_error) answers it out of that load
-//! balancer's listener configuration; [`data_plane`] is what resolves and serves it. A
+//! [`override_operation`](Service::override_operation) hands back the plane that answers it
+//! out of that load balancer's listener configuration; [`data_plane`] is what resolves and
+//! serves it, and [`lambda_target`] is the half of it that INVOKES a `lambda` target group's
+//! function. A
 //! request that plane serves is decided first by the WAFv2 web ACL `AssociateWebACL` put
 //! in front of the load balancer ([`web_acl`]), which is what refuses it at the edge.
 //!
@@ -87,6 +89,8 @@
 pub mod shared_endpoint;
 
 pub mod data_plane;
+
+pub mod lambda_target;
 
 pub mod web_acl;
 
@@ -152,10 +156,14 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The SAME shared engine the generated entry threads into every operation.
     ///
     /// Held here because a LOAD BALANCER's own traffic ([`data_plane`]) is claimed by
-    /// `can_handle` and served from `override_routing_error`, neither of which is an
-    /// operation with a `self.engine` of its own: both must read the one store the
-    /// control-plane operations write, not a second copy.
+    /// `can_handle`, which is not an operation with a `self.engine` of its own: it must read
+    /// the one store the control-plane operations write, not a second copy.
     engine: Arc<Eng>,
+    /// The plane that SERVES a load balancer's own traffic, over that same shared engine.
+    ///
+    /// Held in a field, built once, because `override_operation` hands back a reference
+    /// borrowed from `&self`.
+    data_plane: data_plane::DataPlane<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -171,6 +179,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 management_events::audited_table(&engine),
             )),
             envelope: RequestIdEnvelopeOperation,
+            data_plane: data_plane::DataPlane::new(Arc::clone(&engine)),
             engine,
         }
     }
@@ -224,10 +233,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
         //
-        // No ROUTING is overridden: a request that arrives on [`ROUTE_KEY`] is already
-        // addressed at this model, and the version half of the shared endpoint's
-        // `(Action, Version)` rule is applied by the front door that owns the shared key
-        // (the Classic crate's `src/service/api_version.rs`).
+        // No ROUTING of a modelled operation is overridden: a request that arrives on
+        // [`ROUTE_KEY`] is already addressed at this model, and the version half of the
+        // shared endpoint's `(Action, Version)` rule is applied by the front door that owns
+        // the shared key (the Classic crate's `src/service/api_version.rs`). What IS served
+        // from here is the one request of this service that names no modelled operation at
+        // all: a load balancer's own traffic.
         //
         // Every request the generated routing table can serve is served through the
         // envelope wrapper, which delegates to that same table entry and then adds the
@@ -236,6 +247,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // caller of this seam answers it as the unroutable request it is — the router
         // through the wrapped definition above, and the shared front door (which asks this
         // seam first) through its own action/version refusal.
+        // A LOAD BALANCER's own traffic is served by the data plane, which is the one
+        // request this service answers that names no modelled operation by construction (no
+        // modelled operation is bound at a load balancer's request path). It gets first
+        // refusal, so the claim `can_handle` made ([`data_plane::claims_parts`]) and the
+        // serving are decided by the one rule.
+        if self.data_plane.claims(req) {
+            return Some(&self.data_plane as _);
+        }
         self.entry.routes(req).then_some(&self.envelope as _)
     }
 
@@ -272,16 +291,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. A load balancer's own traffic is exactly that case by
-        // construction (no modelled operation is bound at a load balancer's request path),
-        // so this is where it is served — BEFORE authentication, which is what lets a
-        // client carrying no AWS credential be answered at all.
+        // routing table resolved it. A load balancer's own traffic is served through
+        // `override_operation` instead ([`data_plane::DataPlane`]), which is what hands that
+        // plane the in-process transport a `forward` to a `lambda` target group invokes the
+        // function over.
         //
         // Anything else keeps the protocol-correct default for this service's envelope
         // (query -> 400 InvalidAction text/xml) by returning `None`.
-        if data_plane::claims_request(&*self.engine, req) {
-            return Some(data_plane::serve(&*self.engine, req));
-        }
+        let _ = req;
         None
     }
 

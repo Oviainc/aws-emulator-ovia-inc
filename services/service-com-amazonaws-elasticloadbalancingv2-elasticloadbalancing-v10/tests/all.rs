@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/alb_data_plane.rs"]
 mod alb_data_plane;
+#[path = "all/alb_lambda_target.rs"]
+mod alb_lambda_target;
 #[path = "all/attribute_collections.rs"]
 mod attribute_collections;
 #[path = "all/aws_error_wording.rs"]
