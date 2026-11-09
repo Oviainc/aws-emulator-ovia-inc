@@ -71,6 +71,8 @@ mod malformed_content_and_policy_deletion;
 mod name_constraints;
 #[path = "all/next_token_lifetime.rs"]
 mod next_token_lifetime;
+#[path = "all/next_token_spellings.rs"]
+mod next_token_spellings;
 #[path = "all/policy_registry_name.rs"]
 mod policy_registry_name;
 #[path = "all/published_catalogue_entries.rs"]
