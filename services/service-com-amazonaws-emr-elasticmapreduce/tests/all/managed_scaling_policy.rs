@@ -405,6 +405,13 @@ async fn unknown_clusters_are_refused_by_every_operation() {
     );
 }
 
+/// The sentence a policy whose lower capacity boundary is above its upper one is refused
+/// with: Amazon EMR's own fixed text for the class, which interpolates neither capacity,
+/// so every inverted range is refused the same way.
+const INVERTED_COMPUTE_LIMITS_SENTENCE: &str = "Invalid configuration for managed scaling. \
+                                                The specified max capacity must be greater \
+                                                than min capacity.";
+
 /// `MinimumCapacityUnits` is the lower boundary and `MaximumCapacityUnits` the upper
 /// one, so a minimum above the maximum is refused — wherever a policy is attached — and
 /// nothing is stored.
@@ -437,7 +444,7 @@ async fn compute_limits_with_an_inverted_range_are_refused() {
                 json!({ "ClusterId": cluster, "ManagedScalingPolicy": policy }),
             )
             .await;
-        assert_refused(&case, status, &payload, "MinimumCapacityUnits");
+        assert_refused(&case, status, &payload, INVERTED_COMPUTE_LIMITS_SENTENCE);
 
         // Refused means not stored.
         let got = emr.policy(&case, &cluster).await;
@@ -451,7 +458,7 @@ async fn compute_limits_with_an_inverted_range_are_refused() {
         let mut request = minimal_cluster("inverted at creation");
         request["ManagedScalingPolicy"] = policy.clone();
         let (status, payload) = emr.call("RunJobFlow", request).await;
-        assert_refused(&case, status, &payload, "MinimumCapacityUnits");
+        assert_refused(&case, status, &payload, INVERTED_COMPUTE_LIMITS_SENTENCE);
     }
 }
 

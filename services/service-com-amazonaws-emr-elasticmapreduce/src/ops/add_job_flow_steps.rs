@@ -183,13 +183,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let already_held = cluster.steps.len();
 
         // "You can only add steps to a cluster that is in one of the following states:
-        // STARTING, BOOTSTRAPPING, RUNNING, or WAITING." (AddJobFlowSteps doc.)
+        // STARTING, BOOTSTRAPPING, RUNNING, or WAITING." (AddJobFlowSteps doc.) The
+        // legacy job-flow surface's sentence for a cluster on its way out is CONSTANT:
+        // neither the id the request named nor the state the store holds it in is part
+        // of it.
         if !cluster_state::ACCEPTS_STEPS.contains(&cluster_state_now.as_str()) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "A job flow that is shutting down, terminated, or finished may not be \
-                 modified: '{}' is {cluster_state_now}",
-                input.job_flow_id
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::job_flow_not_modifiable_message(),
+            ));
         }
 
         // "A maximum of 256 steps are allowed in each job flow." (AddJobFlowSteps doc.)

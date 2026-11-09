@@ -257,13 +257,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A cluster on its way out has no capacity left to change: its groups are headed
-        // for `ENDED` whatever this call asks for.
+        // for `ENDED` whatever this call asks for. The sentence the legacy job-flow
+        // surface states that with is CONSTANT — nothing of the request or of the store
+        // is interpolated into it.
         let cluster_state_now = cluster.status.state.clone();
         if cluster.is_terminal() || cluster_state_now == cluster_state::TERMINATING {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "A job flow that is shutting down, terminated, or finished may not be \
-                 modified: '{cluster_id}' is {cluster_state_now}"
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::job_flow_not_modifiable_message(),
+            ));
         }
 
         // "The call will either succeed or fail atomically" (this operation's doc): every

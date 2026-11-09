@@ -32,6 +32,7 @@ use crate::ops::types::{
     Configuration, EbsBlockDevice, EbsConfiguration, Ec2InstanceAttributes, FailureDetails,
     HadoopStepConfig, InstanceFleet, InstanceFleetConfig, InstanceFleetStateChangeReason,
     InstanceFleetStatus, InstanceFleetTimeline, InstanceGroup, InstanceGroupConfig,
+    InstanceFleetModifyConfig,
     InstanceGroupStateChangeReason, InstanceGroupStatus, InstanceGroupTimeline,
     InstanceTypeConfig, InstanceTypeSpecification, InvalidRequestException,
     JobFlowInstancesConfig, KerberosAttributes, ManagedScalingPolicy, MonitoringConfiguration,
@@ -67,6 +68,17 @@ pub use studio_network::*;
 /// same reason, and re-exported the same way.
 mod notebook_executions;
 pub use notebook_executions::*;
+
+/// The sentences every MODIFICATION refusal of this service is worded by, split out and
+/// re-exported the same way.
+mod modification_refusals;
+pub use modification_refusals::*;
+
+/// Modifying an instance fleet a cluster already carries — which capacities a fleet is
+/// held to, and what a modification leaves on its record — split out and re-exported the
+/// same way.
+mod instance_fleet_modification;
+pub use instance_fleet_modification::*;
 
 /// `com.amazonaws.emr#ClusterState`, as the wire carries it.
 pub mod cluster_state {
@@ -734,16 +746,14 @@ pub fn validate_auto_scaling_policy(policy: &AutoScalingPolicy) -> Result<(), St
 /// `MinimumCapacityUnits` is "the lower boundary of Amazon EC2 units" and
 /// `MaximumCapacityUnits` "the upper boundary of Amazon EC2 units"
 /// (`ComputeLimits` member docs, Smithy model), so a minimum above the maximum names no
-/// range the scaling activity could stay inside. Answers the refusal text, which names
-/// the members and the values the request carried.
+/// range the scaling activity could stay inside. Answers the refusal text, which is
+/// Amazon EMR's own fixed sentence for the class
+/// ([`invalid_managed_scaling_compute_limits_message`]) and so names neither member nor
+/// capacity.
 pub fn validate_managed_scaling_policy(policy: &ManagedScalingPolicy) -> Result<(), String> {
     if let Some(limits) = policy.compute_limits.as_ref() {
         if limits.minimum_capacity_units > limits.maximum_capacity_units {
-            return Err(format!(
-                "ComputeLimits.MinimumCapacityUnits {} is above \
-                 ComputeLimits.MaximumCapacityUnits {}",
-                limits.minimum_capacity_units, limits.maximum_capacity_units
-            ));
+            return Err(invalid_managed_scaling_compute_limits_message());
         }
     }
     Ok(())
@@ -1224,20 +1234,17 @@ pub const MIN_STEP_CONCURRENCY_LEVEL: i32 = DEFAULT_STEP_CONCURRENCY_LEVEL;
 /// See [`DEFAULT_STEP_CONCURRENCY_LEVEL`].
 pub const MAX_STEP_CONCURRENCY_LEVEL: i32 = 256;
 
-/// How every operation that takes a `StepConcurrencyLevel` refuses one BELOW the
-/// supported band: Amazon EMR's own sentence for that class, which states the band and
-/// nothing of the request.
+/// How every operation that takes a `StepConcurrencyLevel` refuses one that lies outside
+/// EVERY band Amazon EMR offers — below the lower bound, or above the widest ceiling any
+/// step execution mode raises it to: Amazon EMR's own sentence for that class, which
+/// states no band and nothing of the request.
 ///
-/// Recorded behavior for the text: the offending value is NOT echoed, so a caller
-/// matching the sentence recognises every such level the same way. The two numbers are the
-/// documented bounds themselves ([`MIN_STEP_CONCURRENCY_LEVEL`], and the ceiling of the
-/// mode the cluster runs its steps in), so the band a caller is TOLD about is the band
-/// that is ENFORCED.
+/// Recorded behavior for the text, and it is CONSTANT: a level no mode could take is not
+/// told which band to aim for, because no band would accept it. A level that one mode
+/// WOULD take is the other class ([`step_concurrency_level_exceeded_message`]), and the
+/// two are not interchangeable.
 pub fn invalid_step_concurrency_level_message() -> String {
-    format!(
-        "Invalid step concurrency level. Allowed level is from \
-         {MIN_STEP_CONCURRENCY_LEVEL} to {MAX_STEP_CONCURRENCY_LEVEL}"
-    )
+    "Invalid step concurrency level.".to_string()
 }
 
 /// The mode a cluster runs its steps in, which is what sets the ceiling a
@@ -1260,35 +1267,39 @@ pub mod step_execution_mode {
 }
 
 /// How every operation that takes a `StepConcurrencyLevel` refuses one ABOVE the ceiling
-/// of the mode the cluster runs its steps in: Amazon EMR's own sentence for that class,
-/// which states the level the request sent, the ceiling it exceeded, the mode that
-/// ceiling belongs to and the mode a caller needing more concurrency has to ask for.
+/// of the mode the cluster runs its steps in but inside the widest ceiling a mode raises
+/// it to: Amazon EMR's own sentence for that class, which states the band the cluster's
+/// own mode allows.
 ///
-/// Recorded behavior for the text; the variable parts are the submitted level and the
-/// mode's own ceiling, so a level over the band is told apart from one under it
-/// ([`invalid_step_concurrency_level_message`]) — the two are not interchangeable.
-pub fn step_concurrency_level_exceeded_message(level: i32) -> String {
+/// Recorded behavior for the text: the offending value is NOT echoed, so a caller matching
+/// the sentence recognises every such level the same way, and the two numbers are the
+/// documented bounds themselves ([`MIN_STEP_CONCURRENCY_LEVEL`] and the ceiling of the
+/// mode the cluster runs its steps in) — so the band a caller is TOLD about is the band
+/// that is ENFORCED.
+pub fn step_concurrency_level_exceeded_message() -> String {
     format!(
-        "StepConcurrencyLevel {level} exceeds the maximum ({MAX_STEP_CONCURRENCY_LEVEL}) \
-         for StepExecutionMode {}. Set StepExecutionMode to {} for up to {} concurrent \
-         steps.",
-        step_execution_mode::DEFAULT,
-        step_execution_mode::DISTRIBUTED,
-        step_execution_mode::DISTRIBUTED_MAX_STEP_CONCURRENCY_LEVEL,
+        "Invalid step concurrency level. Allowed level is from \
+         {MIN_STEP_CONCURRENCY_LEVEL} to {MAX_STEP_CONCURRENCY_LEVEL}"
     )
 }
 
 /// Why this `StepConcurrencyLevel` cannot be accepted, if it cannot: the sentence for the
-/// side of the band it falls outside.
+/// class it falls into.
 ///
+/// A level the cluster's own mode would not take but another mode WOULD is told the band
+/// that mode allows ([`step_concurrency_level_exceeded_message`]); a level no mode of the
+/// service could take at all — below the lower bound, or above the widest ceiling any mode
+/// raises it to — is refused without a band ([`invalid_step_concurrency_level_message`]).
 /// Every operation that takes the member judges it through here, so one level cannot be
 /// refused two ways.
 pub fn step_concurrency_level_violation(level: i32) -> Option<String> {
-    if level < MIN_STEP_CONCURRENCY_LEVEL {
+    let servable =
+        MIN_STEP_CONCURRENCY_LEVEL..=step_execution_mode::DISTRIBUTED_MAX_STEP_CONCURRENCY_LEVEL;
+    if !servable.contains(&level) {
         return Some(invalid_step_concurrency_level_message());
     }
     if level > MAX_STEP_CONCURRENCY_LEVEL {
-        return Some(step_concurrency_level_exceeded_message(level));
+        return Some(step_concurrency_level_exceeded_message());
     }
     None
 }
@@ -2224,6 +2235,16 @@ pub const RELEASE_LINES: &[ReleaseLine] = &[
     ReleaseLine { major: 7, minor: 3, patches: &[0] },
     ReleaseLine { major: 7, minor: 4, patches: &[0] },
     ReleaseLine { major: 7, minor: 5, patches: &[0] },
+    // The lines published since: Amazon EMR offers every release of the series, so a
+    // launch naming one of them resolves rather than being refused. Source for the labels
+    // is the Release Guide's release-version table, as for every line above; each bundles
+    // the application versions the newest row at or before its line carries
+    // ([`CatalogApplication::version_at`]), which is the rule that already gives a patch
+    // release its versions.
+    ReleaseLine { major: 7, minor: 6, patches: &[0] },
+    ReleaseLine { major: 7, minor: 7, patches: &[0] },
+    ReleaseLine { major: 7, minor: 8, patches: &[0] },
+    ReleaseLine { major: 7, minor: 9, patches: &[0] },
 ];
 
 /// One application in the catalog.

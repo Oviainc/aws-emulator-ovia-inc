@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyInstanceFleet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyInstanceFleet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Resizes an instance fleet a cluster already carries: the submitted
+//! `InstanceFleetModifyConfig` is applied to the stored fleet
+//! ([`crate::state::InstanceFleetRecord::apply_modification`]) in the shared engine, so a
+//! later `ListInstanceFleets` reports the targets, the resize specification and the
+//! per-instance-type configurations this call left there. A member the configuration
+//! omits asks for no change and leaves that part of the fleet as it was.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyInstanceFleet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it refuses, all with the `InvalidRequestException` it models and none of it
+//! written: a cluster id this account holds no cluster under, a cluster that is shutting
+//! down or gone (the legacy surface's fixed sentence,
+//! [`crate::state::job_flow_not_modifiable_message`]), an `InstanceFleetId` that cluster
+//! carries no fleet for, and a NEGATIVE target capacity — which names no number of
+//! Amazon EC2 units, and whose refusal
+//! ([`crate::state::instance_fleet_capacity_violation`]) names the value the request sent
+//! and the fleet it sent it for.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +164,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyInstanceFleet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyInstanceFleetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyInstanceFleet"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // The SHAPE of the cluster id is settled BEFORE any cluster is resolved: a value
+        // carrying characters no cluster id is drawn from names no cluster the service
+        // could hold, so it is refused as a bad REQUEST — naming the member the caller
+        // has to fix — rather than looked up.
+        if !crate::state::is_cluster_id_shaped(&input.cluster_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_cluster_id_message(&input.cluster_id),
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ModifyInstanceFleetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR cluster store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // A resize changes fleet state, so every transition the clock already made due is
+        // materialised before this one is recorded; `cluster_mut` does that for the
+        // cluster and its fleets.
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(ModifyInstanceFleetErrorModeled::InvalidRequestException(
+                crate::state::unknown_cluster(&input.cluster_id),
+            )
+            .into());
+        };
+
+        let fleet_id = input.instance_fleet.instance_fleet_id.clone();
+
+        // A target capacity is a count of Amazon EC2 units, so a negative one names no
+        // capacity the fleet could be resized to. It is judged on the REQUEST, before the
+        // fleet it names is looked up: the rule and its sentence live in one place
+        // ([`crate::state::instance_fleet_capacity_violation`]) because the generic
+        // request validator reaches the modelled `@range(min: 0)` on these members first
+        // for a client that did not check them itself, and both paths answer the same
+        // refusal in the same order. A refused call leaves the fleet exactly as it was.
+        if let Some(refusal) = crate::state::instance_fleet_capacity_violation(
+            &fleet_id,
+            input
+                .instance_fleet
+                .target_on_demand_capacity
+                .map(i64::from),
+            input.instance_fleet.target_spot_capacity.map(i64::from),
+        ) {
+            return Err(ModifyInstanceFleetErrorModeled::InvalidRequestException(refusal).into());
+        }
+
+        // A cluster on its way out has no capacity left to resize: its fleets are headed
+        // for `TERMINATED` whatever this call asks for.
+        if cluster.is_terminal()
+            || cluster.status.state == crate::state::cluster_state::TERMINATING
+        {
+            return Err(ModifyInstanceFleetErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(crate::state::job_flow_not_modifiable_message()),
+                },
+            )
+            .into());
+        }
+
+        let Some(fleet) = cluster.fleet_mut(&fleet_id) else {
+            return Err(ModifyInstanceFleetErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(crate::state::unknown_instance_fleet_message(&fleet_id)),
+                },
+            )
+            .into());
+        };
+
+        // Bounded: the configurations the merge would leave on the fleet are what every
+        // later read of it reports, so a request that would take the fleet past the
+        // ceiling is refused rather than merged.
+        if let Some(submitted) = input.instance_fleet.instance_type_configs.as_deref() {
+            if let Some(refusal) = crate::state::instance_type_configs_violation(
+                &fleet_id,
+                fleet.config.instance_type_configs.as_deref().unwrap_or(&[]),
+                submitted,
+            ) {
+                return Err(
+                    ModifyInstanceFleetErrorModeled::InvalidRequestException(refusal).into(),
+                );
+            }
+        }
+
+        // "The call either succeeds or fails atomically" (this operation's doc): every
+        // refusal above is answered before anything is written, so what reaches the record
+        // is the whole modification.
+        fleet.apply_modification(&input.instance_fleet);
+        drop(store);
+
+        Ok(ModifyInstanceFleetOutput)
     }
 }

@@ -554,7 +554,7 @@ pub(crate) const BAD_RELEASE_LABELS: &[&str] = &[
     "emr-6.99.0",
     "emr-5.13.0",
     "emr-6.15.1",
-    "emr-7.9.0",
+    "emr-7.90.0",
     "emr-999.0.0",
     "emr-4.9.5",
     "emr-6.15",

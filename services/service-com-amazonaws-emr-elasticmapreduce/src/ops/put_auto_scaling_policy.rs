@@ -197,16 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Creates or updates an automatic scaling policy for a core instance group or
         // task instance group" (this operation's doc): the role of a group IS its type,
-        // and the group that runs the primary node scales with nothing.
+        // and the group that runs the primary node scales with nothing. Amazon EMR's
+        // sentence for that class is FIXED: the group the request named is no part of it.
         if !instance_group_type::AUTO_SCALABLE.contains(&group.config.instance_role.as_str()) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "An automatic scaling policy is supported for an instance group of type \
-                 {} or {}, and instance group '{}' is of type '{}'.",
-                instance_group_type::CORE,
-                instance_group_type::TASK,
-                input.instance_group_id,
-                group.config.instance_role,
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::master_instance_group_auto_scaling_message(),
+            ));
         }
 
         // A policy the model accepts but the service cannot hold to (a lower capacity

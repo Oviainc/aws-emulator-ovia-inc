@@ -188,6 +188,7 @@ const RESOLVES_CLUSTER_ID: &[&str] = &[
     "ListInstanceGroups",
     "ListSteps",
     "ModifyCluster",
+    "ModifyInstanceFleet",
 ];
 
 /// Whether `operation` resolves a cluster from a `ClusterId` of its own input shape.
@@ -198,6 +199,22 @@ fn resolves_cluster_id(operation: &str) -> bool {
 /// The `ClusterId` member as the wire spells it, which is how a request names it and how
 /// a validator member path spells it once lower-camelled.
 const CLUSTER_ID: &str = "ClusterId";
+
+/// The operation that resizes an instance fleet from a configuration of its own input.
+///
+/// Amazon EMR checks that configuration's TARGET CAPACITIES itself and refuses an
+/// unusable one with its own modelled client error, naming the value and the fleet
+/// (`crate::state::instance_fleet_capacity_violation`), while the model also bounds both
+/// members (`@range(min: 0)`) so the generic request validator reaches them first for a
+/// client that did not check them itself — see `instance_fleet_capacity_first_response`.
+const MODIFIES_INSTANCE_FLEET: &str = "ModifyInstanceFleet";
+
+/// The member of `ModifyInstanceFleetInput` that carries the fleet configuration, as the
+/// wire spells it, and the members of that configuration this service checks itself.
+const INSTANCE_FLEET: &str = "InstanceFleet";
+const INSTANCE_FLEET_ID: &str = "InstanceFleetId";
+const TARGET_ON_DEMAND_CAPACITY: &str = "TargetOnDemandCapacity";
+const TARGET_SPOT_CAPACITY: &str = "TargetSpotCapacity";
 
 /// The operation that resolves an EC2 instance profile from its own input.
 ///
@@ -418,6 +435,12 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedRefusal<Eng>
             if let Some(first) = job_flow_role_first_response(operation, svc, req, ctx).await {
                 return first;
             }
+            // An instance fleet's target capacities are Amazon EMR's own check as well, so
+            // an unusable one is answered with the refusal its handler states rather than
+            // with the bound the model happens to carry on the member.
+            if let Some(first) = instance_fleet_capacity_first_response(operation, svc, req) {
+                return first;
+            }
             // The framework rendered the chosen code and sentence already; what it
             // cannot render is the modelled shape's OTHER member. Re-serializing is
             // therefore an improvement on an answer that is already correct in code,
@@ -478,6 +501,47 @@ fn request_member(req: &aws_smithy_runtime_api::http::Request, member: &str) -> 
         .get(member)?
         .as_str()
         .map(str::to_string)
+}
+
+/// The integer `member` of `object`, as the request spelled it, or `None` when it carries
+/// no such member or carries it as something other than an integer.
+fn json_integer(object: &::serde_json::Value, member: &str) -> Option<i64> {
+    object.get(member)?.as_i64()
+}
+
+/// The refusal the served operation would have answered for the target capacities the
+/// request's fleet configuration carries, when one of them is a capacity no fleet could be
+/// resized to. `None` when the operation resizes no fleet, when the request names no
+/// fleet — the absent required member is its own refusal — or when both capacities are
+/// ones the fleet can be asked for.
+///
+/// Amazon EMR checks those capacities ITSELF and answers its own modelled client error for
+/// an unusable one, while the framework refuses it ahead of the handler for violating the
+/// modelled bound on the member — so this restores the identity and the sentence the
+/// handler would have answered, exactly as `cluster_first_response` restores the order the
+/// cluster is resolved in. The class and the sentence are the handler's own
+/// ([`crate::state::instance_fleet_capacity_violation`]), so the two paths cannot word one
+/// refusal two ways; only the envelope is chosen here.
+fn instance_fleet_capacity_first_response(
+    operation: &str,
+    svc: &dyn Service,
+    req: &aws_smithy_runtime_api::http::Request,
+) -> Option<aws_smithy_runtime_api::http::Response> {
+    if operation != MODIFIES_INSTANCE_FLEET {
+        return None;
+    }
+    let body = req.body().bytes()?;
+    let fleet = ::serde_json::from_slice::<::serde_json::Value>(body)
+        .ok()?
+        .get(INSTANCE_FLEET)?
+        .clone();
+    let fleet_id = fleet.get(INSTANCE_FLEET_ID)?.as_str()?.to_string();
+    let refusal = crate::state::instance_fleet_capacity_violation(
+        &fleet_id,
+        json_integer(&fleet, TARGET_ON_DEMAND_CAPACITY),
+        json_integer(&fleet, TARGET_SPOT_CAPACITY),
+    )?;
+    modelled_refusal_response(svc, req, refusal)
 }
 
 /// `refusal` as this service answers it: the modelled client error, serialized through

@@ -7,7 +7,9 @@
 //! `DescribeStudio` / `GetSession` reports exactly the merged set. A key the resource
 //! already carries takes the submitted value rather than being added twice, an id
 //! naming no resource this account holds is refused with `InvalidRequestException`, and
-//! so is a tag Amazon EMR would not have held (see [`crate::state::validate_tags`]).
+//! so is a request that names no tag to add at all and a tag Amazon EMR would not have
+//! held (see [`crate::state::validate_tags`]). The resource is resolved BEFORE the
+//! submitted list is judged, so a call that gets both wrong is refused for the resource.
 //!
 //! Which resource the request names is resolved by
 //! [`crate::state::ComAmazonawsEmrElasticmapreduceState::tag_target_mut`], shared with
@@ -149,10 +151,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
-        // What a submitted tag has to be is the same whichever resource it is for, so
-        // the list is refused before any resource is resolved.
-        validate_tags(&input.tags).map_err(refuse)?;
-
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(AddTagsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -167,9 +165,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for every tag operation, so it is answered in one place
         // ([`crate::state::ComAmazonawsEmrElasticmapreduceState::tag_target_mut`]) and
         // this handler only merges into the set it hands back.
+        //
+        // The TARGET is resolved BEFORE the submitted list is judged, which is the order
+        // Amazon EMR answers a request that gets both wrong in: a tag call naming no
+        // resource of this account is refused for the resource whatever its list carries.
         let mut target = store
             .tag_target_mut(input.cluster_id.as_deref(), &input.resource_id, now)
             .map_err(unresolved)?;
+
+        // The model requires `Tags` and bounds its length nowhere, so a list that is
+        // present and EMPTY reaches here; it names no tag to associate, so it is refused
+        // rather than answered as a change that happened.
+        if input.tags.is_empty() {
+            return Err(refuse(crate::state::empty_tag_list_message()));
+        }
+
+        // What a submitted tag has to be is the same whichever resource it is for, so one
+        // rule judges the list however the request reached it.
+        validate_tags(&input.tags).map_err(refuse)?;
+
         let mut held = target.held();
         merge_tags(&mut held, &input.tags).map_err(refuse)?;
         target.store(held);

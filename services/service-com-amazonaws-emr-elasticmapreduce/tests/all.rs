@@ -53,6 +53,8 @@ mod malformed_input_refusals;
 mod managed_scaling_policy;
 #[path = "all/master_public_dns_name.rs"]
 mod master_public_dns_name;
+#[path = "all/modification_refusal_sentences.rs"]
+mod modification_refusal_sentences;
 #[path = "all/modify_instance_groups.rs"]
 mod modify_instance_groups;
 #[path = "all/multi_primary_termination_protection.rs"]

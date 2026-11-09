@@ -13,7 +13,8 @@
 //! THE RULE every table below asserts: `AddTags` merges the submitted key-value pairs
 //! into the tag set of the Amazon EMR resource its `ResourceId` names — adding a key the
 //! resource does not carry and replacing the value of one it does, changing nothing else
-//! about the resource — and refuses an id naming no resource this account holds, as well
+//! about the resource — and refuses an id naming no resource this account holds, a request
+//! that names no tag at all, as well
 //! as a tag outside what a tag may be: the Unicode letters, separators and numbers plus
 //! `_ . : / = + \ -` of the tag character class, a key of at most 128 characters and a
 //! value of at most 256.
@@ -835,21 +836,60 @@ async fn a_tag_outside_the_documented_bounds_is_refused() {
 }
 
 /// A present but EMPTY `Tags` list: the model requires the member and constrains its
-/// length nowhere, so the list adds no tag, the resource is left exactly as it was, and
-/// the call succeeds rather than being refused for something the model admits.
+/// length nowhere, so the list reaches the service — where it names no tag to associate
+/// and is refused, leaving the resource exactly as it was.
 #[tokio::test]
-async fn an_empty_tag_list_adds_nothing_and_succeeds() {
+async fn an_empty_tag_list_is_refused_and_changes_nothing() {
     let emr = Emr::new();
     let cluster = emr.run_job_flow(kept_alive_request("empty-list")).await;
     let studio = create_studio(&emr, "empty-list").await;
 
-    add_tags_ok(&emr, "an untagged cluster", &cluster, &[]).await;
-    assert_tags(&emr, "an untagged cluster", CLUSTER, &cluster, &[]).await;
-    add_tags_ok(&emr, "an untagged Studio", &studio, &[]).await;
-    assert_tags(&emr, "an untagged Studio", STUDIO, &studio, &[]).await;
+    // The sentence Amazon EMR refuses a tag call carrying no tag with: fixed text,
+    // naming neither the resource nor the member's path.
+    let says = "Tags cannot be null or empty.";
 
+    for (kind, resource_id) in [(CLUSTER, &cluster), (STUDIO, &studio)] {
+        let case = format!("an empty Tags list on a {kind}");
+        let (status, payload) = emr
+            .call("AddTags", json!({ "ResourceId": resource_id, "Tags": [] }))
+            .await;
+        assert_refused(&case, status, &payload, INVALID_REQUEST_EXCEPTION);
+        assert_eq!(
+            message(&case, &payload),
+            says,
+            "case {case:?}: unexpected message in {payload}"
+        );
+        assert_tags(&emr, &case, kind, resource_id, &[]).await;
+    }
+
+    // A resource that already carries tags keeps exactly them.
     let held = [pair("stack", Some("Prod"))];
     add_tags_ok(&emr, "a tagged cluster", &cluster, &held).await;
-    add_tags_ok(&emr, "a tagged cluster, empty list", &cluster, &[]).await;
-    assert_tags(&emr, "a tagged cluster, empty list", CLUSTER, &cluster, &held).await;
+    let case = "an empty Tags list on a tagged cluster";
+    let (status, payload) = emr
+        .call("AddTags", json!({ "ResourceId": &cluster, "Tags": [] }))
+        .await;
+    assert_refused(case, status, &payload, INVALID_REQUEST_EXCEPTION);
+    assert_eq!(
+        message(case, &payload),
+        says,
+        "case {case:?}: unexpected message in {payload}"
+    );
+    assert_tags(&emr, case, CLUSTER, &cluster, &held).await;
+
+    // The RESOURCE is resolved first: a call that gets both the resource and the list
+    // wrong is refused for the resource.
+    let case = "an empty Tags list on a cluster id naming no cluster";
+    let (status, payload) = emr
+        .call(
+            "AddTags",
+            json!({ "ResourceId": "j-ZZZZZZZZZZZZZ", "Tags": [] }),
+        )
+        .await;
+    assert_refused(case, status, &payload, INVALID_REQUEST_EXCEPTION);
+    assert_eq!(
+        message(case, &payload),
+        "Cluster id 'j-ZZZZZZZZZZZZZ' is not valid.",
+        "case {case:?}: the resource is resolved before the list is judged, got {payload}"
+    );
 }
