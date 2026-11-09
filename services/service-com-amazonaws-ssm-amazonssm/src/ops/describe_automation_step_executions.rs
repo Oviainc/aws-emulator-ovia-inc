@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAutomationStepExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAutomationStepExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAutomationStepExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Information about all active and terminated step executions in an Automation workflow:
+//! the step executions of the automation `StartAutomationExecution` persisted
+//! (`crate::state::automation`), narrowed to the ones the request's filters select and
+//! served a page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +153,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAutomationStepExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAutomationStepExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAutomationStepExecutions"))
+        use crate::state::automation::{
+            is_step_execution_filter_key, step_execution_filter_value_rejection,
+            step_execution_page_size, StepExecutionRecord,
+        };
+        use crate::state::{
+            invalid_filter_key_message, is_activation_id, request_region, INVALID_NEXT_TOKEN,
+        };
+
+        // `AutomationExecutionId`'s length, `MaxResults`'s range, the filter list's length
+        // and each filter's `StepExecutionFilterKey` and value lengths are MODELLED
+        // constraints, so the centralized walk has already refused anything outside them.
+        // What is read here is which steps of that execution the request's criteria select.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeAutomationStepExecutionsErrorModeled::InternalServerError(
+                    InternalServerError {
+                        message: Some("the automation execution store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let filters = input.filters.as_deref().unwrap_or_default();
+        for filter in filters {
+            // A filter has to name one of the keys the model declares: a key outside that
+            // set names no property of a step execution, so the filter cannot be served.
+            // The modelled enum is refused before this handler runs, so this is a backstop.
+            if !is_step_execution_filter_key(&filter.key) {
+                return Err(crate::scaffolded::Scaffolded::invalid_filter_key(
+                    invalid_filter_key_message(
+                        &filter.key,
+                        crate::ops::types::STEP_EXECUTION_FILTER_KEY_VALUES,
+                    ),
+                ));
+            }
+            // A value outside what the key may carry is not a value of the property that
+            // key filters, so the filter cannot be served: "The filter value isn't valid.
+            // Verify the value and try again" (`InvalidFilterValue`).
+            if let Some(why) = filter
+                .values
+                .iter()
+                .find_map(|value| step_execution_filter_value_rejection(&filter.key, value))
+            {
+                return Err(
+                    DescribeAutomationStepExecutionsErrorModeled::InvalidFilterValue(
+                        InvalidFilterValue { message: Some(why) },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let page_size = step_execution_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token this report hands out is the id of the step execution the next page
+        // starts at, so a token that is not shaped like one of this store's minted ids was
+        // not issued here.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if is_activation_id(token) => Some(token.to_string()),
+            Some(_) => {
+                return Err(
+                    DescribeAutomationStepExecutionsErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some(INVALID_NEXT_TOKEN.to_string()),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        // Systems Manager is regional: an automation runs at the endpoint its start was
+        // sent to, which is the Region this request was signed for.
+        let region = request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The one write this report makes: everything the clock already owed at `now` — an
+        // execution's pickup and the steps of its walk that have come due — was owed
+        // whether or not anybody called, so it is materialised before anything is read.
+        store.materialize_due(now);
+        let Some(execution) = store.automation_execution(&region, &input.automation_execution_id)
+        else {
+            return Err(
+                DescribeAutomationStepExecutionsErrorModeled::AutomationExecutionNotFoundException(
+                    AutomationExecutionNotFoundException {
+                        message: Some(format!(
+                            "Automation execution {} does not exist.",
+                            input.automation_execution_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Information about all active and terminated step executions in an Automation
+        // workflow": every step of this execution's walk is reported with what the walk has
+        // done with it, narrowed to the steps that meet EVERY filter the request carries.
+        let matching: Vec<&StepExecutionRecord> = execution
+            .step_executions_in_order(input.reverse_order.unwrap_or(false))
+            .into_iter()
+            .filter(|step| {
+                filters
+                    .iter()
+                    .all(|filter| step.matches_filter(&filter.key, &filter.values))
+            })
+            .collect();
+
+        let start = match resume_from.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(at) = matching
+                    .iter()
+                    .position(|step| step.step_execution_id == token)
+                else {
+                    // The token is shaped like one of this store's ids but names no step
+                    // this result holds, so it is not a page of this result to resume.
+                    return Err(
+                        DescribeAutomationStepExecutionsErrorModeled::InvalidNextToken(
+                            InvalidNextToken {
+                                message: Some(INVALID_NEXT_TOKEN.to_string()),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                at
+            }
+        };
+        // `start` is a position in `matching`, so the page is a suffix of it; `get` keeps
+        // that in-bounds without indexing on a value the request steers.
+        let page: &[&StepExecutionRecord] = matching.get(start..).unwrap_or_default();
+        let step_executions = page
+            .iter()
+            .take(page_size)
+            .map(|step| step.to_step_execution())
+            .collect();
+        // A step is still waiting past this page: hand the caller the id it resumes at, so
+        // the next request continues where this one stopped.
+        let next_token = page
+            .get(page_size)
+            .map(|step| step.step_execution_id.clone());
+
+        Ok(DescribeAutomationStepExecutionsOutput {
+            step_executions: Some(step_executions),
+            next_token,
+        })
     }
 }

@@ -186,6 +186,96 @@ pub const ACTION_PAUSE: &str = "aws:pause";
 /// says, one call walks a bounded number of steps.
 pub const MAX_STEP_ENTRIES: usize = runbook::MAX_RUNBOOK_STEPS * 2;
 
+/// The `StepExecutionFilterKey` that selects the steps that started before an instant.
+pub const STEP_FILTER_KEY_START_TIME_BEFORE: &str = "StartTimeBefore";
+
+/// The `StepExecutionFilterKey` that selects the steps that started after an instant.
+pub const STEP_FILTER_KEY_START_TIME_AFTER: &str = "StartTimeAfter";
+
+/// The `StepExecutionFilterKey` that selects the steps a status holds for.
+pub const STEP_FILTER_KEY_STEP_EXECUTION_STATUS: &str = "StepExecutionStatus";
+
+/// The `StepExecutionFilterKey` that selects ONE step execution by its id.
+pub const STEP_FILTER_KEY_STEP_EXECUTION_ID: &str = "StepExecutionId";
+
+/// The `StepExecutionFilterKey` that selects the steps the runbook declares under a name.
+pub const STEP_FILTER_KEY_STEP_NAME: &str = "StepName";
+
+/// The `StepExecutionFilterKey` that selects the steps running an action.
+pub const STEP_FILTER_KEY_ACTION: &str = "Action";
+
+/// The `StepExecutionFilterKey` that selects the steps run inside the step of that id —
+/// `ParentStepDetails$StepExecutionId`.
+pub const STEP_FILTER_KEY_PARENT_STEP_EXECUTION_ID: &str = "ParentStepExecutionId";
+
+/// The `StepExecutionFilterKey` that selects the steps of one iteration of a parent step —
+/// `ParentStepDetails$Iteration`, a number.
+pub const STEP_FILTER_KEY_PARENT_STEP_ITERATION: &str = "ParentStepIteration";
+
+/// The `StepExecutionFilterKey` that selects the steps of the iteration a parent step was
+/// at one value of its iterator — `ParentStepDetails$IteratorValue`.
+pub const STEP_FILTER_KEY_PARENT_STEP_ITERATOR_VALUE: &str = "ParentStepIteratorValue";
+
+/// The bounds the modelled `MaxResults` of a step-execution report carries (range 1..50).
+pub const MIN_STEP_EXECUTION_PAGE_SIZE: i32 = 1;
+
+/// See [`MIN_STEP_EXECUTION_PAGE_SIZE`]. It is also the page size a request naming no
+/// `MaxResults` is served, the way every other read of this service serves one.
+pub const MAX_STEP_EXECUTION_PAGE_SIZE: i32 = 50;
+
+/// The page size a step-execution report serves, or the refusal message for a `MaxResults`
+/// outside the modelled range — which the protocol's boundary validator already refuses,
+/// so this is a backstop rather than the first line of defence.
+pub fn step_execution_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    super::page_size(
+        max_results,
+        MIN_STEP_EXECUTION_PAGE_SIZE,
+        MAX_STEP_EXECUTION_PAGE_SIZE,
+    )
+}
+
+/// Whether `key` is a filter key a step-execution report accepts: the modelled
+/// `StepExecutionFilterKey` enum is that whole set, so nothing else names a property of a
+/// step execution to narrow by.
+pub fn is_step_execution_filter_key(key: &str) -> bool {
+    crate::ops::types::STEP_EXECUTION_FILTER_KEY_VALUES.contains(&key)
+}
+
+/// Why `value` is not a value the step-execution filter key `key` may carry, or `None`
+/// when it is one.
+///
+/// A filter value has to be a legal value of what it filters: a timestamp for the two
+/// instant keys, an `AutomationExecutionStatus` for the status key — which is what
+/// `StepExecution$StepStatus` carries — and a number for the parent-iteration key, which
+/// filters `ParentStepDetails$Iteration`. A name, an id and an action constrain nothing
+/// here: a value no step carries selects no step rather than refusing the read.
+pub fn step_execution_filter_value_rejection(key: &str, value: &str) -> Option<String> {
+    let takes = |what: String| {
+        Some(format!(
+            "The following filter value is not valid: {value}. The {key} filter key takes {what}."
+        ))
+    };
+    match key {
+        STEP_FILTER_KEY_START_TIME_BEFORE | STEP_FILTER_KEY_START_TIME_AFTER
+            if super::commands::parse_filter_instant(value).is_none() =>
+        {
+            takes("a timestamp, for example 2024-07-07T00:00:00Z".to_string())
+        }
+        STEP_FILTER_KEY_STEP_EXECUTION_STATUS
+            if !crate::ops::types::AUTOMATION_EXECUTION_STATUS_VALUES.contains(&value) =>
+        {
+            takes(format!(
+                "one of [{}]",
+                crate::ops::types::AUTOMATION_EXECUTION_STATUS_VALUES.join(", ")
+            ))
+        }
+        STEP_FILTER_KEY_PARENT_STEP_ITERATION if value.parse::<u32>().is_err() => {
+            takes("a step iteration number".to_string())
+        }
+        _ => None,
+    }
+}
+
 /// What one entry into a step did to the walk.
 enum Walked {
     /// The step is running and has not ended: the walk stops here and the execution stays
@@ -241,6 +331,47 @@ impl StepExecutionRecord {
             ended_at: None,
             due_at: None,
             failure_message: None,
+        }
+    }
+
+    /// Whether this step execution meets the filter `key` = `values`.
+    ///
+    /// A filter carries one or more values of its key ("The values of the filter key",
+    /// `StepExecutionFilter$Values`), so the step meets the filter when it meets the key's
+    /// test for ANY of them; the report then keeps the steps that meet EVERY filter.
+    pub fn matches_filter(&self, key: &str, values: &[String]) -> bool {
+        values
+            .iter()
+            .any(|value| self.matches_filter_value(key, value))
+    }
+
+    /// Whether this step execution meets the filter key `key` at the single value `value`.
+    ///
+    /// The three parent keys filter `StepExecution$ParentStepDetails` — the step an action
+    /// that runs other steps ran this one inside of. Nothing in this emulator runs a step
+    /// inside another step, so no step execution carries those details and such a filter
+    /// selects no step.
+    fn matches_filter_value(&self, key: &str, value: &str) -> bool {
+        let started_at_satisfies = |ordering: ::std::cmp::Ordering| {
+            match (
+                self.started_at,
+                super::commands::parse_filter_instant(value),
+            ) {
+                (Some(started), Some(bound)) => started.cmp(&bound) == ordering,
+                // "If the step is in Pending status, this field isn't populated"
+                // (`StepExecution$ExecutionStartTime`): a step that has not started is
+                // neither before nor after an instant.
+                _ => false,
+            }
+        };
+        match key {
+            STEP_FILTER_KEY_STEP_NAME => self.definition.name == value,
+            STEP_FILTER_KEY_ACTION => self.definition.action == value,
+            STEP_FILTER_KEY_STEP_EXECUTION_ID => self.step_execution_id == value,
+            STEP_FILTER_KEY_STEP_EXECUTION_STATUS => self.status == value,
+            STEP_FILTER_KEY_START_TIME_BEFORE => started_at_satisfies(::std::cmp::Ordering::Less),
+            STEP_FILTER_KEY_START_TIME_AFTER => started_at_satisfies(::std::cmp::Ordering::Greater),
+            _ => false,
         }
     }
 
@@ -418,6 +549,35 @@ impl AutomationExecutionRecord {
     /// Whether this execution has ended ([`TERMINAL_STATUSES`]).
     pub fn ended(&self) -> bool {
         is_terminal(&self.status)
+    }
+
+    /// This execution's step executions in the order a report reads them: the order the
+    /// walk started them in, with the steps nothing has started yet after those, in the
+    /// runbook's own order.
+    ///
+    /// `reverse` reads that order backwards: "Indicates whether to list step executions in
+    /// reverse order by start time" (`DescribeAutomationStepExecutionsRequest$ReverseOrder`).
+    /// Two steps started at the one instant — and two steps that have not started at all —
+    /// are ordered by their place in the runbook, which is what makes the order total and a
+    /// page of it resumable.
+    pub fn step_executions_in_order(&self, reverse: bool) -> Vec<&StepExecutionRecord> {
+        let mut ordered: Vec<(usize, &StepExecutionRecord)> =
+            self.steps.iter().enumerate().collect();
+        ordered.sort_by(|(left_at, left), (right_at, right)| {
+            match (left.started_at, right.started_at) {
+                (Some(left_start), Some(right_start)) => left_start.cmp(&right_start),
+                (Some(_), None) => ::std::cmp::Ordering::Less,
+                (None, Some(_)) => ::std::cmp::Ordering::Greater,
+                (None, None) => ::std::cmp::Ordering::Equal,
+            }
+            .then_with(|| left_at.cmp(right_at))
+        });
+        let mut ordered: Vec<&StepExecutionRecord> =
+            ordered.into_iter().map(|(_, step)| step).collect();
+        if reverse {
+            ordered.reverse();
+        }
+        ordered
     }
 
     /// Materialise everything the clock already owes this execution at `now`: the pickup

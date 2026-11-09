@@ -15,6 +15,8 @@
 mod association_dispatch_options;
 #[path = "all/automation_executions.rs"]
 mod automation_executions;
+#[path = "all/automation_step_executions.rs"]
+mod automation_step_executions;
 #[path = "all/document_content.rs"]
 mod document_content;
 #[path = "all/document_versions.rs"]
