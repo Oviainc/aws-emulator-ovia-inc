@@ -160,10 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // A tag belongs to a resource, so an ARN this account holds no resource under has
         // nothing to tag: refused, never a 200 for a write that landed nowhere. The
-        // message names the ARN the request sent, the only identifier the caller gave.
+        // refusal is the owning resource family's own sentence over the ARN the request
+        // sent, the only identifier the caller gave.
         let tags = store.tags_mut(&input.resource_arn).ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation(crate::state::does_not_exist(
-                crate::state::TAGGED_RESOURCE_ENTITY,
+            crate::scaffolded::Scaffolded::validation(crate::state::tagged_resource_not_found(
+                &crate::state::request_region(ctx),
                 &input.resource_arn,
             ))
         })?;

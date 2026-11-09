@@ -50,6 +50,13 @@ pub const IMAGE_STATUS_CREATE_FAILED: &str = "CREATE_FAILED";
 /// stability" — so it is what a version created without `VendorGuidance` reports.
 pub const VENDOR_GUIDANCE_NOT_PROVIDED: &str = "NOT_PROVIDED";
 
+/// The ARN resource kind an image carries, i.e. the `<kind>` in [`resource_arn`], as the
+/// modelled `ImageArn` pattern spells it
+/// (`^arn:aws(-[\w]+)*:sagemaker:.+:[0-9]{12}:image/[a-zA-Z0-9]([-.]?[a-zA-Z0-9])*$`).
+/// Named once here so the creates mint, the readers resolve and the refusals match the
+/// one kind.
+pub const IMAGE_ARN_KIND: &str = "image";
+
 /// The message a `ResourceNotFound` carries for an image no store holds: the image's ARN
 /// inside the service's sentence, built from the request's `ImageName`.
 ///

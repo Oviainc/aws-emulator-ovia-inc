@@ -151,7 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // exists and carries nothing.
             let arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
-                "model-package-group",
+                crate::state::MODEL_PACKAGE_GROUP_ARN_KIND,
                 name,
             );
             return Err(crate::scaffolded::Scaffolded::validation(

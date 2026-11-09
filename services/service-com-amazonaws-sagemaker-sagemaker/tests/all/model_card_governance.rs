@@ -24,6 +24,13 @@ use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emul
 pub(crate) const MODEL_CARD_STATUSES: [&str; 4] =
     ["Draft", "PendingReview", "Approved", "Archived"];
 
+/// Every `ModelCardStatus` member that still admits an `UpdateModelCard`, i.e.
+/// [`MODEL_CARD_STATUSES`] without `Archived` — which the model documents as "The model
+/// card is archived. No more updates should be made to the model card, but it can still
+/// be exported", and which the service refuses an update against (see the archived rule
+/// in `refusal_subject_wording`). A rule about what an update DOES is driven over these.
+pub(crate) const UPDATABLE_MODEL_CARD_STATUSES: [&str; 3] = ["Draft", "PendingReview", "Approved"];
+
 /// `ModelCardContent`'s modelled maximum length (smithy_query query="operation"
 /// operation="CreateModelCard": `Content` is `len 0..100000`).
 pub(crate) const CONTENT_MAX_LEN: usize = 100_000;

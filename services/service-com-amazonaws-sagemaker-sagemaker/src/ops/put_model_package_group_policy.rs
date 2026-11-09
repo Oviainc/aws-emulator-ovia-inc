@@ -158,14 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // failure rather than as this operation's modelled conflict.
             let arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
-                "model-package-group",
+                crate::state::MODEL_PACKAGE_GROUP_ARN_KIND,
                 name,
             );
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::entity_does_not_exist(
-                    crate::state::MODEL_PACKAGE_GROUP_ENTITY,
-                    &arn,
-                ),
+                crate::state::cannot_find(crate::state::MODEL_PACKAGE_GROUP_SUBJECT, &arn),
             ));
         };
 

@@ -142,8 +142,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource under has no tag set to delete from, which is refused rather than
         // reported as a successful removal that happened nowhere.
         let tags = store.tags_mut(&input.resource_arn).ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation(crate::state::does_not_exist(
-                crate::state::TAGGED_RESOURCE_ENTITY,
+            crate::scaffolded::Scaffolded::validation(crate::state::tagged_resource_not_found(
+                &crate::state::request_region(ctx),
                 &input.resource_arn,
             ))
         })?;

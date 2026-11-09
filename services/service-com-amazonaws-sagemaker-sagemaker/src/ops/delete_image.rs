@@ -144,7 +144,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             let arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
-                "image",
+                crate::state::IMAGE_ARN_KIND,
                 &input.image_name,
             );
             return Err(DeleteImageErrorModeled::ResourceNotFound(ResourceNotFound {

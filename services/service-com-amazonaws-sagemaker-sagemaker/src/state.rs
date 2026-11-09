@@ -1091,6 +1091,12 @@ pub const TAGS_PER_RESOURCE_QUOTA: usize = 50;
 /// entity and the ARN the request sent, which is the only identifier the caller supplied.
 pub const TAGGED_RESOURCE_ENTITY: &str = "Resource";
 
+/// The tag-refusal slice: see `state/tagged_resource.rs` for the sentence a tag
+/// operation states an unresolvable `ResourceArn` with, which is the owning resource
+/// family's own — this label is what remains for an ARN naming no family of this account.
+pub mod tagged_resource;
+pub use tagged_resource::*;
+
 /// Generates the two tag accessors over the list of stores whose records carry BOTH an
 /// `arn` and a `tags` list, so the reader (`ListTags`) and the writers (`AddTags`,
 /// `DeleteTags`) resolve one ARN through exactly the same stores and cannot disagree
@@ -3133,6 +3139,12 @@ pub const LINEAGE_GROUP_ENTITY: &str = "Lineage group";
 /// The entity label [`does_not_exist`] names a pipeline by.
 pub const PIPELINE_ENTITY: &str = "Pipeline";
 
+/// The ARN resource kind a pipeline carries, i.e. the `<kind>` in [`resource_arn`], as
+/// the modelled `PipelineArn` pattern spells it
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:([0-9]{12}|aws):pipeline/`). Named once here
+/// so the create mints, the readers resolve and the refusals match the one kind.
+pub const PIPELINE_ARN_KIND: &str = "pipeline";
+
 /// The entity label [`does_not_exist`] names one execution of a pipeline by.
 pub const PIPELINE_EXECUTION_ENTITY: &str = "Pipeline execution";
 
@@ -3244,16 +3256,60 @@ pub const ALGORITHM_ENTITY: &str = "Algorithm";
 /// as the service spells it there, where the group's own conflict refusal spells it out.
 pub const MODEL_PACKAGE_GROUP_ENTITY: &str = "ModelPackageGroup";
 
+/// The ARN resource kind a model package group carries, i.e. the `<kind>` in
+/// [`resource_arn`], as the modelled `ModelPackageGroupArn` pattern spells it
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]{9,16}:[0-9]{12}:model-package-group/[\S]{1,2048}$`).
+/// Named once here so the create mints, the readers resolve and the refusals match the
+/// one kind.
+pub const MODEL_PACKAGE_GROUP_ARN_KIND: &str = "model-package-group";
+
+/// How SageMaker states that something a request named could not be found at all:
+/// `Cannot find`, then WHAT was looked for, then the ARN it resolves to — BARE, with no
+/// quoting around it and NO closing period.
+///
+/// A second not-found sentence beside [`does_not_exist`], and the one the recorded
+/// refusals of this service's code-repository and model-package-group-policy surfaces
+/// carry. Written once here so every subject stated through it — a resource kind, or a
+/// resource POLICY of a resource — words the one sentence identically, and so the
+/// identifier a consumer cuts out of the message is in the same place whichever subject
+/// it names.
+pub fn cannot_find(subject: &str, arn: &str) -> String {
+    format!("Cannot find {subject}: {arn}")
+}
+
+/// What [`cannot_find`] names a code repository as — one word, as the service spells that
+/// resource kind there.
+pub const CODE_REPOSITORY_SUBJECT: &str = "CodeRepository";
+
+/// The ARN resource kind a code repository carries, i.e. the `<kind>` in
+/// [`resource_arn`], as the modelled `CodeRepositoryArn` pattern spells it
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]{9,16}:[0-9]{12}:code-repository/`). Named once
+/// here so the create mints, the readers resolve and the refusals match the one kind.
+pub const CODE_REPOSITORY_ARN_KIND: &str = "code-repository";
+
+/// What [`cannot_find`] names a model package group as — spelled in WORDS there, where the
+/// group's own `does not exist.` sentence spells it as one
+/// ([`MODEL_PACKAGE_GROUP_ENTITY`]).
+///
+/// The subject a PUT of a group policy names: the group it would attach a document to is
+/// not one this account holds, which is a different fact from the policy's absence a read
+/// reports ([`resource_policy_not_found`]) — so the two states a caller tells apart by
+/// text stay distinguishable.
+pub const MODEL_PACKAGE_GROUP_SUBJECT: &str = "Model Package Group";
+
+/// What [`cannot_find`] names a resource POLICY of a model package group as. The `for`
+/// belongs to the subject: the ARN the sentence ends with names the group, not the policy.
+const RESOURCE_POLICY_SUBJECT: &str = "resource policy for";
+
 /// How SageMaker states that there is no resource policy to report or release for a model
-/// group: the fixed clause, then the group's ARN BARE — no quotes around it, and no
-/// closing period.
+/// group: the [`cannot_find`] sentence naming the policy.
 ///
 /// A name no group is stored under and a group carrying no policy are the SAME answer —
 /// there is no policy — so the sentence names the ARN the request's `ModelPackageGroupName`
 /// resolves to in the Region it signed for rather than distinguishing the two. Stated once
 /// here so the read and the delete of a group policy word the same fact the same way.
 pub fn resource_policy_not_found(group_arn: &str) -> String {
-    format!("Cannot find resource policy for: {group_arn}")
+    cannot_find(RESOURCE_POLICY_SUBJECT, group_arn)
 }
 
 /// How SageMaker's hosting operations state a resource the account does not hold: the

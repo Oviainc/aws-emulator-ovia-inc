@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // unknown as a name nobody ever created.
             let arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
-                "pipeline",
+                crate::state::PIPELINE_ARN_KIND,
                 name,
             );
             return Err(DescribePipelineErrorModeled::ResourceNotFound(ResourceNotFound {

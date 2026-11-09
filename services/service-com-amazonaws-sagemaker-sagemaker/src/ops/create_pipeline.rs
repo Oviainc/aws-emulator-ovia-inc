@@ -211,7 +211,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::could_not_assume_role(&input.role_arn),
             ));
         }
-        let arn = crate::state::resource_arn(&region, "pipeline", &input.pipeline_name);
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::PIPELINE_ARN_KIND,
+            &input.pipeline_name,
+        );
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();

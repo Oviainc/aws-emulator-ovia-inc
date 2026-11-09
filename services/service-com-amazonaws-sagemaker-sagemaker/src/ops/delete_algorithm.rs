@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(algorithm) = store.algorithms.get_mut(&input.algorithm_name) else {
             let arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
-                "algorithm",
+                crate::state::ALGORITHM_ARN_KIND,
                 &input.algorithm_name,
             );
             return Err(crate::scaffolded::Scaffolded::validation(

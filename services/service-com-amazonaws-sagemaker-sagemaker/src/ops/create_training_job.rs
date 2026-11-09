@@ -437,7 +437,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(named) = specification.algorithm_name.as_deref() {
                 let key = crate::state::name_from_arn_or_name(named);
                 if !store.algorithms.contains_key(key) {
-                    let algorithm_arn = crate::state::resource_arn(&region, "algorithm", key);
+                    let algorithm_arn = crate::state::resource_arn(
+                        &region,
+                        crate::state::ALGORITHM_ARN_KIND,
+                        key,
+                    );
                     return Err(refuse(crate::state::entity_does_not_exist(
                         crate::state::ALGORITHM_ENTITY,
                         &algorithm_arn,

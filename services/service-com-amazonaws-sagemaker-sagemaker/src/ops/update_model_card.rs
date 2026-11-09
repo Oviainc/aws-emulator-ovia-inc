@@ -230,6 +230,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `ModelCardStatus`'s `Archived` member means "No more updates should be made to
+        // the model card, but it can still be exported": an archived card takes neither
+        // new content nor another status, so the change is refused rather than answered
+        // 200 with a version or a status the service would not have recorded. The card
+        // itself stays readable and exportable. The archived status is a property of the
+        // card the REQUEST named, which is why this is the 400 `ValidationException` —
+        // the status the recorded refusal carries — rather than this operation's modelled
+        // conflict.
+        if card.is_archived() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::MODEL_CARD_ARCHIVED,
+            ));
+        }
+
         match change {
             // New content is a new version of the card, carrying forward the aspects this
             // call does not change (the status and the security configuration), so the

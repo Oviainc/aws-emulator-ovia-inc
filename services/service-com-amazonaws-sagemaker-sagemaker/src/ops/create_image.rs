@@ -155,7 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let region = crate::state::request_region(ctx);
-        let arn = crate::state::resource_arn(&region, "image", &input.image_name);
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::IMAGE_ARN_KIND,
+            &input.image_name,
+        );
         let now = ::std::time::SystemTime::now();
 
         // The image is BUILT UNDER the role the request names, and SageMaker accepts this

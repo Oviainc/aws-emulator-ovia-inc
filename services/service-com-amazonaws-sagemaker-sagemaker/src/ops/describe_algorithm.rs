@@ -159,8 +159,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(algorithm) = store.algorithms.get_mut(name) else {
             // Never a 200 with empty fields: a caller cannot tell that from an
             // algorithm that exists and carries nothing.
-            let arn =
-                crate::state::resource_arn(&crate::state::request_region(ctx), "algorithm", name);
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                crate::state::ALGORITHM_ARN_KIND,
+                name,
+            );
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::entity_does_not_exist(crate::state::ALGORITHM_ENTITY, &arn),
             ));

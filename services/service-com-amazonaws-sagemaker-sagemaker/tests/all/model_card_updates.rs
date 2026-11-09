@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
 use crate::model_card_governance::{
     content_with_description, create_body, describe_body, number_field, CONTENT_MAX_LEN,
-    MODEL_CARD_STATUSES,
+    MODEL_CARD_STATUSES, UPDATABLE_MODEL_CARD_STATUSES,
 };
 
 /// An `UpdateModelCard` body moving `name` to `status`.
@@ -38,9 +38,11 @@ fn content_update(name: &str, content: &str) -> Value {
 /// was, and answers with the card's stored ARN.
 #[tokio::test]
 async fn a_status_update_moves_the_latest_version_in_place_and_adds_no_version() {
-    // Rows: every status a card can be created in, paired with every status
-    // `UpdateModelCard` can move it to — including the self-transition.
-    for created_in in MODEL_CARD_STATUSES {
+    // Rows: every status a card can be created in AND still be updated from, paired with
+    // every status `UpdateModelCard` can move it to — including the self-transition. A
+    // card created `Archived` takes no update at all, which is its own rule in
+    // `refusal_subject_wording`.
+    for created_in in UPDATABLE_MODEL_CARD_STATUSES {
         for moved_to in MODEL_CARD_STATUSES {
             let case = format!("created_in={created_in} moved_to={moved_to}");
             let emulator = Emulator::new();
@@ -166,7 +168,9 @@ async fn a_content_update_appends_the_next_version_and_leaves_the_history_readab
     ];
 
     for (index, revisions) in updates.iter().enumerate() {
-        let status = MODEL_CARD_STATUSES[index % MODEL_CARD_STATUSES.len()];
+        // The status a row's card is created in, from the statuses that still admit an
+        // update: an archived card appends no version (see `refusal_subject_wording`).
+        let status = UPDATABLE_MODEL_CARD_STATUSES[index % UPDATABLE_MODEL_CARD_STATUSES.len()];
         let security_config = &security_configs[index % security_configs.len()];
         let by_arn = index % 2 == 0;
         let name = "versioned-card";
@@ -278,8 +282,10 @@ async fn a_content_update_appends_the_next_version_and_leaves_the_history_readab
 /// was in.
 #[tokio::test]
 async fn a_status_update_moves_only_the_version_that_is_latest_when_it_runs() {
-    // Rows: each status the card is moved to between two content revisions.
-    for moved_to in MODEL_CARD_STATUSES {
+    // Rows: each status the card is moved to between two content revisions. `Archived` is
+    // not among them: it closes the card to the content update this rule applies next
+    // (see `refusal_subject_wording`).
+    for moved_to in UPDATABLE_MODEL_CARD_STATUSES {
         let case = format!("moved_to={moved_to}");
         let emulator = Emulator::new();
         let name = "reviewed-card";

@@ -147,12 +147,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the same message whatever name and region the caller sent.
             let arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
-                "code-repository",
+                crate::state::CODE_REPOSITORY_ARN_KIND,
                 &input.code_repository_name,
             );
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Cannot find CodeRepository: {arn}"
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::cannot_find(crate::state::CODE_REPOSITORY_SUBJECT, &arn),
+            ));
         };
 
         Ok(DescribeCodeRepositoryOutput {

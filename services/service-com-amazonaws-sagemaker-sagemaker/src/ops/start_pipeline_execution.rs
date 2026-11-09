@@ -229,7 +229,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(StartPipelineExecutionErrorModeled::ResourceNotFound(ResourceNotFound {
                 message: Some(crate::state::does_not_exist(
                     crate::state::PIPELINE_ENTITY,
-                    &crate::state::resource_arn(&region, "pipeline", &name),
+                    &crate::state::resource_arn(
+                        &region,
+                        crate::state::PIPELINE_ARN_KIND,
+                        &name,
+                    ),
                 )),
             })
             .into());

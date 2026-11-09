@@ -154,7 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(pipeline) = store.remove_pipeline(&input.pipeline_name) else {
             let arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
-                "pipeline",
+                crate::state::PIPELINE_ARN_KIND,
                 &input.pipeline_name,
             );
             return Err(DeletePipelineErrorModeled::ResourceNotFound(ResourceNotFound {

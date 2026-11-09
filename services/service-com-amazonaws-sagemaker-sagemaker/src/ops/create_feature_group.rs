@@ -213,7 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
         let arn =
-            crate::state::resource_arn(&region, FEATURE_GROUP_ARN_KIND, &input.feature_group_name);
+            crate::state::resource_arn(
+                &region,
+                crate::state::FEATURE_GROUP_ARN_KIND,
+                &input.feature_group_name,
+            );
 
         let mut store = state.lock();
         // The removals the clock already completed are materialised first, so the name and
@@ -329,10 +333,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The `<kind>` component of a feature group's ARN, from `FeatureGroupArn`'s pattern
-/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:feature-group/`).
-pub const FEATURE_GROUP_ARN_KIND: &str = "feature-group";
 
 /// The `FeatureType`s an `EventTime` feature may have: "An EventTime can be a String or
 /// Fractional" (`EventTimeFeatureName`'s doc). Both spellings are members of the model's

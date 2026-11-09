@@ -213,7 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // selection that determines no ARN by what of the image could not be
             // resolved.
             let region = crate::state::request_region(ctx);
-            let image_arn = crate::state::resource_arn(&region, "image", &input.image_name);
+            let image_arn = crate::state::resource_arn(
+                &region,
+                crate::state::IMAGE_ARN_KIND,
+                &input.image_name,
+            );
             let message = if !store.images.contains_key(&input.image_name) {
                 crate::state::image_does_not_exist(&image_arn)
             } else if let Some(version) = input.version {

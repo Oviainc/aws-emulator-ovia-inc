@@ -135,7 +135,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
@@ -143,10 +143,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         // Tags are a property of a resource, so an ARN this account holds no resource
         // under has no tag set to report: refused, rather than an empty list that a
-        // caller cannot tell from a resource carrying no tags.
+        // caller cannot tell from a resource carrying no tags. Same sentence `AddTags`
+        // and `DeleteTags` state — the owning resource family's own.
         let tags = store.tags_of(&input.resource_arn).ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation(crate::state::does_not_exist(
-                crate::state::TAGGED_RESOURCE_ENTITY,
+            crate::scaffolded::Scaffolded::validation(crate::state::tagged_resource_not_found(
+                &crate::state::request_region(ctx),
                 &input.resource_arn,
             ))
         })?;

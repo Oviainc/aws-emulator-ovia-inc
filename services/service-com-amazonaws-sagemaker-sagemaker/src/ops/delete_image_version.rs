@@ -161,7 +161,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx);
-        let image_arn = crate::state::resource_arn(&region, "image", &input.image_name);
+        let image_arn = crate::state::resource_arn(
+            &region,
+            crate::state::IMAGE_ARN_KIND,
+            &input.image_name,
+        );
 
         let mut store = state.lock();
 

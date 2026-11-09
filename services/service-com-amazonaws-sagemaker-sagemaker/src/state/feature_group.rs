@@ -73,6 +73,12 @@ pub fn default_throughput_config() -> crate::ops::types::ThroughputConfig {
     }
 }
 
+/// The `<kind>` component of a feature group's ARN, i.e. the `<kind>` in
+/// [`resource_arn`], from `FeatureGroupArn`'s modelled pattern
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:feature-group/`). Named once here
+/// so the create mints, the readers resolve and the refusals match the one kind.
+pub const FEATURE_GROUP_ARN_KIND: &str = "feature-group";
+
 /// How SageMaker words a feature group this account does not hold: the `Resource Not
 /// Found:` prefix, then the resource type and the name the request resolved to — a
 /// sentence that ends with NO period.

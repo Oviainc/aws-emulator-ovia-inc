@@ -167,7 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let region = crate::state::request_region(ctx);
-        let arn = crate::state::resource_arn(&region, "algorithm", &input.algorithm_name);
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::ALGORITHM_ARN_KIND,
+            &input.algorithm_name,
+        );
         let created_at = ::std::time::SystemTime::now();
 
         // The service's own defaulting step, applied ONCE here so the stored algorithm is

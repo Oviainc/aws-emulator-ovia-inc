@@ -184,7 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored under is the "resource being access is not found" this operation models
         // — nothing is persisted for it.
         let Some(image) = store.images.get(&input.image_name) else {
-            let arn = crate::state::resource_arn(&region, "image", &input.image_name);
+            let arn = crate::state::resource_arn(
+                &region,
+                crate::state::IMAGE_ARN_KIND,
+                &input.image_name,
+            );
             return Err(CreateImageVersionErrorModeled::ResourceNotFound(ResourceNotFound {
                 message: Some(crate::state::image_does_not_exist(&arn)),
             })

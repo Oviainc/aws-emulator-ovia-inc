@@ -145,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let arn = crate::state::resource_arn(
             &region,
-            "model-package-group",
+            crate::state::MODEL_PACKAGE_GROUP_ARN_KIND,
             &input.model_package_group_name,
         );
         let created_by = crate::state::caller_user_context(ctx);

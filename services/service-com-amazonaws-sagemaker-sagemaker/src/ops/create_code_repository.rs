@@ -144,7 +144,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let arn =
-            crate::state::resource_arn(&region, "code-repository", &input.code_repository_name);
+            crate::state::resource_arn(
+                &region,
+                crate::state::CODE_REPOSITORY_ARN_KIND,
+                &input.code_repository_name,
+            );
 
         let mut store = state.lock();
         // The store is bounded, so a caller varying `CodeRepositoryName` cannot grow it

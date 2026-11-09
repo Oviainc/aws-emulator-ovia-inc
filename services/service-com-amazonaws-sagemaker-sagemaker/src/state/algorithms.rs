@@ -19,6 +19,13 @@ use crate::ops::types::{
 /// The most algorithms this service's store holds. See [`super::MODEL_QUOTA`].
 pub const ALGORITHM_QUOTA: usize = 1_000;
 
+/// The ARN resource kind an algorithm carries, i.e. the `<kind>` in
+/// [`super::resource_arn`], as the modelled `AlgorithmArn` pattern spells it
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]{9,16}:[0-9]{12}:algorithm/[\S]{1,2048}$`).
+/// Named once here so the create mints, the readers resolve and the refusals match the
+/// one kind.
+pub const ALGORITHM_ARN_KIND: &str = "algorithm";
+
 /// How long after `CreateAlgorithm` the clock owes the algorithm's transition out of
 /// `Pending`. A caller that describes the algorithm straight after creating it still
 /// observes `Pending`; one that waits observes the terminal status. Real SageMaker takes

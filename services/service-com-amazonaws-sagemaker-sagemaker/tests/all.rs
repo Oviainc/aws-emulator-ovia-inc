@@ -201,6 +201,8 @@ mod processing_job_stop;
 mod processing_job_stop_absent_target;
 #[path = "all/read_responses_report_what_a_resource_holds.rs"]
 mod read_responses_report_what_a_resource_holds;
+#[path = "all/refusal_subject_wording.rs"]
+mod refusal_subject_wording;
 #[path = "all/rejection_fidelity.rs"]
 mod rejection_fidelity;
 #[path = "all/resource_tagging.rs"]

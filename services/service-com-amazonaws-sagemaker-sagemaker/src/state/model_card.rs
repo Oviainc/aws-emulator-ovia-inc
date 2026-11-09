@@ -92,7 +92,34 @@ impl ModelCard {
     pub fn versions_below_quota(&self) -> bool {
         self.versions.len() < MODEL_CARD_VERSION_QUOTA
     }
+
+    /// Whether the card is ARCHIVED, i.e. its latest version carries
+    /// [`MODEL_CARD_STATUS_ARCHIVED`] — the status that takes the card out of review and
+    /// closes it to further change.
+    ///
+    /// The status belongs to a version and the latest one is the card's current state, so
+    /// that is the version the question is asked of; the archived versions behind it are
+    /// history.
+    pub fn is_archived(&self) -> bool {
+        self.latest_version()
+            .is_some_and(|latest| latest.status == MODEL_CARD_STATUS_ARCHIVED)
+    }
 }
+
+/// The `ModelCardStatus` member that closes a card to further change: `Archived`, which
+/// the modelled enum documents as "The model card is archived. No more updates should be
+/// made to the model card, but it can still be exported"
+/// (`smithy_query(query="shape",shape="ModelCardStatus")`). Named once here so no handler
+/// compares a bare string literal.
+pub const MODEL_CARD_STATUS_ARCHIVED: &str = "Archived";
+
+/// How SageMaker refuses a change to a card that is already
+/// [`MODEL_CARD_STATUS_ARCHIVED`]: it states the card's state and nothing else.
+///
+/// Entirely FIXED text — the recorded refusal interpolates no name, ARN or status value,
+/// and closes with no period — so the sentence is stated once here and every operation
+/// that would change an archived card words the one fact the same way.
+pub const MODEL_CARD_ARCHIVED: &str = "Model card is in archived state";
 
 /// Whether `document` is a JSON object.
 ///
