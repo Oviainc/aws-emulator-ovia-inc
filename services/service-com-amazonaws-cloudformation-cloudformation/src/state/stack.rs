@@ -1849,8 +1849,13 @@ impl StoredStack {
     /// transition that ENDS its creation is not stamped until the owning service reports it
     /// ready ([`Self::schedule_resource_events`]).
     ///
-    /// The wait runs from the instant the operation that acted on the resource started,
-    /// which is what the resource's own `*_IN_PROGRESS` event is stamped with too.
+    /// The resource's own `*_IN_PROGRESS` event is stamped with the instant the operation
+    /// that acted on the resource started, which is what the barrier carries as the instant
+    /// the resource's work began ([`stabilising::StabilisationBarrier::opened_at`]). What the
+    /// WAIT itself runs from is the instant the call it is waiting for was MADE, which is
+    /// this record ([`stabilising::StabilisationBarrier::asked_at`]): the calls were just
+    /// answered, so a resource an operation reaches late in a long walk gets the whole of the
+    /// window from its own call rather than what is left of the operation's.
     pub fn record_stabilisations(
         &mut self,
         pending: &[provisioning::Stabilising],
@@ -1863,16 +1868,13 @@ impl StoredStack {
             .pending
             .as_ref()
             .map_or(now, |operation| operation.started_at);
+        let asked_at = SystemTime::now();
         for stabilising in pending {
             self.stabilisations
                 .push(stabilising::StabilisationBarrier::open(
-                    stabilising.awaited,
-                    stabilising.logical_id.clone(),
-                    stabilising.resource_type.clone(),
-                    stabilising.physical_resource_id.clone(),
-                    stabilising.reported_state.clone(),
-                    stabilising.provider_request.clone(),
+                    stabilising,
                     opened_at,
+                    asked_at,
                 ));
         }
     }
@@ -1969,6 +1971,11 @@ impl StoredStack {
     /// [`settle_due_rollbacks`], exactly as a wait condition's timeout does it. A caller that
     /// asked for the failed state to be kept (`DisableRollback`, `OnFailure=DO_NOTHING`) gets
     /// neither: it said what it wanted left behind.
+    ///
+    /// What that removal asks the owning services about is what was really created, and a
+    /// resource whose create was never carried out at all is not in it: a CUSTOM RESOURCE is
+    /// brought into being by the answer its provider gives, so a `Create` no provider
+    /// answered left nothing to remove ([`Self::discard_uncreated_resource`]).
     pub fn fail_stabilisation(
         &mut self,
         now: SystemTime,
@@ -1979,14 +1986,16 @@ impl StoredStack {
         // operation has already concluded: a failure is the OPERATION's, so it is recorded
         // exactly once however many barriers an earlier pass read off the stack — the same
         // guard [`Self::settle_wait_conditions`] makes before it fails one.
-        if self.pending.is_none()
-            || !self
-                .stabilisations
-                .iter()
-                .any(|held| held.is_the_same_wait(barrier) && !held.released())
-        {
-            return None;
-        }
+        let held = self
+            .stabilisations
+            .iter()
+            .find(|held| held.is_the_same_wait(barrier) && !held.released())
+            .filter(|_| self.pending.is_some())?;
+        // Whether the wait was for a PROVIDER's answer that never came, read off the
+        // barrier the stack itself holds rather than the reading handed in: the answer is
+        // recorded on the stack's own copy ([`Self::record_provider_response`]).
+        let unanswered_provider_request =
+            held.provider_request.is_some() && held.provider_response.is_none();
         let logical_id = barrier.logical_id.as_str();
         let failed_status = failed_status_of(&self.status);
         let updating = self.status == status::UPDATE_IN_PROGRESS;
@@ -2002,6 +2011,11 @@ impl StoredStack {
                     resource_status::CREATE_FAILED,
                     reason,
                 );
+                // A create whose PROVIDER never answered created nothing at all, so the
+                // rollback below owes nobody a call about this resource.
+                if unanswered_provider_request {
+                    self.discard_uncreated_resource(logical_id);
+                }
                 failed_action::CREATE
             }
             // The resource's creation had not STARTED: it was waiting for the resources it
@@ -2613,18 +2627,7 @@ impl StoredStack {
         if attributes.is_empty() {
             return;
         }
-        let held = match &mut self.pending_deployment {
-            Some(deployment) => deployment
-                .resources
-                .iter_mut()
-                .find(|resource| resource.logical_id == logical_id),
-            None => self
-                .resources
-                .iter_mut()
-                .map(|deployed| &mut deployed.resource)
-                .find(|resource| resource.logical_id == logical_id),
-        };
-        let Some(held) = held else {
+        let Some(held) = self.recorded_resource_mut(logical_id) else {
             return;
         };
         let mut changed = false;
@@ -2658,18 +2661,7 @@ impl StoredStack {
         if physical_resource_id.is_empty() {
             return;
         }
-        let held = match &mut self.pending_deployment {
-            Some(deployment) => deployment
-                .resources
-                .iter_mut()
-                .find(|resource| resource.logical_id == logical_id),
-            None => self
-                .resources
-                .iter_mut()
-                .map(|deployed| &mut deployed.resource)
-                .find(|resource| resource.logical_id == logical_id),
-        };
-        let Some(held) = held else {
+        let Some(held) = self.recorded_resource_mut(logical_id) else {
             return;
         };
         if held.physical_resource_id == physical_resource_id {
@@ -2679,6 +2671,44 @@ impl StoredStack {
         // An output whose value is a `Ref` to this resource resolved to the stand-in, so what
         // the stack publishes is re-evaluated against the identity it really has.
         self.reevaluate_outputs();
+    }
+
+    /// The record the stack keeps of the resource `logical_id`, for a writer that is
+    /// recording what became of it: the one of the operation IN FLIGHT where there is one,
+    /// since those are what [`Self::settle`] installs, and the installed record otherwise.
+    ///
+    /// One reading of "which record is this resource's", so every writer below updates the
+    /// record the same read would report.
+    fn recorded_resource_mut(&mut self, logical_id: &str) -> Option<&mut StoredResource> {
+        match &mut self.pending_deployment {
+            Some(deployment) => deployment
+                .resources
+                .iter_mut()
+                .find(|resource| resource.logical_id == logical_id),
+            None => self
+                .resources
+                .iter_mut()
+                .map(|deployed| &mut deployed.resource)
+                .find(|resource| resource.logical_id == logical_id),
+        }
+    }
+
+    /// Record that NOTHING was created anywhere for the resource `logical_id`, so no teardown
+    /// of it owes anybody a call.
+    ///
+    /// A CUSTOM RESOURCE is brought into being by the answer its provider PUTs to the request
+    /// CloudFormation sent it and by nothing else — "a required custom resource
+    /// provider-defined physical ID that is unique for that provider" is what the resource
+    /// IS — so a request no provider ever answered leaves nothing behind: the only identifier
+    /// the record carries is the stand-in CloudFormation computed for it, which addresses no
+    /// resource any provider minted. The record stops claiming the resource was created, and
+    /// the teardown of the failed operation then reports its removal exactly as it does for
+    /// every other resource nothing was created for ([`provisioning::delete`]) rather than
+    /// asking a provider to delete a resource that does not exist.
+    fn discard_uncreated_resource(&mut self, logical_id: &str) {
+        if let Some(held) = self.recorded_resource_mut(logical_id) {
+            held.materialised = false;
+        }
     }
 
     /// Report that the update in flight has applied every change and is now removing the

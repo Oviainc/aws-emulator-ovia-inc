@@ -49,6 +49,15 @@ use super::stack_lifecycle::form_encode;
 /// CloudFormation publishes is one SNS accepts.
 pub const PROVIDER_TOPIC: &str = "custom-resource-provider";
 
+/// The `ServiceToken` a template names that provider by: the ARN of [`PROVIDER_TOPIC`].
+///
+/// `pub` for the same reason the helpers below are: a sibling suite deploys templates of its
+/// own against the SAME provider, and one spelling of the token keeps the two from naming
+/// different ones.
+pub fn provider_token() -> String {
+    format!("arn:aws:sns:{REGION}:000000000000:{PROVIDER_TOPIC}")
+}
+
 /// How long one poll of a stack's status waits before asking again, and how many times: the
 /// stack's own transition is clock-owed, and what makes a released wait due is a READ.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -282,7 +291,7 @@ pub fn template(resource_type: &str, marker: &str, attributes: &[&str]) -> Strin
             "Thing": {
                 "Type": resource_type,
                 "Properties": {
-                    "ServiceToken": format!("arn:aws:sns:{REGION}:000000000000:{PROVIDER_TOPIC}"),
+                    "ServiceToken": provider_token(),
                     "Marker": marker,
                 },
             },

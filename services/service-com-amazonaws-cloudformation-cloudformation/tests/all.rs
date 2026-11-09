@@ -461,6 +461,8 @@ mod type_deregistration;
 mod type_registrations;
 #[path = "all/type_testing.rs"]
 mod type_testing;
+#[path = "all/uncreated_custom_resource_rollback.rs"]
+mod uncreated_custom_resource_rollback;
 #[path = "all/unimported_exports.rs"]
 mod unimported_exports;
 #[path = "all/unique_export_names.rs"]

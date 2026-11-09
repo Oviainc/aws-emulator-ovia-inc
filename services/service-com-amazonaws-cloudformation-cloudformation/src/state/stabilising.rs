@@ -64,10 +64,10 @@ use super::provisioning::custom_resource::{ProviderRequest, ProviderResponse};
 /// published says how long one of them takes, unlike the signal wait a template's own
 /// declaration asks for ([`super::wait_conditions::WaitConditionBarrier::deadline`]), which
 /// runs for the span that declaration stated. Long enough that every coming-up span the
-/// services of this emulator owe a new resource falls due inside it many times over —
-/// including the span of the stack operation the wait is measured from
-/// ([`StabilisationBarrier::opened_at`]) — and short enough that a resource nothing will
-/// ever bring up fails the stack inside a client's poll loop instead of outliving it.
+/// services of this emulator owe a new resource falls due inside it many times over, measured
+/// from the call it waits for ([`StabilisationBarrier::asked_at`]), and short enough that a
+/// resource nothing will ever bring up fails the stack inside a client's poll loop instead of
+/// outliving it.
 pub const CREATE_STABILISATION_WINDOW: Duration = super::MAX_HELD_WAIT;
 
 /// The longest it holds ONE resource's deletion open waiting for the service that owns it to
@@ -149,10 +149,22 @@ pub struct StabilisationBarrier {
     /// API spells it. Carried so the failure a wait that runs out reports says what the
     /// resource was still in.
     pub reported_state: String,
-    /// The instant the operation that acted on the resource started, which the wait runs
-    /// from — and which the resource's own `*_IN_PROGRESS` event and reported timestamp
-    /// carry, so one instant is the whole of what the stack says about this resource.
+    /// The instant the operation that acted on the resource started, which the wait's own
+    /// records are stamped from — and which the resource's own `*_IN_PROGRESS` event and
+    /// reported timestamp carry, so one instant is the whole of what the stack says about
+    /// this resource.
     pub opened_at: SystemTime,
+    /// The instant the CALL this wait is for was made, which is the instant the wait RUNS
+    /// FROM ([`Self::deadline`]).
+    ///
+    /// Not the same instant as [`Self::opened_at`]: a stack operation walks its resources one
+    /// after another, and each call is made when the walk reaches that resource, so a
+    /// resource an operation reaches late in a long walk is asked about long after the
+    /// operation started. The window is the span the service that owns the resource — or the
+    /// provider of a custom resource — is given to carry out THAT call, so it runs from the
+    /// call: measuring it from the operation's start would give such a resource only what was
+    /// left of the operation's window, and a resource reached past it none at all.
+    pub asked_at: SystemTime,
     /// The instant the owning service was first seen to give the answer this barrier waits
     /// for, or `None` while it does not.
     pub released_at: Option<SystemTime>,
@@ -168,25 +180,27 @@ pub struct StabilisationBarrier {
 }
 
 impl StabilisationBarrier {
-    /// Open the wait for a resource whose create or delete `now` answered.
+    /// Open the wait a call the operation just made left behind
+    /// ([`super::provisioning::Stabilising`]).
+    ///
+    /// `opened_at` is the instant the operation that acted on the resource started
+    /// ([`Self::opened_at`]) and `asked_at` the instant its own call was made
+    /// ([`Self::asked_at`]), which is what the window below is measured from.
     pub fn open(
-        awaited: Awaited,
-        logical_id: String,
-        resource_type: String,
-        physical_resource_id: String,
-        reported_state: String,
-        provider_request: Option<ProviderRequest>,
-        now: SystemTime,
+        pending: &super::provisioning::Stabilising,
+        opened_at: SystemTime,
+        asked_at: SystemTime,
     ) -> Self {
         Self {
-            awaited,
-            logical_id,
-            resource_type,
-            physical_resource_id,
-            reported_state,
-            opened_at: now,
+            awaited: pending.awaited,
+            logical_id: pending.logical_id.clone(),
+            resource_type: pending.resource_type.clone(),
+            physical_resource_id: pending.physical_resource_id.clone(),
+            reported_state: pending.reported_state.clone(),
+            opened_at,
+            asked_at,
             released_at: None,
-            provider_request,
+            provider_request: pending.provider_request.clone(),
             provider_response: None,
         }
     }
@@ -215,7 +229,8 @@ impl StabilisationBarrier {
         self.released_at.is_some()
     }
 
-    /// The instant the wait gives up, which is the window of the answer it waits for.
+    /// The instant the wait gives up, which is the window of the answer it waits for, run
+    /// from the instant the call it is waiting for was made ([`Self::asked_at`]).
     pub fn deadline(&self) -> SystemTime {
         let window = match self.awaited {
             // A change the owning service has accepted is waited out for as long as a
@@ -228,7 +243,7 @@ impl StabilisationBarrier {
             Awaited::Deferred => CREATE_STABILISATION_WINDOW,
             Awaited::Gone => REMOVAL_STABILISATION_WINDOW,
         };
-        self.opened_at + window
+        self.asked_at + window
     }
 
     /// Whether the wait has run out at `now`, which fails the resource it is holding.

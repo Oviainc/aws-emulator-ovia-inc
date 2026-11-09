@@ -712,12 +712,16 @@ async fn a_certificate_acm_never_issues_fails_the_resource_when_the_wait_runs_ou
          got {body}"
     );
 
-    // The wait has now run out, at the instant it would have anyway.
+    // The wait has now run out, at the instant it would have anyway. The wait runs from the
+    // instant the CALL it is waiting for was made, so that is the instant a case reaching past
+    // its deadline moves — beside the instant the operation behind it started, which is what
+    // the resource's own in-progress reporting is stamped with.
     {
         let state = engine.state::<ComAmazonawsCloudformationCloudformationState>();
         let mut store = state.lock();
         for stack in &mut store.stacks {
             for barrier in &mut stack.stabilisations {
+                barrier.asked_at -= CREATE_STABILISATION_WINDOW + Duration::from_secs(1);
                 barrier.opened_at -= CREATE_STABILISATION_WINDOW + Duration::from_secs(1);
             }
         }
