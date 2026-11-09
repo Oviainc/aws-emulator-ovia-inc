@@ -53,10 +53,12 @@
 //! (the header alone — `awsJson1_0` has no envelope element for the id) and wires it at
 //! the two layers every response of this service passes through:
 //!
-//! * [`RequestIdHeaderOperation`], the wrapper [`Service::override_operation`] hands the
-//!   router in place of each modelled operation, covers everything an operation answers —
-//!   a success, a modelled error, and a constraint refusal raised while that operation
-//!   was being served;
+//! * [`identity_authorization::IamAuthorized`], the wrapper
+//!   [`Service::override_operation`] hands the router in place of each modelled operation:
+//!   it takes the IAM decision in front of the operation and serves everything it admits
+//!   through `service_common`'s own `RequestIdHeaderOperation`, which covers a success, a
+//!   modelled error, a constraint refusal raised while that operation was being served,
+//!   and its own authorization refusal;
 //! * [`RequestIdEnvelopeDefinition::header_only`], the definition wrapper
 //!   [`Service::definition`] hands back, covers a response NO operation produced: a
 //!   routing failure, a transport failure detected up front, and a pre-dispatch
@@ -65,16 +67,28 @@
 //! Nothing else about a response changes: the status, the other headers and every byte
 //! of the body stay as the renderer wrote them.
 
-use service_common::query_error_envelope::{RequestIdEnvelopeDefinition, RequestIdHeaderOperation};
+use service_common::query_error_envelope::RequestIdEnvelopeDefinition;
 use smithy_server_runtime::{
     http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
-/// Whether IAM lets the caller hand this service the ROLE a control-plane request
-/// names — the `iam:PassRole` step `CreateStateMachine`, `UpdateStateMachine` and
-/// `TestState` take before anything the request names is resolved.
+/// Whether IAM lets the CALLER make the request at all: the `iam:PassRole` step a
+/// control-plane request that names a `roleArn` takes, and the identity-based decision
+/// every call of this service is subject to — both read from the documents in force on
+/// the principal the request signed as.
 pub(crate) mod authorization;
+
+/// WHO a signed request speaks for, and what the account's IAM store holds about it —
+/// the lookups both of those questions are decided from.
+pub(crate) mod request_caller;
+
+/// Where that identity-based decision is TAKEN: in front of every modelled operation,
+/// through [`identity_authorization::IamAuthorized`].
+///
+/// Public: its catalog of the member each operation addresses its resource by is checked
+/// against the Smithy model by this crate's tests.
+pub mod identity_authorization;
 
 /// How this service words the input-constraint refusals the framework hands
 /// back — the one formatter every operation's boundary validation reaches.
@@ -106,10 +120,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// `override_protocol` hands out a borrow of it rather than a new one per
     /// request.
     protocol: wire::SwfJsonProtocol,
-    /// Serves every modelled operation, so each response an operation produced names
-    /// the request it answers. Held, not built per request: `override_operation` hands
-    /// back a borrow of it.
-    request_id: RequestIdHeaderOperation,
+    /// Serves every modelled operation to a caller IAM allows to perform it, so each
+    /// response an operation produced names the request it answers and no request IAM
+    /// refuses reaches a handler at all. Held, not built per request:
+    /// `override_operation` hands back a borrow of it.
+    authorized: identity_authorization::IamAuthorized<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -118,9 +133,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(engine)),
+            entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(
+                Arc::clone(&engine),
+            )),
             protocol: wire::SwfJsonProtocol::new(),
-            request_id: RequestIdHeaderOperation,
+            authorized: identity_authorization::IamAuthorized::new(engine),
         }
     }
 }
@@ -158,13 +175,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // NOT a re-route: the operation served is the one this service's own routing
         // table names for the request, reached through the shared
         // `RequestIdHeaderOperation` — the one place every operation's response passes,
-        // so no operation can answer without naming the request it answered. A request
-        // the table does not answer declines here exactly as it would there, leaving the
-        // router's routing-error path (which names the request itself, through the
-        // definition wrapper) unchanged.
+        // so no operation can answer without naming the request it answered — and behind
+        // the IAM decision [`identity_authorization`] takes in front of every one of
+        // them, so no handler can be reached by a caller whose policies do not allow the
+        // action it asked for. A request the table does not answer declines here exactly
+        // as it would there, leaving the router's routing-error path (which names the
+        // request itself, through the definition wrapper) unchanged.
         self.entry
             .routes(req)
-            .then_some(&self.request_id as &dyn ErasedOperation)
+            .then_some(&self.authorized as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

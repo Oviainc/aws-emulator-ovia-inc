@@ -242,21 +242,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Starting an execution is an ACTION of this service on the state machine the
-        // request names, so AWS's frontend authorizes it against the identity-based
-        // policies in force on the caller before anything is resolved or run: a caller
-        // whose policies do not allow it is refused with `AccessDeniedException` (HTTP
-        // 400) and nothing runs. The action is this operation's own name under the
-        // service's action namespace, and the resource is the ARN the REQUEST carried.
-        // See `crate::service::authorization`.
-        if let Some(why) = crate::service::authorization::caller_action_denial(
-            &*self.engine,
-            ctx,
-            &crate::service::authorization::operation_action(Self::NAME),
-            &input.state_machine_arn,
-        ) {
-            return Err(crate::scaffolded::Scaffolded::access_denied(why));
-        }
-
+        // request names, and AWS's frontend authorizes it against the identity-based
+        // policies in force on the caller before anything is resolved or run. That
+        // decision is taken for EVERY operation of this service in front of its handler
+        // (`crate::service::identity_authorization`), so no request a caller's policies
+        // do not allow reaches this body at all and nothing is decided twice.
         if let Some(name) = input.name.as_deref() {
             if !crate::state::is_valid_name(name) {
                 return Err(StartSyncExecutionErrorModeled::InvalidName(InvalidName {

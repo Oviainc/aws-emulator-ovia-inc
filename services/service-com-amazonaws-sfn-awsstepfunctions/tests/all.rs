@@ -101,6 +101,8 @@ mod form_protocol_integration;
 mod history_event_provenance;
 #[path = "all/http_task_endpoint.rs"]
 mod http_task_endpoint;
+#[path = "all/identity_policy_authorization.rs"]
+mod identity_policy_authorization;
 #[path = "all/integration_failure_error_names.rs"]
 mod integration_failure_error_names;
 #[path = "all/integration_member_names.rs"]
