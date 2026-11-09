@@ -208,24 +208,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_security_group_memberships("VpcSecurityGroupIds", &security_groups)
             .map_err(CreateDBProxyError::invalid_parameter_value)?;
         let auth = input.auth.unwrap_or_default();
-        for entry in &auth {
-            for (member, value) in [
-                ("Auth.Description", entry.description.as_deref()),
-                ("Auth.UserName", entry.user_name.as_deref()),
-                ("Auth.AuthScheme", entry.auth_scheme.as_deref()),
-                ("Auth.SecretArn", entry.secret_arn.as_deref()),
-                ("Auth.IAMAuth", entry.iam_auth.as_deref()),
-                (
-                    "Auth.ClientPasswordAuthType",
-                    entry.client_password_auth_type.as_deref(),
-                ),
-            ] {
-                if let Some(value) = value {
-                    crate::state::check_free_form(member, value)
-                        .map_err(CreateDBProxyError::invalid_parameter_value)?;
-                }
-            }
-        }
+        crate::state::check_user_auth_config(&auth)
+            .map_err(CreateDBProxyError::invalid_parameter_value)?;
         let tags = input.tags.unwrap_or_default();
         crate::state::check_tags(&tags).map_err(CreateDBProxyError::invalid_parameter_value)?;
         // "The EC2 subnet IDs for the proxy": a value that is not a subnet id names no
@@ -254,9 +238,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.db_proxies.contains_key(&key) {
             return Err(CreateDBProxyErrorModeled::DBProxyAlreadyExistsFault(
                 DBProxyAlreadyExistsFault {
-                    message: Some(format!(
-                        "A DB proxy named {} already exists",
-                        input.db_proxy_name
+                    message: Some(crate::state::db_proxy_already_exists_message(
+                        &input.db_proxy_name,
                     )),
                 },
             )
@@ -289,17 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             default_auth_scheme: input
                 .default_auth_scheme
                 .unwrap_or_else(|| crate::state::DEFAULT_AUTH_SCHEME_NONE.to_string()),
-            auth: auth
-                .into_iter()
-                .map(|entry| UserAuthConfigInfo {
-                    description: entry.description,
-                    user_name: entry.user_name,
-                    auth_scheme: entry.auth_scheme,
-                    secret_arn: entry.secret_arn,
-                    iam_auth: entry.iam_auth,
-                    client_password_auth_type: entry.client_password_auth_type,
-                })
-                .collect(),
+            auth: crate::state::user_auth_config_to_info(auth),
             role_arn: input.role_arn,
             vpc_subnet_ids: input.vpc_subnet_ids,
             vpc_security_group_ids: security_groups,

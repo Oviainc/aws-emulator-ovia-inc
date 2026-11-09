@@ -139,7 +139,10 @@ async fn read_target_group(router: &MultiServiceRouter, case: &str, proxy: &str)
 }
 
 /// `DescribeDBProxies` for `proxy`.
-async fn read_proxy(router: &MultiServiceRouter, case: &str, proxy: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite of this one test target reads a proxy back the same way
+/// rather than growing a second copy of this call.
+pub(crate) async fn read_proxy(router: &MultiServiceRouter, case: &str, proxy: &str) -> String {
     expect_ok(
         case,
         call(router, "DescribeDBProxies", &[("DBProxyName", proxy)]).await,

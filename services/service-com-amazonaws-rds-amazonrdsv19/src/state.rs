@@ -178,15 +178,17 @@ pub use custom_engine_versions::{
     CUSTOM_ENGINE_VERSION_STATUS_CREATING, MEDIA_TYPE_CUSTOMER_PROVIDED,
 };
 pub use db_proxies::{
-    check_target_group_name, db_proxy_not_found_message, default_connection_pool_config,
-    merged_connection_pool_config, target_to_wire, DbProxyRecord, DbProxyTargetGroupRecord,
+    check_target_group_name, check_user_auth_config, db_proxy_already_exists_message,
+    db_proxy_not_found_message, default_connection_pool_config, merged_connection_pool_config,
+    target_to_wire, user_auth_config_to_info, DbProxyRecord, DbProxyTargetGroupRecord,
     DbProxyTargetRecord, RegisteredDatabase, DEFAULT_AUTH_SCHEME_NONE,
     DEFAULT_CONNECTION_BORROW_TIMEOUT, DEFAULT_DB_PROXY_TARGET_GROUP,
     DEFAULT_IDLE_CLIENT_TIMEOUT, DEFAULT_MAX_CONNECTIONS_PERCENT,
     DEFAULT_MAX_CONNECTIONS_PERCENT_SQLSERVER, DEFAULT_TARGET_GROUP_RENAME_MESSAGE,
     DB_PROXY_QUOTA_PER_REGION, DB_PROXY_STATUS_AVAILABLE, DB_PROXY_STATUS_CREATING,
-    DB_PROXY_STATUS_DELETING, DB_PROXY_TARGET_QUOTA_PER_PROXY, ENGINE_FAMILY_SQLSERVER,
-    MAX_SESSION_PINNING_FILTERS, MISSING_DB_PROXY_TARGET_IDENTIFIER_MESSAGE, NETWORK_TYPE_IPV4,
+    DB_PROXY_STATUS_DELETING, DB_PROXY_STATUS_MODIFYING, DB_PROXY_TARGET_QUOTA_PER_PROXY,
+    ENGINE_FAMILY_SQLSERVER, MAX_SESSION_PINNING_FILTERS,
+    MAX_USER_AUTH_CONFIGS, MISSING_DB_PROXY_TARGET_IDENTIFIER_MESSAGE, NETWORK_TYPE_IPV4,
 };
 pub use engine_log::InstanceLog;
 pub use events::{

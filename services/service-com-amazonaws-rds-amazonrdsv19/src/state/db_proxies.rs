@@ -15,7 +15,7 @@ use std::time::Instant;
 use super::{PendingChange, PendingStatus, ARN_NAMESPACE};
 use crate::ops::types::{
     ConnectionPoolConfiguration, ConnectionPoolConfigurationInfo, DBProxy, DBProxyTarget,
-    DBProxyTargetGroup, Tag, TargetHealth, UserAuthConfigInfo,
+    DBProxyTargetGroup, Tag, TargetHealth, UserAuthConfig, UserAuthConfigInfo,
 };
 
 /// How many proxies one region holds. The cap is this emulator's, and it bounds the store
@@ -35,6 +35,11 @@ pub const DB_PROXY_STATUS_CREATING: &str = "creating";
 /// `DBProxyStatus` — "A status of `available` means the proxy is ready to handle
 /// requests."
 pub const DB_PROXY_STATUS_AVAILABLE: &str = "available";
+
+/// `DBProxyStatus` — the status a proxy reports while this service applies a change a
+/// modification asked for, and which it leaves for [`DB_PROXY_STATUS_AVAILABLE`] on its
+/// own.
+pub const DB_PROXY_STATUS_MODIFYING: &str = "modifying";
 
 /// `DBProxyStatus` — the status a proxy reports once a delete has been accepted for it and
 /// before this service has finished taking it away.
@@ -237,6 +242,74 @@ pub fn db_proxy_not_found_message(named: &str) -> String {
     format!("DBProxy '{named}' not found.")
 }
 
+/// Refuse an `Auth` entry carrying text this store will not hold.
+///
+/// `UserAuthConfigList`'s published length: "len 0..200" (`smithy_query(query="shape",
+/// shape="UserAuthConfigList")`), so a request stating more entries than that states more
+/// than the member accepts. The COUNT is bounded here beside each entry's strings, because
+/// the whole list is what enters the store and outlives the request.
+pub const MAX_USER_AUTH_CONFIGS: usize = 200;
+
+/// One check for `CreateDBProxy`'s authentication settings and for the ones a modification
+/// replaces them with, so neither can take a value the other refuses. `Err` carries the
+/// sentence naming the member at fault.
+pub fn check_user_auth_config(entries: &[UserAuthConfig]) -> Result<(), String> {
+    super::check_request_list_len("Auth", entries.len(), MAX_USER_AUTH_CONFIGS)?;
+    for entry in entries {
+        for (member, value) in [
+            ("Auth.Description", entry.description.as_deref()),
+            ("Auth.UserName", entry.user_name.as_deref()),
+            ("Auth.AuthScheme", entry.auth_scheme.as_deref()),
+            ("Auth.SecretArn", entry.secret_arn.as_deref()),
+            ("Auth.IAMAuth", entry.iam_auth.as_deref()),
+            (
+                "Auth.ClientPasswordAuthType",
+                entry.client_password_auth_type.as_deref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                super::check_free_form(member, value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Project the authentication settings a request carries onto the ones a proxy reports
+/// back: `UserAuthConfigInfo` "returns the details of authentication used by a proxy", one
+/// entry per `UserAuthConfig` the request stated, member for member.
+///
+/// One projection for the create that sets a proxy's authentication settings and the
+/// modification that replaces them.
+pub fn user_auth_config_to_info(entries: Vec<UserAuthConfig>) -> Vec<UserAuthConfigInfo> {
+    entries
+        .into_iter()
+        .map(|entry| UserAuthConfigInfo {
+            description: entry.description,
+            user_name: entry.user_name,
+            auth_scheme: entry.auth_scheme,
+            secret_arn: entry.secret_arn,
+            iam_auth: entry.iam_auth,
+            client_password_auth_type: entry.client_password_auth_type,
+        })
+        .collect()
+}
+
+/// The message a `DBProxyAlreadyExistsFault` carries for a name the region already holds a
+/// proxy under. The sentence is this service's chosen form, carried unchanged from the
+/// create that first answered the fault: it states that a proxy of the requested name
+/// exists, which is what the fault reports ("The specified proxy name must be unique for
+/// all proxies owned by your Amazon Web Services account in the specified Amazon Web
+/// Services Region").
+///
+/// It lives here rather than in one handler because the create that mints a proxy under a
+/// name and the modification that renames one onto a name answer the same one fault, so
+/// neither can drift from the other. `named` is the value the REQUEST carried, which is the
+/// spelling a proxy is stored under too (`DBProxyName` is not folded).
+pub fn db_proxy_already_exists_message(named: &str) -> String {
+    format!("A DB proxy named {named} already exists")
+}
+
 /// The sentence `RegisterDBProxyTargets` and `DeregisterDBProxyTargets` refuse a request
 /// that names no database to act on with.
 ///
@@ -373,6 +446,17 @@ impl DbProxyRecord {
     /// records name the same predicate.
     pub fn is_deleting(&self) -> bool {
         self.status == DB_PROXY_STATUS_DELETING
+    }
+
+    /// Accept a modification: the change is already applied to the record, and the proxy
+    /// reports `modifying` until this service has finished putting it in force
+    /// [`crate::state::STATUS_TRANSITION_DELAY`] from now, after which it is `available`
+    /// again. Nothing sleeps: the due instant is stored and materialised by
+    /// `settle_due_transitions`, so a caller reading the proxy straight afterwards still
+    /// sees it applying the change.
+    pub fn begin_modifying(&mut self) {
+        self.status = DB_PROXY_STATUS_MODIFYING.to_string();
+        self.pending_status = Some(PendingStatus::in_a_moment(DB_PROXY_STATUS_AVAILABLE));
     }
 
     /// Accept a delete: the proxy reports `deleting` from now on, and the clock owes its

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDBProxy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDBProxy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Changes the settings of an existing RDS proxy: the settings the request STATES are the
+//! ones that change, and every setting it leaves out keeps the value the proxy already
+//! holds. This operation's own behaviour lives here; the checks and projections it shares
+//! with the create that first sets these settings live beside the proxy record in
+//! `crate::state`, so the two cannot drift.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDBProxy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `Auth` and `SecurityGroups` are each documented as "the new" list, so a request that
+//! states one REPLACES what the proxy held rather than adding to it, and `NewDBProxyName`
+//! renames the proxy, which its endpoint and its target group ARN are computed from, so
+//! both follow the name.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +170,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDBProxy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDBProxyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDBProxy"))
+        let region = crate::state::request_region(ctx).map_err(ModifyDBProxyError::validation)?;
+        // Each caller-sized value is held to this service's own store bound before it
+        // reaches the store, the same bound `CreateDBProxy` holds these settings to when it
+        // sets them: the role ARN and every string one `Auth` entry carries are
+        // length-bounded, and the `Auth` list and the security group list are each
+        // count-bounded. The two proxy names the request carries need no bound of ours —
+        // `DBProxyName` publishes a length and a pattern the model refuses outside of
+        // before this handler runs. These are checks on what the REQUEST carries, so they
+        // precede the lookup of the proxy it names: a request that is not a well-formed
+        // modification is refused as such whether or not a proxy of that name exists.
+        if let Some(role_arn) = &input.role_arn {
+            crate::state::check_stored_text(
+                "RoleArn",
+                role_arn,
+                crate::state::MAX_IAM_ROLE_ARN_LEN,
+            )
+            .map_err(ModifyDBProxyError::invalid_parameter_value)?;
+        }
+        if let Some(security_groups) = &input.security_groups {
+            crate::state::check_security_group_memberships("SecurityGroups", security_groups)
+                .map_err(ModifyDBProxyError::invalid_parameter_value)?;
+        }
+        if let Some(auth) = &input.auth {
+            crate::state::check_user_auth_config(auth)
+                .map_err(ModifyDBProxyError::invalid_parameter_value)?;
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated modification.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope.
+        let key = (region.clone(), input.db_proxy_name.clone());
+        let Some(proxy) = store.db_proxies.get(&key) else {
+            return Err(ModifyDBProxyErrorModeled::DBProxyNotFoundFault(
+                DBProxyNotFoundFault {
+                    message: Some(crate::state::db_proxy_not_found_message(
+                        &input.db_proxy_name,
+                    )),
+                },
+            )
+            .into());
+        };
+        // A proxy that has not finished coming up, or whose delete has been accepted,
+        // cannot take a modification: the state the clock has yet to settle is real. One
+        // that is already applying a change can, as the modification of a DB instance in
+        // the same status is: a further change is accepted while the last one goes into
+        // force.
+        let current_status = proxy.status.clone();
+        if current_status != crate::state::DB_PROXY_STATUS_AVAILABLE
+            && current_status != crate::state::DB_PROXY_STATUS_MODIFYING
+        {
+            return Err(ModifyDBProxyErrorModeled::InvalidDBProxyStateFault(
+                InvalidDBProxyStateFault {
+                    message: Some(format!(
+                        "DB proxy {} is in state {current_status} and cannot be modified",
+                        input.db_proxy_name
+                    )),
+                },
+            )
+            .into());
+        }
+        // "The new identifier for the DBProxy": a rename onto a name this region already
+        // holds a proxy under would put two proxies under one name, which is the fault this
+        // operation shares with the create. A request restating the name the proxy already
+        // has renames nothing.
+        let renamed_to = input
+            .new_db_proxy_name
+            .filter(|new_name| *new_name != input.db_proxy_name);
+        if let Some(new_name) = &renamed_to {
+            if store
+                .db_proxies
+                .contains_key(&(region.clone(), new_name.clone()))
+            {
+                return Err(ModifyDBProxyErrorModeled::DBProxyAlreadyExistsFault(
+                    DBProxyAlreadyExistsFault {
+                        message: Some(crate::state::db_proxy_already_exists_message(new_name)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Every check has passed, so the change is applied to the record the store holds.
+        // The record is taken OUT of the map because the proxy's name is half its key: a
+        // rename stores it under the new name, and leaves nothing behind under the old one.
+        let mut record = store
+            .db_proxies
+            .remove(&key)
+            .expect("the proxy was found above and the store is locked");
+        if let Some(new_name) = renamed_to {
+            record.name = new_name;
+        }
+        if let Some(default_auth_scheme) = input.default_auth_scheme {
+            record.default_auth_scheme = default_auth_scheme;
+        }
+        // "The new authentication settings for the DBProxy" and "the new list of security
+        // groups for the DBProxy": each REPLACES what the proxy held rather than adding to
+        // it, so a request stating an empty list leaves the proxy holding none.
+        if let Some(auth) = input.auth {
+            record.auth = crate::state::user_auth_config_to_info(auth);
+        }
+        if let Some(security_groups) = input.security_groups {
+            record.vpc_security_group_ids = security_groups;
+        }
+        if let Some(role_arn) = input.role_arn {
+            record.role_arn = role_arn;
+        }
+        if let Some(require_tls) = input.require_tls {
+            record.require_tls = require_tls;
+        }
+        if let Some(idle_client_timeout) = input.idle_client_timeout {
+            record.idle_client_timeout = idle_client_timeout;
+        }
+        if let Some(debug_logging) = input.debug_logging {
+            record.debug_logging = debug_logging;
+        }
+        // "The date and time when the proxy was last updated" is this call's instant, and
+        // the proxy reports `modifying` until this service has the change in force.
+        record.updated_date = crate::state::now_as_wire_timestamp();
+        record.begin_modifying();
+        let db_proxy = record.to_wire();
+        store.db_proxies.insert((region, record.name.clone()), record);
+        Ok(ModifyDBProxyOutput {
+            db_proxy: Some(db_proxy),
+        })
     }
 }
