@@ -258,19 +258,24 @@ async fn invoke(
 const RUNTIME_EXIT_ERROR: &str = "Runtime.ExitError";
 const RUNTIME_KILLED: &str = "signal: killed";
 
-/// How many times a row re-drives its invocation while the host keeps stopping the run.
-const HOST_STOP_ATTEMPTS: usize = 4;
+/// How many times a row re-drives its invocation while the host keeps refusing or stopping
+/// the run.
+const HOST_STOP_ATTEMPTS: usize = 6;
 
-/// `Invoke` on `reference`, re-driven while the answer reports a run the HOST stopped
-/// instead of a run of the handler.
+/// `Invoke` on `reference`, re-driven while the answer reports one of this process's own
+/// HOST BOUNDS instead of a run of the handler.
 ///
 /// The handlers this suite runs allocate nothing and return at once, so no row of it can ask
-/// for an answer like that: the memory bound a run is stopped on is read from the WHOLE
-/// process (`state/execution/python.rs`), and this target runs its suites in parallel over
-/// `state::execution::max_concurrent_runs` run slots, so a trivial run can be stopped for
-/// memory another suite holds. Such an answer is not an answer to the request the row made,
-/// so the request is made again — a bounded number of times, and the last answer is returned
-/// whatever it is, so a run that really failed still fails the row.
+/// for an answer like that: the bounds are the run slots an invocation waits for, whose
+/// refusal says to retry the request, and the memory bound read from the WHOLE process
+/// (`state/execution/python.rs`), which stops whichever run is in flight once this test
+/// binary as a whole is over it. This target runs its suites in parallel over
+/// `state::execution::max_concurrent_runs` run slots, so a trivial run can be refused or
+/// stopped for what another suite holds. Such an answer is not an answer to the request the
+/// row made ([`is_host_bound`]), so the request is made again — after letting the suites
+/// holding those slots and that memory get through a stretch of their own work, a bounded
+/// number of times, and the last answer is returned whatever it is, so a run that really
+/// failed still fails the row.
 async fn invoke_run(
     router: &MultiServiceRouter,
     reference: &str,
@@ -278,25 +283,13 @@ async fn invoke_run(
 ) -> Answer {
     let mut answered = invoke(router, reference, headers).await;
     for _ in 1..HOST_STOP_ATTEMPTS {
-        if !stopped_by_the_host(&answered) {
+        if !is_host_bound(answered.status, &answered.text()) {
             break;
         }
+        tokio::time::sleep(SLACK).await;
         answered = invoke(router, reference, headers).await;
     }
     answered
-}
-
-/// Whether `answered` reports a run the host stopped on a bound of its own.
-fn stopped_by_the_host(answered: &Answer) -> bool {
-    if answered.header("x-amz-function-error").is_none() {
-        return false;
-    }
-    let document = answered.json();
-    document.get("errorType").and_then(Value::as_str) == Some(RUNTIME_EXIT_ERROR)
-        && document
-            .get("errorMessage")
-            .and_then(Value::as_str)
-            .is_some_and(|message| message.contains(RUNTIME_KILLED))
 }
 
 /// One row: the case, the runtime, the handler it runs, the qualifier the invocation names
@@ -475,9 +468,9 @@ async fn delete_function(router: &MultiServiceRouter, case: &str, name: &str) {
 /// Two of those bounds are shared by every suite of this test binary and belong to none of
 /// them: the run slots an invocation waits for, whose refusal says to retry the request,
 /// and the memory bound read from the WHOLE process, which stops whichever run is in
-/// flight once the test binary as a whole is over it ([`stopped_by_the_host`], which reads
-/// the same answer off a parsed document). Neither says anything about what a run came to,
-/// so a row answered with one has nothing of a run to read.
+/// flight once the test binary as a whole is over it. Neither says anything about what a run
+/// came to, so a row answered with one has nothing of a run to read, and a row driven through
+/// [`invoke_run`] is made again rather than read.
 ///
 /// `pub(crate)` so the sibling suites that read what a RUN answered share this one reading
 /// of it.

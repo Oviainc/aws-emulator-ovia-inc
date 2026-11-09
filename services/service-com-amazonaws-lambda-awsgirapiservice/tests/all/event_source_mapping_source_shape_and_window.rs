@@ -17,9 +17,9 @@
 //!    addressed by is refused with the modelled `InvalidParameterValueException` stating the
 //!    ARN FORMAT expected for that source service, written for the Region the request was
 //!    made in; an ARN of any other vendor names no source service at all, so the refusal
-//!    lists the sources a mapping polls instead. The rows differ along the vendor, the
-//!    resource type and the separator the resource field uses, the Region and account the
-//!    value names, and include vendors outside that enumeration.
+//!    states that the source ARN sent is unsupported instead. The rows differ along the
+//!    vendor, the resource type and the separator the resource field uses, the Region and
+//!    account the value names, and include vendors outside that enumeration.
 //!
 //! 2. A member the model leaves OPTIONAL but this operation requires for the event source or
 //!    the starting position the request names — `StartingPosition`, "Required for Amazon
@@ -50,7 +50,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
     create_function, create_mapping, create_request, get_mapping, list_mappings, router_on,
-    DYNAMODB_SOURCE, KINESIS_SOURCE, MSK_SOURCE, QUEUE_SOURCE,
+    unsupported_source_refusal, DYNAMODB_SOURCE, KINESIS_SOURCE, MSK_SOURCE, QUEUE_SOURCE,
 };
 
 /// The modelled error a request no mapping can satisfy is refused with
@@ -105,22 +105,15 @@ fn expected_format_refusal(vendor: &str, resource: &str) -> String {
     )
 }
 
-/// The whole refusal an ARN of a vendor that is no event source service at all answers: the
-/// sources an event source mapping polls, which is `EventSourceArn`'s own enumeration.
-const CATALOGUE_REFUSAL: &str = "An event source mapping polls an Amazon Kinesis data stream \
-                                 or stream consumer, an Amazon DynamoDB stream, an Amazon \
-                                 Simple Queue Service queue, an Amazon Managed Streaming for \
-                                 Apache Kafka cluster or VPC connection, an Amazon MQ broker \
-                                 or an Amazon DocumentDB change stream";
-
 /// What the refusal of one wrong-shaped ARN must state.
 enum Stated {
     /// The ARN names one of the source services, so the refusal states the format that
     /// service's pollable resource is addressed by: that service's vendor namespace and the
     /// resource half of the format.
     ExpectedFormat(&'static str, &'static str),
-    /// The ARN names no source service, so the refusal lists the sources a mapping polls.
-    Catalogue,
+    /// The ARN names no source service, so the refusal states that the source ARN sent is
+    /// unsupported.
+    UnsupportedArn,
 }
 
 /// One row of the ARN-shape table: the value `EventSourceArn` carries and what the refusal
@@ -202,19 +195,19 @@ fn shape_rows() -> Vec<ShapeRow> {
             case: "a bucket, whose vendor is no event source service",
             event_source: "arn:aws:s3:::order-dropbox",
             extras: json!({}),
-            stated: Stated::Catalogue,
+            stated: Stated::UnsupportedArn,
         },
         ShapeRow {
             case: "a topic, whose vendor is no event source service",
             event_source: "arn:aws:sns:us-east-1:000000000000:order-events",
             extras: json!({}),
-            stated: Stated::Catalogue,
+            stated: Stated::UnsupportedArn,
         },
         ShapeRow {
             case: "a function, whose vendor is no event source service",
             event_source: "arn:aws:lambda:us-east-1:000000000000:function:order-fn",
             extras: json!({}),
-            stated: Stated::Catalogue,
+            stated: Stated::UnsupportedArn,
         },
     ]
 }
@@ -222,7 +215,7 @@ fn shape_rows() -> Vec<ShapeRow> {
 /// RULE: an `EventSourceArn` that names one of the source services `EventSourceArn`
 /// enumerates, but not the shape of resource that service is polled through, is refused with
 /// the modelled 400 stating the ARN format expected for THAT service; an ARN of any other
-/// vendor is refused with the list of sources a mapping polls. Neither stores a mapping.
+/// vendor is refused as an unsupported source ARN. Neither stores a mapping.
 #[tokio::test]
 async fn a_wrong_shaped_event_source_arn_is_refused_with_the_format_its_service_expects() {
     let router = emulator();
@@ -260,10 +253,11 @@ async fn a_wrong_shaped_event_source_arn_is_refused_with_the_format_its_service_
                 "case {case:?}: the refusal must state the ARN format this source service is \
                  polled through, got {message:?}"
             ),
-            Stated::Catalogue => assert!(
-                message.contains(CATALOGUE_REFUSAL) && message.contains(row.event_source),
-                "case {case:?}: the refusal must list the sources a mapping polls and quote \
-                 the value it refused, got {message:?}"
+            Stated::UnsupportedArn => assert_eq!(
+                message,
+                unsupported_source_refusal(row.event_source),
+                "case {case:?}: the refusal must state that the source ARN sent is \
+                 unsupported, got {message:?}"
             ),
         }
 

@@ -125,6 +125,8 @@ mod event_source_mapping_role_access;
 mod event_source_mapping_source_shape_and_window;
 #[path = "all/event_source_mapping_sqs_delivery.rs"]
 mod event_source_mapping_sqs_delivery;
+#[path = "all/event_source_mapping_unsupported_source_arn.rs"]
+mod event_source_mapping_unsupported_source_arn;
 #[path = "all/event_source_mapping_update.rs"]
 mod event_source_mapping_update;
 #[path = "all/event_source_mapping_update_omitted_members.rs"]

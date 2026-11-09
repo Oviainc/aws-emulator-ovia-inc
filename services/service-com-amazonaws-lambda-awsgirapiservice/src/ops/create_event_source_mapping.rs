@@ -15,7 +15,8 @@
 //! [`crate::state::event_source_is_mappable_by_this_account`]). Anything else is refused
 //! with the modelled `InvalidParameterValueException` rather than stored as a mapping of
 //! a source nothing could poll — stating the ARN format the source service the value names
-//! is polled through, where it names one at all (see [`unrecognized_event_source`]).
+//! is polled through where it names one at all, and otherwise that the source ARN sent is
+//! unsupported (see [`unrecognized_event_source`]).
 //!
 //! The two settings the model leaves optional because only SOME of those sources need them
 //! — the position a stream is read from, and the instant a position stated as a timestamp
@@ -887,13 +888,17 @@ fn absent_required_nested_member(structure: &str, member: &str) -> String {
 /// How a request whose `EventSourceArn` names nothing an event source mapping can poll is
 /// refused.
 ///
+/// Both refusals open with the same sentence — the source was not recognized — and then
+/// state the ONE thing that distinguishes the two cases, which is what tooling matches on.
+///
 /// An ARN whose VENDOR is one of the source services that member enumerates DOES name a
 /// service a mapping polls, so what the value got wrong is the SHAPE of the resource: the
 /// refusal states the ARN format that service's pollable resource is addressed by
 /// ([`expected_event_source_resource`]), because the missing or extra segment is the only
 /// thing that tells the caller what to send instead. An ARN of any other vendor names no
-/// source service at all, so there is no one format to expect and the refusal lists the
-/// sources a mapping polls, which is that member's own enumeration.
+/// source service at all, so there is no format to expect and nothing about the resource
+/// half to state: the refusal says the source ARN itself is unsupported and quotes it, which
+/// is the only variable part of that sentence.
 ///
 /// What that format states is the SHAPE of the ARN rather than any one resource: the
 /// resource half is written with the placeholder names the format uses
@@ -907,13 +912,7 @@ fn unrecognized_event_source(vendor: &str, event_source: &str, region: &str) -> 
             "Unrecognized event source. Expected arn of format \
              arn:aws:{vendor}:{region}:{EXAMPLE_ACCOUNT_ID}:{resource}"
         ),
-        None => format!(
-            "Unrecognized event source '{event_source}'. An event source mapping polls an \
-             Amazon Kinesis data stream or stream consumer, an Amazon DynamoDB stream, an \
-             Amazon Simple Queue Service queue, an Amazon Managed Streaming for Apache Kafka \
-             cluster or VPC connection, an Amazon MQ broker or an Amazon DocumentDB change \
-             stream"
-        ),
+        None => format!("Unrecognized event source. Unsupported source arn : {event_source}"),
     }
 }
 

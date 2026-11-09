@@ -698,6 +698,15 @@ pub(crate) fn create_request(function: &str, event_source: Option<&str>, extras:
     Value::Object(body)
 }
 
+/// The whole refusal a `CreateEventSourceMapping` whose `EventSourceArn` belongs to a
+/// service no event source mapping polls answers: the fixed sentence, then the rejected
+/// ARN as the request sent it.
+///
+/// One owner for this message class, so the tables that drive it cannot drift apart.
+pub(crate) fn unsupported_source_refusal(event_source: &str) -> String {
+    format!("Unrecognized event source. Unsupported source arn : {event_source}")
+}
+
 /// Assert `answered` carries every member `expected` states, where a `Null` expectation
 /// means the member must be ABSENT (the default its own documentation gives the member
 /// for this event source is "no value at all").

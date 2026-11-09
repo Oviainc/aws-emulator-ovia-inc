@@ -209,13 +209,15 @@ async fn delete_function(router: &MultiServiceRouter, case: &str, name: &str) {
     );
 }
 
-/// `Invoke` on the function `reference` names, waiting out a refusal that no RUN SLOT was
-/// free: every suite of this test binary contends for the emulator's slots, and the
-/// refusal for a call that waited its turn out says to retry the request.
+/// `Invoke` on the function `reference` names, re-driven while the answer reports one of the
+/// emulator's own HOST BOUNDS rather than what the run came to ([`host_bound`]): every suite
+/// of this test binary contends for the emulator's run slots, whose refusal says to retry the
+/// request, and for the resident size it guards the whole process with, which stops whichever
+/// run is in flight. An answer of the run's own — whatever it reports — is returned at once.
 async fn invoke(router: &MultiServiceRouter, reference: &str, payload: &[u8]) -> Answer {
     let mut answered = invoke_once(router, reference, payload).await;
     for _ in 1..SLOT_ATTEMPTS {
-        if answered.status == 200 {
+        if !host_bound(&answered) {
             break;
         }
         tokio::time::sleep(SLACK).await;
@@ -224,8 +226,8 @@ async fn invoke(router: &MultiServiceRouter, reference: &str, payload: &[u8]) ->
     answered
 }
 
-/// How many times a call waits for a free run slot before its answer is read as it is.
-const SLOT_ATTEMPTS: usize = 4;
+/// How many times a call waits out a host bound before its answer is read as it is.
+const SLOT_ATTEMPTS: usize = 6;
 
 /// One `Invoke` on the function `reference` names.
 async fn invoke_once(router: &MultiServiceRouter, reference: &str, payload: &[u8]) -> Answer {
