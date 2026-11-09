@@ -337,11 +337,9 @@ async fn list_adapters_filters_on_the_inclusive_creation_time_window() {
             request: json!({ "AfterCreationTime": at(11), "BeforeCreationTime": at(19) }),
             expect_offsets: vec![],
         },
-        WindowCase {
-            name: "bounds the wrong way round admit nothing",
-            request: json!({ "AfterCreationTime": at(25), "BeforeCreationTime": at(5) }),
-            expect_offsets: vec![],
-        },
+        // A window whose bounds are the wrong way round is no range at all and is
+        // REFUSED rather than listed; that refusal is asserted in
+        // `crate::creation_time_windows`.
     ];
 
     for case in &cases {

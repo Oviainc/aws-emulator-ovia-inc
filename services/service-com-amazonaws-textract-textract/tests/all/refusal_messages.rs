@@ -8,9 +8,10 @@
 //! string on every call, whichever operation refused and whatever the request held, with
 //! nothing taken from the request interpolated into it:
 //!
-//! * a document no page can be read out of — bytes in no format the service reads, or
-//!   bytes in a format it accepts that its decoder cannot read — is
-//!   `UnsupportedDocumentException` with [`UNSUPPORTED_DOCUMENT_FORMAT_MESSAGE`];
+//! * a document no page can be read out of — bytes in no format the service reads, bytes
+//!   in a document format the channel they arrived on does not carry, or bytes in an
+//!   accepted format that its decoder cannot read — is `UnsupportedDocumentException`
+//!   with [`UNSUPPORTED_DOCUMENT_FORMAT_MESSAGE`];
 //! * `QueriesConfig` supplied without the `QUERIES` `FeatureType` is
 //!   `InvalidParameterException` with [`QUERIES_CONFIG_WITHOUT_FEATURE_MESSAGE`];
 //! * an input that violates a modelled constraint (an absent required member, or a value
@@ -134,8 +135,15 @@ async fn a_document_no_page_can_be_read_out_of_is_refused_as_an_unsupported_form
             bytes_document(&[0x00u8, 0x01, 0x02, 0xFF, 0xFE, 0x7F]),
         ),
         (
-            "a text document holding only whitespace",
-            text_document("   \n\t\n"),
+            // Characters are not one of the document formats Textract processes.
+            "a text document",
+            bytes_document(INVOICE.as_bytes()),
+        ),
+        (
+            // `Document$Bytes` carries a document "in PNG or JPEG format"; a TIFF is one
+            // only an Amazon S3 object may hold.
+            "a whole TIFF, which inline Bytes do not carry",
+            bytes_document(&tiff),
         ),
     ];
 
@@ -168,7 +176,7 @@ async fn a_document_no_page_can_be_read_out_of_is_refused_as_an_unsupported_form
     // The positive control for the same rule: the WHOLE page those rows were cut from is
     // read, so the refusal is about bytes no page can be read out of and not about the
     // format itself.
-    for format in [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::Tiff] {
+    for format in [ImageFormat::Png, ImageFormat::Jpeg] {
         let (status, body) = call(
             &router,
             "DetectDocumentText",

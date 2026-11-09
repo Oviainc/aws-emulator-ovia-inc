@@ -52,7 +52,10 @@ const S3_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=0000";
 
 /// The bucket every staged document below lives in.
-const BUCKET: &str = "textract-documents";
+///
+/// `pub(crate)`: `crate::document_formats` stages its own objects in the same bucket,
+/// through the helpers below, rather than standing up a second object store.
+pub(crate) const BUCKET: &str = "textract-documents";
 
 /// A bucket name no `CreateBucket` here ever creates.
 const ABSENT_BUCKET: &str = "textract-documents-missing";
@@ -68,7 +71,7 @@ const UNREADABLE_OBJECT_MESSAGE: &str =
 
 /// One emulator: textract and Amazon S3 on a single shared engine behind the production
 /// router — what `build_router` assembles, narrowed to the two services under test.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -84,7 +87,7 @@ fn emulator() -> MultiServiceRouter {
 /// One textract call in the service's own wire envelope (awsJson1_1), signed for
 /// [`REGION`] so the in-process read of Amazon S3 is addressed to the same Region the
 /// caller is in.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -120,7 +123,7 @@ async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &[u8]) 
 }
 
 /// `PUT /<bucket>` — `CreateBucket` — so the staged objects below have a bucket to live in.
-async fn given_bucket(router: &MultiServiceRouter) {
+pub(crate) async fn given_bucket(router: &MultiServiceRouter) {
     let status = s3(router, "PUT", &format!("/{BUCKET}"), &[]).await;
     assert_eq!(
         status, 200,
@@ -129,7 +132,7 @@ async fn given_bucket(router: &MultiServiceRouter) {
 }
 
 /// `PUT /<bucket>/<key>` — `PutObject` — storing `bytes` as the object's own body.
-async fn given_object(router: &MultiServiceRouter, key: &str, bytes: &[u8]) {
+pub(crate) async fn given_object(router: &MultiServiceRouter, key: &str, bytes: &[u8]) {
     let status = s3(router, "PUT", &format!("/{BUCKET}/{key}"), bytes).await;
     assert_eq!(
         status, 200,
@@ -151,7 +154,7 @@ async fn given_raster_object(
 }
 
 /// A `Document` naming the staged object `key`.
-fn s3_document(key: &str) -> Value {
+pub(crate) fn s3_document(key: &str) -> Value {
     json!({ "S3Object": { "Bucket": BUCKET, "Name": key } })
 }
 
@@ -348,8 +351,24 @@ async fn every_synchronous_path_reads_the_object_amazon_s3_holds() {
 
             // One document, read ONE way: the same bytes submitted inline report the same
             // text (the block ids differ, because they are derived from the document's own
-            // identity — an object's location, or the digest of the inline bytes).
+            // identity — an object's location, or the digest of the inline bytes). A TIFF
+            // is where the two channels part: `Document$Bytes` carries a document "in PNG
+            // or JPEG format", so the same bytes inline are refused as a document format
+            // that channel does not take.
             let (status, inline_body) = call(&router, operation, &from_bytes).await;
+            if staged.format == ImageFormat::Tiff {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: a TIFF inline is not a document Document$Bytes carries, \
+                     got {status} with {inline_body}"
+                );
+                assert_eq!(
+                    error_code(&inline_body),
+                    "UnsupportedDocumentException",
+                    "case {case:?}: expected UnsupportedDocumentException, got {inline_body}"
+                );
+                continue;
+            }
             assert_eq!(
                 status, 200,
                 "case {case:?}: the same bytes inline must be read too, got {status} with \
@@ -520,19 +539,25 @@ async fn an_asynchronous_job_over_a_readable_object_succeeds_with_its_blocks() {
     given_bucket(&router).await;
 
     // Two staged objects, so the rows differ along what the OBJECT holds as well as which
-    // family reads it: a rendered raster, and a text document whose tab-separated lines are
-    // the table the TABLES feature reports. Both are documents this service reads, and both
-    // arrive the same way — as the body of a `PutObject`.
+    // family reads it: a rendered page of labelled lines, and a page whose columns are the
+    // table the TABLES feature reports — the second encoded as a TIFF, a document format
+    // only an Amazon S3 object carries. Both arrive the same way, as the body of a
+    // `PutObject`.
     let rendered = vec!["SIMPARITY LEDGER", "Account Number: 48213"];
     let page = render(&rendered, paper());
     given_raster_object(&router, "ledger.png", &page, ImageFormat::Png).await;
     let tabulated = vec![
         "SIMPARITY LEDGER",
-        "Item\tAmount",
-        "Freight\t250.00",
-        "Total\t1250.00",
+        "Item Code\tAmount Due",
+        "Freight Charge\t250.00",
+        "Total Payable\t1250.00",
     ];
-    given_object(&router, "ledger.txt", tabulated.join("\n").as_bytes()).await;
+    let drawn = crate::document_extraction::drawn_lines(&tabulated.join("\n"));
+    let tabulated_page = render(
+        &drawn.iter().map(String::as_str).collect::<Vec<_>>(),
+        paper(),
+    );
+    given_raster_object(&router, "ledger.tiff", &tabulated_page, ImageFormat::Tiff).await;
 
     // (case, the object, its lines, the start, its extra members, the matching read, the
     // model version it reports)
@@ -547,8 +572,8 @@ async fn an_asynchronous_job_over_a_readable_object_succeeds_with_its_blocks() {
             version_member: "DetectDocumentTextModelVersion",
         },
         Family {
-            case: "text detection over a text document",
-            key: "ledger.txt",
+            case: "text detection over a TIFF of a table",
+            key: "ledger.tiff",
             lines: &tabulated,
             start: "StartDocumentTextDetection",
             extra: json!({}),
@@ -557,7 +582,7 @@ async fn an_asynchronous_job_over_a_readable_object_succeeds_with_its_blocks() {
         },
         Family {
             case: "analysis with TABLES",
-            key: "ledger.txt",
+            key: "ledger.tiff",
             lines: &tabulated,
             start: "StartDocumentAnalysis",
             extra: json!({ "FeatureTypes": ["TABLES"] }),
@@ -566,7 +591,7 @@ async fn an_asynchronous_job_over_a_readable_object_succeeds_with_its_blocks() {
         },
         Family {
             case: "analysis with TABLES and FORMS",
-            key: "ledger.txt",
+            key: "ledger.tiff",
             lines: &tabulated,
             start: "StartDocumentAnalysis",
             extra: json!({ "FeatureTypes": ["TABLES", "FORMS"] }),
@@ -765,7 +790,7 @@ fn each_document_source_is_held_to_the_ceiling_documented_for_it() {
         bytes: None,
         s3_object: Some(S3Object {
             bucket: Some(BUCKET.to_string()),
-            name: Some("ledger.txt".to_string()),
+            name: Some("ledger.png".to_string()),
             version: None,
         }),
     })
@@ -809,9 +834,16 @@ fn each_document_source_is_held_to_the_ceiling_documented_for_it() {
     ];
 
     for (case, size, from_an_object, must_be_read) in rows {
-        // A document of printable characters, so what decides the outcome is its SIZE:
-        // inside the ceiling it is a text document this service reads.
-        let bytes = vec![b'a'; *size];
+        // A page of real pixels, padded out to the size under test: what decides the
+        // outcome is the SIZE, so the bytes are a document the service would otherwise
+        // read (a PNG; the padding sits past the stream's end marker).
+        let page = encode(&render(&["SIMPARITY LEDGER"], paper()), ImageFormat::Png);
+        assert!(
+            page.len() <= *size,
+            "case {case:?}: the drawn page must fit inside the size under test"
+        );
+        let mut bytes = page;
+        bytes.resize(*size, 0);
         let reference = if *from_an_object {
             object_reference.clone()
         } else {

@@ -189,6 +189,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The creation-time window is validated BEFORE anything is listed: its lower
+        // bound must lie at or before its upper bound, so a pair that is no range at all
+        // is refused rather than answered with the listing it would select.
+        if !crate::state::creation_window_is_range(
+            input.after_creation_time.as_ref(),
+            input.before_creation_time.as_ref(),
+        ) {
+            return Err(ListAdaptersErrorModeled::ValidationException(
+                crate::state::invalid_time_range(),
+            )
+            .into());
+        }
+
         // A `NextToken` is an offset into the listing the SAME filtration criteria
         // produce, so the cursor is bound to those criteria and checked before anything
         // is reported.

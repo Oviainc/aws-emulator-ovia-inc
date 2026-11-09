@@ -22,20 +22,19 @@
 //!
 //! [`read_content`] is the ONLY source of a document's text, and it never invents one.
 //! The bytes it reads are the request's own inline `Bytes` or the object this emulator's
-//! Amazon S3 holds at the named location ([`s3_source`]), and from there the two sources
-//! are read exactly alike:
+//! Amazon S3 holds at the named location ([`s3_source`]), and a document is read only
+//! when those bytes are in a format Amazon Textract processes on the channel they arrived
+//! on ([`DocumentChannel`]):
 //!
-//! * bytes that decode as text — their real lines and words are extracted
-//!   verbatim (form feed, `U+000C`, is the page break), and FORMS/TABLES analysis reads
-//!   that same real text;
-//! * bytes that are a raster in a format Textract accepts (PNG, JPEG or TIFF) —
-//!   the pixels are decoded and the text recognised off them by [`ocr`], which reports
-//!   the characters it measured and the confidence it measured them with, and reports
-//!   nothing for ink it could not match to a glyph. A page with no ink is a page with no
-//!   words, answered as such rather than refused;
-//! * bytes no document can be read out of — whether they are in no format this service
-//!   reads at all, or in one of the accepted formats but truncated or otherwise
-//!   undecodable — refused as [`Unreadable::UnsupportedFormat`], which the handlers
+//! * bytes that are a raster in an accepted format — PNG or JPEG either way, and TIFF
+//!   from an Amazon S3 object, which is the split AWS states for `Document$Bytes` — the
+//!   pixels are decoded and the text recognised off them by [`ocr`], which reports the
+//!   characters it measured and the confidence it measured them with, and reports nothing
+//!   for ink it could not match to a glyph. A page with no ink is a page with no words,
+//!   answered as such rather than refused;
+//! * bytes no document can be read out of — in no document format at all, in an accepted
+//!   format but truncated or otherwise undecodable, or in a document format the channel
+//!   does not accept — refused as [`Unreadable::UnsupportedFormat`], which the handlers
 //!   answer with the modelled `UnsupportedDocumentException` and the one sentence Amazon
 //!   Textract states that refusal with ([`UNSUPPORTED_DOCUMENT_FORMAT_MESSAGE`]). A PDF
 //!   is answered there too: Textract accepts PDF, but this emulator has no page
@@ -60,10 +59,10 @@
 //!   [`ocr`] found it at and the mean score it matched that ink's glyphs with, so two
 //!   words of one line, and one word on two documents, carry their own boxes and their
 //!   own confidences;
-//! * a document read as CHARACTERS has no pixels to measure, so its lines and words are
-//!   laid out on the character grid its own lines, columns and word lengths place them on
-//!   ([`bounding_box`]), and report the one documented [`EXTRACTED_TEXT_CONFIDENCE`] —
-//!   a per-word spread there would be a measurement nothing made;
+//! * a line whose measured words do not line up with the words laid out for it has no
+//!   measurement to give them, so its words are laid out on the character grid their own
+//!   columns and lengths place them on ([`bounding_box`]) and report the page's own
+//!   confidence — a per-word spread there would be a measurement nothing made;
 //! * every block above a word spans exactly the words it was read from (a `LINE`, a
 //!   `KEY_VALUE_SET`, a `CELL`, an `ExpenseDetection`), and a `PAGE` encloses the page's
 //!   top-level blocks rather than claiming the whole page.
@@ -81,7 +80,7 @@ use crate::ops::types::{
     DocumentMetadata, ExpenseCurrency, ExpenseDetection, ExpenseDocument, ExpenseField,
     ExpenseType, Geometry, InvalidParameterException, LineItemFields, LineItemGroup,
     NotificationChannel, OutputConfig, Point, QueriesConfig, Query, Relationship,
-    ResourceNotFoundException, Warning,
+    ResourceNotFoundException, ValidationException, Warning,
     AUTO_UPDATE_VALUES, FEATURE_TYPE_VALUES,
 };
 
@@ -239,6 +238,13 @@ pub const UNSUPPORTED_DOCUMENT_FORMAT_MESSAGE: &str = "Request has unsupported d
 /// so a rejected value is never echoed back to the caller.
 pub const INVALID_PARAMETERS_MESSAGE: &str = "Request has invalid parameters";
 
+/// The message Amazon Textract states `ValidationException` with for a creation-time
+/// window whose bounds do not describe a range.
+///
+/// WHOLLY FIXED text for this refusal class: it names neither the bound that was wrong nor
+/// the instants the request carried, so nothing of the request reaches the error surface.
+pub const INVALID_TIME_RANGE_MESSAGE: &str = "Request has invalid time range.";
+
 /// The message Amazon Textract states `InvalidJobIdException` with, for a `JobId` no
 /// asynchronous `Start*` of this service issued.
 ///
@@ -275,16 +281,6 @@ pub const ADAPTER_RESOURCE_TYPE: &str = "adapters";
 /// which bounds one REQUEST's map; the same ceiling bounds the resource, so a merge that
 /// would leave it holding more pairs than a `TagMap` can express is refused.
 pub const MAX_TAGS_PER_RESOURCE: usize = 200;
-
-/// The `Confidence` a block of a document whose text was read VERBATIM reports.
-///
-/// A text document's characters are not recognised, they are read, so there is no
-/// recogniser confidence to measure for them and one documented constant says exactly
-/// that; a per-block spread would look like a measurement nothing made. A raster
-/// document reports instead the confidence its recogniser really measured (see
-/// [`ocr::Recognised`] and [`DocumentContent::confidence`]). Inside `Percent`'s `0..=100`
-/// range.
-pub const EXTRACTED_TEXT_CONFIDENCE: f32 = 99.0;
 
 /// Characters in a pagination token issued by [`encode_page_token`].
 const PAGE_TOKEN_LEN: usize = 32;
@@ -822,6 +818,34 @@ pub fn invalid_parameters() -> InvalidParameterException {
     }
 }
 
+/// The modelled refusal of a creation-time window that is not a range
+/// ([`INVALID_TIME_RANGE_MESSAGE`]), as every listing taking an
+/// `AfterCreationTime`/`BeforeCreationTime` pair answers it.
+pub fn invalid_time_range() -> ValidationException {
+    ValidationException {
+        message: Some(INVALID_TIME_RANGE_MESSAGE.to_string()),
+        code: None,
+    }
+}
+
+/// Whether the creation-time window a listing request named is a RANGE: its lower bound
+/// at or before its upper bound.
+///
+/// `AfterCreationTime` "[s]pecifies the lower bound" and `BeforeCreationTime` the upper
+/// bound of the window a listing filters on, and both bounds are inclusive
+/// ([`within_creation_window`]), so a lower bound AFTER the upper one describes no window
+/// at all and is refused rather than answered with the empty listing it would select. A
+/// window with one bound, or neither, is unbounded on that side and always a range.
+pub fn creation_window_is_range(
+    after_creation_time: Option<&::aws_smithy_types::DateTime>,
+    before_creation_time: Option<&::aws_smithy_types::DateTime>,
+) -> bool {
+    match (after_creation_time, before_creation_time) {
+        (Some(after), Some(before)) => datetime_nanos(after) <= datetime_nanos(before),
+        _ => true,
+    }
+}
+
 /// The modelled refusal of a well-formed Amazon Textract ARN that names no resource
 /// this service holds.
 ///
@@ -1332,31 +1356,18 @@ pub type MeasuredPage = Vec<ocr::MeasuredLine>;
 pub struct DocumentContent {
     pub pages: Vec<String>,
     /// The `Confidence` a block derived from this text reports when nothing finer was
-    /// measured for it: the one documented [`EXTRACTED_TEXT_CONFIDENCE`] for text read
-    /// verbatim, and the mean score the recogniser measured over the whole page for a
-    /// raster.
+    /// measured for it: the mean score the recogniser measured over the whole page.
     pub confidence: f32,
     /// Where the text of each page sits on it, index-aligned with [`Self::pages`].
     ///
-    /// Filled for a page whose text was RECOGNISED off pixels, which is the only case
-    /// where a position and a size were measured; EMPTY for a document that carries no
-    /// pixels (text read verbatim has characters but no page to measure them on), whose
-    /// blocks are laid out on the character grid [`bounding_box`] computes from the
-    /// document's own lines, columns and word lengths instead.
+    /// A page's text is RECOGNISED off its pixels, so this is where each line and word of
+    /// it was measured. A line whose measured words do not line up with the words laid
+    /// out for it is laid out on the character grid [`bounding_box`] computes from the
+    /// line's own columns and word lengths instead.
     pub measured: Vec<MeasuredPage>,
 }
 
 impl DocumentContent {
-    /// Text read verbatim out of a document, so reported with the one documented
-    /// confidence and with no measured geometry.
-    pub fn read_verbatim(pages: Vec<String>) -> Self {
-        Self {
-            pages,
-            confidence: EXTRACTED_TEXT_CONFIDENCE,
-            measured: Vec::new(),
-        }
-    }
-
     /// The measured lines of page `page_index`, when that page's text was recognised off
     /// pixels.
     fn measured_page(&self, page_index: usize) -> Option<&[ocr::MeasuredLine]> {
@@ -1537,21 +1548,24 @@ pub fn read_content(
     };
     // A document provided as inline bytes and one read out of an S3 object carry
     // different published ceilings, so each is held to its own.
-    let (ceiling, source) = if reference.s3.is_some() {
-        (MAX_S3_DOCUMENT_BYTES, "read from an Amazon S3 object")
-    } else {
-        (MAX_INLINE_DOCUMENT_BYTES, "provided as inline bytes")
+    let channel = DocumentChannel::of(reference);
+    let (ceiling, ceiling_source) = match channel {
+        DocumentChannel::S3Object => (MAX_S3_DOCUMENT_BYTES, "read from an Amazon S3 object"),
+        DocumentChannel::Inline => (MAX_INLINE_DOCUMENT_BYTES, "provided as inline bytes"),
     };
     if bytes.len() > ceiling {
         return Err(Unreadable::TooLarge(format!(
-            "the document is {} bytes; the maximum size of a document {source} is {ceiling} bytes",
+            "the document is {} bytes; the maximum size of a document {ceiling_source} is \
+             {ceiling} bytes",
             bytes.len()
         )));
     }
-    // The format comes from the bytes' own magic numbers, so a raster is recognised as
-    // one before the text heuristic ever sees it. A page the recogniser finds no text on
-    // is a page with no words, not a document in an unsupported format.
-    if let Some(format) = ocr::raster_format(bytes) {
+    // A document is read only when its bytes are in a format Amazon Textract processes on
+    // the channel they were submitted on, and the format comes from the bytes' own magic
+    // numbers rather than from anything the request declared about them. A page the
+    // recogniser finds no text on is a page with no words, not a document in an
+    // unsupported format.
+    if let Some(format) = ocr::raster_format(bytes, channel) {
         let page = ocr::read_raster(bytes, format)?;
         return Ok(DocumentContent {
             pages: bounded(vec![page.text])?,
@@ -1559,39 +1573,67 @@ pub fn read_content(
             measured: vec![page.lines],
         });
     }
-    // A PDF is a document format Textract itself accepts, and this emulator reads none:
-    // rendering a PDF page needs a page rasteriser it does not have, and the text a PDF
-    // carries sits in content streams nothing here parses. So nothing is read out of one,
-    // and it is decided on the PDF header, BEFORE the text heuristic, so a PDF whose bytes
-    // happen to be printable is not read as if it were a text document. Which part of the
-    // document could not be read is logged, not answered: the refusal is the one sentence
-    // the service states for a document it cannot read.
-    if bytes.starts_with(PDF_MAGIC) {
-        ::tracing::debug!(
-            "the document is a PDF: this emulator renders no PDF page and parses no PDF \
-             content stream"
-        );
-        return Err(Unreadable::UnsupportedFormat);
-    }
-    if let Some(text) = decode_text(bytes) {
-        // `U+000C` FORM FEED is the page break in a text document.
-        let pages: Vec<String> = text
-            .split('\u{c}')
-            .filter(|page| !page.trim().is_empty())
-            .map(ToString::to_string)
-            .collect();
-        if pages.is_empty() {
-            ::tracing::debug!("the document holds no text");
-            return Err(Unreadable::UnsupportedFormat);
-        }
-        return Ok(DocumentContent::read_verbatim(bounded(pages)?));
-    }
-    ::tracing::debug!("the document's bytes are not text and not a PNG, JPEG or TIFF raster");
+    // Every other byte string is a document this service reads no page out of, and they
+    // all get the ONE refusal the service states for that: bytes in no document format at
+    // all, bytes in a document format this channel does not take, and a PDF — which
+    // Textract itself accepts, while this emulator reads nothing out of one, because
+    // rendering a PDF page needs a page rasteriser it does not have and the text a PDF
+    // carries sits in content streams nothing here parses. WHICH it was is logged rather
+    // than answered: the refusal names neither the format the document was sent in nor
+    // the part of it that could not be read.
+    ::tracing::debug!(
+        declared = declared_format(bytes),
+        channel = ?channel,
+        "the document is in no format this service reads on the channel it arrived on"
+    );
     Err(Unreadable::UnsupportedFormat)
+}
+
+/// The name of the format these bytes declare, for the log of a refused document: the
+/// raster container `image`'s own sniffing recognises, a PDF by its file header, or
+/// `"unrecognised"` for bytes that declare no format this emulator knows at all.
+///
+/// Reported to the emulator's operator only. It is never part of an answer: a caller is
+/// told the one sentence Amazon Textract states for a document it cannot read, which
+/// names no format.
+fn declared_format(bytes: &[u8]) -> &'static str {
+    if let Some(raster) = ocr::declared_raster_format(bytes) {
+        return raster;
+    }
+    if bytes.starts_with(PDF_MAGIC) {
+        return "PDF";
+    }
+    "unrecognised"
 }
 
 /// The bytes every PDF document starts with ("%PDF-", per the PDF file header).
 const PDF_MAGIC: &[u8] = b"%PDF-";
+
+/// HOW a document was submitted, which decides the formats it may be in.
+///
+/// AWS states the accepted formats per channel: `Document$Bytes` is "a blob of
+/// base64-encoded document bytes … The document bytes must be in PNG or JPEG format",
+/// while a document named as an Amazon S3 object (`Document$S3Object`, or the
+/// `DocumentLocation` of an asynchronous `Start*`) may be in any of the formats the
+/// operations name — "PNG, JPEG, PDF, or TIFF format".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentChannel {
+    /// The request's own inline `Document$Bytes`.
+    Inline,
+    /// An object of Amazon S3.
+    S3Object,
+}
+
+impl DocumentChannel {
+    /// The channel the document `reference` names was submitted on.
+    pub fn of(reference: &DocumentRef) -> Self {
+        if reference.s3.is_some() {
+            Self::S3Object
+        } else {
+            Self::Inline
+        }
+    }
+}
 
 /// `pages` unchanged, or the reason they are over a documented or emulator-side limit.
 fn bounded(pages: Vec<String>) -> Result<Vec<String>, Unreadable> {
@@ -1632,22 +1674,6 @@ fn estimated_block_count(pages: &[String]) -> usize {
     total
 }
 
-/// `Some(text)` when these bytes are a text document: valid UTF-8 carrying at least one
-/// non-whitespace character and no control characters beyond the layout ones.
-fn decode_text(bytes: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    if text.trim().is_empty() {
-        return None;
-    }
-    if text
-        .chars()
-        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t' | '\u{c}'))
-    {
-        return None;
-    }
-    Some(text.to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Block derivation
 // ---------------------------------------------------------------------------
@@ -1684,9 +1710,9 @@ struct LineLayout {
     text: String,
     words: Vec<WordLayout>,
     /// The `Confidence` a block derived from the line as a whole reports: the mean score
-    /// the characters of THIS LINE were recognised with, or the document's one
-    /// confidence ([`EXTRACTED_TEXT_CONFIDENCE`]) when its text was read verbatim rather
-    /// than recognised, where a per-line spread would be a measurement nothing made.
+    /// the characters of THIS LINE were recognised with, or the page's own confidence
+    /// where the line itself carries no measurement, since a per-line spread there would
+    /// be a measurement nothing made.
     confidence: f32,
     /// Where the line sits on the page: the extent of the ink it was read from when it
     /// was recognised off pixels, and otherwise its place on the character grid.
@@ -1731,9 +1757,10 @@ fn block_id(key: &str, kind: &str, path: &[usize]) -> String {
 /// Where a line or a word of a TEXT document sits, on the character grid the document's
 /// own lines, columns and word lengths place it on.
 ///
-/// The fallback layout for content that carries no measured geometry: a document read as
-/// characters has no page its text was measured on, so its geometry is computed from the
-/// text itself. A RECOGNISED page reports instead the rectangle [`ocr`] measured for it.
+/// The fallback layout for a line that carries no measured geometry — one whose measured
+/// words do not line up with the words laid out for it — so its geometry is computed from
+/// the text itself rather than borrowed from another word's rectangle. A line measured on
+/// the page reports instead the rectangle [`ocr`] measured for it.
 fn bounding_box(line_index: usize, column: usize, chars: usize) -> BoundingBox {
     // The two bounds are computed independently and never derived from each other:
     // `f32::clamp` panics when its min exceeds its max, and rounding makes `1.0 - left`
@@ -1851,9 +1878,9 @@ fn words_of(line: &str) -> Vec<(usize, String)> {
 ///
 /// The ONE place a line or a word gets its position, its size and its confidence, so the
 /// four read paths over one document cannot disagree on them. Both come from what was
-/// really read: the rectangle and the score [`ocr`] measured for a page recognised off
-/// pixels, and the character grid plus the one documented confidence for text read
-/// verbatim.
+/// really read: the rectangle and the score [`ocr`] measured for the line's own ink, and
+/// the character grid plus the page's own confidence for a line whose measured words do
+/// not line up with the words laid out here.
 fn layout_page(
     key: &str,
     page_index: usize,

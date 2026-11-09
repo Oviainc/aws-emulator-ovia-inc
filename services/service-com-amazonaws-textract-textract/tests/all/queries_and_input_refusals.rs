@@ -33,9 +33,6 @@ use crate::raster_documents::{raster_document, render, Paper};
 /// answers are known from its own text.
 const INVOICE: &str = "Invoice Number: INV-1024\nTotal Due: 42.50\nVendor Name: Acme Supplies";
 
-/// A two-page document: the page break is a form feed, as the text reader documents.
-const TWO_PAGES: &str = "Invoice Number: INV-7\n\u{c}Shipped Date: 2026-01-05";
-
 /// One query of a case: what is asked, and what the document answers it with.
 #[derive(Debug, Clone)]
 struct Asked {
@@ -182,29 +179,35 @@ fn query_cases() -> Vec<QueryCase> {
             also: Vec::new(),
         },
         QueryCase {
-            name: "a page-2 field is out of reach of a query that names no page",
-            document: text_document(TWO_PAGES),
+            // A document is ONE page: the page a query names decides whether the
+            // document's text is in reach of it at all, and page 2 of a one-page document
+            // holds nothing.
+            name: "a query that names a page the document does not have finds nothing",
+            document: text_document(INVOICE),
             feature_types: vec!["QUERIES"],
-            queries: vec![Asked::new("What is the shipped date?", None)],
+            queries: vec![
+                Asked::new("What is the invoice number?", None).on_pages(&["2"], 1),
+                Asked::new("What is the total due?", None).on_pages(&["2-*"], 1),
+            ],
             also: Vec::new(),
         },
         QueryCase {
-            name: "the same query over every page finds the page-2 field",
-            document: text_document(TWO_PAGES),
+            name: "every page selector that reaches the document's own page",
+            document: text_document(INVOICE),
             feature_types: vec!["QUERIES"],
             queries: vec![
-                Asked::new("What is the shipped date?", Some("2026-01-05")).on_pages(&["*"], 1),
-                Asked::new("What is the shipped date?", Some("2026-01-05")).on_pages(&["2"], 2),
-                Asked::new("What is the shipped date?", Some("2026-01-05")).on_pages(&["1-2"], 1),
-                Asked::new("What is the shipped date?", Some("2026-01-05")).on_pages(&["2-*"], 2),
-                Asked::new("What is the invoice number?", Some("INV-7")).on_pages(&["1"], 1),
+                Asked::new("What is the invoice number?", Some("INV-1024")).on_pages(&["*"], 1),
+                Asked::new("What is the total due?", Some("42.50")).on_pages(&["1"], 1),
+                Asked::new("What is the vendor name?", Some("Acme Supplies"))
+                    .on_pages(&["1-2"], 1),
+                Asked::new("What is the invoice number?", Some("INV-1024")).on_pages(&["1-*"], 1),
             ],
             also: Vec::new(),
         },
         QueryCase {
             name: "QUERIES alongside FORMS and TABLES",
             document: text_document(
-                "Invoice Number: INV-1024\nTotal Due: 42.50\nItem\tQty\nBolt\t4",
+                "Invoice Number: INV-1024\nTotal Due: 42.50\nItem Code\tQty\nBolt Mk2\t4",
             ),
             feature_types: vec!["TABLES", "FORMS", "QUERIES"],
             queries: vec![Asked::new(

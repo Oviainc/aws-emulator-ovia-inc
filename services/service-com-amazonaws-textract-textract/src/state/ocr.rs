@@ -22,8 +22,8 @@
 //!    [`MIN_INK_CONTRAST`] are sensor or compression noise on a blank page, not ink.
 //! 3. **Segment** — a horizontal projection profile of the ink gives the page's text
 //!    lines; a vertical profile within one line gives its glyph candidates, and the
-//!    gaps between them, measured against the glyphs' own median width, give the word
-//!    and column breaks.
+//!    gaps between them, clustered against the glyphs' own median width, give the word
+//!    and column breaks ([`breaks`]).
 //! 4. **Recognise** — each candidate is resampled onto an 8x8 grid and scored against
 //!    every printable ASCII glyph of the embedded public-domain 8x8 font (`font8x8`) by
 //!    shape overlap (the Sørensen-Dice coefficient) plus the glyph's height, width and
@@ -177,14 +177,31 @@ fn percentage(score_total: f32, score_count: usize) -> f32 {
     }
 }
 
-/// `Some(format)` when these bytes are a raster document format Textract accepts.
+/// `Some(format)` when these bytes are a raster document format Textract reads on the
+/// channel they were submitted on.
 ///
-/// The format comes from the bytes' own magic numbers, never from a declared name.
-pub fn raster_format(bytes: &[u8]) -> Option<ImageFormat> {
+/// The format comes from the bytes' own magic numbers, never from a declared name. Which
+/// formats a channel accepts is AWS's own split (see [`super::DocumentChannel`]): PNG and
+/// JPEG are read whichever way the document arrived, while a TIFF is a document only an
+/// Amazon S3 object may hold — `Document$Bytes` takes PNG and JPEG alone.
+pub fn raster_format(bytes: &[u8], channel: super::DocumentChannel) -> Option<ImageFormat> {
     match image::guess_format(bytes) {
-        Ok(format @ (ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Tiff)) => Some(format),
+        Ok(format @ (ImageFormat::Png | ImageFormat::Jpeg)) => Some(format),
+        Ok(ImageFormat::Tiff) if channel == super::DocumentChannel::S3Object => {
+            Some(ImageFormat::Tiff)
+        }
         _ => None,
     }
+}
+
+/// The name of the raster format these bytes DECLARE, whatever it is: `image`'s own
+/// sniffing of the magic number at their head.
+///
+/// `None` says the bytes declare no raster format the sniffer knows — not that they are a
+/// document. It is what lets [`super::read_content`] tell a document in a raster format
+/// the service does not process from bytes that are not a raster at all.
+pub fn declared_raster_format(bytes: &[u8]) -> Option<&'static str> {
+    image::guess_format(bytes).ok().map(format_name)
 }
 
 /// Read the text of one raster document.
@@ -273,9 +290,9 @@ fn format_name(format: ImageFormat) -> &'static str {
         ImageFormat::Png => "PNG",
         ImageFormat::Jpeg => "JPEG",
         ImageFormat::Tiff => "TIFF",
-        // Defensive: `raster_format` yields only the three above, so nothing reaches
-        // this arm today. It is here so that adding a format cannot panic a message.
-        _ => "raster",
+        // Reached through `declared_raster_format`, which names whatever format the
+        // sniffer recognised so a refusal can be logged with it.
+        other => other.extensions_str().first().copied().unwrap_or("raster"),
     }
 }
 
@@ -589,15 +606,11 @@ impl InkLine {
             .windows(2)
             .map(|pair| pair[1].x0.saturating_sub(pair[0].x1 + 1))
             .collect();
-        // Which gaps are word breaks is a property of THIS line's own text: the gaps
-        // inside a word and the gaps between words are two clusters, so the widest jump
-        // in the sorted gaps splits them. A line whose gaps form one cluster is one
-        // word, and a line too short to show a jump falls back to comparing the gap
-        // with the glyphs' own median width.
-        let word_gap = word_break(&gaps, median_width).max(2.0);
-        // A gap several times wider again is a column break, which the block layer reads
-        // as a table row.
-        let column_gap = 3.0 * word_gap;
+        // Which gaps are word breaks, and which are COLUMN breaks, is a property of THIS
+        // line's own marks: its gaps fall into clusters — the ones inside a word, the ones
+        // between words and, on a table row, the ones between columns — and each boundary
+        // between two clusters is a jump in the sorted gaps. See [`breaks`].
+        let (word_gap, column_gap) = breaks(&gaps, median_width);
         // The character cell the line's left margin is reported in, so a line that
         // starts half way across the page is laid out half way across its text.
         let cell = median(
@@ -671,34 +684,38 @@ fn median(values: impl Iterator<Item = usize>) -> Option<f32> {
     Some(values[values.len() / 2] as f32)
 }
 
-/// The gap width above which a gap between two marks is a break between two words.
+/// The gap widths that separate one line's marks into WORDS and into COLUMNS.
 ///
-/// The gaps of one line fall into two clusters — the ones inside a word and the ones
-/// between words — so the widest jump between consecutive sorted gaps separates them,
-/// provided that jump is wide enough to be a cluster boundary rather than the ordinary
-/// variation between letter pairs. When there is no such jump the line is one word, and
-/// the only gap wide enough to break it is one wider than the glyphs themselves.
-fn word_break(gaps: &[usize], median_width: f32) -> f32 {
+/// The gaps of one line fall into clusters — the ones inside a word, the ones between
+/// words and, on a table row, the ones between columns — and a boundary between two
+/// clusters is a jump between consecutive sorted gaps that is wide in absolute terms,
+/// against the size of the text, and a doubling of the gaps below it.
+///
+/// The LOWEST such boundary is what separates marks into words, so a row whose columns
+/// stand far apart still has its words split on its own word gaps rather than on the
+/// column gaps. The NEXT boundary above it separates those words into columns. A line
+/// that shows no second boundary has no column structure of its own, and only a gap
+/// several times its word gap is read as one; a line with no boundary at all is one word,
+/// where only a gap wider than the glyphs themselves breaks it.
+fn breaks(gaps: &[usize], median_width: f32) -> (f32, f32) {
     let mut sorted: Vec<usize> = gaps.to_vec();
     sorted.sort_unstable();
-    let mut best: Option<(usize, usize)> = None;
-    for pair in sorted.windows(2) {
-        let (low, high) = (pair[0], pair[1]);
-        let jump = (high - low) as f32;
-        // A cluster boundary: a jump that is both wide in absolute terms, against the
-        // size of the text, and a doubling of the gaps below it.
-        if jump >= (0.6 * median_width).max(2.0)
-            && high >= 2 * low.max(1)
-            && best.is_none_or(|(best_low, best_high)| best_high - best_low < high - low)
-        {
-            best = Some((low, high));
-        }
-    }
-    match best {
-        Some((low, high)) => (low + high) as f32 / 2.0,
-        // No two clusters: only a gap wider than the glyphs themselves breaks a word.
-        None => 0.9 * median_width,
-    }
+    sorted.dedup();
+    let boundaries: Vec<f32> = sorted
+        .windows(2)
+        .filter(|pair| {
+            let (low, high) = (pair[0], pair[1]);
+            (high - low) as f32 >= (0.6 * median_width).max(2.0) && high >= 2 * low.max(1)
+        })
+        .map(|pair| (pair[0] + pair[1]) as f32 / 2.0)
+        .collect();
+    let word_gap = boundaries
+        .first()
+        .copied()
+        .unwrap_or(0.9 * median_width)
+        .max(2.0);
+    let column_gap = boundaries.get(1).copied().unwrap_or(3.0 * word_gap);
+    (word_gap, column_gap)
 }
 
 // ---------------------------------------------------------------------------

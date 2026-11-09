@@ -188,9 +188,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The creation-time window is validated BEFORE anything is listed, on the same
+        // rule as every other listing taking this bound pair: its lower bound must lie at
+        // or before its upper bound.
+        if !crate::state::creation_window_is_range(
+            input.after_creation_time.as_ref(),
+            input.before_creation_time.as_ref(),
+        ) {
+            return Err(ListAdapterVersionsErrorModeled::ValidationException(
+                crate::state::invalid_time_range(),
+            )
+            .into());
+        }
+
         let now = std::time::SystemTime::now();
         let store = state.lock();
-
         // `AdapterId` is optional: naming one scopes the listing to that adapter, and
         // naming none lists the versions of every adapter this service holds. An
         // `AdapterId` that names no adapter is not an empty listing — it is the missing

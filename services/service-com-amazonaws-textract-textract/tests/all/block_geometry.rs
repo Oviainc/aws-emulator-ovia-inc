@@ -14,10 +14,9 @@
 //! * so the geometry varies with the document: between the lines of one page, between the
 //!   words of one line, and not at all between two renderings of the same page at two
 //!   sizes (the boxes are page-relative fractions);
-//! * a block's `Confidence` is the confidence of the characters IT was read from — for a
-//!   recognised page the mean score of its own glyphs, so a `LINE` reports the
-//!   character-weighted mean of its words; for text read VERBATIM the one documented
-//!   `state::EXTRACTED_TEXT_CONFIDENCE`, because nothing was recognised to measure.
+//! * a block's `Confidence` is the confidence of the characters IT was read from: the
+//!   mean score of its own glyphs, so a `LINE` reports the character-weighted mean of its
+//!   words.
 //!
 //! Both synchronous read paths are driven here (`DetectDocumentText` and
 //! `AnalyzeDocument`), because they answer over one document model and must report one
@@ -32,7 +31,6 @@ use std::collections::BTreeSet;
 
 use image::ImageFormat;
 use serde_json::{json, Value};
-use service_com_amazonaws_textract_textract::state;
 
 use crate::document_extraction::{
     assert_block_graph, block_id, block_type, blocks_of, call, harness, of_type, text_document,
@@ -309,14 +307,16 @@ fn geometry_cases() -> Vec<GeometryCase> {
             features: Vec::new(),
         },
         GeometryCase {
-            name: "a TIFF of six short lines",
+            name: "a JPEG of six short lines",
             lines: vec!["One", "Two", "Three", "Four", "Five", "Six"],
             paper: Paper {
                 scale: 3,
                 margin: 10,
                 ..Paper::plain()
             },
-            format: ImageFormat::Tiff,
+            // `Document$Bytes` carries "PNG or JPEG format"; a TIFF is a document only an
+            // Amazon S3 object may hold, and `crate::s3_sourced_documents` reads one.
+            format: ImageFormat::Jpeg,
             operation: "DetectDocumentText",
             features: Vec::new(),
         },
@@ -695,20 +695,22 @@ async fn a_blocks_confidence_is_measured_over_the_characters_it_was_read_from() 
     }
 }
 
-/// Lines of several lengths and labels, and a tab-separated table: a document read as
-/// CHARACTERS, so its geometry is the character grid its own text places it on.
+/// Lines of several lengths and labels, and a tab-separated table whose cells hold more
+/// than one word: a document whose every line is DRAWN onto the page, so its blocks are
+/// laid out where its own ink is.
 const TEXT_DOCUMENT: &str = "Statement of Account\n\
                              Invoice Number: INV-7781\n\
                              Prepared for: Simparity Logistics Incorporated\n\
-                             Item\tQty\tPrice\n\
-                             Widget\t12\t1250.00\n\
+                             Item Code\tQty\tUnit Price\n\
+                             Widget Mk2\t12\t1250.00\n\
                              Total Due: 1250.00\n";
 
 #[tokio::test]
-async fn a_text_documents_blocks_are_laid_out_from_its_own_text() {
+async fn a_documents_blocks_are_laid_out_from_the_text_it_holds() {
     let router = harness();
     let document = text_document(TEXT_DOCUMENT);
-    let drawn_lines: Vec<&str> = TEXT_DOCUMENT.lines().collect();
+    let drawn = crate::document_extraction::drawn_lines(TEXT_DOCUMENT);
+    let drawn_lines: Vec<&str> = drawn.iter().map(String::as_str).collect();
 
     for (case, request) in [
         (
@@ -724,12 +726,12 @@ async fn a_text_documents_blocks_are_laid_out_from_its_own_text() {
         let (status, body) = call(&router, operation, &request).await;
         assert_eq!(
             status, 200,
-            "case {case:?}: a readable text document must answer 200, got {status} with {body}"
+            "case {case:?}: a readable document must answer 200, got {status} with {body}"
         );
         let blocks = blocks_of(&body);
-        // Text read verbatim was not recognised, so every block reports the one
-        // documented confidence rather than a measurement nothing made.
-        assert_block_graph(case, &body, &blocks, Some(state::EXTRACTED_TEXT_CONFIDENCE));
+        // Each block reports the confidence measured over its own characters, so only
+        // `Percent`'s range holds for all of them.
+        assert_block_graph(case, &body, &blocks, None);
 
         // Every block the document's words were read into spans exactly those words.
         let checked = assert_spans_its_words(case, &blocks, 1e-6, &mut BTreeSet::new());
@@ -856,12 +858,10 @@ async fn a_text_documents_blocks_are_laid_out_from_its_own_text() {
     }
 }
 
-/// One row of the empty-cell table: the row as the document holds it, and the 1-based
-/// columns of it that hold no words.
-struct EmptyCellCase {
+/// One row of the table-cell geometry table: the row as the document holds it.
+struct TableRowCase {
     name: &'static str,
     row: &'static str,
-    empty: &'static [usize],
 }
 
 /// The `CELL` blocks of one row of the page's one table, in column order.
@@ -879,45 +879,34 @@ fn row_cells<'a>(case: &str, blocks: &'a [Value], row_index: i64) -> Vec<&'a Val
 }
 
 #[tokio::test]
-async fn a_table_cell_holding_no_words_is_bounded_by_the_cells_around_it() {
+async fn a_table_cells_box_spans_the_words_read_in_it() {
     let router = harness();
 
-    // A cell's box is the extent of the words read IN it, so a cell that holds no words
-    // has nothing of its own to have been measured: it spans the gap its neighbours
-    // leave, from the right edge of the nearest populated cell before it to the left edge
-    // of the nearest one after it. The rows differ along WHERE the empty cells sit and
-    // HOW MANY run together — the only ways the gap can be formed — and a trailing empty
-    // cell is not among them because trailing whitespace is not part of a line's text.
+    // A cell's box is the extent of the words read IN it, which are the children it names,
+    // and every cell of a row sits inside the TABLE the row belongs to. The rows differ
+    // along the shape of the table: how many columns the row has, and how many words stand
+    // in one cell.
+    //
+    // A cell holding NO words is not among them, and cannot be: a page shows a column
+    // break as a gap in its ink, and two gaps running together are one gap, so no page
+    // draws an empty cell between two populated ones.
     let cases = [
-        EmptyCellCase {
-            name: "one empty cell between two populated ones",
-            row: "Widget\t\t1250.00",
-            empty: &[2],
+        TableRowCase {
+            name: "two columns",
+            row: "Widget Mk2\t1250.00",
         },
-        EmptyCellCase {
-            name: "two empty cells running together",
-            row: "Widget\t\t\t1250.00",
-            empty: &[2, 3],
+        TableRowCase {
+            name: "three columns",
+            row: "Widget Mk2\t12\t1250.00",
         },
-        EmptyCellCase {
-            name: "an empty cell before every populated one",
-            row: "\tWidget\t1250.00",
-            empty: &[1],
-        },
-        EmptyCellCase {
-            name: "two empty cells before every populated one",
-            row: "\t\tWidget",
-            empty: &[1, 2],
-        },
-        EmptyCellCase {
-            name: "an empty cell at the start and another inside",
-            row: "\tWidget\t\t1250.00",
-            empty: &[1, 3],
+        TableRowCase {
+            name: "a cell of several words",
+            row: "Widget Mk2 Blue\t1250.00 USD",
         },
     ];
 
     for case in &cases {
-        let text = format!("Item\tQty\tPrice\n{}\n", case.row);
+        let text = format!("Item Code\tQty\tUnit Price\n{}\n", case.row);
         let (status, body) = call(
             &router,
             "AnalyzeDocument",
@@ -944,82 +933,19 @@ async fn a_table_cell_holding_no_words_is_bounded_by_the_cells_around_it() {
         );
 
         let boxes: Vec<Rect> = cells.iter().map(|cell| bbox_of(case.name, cell)).collect();
-        let populated: Vec<usize> = (1..=cells.len())
-            .filter(|column| !case.empty.contains(column))
-            .collect();
-        assert!(
-            !populated.is_empty(),
-            "case {:?}: the row must hold at least one populated cell",
-            case.name
-        );
-
-        for &column in case.empty {
-            let own = boxes[column - 1];
-            assert!(
-                own.width >= -1e-6,
-                "case {:?}: the empty cell at column {column} must not be reported \
-                 inside out, got {own:?}",
-                case.name
-            );
-            match populated.iter().rev().find(|before| **before < column) {
-                Some(&before) => assert!(
-                    (own.left - boxes[before - 1].right()).abs() < 1e-6,
-                    "case {:?}: the empty cell at column {column} must start where column \
-                     {before} ends ({:?}), got {own:?}",
-                    case.name,
-                    boxes[before - 1]
-                ),
-                // No populated cell before it: nothing was read to its left, so it may
-                // not start further right than the first cell that was.
-                None => assert!(
-                    own.left <= boxes[populated[0] - 1].left + 1e-6,
-                    "case {:?}: the empty cell at column {column} must start at or before \
-                     the row's first populated cell ({:?}), got {own:?}",
-                    case.name,
-                    boxes[populated[0] - 1]
-                ),
-            }
-            match populated.iter().find(|after| **after > column) {
-                Some(&after) => assert!(
-                    (own.right() - boxes[after - 1].left).abs() < 1e-6,
-                    "case {:?}: the empty cell at column {column} must end where column \
-                     {after} starts ({:?}), got {own:?}",
-                    case.name,
-                    boxes[after - 1]
-                ),
-                None => {
-                    let last = populated.last().copied().unwrap_or_default();
-                    assert!(
-                        own.right() >= boxes[last - 1].right() - 1e-6,
-                        "case {:?}: the empty cell at column {column} must end at or after \
-                         the row's last populated cell ({:?}), got {own:?}",
-                        case.name,
-                        boxes[last - 1]
-                    );
-                }
-            }
-            assert!(
-                cells[column - 1].get("Relationships").is_none(),
-                "case {:?}: the empty cell at column {column} holds no words, so it must \
-                 name no children, got {}",
-                case.name,
-                cells[column - 1]
-            );
-        }
-
-        // The positive control on the same row: a populated cell spans the words read in
-        // it, which are the children it names, and the table encloses every cell.
         let table = of_type(&blocks, "TABLE");
         let table_box = bbox_of(case.name, table[0]);
-        for &column in &populated {
-            let own = boxes[column - 1];
-            let words = children(&blocks, cells[column - 1]);
+        // Every cell of the row spans the words read IN it, which are the children it
+        // names, and the table encloses every cell.
+        for (index, cell) in cells.iter().enumerate() {
+            let column = index + 1;
+            let own = boxes[index];
+            let words = children(&blocks, cell);
             assert!(
                 !words.is_empty(),
-                "case {:?}: the populated cell at column {column} must name the words read \
-                 in it, got {}",
-                case.name,
-                cells[column - 1]
+                "case {:?}: the cell at column {column} must name the words read in it, got \
+                 {cell}",
+                case.name
             );
             let enclosing = union(
                 &words
@@ -1034,6 +960,16 @@ async fn a_table_cell_holding_no_words_is_bounded_by_the_cells_around_it() {
                  ({enclosing:?}), got {own:?}",
                 case.name
             );
+            // Cells are reported across the row: each one begins after the one before it.
+            if index > 0 {
+                assert!(
+                    own.left > boxes[index - 1].left,
+                    "case {:?}: the cell at column {column} comes later in the row, so it \
+                     must be reported further right, got {own:?} after {:?}",
+                    case.name,
+                    boxes[index - 1]
+                );
+            }
         }
         for (index, own) in boxes.iter().enumerate() {
             assert!(

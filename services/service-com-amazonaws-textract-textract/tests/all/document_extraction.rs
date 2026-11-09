@@ -143,6 +143,45 @@ fn related_ids(block: &Value, kind: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// How many character cells a tab is drawn as.
+///
+/// A column break is a gap distinctly wider than the line's own word gaps
+/// (`crate::state::ocr`'s clustering), so a tab is drawn wide enough to stand apart from
+/// the single-cell gap a space is drawn as.
+pub(crate) const TAB_CELLS: usize = 6;
+
+/// A `Document` of inline `Bytes` this service reads: `text`'s own lines DRAWN onto a
+/// page, encoded as a PNG.
+///
+/// `Document$Bytes` carries a document "in PNG or JPEG format", so a suite that wants a
+/// document holding known text submits that text as PIXELS and the service reads it back
+/// off them. The page is drawn with the same public-domain 8x8 font the recogniser holds
+/// templates for (`crate::raster_documents::render`), so the characters that come back
+/// are the characters that went in.
+pub(crate) fn text_document(text: &str) -> Value {
+    crate::raster_documents::raster_document(&text_page(text), image::ImageFormat::Png)
+}
+
+/// The page [`text_document`] draws, for a suite that needs the pixels or another format.
+pub(crate) fn text_page(text: &str) -> image::GrayImage {
+    let lines = drawn_lines(text);
+    crate::raster_documents::render(
+        &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+        crate::raster_documents::Paper {
+            scale: 3,
+            ..crate::raster_documents::Paper::plain()
+        },
+    )
+}
+
+/// `text`'s lines as they are DRAWN: one line of the document per line of ink, with each
+/// tab widened into the gap that makes its neighbours two columns rather than two words.
+pub(crate) fn drawn_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| line.replace('\t', &" ".repeat(TAB_CELLS)))
+        .collect()
+}
+
 fn find<'a>(blocks: &'a [Value], id: &str) -> Option<&'a Value> {
     blocks.iter().find(|block| block_id(block) == id)
 }
@@ -155,14 +194,12 @@ fn collapse(text: &str) -> String {
 /// Every invariant a Textract block graph holds, whatever the document or the
 /// requested features.
 ///
-/// `expected_confidence` is the one value every block of this answer must report, when
-/// the caller knows it: a document whose text was read VERBATIM reports
-/// `state::EXTRACTED_TEXT_CONFIDENCE` on every block, because its characters were read
-/// rather than recognised and there is nothing finer to report. A RECOGNISED page is
-/// passed `None`: each of its blocks reports the confidence measured over the characters
-/// IT was read from, so the values differ between blocks and only `Percent`'s range is
-/// asserted here (`confidence_varies_with_the_text_it_was_measured_from` is where the
-/// spread itself is asserted).
+/// `expected_confidence` is the one value every block of this answer must report, where a
+/// caller knows it. A page read off its pixels is passed `None`: each of its blocks
+/// reports the confidence measured over the characters IT was read from, so the values
+/// differ between blocks and only `Percent`'s range is asserted here
+/// (`confidence_varies_with_the_text_it_was_measured_from` is where the spread itself is
+/// asserted).
 pub(crate) fn assert_block_graph(
     case: &str,
     body: &Value,
@@ -374,10 +411,6 @@ fn line_texts(blocks: &[Value]) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn text_document(text: &str) -> Value {
-    json!({ "Bytes": aws_smithy_types::base64::encode(text.as_bytes()) })
-}
-
 /// One readable-document case of the DetectDocumentText table.
 struct DetectCase {
     name: &'static str,
@@ -391,6 +424,10 @@ struct DetectCase {
 async fn detect_document_text_reports_the_text_the_document_holds() {
     let router = harness();
 
+    // Every row is a document DRAWN from known text (`text_document`), so what is
+    // asserted is the round trip: the lines that come back are the lines that went in.
+    // One raster is one page — the multi-page document formats (PDF, and a TIFF of
+    // several frames) are not ones this emulator decodes, so every row is a page.
     let cases = vec![
         DetectCase {
             name: "one page",
@@ -403,22 +440,10 @@ async fn detect_document_text_reports_the_text_the_document_holds() {
             ],
         },
         DetectCase {
-            name: "two pages split on a form feed",
-            text: "First page line\n\u{c}Second page line\nand another",
-            expected_pages: 2,
-            expected_lines: vec!["First page line", "Second page line", "and another"],
-        },
-        DetectCase {
-            name: "three pages",
-            text: "One\n\u{c}Two\n\u{c}Three",
-            expected_pages: 3,
-            expected_lines: vec!["One", "Two", "Three"],
-        },
-        DetectCase {
             name: "tab separated rows are still lines and words",
-            text: "Item\tQuantity\nWidget\t3",
+            text: "Item Code\tQuantity Shipped\nWidget Mk2\t3 Crates",
             expected_pages: 1,
-            expected_lines: vec!["Item\tQuantity", "Widget\t3"],
+            expected_lines: vec!["Item Code\tQuantity Shipped", "Widget Mk2\t3 Crates"],
         },
         DetectCase {
             name: "blank lines carry no block",
@@ -427,10 +452,10 @@ async fn detect_document_text_reports_the_text_the_document_holds() {
             expected_lines: vec!["Only line"],
         },
         DetectCase {
-            name: "non-ascii text",
-            text: "Référence: ÀÉÎ-7\nMontant dû 12,00 €",
+            name: "digits and punctuation",
+            text: "Ref: AB-7/9\nAmount 12.00 (net)",
             expected_pages: 1,
-            expected_lines: vec!["Référence: ÀÉÎ-7", "Montant dû 12,00 €"],
+            expected_lines: vec!["Ref: AB-7/9", "Amount 12.00 (net)"],
         },
         DetectCase {
             name: "a single word",
@@ -455,12 +480,9 @@ async fn detect_document_text_reports_the_text_the_document_holds() {
             "case {:?}: expected blocks, got {body}",
             case.name
         );
-        assert_block_graph(
-            case.name,
-            &body,
-            &blocks,
-            Some(state::EXTRACTED_TEXT_CONFIDENCE),
-        );
+        // A recognised page reports the confidence measured over each block's own
+        // characters, so only `Percent`'s range is asserted here.
+        assert_block_graph(case.name, &body, &blocks, None);
         assert_text_detection_only(case.name, &blocks);
         assert_eq!(
             body.get("DetectDocumentTextModelVersion")
@@ -529,8 +551,16 @@ async fn detect_document_text_refuses_a_document_whose_text_it_cannot_read() {
     let truncated_png = [
         0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01, 0x02, 0xFF,
     ];
-    // Over `state::MAX_BLOCKS_PER_DOCUMENT` once expanded: one LINE and one WORD each.
-    let too_many_blocks = "x\n".repeat(state::MAX_BLOCKS_PER_DOCUMENT / 4);
+    // More marks than this emulator recognises on one page: a document too large to
+    // process, whatever format it arrived in.
+    let dense: Vec<String> = (0..120).map(|_| "x".repeat(90)).collect();
+    let dense_page = crate::raster_documents::render(
+        &dense.iter().map(String::as_str).collect::<Vec<_>>(),
+        crate::raster_documents::Paper {
+            scale: 1,
+            ..crate::raster_documents::Paper::plain()
+        },
+    );
     let too_many_bytes = vec![b'a'; state::MAX_INLINE_DOCUMENT_BYTES + 1];
 
     let cases: Vec<(&str, Value, &str)> = vec![
@@ -545,8 +575,8 @@ async fn detect_document_text_refuses_a_document_whose_text_it_cannot_read() {
             "UnsupportedDocumentException",
         ),
         (
-            "bytes that hold no text at all",
-            json!({ "Bytes": aws_smithy_types::base64::encode(b"   \n\t\n") }),
+            "characters, which are not a document format Document$Bytes accepts",
+            json!({ "Bytes": aws_smithy_types::base64::encode(b"Invoice Number: INV-1\n") }),
             "UnsupportedDocumentException",
         ),
         (
@@ -565,8 +595,8 @@ async fn detect_document_text_refuses_a_document_whose_text_it_cannot_read() {
             "DocumentTooLargeException",
         ),
         (
-            "more blocks than one document may expand into",
-            text_document(&too_many_blocks),
+            "more marks than one page may hold",
+            crate::raster_documents::raster_document(&dense_page, image::ImageFormat::Png),
             "DocumentTooLargeException",
         ),
         (
@@ -630,9 +660,15 @@ struct FeatureCase {
 
 /// A document whose text carries both labelled fields and a tab-separated table, so
 /// FORMS and TABLES each have real text to read.
+///
+/// Every cell of the table holds more than one word: what makes a gap a COLUMN break
+/// rather than a word break is that it is distinctly wider than the line's own word gaps,
+/// so a row of one-word cells is a row of words.
 const ANALYSIS_DOCUMENT: &str = "Statement of Account\nInvoice Number: INV-7781\n\
                                  Customer Name: Acme Corporation\n\
-                                 Item\tQuantity\tAmount\nWidget\t3\t12.00\nGadget\t1\t99.95\n\
+                                 Item Code\tQuantity Sent\tAmount Due\n\
+                                 Widget Mk2\t3 Crates\t12.00 USD\n\
+                                 Gadget Mk1\t1 Crate\t99.95 USD\n\
                                  Thank you";
 
 #[tokio::test]
@@ -724,12 +760,7 @@ async fn analyze_document_block_set_follows_the_requested_feature_types() {
         }
 
         let blocks = blocks_of(&body);
-        assert_block_graph(
-            case.name,
-            &body,
-            &blocks,
-            Some(state::EXTRACTED_TEXT_CONFIDENCE),
-        );
+        assert_block_graph(case.name, &body, &blocks, None);
         assert_eq!(
             body.get("AnalyzeDocumentModelVersion")
                 .and_then(Value::as_str),
@@ -876,7 +907,7 @@ async fn analyze_document_block_set_follows_the_requested_feature_types() {
     }
 }
 
-/// A line can be far wider than the page's character grid, in every feature set: the
+/// A line can be far wider than the page it is read off, in every feature set: the
 /// layout must saturate rather than panic, and the geometry must stay on the page.
 #[tokio::test]
 async fn a_document_wider_than_the_page_grid_still_lays_out() {
@@ -887,11 +918,23 @@ async fn a_document_wider_than_the_page_grid_still_lays_out() {
         .collect::<Vec<_>>()
         .join(" ");
     let wide_row: String = (0..40)
-        .map(|i| format!("c{i}"))
+        .map(|i| format!("c{i} x"))
         .collect::<Vec<_>>()
         .join("\t");
     let text = format!("{long_word}\n{many_words}\nLabel: {long_word}\n{wide_row}\n{wide_row}");
-    let document = text_document(&text);
+    // Drawn at the font's own size: the page is as wide as its longest line of ink, and
+    // this one is hundreds of characters long.
+    let page = crate::raster_documents::render(
+        &drawn_lines(&text)
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        crate::raster_documents::Paper {
+            scale: 1,
+            ..crate::raster_documents::Paper::plain()
+        },
+    );
+    let document = crate::raster_documents::raster_document(&page, image::ImageFormat::Png);
 
     for features in [
         Vec::new(),
@@ -926,7 +969,7 @@ async fn a_document_wider_than_the_page_grid_still_lays_out() {
             blocks.len()
         );
         // assert_block_graph checks every bounding box stays inside 0..=1.
-        assert_block_graph(&case, &body, &blocks, Some(state::EXTRACTED_TEXT_CONFIDENCE));
+        assert_block_graph(&case, &body, &blocks, None);
     }
 }
 
@@ -1115,14 +1158,18 @@ async fn start_and_get_document_text_detection_round_trip_through_the_job() {
 #[tokio::test]
 async fn a_cursor_pages_a_stored_block_list_exactly() {
     // The block list a real DetectDocumentText answer is built from, so the paging rule
-    // is asserted over the same values the wire carries.
-    let bytes = ANALYSIS_DOCUMENT.as_bytes();
+    // is asserted over the same values the wire carries: the fixture document DRAWN onto
+    // a page and read back off its pixels.
+    let bytes = crate::raster_documents::encode(
+        &text_page(ANALYSIS_DOCUMENT),
+        image::ImageFormat::Png,
+    );
     let document = service_com_amazonaws_textract_textract::ops::types::Document {
-        bytes: Some(bytes.to_vec()),
+        bytes: Some(bytes.clone()),
         s3_object: None,
     };
     let reference = state::reference_for_document(&document).expect("a readable document");
-    let content = state::read_content(&reference, Some(bytes)).expect("readable text");
+    let content = state::read_content(&reference, Some(&bytes)).expect("a readable page");
     let all = state::blocks(
         &reference.identity_key(),
         &content,

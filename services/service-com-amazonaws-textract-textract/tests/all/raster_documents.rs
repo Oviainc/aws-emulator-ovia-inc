@@ -4,11 +4,12 @@
 //! document submitted as pixels rather than as characters.
 //!
 //! The rule under test, over a table of inputs rather than one recorded page:
-//! a synchronous document operation given inline `Bytes` in a raster format Textract
-//! accepts answers HTTP 200 with the text its pixels really carry — a `PAGE` block, the
-//! `LINE` blocks of the lines of ink on the page and the `WORD` blocks of the words in
-//! them — and `UnsupportedDocumentException` answers every byte string no page can be
-//! read out of, whether it is in no format the service reads or in an accepted one its
+//! a synchronous document operation given inline `Bytes` in a raster format
+//! `Document$Bytes` carries — "PNG or JPEG format" — answers HTTP 200 with the text its
+//! pixels really carry — a `PAGE` block, the `LINE` blocks of the lines of ink on the
+//! page and the `WORD` blocks of the words in them — and `UnsupportedDocumentException`
+//! answers every byte string no page can be read out of, whether it is in no format the
+//! service reads, in a format this channel does not carry, or in an accepted one its
 //! decoder cannot read. The rows differ along what the rule generalises over: the format,
 //! the size the text is rendered at, where it sits on the page, the polarity and contrast
 //! of the ink, the stroke weight, and whether the page carries any text at all.
@@ -258,15 +259,6 @@ fn recognition_cases() -> Vec<RasterCase> {
             Paper {
                 scale: 3,
                 rule: true,
-                ..Paper::plain()
-            },
-        ),
-        exact(
-            "a TIFF",
-            sample_lines(),
-            ImageFormat::Tiff,
-            Paper {
-                scale: 3,
                 ..Paper::plain()
             },
         ),
@@ -682,6 +674,23 @@ async fn bytes_in_no_format_this_service_reads_are_refused_as_unsupported() {
         (
             "a PNG cut in half",
             truncated,
+            "UnsupportedDocumentException",
+        ),
+        (
+            // `Document$Bytes` carries a document "in PNG or JPEG format", so a TIFF —
+            // a format Textract reads out of an Amazon S3 object — is not a document
+            // this channel takes. `crate::s3_sourced_documents` reads one from an object.
+            "a TIFF, which inline Bytes do not carry",
+            encode(
+                &render(&sample_lines(), Paper { scale: 3, ..Paper::plain() }),
+                ImageFormat::Tiff,
+            ),
+            "UnsupportedDocumentException",
+        ),
+        (
+            // Characters are not one of the document formats Textract processes.
+            "a text document",
+            b"Invoice Number: INV-1\nTotal Due: 42.50\n".to_vec(),
             "UnsupportedDocumentException",
         ),
         (

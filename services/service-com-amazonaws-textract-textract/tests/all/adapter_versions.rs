@@ -490,14 +490,8 @@ async fn creation_time_bounds_are_the_windows_inclusive_edges() {
             json!({ "BeforeCreationTime": epoch_seconds(at(0) - Duration::from_secs(1)) }),
             vec![],
         ),
-        (
-            "a window with its bounds crossed",
-            json!({
-                "AfterCreationTime": epoch_seconds(at(300)),
-                "BeforeCreationTime": epoch_seconds(at(0)),
-            }),
-            vec![],
-        ),
+        // A window whose bounds are crossed is no range at all and is REFUSED rather
+        // than listed; that refusal is asserted in `crate::creation_time_windows`.
     ];
 
     for (name, criteria, wanted) in &cases {

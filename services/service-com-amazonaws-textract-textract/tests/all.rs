@@ -23,8 +23,14 @@ mod adapters;
 mod authorization;
 #[path = "all/block_geometry.rs"]
 mod block_geometry;
+#[path = "all/block_geometry_table_cells.rs"]
+mod block_geometry_table_cells;
+#[path = "all/creation_time_windows.rs"]
+mod creation_time_windows;
 #[path = "all/document_extraction.rs"]
 mod document_extraction;
+#[path = "all/document_formats.rs"]
+mod document_formats;
 #[path = "all/expense_analysis.rs"]
 mod expense_analysis;
 #[path = "all/queries_and_input_refusals.rs"]

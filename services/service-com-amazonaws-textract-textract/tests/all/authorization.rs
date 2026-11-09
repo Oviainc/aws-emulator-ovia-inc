@@ -282,9 +282,10 @@ fn documents_in_force(
     ]
 }
 
-/// A `Document` of inline bytes this service can read.
+/// A `Document` of inline bytes this service can read: the text DRAWN onto a page, which
+/// is the format `Document$Bytes` carries.
 fn readable_document() -> Value {
-    json!({ "Bytes": aws_smithy_types::base64::encode(DOCUMENT_TEXT.as_bytes()) })
+    crate::document_extraction::text_document(DOCUMENT_TEXT)
 }
 
 /// The operations this suite holds to the rule, with the request each is given: one
