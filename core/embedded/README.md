@@ -26,6 +26,11 @@ one emulator shares its state; two emulators never do.
 off; `aws_credentials_provider()` turns that into an AWS SDK credentials provider,
 with placeholder keys when authentication is off.
 
+`certificate_authority()` is the TLS certificate authority behind every listener the
+emulator opens, such as one a signed URL it returns points at. Trust `pem()` (for
+`AWS_CA_BUNDLE` or `curl --cacert`) or `der()` (for a rustls root store) to fetch
+those URLs.
+
 ## Usage
 
 This crate names no service and depends on no `aws-sdk-*` crate. The host adds

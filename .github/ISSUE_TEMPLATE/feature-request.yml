@@ -1,0 +1,51 @@
+name: Feature request
+description: >-
+  Ask for a change to the emulator itself, such as how you install, start, configure, run or use it,
+  or a capability beyond matching AWS that would help you build and test.
+labels: ["needs-triage", "feature-request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This form is for the emulator itself. If an AWS API is missing from the emulator or behaves differently from AWS, use "Behavior differs from AWS" instead.
+
+        Remove credentials, account IDs, personal data and anything else sensitive from what you paste.
+
+        We triage new requests, but we can't commit to when a request will be addressed. If someone has already asked for this, add a 👍 reaction to that issue instead: it helps us prioritize.
+  - type: checkboxes
+    id: checked
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched open and recently closed issues and found no request for this.
+          required: true
+        - label: I checked that the latest version of the emulator doesn't already do this.
+          required: true
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: >-
+        The problem behind the request and why it matters to you. What are you building or testing, what are
+        you trying to achieve, and what gets in the way today? Describe the problem rather than a solution,
+        so we can look for the best way to address it.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: What would help
+      description: How you imagine a better experience with the emulator, and how this change would help you get there.
+    validations:
+      required: true
+  - type: textarea
+    id: other
+    attributes:
+      label: Other information
+      description: How you work around it today, if you do, how much this affects your work, alternatives you considered, or links to related issues.
+  - type: textarea
+    id: version
+    attributes:
+      label: Emulator version
+      description: The output of aws-emulator -v, or the crate version in embedded mode.
+      render: text

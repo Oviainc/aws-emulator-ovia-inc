@@ -1,0 +1,66 @@
+name: Behavior differs from AWS
+description: >-
+  The emulator doesn't support an AWS API yet, or behaves differently from AWS, such as a different
+  response or error, or an expected side effect is missing.
+labels: ["needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for telling us. Please don't report security vulnerabilities here: use https://aws.amazon.com/security/vulnerability-reporting/ instead.
+
+        Remove credentials, account IDs, personal data and anything else sensitive from what you paste.
+
+        We triage new issues, but we can't commit to when an issue will be addressed. If someone has already reported what you're seeing, add a 👍 reaction to that issue instead: it helps us prioritize.
+  - type: checkboxes
+    id: checked
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched open and recently closed issues and found no report of this.
+          required: true
+        - label: I checked that this still happens with the latest version of the emulator.
+          required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: What the emulator returned or did, or what it didn't do. Include the error code and message, and any emulator log output around the request.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: What AWS returns or does for the same request, and how you know (for example, you ran it against AWS, or the AWS documentation says so).
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: >-
+        Ideally a script that shows it from a freshly started emulator that nothing else is using, including
+        any resources it creates first. Say which client or SDK and version you used, the Region, how you
+        pointed it at the emulator (for example AWS_ENDPOINT_URL), and any emulator setting you changed from
+        the default. If you can, run it again to check that it reproduces.
+    validations:
+      required: true
+  - type: textarea
+    id: version
+    attributes:
+      label: Emulator version
+      description: The output of aws-emulator -v, or the crate version in embedded mode.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact and workaround
+      description: How this affects your work, and any workaround you use for now. This helps us prioritize.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that helps, such as more logs, or whether this worked in an earlier version.

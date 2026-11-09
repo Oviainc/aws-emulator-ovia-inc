@@ -72,6 +72,18 @@ There are two kinds of credentials:
   the id and secrets you get back, write none to a file or log, and delete them with
   `delete(id)`; never construct an id or a secret yourself.
 
+A URL an operation returns for the caller to fetch later must lead back to this emulator:
+
+- A presigned URL (a download or upload location, a callback URL): sign it with
+  `ctx.url_signer().sign(SignedUrlRequest::new(method, signing_name, path), expires_in)`, with
+  `path` decoded as the model lays it out, and return `url.as_str()`. Return `expires_at()` and
+  `required_headers()` as well when the output has members for them. Code without a context
+  (state, a background task) is handed a clone of `ctx.url_signer()`. Never write
+  `X-Amz-Signature` yourself or presign with an AWS SDK: that URL reaches the real service or
+  fails verification.
+- An unsigned address (a queue URL, a resource endpoint): `ctx.endpoint()` followed by the
+  resource's path. Never build it from `<service>.<region>.amazonaws.com`.
+
 The emulator verifies every request signature: a service never checks signatures itself.
 
 ## Quick Start

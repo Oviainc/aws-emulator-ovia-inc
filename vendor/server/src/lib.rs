@@ -1114,7 +1114,7 @@ fn parse_bind_address(raw: Option<&str>) -> Result<IpAddr, ServeError> {
 /// ports — this is what lets callers run concurrent emulators without the
 /// `Address already in use` failures that fixed ports caused. The caller learns
 /// the actual port from [`serve_production`]'s post-bind startup announcement
-/// (`data_addr`, repeated as `health_addr`).
+/// (`endpoint_url`, the URL clients dial).
 pub fn data_port_from_env() -> u16 {
     parse_port(std::env::var(DATA_PORT_ENV).ok().as_deref(), DEFAULT_DATA_PORT)
 }
@@ -1137,7 +1137,7 @@ fn parse_port(raw: Option<&str>, default: u16) -> u16 {
 /// concrete port the OS actually chose. Binding the data listener up front (as
 /// a `std::net::TcpListener` handed to `axum_server::from_tcp_rustls`) rather
 /// than letting `axum_server` bind lazily is what makes the announced
-/// `data_addr` carry the *real* port when `data_port == 0`; otherwise the
+/// `endpoint_url` carry the *real* port when `data_port == 0`; otherwise the
 /// announcement would advertise the placeholder `:0` and the launcher could not
 /// discover the endpoint.
 fn bind_production_listener(
@@ -1162,8 +1162,8 @@ fn bind_production_listener(
 ///
 /// Passing `0` lets several emulators run **concurrently on one host** without
 /// colliding on the fixed well-known port. The startup announcement logs the
-/// **post-bind actual** `data_addr` / `health_addr` (the same socket), so even
-/// with `0` the caller can discover the real port.
+/// **post-bind actual** port in `endpoint_url` and `health_check_url`, so even with
+/// `0` the caller can discover the real port.
 ///
 /// Delegates to [`serve_production_on_address`]; callers that must pin explicit
 /// ports (e.g. tests) can call [`serve_production_on`] directly.
@@ -1291,15 +1291,19 @@ pub async fn serve_production_on_address<S: EmulatorService>(
     let config_file = request_authentication::write_emulator_file(port, "config", &config_text)
         .map_err(ServeError::Io)?;
 
+    // `endpoint_url` is what clients dial; a bind other machines can reach is named by the
+    // exposure warning below.
     tracing::info!(
-        %data_addr,
+        %endpoint_url,
+        health_check_url = %format_args!("{endpoint_url}{HEALTH_PATH}"),
         config_file = %config_file.0.display(),
         ca_file = %ca_file.0.display(),
         java_truststore_file = %java_truststore_file.0.display(),
-        health_addr = %data_addr,
-        %bind_address,
-        "emulator server starting: serving the API and {HEALTH_PATH} over HTTPS on one port"
+        "emulator server information"
     );
+    for warning in exposure_warnings(bind_address, port, authentication_enabled()) {
+        tracing::warn!(%bind_address, "{warning}");
+    }
     // Ready means the port is bound and the client files are written: an error
     // before this point is a failed startup.
     if let Some(telemetry) = emulator_telemetry::global() {
@@ -1326,6 +1330,29 @@ pub async fn serve_production_on_address<S: EmulatorService>(
 
     Ok(())
 }
+
+/// What a start must warn about: a bind other machines can reach, and request authentication
+/// being off. Each names who can reach the emulator and how to narrow it, so the log alone says
+/// what to change.
+fn exposure_warnings(bind_address: IpAddr, port: u16, authentication: bool) -> Vec<String> {
+    let reachable = !bind_address.to_canonical().is_loopback();
+    let reachable_bind = reachable.then(|| reachable_bind_warning(bind_address, port));
+    let authentication_off = (!authentication).then(|| AUTHENTICATION_OFF_WARNING.to_string());
+    reachable_bind
+        .into_iter()
+        .chain(authentication_off)
+        .collect()
+}
+
+fn reachable_bind_warning(bind_address: IpAddr, port: u16) -> String {
+    format!(
+        "the emulator listens on {bind_address}, not loopback: other machines that can \
+         reach port {port} can call it; bind 127.0.0.1 (-b 127.0.0.1) unless that is intended"
+    )
+}
+
+const AUTHENTICATION_OFF_WARNING: &str = "request authentication is off: the emulator accepts \
+     any request, signed or not; start it with -a on to require signatures";
 
 /// The address a client dials to reach a listener bound on `bind_address`: the address itself,
 /// or loopback for a wildcard bind, which has no single address to name.
@@ -2763,6 +2790,42 @@ mod tests {
         // Customers copy this port from the AWS Emulator user guide. Changing
         // it needs a user guide change in the same release.
         check!(DEFAULT_DATA_PORT == 9297);
+    }
+
+    #[test]
+    fn a_loopback_authenticated_start_warns_about_nothing() {
+        let loopback = [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "::1".parse().unwrap(),
+            "::ffff:127.0.0.1".parse().unwrap(),
+        ];
+        for bind in loopback {
+            check!(exposure_warnings(bind, 9297, true).is_empty(), "{bind}");
+        }
+    }
+
+    #[test]
+    fn every_non_loopback_bind_warns_who_can_reach_the_emulator() {
+        for bind in ["0.0.0.0", "::", "10.0.0.5"] {
+            let warnings = exposure_warnings(bind.parse().unwrap(), 9297, true);
+            let expected = format!("the emulator listens on {bind}, not loopback");
+            check!(
+                warnings.len() == 1 && warnings[0].starts_with(&expected),
+                "{bind}"
+            );
+            check!(warnings[0].contains("port 9297"));
+        }
+    }
+
+    #[test]
+    fn a_start_without_authentication_warns_that_any_request_is_accepted() {
+        let warnings = exposure_warnings(IpAddr::V4(Ipv4Addr::LOCALHOST), 9297, false);
+        check!(warnings == [AUTHENTICATION_OFF_WARNING]);
+    }
+
+    #[test]
+    fn a_reachable_start_without_authentication_warns_about_both() {
+        check!(exposure_warnings(Ipv4Addr::UNSPECIFIED.into(), 9297, false).len() == 2);
     }
 
     #[test]

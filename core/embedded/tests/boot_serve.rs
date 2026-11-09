@@ -29,7 +29,15 @@ fn the_in_process_facade_assembles() {
         .name("boot-check".to_string())
         .stack_size(BOOT_STACK_SIZE)
         .spawn(|| {
-            assert_sdk_http_client(AwsEmulatorEmbedded::default().http_client());
+            let emulator = AwsEmulatorEmbedded::default();
+            assert_sdk_http_client(emulator.http_client());
+            assert!(
+                emulator
+                    .certificate_authority()
+                    .pem()
+                    .starts_with("-----BEGIN CERTIFICATE-----"),
+                "the facade must hand a host the certificate its listeners present"
+            );
         })
         .expect("spawn the boot-check thread")
         .join()

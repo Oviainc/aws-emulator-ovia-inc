@@ -16,7 +16,7 @@
 //! emulators never do.
 
 pub use emulator_server::embedded::{Authentication, EmbeddedOptions, Telemetry};
-pub use emulator_server::VendedCredentials;
+pub use emulator_server::{TlsCertificateAuthority, VendedCredentials};
 use emulator_telemetry::{TelemetryClient, TelemetryOptions};
 use smithy_server_runtime::EmbeddedEmulator;
 use std::sync::Once;
@@ -90,6 +90,13 @@ impl AwsEmulatorEmbedded {
         &self,
     ) -> emulator_server::embedded::SharedCredentialsProvider {
         self.emulator.aws_credentials_provider()
+    }
+
+    /// The TLS certificate authority behind every listener this emulator opens, such as the
+    /// one a signed URL points at. Trust it to fetch those URLs: `pem()` for `AWS_CA_BUNDLE`
+    /// or `curl --cacert`, `der()` for a rustls root store.
+    pub fn certificate_authority(&self) -> &TlsCertificateAuthority {
+        self.emulator.certificate_authority()
     }
 }
 
