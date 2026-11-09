@@ -132,14 +132,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // What the ARN names, for the modelled required members of a refusal. Read off
-        // the request, so an ARN naming nothing still reports what it named.
-        let (kind, resource_id) = crate::state::arn_resource(&input.resource_arn);
+        // An ARN naming no resource this service holds: the refusal states the service's
+        // own sentence for the ARN-keyed path and names neither the resource nor its kind.
         let not_found = || {
-            UntagResourceErrorModeled::ResourceNotFoundException(crate::state::not_found(
-                kind,
-                &resource_id,
-            ))
+            UntagResourceErrorModeled::ResourceNotFoundException(crate::state::arn_not_found())
         };
 
         // This operation models no server error, and an engine holding no PCS state

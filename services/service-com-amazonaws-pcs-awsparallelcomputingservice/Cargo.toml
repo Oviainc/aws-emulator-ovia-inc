@@ -23,6 +23,14 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes the opaque `nextToken` a paginated list hands back.
 hex = { workspace = true }
+# The AWS SDK for IAM, driven over the in-process callback
+# (`OperationContext::callback`): `CreateComputeNodeGroup` resolves the instance profile
+# its `iamInstanceProfileArn` references with `GetInstanceProfile` before it resolves
+# anything of its own. Only the generated client is needed — the emulator supplies the
+# transport, so the SDK's own HTTPS stack and runtime are left out.
+aws-sdk-iam = { version = "1", default-features = false }
+# The tree's shared IAM-ARN reading, in-process IAM client and `@pattern` rendering.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

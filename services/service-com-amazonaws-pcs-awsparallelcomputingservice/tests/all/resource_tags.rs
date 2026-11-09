@@ -16,7 +16,8 @@
 //! * a resource holds at most `MAX_TAGS_PER_RESOURCE` tags, and a write that would leave
 //!   it with more is refused whole with the modelled `ServiceQuotaExceededException`;
 //! * an ARN no stored resource carries is refused with `ResourceNotFoundException` on all
-//!   three operations.
+//!   three operations, carrying the service's fixed sentence for the ARN-keyed path
+//!   ([`ARN_NOT_FOUND`]) and naming neither the resource nor its kind.
 //!
 //! Each test builds its own engine, so the state one test writes is invisible to the
 //! others.
@@ -39,6 +40,11 @@ const SIGNED_FOR_PCS: &str = "AWS4-HMAC-SHA256 \
 
 /// The region [`SIGNED_FOR_PCS`] signs for, which every ARN in these tests carries.
 const REGION: &str = "us-east-1";
+
+/// The sentence PCS states for an ARN that names no resource it holds — the ARN-keyed
+/// lookup the tagging operations take, as against the identifier-keyed lookups, whose
+/// sentence names the kind of resource.
+const ARN_NOT_FOUND: &str = "Resource cannot be found.";
 
 /// An emulator with only PCS mounted, on its own engine.
 fn emulator() -> MultiServiceRouter {
@@ -578,11 +584,14 @@ async fn the_tagging_operations_refuse_an_arn_no_resource_carries() {
     // Rows: an ARN naming each resource kind that does not exist — one inside a cluster
     // that DOES exist, so the refusal is about the child and not its parent — plus an ARN
     // in another region, which names no resource this account's store holds either.
-    let absent: Vec<(&str, String, &str)> = vec![
+    //
+    // The refusal is the same whichever of them is named: the ARN-keyed path states the
+    // service's own fixed sentence for a resource that cannot be found and names neither
+    // the resource nor its kind, because the ARN the caller sent carries both.
+    let absent: Vec<(&str, String)> = vec![
         (
             "cluster",
             format!("arn:aws:pcs:{REGION}:{account}:cluster/pcs_0000000000000000"),
-            "AWS PCS couldn't find the cluster you specified.",
         ),
         (
             "queue",
@@ -590,7 +599,6 @@ async fn the_tagging_operations_refuse_an_arn_no_resource_carries() {
                 "arn:aws:pcs:{REGION}:{account}:cluster/{}/queue/pcs_0000000000000000",
                 created.cluster_id
             ),
-            "AWS PCS couldn't find the queue you specified.",
         ),
         (
             "computenodegroup",
@@ -598,14 +606,12 @@ async fn the_tagging_operations_refuse_an_arn_no_resource_carries() {
                 "arn:aws:pcs:{REGION}:{account}:cluster/{}/computenodegroup/pcs_0000000000000000",
                 created.cluster_id
             ),
-            "AWS PCS couldn't find the compute node group you specified.",
         ),
         (
             "cluster",
             created
                 .cluster_arn
                 .replace(REGION, "eu-west-1"),
-            "AWS PCS couldn't find the cluster you specified.",
         ),
         // A child id that EXISTS, under a cluster id that does not: a resource is reached
         // by exactly the ARN the service minted for it, never by one that merely ends in
@@ -616,7 +622,6 @@ async fn the_tagging_operations_refuse_an_arn_no_resource_carries() {
                 &created.cluster_id,
                 "pcs_0000000000000000",
             ),
-            "AWS PCS couldn't find the queue you specified.",
         ),
         (
             "computenodegroup",
@@ -624,11 +629,10 @@ async fn the_tagging_operations_refuse_an_arn_no_resource_carries() {
                 &created.cluster_id,
                 "pcs_0000000000000000",
             ),
-            "AWS PCS couldn't find the compute node group you specified.",
         ),
     ];
 
-    for (resource_type, arn, message) in &absent {
+    for (resource_type, arn) in &absent {
         for (operation, request) in [
             (
                 "TagResource",
@@ -653,13 +657,20 @@ async fn the_tagging_operations_refuse_an_arn_no_resource_carries() {
             );
             assert_eq!(
                 body["message"],
-                json!(message),
-                "case {operation} on an absent {resource_type}: expected {message:?}, got {body:?}"
+                json!(ARN_NOT_FOUND),
+                "case {operation} on an absent {resource_type}: expected {ARN_NOT_FOUND:?}, got \
+                 {body:?}"
             );
+            // The ARN-keyed path names neither the resource nor its kind; the two members
+            // are modelled `@required`, so they travel empty rather than absent.
             assert_eq!(
-                body["resourceType"],
-                json!(resource_type),
-                "case {operation} on an absent {resource_type}: got {body:?}"
+                (
+                    body["resourceId"].as_str().unwrap_or_default(),
+                    body["resourceType"].as_str().unwrap_or_default()
+                ),
+                ("", ""),
+                "case {operation} on an absent {resource_type}: expected neither member to be \
+                 populated, got {body:?}"
             );
         }
     }

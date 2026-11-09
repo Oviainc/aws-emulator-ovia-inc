@@ -230,14 +230,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `computeNodeGroupName` carries the same lookahead `@pattern` as every other
         // PCS resource name, which the boundary validator cannot compile.
-        if let Some(message) = crate::state::resource_name_violation(
+        if let Some(refusal) = crate::state::resource_name_violation(
             "computeNodeGroupName",
             &input.compute_node_group_name,
         ) {
-            return Err(CreateComputeNodeGroupErrorModeled::ValidationException(
-                crate::state::field_validation("computeNodeGroupName", message),
-            )
-            .into());
+            return Err(CreateComputeNodeGroupErrorModeled::ValidationException(refusal).into());
         }
 
         // The caller-sized lists this create would PERSIST. The model bounds neither
@@ -257,9 +254,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         ];
         for (member, entries) in stored_lists {
-            if let Some(message) = crate::state::stored_list_violation(member, entries) {
+            if let Some(constraint) = crate::state::stored_list_violation(entries) {
                 return Err(CreateComputeNodeGroupErrorModeled::ValidationException(
-                    crate::state::field_validation(member, message),
+                    crate::state::field_validation(member, constraint),
                 )
                 .into());
             }
@@ -273,10 +270,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateComputeNodeGroupErrorModeled::ValidationException(
                 crate::state::field_validation(
                     "scalingConfiguration",
-                    format!(
-                        "minInstanceCount ({}) must not exceed maxInstanceCount ({})",
-                        scaling.min_instance_count, scaling.max_instance_count
-                    ),
+                    "Member must specify a minInstanceCount at most its maxInstanceCount"
+                        .to_string(),
                 ),
             )
             .into());
@@ -297,6 +292,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+
+        let region = crate::state::request_region(ctx);
+
+        // The instance profile this group's instances would assume belongs to IAM, and a
+        // create resolves what it REFERENCES in another service before it resolves the
+        // cluster of its own the request names: a request naming a profile that does not
+        // exist is answered about that profile, whether or not the cluster exists. The hop
+        // is made before the state lock is taken, so nothing is held across it.
+        if let Some(refusal) =
+            crate::state::instance_profile::violation(ctx, &region, &input.iam_instance_profile_arn)
+                .await
+        {
+            return Err(CreateComputeNodeGroupErrorModeled::ValidationException(refusal).into());
         }
 
         let mut state = state.lock();
@@ -394,7 +403,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let (seq, id) = state.mint_id();
-        let region = crate::state::request_region(ctx);
         let now = crate::state::now_date_time();
         let Some(cluster) = state.clusters.get_mut(&cluster_id) else {
             return Err(CreateComputeNodeGroupErrorModeled::InternalServerException(

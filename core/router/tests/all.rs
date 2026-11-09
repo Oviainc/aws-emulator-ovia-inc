@@ -765,6 +765,11 @@ mod logs_subscription_delivery_role;
 mod partnercentral_channel_target_routing;
 #[path = "all/personalize_signing_name_routing.rs"]
 mod personalize_signing_name_routing;
+// Declared HERE, in this quiet span of the sorted list, for the reason the entries around it
+// record: the appended tail at the end of this file and the head of the list are both regions
+// every concurrently landing router suite puts its line in.
+#[path = "all/pcs_compute_node_group_instance_profile.rs"]
+mod pcs_compute_node_group_instance_profile;
 // Declared HERE, beside the sibling Personalize suite, for the reason the entries around it
 // record: the appended tail at the end of this file and the head of the list are both regions
 // every concurrently landing router suite puts its line in.

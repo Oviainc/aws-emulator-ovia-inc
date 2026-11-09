@@ -17,6 +17,8 @@ mod cluster_lifecycle;
 mod cluster_update_and_endpoints;
 #[path = "all/delete_ordering.rs"]
 mod delete_ordering;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

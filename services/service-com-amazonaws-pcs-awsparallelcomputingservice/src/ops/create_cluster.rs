@@ -195,13 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `clusterName`'s `@pattern` carries a negative lookahead the boundary validator
         // cannot compile, so the character rule is enforced here. Its `@length` bounds
         // compile and were already enforced before this handler ran.
-        if let Some(message) =
+        if let Some(refusal) =
             crate::state::resource_name_violation("clusterName", &input.cluster_name)
         {
-            return Err(CreateClusterErrorModeled::ValidationException(
-                crate::state::field_validation("clusterName", message),
-            )
-            .into());
+            return Err(CreateClusterErrorModeled::ValidationException(refusal).into());
         }
 
         // `scheduler.version` is an unconstrained `String` in the model, so the set of
@@ -252,9 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         ];
         for (member, entries) in stored_lists {
-            if let Some(message) = crate::state::stored_list_violation(member, entries) {
+            if let Some(constraint) = crate::state::stored_list_violation(entries) {
                 return Err(CreateClusterErrorModeled::ValidationException(
-                    crate::state::field_validation(member, message),
+                    crate::state::field_validation(member, constraint),
                 )
                 .into());
             }

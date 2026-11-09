@@ -192,12 +192,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `queueName` carries the same lookahead `@pattern` as every other PCS resource
         // name, which the boundary validator cannot compile.
-        if let Some(message) = crate::state::resource_name_violation("queueName", &input.queue_name)
+        if let Some(refusal) = crate::state::resource_name_violation("queueName", &input.queue_name)
         {
-            return Err(CreateQueueErrorModeled::ValidationException(
-                crate::state::field_validation("queueName", message),
-            )
-            .into());
+            return Err(CreateQueueErrorModeled::ValidationException(refusal).into());
         }
 
         // The caller-sized lists this create would PERSIST. The model bounds neither
@@ -222,9 +219,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         ];
         for (member, entries) in stored_lists {
-            if let Some(message) = crate::state::stored_list_violation(member, entries) {
+            if let Some(constraint) = crate::state::stored_list_violation(entries) {
                 return Err(CreateQueueErrorModeled::ValidationException(
-                    crate::state::field_validation(member, message),
+                    crate::state::field_validation(member, constraint),
                 )
                 .into());
             }

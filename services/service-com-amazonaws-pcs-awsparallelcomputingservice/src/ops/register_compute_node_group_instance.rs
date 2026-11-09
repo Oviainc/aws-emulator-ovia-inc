@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterComputeNodeGroupInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterComputeNodeGroupInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterComputeNodeGroupInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Denies every caller that cannot be attributed to a compute node instance PCS launched:
+//! this operation is how such an instance collects its Slurm bootstrap material, and no
+//! other caller is handed any of it.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterComputeNodeGroupInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterComputeNodeGroupInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // "This API action isn't intended for you to use. PCS uses this API action to
+        // register the compute nodes it launches in your account" (this operation's own
+        // documentation): the caller it serves is an Amazon EC2 instance PCS launched into
+        // a compute node group, and the `bootstrapId` is how PCS recognises that instance
+        // as the one it minted bootstrap material for. Nothing else is handed the
+        // material the response carries — the Slurm shared Munge key, the scheduler node
+        // id and the scheduler endpoints — so a caller that cannot be attributed to such
+        // an instance is denied, with no response body at all.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterComputeNodeGroupInstance"))
+        // This emulator launches no compute node instances: a compute node group is a
+        // control-plane record here ([`crate::state::ComputeNodeGroupRecord`]), no EC2
+        // instance of one ever registers, and so nothing holds bootstrap material any
+        // `bootstrapId` could be attributed to — whatever cluster the request names, and
+        // whether or not that cluster exists. The refusal is the operation's one
+        // client-visible outcome (`AccessDeniedException` and `InternalServerException`
+        // are the only errors it models, and the cluster is not resolved first: the model
+        // declares no `ResourceNotFoundException` here, and "the cluster ID doesn't exist"
+        // is one of the examples `AccessDeniedException`'s own documentation gives).
+        let _ = (&input, ctx, &self.engine);
+        Err(RegisterComputeNodeGroupInstanceErrorModeled::AccessDeniedException(
+            AccessDeniedException {
+                message: "This API must be called from an EC2 instance.".to_string(),
+            },
+        )
+        .into())
     }
 }

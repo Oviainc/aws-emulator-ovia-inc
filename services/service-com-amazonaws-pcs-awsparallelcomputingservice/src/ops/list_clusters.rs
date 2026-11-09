@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         return Err(ListClustersErrorModeled::ValidationException(
                             crate::state::field_validation(
                                 "nextToken",
-                                "nextToken is not a token this listing issued".to_string(),
+                                "Member must be a token this listing issued".to_string(),
                             ),
                         )
                         .into())

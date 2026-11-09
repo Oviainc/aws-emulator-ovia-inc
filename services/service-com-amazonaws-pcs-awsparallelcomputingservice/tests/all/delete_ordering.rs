@@ -507,22 +507,28 @@ async fn deleting_the_hierarchy_back_to_back_is_served() {
 }
 
 /// RULE: a delete names a cluster and a resource inside it, so a name neither holds is
-/// `ResourceNotFoundException` (404) naming the resource the request could not resolve.
+/// `ResourceNotFoundException` (404) naming the resource the request could not resolve:
+/// `resourceId` is the identifier as supplied and `resourceType` the KIND of identifier
+/// that did not resolve.
 #[tokio::test]
 async fn a_delete_of_a_resource_nothing_holds_is_not_found() {
     let router = emulator();
     let case = "a delete of what nothing holds";
     let cluster = active_cluster(&router, case, "lonely-cluster").await;
 
-    // Each row: the operation, the request, and the `resourceType` the refusal names.
-    let rows: Vec<(&str, Value, &str)> = vec![
+    // Each row: the operation, the request, the identifier that does not resolve, and the
+    // `resourceType` the refusal reports for it. Each operation resolves the cluster
+    // first, so a row naming no cluster is refused about the cluster whichever resource
+    // inside one it also names.
+    let rows: Vec<(&str, Value, &str, &str)> = vec![
         (
             "DeleteQueue",
             json!({
                 "clusterIdentifier": "no-such-cluster",
                 "queueIdentifier": "work",
             }),
-            "cluster",
+            "no-such-cluster",
+            "Cluster ID",
         ),
         (
             "DeleteQueue",
@@ -530,7 +536,8 @@ async fn a_delete_of_a_resource_nothing_holds_is_not_found() {
                 "clusterIdentifier": cluster.id.clone(),
                 "queueIdentifier": "no-such-queue",
             }),
-            "queue",
+            "no-such-queue",
+            "Queue ID",
         ),
         (
             "DeleteComputeNodeGroup",
@@ -538,7 +545,8 @@ async fn a_delete_of_a_resource_nothing_holds_is_not_found() {
                 "clusterIdentifier": "no-such-cluster",
                 "computeNodeGroupIdentifier": "nodes",
             }),
-            "computenodegroup",
+            "no-such-cluster",
+            "Cluster ID",
         ),
         (
             "DeleteComputeNodeGroup",
@@ -546,16 +554,18 @@ async fn a_delete_of_a_resource_nothing_holds_is_not_found() {
                 "clusterIdentifier": cluster.id.clone(),
                 "computeNodeGroupIdentifier": "no-such-group",
             }),
-            "computenodegroup",
+            "no-such-group",
+            "Compute Node Group ID",
         ),
         (
             "ListComputeNodeGroups",
             json!({"clusterIdentifier": "no-such-cluster"}),
-            "cluster",
+            "no-such-cluster",
+            "Cluster ID",
         ),
     ];
 
-    for (operation, body, resource_type) in rows {
+    for (operation, body, identifier, resource_type) in rows {
         let (status, refused) = call(&router, operation, &body).await;
         assert_eq!(
             (status, error_code(&refused).as_str()),
@@ -563,16 +573,17 @@ async fn a_delete_of_a_resource_nothing_holds_is_not_found() {
             "case {case}: expected {operation} {body} to answer 404, got {status} with \
              {refused}"
         );
-        // The refusal names the kind of resource it could not resolve; the cluster arm of
-        // each pair resolves the cluster first, so it names the cluster.
-        if resource_type == "cluster" {
-            assert_eq!(
-                refused["resourceType"].as_str(),
-                Some("cluster"),
-                "case {case}: expected {operation} to name the cluster it could not find, \
-                 got {refused}"
-            );
-        }
+        // The refusal names the identifier it could not resolve and the kind of
+        // identifier that was.
+        assert_eq!(
+            (
+                refused["resourceId"].as_str(),
+                refused["resourceType"].as_str()
+            ),
+            (Some(identifier), Some(resource_type)),
+            "case {case}: expected {operation} to name the identifier it could not \
+             resolve, got {refused}"
+        );
     }
 }
 

@@ -199,6 +199,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         }
         self.advance_service_deployments(now);
         self.settle_services(now);
+        // Every status a task moved into during THIS pass becomes an event here, under the
+        // same lock that materialised it. A transition the clock owes is observable for one
+        // span only, so a pass that materialises one and a later writer that supersedes it
+        // leave the comparison in `record_task_state_changes` — which reads the task's
+        // CURRENT reported pair — with no trace of the status in between: the task really
+        // passed through it, and no event announced it. Recording where the transition is
+        // applied is what keeps the published stream the task's own history (see that
+        // method's own documentation). Queueing only; the publication stays the pump's.
+        self.record_task_state_changes(now);
     }
 
     /// Materialise the SERVICE-level transitions the clock owes, as of `now`: the steady

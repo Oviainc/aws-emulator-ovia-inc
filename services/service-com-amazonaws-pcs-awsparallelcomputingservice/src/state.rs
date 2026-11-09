@@ -45,6 +45,10 @@
 //! * response size — [`page_size`] clamps a caller's `maxResults` to the modelled
 //!   `1..=100` before [`paginate`] truncates.
 
+/// The IAM instance profile a compute node group's instances assume, resolved against the
+/// service that owns instance profiles.
+pub mod instance_profile;
+
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -922,19 +926,27 @@ pub fn queue_arn(region: &str, cluster_id: &str, queue_id: &str) -> String {
     )
 }
 
-/// Why the service refuses this resource name, or `None` when it accepts it.
+/// The `@pattern` `clusterName`, `computeNodeGroupName` and `queueName` all carry
+/// (`ClusterName`, `ComputeNodeGroupName` and `QueueName` in this service's model): a
+/// leading ASCII letter, then only ASCII letters, digits and hyphens, which also rules out
+/// the `pcs_` prefix the service reserves for the ids it generates, because `_` is not in
+/// the class.
+pub const RESOURCE_NAME_PATTERN: &str = "^(?!pcs_)^[A-Za-z][A-Za-z0-9-]+$";
+
+/// The modelled `ValidationException` the service refuses this resource name with, or
+/// `None` when it accepts it.
 ///
-/// `clusterName`, `computeNodeGroupName` and `queueName` all carry the same
-/// `@pattern`, `^(?!pcs_)^[A-Za-z][A-Za-z0-9-]+$`: a leading ASCII letter, then only
-/// ASCII letters, digits and hyphens — which also rules out the `pcs_` prefix the
-/// service reserves for the ids it generates, because `_` is not in the class.
+/// The name has to match [`RESOURCE_NAME_PATTERN`], and the refusal is stated the way
+/// every other modelled-constraint violation of this service is
+/// ([`constraint_violations`]), because that is what failed: a member constraint the model
+/// declares.
 ///
 /// The rule is enforced HERE rather than at the boundary because that regex carries a
 /// negative lookahead, which the boundary validator's regex engine cannot compile, and
 /// a pattern it cannot compile is treated as matching (see
 /// `aws_smithy_schema_server::constraints::pattern_matches`). The `@length` bounds on
 /// the same members compile and are enforced at the boundary, so they are not repeated.
-pub fn resource_name_violation(member: &str, value: &str) -> Option<String> {
+pub fn resource_name_violation(member: &str, value: &str) -> Option<ValidationException> {
     let mut chars = value.chars();
     let starts_with_letter = chars.next().is_some_and(|c| c.is_ascii_alphabetic());
     let rest: Vec<char> = chars.collect();
@@ -948,72 +960,150 @@ pub fn resource_name_violation(member: &str, value: &str) -> Option<String> {
     if starts_with_letter && rest_is_allowed {
         return None;
     }
-    Some(format!(
-        "{member} must satisfy regular expression pattern: ^(?!pcs_)^[A-Za-z][A-Za-z0-9-]+$"
+    Some(field_validation(
+        member,
+        pattern_constraint(RESOURCE_NAME_PATTERN),
     ))
 }
 
-/// The modelled `ValidationException` for a member the service refuses: reason
-/// `fieldValidationFailed` (a `ValidationExceptionReason` member) and a `fieldList`
-/// naming the member, so a client can fix the request from the error alone.
-pub fn field_validation(member: &str, message: String) -> ValidationException {
+/// The constraint clause stated for a value outside its member's `@pattern`.
+///
+/// The expression is quoted as the service PUBLISHES it rather than as the model writes
+/// it: the `^`/`$` pair a model writes around a full-match expression is that wrapping, so
+/// it is dropped through the tree's one reading of it
+/// (`service_common::validation::unanchored`), and a client that lifts the expression out
+/// of the message gets the one the service advertises.
+pub fn pattern_constraint(pattern: &str) -> String {
+    format!(
+        "Member must satisfy regular expression pattern: {}",
+        ::service_common::validation::unanchored(pattern)
+    )
+}
+
+/// The constraint clause stated for a collection longer than the most entries its member
+/// admits.
+pub fn length_at_most_constraint(entries: usize) -> String {
+    format!("Member must have length less than or equal to {entries}")
+}
+
+/// The modelled `ValidationException` for ONE member whose value failed `constraint`:
+/// [`constraint_violations`] over a single violation.
+pub fn field_validation(member: &str, constraint: String) -> ValidationException {
+    constraint_violations(&[(member, constraint)])
+}
+
+/// The modelled `ValidationException` (HTTP 400) for the member constraints one request
+/// violated, each given as `(member path, the constraint that member's value failed)`.
+///
+/// The message is built from the REQUEST and the model, in the framing a constraint
+/// violation is reported in: how many violations were detected, then one clause per
+/// violation naming the member path and the constraint it failed, joined by `; `, so a
+/// client that parses the sentence can count the violations and extract the offending
+/// member. The modelled members carry the same detail structurally — reason
+/// `fieldValidationFailed` (a `ValidationExceptionReason` member) and one `fieldList`
+/// entry per violation — so a client can fix the request without parsing it at all.
+pub fn constraint_violations(violations: &[(&str, String)]) -> ValidationException {
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(|(member, constraint)| {
+            format!("Value at '{member}' failed to satisfy constraint: {constraint}")
+        })
+        .collect();
     ValidationException {
-        message: message.clone(),
+        message: format!(
+            "{} validation error(s) detected: {}",
+            clauses.len(),
+            clauses.join("; ")
+        ),
         reason: "fieldValidationFailed".to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: member.to_string(),
-            message,
-        }]),
+        field_list: Some(
+            violations
+                .iter()
+                .map(|(member, constraint)| ValidationExceptionField {
+                    name: (*member).to_string(),
+                    message: constraint.clone(),
+                })
+                .collect(),
+        ),
     }
 }
 
 /// One of the resource kinds this service refuses a request about: the `resourceType`
-/// member its errors carry, and the noun the service's own error sentences name it by.
+/// member its errors carry, the noun the service's own error sentences name it by, and how
+/// it names the kind of IDENTIFIER a request supplies for such a resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceKind {
-    /// The `resourceType` member of `ResourceNotFoundException`/`ConflictException`.
+    /// The `resourceType` member of `ConflictException`, and the segment that names this
+    /// kind of resource in a PCS ARN ([`arn_resource`]).
     pub resource_type: &'static str,
     /// How an error sentence names this kind of resource.
     pub noun: &'static str,
+    /// How the service names the kind of identifier a request supplies for this resource,
+    /// which is the `resourceType` an identifier-keyed not-found reports ([`not_found`]).
+    pub identifier_label: &'static str,
 }
 
 /// The cluster kind.
 pub const CLUSTER: ResourceKind = ResourceKind {
     resource_type: "cluster",
     noun: "cluster",
+    identifier_label: "Cluster ID",
 };
 
 /// The queue kind.
 pub const QUEUE: ResourceKind = ResourceKind {
     resource_type: "queue",
     noun: "queue",
+    identifier_label: "Queue ID",
 };
 
 /// The compute node group kind.
 pub const COMPUTE_NODE_GROUP: ResourceKind = ResourceKind {
     resource_type: "computenodegroup",
     noun: "compute node group",
+    identifier_label: "Compute Node Group ID",
 };
 
 /// The kind an ARN names when its resource part is none of the three above: the service
-/// defines no fourth type, so a refusal about such an ARN names the resource generically
-/// rather than claiming a type PCS does not have ([`arn_resource`]).
+/// defines no fourth type, so nothing about such an ARN claims a type PCS does not have
+/// ([`arn_resource`]).
 pub const UNNAMED_RESOURCE: ResourceKind = ResourceKind {
     resource_type: "resource",
     noun: "resource",
+    identifier_label: "Resource ID",
 };
 
-/// The modelled `ResourceNotFoundException` (HTTP 404) for a resource the service cannot
-/// find.
+/// The modelled `ResourceNotFoundException` (HTTP 404) for a resource a request named by
+/// IDENTIFIER — a `clusterIdentifier`, `queueIdentifier` or `computeNodeGroupIdentifier` —
+/// that the service cannot find.
 ///
 /// The message is the service's own FIXED sentence for that kind of resource: it names
 /// the kind and nothing else, so the identifier the caller supplied is not echoed back in
-/// it — the modelled `resourceId` member is where that belongs.
+/// it. The modelled members are where the request's own values belong: `resourceId`
+/// carries the identifier as supplied, and `resourceType` the kind of identifier that did
+/// not resolve ([`ResourceKind::identifier_label`]).
 pub fn not_found(kind: ResourceKind, identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: format!("AWS PCS couldn't find the {} you specified.", kind.noun),
         resource_id: identifier.to_string(),
-        resource_type: kind.resource_type.to_string(),
+        resource_type: kind.identifier_label.to_string(),
+    }
+}
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) for an ARN — the key the tagging
+/// operations take — that names no resource this service holds.
+///
+/// The ARN-keyed path states the service's own fixed sentence for a resource that cannot
+/// be found and names NEITHER the resource nor its kind: the ARN the caller sent carries
+/// both already, so the refusal adds nothing by repeating them, where the
+/// identifier-keyed path ([`not_found`]) reports both because an identifier carries
+/// neither. The two members are modelled `@required`, so they travel empty rather than
+/// absent.
+pub fn arn_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: "Resource cannot be found.".to_string(),
+        resource_id: String::new(),
+        resource_type: String::new(),
     }
 }
 
@@ -1081,15 +1171,16 @@ pub fn cluster_still_has_children(cluster_id: &str) -> ConflictException {
     }
 }
 
-/// Why the service refuses a caller-sized list a create would PERSIST, or `None` when
-/// it accepts it.
+/// The constraint clause a caller-sized list a create would PERSIST failed, or `None`
+/// when the service accepts it.
 ///
 /// The model bounds none of these lists, so this is the ceiling that keeps one request
-/// from sizing one stored record arbitrarily — see [`MAX_STORED_LIST_ENTRIES`].
-pub fn stored_list_violation(member: &str, entries: usize) -> Option<String> {
-    (entries > MAX_STORED_LIST_ENTRIES).then(|| {
-        format!("{member} must carry at most {MAX_STORED_LIST_ENTRIES} entries, not {entries}")
-    })
+/// from sizing one stored record arbitrarily — see [`MAX_STORED_LIST_ENTRIES`]. The clause
+/// is the one every length ceiling of this service is stated in
+/// ([`length_at_most_constraint`]); the caller hands it to [`field_validation`] with the
+/// member it bounds.
+pub fn stored_list_violation(entries: usize) -> Option<String> {
+    (entries > MAX_STORED_LIST_ENTRIES).then(|| length_at_most_constraint(MAX_STORED_LIST_ENTRIES))
 }
 
 /// The modelled `ValidationException` (HTTP 400) `CreateCluster` answers for a scheduler

@@ -212,9 +212,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             ];
             for (member, entries) in stored_lists {
-                if let Some(message) = crate::state::stored_list_violation(member, entries) {
+                if let Some(constraint) = crate::state::stored_list_violation(entries) {
                     return Err(UpdateClusterErrorModeled::ValidationException(
-                        crate::state::field_validation(member, message),
+                        crate::state::field_validation(member, constraint),
                     )
                     .into());
                 }
