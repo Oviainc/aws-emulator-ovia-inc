@@ -74,8 +74,11 @@ pub const RESERVED_NODE_OFFERING_TYPE_REGULAR: &str = "Regular";
 /// exchange can target are the DC2 ones, so those are the node types the
 /// EXCHANGE-TARGET catalog ([`published_exchange_reserved_node_offerings`])
 /// publishes an offering of, each carrying
-/// [`RESERVED_NODE_OFFERING_TYPE_UPGRADABLE`].
-pub const EXCHANGE_TARGET_NODE_TYPE_PREFIX: &str = "dc2.";
+/// [`RESERVED_NODE_OFFERING_TYPE_UPGRADABLE`]. The DC2 family is named in one
+/// place ([`PREVIOUS_GENERATION_NODE_TYPE_PREFIX`]), so the family this catalog
+/// targets and the family the orderable catalog no longer offers a NEW cluster
+/// cannot drift apart.
+pub const EXCHANGE_TARGET_NODE_TYPE_PREFIX: &str = PREVIOUS_GENERATION_NODE_TYPE_PREFIX;
 
 /// The hourly on-demand rate, in [`RESERVED_NODE_CURRENCY_CODE`], this emulator
 /// publishes for one node of each offered node type — the rate every price in

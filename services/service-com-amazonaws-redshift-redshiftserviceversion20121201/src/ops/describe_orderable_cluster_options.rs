@@ -2,9 +2,10 @@
 
 //! @op DescribeOrderableClusterOptions
 //!
-//! Reports the catalog of cluster options this service offers: every combination
-//! of an offered engine version, a cluster type and a node type, each paired with
-//! the Availability Zones of the Region the request was signed for. The engine
+//! Reports the catalog of cluster options this service offers: every ORDERABLE
+//! pairing of an offered engine version, a node type and the cluster types that
+//! node type can be ordered as, each paired with the Availability Zones of the
+//! Region the request was signed for. The engine
 //! versions come from the same seeded catalog `DescribeClusterVersions` reports,
 //! which is what makes the input's "Must be one of the version returned from
 //! DescribeClusterVersions" hold. Filtered by `ClusterVersion` and `NodeType`,
@@ -193,12 +194,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The catalog, in a stable order: engine version (as the store offers
         // them, so `DescribeClusterVersions` and this operation cannot disagree
         // about which versions exist), then node type, then cluster type, each
-        // list in the order the model documents it. Neither documented list
-        // restricts the other — `ClusterType` is "multi-node | single-node" for
-        // every node type the service offers — so the catalog is their full
-        // product, and the request's `ClusterVersion` / `NodeType` filters SELECT
-        // from it rather than refusing ("Default: All versions"): a filter that
-        // matches nothing selects nothing.
+        // list in the order the model documents it. An option is a shape that can
+        // be ORDERED, so the pairs come from the one orderable rule
+        // (`orderable_cluster_types`): the current-generation node types, each as
+        // `multi-node` and — where the service offers a one-node cluster of that
+        // shape — as `single-node` too. The request's `ClusterVersion` /
+        // `NodeType` filters SELECT from that catalog rather than refusing
+        // ("Default: All versions"): a filter that matches nothing selects
+        // nothing.
         let mut options: Vec<OrderableClusterOption> = Vec::new();
         for offered in &store.cluster_versions {
             let Some(cluster_version) = offered.cluster_version.as_deref() else {
@@ -219,7 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     continue;
                 }
-                for cluster_type in st::ORDERABLE_CLUSTER_TYPES {
+                for cluster_type in st::orderable_cluster_types(node_type) {
                     options.push(OrderableClusterOption {
                         cluster_version: Some(cluster_version.to_string()),
                         cluster_type: Some(cluster_type.to_string()),

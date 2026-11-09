@@ -148,7 +148,7 @@ pub struct CatalogEvent {
     /// Its severity, one of [`EVENT_SEVERITIES`].
     pub severity: &'static str,
     /// What it reports, with every part taken from the resource and the clock
-    /// written as a `[placeholder]` — the catalog describes the event, it does
+    /// written as a `<placeholder>` — the catalog describes the event, it does
     /// not report one occurrence of it.
     pub event_description: &'static str,
 }
@@ -177,16 +177,22 @@ impl CatalogEvent {
 /// categories and event messages", Amazon Redshift Management Guide), which
 /// gives each event its identifier, the source type that raises it, its
 /// category, its severity, and the message it carries with every part taken from
-/// the resource and the clock written as a `[placeholder]`. The identifiers are
-/// numbered by CATEGORY — the 1000 range for `configuration`, 2000 for
-/// `management`, 3000 for `monitoring`, 4000 for `security` and 5000 for
-/// `pending` — which is why [`EVENT_ID_PARAMETER_GROUP_CREATED`], the event a
-/// cluster parameter group's creation raises and the one this service's own
-/// event path names, sits in the configuration range.
+/// the resource and the clock written as a `<placeholder>` — the form the
+/// published description text carries, which is why this read returns TEMPLATES
+/// rather than instantiated messages.
+///
+/// The identifiers are the ones the published catalog gives each event, not a
+/// number this emulator chose. They run in ranges that follow the CATEGORY
+/// loosely — the 1000 range for `configuration`, 2000 for `management`, 3000 for
+/// `monitoring`, 4000 for `security` — but the published catalog is the
+/// authority over the range, which is why a cluster's `pending` event is
+/// `REDSHIFT-EVENT-3015` and its ERROR event `REDSHIFT-EVENT-4502`.
 ///
 /// Every source type the catalog read admits carries at least one event: an
 /// entry reporting an empty event list would say that source type raises no
-/// Amazon Redshift event at all, which is true of none of them.
+/// Amazon Redshift event at all, which is true of none of them. Every event this
+/// service RAISES is an entry here too, so an event id a client reads off
+/// `DescribeEvents` is one the catalog read publishes.
 pub const EVENT_CATALOG: &[CatalogEvent] = &[
     // The cluster itself: its own management lifecycle, the configuration
     // changes applied to it, what it is observed doing, the access to it, and
@@ -197,7 +203,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_CONFIGURATION],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "Your Amazon Redshift cluster [cluster name] was modified at [time] UTC. \
+            "Your Amazon Redshift cluster <cluster name> was modified at <time in UTC>. \
              The changes you requested are being applied.",
     },
     CatalogEvent {
@@ -205,14 +211,14 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         source_type: EVENT_SOURCE_TYPE_CLUSTER,
         event_categories: &[EVENT_CATEGORY_MANAGEMENT],
         severity: EVENT_SEVERITY_INFO,
-        event_description: "Your Amazon Redshift cluster [cluster name] was created at [time] UTC.",
+        event_description: "Cluster <cluster name> created at <time in UTC>.",
     },
     CatalogEvent {
         event_id: EVENT_ID_CLUSTER_DELETED,
         source_type: EVENT_SOURCE_TYPE_CLUSTER,
         event_categories: &[EVENT_CATEGORY_MANAGEMENT],
         severity: EVENT_SEVERITY_INFO,
-        event_description: "Your Amazon Redshift cluster [cluster name] was deleted at [time] UTC.",
+        event_description: "Cluster <cluster name> deleted at <time in UTC>.",
     },
     CatalogEvent {
         event_id: EVENT_ID_CLUSTER_RENAMED,
@@ -220,15 +226,15 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_MANAGEMENT],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "Your Amazon Redshift cluster [cluster name] was renamed to [new cluster name] \
-             at [time] UTC.",
+            "Your Amazon Redshift cluster <cluster name> was renamed to <new cluster name> \
+             at <time in UTC>.",
     },
     CatalogEvent {
         event_id: EVENT_ID_CLUSTER_REBOOTED,
         source_type: EVENT_SOURCE_TYPE_CLUSTER,
         event_categories: &[EVENT_CATEGORY_MONITORING],
         severity: EVENT_SEVERITY_INFO,
-        event_description: "Your Amazon Redshift cluster [cluster name] was rebooted at [time] UTC.",
+        event_description: "Your Amazon Redshift cluster <cluster name> was rebooted at <time in UTC>.",
     },
     CatalogEvent {
         event_id: EVENT_ID_CLUSTER_RESTORED,
@@ -236,17 +242,18 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_MONITORING],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "Your Amazon Redshift cluster [cluster name] was restored from snapshot \
-             [snapshot name] at [time] UTC.",
+            "Your Amazon Redshift cluster <cluster name> was restored from snapshot \
+             <snapshot name> at <time in UTC>.",
     },
     CatalogEvent {
-        event_id: "REDSHIFT-EVENT-3002",
+        event_id: "REDSHIFT-EVENT-3015",
         source_type: EVENT_SOURCE_TYPE_CLUSTER,
-        event_categories: &[EVENT_CATEGORY_MONITORING],
-        severity: EVENT_SEVERITY_ERROR,
+        event_categories: &[EVENT_CATEGORY_PENDING],
+        severity: EVENT_SEVERITY_INFO,
         event_description:
-            "Your Amazon Redshift cluster [cluster name] is unavailable at [time] UTC. \
-             Amazon Redshift is working to make the cluster available again.",
+            "Your Amazon Redshift cluster <cluster name> has a pending maintenance update \
+             scheduled between <start time> and <end time> UTC. The cluster is not available \
+             while the update is applied.",
     },
     CatalogEvent {
         event_id: EVENT_ID_MASTER_PASSWORD_UPDATED,
@@ -254,18 +261,16 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_SECURITY],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "The master user password for your Amazon Redshift cluster [cluster name] \
-             was updated at [time] UTC.",
+            "Master credentials updated for cluster <cluster name> at <time in UTC>.",
     },
     CatalogEvent {
-        event_id: "REDSHIFT-EVENT-5000",
+        event_id: "REDSHIFT-EVENT-4502",
         source_type: EVENT_SOURCE_TYPE_CLUSTER,
-        event_categories: &[EVENT_CATEGORY_PENDING],
-        severity: EVENT_SEVERITY_INFO,
+        event_categories: &[EVENT_CATEGORY_MONITORING],
+        severity: EVENT_SEVERITY_ERROR,
         event_description:
-            "Your Amazon Redshift cluster [cluster name] has a pending maintenance update \
-             scheduled between [start time] and [end time] UTC. The cluster is not available \
-             while the update is applied.",
+            "Your Amazon Redshift cluster <cluster name> is unavailable at <time in UTC>. \
+             Amazon Redshift is working to make the cluster available again.",
     },
     // The cluster parameter group: the configuration a cluster is created from,
     // whose changes are what this source type publishes.
@@ -275,7 +280,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_CONFIGURATION],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "Cluster parameter group [parameter group name] was updated at [time] UTC. \
+            "Cluster parameter group <parameter group name> was updated at <time in UTC>. \
              If you changed only dynamic parameters, associated clusters are being modified now. \
              If you changed static parameters, all updates, including dynamic parameters, are \
              applied when you reboot the associated clusters.",
@@ -286,7 +291,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_CONFIGURATION],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "Cluster parameter group [parameter group name] was created at [time] UTC.",
+            "Cluster parameter group <parameter group name> was created at <time in UTC>.",
     },
     CatalogEvent {
         event_id: EVENT_ID_PARAMETER_GROUP_DELETED,
@@ -294,7 +299,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_CONFIGURATION],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "Cluster parameter group [parameter group name] was deleted at [time] UTC.",
+            "Cluster parameter group <parameter group name> was deleted at <time in UTC>.",
     },
     // The cluster security group: which hosts may connect to a cluster.
     CatalogEvent {
@@ -303,7 +308,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_CONFIGURATION],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "Cluster security group [cluster security group name] was created at [time] UTC.",
+            "Cluster security group <cluster security group name> was created at <time in UTC>.",
     },
     CatalogEvent {
         event_id: "REDSHIFT-EVENT-1101",
@@ -311,7 +316,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_CONFIGURATION],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "Cluster security group [cluster security group name] was updated at [time] UTC. \
+            "Cluster security group <cluster security group name> was updated at <time in UTC>. \
              The clusters it is associated with are being modified now.",
     },
     CatalogEvent {
@@ -320,7 +325,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_CONFIGURATION],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "Cluster security group [cluster security group name] was deleted at [time] UTC.",
+            "Cluster security group <cluster security group name> was deleted at <time in UTC>.",
     },
     // The cluster snapshot: the backups taken of a cluster.
     CatalogEvent {
@@ -329,15 +334,15 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_MONITORING],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "A snapshot [snapshot name] of your Amazon Redshift cluster [cluster name] \
-             was created at [time] UTC.",
+            "A snapshot <snapshot name> of your Amazon Redshift cluster <cluster name> \
+             was created at <time in UTC>.",
     },
     CatalogEvent {
         event_id: EVENT_ID_SNAPSHOT_DELETED,
         source_type: EVENT_SOURCE_TYPE_SNAPSHOT,
         event_categories: &[EVENT_CATEGORY_MONITORING],
         severity: EVENT_SEVERITY_INFO,
-        event_description: "The snapshot [snapshot name] was deleted at [time] UTC.",
+        event_description: "The snapshot <snapshot name> was deleted at <time in UTC>.",
     },
     // The scheduled action: the operation Amazon Redshift performs on a cluster
     // on a schedule.
@@ -347,7 +352,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_MANAGEMENT],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "The scheduled action [scheduled action name] was created at [time] UTC.",
+            "The scheduled action <scheduled action name> was created at <time in UTC>.",
     },
     CatalogEvent {
         event_id: "REDSHIFT-EVENT-2201",
@@ -355,7 +360,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_MANAGEMENT],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "The scheduled action [scheduled action name] was deleted at [time] UTC.",
+            "The scheduled action <scheduled action name> was deleted at <time in UTC>.",
     },
     CatalogEvent {
         event_id: "REDSHIFT-EVENT-5200",
@@ -363,8 +368,8 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_PENDING],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "The scheduled action [scheduled action name] is scheduled to run \
-             [target action] at [time] UTC.",
+            "The scheduled action <scheduled action name> is scheduled to run \
+             <target action> at <time in UTC>.",
     },
     // The reserved compute node: the reservations an account buys and exchanges.
     // These three entries are this emulator's OWN published catalog rather than
@@ -386,7 +391,7 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_MANAGEMENT],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "Your reserved node [reserved node id] was purchased at [time] UTC. \
+            "Your reserved node <reserved node id> was purchased at <time in UTC>. \
              The sale has been approved and the payment has not yet been confirmed.",
     },
     CatalogEvent {
@@ -395,8 +400,8 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_MANAGEMENT],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "The payment for your reserved node [reserved node id] was confirmed at \
-             [time] UTC. The reserved node is available for use.",
+            "The payment for your reserved node <reserved node id> was confirmed at \
+             <time in UTC>. The reserved node is available for use.",
     },
     CatalogEvent {
         event_id: "REDSHIFT-EVENT-2302",
@@ -404,8 +409,8 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
         event_categories: &[EVENT_CATEGORY_MANAGEMENT],
         severity: EVENT_SEVERITY_INFO,
         event_description:
-            "Your reserved node [reserved node id] was exchanged for reserved node \
-             [target reserved node id] at [time] UTC.",
+            "Your reserved node <reserved node id> was exchanged for reserved node \
+             <target reserved node id> at <time in UTC>.",
     },
 ];
 

@@ -42,10 +42,13 @@ use super::{CatalogEvent, EVENT_CATALOG, SNS_ARN_SERVICE};
 
 /// The placeholder the published catalog writes the event's own instant as.
 ///
-/// Every entry of [`EVENT_CATALOG`] renders each value an occurrence fills in as a
-/// `[placeholder]`; this is the one filled from the CLOCK rather than from the
-/// resource the event is about.
-const TIME_PLACEHOLDER: &str = "time";
+/// Every entry of [`EVENT_CATALOG`] renders each value an occurrence fills in as
+/// a `<placeholder>`, the form the published catalog's description text carries;
+/// this is the one filled from the CLOCK rather than from the resource the event
+/// is about, and the catalog names it after the instant it stands for — the time
+/// in UTC — so the rendered message reads `<date> <minute> UTC` where the
+/// template reads `<time in UTC>`.
+const TIME_PLACEHOLDER: &str = "time in UTC";
 
 /// The catalog placeholder a cluster parameter group's name fills.
 pub const PARAMETER_GROUP_NAME: &str = "parameter group name";
@@ -80,7 +83,7 @@ pub struct RaisedEvent {
 ///
 /// `fills` names the catalog placeholders this occurrence fills, without their
 /// brackets: `[("parameter group name", "my-group")]` fills
-/// `[parameter group name]`. The clock fills [`TIME_PLACEHOLDER`], so no caller
+/// `<parameter group name>`. The clock fills [`TIME_PLACEHOLDER`], so no caller
 /// passes an instant.
 pub fn raised(event_id: &str, source_id: &str, fills: &[(&str, &str)]) -> Option<RaisedEvent> {
     let event = EVENT_CATALOG.iter().find(|entry| entry.event_id == event_id)?;
@@ -119,26 +122,26 @@ impl RaisedEvent {
 }
 
 /// The message one occurrence of `event` carries: the catalog's description with
-/// every `[placeholder]` filled.
+/// every `<placeholder>` filled.
 ///
 /// The description is the published text and the fixed half of the message; what
 /// an occurrence supplies is the values. A placeholder naming the event's own
-/// instant is filled from the clock, in the `YYYY-MM-DD HH:MM` form the catalog
-/// text spells "UTC" after; any other placeholder is filled from `fills` and
+/// instant is filled from the clock, in the `YYYY-MM-DD HH:MM UTC` form the
+/// catalog text names it by; any other placeholder is filled from `fills` and
 /// rendered in single quotes, the form the published message takes for the name of
 /// the resource an event happened to.
 ///
-/// `None` when a placeholder has no fill: a message naming `[a placeholder]` where
+/// `None` when a placeholder has no fill: a message naming `<a placeholder>` where
 /// a value belongs reports nothing, so no event is raised at all rather than one
 /// carrying an unfilled template.
 fn message(event: &CatalogEvent, at: SystemTime, fills: &[(&str, &str)]) -> Option<String> {
     let description = event.event_description;
     let mut rendered = String::with_capacity(description.len());
     let mut rest = description;
-    while let Some(open) = rest.find('[') {
+    while let Some(open) = rest.find('<') {
         rendered.push_str(&rest[..open]);
         let after = &rest[open + 1..];
-        let close = after.find(']')?;
+        let close = after.find('>')?;
         let placeholder = &after[..close];
         if placeholder == TIME_PLACEHOLDER {
             rendered.push_str(&minute_text(at)?);
@@ -154,19 +157,20 @@ fn message(event: &CatalogEvent, at: SystemTime, fills: &[(&str, &str)]) -> Opti
     Some(rendered)
 }
 
-/// `at` to the minute, as `YYYY-MM-DD HH:MM`.
+/// `at` to the minute, as `YYYY-MM-DD HH:MM UTC`.
 ///
 /// The calendar conversion is the LIBRARY's: `DateTime::fmt(Format::DateTime)`
 /// renders an instant as RFC 3339 in UTC (`YYYY-MM-DDThh:mm:ss[.fff]Z`), so the
 /// date and the hour and minute are read off that rendering rather than computed
-/// here.
+/// here. The zone is spelled out because the placeholder the catalog fills with
+/// it is the time IN UTC.
 fn minute_text(at: SystemTime) -> Option<String> {
     let rendered = ::aws_smithy_types::DateTime::from(at)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .ok()?;
     let (date, clock) = rendered.split_once('T')?;
     let minutes = clock.get(..5)?;
-    Some(format!("{date} {minutes}"))
+    Some(format!("{date} {minutes} UTC"))
 }
 
 /// `at` as the notification's own `Event Time`: the RFC 3339 instant in UTC, the

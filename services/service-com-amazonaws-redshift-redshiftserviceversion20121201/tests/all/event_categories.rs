@@ -273,9 +273,10 @@ async fn each_source_type_publishes_the_catalogued_events_of_its_resource() {
     // table so a wrong entry fails this suite.
     //
     // Source: the published Amazon Redshift event catalog ("Amazon Redshift
-    // event categories and event messages"), whose identifiers are numbered by
-    // category — 1000 configuration, 2000 management, 3000 monitoring, 5000
-    // pending.
+    // event categories and event messages"), whose identifiers run in ranges
+    // that follow the category loosely — 1000 configuration, 2000 management,
+    // 3000 monitoring, 4000 security — with the published catalog, not the
+    // range, deciding each event's own identifier.
     let rows: [(&str, &str, &[&str], &str); 6] = [
         ("cluster", "REDSHIFT-EVENT-2000", &["management"], "INFO"),
         (

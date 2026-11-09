@@ -124,9 +124,8 @@ fn listed_names(xml: &str) -> Vec<String> {
 /// `MaintenanceTrackName` — "Possible values are `current` and `trailing`" — and
 /// on the structure itself: `current` applies "the most recently certified
 /// maintenance release", `trailing` "the previously certified maintenance
-/// release". Those are two DIFFERENT releases of
-/// `state::CERTIFIED_ENGINE_BUILDS`, so the two tracks report different
-/// `DatabaseVersion` values and a client can tell them apart.
+/// release". Those are two DIFFERENT releases, so the two tracks report
+/// different `DatabaseVersion` values and a client can tell them apart.
 const PUBLISHED_TRACKS: [&str; 2] = ["current", "trailing"];
 
 /// The operations a track you can switch to supports, in the order the service
@@ -167,26 +166,36 @@ async fn the_published_track_catalog_is_what_a_read_reports() {
     );
 
     // `current` applies the most recently certified release and `trailing` the
-    // one certified before it, so the two carry different builds — and every
-    // `UpdateTarget` carries the build of the track it points AT, which is what
-    // a client diffing the two tracks reads.
-    let builds = state::certified_engine_builds();
-    assert!(
-        builds.len() > 1,
-        "case published catalog: expected more than one certified release, got {builds:?}"
+    // one certified before it, so the two carry different releases of the
+    // cluster-release stream — and every `UpdateTarget` carries the release of
+    // the track it points AT, which is what a client diffing the two tracks
+    // reads.
+    let releases = state::PUBLISHED_TRACK_RELEASES;
+    assert_eq!(
+        releases.len(),
+        PUBLISHED_TRACKS.len(),
+        "case published catalog: expected one published release per track, got {releases:?}"
     );
-    let latest = builds[builds.len() - 1].to_string();
-    let previous = builds[builds.len() - 2].to_string();
+    for (track, release) in releases {
+        // A release is a patch release of the 1.0 cluster-release stream: the
+        // engine version, then the patch number the service certified.
+        let patch = release.strip_prefix("1.0.").unwrap_or_default();
+        assert!(
+            !patch.is_empty() && patch.chars().all(|digit| digit.is_ascii_digit()),
+            "case release of {track}: expected a 1.0 cluster release, got {release:?}"
+        );
+    }
     assert_ne!(
-        latest, previous,
-        "case published catalog: the two tracks must apply different releases, got {latest} twice"
+        releases[0].1, releases[1].1,
+        "case published catalog: the two tracks must apply different releases, got {:?} twice",
+        releases[0].1
     );
     let release_of = |track: &str| {
-        if track == "current" {
-            latest.clone()
-        } else {
-            previous.clone()
-        }
+        releases
+            .into_iter()
+            .find(|(published, _)| *published == track)
+            .map(|(_, release)| release.to_string())
+            .unwrap_or_else(|| panic!("case release of {track}: the catalog publishes no release"))
     };
     let expected: Vec<Track> = PUBLISHED_TRACKS
         .into_iter()

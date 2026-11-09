@@ -205,6 +205,61 @@ pub const ORDERABLE_NODE_TYPES: [&str; 10] = [
     "ra3.16xlarge",
 ];
 
+/// The node-type family Amazon Redshift publishes as the PREVIOUS generation of
+/// compute nodes.
+///
+/// A cluster that already runs one of these keeps running it — which is why they
+/// stay in the `NodeType` valid-value list every operation naming a node type is
+/// checked against ([`ORDERABLE_NODE_TYPES`]) — and the reserved-node exchange
+/// surface targets them by name ("Returns an array of DC2 ReservedNodeOfferings
+/// that matches the payment type, term, and usage price of the given DC1
+/// reserved node", `smithy_query(query="doc",
+/// operation="GetReservedNodeExchangeOfferings")`). What the family is NOT is a
+/// shape a new cluster is ordered with, so the orderable catalog
+/// ([`orderable_cluster_types`]) offers none of it.
+pub const PREVIOUS_GENERATION_NODE_TYPE_PREFIX: &str = "dc2.";
+
+/// Every node type a SINGLE-NODE cluster is orderable with, in
+/// [`ORDERABLE_NODE_TYPES`] order.
+///
+/// Source: the orderable-shape catalog Amazon Redshift publishes (what
+/// `DescribeOrderableClusterOptions` reports). A single-node cluster is the
+/// whole cluster on ONE compute node, and the service offers that only on the
+/// entry-size member of each current-generation family; every larger member is
+/// offered as `multi-node` alone. The model bounds only the VALUE lists —
+/// `ClusterType` is "multi-node | single-node" and `NumberOfNodes` "If you don't
+/// specify this parameter, you get a single-node cluster"
+/// (`smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="NumberOfNodes")`) — and says nothing about which node type pairs with
+/// which cluster type, so the pairing is published catalog data.
+pub const SINGLE_NODE_NODE_TYPES: [&str; 3] = ["rg.large", "ra3.large", "ra3.xlplus"];
+
+/// The `ClusterType`s one node type is ORDERABLE as, in the documented
+/// [`ORDERABLE_CLUSTER_TYPES`] order, or an empty list for a node type a new
+/// cluster cannot be ordered with at all.
+///
+/// The one rule the orderable catalog is built by: a current-generation node
+/// type ([`PREVIOUS_GENERATION_NODE_TYPE_PREFIX`]) is orderable as `multi-node`,
+/// and as `single-node` as well when the service offers a one-node cluster of
+/// that shape ([`SINGLE_NODE_NODE_TYPES`]).
+///
+/// This governs what the catalog OFFERS, not what a write accepts: a cluster is
+/// created, modified or restored onto any node type the model's valid-value list
+/// publishes ([`ORDERABLE_NODE_TYPES`]), including the previous generation that
+/// existing clusters run.
+pub fn orderable_cluster_types(node_type: &str) -> Vec<&'static str> {
+    if node_type.starts_with(PREVIOUS_GENERATION_NODE_TYPE_PREFIX) {
+        return Vec::new();
+    }
+    ORDERABLE_CLUSTER_TYPES
+        .into_iter()
+        .filter(|cluster_type| {
+            *cluster_type != CLUSTER_TYPE_SINGLE_NODE
+                || SINGLE_NODE_NODE_TYPES.contains(&node_type)
+        })
+        .collect()
+}
+
 /// The port the Redshift database engine listens on when the request names none.
 pub const DEFAULT_PORT: i32 = 5439;
 
@@ -280,39 +335,31 @@ pub fn published_parameter_group_families() -> Vec<String> {
     families
 }
 
-/// Every maintenance release of the published engine this service has
-/// CERTIFIED, oldest first.
+/// The engine BUILD Amazon Redshift publishes for the engine version this
+/// service offers.
 ///
-/// A maintenance track applies one of these releases: `current` the most
-/// recently certified one and `trailing` the one certified before it
-/// (`smithy_query(query="shape", shape="MaintenanceTrack")`), which is why the
-/// list holds more than one — two tracks that applied the same release would be
-/// the same track, and a client cannot choose between them or diff them. The
-/// LAST entry is the build Amazon Redshift publishes for engine version 1.0,
-/// which is what a version reports as its own
-/// `ClusterVersion$Description` ([`PUBLISHED_ENGINE_BUILDS`]); the entries
-/// before it are this emulator's OWN published catalog — the releases it
-/// succeeded, which no recorded value fixes. A build is catalog data either way:
-/// the same for every account and stable across reads, never a per-run value.
-pub const CERTIFIED_ENGINE_BUILDS: [&str; 2] = ["1.0.49608", "1.0.49795"];
+/// Amazon Redshift reports the engine build of a version as that version's
+/// `ClusterVersion$Description` (`smithy_query(query="shape",
+/// shape="ClusterVersion")` — "The description of the cluster version"), and the
+/// build it publishes for engine version 1.0 is this one. A build is catalog
+/// data: the same for every account and stable across reads, never a per-run
+/// value.
+///
+/// It is a DIFFERENT published value from the cluster release a maintenance
+/// track applies ([`PUBLISHED_TRACK_RELEASES`]): the service publishes the
+/// engine build of a VERSION and the release of a TRACK independently, so
+/// neither is derived from the other.
+pub const PUBLISHED_ENGINE_BUILD: &str = "1.0.49795";
 
 /// Every engine version this service offers, paired with the engine BUILD that
 /// version currently runs.
 ///
 /// Source for the version list: `smithy_query(query="doc",
 /// shape="CreateClusterMessage", member="ClusterVersion")` — "Only version 1.0
-/// is currently available. Example: 1.0". Source for the build: Amazon Redshift
-/// reports the engine build of a version as that version's
-/// `ClusterVersion$Description` (`smithy_query(query="shape",
-/// shape="ClusterVersion")` — "The description of the cluster version"), and the
-/// build Amazon Redshift publishes for engine version 1.0 is `1.0.49795` — the
-/// most recently certified release of [`CERTIFIED_ENGINE_BUILDS`], read off that
-/// list so the build a version reports and the release the `current` maintenance
-/// track applies cannot disagree.
-pub const PUBLISHED_ENGINE_BUILDS: [(&str, &str); 1] = [(
-    DEFAULT_CLUSTER_VERSION,
-    CERTIFIED_ENGINE_BUILDS[CERTIFIED_ENGINE_BUILDS.len() - 1],
-)];
+/// is currently available. Example: 1.0". Source for the build:
+/// [`PUBLISHED_ENGINE_BUILD`].
+pub const PUBLISHED_ENGINE_BUILDS: [(&str, &str); 1] =
+    [(DEFAULT_CLUSTER_VERSION, PUBLISHED_ENGINE_BUILD)];
 
 /// `ClusterVersion$Description` for an engine build: the Amazon Redshift engine
 /// (ParAccel Analytic DataBase) build string, `PADB <build>`.
@@ -404,9 +451,13 @@ pub const TRAILING_MAINTENANCE_TRACK: &str = "trailing";
 /// `MaintenanceTrackName` — "The name of the maintenance track. Possible values
 /// are current and trailing." This list IS the catalogue every operation that
 /// names a maintenance track resolves against, so a cluster can always look its
-/// own track up in what `DescribeClusterTracks` reports.
-pub const PUBLISHED_MAINTENANCE_TRACKS: [&str; 2] =
-    [DEFAULT_MAINTENANCE_TRACK, TRAILING_MAINTENANCE_TRACK];
+/// own track up in what `DescribeClusterTracks` reports. Read off
+/// [`PUBLISHED_TRACK_RELEASES`], so the names the catalog publishes and the
+/// releases they apply cannot disagree.
+pub const PUBLISHED_MAINTENANCE_TRACKS: [&str; 2] = [
+    PUBLISHED_TRACK_RELEASES[0].0,
+    PUBLISHED_TRACK_RELEASES[1].0,
+];
 
 /// The operations a maintenance track you can switch to supports, in the
 /// hyphenated form `SupportedOperation$OperationName` names an operation by.
@@ -424,40 +475,47 @@ pub const PUBLISHED_MAINTENANCE_TRACKS: [&str; 2] =
 /// first, then the modify.
 pub const TRACK_SWITCH_OPERATIONS: [&str; 2] = ["restore-from-cluster-snapshot", "modify-cluster"];
 
-/// The maintenance releases this service has certified, oldest first:
-/// [`CERTIFIED_ENGINE_BUILDS`].
-pub fn certified_engine_builds() -> Vec<&'static str> {
-    CERTIFIED_ENGINE_BUILDS.to_vec()
-}
+/// The cluster RELEASE each maintenance track this service publishes applies,
+/// in the order `DescribeClusterTracks` reports the tracks.
+///
+/// `MaintenanceTrack$DatabaseVersion` is "The version number for the cluster
+/// release" (`smithy_query(query="shape", shape="MaintenanceTrack")`), and the
+/// model publishes no release for either track, so this table IS the catalog the
+/// service publishes for the tracks themselves: one patch release of the 1.0
+/// cluster-release stream per track, carried PER TRACK rather than derived, for
+/// two reasons.
+///
+/// First, the releases of two tracks are certified separately — `current` applies
+/// "the most recently certified maintenance release" and `trailing` "the
+/// previously certified" one — so a track's release identifies that track's
+/// release and is not a number a reader may ORDER against another track's. What
+/// the catalog has to keep is that the two tracks apply DIFFERENT releases, so a
+/// client can tell them apart and diff them.
+///
+/// Second, the release a track applies is not the engine BUILD a version reports
+/// as its `ClusterVersion$Description` ([`PUBLISHED_ENGINE_BUILD`]): the service
+/// publishes those two values independently, and this emulator publishes each
+/// from its own source rather than deriving one from the other.
+///
+/// A release moves with every certification, so the digits are release-dependent
+/// catalog data — the same for every account and stable across reads, never a
+/// per-run value.
+pub const PUBLISHED_TRACK_RELEASES: [(&str, &str); 2] = [
+    (DEFAULT_MAINTENANCE_TRACK, "1.0.434008"),
+    (TRAILING_MAINTENANCE_TRACK, "1.0.436211"),
+];
 
 /// `MaintenanceTrack$DatabaseVersion` — "The version number for the cluster
 /// release" — of one published track, or `None` for a name the catalog does not
 /// publish.
 ///
-/// The `current` track applies the most recently certified release and the
-/// `trailing` track the one certified before it
-/// (`smithy_query(query="shape", shape="MaintenanceTrack")`), so both are read
-/// off [`certified_engine_builds`] rather than written out — the LAST entry for
-/// `current` and the one before it for `trailing`, which is why the two tracks
-/// report different releases and a client can tell them apart.
+/// Read off [`PUBLISHED_TRACK_RELEASES`], the one table every operation that
+/// reports a track's release resolves against.
 pub fn track_database_version(track: &str) -> Option<String> {
-    let builds = certified_engine_builds();
-    let latest = *builds.last()?;
-    if track == DEFAULT_MAINTENANCE_TRACK {
-        Some(latest.to_string())
-    } else if track == TRAILING_MAINTENANCE_TRACK {
-        Some(
-            builds
-                .iter()
-                .rev()
-                .nth(1)
-                .copied()
-                .unwrap_or(latest)
-                .to_string(),
-        )
-    } else {
-        None
-    }
+    PUBLISHED_TRACK_RELEASES
+        .into_iter()
+        .find(|(published, _)| *published == track)
+        .map(|(_, release)| release.to_string())
 }
 
 /// The maintenance-track catalog, in the order `DescribeClusterTracks` reports

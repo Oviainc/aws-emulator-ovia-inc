@@ -8,10 +8,11 @@
 //! owns rather than keeping a second copy of it.
 //!
 //! The suite asserts the RULE rather than one recorded request: the catalog is
-//! the product of the offered engine versions (the ones `DescribeClusterVersions`
-//! reports) with the two documented valid-value lists (cluster type, node type),
+//! the ORDERABLE pairings of the offered engine versions (the ones
+//! `DescribeClusterVersions` reports) with the node types the service still
+//! offers a new cluster of and the cluster types each of those can be ordered as,
 //! each option carrying the Availability Zones of the Region the request was
-//! signed for; `ClusterVersion` and `NodeType` SELECT from that product; the
+//! signed for; `ClusterVersion` and `NodeType` SELECT from that catalog; the
 //! shared `MaxRecords` window and `Marker` cursor paginate it; and reading it
 //! changes nothing. The node-type, cluster-type and zone lists are written out
 //! here, quoting the source they come from, so the suite pins the catalog
@@ -46,6 +47,21 @@ const NODE_TYPES: [&str; 10] = [
 /// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
 /// member="ClusterType")` — "Valid Values: multi-node | single-node".
 const CLUSTER_TYPES: [&str; 2] = ["multi-node", "single-node"];
+
+/// The node-type family the service publishes as the PREVIOUS generation: a
+/// cluster already running one keeps running it, so the family stays in the
+/// `NodeType` valid-value list, but a NEW cluster is not ordered with one, so the
+/// orderable catalog offers no pairing of it.
+const PREVIOUS_GENERATION_PREFIX: &str = "dc2.";
+
+/// The node types a SINGLE-NODE cluster is orderable with: the entry-size member
+/// of each current-generation family. Every larger member is offered as
+/// `multi-node` alone.
+///
+/// Source: the orderable-shape catalog the service publishes (what
+/// `DescribeOrderableClusterOptions` reports); the model bounds only the value
+/// lists and says nothing about which node type pairs with which cluster type.
+const SINGLE_NODE_NODE_TYPES: [&str; 3] = ["rg.large", "ra3.large", "ra3.xlplus"];
 
 /// Every engine version the catalog offers.
 ///
@@ -110,13 +126,20 @@ async fn orderable(emulator: &Emulator, case: &str, params: &[(&str, &str)]) -> 
     listed_options(&answer)
 }
 
-/// The whole catalog the rule describes: the product of the offered versions and
-/// the two documented lists, nested version -> node type -> cluster type.
+/// The whole catalog the rule describes: for each offered version, every node
+/// type a new cluster can still be ordered with, paired with each cluster type
+/// that node type is orderable as.
 fn expected_catalog() -> Vec<Option3> {
     let mut expected = Vec::new();
     for version in CLUSTER_VERSIONS {
         for node_type in NODE_TYPES {
+            if node_type.starts_with(PREVIOUS_GENERATION_PREFIX) {
+                continue;
+            }
             for cluster_type in CLUSTER_TYPES {
+                if cluster_type == "single-node" && !SINGLE_NODE_NODE_TYPES.contains(&node_type) {
+                    continue;
+                }
                 expected.push((
                     version.to_string(),
                     node_type.to_string(),
@@ -141,18 +164,21 @@ fn expected_filtered(version: Option<&str>, node_type: Option<&str>) -> Vec<Opti
 }
 
 #[tokio::test]
-async fn the_catalog_is_the_product_of_the_offered_versions_and_documented_lists() {
+async fn the_catalog_is_the_orderable_pairings_of_the_offered_versions_and_shapes() {
     let emulator = Emulator::new();
 
     let served = orderable(&emulator, "the whole catalog", &[]).await;
     let expected = expected_catalog();
     assert_eq!(
         served, expected,
-        "case the whole catalog: expected every offered version/node-type/cluster-type combination, got {served:?}"
+        "case the whole catalog: expected every orderable version/node-type/cluster-type pairing, got {served:?}"
     );
 
     // The node-type and cluster-type constants the handler reads must be the
-    // documented lists this suite pins.
+    // documented lists this suite pins, and the orderable rule it applies to
+    // them must be the one pinned here: every current-generation node type as
+    // `multi-node`, the entry sizes also as `single-node`, the previous
+    // generation not orderable at all.
     assert_eq!(
         (
             state::ORDERABLE_NODE_TYPES.to_vec(),
@@ -161,6 +187,21 @@ async fn the_catalog_is_the_product_of_the_offered_versions_and_documented_lists
         (NODE_TYPES.to_vec(), CLUSTER_TYPES.to_vec()),
         "case catalog constants: the handler's lists must match the documented ones"
     );
+    for node_type in NODE_TYPES {
+        let expected: Vec<&str> = CLUSTER_TYPES
+            .into_iter()
+            .filter(|cluster_type| {
+                !node_type.starts_with(PREVIOUS_GENERATION_PREFIX)
+                    && (*cluster_type != "single-node"
+                        || SINGLE_NODE_NODE_TYPES.contains(&node_type))
+            })
+            .collect();
+        assert_eq!(
+            state::orderable_cluster_types(node_type),
+            expected,
+            "case orderable {node_type}: expected {expected:?}"
+        );
+    }
 
     // "Constraints: Must be one of the version returned from
     // DescribeClusterVersions" — the versions an option carries come from the one
@@ -194,10 +235,22 @@ async fn every_filter_selects_from_the_catalog() {
     let cases: Vec<FilterCase> = vec![
         ("no filter", vec![], None, None),
         (
-            "the smallest node type",
+            "a previous-generation node type",
             vec![("NodeType", "dc2.large")],
             None,
             Some("dc2.large"),
+        ),
+        (
+            "the largest previous-generation node type",
+            vec![("NodeType", "dc2.8xlarge")],
+            None,
+            Some("dc2.8xlarge"),
+        ),
+        (
+            "the entry size of the rg family",
+            vec![("NodeType", "rg.large")],
+            None,
+            Some("rg.large"),
         ),
         (
             "a node type the issue did not cite",

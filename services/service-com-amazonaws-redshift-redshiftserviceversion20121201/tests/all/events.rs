@@ -176,7 +176,7 @@ fn write_cases() -> Vec<WriteCase> {
             source_type: "cluster",
             source_identifier: cluster.clone(),
             categories: vec!["management"],
-            before: format!("Your Amazon Redshift cluster '{cluster}' was created at "),
+            before: format!("Cluster '{cluster}' created at "),
             after: " UTC.",
         },
         WriteCase {

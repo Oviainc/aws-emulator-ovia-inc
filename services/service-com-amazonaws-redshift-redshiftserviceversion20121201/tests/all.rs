@@ -99,6 +99,8 @@ mod namespace_registration;
 mod namespace_registration_serverless;
 #[path = "all/orderable_cluster_options.rs"]
 mod orderable_cluster_options;
+#[path = "all/published_catalog_fidelity.rs"]
+mod published_catalog_fidelity;
 #[path = "all/published_catalog_values.rs"]
 mod published_catalog_values;
 #[path = "all/qev2_idc_applications.rs"]

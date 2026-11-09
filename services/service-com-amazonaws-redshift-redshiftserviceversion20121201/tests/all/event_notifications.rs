@@ -531,7 +531,7 @@ fn write_cases() -> Vec<WriteCase> {
                 cluster_type.clone(),
                 cluster.clone(),
                 "REDSHIFT-EVENT-2000",
-                format!("Your Amazon Redshift cluster '{cluster}' was created at "),
+                format!("Cluster '{cluster}' created at "),
                 " UTC.",
             )],
         },
@@ -581,7 +581,7 @@ fn write_cases() -> Vec<WriteCase> {
                     cluster.clone(),
                     "REDSHIFT-EVENT-4000",
                     format!(
-                        "The master user password for your Amazon Redshift cluster '{cluster}' was updated at "
+                        "Master credentials updated for cluster '{cluster}' at "
                     ),
                     " UTC.",
                 ),
@@ -600,7 +600,7 @@ fn write_cases() -> Vec<WriteCase> {
                     cluster_type,
                     renamed.clone(),
                     "REDSHIFT-EVENT-2001",
-                    format!("Your Amazon Redshift cluster '{renamed}' was deleted at "),
+                    format!("Cluster '{renamed}' deleted at "),
                     " UTC.",
                 ),
                 (
