@@ -27,10 +27,10 @@
 //! volumes the instance holds, each one's size and encryption state, which exclusion names
 //! it, which tag source, which refusal — so no row is the specification.
 //!
-//! `DescribeSnapshots` is still a scaffold
-//! (`issues/.../20261022T235108Z-ec2-describesnapshots-stub.md`), so the snapshots a call
-//! stored are read back out of the engine's own state here; the VOLUMES the launch creates
-//! are read back over the wire through `DescribeVolumes`.
+//! The snapshots a call stored are read back out of the engine's own state here, which is
+//! what lets a row assert the stored record member by member; what `DescribeSnapshots`
+//! REPORTS of them over the wire is the subject of `describe_snapshots.rs`. The VOLUMES the
+//! launch creates are read back over the wire through `DescribeVolumes`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
