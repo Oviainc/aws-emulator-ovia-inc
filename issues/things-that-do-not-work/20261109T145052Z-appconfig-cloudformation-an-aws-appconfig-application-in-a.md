@@ -1,0 +1,59 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: appconfig__cloudformation.deploy-cfn-appconfig-application-resource-lifecycle appconfig__cloudformation.deploy-cfn-appconfig-application-name-too-long-rejected
+Issue-Key: appconfig__cloudformation|GetApplication|ResourceNotFoundException
+Issue-Commit: 39b863d101414613449d16e44f0b23fd775a8d87
+
+# appconfig__cloudformation: an AWS::AppConfig::Application in a CREATE_COMPLETE stack is never created in AppConfig, and Ref/PhysicalResourceId hand back the template Name instead of the generated Id
+
+> _Note: this issue was identified against the code base at commit `39b863d101414613449d16e44f0b23fd775a8d87`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetApplication
+
+## Description
+One net-new root cause, grounded in two replayed behavioral checks. Neither check was marked ALREADY FILED and neither was marked OWNED by an open issue in this replay.
+
+=== Cause 1 of 1: AWS::AppConfig::Application reaches CREATE_COMPLETE without provisioning anything in AppConfig, and its physical resource id is the template's Name ===
+AWS: a CloudFormation stack declaring AWS::AppConfig::Application creates a live AppConfig application through AppConfig's own CreateApplication path. `Ref` on that resource — and DescribeStackResource's StackResourceDetail.PhysicalResourceId, and Fn::GetAtt <App>.ApplicationId — resolve to the AppConfig-generated application Id, whose shape the model constrains: Smithy (services/service-com-amazonaws-appconfig-amazonappconfig/smithy-model/com-amazonaws-appconfig-amazonappconfig.json) targets every AppConfig application-id member at shape `Id`, pattern ^[a-z0-9]{4,7}$. A caller-supplied Name is a different shape (@length 1..64 free text) and is never the physical id. Consequently GetApplication(ApplicationId=<that Ref value>) answers HTTP 200 with Name and Description echoing the template, and ListApplications includes it. GetApplication only answers ResourceNotFoundException (HTTP 404) when the application genuinely does not exist, with the message 'Application with Id <ApplicationId> could not be found for account <accountId>.' — fixed text 'Application with Id ' / ' could not be found for account ' / '.', the variable parts being the ApplicationId from the request and the account id from the caller's credentials.
+Emulator: the stack reaches CREATE_COMPLETE (the create-complete waiter succeeds) and both DescribeStacks Outputs and DescribeStackResource.PhysicalResourceId return a value for the Application — but that value is the template's AppName PARAMETER (a free-text name, well outside ^[a-z0-9]{4,7}$), and no application was created in AppConfig under it. The very next control-plane read is therefore refused: appconfig.GetApplication(ApplicationId=<that Ref value>) answers HTTP 404 ResourceNotFoundException 'Application with Id <the template Name> could not be found for account <account>.' The refusal wording itself matches AWS for a genuinely-missing application; the defect is that the application is missing at all, and that Ref/PhysicalResourceId produced a Name where an Id is required.
+Why: a client that provisions an AppConfig estate with CloudFormation gets a stack that reports success while the account holds nothing. Every identifier read out of Outputs or DescribeStackResource is unusable, so each subsequent appconfig/appconfigdata call 404s even though the stack claims the resources exist — the failure surfaces far from the deploy, as a not-found on an unrelated operation. The value is also detectably the wrong SHAPE, so SDK or consumer code that validates or persists the id corrupts downstream state. It further makes the whole negative path unobservable: a template whose Name exceeds AppConfig's 64-character maximum can never be seen to fail, because the positive control never gets off the ground, and the stack-delete-removes-the-application leg of the lifecycle cannot be checked either.
+Fix: the CloudFormation resource provider for AWS::AppConfig::Application (and the sibling AWS::AppConfig::Environment / ::ConfigurationProfile providers the same stacks declare) — create each resource through appconfig's own create handler, record the service-generated Id as the physical resource id that Ref, PhysicalResourceId and Fn::GetAtt <res>.ApplicationId/EnvironmentId/ConfigurationProfileId resolve to, propagate AppConfig's own validation refusal into the resource's CREATE_FAILED reason, and delete the real resource on stack delete. Until a resource is actually created the stack must not reach CREATE_COMPLETE.
+Related open issues that do NOT carry these checks' replay keys: 20261105T010503Z-appconfig-iam-lambda-cloudformation-ref-on-aws-appconfig-application-resolves-to.md describes the same defect grounded in appconfig__iam__lambda.e2e-lambda-appconfig-stale-value-troubleshoot-lifecycle (a JSON template consumed by a Lambda scenario), and 20261023T032202Z-appconfig-getconfiguration-and-getexperimentdefinition-answer-501-and-cloudformation.md Cause 3 describes it grounded in appconfig.appconfig-application-cloudformation-behaves. Both are reported as not owning the two checks here, which additionally exercise DescribeStackResource.PhysicalResourceId, the over-length-Name CREATE_FAILED path and the delete-removes-the-application path. Fixing those should fix this; verify against these check ids too.
+Traces: appconfig__cloudformation.deploy-cfn-appconfig-application-resource-lifecycle, appconfig__cloudformation.deploy-cfn-appconfig-application-name-too-long-rejected.
+
+## Evidence
+Behavioral replay of suite simparity-behavioral-aws-v1 against the booted emulator: 207/246 passed (84.1%), 30 mismatched, 9 errored, 0 skipped, 0 unloadable; bootstrap_signal false. Per-service: appconfig__cloudformation 0/2 (0%), 2 failed — neither marked ALREADY FILED nor OWNED. Both appconfig (crate service-com-amazonaws-appconfig-amazonappconfig) and cloudformation (crate service-com-amazonaws-cloudformation-cloudformation) are bootstrapped.
+
+appconfig__cloudformation.deploy-cfn-appconfig-application-resource-lifecycle, verdict [error]:
+  botocore.errorfactory.ResourceNotFoundException: An error occurred (ResourceNotFoundException) when calling the GetApplication operation: Application with Id sim2real-behav-cfnapp-36d0423f5b40 could not be found for account 000000000000.
+  The check creates a stack from a template whose single resource is App: AWS::AppConfig::Application with Properties.Name = !Ref AppName and Description 'sim2real cfn resource existence check', and Outputs AppRef = !Ref App, AppIdGetAtt = !GetAtt App.ApplicationId. The stack_create_complete waiter SUCCEEDED and the two outputs agreed with each other. app_id = Outputs['AppRef'] is the AppName parameter value ('sim2real-behav-cfnapp-<hex>'), not an Id matching ^[a-z0-9]{4,7}$.
+  Expected: appconfig.get_application(ApplicationId=app_id) -> HTTP 200 with Name == the template's AppName and Description == 'sim2real cfn resource existence check'; then, after delete_stack reaches DELETE_COMPLETE, the same call -> ResourceNotFoundException 'Application with Id <app_id> could not be found for account <account>.'
+  Observed: the FIRST get_application (before any delete) already answers HTTP 404 ResourceNotFoundException with that message, so the application never existed and the delete leg is never exercised.
+
+appconfig__cloudformation.deploy-cfn-appconfig-application-name-too-long-rejected, verdict [error]:
+  botocore.errorfactory.ResourceNotFoundException: An error occurred (ResourceNotFoundException) when calling the GetApplication operation: Application with Id sim2real-behav-cfnok-7a6748cb98ea could not be found for account 000000000000.
+  This failure is on the check's POSITIVE CONTROL: create_stack with a VALID 20-ish-character Name, stack_create_complete waiter succeeds, then good_app_id = describe_stack_resource(StackName=<good stack>, LogicalResourceId='App')['StackResourceDetail']['PhysicalResourceId'] — which comes back as the AppName parameter value — and appconfig.get_application(ApplicationId=good_app_id) 404s. Expected: HTTP 200 with Name == the valid AppName.
+  The check's actual subject (a 70-character Name must drive the resource to CREATE_FAILED with ResourceStatusReason 'Resource handler returned message: "1 validation error detected: Value \'<name>\' at \'name\' failed to satisfy constraint: Member must have length less than or equal to 64 (Service: AppConfig, Status Code: 400, Request ID: <id>)" (RequestToken: <token>, HandlerErrorCode: InvalidRequest)' — fixed text apart from the name value, the request id and the request token, which are per-run) is never reached, and neither is its assertion that the over-length name must not appear in ListApplications.
+
+The hex suffixes and account id above are per-run values; the requirement is that Ref/PhysicalResourceId/GetAtt carry an AppConfig-generated Id of shape ^[a-z0-9]{4,7}$ that GetApplication and ListApplications answer to.
+
+Smithy consulted (services/service-com-amazonaws-appconfig-amazonappconfig/smithy-model/com-amazonaws-appconfig-amazonappconfig.json): shape Id = string, pattern ^[a-z0-9]{4,7}$, and every application-id output member (e.g. StartDeployment output ApplicationId, CreateExtension output Id) targets it; Name is @length 1..64 free text. GetApplication's not-found class is ResourceNotFoundException, httpError 404.
+
+## Steps to Reproduce
+Boot the emulator and point cloudformation and appconfig clients at its data listener.
+
+1. cloudformation.create_stack(StackName=<unique>, TemplateBody=<YAML with Parameters.AppName and Resources.App: {Type: AWS::AppConfig::Application, Properties: {Name: !Ref AppName, Description: 'sim2real cfn resource existence check'}} and Outputs AppRef: !Ref App, AppIdGetAtt: !GetAtt App.ApplicationId>, Parameters=[{AppName: <unique name>}]).
+2. Wait on the stack_create_complete waiter — it succeeds.
+3. Read outputs = {o['OutputKey']: o['OutputValue'] for o in describe_stacks(StackName=<stack>)['Stacks'][0]['Outputs']}, and also describe_stack_resource(StackName=<stack>, LogicalResourceId='App')['StackResourceDetail']['PhysicalResourceId'].
+   EXPECTED: all three are the same AppConfig-generated application Id matching ^[a-z0-9]{4,7}$.
+   OBSERVED: all three are the AppName parameter value.
+4. appconfig.get_application(ApplicationId=outputs['AppRef']).
+   EXPECTED: HTTP 200, Name == the AppName parameter, Description == the template's Description.
+   OBSERVED: HTTP 404 ResourceNotFoundException 'Application with Id <AppName> could not be found for account <account>.'
+   appconfig.list_applications() likewise shows the stack created no application.
+5. delete_stack + stack_delete_complete, then get_application(ApplicationId=<the Id from step 3>): AWS answers ResourceNotFoundException only here. (Unreachable today — step 4 already 404s.)
+6. Negative path: create a second stack from the SAME template with a 70-character AppName and DisableRollback=True. EXPECTED: StackStatus CREATE_FAILED and the App resource's single CREATE_FAILED event carrying ResourceStatusReason 'Resource handler returned message: "1 validation error detected: Value \'<name>\' at \'name\' failed to satisfy constraint: Member must have length less than or equal to 64 (Service: AppConfig, Status Code: 400, Request ID: <id>)" (RequestToken: <token>, HandlerErrorCode: InvalidRequest)', and the over-length name absent from ListApplications.
+
+Re-replay appconfig__cloudformation.deploy-cfn-appconfig-application-resource-lifecycle and appconfig__cloudformation.deploy-cfn-appconfig-application-name-too-long-rejected to confirm.
