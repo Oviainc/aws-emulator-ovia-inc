@@ -2,19 +2,22 @@
 
 //! The evaluation DATASET's state: one [`DatasetRecord`] per `datasetId`,
 //! holding the configuration the create persisted, the examples its source
-//! yielded into the DRAFT working copy, and the transition out of `CREATING`
-//! the clock owes it.
+//! yielded into the DRAFT working copy, every version published from that copy,
+//! and the transition out of `CREATING` the clock owes it.
 //!
 //! The examples live on the record rather than in a store of their own, because
 //! an example is addressed only THROUGH the dataset that holds it
 //! (`/datasets/{datasetId}/examples`) and is gone when the dataset is — the same
-//! reason a gateway target lives inside its gateway.
+//! reason a gateway target lives inside its gateway. A published version
+//! ([`DatasetVersionRecord`]) is held the same way, and for the same reason.
 //!
 //! The ingestion of a source lives here too ([`ingest_dataset_source`]): an
 //! inline source carries its examples in the request, and an Amazon S3 source
 //! names a JSONL file this emulator READS out of its own object storage, so the
 //! number of examples a dataset reports is the number it really holds either
-//! way.
+//! way. The SCHEMA check an inline batch has to pass before any of it is
+//! persisted is here as well ([`validate_inline_examples`]), so the create and
+//! any later write of examples cannot disagree about what an example must carry.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -23,10 +26,11 @@ use ::aws_smithy_types::Document;
 use ::serde_json::Value;
 
 use crate::ops::types::{
-    CreateDatasetInput, CreateDatasetOutput, DataSourceType, GetDatasetOutput,
+    CreateDatasetInput, CreateDatasetOutput, CreateDatasetVersionOutput, DataSourceType,
+    DatasetSummary, DatasetVersionSummary, GetDatasetOutput, ValidationException,
 };
 
-use super::{sorted_map, timestamp};
+use super::{sorted_map, timestamp, VALIDATION_REASON_FIELD_VALIDATION_FAILED};
 
 /// The ARN resource type a dataset carries — `DatasetArn` is
 /// `…:bedrock-agentcore:{region}:{account}:dataset/{datasetId}` (`smithy_query
@@ -38,17 +42,23 @@ pub const RESOURCE_DATASET_VERSION: &str = "dataset version";
 
 /// `DatasetStatus` members this service drives. The enum's full value list is
 /// `CREATING | UPDATING | DELETING | ACTIVE | CREATE_FAILED | UPDATE_FAILED |
-/// DELETE_FAILED` (`smithy_query shape=DatasetStatus`).
+/// DELETE_FAILED` (`smithy_query shape=DatasetStatus`), where `CREATING` is
+/// "CreateDataset async ingestion in progress", `UPDATING` is "An async example
+/// mutation or CreateDatasetVersion is in progress" — in both of which "All
+/// writes are blocked" — and `ACTIVE` is "Dataset is stable".
 pub const DATASET_STATUS_CREATING: &str = "CREATING";
 pub const DATASET_STATUS_ACTIVE: &str = "ACTIVE";
 pub const DATASET_STATUS_CREATE_FAILED: &str = "CREATE_FAILED";
+pub const DATASET_STATUS_UPDATING: &str = "UPDATING";
+pub const DATASET_STATUS_DELETING: &str = "DELETING";
 
 /// `DraftStatus` members a dataset reports. The enum's full value list is
-/// `MODIFIED | UNMODIFIED` (`smithy_query shape=DraftStatus`), and `MODIFIED`
-/// is what the DRAFT of a dataset with no published version is: "DRAFT has
-/// changes not yet reflected in any published version, or no versions have been
-/// published yet".
+/// `MODIFIED | UNMODIFIED` (`smithy_query shape=DraftStatus`): `MODIFIED` is
+/// what a DRAFT with "changes not yet reflected in any published version, or no
+/// versions … published yet" reports, and `UNMODIFIED` what one whose "DRAFT
+/// content matches the latest published version exactly" reports.
 pub const DRAFT_STATUS_MODIFIED: &str = "MODIFIED";
+pub const DRAFT_STATUS_UNMODIFIED: &str = "UNMODIFIED";
 
 /// The version a dataset read resolves to when the request names none: "Use the
 /// `datasetVersion` query parameter to retrieve a specific version's metadata.
@@ -58,14 +68,15 @@ pub const DRAFT_STATUS_MODIFIED: &str = "MODIFIED";
 pub const DATASET_VERSION_DRAFT: &str = "DRAFT";
 
 /// How long a freshly created dataset stays `CREATING` before the clock owes it
-/// the status its ingestion earned.
+/// the status its ingestion earned, and how long one stays `UPDATING` after a
+/// version is published from it.
 ///
 /// The create is asynchronous — "Returns immediately with status CREATING. Poll
 /// GetDataset until status transitions to ACTIVE or CREATE_FAILED"
 /// (`smithy_query doc shape=CreateDataset`) — and AWS documents no duration for
 /// the transition, so the span is chosen: long enough that a caller polling
-/// straight after the call still observes `CREATING`, short enough to keep a
-/// client script quick.
+/// straight after the call still observes the transient status, short enough to
+/// keep a client script quick.
 pub const DATASET_SETTLE_DELAY: Duration = Duration::from_secs(3);
 
 /// How many datasets this emulator will hold.
@@ -96,6 +107,17 @@ pub const MAX_DATASET_FILE_BYTES: i64 = 32 * 1024 * 1024;
 /// stack rather than by recursion, so measuring cannot itself overflow.
 pub const MAX_EXAMPLE_DEPTH: usize = 64;
 
+/// How many published versions this emulator will hold for one dataset.
+///
+/// `CreateDatasetVersion` models `ServiceQuotaExceededException` (HTTP 402) for
+/// exceeding the real service's quota; this number is the emulator's own
+/// ceiling, so a caller looping on publish cannot grow this process's memory
+/// without bound. It is lower than the ceilings on the resources beside it
+/// because every version SNAPSHOTS the whole working copy
+/// ([`MAX_DATASET_EXAMPLES`]), so the memory one dataset can hold is the product
+/// of the two.
+pub const MAX_VERSIONS_PER_DATASET: usize = 100;
+
 /// `arn:aws:bedrock-agentcore:{region}:{account}:dataset/{datasetId}` —
 /// `DatasetArn`'s pattern.
 pub fn dataset_arn(region: &str, dataset_id: &str) -> String {
@@ -104,6 +126,93 @@ pub fn dataset_arn(region: &str, dataset_id: &str) -> String {
         region,
         &format!("{ARN_TYPE_DATASET}/{dataset_id}"),
     )
+}
+
+/// The field every example of an AgentCore evaluation dataset is keyed by: both
+/// AgentCore schema types describe an example as a scenario — "each example is a
+/// scenario used to generate full conversations" for the simulated schema, and
+/// "pre-written inputs per conversation turn" for the predefined one, each turn
+/// belonging to a scenario (`smithy_query doc shape=DatasetSchemaType
+/// member=AGENTCORE_EVALUATION_SIMULATED_V1` /
+/// `member=AGENTCORE_EVALUATION_PREDEFINED_V1`) — so an example that names no
+/// scenario belongs to none.
+const EXAMPLE_FIELD_SCENARIO_ID: &str = "scenario_id";
+
+/// The field every example of a third-party evaluation dataset carries: that
+/// schema "supports single-turn (string input) and multi-turn (message list
+/// input) across third-party evaluation frameworks" (`smithy_query doc
+/// shape=DatasetSchemaType member=THIRD_PARTY_EVALUATION_V1`), so the input is
+/// the example.
+const EXAMPLE_FIELD_INPUT: &str = "input";
+
+/// `DatasetSchemaType` members, each of which "identifies both the source format
+/// and the version of that format's schema"
+/// (`crate::ops::types::DATASET_SCHEMA_TYPE_VALUES`).
+pub const DATASET_SCHEMA_AGENTCORE_EVALUATION_PREDEFINED_V1: &str =
+    "AGENTCORE_EVALUATION_PREDEFINED_V1";
+pub const DATASET_SCHEMA_AGENTCORE_EVALUATION_SIMULATED_V1: &str =
+    "AGENTCORE_EVALUATION_SIMULATED_V1";
+pub const DATASET_SCHEMA_THIRD_PARTY_EVALUATION_V1: &str = "THIRD_PARTY_EVALUATION_V1";
+
+/// The fields an example of `schema_type` must carry.
+///
+/// The schema type "identifies both the source format and the version of that
+/// format's schema", so which fields an example needs is a property of the
+/// schema and not of any one request.
+pub fn required_example_fields(schema_type: &str) -> &'static [&'static str] {
+    match schema_type {
+        DATASET_SCHEMA_THIRD_PARTY_EVALUATION_V1 => &[EXAMPLE_FIELD_INPUT],
+        // Both AgentCore evaluation schemas address an example as a scenario.
+        _ => &[EXAMPLE_FIELD_SCENARIO_ID],
+    }
+}
+
+/// The modelled validation error for an example that does not satisfy the
+/// dataset's schema: which example in the submitted batch failed, and the field
+/// of the schema it omits.
+///
+/// `index` is the zero-based position of the offending example in the batch the
+/// request carried and `field` the schema field it does not carry, so the
+/// sentence around them is fixed and both values come from the request.
+pub fn example_schema_violation(index: usize, field: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "Example at index {index} failed schema validation: Required field '{field}' is \
+             missing from example content"
+        ),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: None,
+    }
+}
+
+/// Check every example a request carried INLINE against the dataset's schema,
+/// answering the modelled refusal of the FIRST example that does not satisfy it.
+///
+/// Whole-batch, before anything is persisted: a batch is one commit, so one
+/// example that fails the schema refuses the whole call and leaves no dataset
+/// holding the examples that would have passed.
+pub fn validate_inline_examples(
+    schema_type: &str,
+    examples: &[Document],
+) -> Result<(), ValidationException> {
+    let required = required_example_fields(schema_type);
+    for (index, example) in examples.iter().enumerate() {
+        // An example is "a free-form JSON document whose structure is defined by
+        // the dataset's schema type": anything that is not a JSON object carries
+        // no field of that structure at all, so it is missing the first one the
+        // schema requires.
+        let members = match example {
+            Document::Object(members) => Some(members),
+            _ => None,
+        };
+        for field in required {
+            let present = members.is_some_and(|members| members.contains_key(*field));
+            if !present {
+                return Err(example_schema_violation(index, field));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What ingesting a dataset's source established.
@@ -372,9 +481,43 @@ fn json_number(number: &::serde_json::Number) -> ::aws_smithy_types::Number {
     }
 }
 
+/// One published version of a dataset: the numbered snapshot
+/// `CreateDatasetVersion` publishes the working copy as.
+///
+/// "The DRAFT is preserved and remains editable after publishing", so a version
+/// holds the examples the draft carried at the instant it was published rather
+/// than a reference to the draft.
+#[derive(Debug, Clone)]
+pub struct DatasetVersionRecord {
+    /// The version number, as `DatasetVersion` spells it: "a non-negative
+    /// integer string representing a published version number".
+    pub version: u32,
+    /// The examples the draft held when this version was published.
+    pub examples: Vec<Document>,
+    pub created_at: SystemTime,
+}
+
+impl DatasetVersionRecord {
+    /// How many examples this version holds, as the `Long` the responses
+    /// declare.
+    pub fn example_count(&self) -> i64 {
+        i64::try_from(self.examples.len()).unwrap_or(i64::MAX)
+    }
+
+    /// This version as `ListDatasetVersions` reports it: the three members
+    /// `DatasetVersionSummary` declares, off the snapshot itself.
+    pub fn summary(&self) -> DatasetVersionSummary {
+        DatasetVersionSummary {
+            dataset_version: self.version.to_string(),
+            example_count: self.example_count(),
+            created_at: timestamp(self.created_at),
+        }
+    }
+}
+
 /// One dataset: the configuration `CreateDataset` persisted, the examples its
-/// source yielded into the DRAFT working copy, and the transition out of
-/// `CREATING` the clock owes it.
+/// source yielded into the DRAFT working copy, every version published from that
+/// copy, and the transition out of `CREATING` the clock owes it.
 ///
 /// Every read of the dataset reports this record, so a create and a later read
 /// cannot disagree about its name, its configuration, how many examples it holds
@@ -403,6 +546,14 @@ pub struct DatasetRecord {
     /// Why the settled status is a failure state, for a dataset whose ingestion
     /// failed; `None` for one that ingested its source.
     pub failure_reason: Option<String>,
+    /// Every version published from the working copy, in the order they were
+    /// published. Grown only through [`Self::publish_version`], which caps it at
+    /// [`MAX_VERSIONS_PER_DATASET`].
+    versions: Vec<DatasetVersionRecord>,
+    /// Whether the working copy holds changes no published version reflects,
+    /// which is what `draftStatus` reports. True for a dataset no version has
+    /// been published from, false from the instant one is.
+    draft_modified: bool,
 }
 
 impl DatasetRecord {
@@ -411,7 +562,9 @@ impl DatasetRecord {
     ///
     /// A new dataset is `CREATING`, not yet settled: the transition to the
     /// status its ingestion earned — `ACTIVE`, or `CREATE_FAILED` for a source
-    /// that yielded nothing — is owed by the clock rather than by this call.
+    /// that yielded nothing — is owed by the clock rather than by this call. No
+    /// version has been published from it yet, so its working copy holds changes
+    /// no version reflects.
     pub fn created(
         region: &str,
         dataset_id: String,
@@ -445,6 +598,8 @@ impl DatasetRecord {
             settled_status,
             settles_at: now + DATASET_SETTLE_DELAY,
             failure_reason,
+            versions: Vec::new(),
+            draft_modified: true,
         }
     }
 
@@ -474,6 +629,64 @@ impl DatasetRecord {
         i64::try_from(self.draft_examples.len()).unwrap_or(i64::MAX)
     }
 
+    /// What `draftStatus` reports: whether the working copy holds changes no
+    /// published version reflects.
+    pub fn draft_status(&self) -> &'static str {
+        if self.draft_modified {
+            DRAFT_STATUS_MODIFIED
+        } else {
+            DRAFT_STATUS_UNMODIFIED
+        }
+    }
+
+    /// Every version published from this dataset, in the order they were
+    /// published.
+    pub fn versions(&self) -> &[DatasetVersionRecord] {
+        &self.versions
+    }
+
+    /// The version a `datasetVersion` names, or `None` when this dataset holds
+    /// no such published version.
+    pub fn version(&self, version: u32) -> Option<&DatasetVersionRecord> {
+        self.versions
+            .iter()
+            .find(|published| published.version == version)
+    }
+
+    /// Publish the working copy as this dataset's next numbered version,
+    /// answering the number it was published as — or `None` when the dataset
+    /// already holds [`MAX_VERSIONS_PER_DATASET`] of them — whereupon the caller
+    /// answers the operation's modelled quota error rather than growing this
+    /// process's memory. The ceiling lives here, at the ONE place a version is
+    /// appended (`versions` is private for exactly that reason), so no publish
+    /// path can skip it.
+    ///
+    /// "The DRAFT is preserved and remains editable after publishing", so the
+    /// version is a snapshot of the examples the draft holds now and the draft
+    /// itself is left in place — matching the version it was published as until
+    /// something changes it again. The dataset reports `UPDATING` until the
+    /// clock owes it `ACTIVE`: "Always UPDATING immediately after this call".
+    pub fn publish_version(&mut self, now: SystemTime) -> Option<u32> {
+        if self.versions.len() >= MAX_VERSIONS_PER_DATASET {
+            return None;
+        }
+        // Versions are numbered from one, in publication order.
+        let version = u32::try_from(self.versions.len() + 1).unwrap_or(u32::MAX);
+        self.versions.push(DatasetVersionRecord {
+            version,
+            examples: self.draft_examples.clone(),
+            created_at: now,
+        });
+        self.draft_modified = false;
+        self.updated_at = now;
+        self.transient_status = DATASET_STATUS_UPDATING.to_string();
+        self.settled_status = DATASET_STATUS_ACTIVE.to_string();
+        self.settles_at = now + DATASET_SETTLE_DELAY;
+        // The publication succeeded, so nothing of an earlier failure is owed.
+        self.failure_reason = None;
+        Some(version)
+    }
+
     /// The tags as a response reports them: the map the create carried, or no
     /// member at all for a dataset carrying none, so an untagged dataset is not
     /// reported as one holding an empty tag set.
@@ -501,23 +714,50 @@ impl DatasetRecord {
         }
     }
 
-    /// What a read of this dataset's DRAFT reports.
-    pub fn get_output(&self, now: SystemTime) -> GetDatasetOutput {
+    /// What the publication of `version` from this dataset reports.
+    pub fn create_version_output(
+        &self,
+        version: &DatasetVersionRecord,
+        now: SystemTime,
+    ) -> CreateDatasetVersionOutput {
+        CreateDatasetVersionOutput {
+            dataset_arn: self.dataset_arn.clone(),
+            dataset_id: self.dataset_id.clone(),
+            status: self.status_at(now).to_string(),
+            dataset_version: version.version.to_string(),
+            created_at: timestamp(version.created_at),
+        }
+    }
+
+    /// What a read of this dataset reports, for the version the request resolved
+    /// to: the DRAFT working copy, or one version published from it.
+    ///
+    /// Only the version's own members differ between the two — the identifier it
+    /// is addressed by and the examples it holds; everything else is a property
+    /// of the dataset.
+    pub fn get_output(
+        &self,
+        version: Option<&DatasetVersionRecord>,
+        now: SystemTime,
+    ) -> GetDatasetOutput {
         GetDatasetOutput {
             dataset_arn: self.dataset_arn.clone(),
             dataset_id: self.dataset_id.clone(),
-            dataset_version: DATASET_VERSION_DRAFT.to_string(),
+            dataset_version: version.map_or_else(
+                || DATASET_VERSION_DRAFT.to_string(),
+                |published| published.version.to_string(),
+            ),
             dataset_name: self.dataset_name.clone(),
             description: self.description.clone(),
             status: self.status_at(now).to_string(),
-            // The DRAFT's publish synchronization state: this dataset holds no
-            // published version, and `MODIFIED` is what a DRAFT with "no
-            // versions … published yet" reports.
-            draft_status: Some(DRAFT_STATUS_MODIFIED.to_string()),
+            // The DRAFT's publish synchronization state, which is a property of
+            // the working copy whichever version was read.
+            draft_status: Some(self.draft_status().to_string()),
             failure_reason: self.failure_reason_at(now),
             schema_type: self.schema_type.clone(),
             kms_key_arn: self.kms_key_arn.clone(),
-            example_count: self.example_count(),
+            example_count: version
+                .map_or_else(|| self.example_count(), DatasetVersionRecord::example_count),
             // "Presigned Amazon S3 URL to download the consolidated dataset
             // file for the resolved version. … Omitted if the file does not yet
             // exist": this emulator consolidates no file into object storage, so
@@ -527,6 +767,23 @@ impl DatasetRecord {
             created_at: timestamp(self.created_at),
             updated_at: timestamp(self.updated_at),
             tags: self.reported_tags(),
+        }
+    }
+
+    /// This dataset as `ListDatasets` reports it: the members `DatasetSummary`
+    /// declares, off the same record a read answers from.
+    pub fn summary(&self, now: SystemTime) -> DatasetSummary {
+        DatasetSummary {
+            dataset_arn: self.dataset_arn.clone(),
+            dataset_id: self.dataset_id.clone(),
+            dataset_name: self.dataset_name.clone(),
+            description: self.description.clone(),
+            status: self.status_at(now).to_string(),
+            draft_status: Some(self.draft_status().to_string()),
+            schema_type: self.schema_type.clone(),
+            example_count: self.example_count(),
+            created_at: timestamp(self.created_at),
+            updated_at: timestamp(self.updated_at),
         }
     }
 }
@@ -579,6 +836,44 @@ impl super::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolStat
             &mut self.dataset_idempotency_order,
             super::token_key(operation, &token),
             dataset_id.to_string(),
+        );
+    }
+
+    /// The (dataset, version number) a previous request to `operation` carrying
+    /// this `clientToken` published, if the record is still held and the version
+    /// it names still exists.
+    pub fn replayed_dataset_version(
+        &self,
+        operation: &str,
+        client_token: Option<&str>,
+    ) -> Option<(String, u32)> {
+        let (dataset_id, version) = self
+            .dataset_version_idempotency
+            .get(&super::token_key(operation, client_token?))?;
+        self.datasets
+            .get(dataset_id)
+            .and_then(|record| record.version(*version))
+            .map(|_| (dataset_id.clone(), *version))
+    }
+
+    /// Record which version a `clientToken` published for `operation`, evicting
+    /// the oldest record once `MAX_REMEMBERED_CLIENT_TOKENS` are held, on the
+    /// same rule as every other idempotency record of this service.
+    pub fn remember_dataset_version_client_token(
+        &mut self,
+        operation: &str,
+        client_token: Option<String>,
+        dataset_id: &str,
+        version: u32,
+    ) {
+        let Some(token) = client_token else {
+            return;
+        };
+        super::remember_token(
+            &mut self.dataset_version_idempotency,
+            &mut self.dataset_version_idempotency_order,
+            super::token_key(operation, &token),
+            (dataset_id.to_string(), version),
         );
     }
 }

@@ -159,12 +159,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The policy attaches to the resource the ARN names, so an ARN naming no
         // resource this service holds — or one of a type the feature does not
-        // cover — is the modelled 404 rather than a policy nothing carries.
+        // cover — is the modelled 404 for an ARN that resolves to nothing,
+        // rather than a policy nothing carries.
         let target = store
             .resource_policy_target(&region, &input.resource_arn)
             .ok_or_else(|| {
                 PutResourcePolicyErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(crate::state::RESOURCE_POLICY_TARGET),
+                    crate::state::resource_arn_not_found(),
                 )
             })?;
 

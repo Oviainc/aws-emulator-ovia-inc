@@ -276,7 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request is served rather than refused over it.
         let (api_key_secret_arn, api_key_secret_json_key) = match external_reference {
             Some(reference) => {
-                let arn = crate::state::external_api_key_secret_arn(
+                let arn = crate::state::referenced_external_secret_arn(
                     ctx,
                     &region,
                     &reference.secret_id,
@@ -348,9 +348,11 @@ fn name_taken(name: &str) -> CreateApiKeyCredentialProviderErrorModeled {
 
 /// How a create answers when the secret the provider's key lives in could not be
 /// reported: the reference names no secret of this account, which is the modelled
-/// 404 for "a resource referenced by the operation does not exist"; anything else
-/// is this emulator failing to reach Secrets Manager, which is a server failure
-/// rather than a statement about the request.
+/// 404 for "a resource referenced by the operation does not exist"; a secret
+/// whose own KMS key will not decrypt it is the modelled `DecryptionFailure`,
+/// which is the one failure the caller recovers from by fixing the key rather
+/// than the request; anything else is this emulator failing to reach Secrets
+/// Manager, which is a server failure rather than a statement about the request.
 fn secret_problem(
     problem: crate::state::ApiKeySecretProblem,
     reference: &str,
@@ -360,6 +362,12 @@ fn secret_problem(
             CreateApiKeyCredentialProviderErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(crate::state::RESOURCE_SECRET),
             )
+            .into()
+        }
+        crate::state::ApiKeySecretProblem::Undecryptable => {
+            CreateApiKeyCredentialProviderErrorModeled::DecryptionFailure(DecryptionFailure {
+                message: crate::state::SECRET_UNDECRYPTABLE_MESSAGE.to_string(),
+            })
             .into()
         }
         crate::state::ApiKeySecretProblem::Unavailable(detail) => {

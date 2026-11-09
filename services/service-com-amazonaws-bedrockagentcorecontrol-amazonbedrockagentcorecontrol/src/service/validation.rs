@@ -146,6 +146,32 @@ pub(super) fn refusal(
     })
 }
 
+/// This service's wording for a constraint violation a HANDLER found, as the `message` of
+/// the modelled `ValidationException` it answers with.
+///
+/// The boundary walk reaches every constraint codegen captured on an operation's input
+/// members, but not one the model declares inside a UNION: that member is validated by the
+/// handler, which words its refusal HERE rather than spelling a second clause of its own —
+/// so rules 1, 3 and 5 hold for a handler-enforced constraint exactly as they do for a
+/// boundary-enforced one, and one service cannot word the same violation two ways.
+///
+/// `input_schema` is the enforcing operation's own input shape, which rule 5's echo policy
+/// is read off. `None` when the violation's class has no wording here, which the caller
+/// answers with its own sentence rather than an empty message.
+pub(crate) fn handler_refusal_message(
+    violations: &[Violation],
+    input_schema: &'static Schema,
+) -> Option<String> {
+    message(
+        violations,
+        Some(input_schema),
+        echo_of(input_schema),
+        // A handler enforces a constraint on ONE member it read off the request, so there
+        // is no collection whose rendered value a clause would have to state (rule 4).
+        &HashMap::new(),
+    )
+}
+
 /// The `message` for a set of violations: the count, then one clause per failing
 /// (member, requirement) in the order the walk found them.
 fn message(

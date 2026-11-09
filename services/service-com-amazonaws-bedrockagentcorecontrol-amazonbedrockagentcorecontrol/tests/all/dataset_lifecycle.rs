@@ -230,10 +230,18 @@ fn is_modelled_dataset_id(id: &str) -> bool {
 
 /// A `source` carrying `count` inline examples. Each example is a JSON object, which is
 /// what `DatasetExampleList`'s `document` member admits (`smithy_query
-/// shape=DatasetExampleList`).
+/// shape=DatasetExampleList`), carrying the fields the AgentCore evaluation schemas
+/// require of one: the scenario it belongs to and the turn's input
+/// (`crate::state::required_example_fields`).
 fn inline_source(count: usize) -> Value {
     let examples: Vec<Value> = (0..count)
-        .map(|index| json!({"input": format!("turn {index}"), "expected": {"score": index}}))
+        .map(|index| {
+            json!({
+                "scenario_id": format!("scenario-{index}"),
+                "input": format!("turn {index}"),
+                "expected": {"score": index},
+            })
+        })
         .collect();
     json!({"inlineExamples": {"examples": examples}})
 }

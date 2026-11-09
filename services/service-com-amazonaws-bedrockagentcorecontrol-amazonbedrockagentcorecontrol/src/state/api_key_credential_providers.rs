@@ -23,10 +23,12 @@
 //!   secret Secrets Manager really holds: a client that reads the provider and
 //!   then reads the secret finds the key there;
 //! * `EXTERNAL` — "you manage the secret yourself in Amazon Web Services Secrets
-//!   Manager" — so the create resolves the secret the request's
-//!   `apiKeySecretConfig` names and reports its ARN, together with the `jsonKey`
-//!   the caller extracts the key with. Nothing is written into it: the key is the
-//!   caller's.
+//!   Manager" — so the create READS the secret the request's `apiKeySecretConfig`
+//!   names and reports the ARN Secrets Manager answered with, together with the
+//!   `jsonKey` the caller extracts the key with. Nothing is written into it: the
+//!   key is the caller's. The read is `GetSecretValue`, which DECRYPTS: a secret
+//!   whose KMS key will not decrypt is the modelled `DecryptionFailure`, because
+//!   a key the provider cannot read is of no use to it.
 //!
 //! Secrets Manager is reached the way this crate reaches every other emulated
 //! service — through the in-process callback
@@ -213,6 +215,17 @@ pub fn effective_secret_source(requested: Option<&str>, has_secret_config: bool)
     }
 }
 
+/// The message this service refuses a credential provider with when a secret
+/// the caller references cannot be decrypted.
+///
+/// Fixed text: nothing of the request or of the state is interpolated, because
+/// the remedy does not depend on which secret or which key was at fault — the
+/// caller fixes the key's permissions and retries. Shared by every credential
+/// provider plane of this crate, so one undecryptable secret is reported in one
+/// sentence whichever provider referenced it.
+pub const SECRET_UNDECRYPTABLE_MESSAGE: &str =
+    "Unable to decrypt the provided secret. Verify KMS key permissions.";
+
 /// Why the secret an API key credential provider's key lives in could not be
 /// reported.
 #[derive(Debug)]
@@ -220,6 +233,10 @@ pub enum ApiKeySecretProblem {
     /// Secrets Manager answered that this account holds no such secret, so the
     /// request references a resource that does not exist.
     Absent,
+    /// Secrets Manager will not decrypt the secret: the state of its own KMS
+    /// key. The secret is there, but its value cannot be read, so a credential
+    /// provider over it would carry a credential nothing can use.
+    Undecryptable,
     /// Secrets Manager could not be asked, or refused the call: nothing is known
     /// about the secret, so there is no ARN to report. Carries the rendering of
     /// what came back, for the trace.
@@ -300,37 +317,46 @@ pub(crate) async fn store_managed_secret(
     }
 }
 
-/// The ARN of the secret an `EXTERNAL` provider references, as Secrets Manager
-/// reports it for the `secretId` the caller named — which may be the secret's
-/// name or its whole ARN, both of which that service resolves.
+/// The ARN of the secret an `EXTERNAL` credential provider references, as
+/// Secrets Manager reports it for the `secretId` the caller named — which may be
+/// the secret's name or its whole ARN, both of which that service resolves.
 ///
-/// Nothing is written: the secret is the caller's. The ARN reported is the one
+/// Nothing is written: the secret is the caller's. The read is `GetSecretValue`,
+/// the call that DECRYPTS the value, because a credential the provider cannot
+/// read is of no use to it: a secret whose KMS key will not decrypt is
+/// [`ApiKeySecretProblem::Undecryptable`] and a `secretId` Secrets Manager holds
+/// no secret for is [`ApiKeySecretProblem::Absent`]. The ARN reported is the one
 /// Secrets Manager answered with, never the string the request carried, so a
 /// provider is never recorded against a secret nothing holds.
 ///
+/// Shared by every credential-provider plane of this crate, so none of them can
+/// accept a secret another would refuse.
+///
 /// Call it with NO state guard held — it awaits.
-pub async fn external_api_key_secret_arn(
+pub async fn referenced_external_secret_arn(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     secret_id: &str,
 ) -> Result<String, ApiKeySecretProblem> {
     match secrets_manager_client(ctx, region)
-        .describe_secret()
+        .get_secret_value()
         .secret_id(secret_id)
         .send()
         .await
     {
-        Ok(answer) => arn_of(answer.arn, "DescribeSecret"),
-        Err(error)
-            if error
-                .as_service_error()
-                .is_some_and(|service| service.is_resource_not_found_exception()) =>
-        {
-            Err(ApiKeySecretProblem::Absent)
+        Ok(answer) => arn_of(answer.arn, "GetSecretValue"),
+        Err(error) => {
+            let service = error.as_service_error();
+            if service.is_some_and(|failure| failure.is_decryption_failure()) {
+                return Err(ApiKeySecretProblem::Undecryptable);
+            }
+            if service.is_some_and(|failure| failure.is_resource_not_found_exception()) {
+                return Err(ApiKeySecretProblem::Absent);
+            }
+            Err(unavailable(
+                ::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            ))
         }
-        Err(error) => Err(unavailable(
-            ::aws_smithy_types::error::display::DisplayErrorContext(&error),
-        )),
     }
 }
 

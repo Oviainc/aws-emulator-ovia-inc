@@ -152,14 +152,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A policy is addressed through the resource that carries it, so an ARN
         // naming no resource this service holds — or one of a type the feature
-        // does not cover — resolves no document, which is the same answer as a
-        // resource that carries none: neither has a policy to remove.
-        let target = store.resource_policy_target(&region, &input.resource_arn);
-        let removed = match &target {
-            Some(target) => store.detach_resource_policy(target),
-            None => None,
-        };
-        if removed.is_none() {
+        // does not cover — is the modelled 404 for an ARN that resolves to
+        // nothing, which is a different condition from a resource that exists
+        // and carries no document to remove.
+        let target = store
+            .resource_policy_target(&region, &input.resource_arn)
+            .ok_or_else(|| {
+                DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_arn_not_found(),
+                )
+            })?;
+        if store.detach_resource_policy(&target).is_none() {
             return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
                 crate::state::resource_policy_not_found(),
             )

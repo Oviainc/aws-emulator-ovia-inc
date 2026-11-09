@@ -7,6 +7,9 @@
 //! its `source` yielded into the DRAFT working copy. Every later read of the dataset
 //! comes from that record.
 //!
+//! An inline batch is checked against the dataset's schema BEFORE anything is persisted,
+//! so one example that omits a field the schema requires refuses the whole call.
+//!
 //! The create is ASYNCHRONOUS: it reports `CREATING`, and the clock owes the transition
 //! to the status the ingestion earned — `ACTIVE`, or `CREATE_FAILED` for a source that
 //! yielded no examples — which `GetDataset` reports from then on.
@@ -184,6 +187,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
+        // "Source of initial examples. Provide either inline examples or an S3
+        // URI pointing to a JSONL file." A batch the REQUEST carries is one
+        // commit, so every example in it is checked against the dataset's schema
+        // first and the whole call is refused if one of them fails: a refused
+        // example leaves no dataset holding the rest.
+        if let DataSourceType::inlineExamples(inline) = &input.source {
+            crate::state::validate_inline_examples(&input.schema_type, &inline.examples)
+                .map_err(CreateDatasetErrorModeled::ValidationException)?;
+        }
+
         // The examples the source yields, read BEFORE the store is locked: an
         // Amazon S3 source names a JSONL file in the caller's own bucket, which
         // this emulator reads out of its own object storage, so the number of
@@ -199,6 +212,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(dataset_id) =
             store.replayed_dataset_result(Self::NAME, input.client_token.as_deref())
         {
+            // `replayed_dataset_result` answers only for a dataset the store
+            // still holds, so this lookup cannot miss.
             if let Some(record) = store.datasets.get(&dataset_id) {
                 return Ok(record.create_output(now));
             }

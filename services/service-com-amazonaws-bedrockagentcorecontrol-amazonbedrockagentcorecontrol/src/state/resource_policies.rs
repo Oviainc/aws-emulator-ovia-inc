@@ -32,21 +32,31 @@ pub const POLICY_TARGET_GATEWAY: &str = "gateway";
 /// with ("Resource Policy doesn't exist for requested arn").
 ///
 /// The sentence has no variable part: it names the ARN the request asked under
-/// rather than quoting the caller's own value, so one answer covers every ARN
-/// that resolves no policy — a resource of this service that carries none, and
-/// an ARN naming no resource a policy could be attached to at all, which carries
-/// none either.
+/// rather than quoting the caller's own value, so one answer covers every
+/// resource of this service that carries no policy.
+///
+/// It is NOT the answer for an ARN that names no resource at all — that one is
+/// [`resource_arn_not_found`]: the two conditions have different remedies (write
+/// a policy, versus address a resource that exists), so they are worded apart.
 pub fn resource_policy_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some("Resource Policy doesn't exist for requested arn".to_string()),
     }
 }
 
-/// The resource noun [`resource_not_found`] names the resource a policy attaches
-/// to with. A policy request addresses that resource by its ARN rather than by a
-/// type-specific identifier, and the two types the feature covers are refused
-/// alike, so the refusal names it as a resource.
-pub const RESOURCE_POLICY_TARGET: &str = "resource";
+/// The modelled not-found error for a `resourceArn` that names no resource a
+/// policy of this service can attach to, in the words AWS answers it with
+/// ("ResourceArn provided in the request does not exist").
+///
+/// Entirely fixed text: the ARN is the caller's own value and the remedy — name
+/// a resource that exists — does not depend on it. Shared by every
+/// resource-policy operation, so the same unresolvable ARN is reported in one
+/// sentence whichever of them was asked.
+pub fn resource_arn_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some("ResourceArn provided in the request does not exist".to_string()),
+    }
+}
 
 impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
     /// The resource `resource_arn` names, as the key a policy of it is held

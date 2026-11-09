@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDatasetVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDatasetVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDatasetVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +163,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDatasetVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDatasetVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDatasetVersion"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDatasetVersionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the dataset store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the
+        // version that token first published, rather than publishing a second
+        // one: "If this token matches a previous request, the service ignores
+        // the request, but doesn't return an error."
+        if let Some((dataset_id, version)) =
+            store.replayed_dataset_version(Self::NAME, input.client_token.as_deref())
+        {
+            // `replayed_dataset_version` answers only for a version the store
+            // still holds, so neither lookup can miss.
+            if let Some(record) = store.datasets.get(&dataset_id) {
+                if let Some(published) = record.version(version) {
+                    return Ok(record.create_version_output(published, now));
+                }
+            }
+        }
+
+        // The store is keyed by the `datasetId` the create minted; an id naming
+        // no stored dataset is the modelled 404, and nothing is published for
+        // it.
+        let record = store.datasets.get_mut(&input.dataset_id).ok_or_else(|| {
+            CreateDatasetVersionErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_DATASET),
+            )
+        })?;
+
+        // A dataset whose own ingestion or last mutation is still in flight
+        // blocks every write: "All writes are blocked" while it is `CREATING` or
+        // `UPDATING`, so the request conflicts with the operation already
+        // running on it.
+        let status = record.status_at(now).to_string();
+        if status == crate::state::DATASET_STATUS_CREATING
+            || status == crate::state::DATASET_STATUS_UPDATING
+            || status == crate::state::DATASET_STATUS_DELETING
+        {
+            return Err(CreateDatasetVersionErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Cannot perform operation {} when dataset is in {status} status",
+                        Self::NAME
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The version history this request would grow is bounded, so a caller
+        // looping on publish meets the modelled quota instead of this process's
+        // memory limit. The ceiling is the record's own, at the one place a
+        // version is appended.
+        let Some(version_number) = record.publish_version(now) else {
+            return Err(
+                CreateDatasetVersionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "dataset {} already holds the maximum of {} versions",
+                            input.dataset_id,
+                            crate::state::MAX_VERSIONS_PER_DATASET
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The version was just appended, so this lookup cannot miss.
+        let output = record
+            .version(version_number)
+            .map(|published| record.create_version_output(published, now))
+            .ok_or_else(|| {
+                CreateDatasetVersionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the published dataset version could not be read back"
+                            .to_string()),
+                    },
+                )
+            })?;
+        store.remember_dataset_version_client_token(
+            Self::NAME,
+            input.client_token,
+            &input.dataset_id,
+            version_number,
+        );
+
+        Ok(output)
     }
 }

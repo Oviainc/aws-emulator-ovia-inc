@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDatasetVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDatasetVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDatasetVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +145,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDatasetVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDatasetVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDatasetVersions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDatasetVersionsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the dataset store is unavailable".to_string()),
+            })
+        })?;
+        let store = state.lock();
+
+        // A version is addressed through the dataset it was published from, so
+        // an id naming no stored dataset is the modelled 404 rather than an
+        // empty page.
+        let record = store.datasets.get(&input.dataset_id).ok_or_else(|| {
+            ListDatasetVersionsErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_DATASET),
+            )
+        })?;
+
+        // The token is opaque on the wire: it carries the version the previous
+        // page ended on, hex-encoded, and the next page starts strictly after
+        // it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListDatasetVersionsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                    reason: "FieldValidationFailed".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message: "must be a nextToken returned by a previous \
+                                  ListDatasetVersions call"
+                            .to_string(),
+                    }]),
+                })
+            })?),
+        };
+
+        // The versions of one dataset are held in publication order, so the
+        // page walks them by that order — the same ascending-key rule every
+        // listing of this service pages by, with the version number
+        // zero-padded in the key so 10 follows 9 rather than 1.
+        let versions: ::std::collections::BTreeMap<String, DatasetVersionSummary> = record
+            .versions()
+            .iter()
+            .map(|version| (format!("{:010}", version.version), version.summary()))
+            .collect();
+        let page_size = crate::state::page_size(input.max_results, MAX_PAGE_SIZE);
+        let (versions, next_token) =
+            crate::state::page_over(&versions, resume_after.as_deref(), page_size, |summary| {
+                Some(summary.clone())
+            });
+
+        Ok(ListDatasetVersionsOutput {
+            versions,
+            next_token,
+        })
     }
 }
+
+/// The modeled upper bound of `maxResults` (range 1..100), used as the page size
+/// when the caller names none.
+const MAX_PAGE_SIZE: i32 = 100;
+
+// The opaque `nextToken` codec is `crate::state`'s
+// (`encode_page_token`/`decode_page_token`): every `@paginated` listing in this
+// service issues and reads the same token form.

@@ -33,13 +33,13 @@ const ACCOUNT: &str = "000000000000";
 /// `smithy_query(query="shape", shape="ResourcePolicyBody")`).
 const MAX_POLICY_LEN: usize = 20_480;
 
-/// How a policy lookup that resolves no document is worded.
+/// How a policy lookup that resolves no document is worded, for a resource this service
+/// HOLDS that carries none.
 const POLICY_MISSING: &str = "Resource Policy doesn't exist for requested arn";
 
-/// How this service words a resource of its own that is not there, which is what a WRITE of
-/// a policy needs (`crate::state::resource_not_found`).
-const RESOURCE_MISSING: &str = "Failed to retrieve resource because it doesn't exist. Retry \
-                                the request with a different resource identifier.";
+/// How every resource-policy operation words a `resourceArn` that names no resource a
+/// policy can attach to (`crate::state::resource_arn_not_found`).
+const RESOURCE_MISSING: &str = "ResourceArn provided in the request does not exist";
 
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -509,9 +509,9 @@ async fn the_resource_policy_operations_refuse_what_the_model_states_they_must()
     ];
 
     for (case, arn) in unresolved {
-        // A write must have a resource to attach the document to, so it reports the
-        // missing RESOURCE; a read and a delete asked for the POLICY, which an ARN
-        // naming no such resource carries no more than a resource that has none.
+        // Every one of the three asked about a resource that is not there, so each
+        // reports the ARN that resolves to nothing rather than a policy: the remedy is
+        // to address a resource that exists, whichever operation was called.
         for (operation, expected_message, (status, answer)) in [
             (
                 "PutResourcePolicy",
@@ -520,12 +520,12 @@ async fn the_resource_policy_operations_refuse_what_the_model_states_they_must()
             ),
             (
                 "GetResourcePolicy",
-                POLICY_MISSING,
+                RESOURCE_MISSING,
                 get_policy(&router, &arn, REGION).await,
             ),
             (
                 "DeleteResourcePolicy",
-                POLICY_MISSING,
+                RESOURCE_MISSING,
                 delete_policy(&router, &arn, REGION).await,
             ),
         ] {

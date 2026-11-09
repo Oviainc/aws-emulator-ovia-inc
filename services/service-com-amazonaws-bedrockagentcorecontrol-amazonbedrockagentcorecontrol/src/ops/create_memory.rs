@@ -286,6 +286,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             namespace_keys: input.namespace_keys,
             stream_delivery_resources: input.stream_delivery_resources,
             tags: crate::state::sorted_map(input.tags),
+            // Nobody has deleted this memory, so the clock owes no removal.
+            removal_due_at: None,
         };
         let output = CreateMemoryOutput {
             memory: Some(record.memory(now)),

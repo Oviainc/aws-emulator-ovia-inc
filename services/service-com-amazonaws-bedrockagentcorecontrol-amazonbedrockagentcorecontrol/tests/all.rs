@@ -37,8 +37,12 @@ mod configuration_bundle_deletion;
 mod configuration_bundle_lifecycle;
 #[path = "all/control_plane_preconditions.rs"]
 mod control_plane_preconditions;
+#[path = "all/credential_provider_external_secret_decryption.rs"]
+mod credential_provider_external_secret_decryption;
 #[path = "all/dataset_lifecycle.rs"]
 mod dataset_lifecycle;
+#[path = "all/dataset_schema_validation.rs"]
+mod dataset_schema_validation;
 #[path = "all/gateway_dependent_children.rs"]
 mod gateway_dependent_children;
 #[path = "all/gateway_endpoint_url.rs"]
@@ -75,6 +79,8 @@ mod harness_endpoint_lifecycle;
 mod harness_lifecycle;
 #[path = "all/harness_version_listing.rs"]
 mod harness_version_listing;
+#[path = "all/memory_deletion.rs"]
+mod memory_deletion;
 #[path = "all/memory_lifecycle.rs"]
 mod memory_lifecycle;
 #[path = "all/memory_mutation.rs"]
@@ -85,6 +91,8 @@ mod memory_namespace_key_reference_wording;
 mod memory_read_reflects_last_mutation;
 #[path = "all/memory_update_and_read_projection.rs"]
 mod memory_update_and_read_projection;
+#[path = "all/oauth2_credential_provider_configuration.rs"]
+mod oauth2_credential_provider_configuration;
 #[path = "all/payment_manager_lifecycle.rs"]
 mod payment_manager_lifecycle;
 #[path = "all/payment_credential_provider.rs"]
@@ -117,6 +125,8 @@ mod state_roundtrip;
 mod system_tools;
 #[path = "all/token_vault_cmk.rs"]
 mod token_vault_cmk;
+#[path = "all/tool_and_bundle_listings.rs"]
+mod tool_and_bundle_listings;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;
 #[path = "all/workload_identity_arn_region.rs"]

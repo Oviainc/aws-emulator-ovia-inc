@@ -4,11 +4,11 @@
 //!
 //! Reports the dataset `CreateDataset` persisted, read out of [`crate::state`]: the
 //! name, schema type, description, KMS key and tags it was created with, how many
-//! examples its DRAFT working copy holds, and the status the clock owes it.
+//! examples the version it resolved to holds, and the status the clock owes it.
 //!
 //! The version a read resolves to is the request's `datasetVersion`, defaulting to
-//! DRAFT. A published version number addresses a version of the dataset, which exists
-//! only once one has been published for it.
+//! DRAFT. A published version number addresses a version `CreateDatasetVersion`
+//! published from the working copy, which exists only once one has been published.
 //!
 //! ## Shape of an operation
 //!
@@ -202,20 +202,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Use the datasetVersion query parameter to retrieve a specific
         // version's metadata. If absent, defaults to DRAFT." Every other
-        // spelling `DatasetVersion` admits is a PUBLISHED version number, and a
-        // dataset reports a version only once one has been published for it, so
-        // a number no published version carries is the modelled 404.
-        let version = input
+        // spelling `DatasetVersion` admits is a PUBLISHED version number, which
+        // names a version `CreateDatasetVersion` published from this dataset's
+        // working copy, so a number no published version of it carries is the
+        // modelled 404.
+        let requested = input
             .dataset_version
             .as_deref()
             .unwrap_or(crate::state::DATASET_VERSION_DRAFT);
-        if version != crate::state::DATASET_VERSION_DRAFT {
-            return Err(GetDatasetErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(crate::state::RESOURCE_DATASET_VERSION),
+        let version = if requested == crate::state::DATASET_VERSION_DRAFT {
+            None
+        } else {
+            // The member's pattern admits only `DRAFT` or digits, so anything
+            // else was already refused before this handler ran.
+            Some(
+                requested
+                    .parse::<u32>()
+                    .ok()
+                    .and_then(|version| record.version(version))
+                    .ok_or_else(|| {
+                        GetDatasetErrorModeled::ResourceNotFoundException(
+                            crate::state::resource_not_found(
+                                crate::state::RESOURCE_DATASET_VERSION,
+                            ),
+                        )
+                    })?,
             )
-            .into());
-        }
+        };
 
-        Ok(record.get_output(now))
+        Ok(record.get_output(version, now))
     }
 }

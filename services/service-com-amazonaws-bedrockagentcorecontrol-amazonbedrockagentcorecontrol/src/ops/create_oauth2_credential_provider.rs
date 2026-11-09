@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOauth2CredentialProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOauth2CredentialProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOauth2CredentialProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +185,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOauth2CredentialProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOauth2CredentialProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOauth2CredentialProvider"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateOauth2CredentialProviderErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the credential provider store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let vault = crate::state::DEFAULT_TOKEN_VAULT_ID;
+
+        // `credentialProviderVendor` and `oauth2ProviderConfigInput` are one
+        // configuration: the vendor SELECTS which member of the union carries
+        // the credentials, and the member's own `discoveryUrl` carries a pattern
+        // the model states inside a union, which the framework's constraint walk
+        // does not reach. Both are decided before anything is stored, so a
+        // refused request leaves no provider behind.
+        let requested = crate::state::RequestedOauth2Configuration::from_input(
+            &input.credential_provider_vendor,
+            &input.oauth2_provider_config_input,
+        )
+        .map_err(CreateOauth2CredentialProviderErrorModeled::ValidationException)?;
+
+        // The name this account already holds a provider under, and this
+        // emulator's own ceiling, are both decided before anything is minted:
+        // nothing is stored in Secrets Manager for a request that is refused.
+        // The guard is dropped before the await below.
+        {
+            let store = state.lock();
+            if store.oauth2_credential_providers.contains_key(&input.name) {
+                return Err(name_taken(&input.name).into());
+            }
+            if store.oauth2_credential_providers.len()
+                >= crate::state::MAX_OAUTH2_CREDENTIAL_PROVIDERS
+            {
+                return Err(
+                    CreateOauth2CredentialProviderErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(format!(
+                                "this account already holds the maximum of {} OAuth2 \
+                                 credential providers",
+                                crate::state::MAX_OAUTH2_CREDENTIAL_PROVIDERS
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The secret the provider reports is a secret Secrets Manager really
+        // holds: the one this create puts the caller's client secret into for a
+        // managed provider, or the one the request references for an external
+        // one. The ARN is `@required` on this operation's own answer, so a
+        // provider is not recorded — and no success is reported — when there is
+        // no secret to name.
+        let client_secret = requested
+            .resolve_secret(ctx, &region, vault, &input.name)
+            .await
+            .map_err(secret_problem)?;
+
+        let record = crate::state::Oauth2CredentialProviderRecord {
+            credential_provider_arn: crate::state::oauth2_credential_provider_arn(
+                &region,
+                vault,
+                &input.name,
+            ),
+            name: input.name,
+            credential_provider_vendor: input.credential_provider_vendor,
+            client_secret,
+            config_output: requested.config_output,
+            tags: crate::state::sorted_map(input.tags),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let mut store = state.lock();
+        // The name was free when this request started, and the secret resolution
+        // above awaited: a provider stored under that name in the meantime is the
+        // one the account holds, so the later request is refused rather than
+        // replacing it. That is what makes the name unique under concurrent
+        // creates.
+        if store.oauth2_credential_providers.contains_key(&record.name) {
+            return Err(name_taken(&record.name).into());
+        }
+        let output = record.create_output();
+        store
+            .oauth2_credential_providers
+            .insert(record.name.clone(), record);
+
+        Ok(output)
+    }
+}
+
+/// The refusal of a create whose `name` this account already holds a provider
+/// under: a provider is addressed by name, so a repeated name is a conflict
+/// rather than a second provider later reads could not tell apart.
+fn name_taken(name: &str) -> CreateOauth2CredentialProviderErrorModeled {
+    CreateOauth2CredentialProviderErrorModeled::ConflictException(ConflictException {
+        message: Some(format!(
+            "an OAuth2 credential provider named {name} already exists in this account"
+        )),
+    })
+}
+
+/// How a create answers when the secret the provider's client secret lives in
+/// could not be reported: the reference names no secret of this account, which
+/// is the modelled 404 for "a resource referenced by the operation does not
+/// exist"; a secret whose own KMS key will not decrypt it is the modelled
+/// `DecryptionFailure`, the one failure the caller recovers from by fixing the
+/// key rather than the request; anything else is this emulator failing to reach
+/// Secrets Manager, which is a server failure rather than a statement about the
+/// request.
+fn secret_problem(
+    problem: crate::state::ApiKeySecretProblem,
+) -> CreateOauth2CredentialProviderError {
+    match problem {
+        crate::state::ApiKeySecretProblem::Absent => {
+            CreateOauth2CredentialProviderErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_SECRET),
+            )
+            .into()
+        }
+        crate::state::ApiKeySecretProblem::Undecryptable => {
+            CreateOauth2CredentialProviderErrorModeled::DecryptionFailure(DecryptionFailure {
+                message: crate::state::SECRET_UNDECRYPTABLE_MESSAGE.to_string(),
+            })
+            .into()
+        }
+        crate::state::ApiKeySecretProblem::Unavailable(detail) => {
+            ::tracing::warn!(
+                %detail,
+                "the OAuth2 credential provider's client secret could not be stored in or \
+                 resolved against Secrets Manager, so no provider was created",
+            );
+            CreateOauth2CredentialProviderErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the client secret could not be stored in Secrets Manager".to_string(),
+                    ),
+                },
+            )
+            .into()
+        }
     }
 }

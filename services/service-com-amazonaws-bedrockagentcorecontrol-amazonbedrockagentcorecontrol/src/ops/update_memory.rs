@@ -547,6 +547,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )?;
 
         let mut store = state.lock();
+        // A memory whose accepted deletion the clock has already made due is
+        // gone before this update looks for it — the removal was owed at this
+        // instant whether or not anybody called.
+        store.expire_deleted_memories(now);
 
         // A replayed request carrying the same `clientToken` answers with the
         // memory the first one produced instead of applying the change twice:
@@ -576,11 +580,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
-        // A memory still being created cannot be updated: its configuration is
-        // not in place yet, so the request conflicts with the operation already
-        // running on it.
+        // A memory still being created — or already being deleted — cannot be
+        // updated: its configuration is not in place yet, or is on its way out,
+        // so the request conflicts with the operation already running on it.
         let status = record.status_at(now).to_string();
-        if status == crate::state::MEMORY_STATUS_CREATING {
+        if status == crate::state::MEMORY_STATUS_CREATING
+            || status == crate::state::MEMORY_STATUS_DELETING
+        {
             return Err(UpdateMemoryErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
                     "Cannot perform operation {} when memory is in {status} status",

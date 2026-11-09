@@ -96,6 +96,7 @@ use crate::ops::types::{
     CreateBrowserOutput, CreateGatewayOutput, DeleteBrowserOutput, GetBrowserOutput,
     BrowserProfileSummary,
     CreateBrowserProfileOutput, DeleteBrowserProfileOutput, GetBrowserProfileOutput,
+    DeleteMemoryOutput,
     RecordingConfig, ToolsFileSystemConfiguration,
     CreateGatewayTargetOutput, CredentialProviderConfiguration, CustomTransformConfiguration,
     DeleteConfigurationBundleOutput,
@@ -361,6 +362,24 @@ pub fn memory_not_found(operation: &str, memory_id: &str) -> ResourceNotFoundExc
     }
 }
 
+/// The modelled not-found error for a memory a DELETE could not resolve, which
+/// the service words with the account the lookup ran in as well as the id
+/// ("Resource not found during DeleteMemory: Failed to retrieve memory with ID:
+/// <memoryId> for account: <accountId>").
+///
+/// The sentence around the two values is fixed: `memory_id` is the id the
+/// request's path carried, and the account is the single one this emulator
+/// serves (`engine::emulator_account_id`), never a literal of one run.
+pub fn memory_not_found_for_account(operation: &str, memory_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Resource not found during {operation}: Failed to retrieve memory with ID: \
+             {memory_id} for account: {}",
+            ::engine::emulator_account_id()
+        )),
+    }
+}
+
 /// How [`agent_runtime_not_found`] spells "the request asked for no particular
 /// version": the lookup ran with no version, and the sentence reports the
 /// missing value rather than leaving a gap.
@@ -450,6 +469,7 @@ pub const MAX_AGENT_RUNTIME_VERSION: u32 = 99_999;
 pub const MEMORY_STATUS_CREATING: &str = "CREATING";
 pub const MEMORY_STATUS_ACTIVE: &str = "ACTIVE";
 pub const MEMORY_STATUS_UPDATING: &str = "UPDATING";
+pub const MEMORY_STATUS_DELETING: &str = "DELETING";
 
 /// `MemoryStrategyStatus` members a strategy of a memory this emulator drives
 /// reports. The enum's full value list is `CREATING | ACTIVE | DELETING |
@@ -1605,6 +1625,11 @@ pub struct MemoryRecord {
     pub namespace_keys: Option<Vec<NamespaceKeyEntry>>,
     pub stream_delivery_resources: Option<StreamDeliveryResources>,
     pub tags: BTreeMap<String, String>,
+    /// The instant an accepted deletion removes this record, once `DeleteMemory`
+    /// has accepted one; `None` for a memory nobody has deleted. Stored, never
+    /// slept on, like
+    /// [`GatewayRecord::removal_due_at`](GatewayRecord#structfield.removal_due_at).
+    pub removal_due_at: Option<SystemTime>,
 }
 
 impl MemoryRecord {
@@ -1771,6 +1796,21 @@ impl MemoryRecord {
         memory.extraction_health = Some(extraction_health());
         memory
     }
+
+    /// Whether a deletion has been accepted for this memory: it reports
+    /// `DELETING` and the clock owes its removal.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
+    /// What the deletion of this memory reports: the id it was addressed by and
+    /// the status it reports from now on.
+    pub fn delete_output(&self, now: SystemTime) -> DeleteMemoryOutput {
+        DeleteMemoryOutput {
+            memory_id: self.id.clone(),
+            status: Some(self.status_at(now).to_string()),
+        }
+    }
 }
 
 /// One gateway's rate limits: the record each is stored as, the clock-owed
@@ -1780,9 +1820,10 @@ impl MemoryRecord {
 /// the limits.
 pub mod gateway_rate_limits;
 /// The evaluation dataset: the record a create persists, the examples its
-/// source yields into the DRAFT working copy, and the ARN and statuses it
-/// carries. Re-exported, so a handler names `crate::state::…` for it exactly as
-/// it does for the resources beside it.
+/// source yields into the DRAFT working copy, the versions published from it,
+/// the schema check its examples pass, and the ARN and statuses it carries.
+/// Re-exported, so a handler names `crate::state::…` for it exactly as it does
+/// for the resources beside it.
 pub mod datasets;
 /// What a requested memory strategy becomes before it is stored: the union
 /// member it was read off, the namespace list the rule gives it, its validated
@@ -1832,10 +1873,22 @@ pub mod api_key_credential_providers;
 /// synchronization reports a target in. Re-exported, so a handler names
 /// `crate::state::…` for it exactly as it does for the target record itself.
 pub mod gateway_target_synchronization;
+/// The OAuth2 credential providers of this account's token vault: the record a
+/// create persists, the ARN it mints, the configuration each vendor's
+/// credentials are carried in and the secret the client secret lives in.
+/// Re-exported, so a handler names `crate::state::…` for it exactly as it does
+/// for the token vault the providers belong to.
+pub mod oauth2_credential_providers;
+/// The summaries this service's paginated listings report for the resources
+/// whose record lives in this module. Re-exported, so a handler names
+/// `crate::state::…` for them exactly as it does for the records themselves.
+mod listings;
 pub use api_key_credential_providers::*;
 pub use datasets::*;
 pub use gateway_rate_limits::*;
 pub use gateway_target_synchronization::*;
+pub use listings::*;
+pub use oauth2_credential_providers::*;
 pub use memory_strategies::*;
 pub use payment_credential_providers::*;
 pub use payment_managers::*;
@@ -3133,7 +3186,11 @@ impl ConfigurationBundleRecord {
 /// the policies one engine holds,
 /// [`MAX_PAYMENT_CREDENTIAL_PROVIDERS`] the payment credential providers and
 /// [`MAX_WORKLOAD_IDENTITIES`] the workload identities,
-/// [`MAX_API_KEY_CREDENTIAL_PROVIDERS`] the API key credential providers, the
+/// [`MAX_API_KEY_CREDENTIAL_PROVIDERS`] the API key credential providers,
+/// [`MAX_DATASETS`] the datasets (and with them their 1:1 name index),
+/// [`MAX_DATASET_EXAMPLES`] the examples one ingestion yields into a dataset and
+/// [`MAX_VERSIONS_PER_DATASET`] the versions one dataset holds,
+/// [`MAX_OAUTH2_CREDENTIAL_PROVIDERS`] the OAuth2 credential providers, the
 /// resource policies are capped by the resources they attach to (one per runtime
 /// or gateway at most, and the entry of a resource that is gone is dropped), and
 /// the
@@ -3406,6 +3463,25 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// The keys of [`Self::policy_idempotency`] in the order they were first
     /// recorded, so the oldest record is the one evicted at the ceiling.
     policy_idempotency_order: VecDeque<String>,
+    /// `<operation>/<clientToken>` -> the (dataset, version number) that token
+    /// first published, so a replayed `CreateDatasetVersion` answers with its
+    /// first result instead of publishing a second version. Separate from
+    /// [`Self::dataset_idempotency`] because the record is validated against the
+    /// versions of a dataset rather than against the dataset itself; the key
+    /// carries the operation for the same reason as there.
+    dataset_version_idempotency: BTreeMap<String, (String, u32)>,
+    /// The keys of [`Self::dataset_version_idempotency`] in the order they were
+    /// first recorded, so the oldest record is the one evicted at the ceiling.
+    dataset_version_idempotency_order: VecDeque<String>,
+    /// Every OAuth2 credential provider of this account's default token vault,
+    /// keyed by `name` — the identifier every OAuth2-credential-provider route
+    /// addresses it by, and what the provider's own ARN ends in. The key order is
+    /// the deterministic list order a provider listing pages over.
+    ///
+    /// The client SECRET is not here: a provider's secret lives in a Secrets
+    /// Manager secret (see [`oauth2_credential_providers`]), and the record holds
+    /// the ARN of that secret rather than the credential.
+    pub oauth2_credential_providers: BTreeMap<String, Oauth2CredentialProviderRecord>,
     /// Bumped on every mint, so two runtimes created in the same instant with
     /// the same name still get distinct ids.
     mint_counter: u64,

@@ -535,6 +535,40 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
         );
     }
 
+    /// Drop the idempotency records naming a memory that no longer exists, for
+    /// the same reason [`Self::forget_client_tokens_for`] does: the memory the
+    /// record names is gone, so it can never replay anything again.
+    pub fn forget_memory_client_tokens_for(&mut self, memory_id: &str) {
+        self.memory_idempotency.retain(|_, id| id != memory_id);
+        let live = &self.memory_idempotency;
+        self.memory_idempotency_order
+            .retain(|token| live.contains_key(token));
+    }
+
+    /// Remove every memory whose accepted deletion the clock has made due, and
+    /// the name index entry and idempotency records naming it.
+    ///
+    /// `DeleteMemory` ACCEPTS the deletion (202) and reports the memory
+    /// `DELETING`; the record itself goes when the span it owes passes, so a
+    /// caller polling the memory sees `DELETING` and then the modelled 404. The
+    /// removal is owed by the CLOCK — it was due at this instant whether or not
+    /// anybody called — so every operation that reads the memory store
+    /// materialises it first, and nothing ever sleeps for it.
+    pub fn expire_deleted_memories(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .memories
+            .iter()
+            .filter(|(_, record)| record.removal_due_at.is_some_and(|at| now >= at))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            if let Some(record) = self.memories.remove(&id) {
+                self.memory_names.remove(&record.name);
+                self.forget_memory_client_tokens_for(&record.id);
+            }
+        }
+    }
+
     /// Mint a `registryId` no stored registry holds: [`REGISTRY_ID_LEN`]
     /// alphanumerics, per `RegistryId`'s pattern `^[a-zA-Z0-9]{12,16}$`, which
     /// — unlike a runtime, gateway or memory id — carries no name. The name is

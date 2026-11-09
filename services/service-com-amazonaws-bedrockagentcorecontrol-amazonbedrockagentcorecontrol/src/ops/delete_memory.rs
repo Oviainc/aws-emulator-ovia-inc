@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMemory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMemory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMemory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -154,20 +145,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMemory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMemoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteMemoryErrorModeled::ServiceException(ServiceException {
+                message: Some("the memory store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A memory whose earlier deletion the clock has already made due is gone
+        // before this call looks for it.
+        store.expire_deleted_memories(now);
+
+        // The store is keyed by the `memoryId` the create minted; a well-formed
+        // id naming no stored memory is the modelled 404 — which is also what a
+        // delete of an already-removed memory answers — and nothing is mutated
+        // for it, so an unrelated memory is untouched and still deletable.
+        let record = store.memories.get_mut(&input.memory_id).ok_or_else(|| {
+            DeleteMemoryErrorModeled::ResourceNotFoundException(
+                crate::state::memory_not_found_for_account(Self::NAME, &input.memory_id),
+            )
+        })?;
+
+        // The deletion is ACCEPTED here (202) and the memory reports `DELETING`
+        // from now on; the record is removed when the span the clock owes passes,
+        // so a caller that deletes and then polls sees `DELETING` and then the
+        // modelled 404 rather than a resource that vanished mid-call.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMemory"))
+        // `DeleteMemory` is `@idempotent`, so a repeat while the deletion is
+        // still under way reports that same memory instead of re-arming the
+        // clock.
+        if !record.is_deleting() {
+            record.transient_status = crate::state::MEMORY_STATUS_DELETING.to_string();
+            record.settled_status = crate::state::MEMORY_STATUS_DELETING.to_string();
+            record.settles_at = now;
+            record.removal_due_at = Some(now + crate::state::MEMORY_SETTLE_DELAY);
+            record.updated_at = now;
+        }
+        let output = record.delete_output(now);
+
+        // The container is being torn down, so the AgentCore DATA plane — which
+        // resolves a memory only because this service RECORDED it — stops
+        // resolving this one: an accepted deletion is the end of the container
+        // the events were written into. Taken AFTER this service's own store,
+        // the one lock order every reader of the inventory keeps.
+        drop(store);
+        if let Some(inventory) = crate::state::resource_inventory(&*self.engine) {
+            inventory.lock().forget_memory(&input.memory_id);
+        }
+
+        Ok(output)
     }
 }

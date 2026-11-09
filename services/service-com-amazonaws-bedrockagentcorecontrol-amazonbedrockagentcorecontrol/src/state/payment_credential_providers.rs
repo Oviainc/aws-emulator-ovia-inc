@@ -38,7 +38,7 @@
 use std::collections::HashMap;
 
 use super::api_key_credential_providers::{
-    secrets_manager_client, store_managed_secret, unavailable, ApiKeySecretProblem,
+    referenced_external_secret_arn, store_managed_secret, ApiKeySecretProblem,
     CREDENTIAL_PROVIDER_ARN_SERVICE, MANAGED_SECRET_PREFIX, SECRET_SOURCE_EXTERNAL,
     SECRET_SOURCE_MANAGED,
 };
@@ -72,15 +72,6 @@ pub fn payment_credential_provider_not_found() -> ResourceNotFoundException {
         message: Some(PAYMENT_CREDENTIAL_PROVIDER_NOT_FOUND_MESSAGE.to_string()),
     }
 }
-
-/// The message this service refuses a provider with when a secret the caller
-/// references cannot be decrypted.
-///
-/// Fixed text: nothing of the request or of the state is interpolated, because
-/// the remedy does not depend on which secret or which key was at fault — the
-/// caller fixes the key's permissions and retries.
-pub const SECRET_UNDECRYPTABLE_MESSAGE: &str =
-    "Unable to decrypt the provided secret. Verify KMS key permissions.";
 
 /// The ARN resource type a provider's name is nested under, inside the token
 /// vault that holds its credentials (`PaymentCredentialProviderArnType`'s
@@ -376,11 +367,11 @@ pub enum PaymentSecretProblem {
 
 impl From<ApiKeySecretProblem> for PaymentSecretProblem {
     /// The outcome of a Secrets Manager call made through the shared helpers,
-    /// which cannot meet a decryption refusal: they write a secret rather than
-    /// read one.
+    /// reported in this plane's own terms.
     fn from(problem: ApiKeySecretProblem) -> Self {
         match problem {
             ApiKeySecretProblem::Absent => Self::Absent,
+            ApiKeySecretProblem::Undecryptable => Self::Undecryptable,
             ApiKeySecretProblem::Unavailable(detail) => Self::Unavailable(detail),
         }
     }
@@ -392,19 +383,18 @@ impl From<ApiKeySecretProblem> for PaymentSecretProblem {
 ///
 /// WHAT IS ASKED, AND WHERE. The `secretId` reaching here has already been
 /// confined to a secret of THIS account in the request's own Region
-/// ([`addressable_secret_id`]), and the client is the in-process callback into
-/// this same emulator ([`secrets_manager_client`], shared with the API key
-/// provider): the request is routed in process to the emulated Secrets Manager
-/// mounted beside this service, so no socket is opened, no host is dialled and
-/// nothing outside this emulator is reachable from here.
+/// ([`addressable_secret_id`]), and the resolution itself is the one every
+/// credential-provider plane of this crate shares
+/// ([`referenced_external_secret_arn`]), whose client is the in-process callback
+/// into this same emulator: the request is routed in process to the emulated
+/// Secrets Manager mounted beside this service, so no socket is opened, no host
+/// is dialled and nothing outside this emulator is reachable from here.
 ///
-/// Nothing is written: the secret is the caller's. The read is `GetSecretValue`,
-/// the call that DECRYPTS the value, because a credential a payment connector
-/// cannot read is of no use to it: a key Secrets Manager will not decrypt under
-/// is [`PaymentSecretProblem::Undecryptable`], a `secretId` it holds no secret
-/// for is [`PaymentSecretProblem::Absent`], and the ARN reported is the one it
-/// answered with, never the string the request carried — so a provider is never
-/// recorded against a secret nothing holds.
+/// Nothing is written: the secret is the caller's. The shared read DECRYPTS,
+/// because a credential a payment connector cannot read is of no use to it, so a
+/// key Secrets Manager will not decrypt under is
+/// [`PaymentSecretProblem::Undecryptable`] and a `secretId` it holds no secret
+/// for is [`PaymentSecretProblem::Absent`].
 ///
 /// Call it with NO state guard held — it awaits.
 async fn referenced_secret_arn(
@@ -412,28 +402,9 @@ async fn referenced_secret_arn(
     region: &str,
     secret_id: &str,
 ) -> Result<String, PaymentSecretProblem> {
-    match secrets_manager_client(ctx, region)
-        .get_secret_value()
-        .secret_id(secret_id)
-        .send()
+    referenced_external_secret_arn(ctx, region, secret_id)
         .await
-    {
-        Ok(answer) => answer.arn.ok_or_else(|| {
-            PaymentSecretProblem::Unavailable(
-                "GetSecretValue answered with no secret ARN".to_string(),
-            )
-        }),
-        Err(error) => {
-            let service = error.as_service_error();
-            if service.is_some_and(|failure| failure.is_decryption_failure()) {
-                return Err(PaymentSecretProblem::Undecryptable);
-            }
-            if service.is_some_and(|failure| failure.is_resource_not_found_exception()) {
-                return Err(PaymentSecretProblem::Absent);
-            }
-            Err(unavailable(::aws_smithy_types::error::display::DisplayErrorContext(&error)).into())
-        }
-    }
+        .map_err(PaymentSecretProblem::from)
 }
 
 /// ONE secret of a stored vendor configuration, as every response that reports
