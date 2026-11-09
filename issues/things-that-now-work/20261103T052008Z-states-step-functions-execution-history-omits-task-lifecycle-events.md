@@ -122,3 +122,33 @@ Cause 9 (sfn-runtime-error-bypasses-catch-and-redrive#task#16): $.events[0] expe
 2. Compare the returned $.events list against the recording: AWS has TaskStateEntered, TaskScheduled, TaskStarted, TaskFailed, TaskStateExited(if any) and ExecutionFailed as separate events with contiguous id/previousEventId; the emulator returns a shorter list whose event types are shifted.
 3. For the other causes replay, in the same way, sfn-failing-lambda-task-execution-diagnosis#task#11, #task#12 and #task#19, sfn-legacy-lambda-arn-task-failure-events#task#10, sfn-retry-catch-error-name-matching#task#13 and #task#17, and sfn-runtime-error-bypasses-catch-and-redrive#task#12 and #task#16.
 4. task#19 and sfn-runtime-error-bypasses-catch-and-redrive#task#16 must be replayed after their fixture's RedriveExecution step, since they assert the post-redrive history.
+
+## Resolution
+
+All nine causes are fixed in the history recorder, and the event sequence the fixtures
+assert is now produced exactly: for a failing optimized `lambda:invoke` task the emulator
+answers `ExecutionStarted 1/0, TaskStateEntered 2/0, TaskScheduled 3/2 (parameters the
+resolved FunctionName/Payload document), TaskStarted 4/3, TaskFailed 5/4, ExecutionFailed
+6/5`, and after a `RedriveExecution` it continues `ExecutionRedriven 7/6 (redriveCount 1),
+TaskScheduled 8/7, TaskStarted 9/8, TaskFailed 10/9, ExecutionFailed 11/10`; a `Task`
+whose `Resource` is a bare function ARN records the `LambdaFunction*` family instead; a
+`Parameters` path that resolves to nothing records no task lifecycle event at all. Pinned
+by `services/service-com-amazonaws-sfn-awsstepfunctions/tests/all/task_work_event_families.rs`
+and `.../tests/all/task_lifecycle_under_execution_role.rs`.
+
+Two things this report lists are NOT closed by that fix and are not this issue's to close:
+
+* The `error` and `cause` VALUES the history repeats on a failed task's events come from
+  the Lambda run itself, and the replay attributes their remaining divergence to
+  `states|DescribeExecution|2xx->2xx|$.error` and `$.cause` (with `$.input` and `$.output`)
+  — keys this report does not carry. The `GetExecutionHistory` keys that still replay red
+  (`$.events[*]`, `$.events[*].type`, `$.events[*].taskFailedEventDetails`,
+  `...taskFailedEventDetails.cause`, `...taskStartedEventDetails`,
+  `...taskScheduledEventDetails`, `...executionRedrivenEventDetails`,
+  `...previousEventId`) do so on those same values, on steps whose event sequence now
+  matches.
+* `$.nextToken` is a server-generated opaque cursor. The model gives it only a type and a
+  length (`PageToken`, 1..1024) and the documentation only that it "is a unique pagination
+  token for each page"; the emulator's cursor keeps that type, is unique per page, is
+  stable across reads of the same page and resolves on the next call, so its bytes are a
+  per-run value rather than a defect.

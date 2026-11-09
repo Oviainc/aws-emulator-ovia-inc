@@ -551,7 +551,14 @@ fn projected(
                     resource_type,
                     resource,
                     region: crate::state::arn_region(&execution.arn),
-                    parameters: data(stored.details.input.clone()).unwrap_or_default(),
+                    // "You can select whether execution data (input or output of a
+                    // history event) is returned": `parameters` is neither. It is a
+                    // REQUIRED member of this detail with no `inputDetails` companion to
+                    // say a document was withheld — unlike every `input` and `output`
+                    // member, which is optional and paired with one — so it is reported
+                    // whatever the request asked for, since a read that withheld it
+                    // would answer a document the task was never handed.
+                    parameters: stored.details.input.clone().unwrap_or_default(),
                     timeout_in_seconds: seconds(stored.details.timeout_seconds),
                     heartbeat_in_seconds: seconds(stored.details.heartbeat_seconds),
                     task_credentials: None,
@@ -619,6 +626,46 @@ fn projected(
                     cause: stored.details.cause.clone(),
                 });
             }
+        }
+        // The same lifecycle for a `Task` state whose `Resource` is the ARN of a Lambda
+        // FUNCTION, which the model records under its own family: the invocation is
+        // named by that function's ARN alone — `resource` is required, so an event whose
+        // record does not carry it reports no detail — and `LambdaFunctionStarted` is
+        // the one event of either family the model gives no detail structure at all.
+        crate::state::EVENT_LAMBDA_FUNCTION_SCHEDULED => {
+            if let Some(resource) = stored.details.resource.clone() {
+                event.lambda_function_scheduled_event_details =
+                    Some(LambdaFunctionScheduledEventDetails {
+                        resource,
+                        input: data(stored.details.input.clone()),
+                        input_details: included
+                            .clone()
+                            .filter(|_| with_data && stored.details.input.is_some()),
+                        timeout_in_seconds: seconds(stored.details.timeout_seconds),
+                        task_credentials: None,
+                    });
+            }
+        }
+        crate::state::EVENT_LAMBDA_FUNCTION_SUCCEEDED => {
+            event.lambda_function_succeeded_event_details =
+                Some(LambdaFunctionSucceededEventDetails {
+                    output: data(stored.details.output.clone()),
+                    output_details: included
+                        .filter(|_| with_data && stored.details.output.is_some()),
+                });
+        }
+        crate::state::EVENT_LAMBDA_FUNCTION_FAILED => {
+            event.lambda_function_failed_event_details = Some(LambdaFunctionFailedEventDetails {
+                error: stored.details.error.clone(),
+                cause: stored.details.cause.clone(),
+            });
+        }
+        crate::state::EVENT_LAMBDA_FUNCTION_TIMED_OUT => {
+            event.lambda_function_timed_out_event_details =
+                Some(LambdaFunctionTimedOutEventDetails {
+                    error: stored.details.error.clone(),
+                    cause: stored.details.cause.clone(),
+                });
         }
         // "The size of the array for Map state iterations", which the state knew when
         // it started iterating.

@@ -33,6 +33,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_sfn_awsstepfunctions::EmulatedService;
 
+use crate::execution_data_encryption::{form_encode, xml_element};
 use crate::state_machine_lifecycle::{string, PAST_THE_EXECUTION_DELAY, REGION, ROLE_ARN};
 
 /// Where `CreateFunction` is bound (`POST /2015-03-31/functions`).
@@ -127,17 +128,25 @@ pub(crate) struct Chain {
 
 impl Chain {
     pub(crate) fn new() -> Self {
-        Self::mounted(false)
+        Self::mounted(false, false)
     }
 
     /// [`Self::new`] with DynamoDB mounted beside the two, for a suite whose handlers
     /// call it through the SDK their runtime supplies: what a run wrote is then read
     /// back through DynamoDB's own API rather than claimed by the handler's answer.
     pub(crate) fn with_dynamodb() -> Self {
-        Self::mounted(true)
+        Self::mounted(true, false)
     }
 
-    fn mounted(dynamodb: bool) -> Self {
+    /// [`Self::new`] with IAM mounted beside the two, for a suite whose rule is about the
+    /// EXECUTION ROLE a `Task` state's call is made as: with IAM there the `roleArn` is a
+    /// role this account really holds, so the access gate in front of the call really
+    /// runs ([`Self::role`]).
+    pub(crate) fn with_iam() -> Self {
+        Self::mounted(false, true)
+    }
+
+    fn mounted(dynamodb: bool, iam: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -147,6 +156,13 @@ impl Chain {
                 service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService::new(Arc::clone(
                     &engine,
                 )),
+            );
+        }
+        if iam {
+            router.register_service(
+                service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                    Arc::clone(&engine),
+                ),
             );
         }
         router.register_service(
@@ -317,6 +333,19 @@ impl Chain {
         definition: &Value,
         input: &Value,
     ) -> Value {
+        self.ran_as(case, name, definition, input, ROLE_ARN).await
+    }
+
+    /// [`Self::ran`] under a NAMED execution role, for a suite whose rule is about what
+    /// that role lets the definition's tasks do ([`Self::role`]).
+    pub(crate) async fn ran_as(
+        &self,
+        case: &str,
+        name: &str,
+        definition: &Value,
+        input: &Value,
+        role_arn: &str,
+    ) -> Value {
         let created = self
             .sfn(
                 case,
@@ -324,7 +353,7 @@ impl Chain {
                 &json!({
                     "name": name,
                     "definition": definition.to_string(),
-                    "roleArn": ROLE_ARN,
+                    "roleArn": role_arn,
                 }),
             )
             .await;
@@ -340,7 +369,12 @@ impl Chain {
                 }),
             )
             .await;
-        let execution = string(&started, "executionArn");
+        self.settled(case, &string(&started, "executionArn")).await
+    }
+
+    /// `execution` once it has left `RUNNING`, which is also what a suite waits out after
+    /// asking for a further attempt of it (`RedriveExecution`).
+    pub(crate) async fn settled(&self, case: &str, execution: &str) -> Value {
         let began = std::time::Instant::now();
         loop {
             let described = self
@@ -361,7 +395,83 @@ impl Chain {
             std::thread::sleep(POLL_INTERVAL);
         }
     }
+
+    /// One `awsQuery` call to IAM, requiring a 200. Only a [`Chain::with_iam`] chain
+    /// serves one.
+    pub(crate) async fn iam(&self, case: &str, action: &str, params: &[(&str, String)]) -> String {
+        let mut body = format!("Action={action}&Version=2010-05-08");
+        for (name, value) in params {
+            body.push('&');
+            body.push_str(name);
+            body.push('=');
+            body.push_str(&form_encode(value));
+        }
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "iam.amazonaws.com")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("authorization", Self::authorization("iam"))
+            .body(Bytes::from(body))
+            .expect("a well-formed awsQuery request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let text = String::from_utf8_lossy(&response.into_body()).to_string();
+        assert_eq!(
+            status, 200,
+            "case {case:?}: {action} must answer 200 from IAM, got {status} with {text}"
+        );
+        text
+    }
+
+    /// A role this service's own principal may assume, whose inline policy carries
+    /// `statements`; answers the ARN IAM's own `CreateRole` reported for it.
+    ///
+    /// The trust policy names [`SFN_SERVICE_PRINCIPAL`], because acting as the role is
+    /// itself a call this service makes before any of the task's own.
+    pub(crate) async fn role(&self, case: &str, name: &str, statements: &Value) -> String {
+        let trust = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": SFN_SERVICE_PRINCIPAL },
+                "Action": "sts:AssumeRole",
+            }],
+        });
+        let created = self
+            .iam(
+                case,
+                "CreateRole",
+                &[
+                    ("RoleName", name.to_string()),
+                    ("AssumeRolePolicyDocument", trust.to_string()),
+                ],
+            )
+            .await;
+        self.iam(
+            case,
+            "PutRolePolicy",
+            &[
+                ("RoleName", name.to_string()),
+                ("PolicyName", "TaskWork".to_string()),
+                (
+                    "PolicyDocument",
+                    json!({ "Version": "2012-10-17", "Statement": statements }).to_string(),
+                ),
+            ],
+        )
+        .await;
+        // The ARN is IAM's, read out of the answer its own handler wrote rather than
+        // built here: the role is that service's resource.
+        xml_element(&created, "Arn").unwrap_or_else(|| {
+            panic!("case {case:?}: CreateRole answers the role Arn, got {created}")
+        })
+    }
 }
+
+/// The GLOBAL service principal Step Functions assumes a state machine's execution role
+/// as, which a trust policy has to name for the role to be assumable at all.
+const SFN_SERVICE_PRINCIPAL: &str = "states.amazonaws.com";
 
 /// The execution role the function runs as. No IAM is mounted here, so nothing is known
 /// about it and Lambda serves the create — which is the documented reading of a role

@@ -26,6 +26,11 @@
 //! the order each row is about — which is the item's key and the value the raised message
 //! embeds.
 //!
+//! The `Resource` form also decides which FAMILY of history events the work's lifecycle is
+//! recorded under ([`Resource::failed`]), so each row reads the events its own form
+//! selects; the error NAME a catcher is evaluated against is the error document's own
+//! class either way, which is what the rule above is about.
+//!
 //! The harness (`Chain`, `given_function_of`, `ran`, `sfn`, `ddb`) is the one
 //! `lambda_task_control_flow` builds for these services, and the history's event types are
 //! read through `lambda_function_timeout`'s own reading of them; `tests/all.rs` is this
@@ -179,6 +184,38 @@ enum Resource {
     Optimized,
     /// The function's own ARN, which names the function itself.
     FunctionArn,
+}
+
+impl Resource {
+    /// The history event the work a state in THIS form asked for writes when it FAILED,
+    /// and the detail member that event carries the failure under.
+    ///
+    /// `HistoryEventType` names a `Task` state's lifecycle twice over, and which family
+    /// records one state's work is decided by what its `Resource` names: a `Resource`
+    /// that is the ARN of a Lambda FUNCTION makes the unit of work one invocation of
+    /// that function, recorded under the `LambdaFunction*` events, while a `Resource`
+    /// naming a service INTEGRATION has one API call as its unit of work, recorded under
+    /// the `Task*` events. The error NAME a catcher is evaluated against is the same
+    /// either way — it is the error document's own class — which is what this suite's
+    /// rule is about, so the rows read the family their form selects rather than one
+    /// family's events for both.
+    fn failed(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Optimized => ("TaskFailed", "taskFailedEventDetails"),
+            Self::FunctionArn => (
+                "LambdaFunctionFailed",
+                "lambdaFunctionFailedEventDetails",
+            ),
+        }
+    }
+
+    /// The event that work writes when it ANSWERED, in the same family.
+    fn succeeded(self) -> &'static str {
+        match self {
+            Self::Optimized => "TaskSucceeded",
+            Self::FunctionArn => "LambdaFunctionSucceeded",
+        }
+    }
 }
 
 /// One `Task` state invoking `function_arn` in `resource`'s form, carrying `transition` —
@@ -520,7 +557,8 @@ async fn a_failed_tasks_catch_runs_the_compensating_state() {
                 // And the history: the work task failed under the run's own class, the
                 // catcher's state was entered exactly once, and the one task that
                 // succeeded is the compensating one.
-                let (error, cause) = only_failure(&events, "TaskFailed", "taskFailedEventDetails", case);
+                let (failed, member) = resource.failed();
+                let (error, cause) = only_failure(&events, failed, member, case);
                 assert_eq!(
                     error, error_type,
                     "case {case:?}: expected the task to fail under {error_type:?}, got {error:?}"
@@ -543,7 +581,7 @@ async fn a_failed_tasks_catch_runs_the_compensating_state() {
                         entries(&events, COMPENSATE_STATE),
                         entries(&events, CONFIRM_STATE),
                         entries(&events, ROLLED_BACK_STATE),
-                        count(&events, "TaskSucceeded"),
+                        count(&events, resource.succeeded()),
                     ),
                     (1, 1, 0, 1, 1),
                     "case {case:?}: expected the catcher's state to run and the success path \
@@ -594,7 +632,7 @@ async fn a_failed_tasks_catch_runs_the_compensating_state() {
                     event_types(&events)
                 );
                 assert_eq!(
-                    count(&events, "TaskSucceeded"),
+                    count(&events, resource.succeeded()),
                     0,
                     "case {case:?}: expected no task to have succeeded, got {:?}",
                     event_types(&events)
@@ -622,8 +660,8 @@ async fn a_failed_tasks_catch_runs_the_compensating_state() {
                         recorded,
                         entries(&events, COMPENSATE_STATE),
                         entries(&events, CONFIRM_STATE),
-                        count(&events, "TaskSucceeded"),
-                        count(&events, "TaskFailed"),
+                        count(&events, resource.succeeded()),
+                        count(&events, resource.failed().0),
                     ),
                     (None, 0, 1, 1, 0),
                     "case {case:?}: expected the success path and nothing else, got {:?}",

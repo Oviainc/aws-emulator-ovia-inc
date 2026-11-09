@@ -632,6 +632,33 @@ fn log_details(
             work(&mut details, stored)?;
             failure(&mut details, stored);
         }
+        // A `Task` state whose `Resource` is the ARN of a Lambda FUNCTION records the
+        // same lifecycle under the `LambdaFunction*` family, whose events name the work
+        // by the function's own ARN alone and carry no `resourceType`
+        // (`super::asl`'s work-event families). `LambdaFunctionStarted` is the one
+        // event of either family the model gives no detail structure at all.
+        super::EVENT_LAMBDA_FUNCTION_SCHEDULED => {
+            // `resource` is the function the invocation was scheduled on and is
+            // required, so an event whose record does not name it carries no detail at
+            // all. `LambdaFunctionScheduledEventDetails` declares `timeoutInSeconds`
+            // and no heartbeat bound, so only the one the structure has is reported.
+            let resource = stored.resource.as_deref()?;
+            text(&mut details, "resource", Some(resource));
+            payload(&mut details, "input", stored.input.as_deref());
+            number(
+                &mut details,
+                "timeoutInSeconds",
+                stored
+                    .timeout_seconds
+                    .map(|bound| i64::try_from(bound).unwrap_or(i64::MAX)),
+            );
+        }
+        super::EVENT_LAMBDA_FUNCTION_SUCCEEDED => {
+            payload(&mut details, "output", stored.output.as_deref());
+        }
+        super::EVENT_LAMBDA_FUNCTION_FAILED | super::EVENT_LAMBDA_FUNCTION_TIMED_OUT => {
+            failure(&mut details, stored);
+        }
         // "The size of the array for Map state iterations", which the state knew when
         // it started iterating. It is required, so a record carrying none reports the
         // member's own default.
@@ -926,18 +953,29 @@ enum Phase {
 /// The phase an event of type `event_type` reports, and `None` for every event that is
 /// not a `Task` state reporting its own work.
 ///
+/// Both FAMILIES a `Task` state records its work under report the same phases — the
+/// `Task*` events of a service integration's call and the `LambdaFunction*` events of a
+/// direct invocation (`super::asl`'s work-event families) — so each phase is read off
+/// either family's event for it.
+///
 /// The failure of the work and the failure to SUBMIT it are both the invocation ending
 /// without doing its work, so both are counted as a failure; running out of the time
 /// the state allowed is its own series, exactly as it is its own event.
 fn task_phase(event_type: &str) -> Option<Phase> {
     match event_type {
-        super::EVENT_TASK_SCHEDULED => Some(Phase::Scheduled),
-        super::EVENT_TASK_STARTED => Some(Phase::Started),
-        super::EVENT_TASK_SUCCEEDED => Some(Phase::Closed(LAMBDA_FUNCTIONS_SUCCEEDED_METRIC)),
-        super::EVENT_TASK_FAILED | super::EVENT_TASK_SUBMIT_FAILED => {
-            Some(Phase::Closed(LAMBDA_FUNCTIONS_FAILED_METRIC))
+        super::EVENT_TASK_SCHEDULED | super::EVENT_LAMBDA_FUNCTION_SCHEDULED => {
+            Some(Phase::Scheduled)
         }
-        super::EVENT_TASK_TIMED_OUT => Some(Phase::Closed(LAMBDA_FUNCTIONS_TIMED_OUT_METRIC)),
+        super::EVENT_TASK_STARTED | super::EVENT_LAMBDA_FUNCTION_STARTED => Some(Phase::Started),
+        super::EVENT_TASK_SUCCEEDED | super::EVENT_LAMBDA_FUNCTION_SUCCEEDED => {
+            Some(Phase::Closed(LAMBDA_FUNCTIONS_SUCCEEDED_METRIC))
+        }
+        super::EVENT_TASK_FAILED
+        | super::EVENT_TASK_SUBMIT_FAILED
+        | super::EVENT_LAMBDA_FUNCTION_FAILED => Some(Phase::Closed(LAMBDA_FUNCTIONS_FAILED_METRIC)),
+        super::EVENT_TASK_TIMED_OUT | super::EVENT_LAMBDA_FUNCTION_TIMED_OUT => {
+            Some(Phase::Closed(LAMBDA_FUNCTIONS_TIMED_OUT_METRIC))
+        }
         _ => None,
     }
 }

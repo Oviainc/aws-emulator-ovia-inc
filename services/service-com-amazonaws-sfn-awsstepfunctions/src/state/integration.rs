@@ -2016,6 +2016,13 @@ impl Tasks for Unserved {
 /// work happened.
 pub fn read(resource: &str) -> Result<Call, String> {
     let shown = super::asl::echoed(resource);
+    // A LAMBDA FUNCTION's ARN names no integration token: it names the function, and
+    // the task's work is one synchronous invocation of it (`direct_invocation`). It is
+    // the first question asked, because it is the one reading of a `Resource` that needs
+    // no integration field at all.
+    if names_a_function(resource).is_some() {
+        return direct_invocation(resource, &shown);
+    }
     let fields: Vec<&str> = resource.splitn(6, ':').collect();
     let (vendor, rest) = match fields.as_slice() {
         ["arn", _partition, vendor, _region, _account, rest] => (*vendor, *rest),
@@ -2026,11 +2033,6 @@ pub fn read(resource: &str) -> Result<Call, String> {
             ))
         }
     };
-    // A LAMBDA FUNCTION's ARN names no integration token: it names the function, and
-    // the task's work is one synchronous invocation of it (`direct_invocation`).
-    if vendor == LAMBDA_NAMESPACE && rest.starts_with(FUNCTION_RESOURCE_TYPE_PREFIX) {
-        return direct_invocation(resource, &shown);
-    }
     if vendor != STATES_NAMESPACE {
         return Err(format!(
             "'{shown}' names a resource of '{}' rather than a service integration, which this \
@@ -2451,18 +2453,57 @@ pub fn named_work(resource: &str) -> (String, String) {
     (clip_name(kind), clip_name(action))
 }
 
+/// The LAMBDA FUNCTION a `Resource` names DIRECTLY, and `None` for every `Resource`
+/// that names an integration instead.
+///
+/// The ONE statement of that reading: a `Resource` whose ARN is a function of the
+/// Lambda namespace makes the task's unit of work one invocation of that function
+/// ([`direct_invocation`]), which is what decides both the call the task makes and the
+/// FAMILY of history events its lifecycle is recorded under
+/// (`super::asl`'s work-event families). The function is answered as the `Resource`
+/// named it, because that ARN is what the invocation addresses and what the history
+/// reports.
+#[must_use]
+pub fn names_a_function(resource: &str) -> Option<&str> {
+    match resource.splitn(6, ':').collect::<Vec<&str>>().as_slice() {
+        ["arn", _partition, vendor, _region, _account, rest]
+            if *vendor == LAMBDA_NAMESPACE && rest.starts_with(FUNCTION_RESOURCE_TYPE_PREFIX) =>
+        {
+            Some(resource)
+        }
+        _ => None,
+    }
+}
+
 /// `name` within the bytes the modelled `Name` shape (len 1..80) carries, cut at a
 /// character boundary: a `Resource` is a caller's text, so what it names is reported
 /// through the member's own bound rather than past it.
 fn clip_name(name: String) -> String {
-    if name.len() <= MAX_NAME_BYTES {
-        return name;
+    clip(name, MAX_NAME_BYTES)
+}
+
+/// `arn` within the bytes the modelled `Arn` shape (len 1..256) carries — the bound
+/// [`super::MAX_ARN_BYTES`] states for every ARN of this service — for the same reason
+/// [`clip_name`] clips a name: the `Resource` the ARN is read from is a caller's text.
+///
+/// It is a wider bound than the `Name` the `Task*` details carry, because the member it
+/// bounds is the function's whole ARN rather than one field of a `Resource`
+/// (`smithy_query(query="shape",shape="LambdaFunctionScheduledEventDetails")`).
+#[must_use]
+pub fn clip_arn(arn: String) -> String {
+    clip(arn, super::MAX_ARN_BYTES)
+}
+
+/// `text` within `most` bytes, cut at a character boundary.
+fn clip(text: String, most: usize) -> String {
+    if text.len() <= most {
+        return text;
     }
-    let mut end = MAX_NAME_BYTES;
-    while end > 0 && !name.is_char_boundary(end) {
+    let mut end = most;
+    while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    name[..end].to_string()
+    text[..end].to_string()
 }
 
 /// One integration call handed from the walk to the operation that is running it.

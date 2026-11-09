@@ -1022,27 +1022,22 @@ impl Interpreter<'_> {
         step.details.work_millis = Some(u64::try_from(spent.as_millis()).unwrap_or(u64::MAX));
     }
 
-    /// The event one attempt of a `Task` state's work failed with: the language's own
-    /// timeout event where the work ran out of the time the state allowed it, and the
-    /// task's own failure event otherwise, both carrying the work that failed and the
-    /// error and cause it failed with.
+    /// The event one attempt of a `Task` state's work failed with, in the FAMILY that
+    /// state's `Resource` records its work under ([`WorkEvents`]): the family's own
+    /// timeout event where the work ran out of the time the state allowed it, and its
+    /// own failure event otherwise, both carrying the work that failed and the error and
+    /// cause it failed with.
     pub(super) fn push_task_failure(
         &mut self,
         state_name: &str,
-        resource_type: &str,
-        action: &str,
+        work: &WorkEvents,
         failure: &Failure,
         after: Duration,
     ) {
-        let event_type = if failure.name() == TIMEOUT_ERROR {
-            super::super::EVENT_TASK_TIMED_OUT
-        } else {
-            super::super::EVENT_TASK_FAILED
-        };
-        let mut details = task_work_details(resource_type, action);
+        let mut details = work.naming();
         details.error = failure.error.clone();
         details.cause = failure.cause.clone();
-        self.push_detailed(event_type, state_name, after, details);
+        self.push_detailed(work.failed(failure), state_name, after, details);
     }
 
     /// The event one attempt of a run-a-job task failed to START its job with: "the
@@ -1052,17 +1047,16 @@ impl Interpreter<'_> {
     pub(super) fn push_submit_failure(
         &mut self,
         state_name: &str,
-        resource_type: &str,
-        action: &str,
+        work: &WorkEvents,
         failure: &Failure,
         after: Duration,
         call: &super::super::integration::Call,
     ) {
         if call.job.is_none() || failure.name() == TIMEOUT_ERROR {
-            self.push_task_failure(state_name, resource_type, action, failure, after);
+            self.push_task_failure(state_name, work, failure, after);
             return;
         }
-        let mut details = task_work_details(resource_type, action);
+        let mut details = work.naming();
         details.error = failure.error.clone();
         details.cause = failure.cause.clone();
         self.push_detailed(
@@ -1089,20 +1083,19 @@ impl Interpreter<'_> {
         language: &'static str,
         raw: &Value,
         effective: &Value,
-        work: (&str, &str),
+        work: &WorkEvents,
         outcome: Result<Value, Failure>,
         context: &Value,
         at: Duration,
     ) -> Result<StateStep, Fault> {
-        let (resource_type, action) = work;
         let outcome = outcome.and_then(|result| {
             measure_payload(&result, &format!("the 'Task' state '{name}'")).map(|_bytes| result)
         });
         match outcome {
             Ok(result) => {
-                let mut details = task_work_details(resource_type, action);
+                let mut details = work.naming();
                 details.output = Some(result.to_string());
-                self.push_detailed(super::super::EVENT_TASK_SUCCEEDED, name, at, details);
+                self.push_detailed(work.succeeded(), name, at, details);
                 let value = self
                     .produced(state, language, raw, effective, Some(result), context, true)
                     .map_err(|failure| failure.at(at))?;
@@ -1111,7 +1104,7 @@ impl Interpreter<'_> {
                 Ok(StateStep { value, at, next })
             }
             Err(failure) => {
-                self.push_task_failure(name, resource_type, action, &failure, at);
+                self.push_task_failure(name, work, &failure, at);
                 self.catch_or_fail(
                     (name, "TaskStateExited"),
                     state,
@@ -1135,12 +1128,11 @@ impl Interpreter<'_> {
     pub(super) fn task_fault(
         &mut self,
         state_name: &str,
-        resource_type: &str,
-        action: &str,
+        work: &WorkEvents,
         failure: Failure,
         after: Duration,
     ) -> Fault {
-        self.push_task_failure(state_name, resource_type, action, &failure, after);
+        self.push_task_failure(state_name, work, &failure, after);
         failure.at(after)
     }
 
@@ -1548,18 +1540,13 @@ impl Interpreter<'_> {
             ))
             .at(at)
         })?;
-        // "The service name of the resource in a task state" and "the action of the
-        // resource called by a task state": what every one of this state's own events
-        // names the work by, read once from the `Resource` they all describe.
-        let (resource_type, action) = super::super::integration::named_work(resource);
+        // The FAMILY of events this state's work is recorded under, and what those
+        // events name the work by, read once from the `Resource` they all describe
+        // ([`WorkEvents`]) — chosen here so every event below is asked of it rather than
+        // named at each site.
+        let work = WorkEvents::of(resource);
         let call = super::super::integration::read(resource).map_err(|why| {
-            self.task_fault(
-                name,
-                &resource_type,
-                &action,
-                runtime(format!("state '{name}': {why}")),
-                at,
-            )
+            self.task_fault(name, &work, runtime(format!("state '{name}': {why}")), at)
         })?;
         // "TimeoutSeconds […] If the task runs longer than the specified seconds,
         // this state fails with a States.Timeout error name": the span it bounds is
@@ -1575,11 +1562,11 @@ impl Interpreter<'_> {
         // a `Duration` total for every value a caller can write.
         let within = self
             .task_seconds(state, language, "TimeoutSeconds", &effective, context)
-            .map_err(|failure| self.task_fault(name, &resource_type, &action, failure, at))?
+            .map_err(|failure| self.task_fault(name, &work, failure, at))?
             .map(Duration::from_secs);
         let heartbeat = self
             .task_seconds(state, language, "HeartbeatSeconds", &effective, context)
-            .map_err(|failure| self.task_fault(name, &resource_type, &action, failure, at))?;
+            .map_err(|failure| self.task_fault(name, &work, failure, at))?;
         // The job a run-a-job integration started has ENDED: what it ended as is this
         // state's own outcome, so the state reports it instead of starting the job a
         // second time. The events up to here are the ones the call that parked the
@@ -1599,7 +1586,7 @@ impl Interpreter<'_> {
                 language,
                 &raw,
                 &effective,
-                (&resource_type, &action),
+                &work,
                 ended.outcome,
                 context,
                 at,
@@ -1615,8 +1602,7 @@ impl Interpreter<'_> {
         if call.job.is_some() && self.map_depth > 0 {
             return Err(self.task_fault(
                 name,
-                &resource_type,
-                &action,
+                &work,
                 runtime(format!(
                     "state '{name}' starts a run-a-job integration inside a 'Map' iteration, \
                      which this emulator does not park at, so nothing was run for it"
@@ -1630,8 +1616,7 @@ impl Interpreter<'_> {
         if call.job.is_some() && self.parked.is_some() {
             return Err(self.task_fault(
                 name,
-                &resource_type,
-                &action,
+                &work,
                 runtime(format!(
                     "state '{name}' starts a second run-a-job integration while this execution \
                      is already parked at one, which this emulator does not park at, so nothing \
@@ -1647,8 +1632,7 @@ impl Interpreter<'_> {
         if call.job.is_some() && self.job_reply.is_some() {
             return Err(self.task_fault(
                 name,
-                &resource_type,
-                &action,
+                &work,
                 runtime(format!(
                     "state '{name}' would start the job of a run-a-job integration again while \
                      this execution is being continued from one that has ended, so nothing was \
@@ -1663,8 +1647,7 @@ impl Interpreter<'_> {
         if call.job.is_some() && self.express {
             return Err(self.task_fault(
                 name,
-                &resource_type,
-                &action,
+                &work,
                 express_run_a_job_refusal(name, entered),
                 at,
             ));
@@ -1678,8 +1661,7 @@ impl Interpreter<'_> {
         if call.callback && self.depth > 0 {
             return Err(self.task_fault(
                 name,
-                &resource_type,
-                &action,
+                &work,
                 runtime(format!(
                     "state '{name}' waits for a task token inside a 'Map' iteration or a \
                      'Parallel' branch, which this emulator does not wait at, so nothing was \
@@ -1695,8 +1677,7 @@ impl Interpreter<'_> {
         if call.callback && self.express {
             return Err(self.task_fault(
                 name,
-                &resource_type,
-                &action,
+                &work,
                 express_callback_refusal(name, entered),
                 at,
             ));
@@ -1728,16 +1709,16 @@ impl Interpreter<'_> {
                 });
                 return match reply.outcome {
                     Ok(result) => {
-                        let mut details = task_work_details(&resource_type, &action);
+                        let mut details = work.naming();
                         details.output = Some(me.echo(&result));
-                        me.push_detailed(super::super::EVENT_TASK_SUCCEEDED, name, at, details);
+                        me.push_detailed(work.succeeded(), name, at, details);
                         let measured =
                             measure_payload(&result, &format!("the 'Task' state '{name}'"))
                                 .map(|_bytes| result);
                         (measured, at)
                     }
                     Err(failure) => {
-                        me.push_task_failure(name, &resource_type, &action, &failure, at);
+                        me.push_task_failure(name, &work, &failure, at);
                         (Err(failure), at)
                     }
                 };
@@ -1760,27 +1741,28 @@ impl Interpreter<'_> {
                 Some(token) => with_task_token(&attempt_context, token),
                 None => attempt_context,
             };
+            // Resolving what the work is handed is the INTERPRETER's own step, taken
+            // before anything is handed over: a template or a path that cannot be
+            // resolved against this state's input means the work was never submitted,
+            // so the state records no lifecycle event for work that did not happen and
+            // the failure is the execution's ([`RUNTIME_ERROR`], which is neither
+            // retried nor caught).
             let request = match me.task_request(state, language, &effective, &attempt_context) {
                 Ok(request) => request,
-                Err(failure) => {
-                    me.push_task_failure(name, &resource_type, &action, &failure, at);
-                    return (Err(failure), at);
-                }
+                Err(failure) => return (Err(failure), at),
             };
             // Each attempt hands the work over and starts it again, so each writes
             // its own pair of events, carrying the document THAT attempt built and
             // the bounds the state declared for it.
             me.push_detailed(
-                super::super::EVENT_TASK_SCHEDULED,
+                work.scheduled(),
                 name,
                 at,
                 super::super::EventDetails {
-                    resource_type: Some(resource_type.clone()),
-                    resource: Some(action.clone()),
                     input: Some(me.echo(&request)),
                     timeout_seconds: within.map(|within| within.as_secs()),
                     heartbeat_seconds: heartbeat,
-                    ..super::super::EventDetails::default()
+                    ..work.naming()
                 },
             );
             // The call is made AS the state machine's execution role, so what that
@@ -1794,21 +1776,16 @@ impl Interpreter<'_> {
                     error: Some(refused.error),
                     cause: Some(refused.cause),
                 };
-                me.push_task_failure(name, &resource_type, &action, &failure, at);
+                me.push_task_failure(name, &work, &failure, at);
                 return (Err(failure), at);
             }
-            me.push_detailed(
-                super::super::EVENT_TASK_STARTED,
-                name,
-                at,
-                task_work_details(&resource_type, &action),
-            );
+            me.push_detailed(work.started(), name, at, work.naming());
             // The interpretation's own deadline is consulted HERE as well as at each
             // transition: the walk blocks inside a call rather than transitioning, so
             // a run already past its deadline makes no further call (and a `Retry`
             // cannot keep making them).
             if let Some(failure) = me.out_of_time() {
-                me.push_submit_failure(name, &resource_type, &action, &failure, at, &call);
+                me.push_submit_failure(name, &work, &failure, at, &call);
                 return (Err(failure), at);
             }
             let began = super::super::now();
@@ -1859,10 +1836,10 @@ impl Interpreter<'_> {
                              started cannot be reported and nothing was run for it",
                             call.operation, call.api.sdk_id, job.job_id
                         ));
-                        me.push_submit_failure(name, &resource_type, &action, &failure, at, &call);
+                        me.push_submit_failure(name, &work, &failure, at, &call);
                         return (Err(failure), at);
                     };
-                    let mut details = task_work_details(&resource_type, &action);
+                    let mut details = work.naming();
                     details.output = Some(result.to_string());
                     me.push_detailed(super::super::EVENT_TASK_SUBMITTED, name, at, details);
                     me.parked = Some(ParkedJob {
@@ -1887,7 +1864,7 @@ impl Interpreter<'_> {
                     });
                 }
                 (Ok(result), None) => {
-                    let mut details = task_work_details(&resource_type, &action);
+                    let mut details = work.naming();
                     details.output = Some(result.to_string());
                     // A CALLBACK integration's call HANDED the work over together
                     // with the token that answers it: the task is not finished, so
@@ -1921,17 +1898,12 @@ impl Interpreter<'_> {
                             });
                         }
                         None => {
-                            me.push_detailed(
-                                super::super::EVENT_TASK_SUCCEEDED,
-                                name,
-                                at,
-                                details,
-                            );
+                            me.push_detailed(work.succeeded(), name, at, details);
                         }
                     }
                 }
                 (Err(failure), _) => {
-                    me.push_submit_failure(name, &resource_type, &action, failure, at, &call)
+                    me.push_submit_failure(name, &work, failure, at, &call)
                 }
             }
             // The span that call really took belongs to the event that CLOSED this

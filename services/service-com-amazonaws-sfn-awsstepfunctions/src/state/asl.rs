@@ -158,6 +158,7 @@ mod diagnose;
 mod echo;
 mod intrinsics;
 mod walk;
+mod work_events;
 pub use diagnose::*;
 // How a document a walk reports is ENCODED, and the intrinsic-function evaluator, are
 // this module's own: each holds one concern in its own file, and the names stay
@@ -165,6 +166,7 @@ pub use diagnose::*;
 // this file.
 use echo::*;
 use intrinsics::*;
+use work_events::*;
 
 /// The ASL predefined error name for a failure the interpreter itself raises
 /// ("States.Runtime — an execution failed due to some exception that could not be

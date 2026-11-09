@@ -519,6 +519,44 @@ pub const EVENT_TASK_SUBMIT_FAILED: &str = "TaskSubmitFailed";
 /// state allowed it, which the language reports under [`TASK_TIMEOUT_ERROR`].
 pub const EVENT_TASK_TIMED_OUT: &str = "TaskTimedOut";
 
+// ---------------------------------------------------------------------------
+// The LambdaFunction* family
+//
+// `HistoryEventType` names the lifecycle of a `Task` state's work twice over: the
+// `Task*` events above, and the `LambdaFunction*` events here. Which family a
+// state's work is recorded under is decided by WHAT the `Resource` names rather
+// than by what the work turned out to be: a `Resource` that is the ARN of a Lambda
+// FUNCTION makes the task's unit of work one invocation of that function
+// ([`integration::names_a_function`]), and that invocation's hand-over, start and
+// outcome are the events here; every other `Resource` names an integration, whose
+// unit of work is one API call, recorded under the `Task*` family.
+//
+// The two families differ in what their events NAME the work by, which is why the
+// distinction is observable: a `Task*` event names it by the kind of resource and
+// the action ("the service name of the resource in a task state"), while a
+// `LambdaFunction*` event names it by the function's own ARN alone — the modelled
+// `resource` of `LambdaFunctionScheduledEventDetails` is an `Arn`, not the
+// 80-character `Name` the `Task*` details carry.
+// ---------------------------------------------------------------------------
+
+/// The history event such a state writes when the invocation is handed over, which a
+/// `Retry` writes again for each attempt it makes.
+pub const EVENT_LAMBDA_FUNCTION_SCHEDULED: &str = "LambdaFunctionScheduled";
+
+/// The history event it writes when that invocation starts.
+pub const EVENT_LAMBDA_FUNCTION_STARTED: &str = "LambdaFunctionStarted";
+
+/// The history event it writes when the function returned.
+pub const EVENT_LAMBDA_FUNCTION_SUCCEEDED: &str = "LambdaFunctionSucceeded";
+
+/// The history event it writes when the invocation ended without doing its work.
+pub const EVENT_LAMBDA_FUNCTION_FAILED: &str = "LambdaFunctionFailed";
+
+/// The history event it writes when the invocation outlived the time the state
+/// allowed it, which the language reports under [`TASK_TIMEOUT_ERROR`] exactly as the
+/// `Task*` family's own timeout event does.
+pub const EVENT_LAMBDA_FUNCTION_TIMED_OUT: &str = "LambdaFunctionTimedOut";
+
 /// The history event a `Map` state writes when it starts iterating, carrying how many
 /// items it is iterating; written again for each attempt a `Retry` makes.
 pub const EVENT_MAP_STATE_STARTED: &str = "MapStateStarted";
