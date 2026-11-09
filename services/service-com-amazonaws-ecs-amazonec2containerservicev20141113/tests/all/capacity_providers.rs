@@ -29,7 +29,10 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ecs_wire::{create_cluster, list, ok, refusal, refused, service, string, ACCOUNT, SIGNED_REGION};
+use crate::ecs_wire::{
+    create_auto_scaling_group, create_cluster, list, ok, refusal, refused, service, string,
+    ACCOUNT, SIGNED_REGION,
+};
 
 /// One row of the create table: how the provider is created, and what the stored record
 /// must then report.
@@ -123,6 +126,12 @@ async fn describe(
 async fn a_created_capacity_provider_reads_back_through_describe() {
     let router = service();
     create_cluster(&router, "capacity", "setup").await;
+    // Every Auto Scaling group a row below binds a provider onto, created through Auto
+    // Scaling's own API first: a provider over a group the account does not hold is
+    // refused.
+    for group in ["asg-byarn", "asg-byname"] {
+        create_auto_scaling_group(&router, group, "setup").await;
+    }
 
     // The rows differ along what backs the provider (an Auto Scaling group named by ARN,
     // the same named by its bare name, or capacity Amazon ECS manages), whether managed
@@ -150,7 +159,7 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
                 })
             },
             expect_cluster: None,
-            expect_type: None,
+            expect_type: Some("EC2_AUTOSCALING"),
             expect_group: || Some(group_arn("asg-byarn")),
             expect_tags: json!([{ "key": "team", "value": "platform" }]),
             expect_status: "ACTIVE",
@@ -165,7 +174,7 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
                 })
             },
             expect_cluster: None,
-            expect_type: None,
+            expect_type: Some("EC2_AUTOSCALING"),
             expect_group: || Some("asg-byname".to_string()),
             expect_tags: json!([]),
             expect_status: "ACTIVE",
@@ -279,11 +288,14 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
             );
         }
 
-        // "If this field is omitted, tags aren't included in the response."
+        // "If this field is omitted, tags aren't included in the response": the member is
+        // still reported, carrying no tag.
         let without_tags = describe(&router, test.provider_name, false, case).await;
-        assert!(
-            without_tags["tags"].is_null(),
-            "case {case:?}: tags are reported only when include names TAGS, got {without_tags}"
+        assert_eq!(
+            without_tags["tags"],
+            json!([]),
+            "case {case:?}: a provider read without include reports an empty tag list, got \
+             {without_tags}"
         );
     }
 
@@ -331,6 +343,11 @@ async fn a_created_capacity_provider_reads_back_through_describe() {
 async fn a_capacity_provider_request_that_cannot_be_satisfied_is_refused() {
     let router = service();
     create_cluster(&router, "capacity", "setup").await;
+    // The groups the rows below bind onto, so each row is refused for the rule it is about
+    // rather than for a group the account does not hold.
+    for group in ["asg-taken", "asg-other"] {
+        create_auto_scaling_group(&router, group, "setup").await;
+    }
     ok(
         &router,
         "CreateCapacityProvider",
@@ -546,6 +563,14 @@ async fn repeating_a_capacity_provider_create_reports_the_stored_provider() {
     let router = service();
     create_cluster(&router, "capacity", "setup").await;
     create_cluster(&router, "elsewhere", "setup").await;
+    // Every group a row below binds onto, including the one a repeat tries to move a
+    // provider to: a group the account does not hold is refused before the repeat rule is
+    // ever reached.
+    for group in [
+        "asg-r0", "asg-r1", "asg-r2", "asg-r4", "asg-r5", "asg-other5", "asg-r6", "asg-r7",
+    ] {
+        create_auto_scaling_group(&router, group, "setup").await;
+    }
 
     // `CreateCapacityProvider` carries the `@idempotent` trait
     // (`smithy_query(query="operation",operation="CreateCapacityProvider")` reports
@@ -735,12 +760,14 @@ async fn describe_capacity_providers_filters_pages_and_reports_failures() {
     // size of 10 is crossed.
     let names: Vec<String> = (0..12).map(|index| format!("provider{index:02}")).collect();
     for name in &names {
+        let group = format!("asg-{name}");
+        create_auto_scaling_group(&router, &group, "setup").await;
         ok(
             &router,
             "CreateCapacityProvider",
             json!({
                 "name": name,
-                "autoScalingGroupProvider": { "autoScalingGroupArn": format!("asg-{name}") },
+                "autoScalingGroupProvider": { "autoScalingGroupArn": group },
             }),
             "setup",
         )
@@ -812,16 +839,32 @@ async fn describe_capacity_providers_filters_pages_and_reports_failures() {
         );
     }
 
-    // "This value can be between 1 and 10."
-    for (case, max_results) in [("zero", 0), ("eleven", 11)] {
-        refused(
+    // "This value can be between 1 and 10. If this parameter is not used, then
+    // DescribeCapacityProviders returns up to 10 results": a page size below the range asks
+    // for no page at all and is refused, while one above it is served the page this read
+    // serves.
+    refused(
+        &router,
+        "DescribeCapacityProviders",
+        json!({ "maxResults": 0 }),
+        "InvalidParameterException",
+        "zero",
+    )
+    .await;
+    for (case, max_results) in [("eleven", 11), ("a hundred", 100)] {
+        let body = ok(
             &router,
             "DescribeCapacityProviders",
             json!({ "maxResults": max_results }),
-            "InvalidParameterException",
             case,
         )
         .await;
+        assert_eq!(
+            list(&body, "capacityProviders", case).len(),
+            10,
+            "case {case:?}: a page above the range is served the page this read serves, got \
+             {body}"
+        );
     }
 
     // "only capacity providers associated with this cluster are returned, including
@@ -884,8 +927,9 @@ async fn describe_capacity_providers_filters_pages_and_reports_failures() {
     assert_eq!(
         list(&body, "failures", case),
         vec![json!({
-            "arn": format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:capacity-provider/ghost"),
-            "reason": "MISSING",
+            "arn": "ghost",
+            "reason": "The specified capacity provider does not exist. Specify a valid name \
+                       or ARN and try again.",
         })],
         "case {case:?}: unexpected failures in {body}"
     );

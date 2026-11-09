@@ -53,5 +53,11 @@ service-common = { path = "../common" }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# Amazon EC2 Auto Scaling owns the Auto Scaling group an ECS capacity provider binds onto,
+# and ECS resolves that reference against this service's records, so the propagation suite
+# creates the group through its OWN API before creating the provider it tags.
+service-com-amazonaws-autoscaling-autoscaling-2011-01-01 = { workspace = true }
+
 [lints]
 workspace = true

@@ -19,8 +19,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    cluster_with_capacity, identity_document, list, ok, refusal, register_definition, service,
-    string, ACCOUNT, SIGNED_REGION,
+    cluster_with_capacity, create_auto_scaling_group, identity_document, list, ok, refusal,
+    register_definition, service, string, ACCOUNT, SIGNED_REGION,
 };
 use crate::task_lifecycle::container;
 
@@ -64,12 +64,14 @@ pub(crate) async fn create(
 ) -> String {
     match kind {
         Kind::CapacityProvider => {
+            let group = format!("asg-{name}");
+            create_auto_scaling_group(router, &group, case).await;
             let body = ok(
                 router,
                 "CreateCapacityProvider",
                 json!({
                     "name": name,
-                    "autoScalingGroupProvider": { "autoScalingGroupArn": format!("asg-{name}") },
+                    "autoScalingGroupProvider": { "autoScalingGroupArn": group },
                     "tags": tags,
                 }),
                 case,

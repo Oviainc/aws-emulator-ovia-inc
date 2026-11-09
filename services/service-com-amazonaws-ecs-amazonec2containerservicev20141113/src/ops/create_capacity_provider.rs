@@ -321,6 +321,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // "The Amazon Resource Name (ARN) that identifies the Auto Scaling group, or the
+        // Auto Scaling group name": the group is a resource of the CALLER's that Amazon EC2
+        // Auto Scaling holds, so a reference naming a group the account does not hold binds
+        // the provider onto no capacity at all. Resolved against that service's own records
+        // BEFORE this service's store is locked, which is the lock order
+        // [`crate::state::unresolved_auto_scaling_group_refusal`] documents.
+        if let Some(message) = crate::state::unresolved_auto_scaling_group_refusal(
+            &*self.engine,
+            &region,
+            input.auto_scaling_group_provider.as_ref(),
+        ) {
+            return Err(
+                CreateCapacityProviderErrorModeled::ClientException(ClientException {
+                    message: Some(message.to_string()),
+                })
+                .into(),
+            );
+        }
+
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
@@ -457,9 +476,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             active_due_at: stands_up_capacity.then(|| now + crate::state::TRANSITION_SPAN),
             cluster: cluster_name,
             auto_scaling_group_provider: input.auto_scaling_group_provider.clone(),
-            provider_type: managed_instances_provider.as_ref().map(|_| {
-                crate::state::CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES.to_string()
-            }),
+            // `CapacityProvider$type` names the class of capacity the provider binds onto:
+            // the managed instances Amazon ECS runs for the cluster, or the caller's own
+            // Auto Scaling group. A provider is built on exactly one of the two, so the
+            // binding decides the type.
+            provider_type: Some(
+                if managed_instances_provider.is_some() {
+                    crate::state::CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES
+                } else {
+                    crate::state::CAPACITY_PROVIDER_TYPE_EC2_AUTOSCALING
+                }
+                .to_string(),
+            ),
             managed_instances_provider,
             tags: input.tags.clone().unwrap_or_default(),
         };

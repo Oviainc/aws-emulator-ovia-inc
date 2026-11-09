@@ -788,9 +788,7 @@ async fn the_ecs_managed_capacity_providers_are_active_without_being_created() {
             "a managed provider beside a name nothing holds",
             json!(["FARGATE", "absent"]),
             vec!["FARGATE"],
-            vec![format!(
-                "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:capacity-provider/absent"
-            )],
+            vec!["absent".to_string()],
         ),
     ];
 
@@ -826,14 +824,27 @@ async fn the_ecs_managed_capacity_providers_are_active_without_being_created() {
                 "case {case:?}: unexpected capacityProviderArn, got {provider}"
             );
             // Fargate capacity is neither a caller's Auto Scaling group nor the managed
-            // instances ECS runs for a cluster, so a managed provider carries neither.
+            // instances ECS runs for a cluster, so a managed provider carries neither — and
+            // its `type` is the Fargate class it binds onto, which is its own name.
             assert!(
                 provider["autoScalingGroupProvider"].is_null()
                     && provider["managedInstancesProvider"].is_null()
-                    && provider["cluster"].is_null()
-                    && provider["type"].is_null(),
+                    && provider["cluster"].is_null(),
                 "case {case:?}: a managed provider binds no capacity of a caller's, got \
                  {provider}"
+            );
+            assert_eq!(
+                provider["type"].as_str(),
+                Some(name.as_str()),
+                "case {case:?}: a managed provider reports the Fargate class it binds onto, \
+                 got {provider}"
+            );
+            // The tag list is reported whatever the request asked for, and these carry no
+            // tag at all.
+            assert_eq!(
+                provider["tags"],
+                json!([]),
+                "case {case:?}: a managed provider reports an empty tag list, got {provider}"
             );
         }
         let failures: Vec<String> = list(&body, "failures", case)

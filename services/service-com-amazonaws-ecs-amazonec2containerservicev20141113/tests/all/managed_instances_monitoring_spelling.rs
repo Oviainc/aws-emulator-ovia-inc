@@ -199,7 +199,7 @@ async fn a_monitoring_value_that_names_no_option_is_refused_and_stores_no_provid
              {message:?}"
         );
         // The refused create stored nothing: the name it asked for describes no provider,
-        // and the read reports it as one MISSING identifier instead.
+        // and the read reports it as one identifier that names none instead.
         let body = ok(
             &router,
             "DescribeCapacityProviders",
@@ -219,8 +219,11 @@ async fn a_monitoring_value_that_names_no_option_is_refused_and_stores_no_provid
         );
         assert_eq!(
             failures[0]["reason"].as_str(),
-            Some("MISSING"),
-            "case {case:?}: expected the name reported MISSING, got {body}"
+            Some(
+                "The specified capacity provider does not exist. Specify a valid name or ARN \
+                 and try again."
+            ),
+            "case {case:?}: expected the name reported as naming no provider, got {body}"
         );
     }
 }

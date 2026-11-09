@@ -223,6 +223,29 @@ pub fn missing_failure(arn: &str) -> Failure {
     }
 }
 
+/// The `Failure` a batch read of capacity providers reports for an identifier that names
+/// no provider the account holds, naming the identifier AS THE CALLER SENT IT.
+///
+/// The capacity-provider surface states what went wrong in a sentence of its own rather
+/// than with the `MISSING` code the other batch reads answer ([`unresolved_failure`]): the
+/// provider is named by "the short name or full Amazon Resource Name (ARN)", so the
+/// failure echoes the reference the request carried — the only value a client can match
+/// its entry back to — and the sentence is fixed text naming nothing of the request.
+pub fn capacity_provider_missing_failure(reference: &str) -> Failure {
+    Failure {
+        arn: Some(reference.to_string()),
+        reason: Some(CAPACITY_PROVIDER_MISSING_FAILURE_REASON.to_string()),
+        detail: None,
+    }
+}
+
+/// `Failure$reason` for a capacity-provider identifier that names nothing: the whole
+/// sentence, which states both halves of the rule — the identifier is a name or an ARN,
+/// and no provider of the account answers to this one.
+pub const CAPACITY_PROVIDER_MISSING_FAILURE_REASON: &str =
+    "The specified capacity provider does not exist. Specify a valid name or ARN and try \
+     again.";
+
 /// The `MISSING` `Failure` a batch read reports for an identifier that resolves to no
 /// resource of `resource_type`, naming the identifier AS THE CALLER SENT IT: the value
 /// itself when it is already an ARN, otherwise that id alone under the resource type.
@@ -1877,8 +1900,10 @@ pub fn capacity_provider_arn(region: &str, name: &str) -> String {
 /// than stored — which is also what keeps the ARN they report in the Region the caller
 /// asked in. They bind onto Fargate capacity, which is neither a caller's Auto Scaling
 /// group nor the managed instances Amazon ECS runs for a cluster, so they carry neither
-/// provider configuration and no `type`; `CapacityProvider$status` is
-/// [`CAPACITY_PROVIDER_ACTIVE`] — they are there and usable, and nothing can delete them.
+/// provider configuration; `CapacityProvider$type` is the Fargate capacity class each one
+/// binds onto, which `CapacityProviderType` spells with the provider's own name, and
+/// `CapacityProvider$status` is [`CAPACITY_PROVIDER_ACTIVE`] — they are there and usable,
+/// and nothing can delete them.
 pub fn managed_capacity_provider(name: &str, region: &str) -> Option<CapacityProviderRecord> {
     if !MANAGED_CAPACITY_PROVIDERS.contains(&name) {
         return None;
@@ -1892,7 +1917,7 @@ pub fn managed_capacity_provider(name: &str, region: &str) -> Option<CapacityPro
         cluster: None,
         auto_scaling_group_provider: None,
         managed_instances_provider: None,
-        provider_type: None,
+        provider_type: Some(name.to_string()),
         tags: Vec::new(),
     })
 }

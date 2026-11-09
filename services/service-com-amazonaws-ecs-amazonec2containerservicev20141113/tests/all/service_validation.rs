@@ -29,8 +29,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    awsvpc_network_configuration, cluster_with_capacity, create_cluster, list, ok, refusal,
-    refused, service, string, ACCOUNT,
+    awsvpc_network_configuration, cluster_with_capacity, create_auto_scaling_group, create_cluster,
+    list, ok, refusal, refused, service, string, ACCOUNT,
 };
 
 /// The cluster every case in this suite acts in.
@@ -693,7 +693,9 @@ async fn a_task_on_an_auto_scaling_group_provider_needs_capacity_unless_it_scale
         let provider = format!("provider{index}");
         let cluster = format!("provided{index}");
         create_cluster(&router, &cluster, case).await;
-        let mut group = json!({ "autoScalingGroupArn": format!("asg-{provider}") });
+        let group_name = format!("asg-{provider}");
+        create_auto_scaling_group(&router, &group_name, case).await;
+        let mut group = json!({ "autoScalingGroupArn": group_name });
         if let Some(status) = managed_scaling {
             group["managedScaling"] = json!({ "status": status, "targetCapacity": 100 });
         }
@@ -767,12 +769,14 @@ async fn a_task_on_an_auto_scaling_group_provider_needs_capacity_unless_it_scale
     create_cluster(&router, cluster, "two providers").await;
     let names = ["alpha", "beta"];
     for name in names {
+        let group = format!("asg-{name}");
+        create_auto_scaling_group(&router, &group, "two providers").await;
         ok(
             &router,
             "CreateCapacityProvider",
             json!({
                 "name": name,
-                "autoScalingGroupProvider": { "autoScalingGroupArn": format!("asg-{name}") },
+                "autoScalingGroupProvider": { "autoScalingGroupArn": group },
             }),
             "two providers",
         )

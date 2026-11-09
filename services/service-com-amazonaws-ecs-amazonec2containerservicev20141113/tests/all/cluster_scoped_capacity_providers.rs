@@ -30,7 +30,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::capacity_providers::{group_arn, managed_instances};
 use crate::ecs_wire::{
-    create_cluster, list, ok, refusal, register_definition, service, string,
+    create_auto_scaling_group, create_cluster, list, ok, refusal, register_definition, service,
+    string,
 };
 
 /// The whole of AWS's sentence for a delete a cluster-scoped capacity provider holds
@@ -123,6 +124,7 @@ fn lifecycle(provider: &Value, case: &str) -> (String, Option<String>) {
 async fn a_provider_whose_capacity_is_stood_up_settles_to_a_terminal_status() {
     let router = service();
     create_cluster(&router, "settling", "setup").await;
+    create_auto_scaling_group(&router, "asg-settle", "setup").await;
 
     // The rows differ along what backs the provider, which is what decides whether
     // anything has to be stood up for it before it can be used.
@@ -264,6 +266,7 @@ async fn a_cluster_carrying_a_cluster_scoped_provider_cannot_be_deleted() {
         )
         .await;
     }
+    create_auto_scaling_group(&router, "asg-delete", "setup").await;
     ok(
         &router,
         "CreateCapacityProvider",

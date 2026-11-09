@@ -30,7 +30,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
     answered, awsvpc_network_configuration, cloud_map, cluster_with_capacity,
-    emulator_with_cloud_map, list, ok, refusal, service, string, ACCOUNT, SIGNED_REGION,
+    create_auto_scaling_group, emulator_with_cloud_map, list, ok, refusal, service, string,
+    ACCOUNT, SIGNED_REGION,
 };
 
 /// The modelled error every bad-parameter refusal below carries.
@@ -122,12 +123,14 @@ async fn a_capacity_provider_the_account_holds_none_of_is_refused_and_stores_no_
     cluster_with_capacity(&router, cluster, "setup").await;
     register_fargate_capable(&router, "setup").await;
     for name in ["real-provider", "unassociated-provider"] {
+        let group = format!("asg-{name}");
+        create_auto_scaling_group(&router, &group, "setup").await;
         ok(
             &router,
             "CreateCapacityProvider",
             json!({
                 "name": name,
-                "autoScalingGroupProvider": { "autoScalingGroupArn": format!("asg-{name}") },
+                "autoScalingGroupProvider": { "autoScalingGroupArn": group },
             }),
             "setup",
         )

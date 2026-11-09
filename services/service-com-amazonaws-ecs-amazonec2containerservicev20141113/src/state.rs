@@ -158,6 +158,11 @@ pub use image_pull::*;
 mod vpc_resolution;
 pub use vpc_resolution::*;
 
+/// The Auto Scaling group a capacity provider binds onto, resolved against Amazon EC2 Auto
+/// Scaling's own records.
+mod auto_scaling_groups;
+pub use auto_scaling_groups::*;
+
 /// The Cloud Map instances Amazon ECS registers for the tasks of a service that names a
 /// `serviceRegistries` entry.
 mod service_discovery;
@@ -679,8 +684,12 @@ pub const CAPACITY_PROVIDER_INACTIVE: &str = "INACTIVE";
 
 /// `CapacityProvider$type` for a provider that manages EC2 instances itself — that
 /// member's doc: "For Amazon ECS Managed Instances, this value is `MANAGED_INSTANCES`".
-/// A provider built on a caller's own Auto Scaling group carries no type.
 pub const CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES: &str = "MANAGED_INSTANCES";
+
+/// `CapacityProvider$type` for a provider over one of the caller's OWN Auto Scaling
+/// groups — the `CapacityProviderType` value that names that class of capacity, beside
+/// `MANAGED_INSTANCES` and the two Fargate ones.
+pub const CAPACITY_PROVIDER_TYPE_EC2_AUTOSCALING: &str = "EC2_AUTOSCALING";
 
 /// The prefixes a capacity-provider name may not start with, from the
 /// `CreateCapacityProvider$name` doc: "The name can't be prefixed with \"aws\", \"ecs\",
@@ -688,10 +697,11 @@ pub const CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES: &str = "MANAGED_INSTANCES";
 /// and the reservation is on the word rather than on its spelling.
 pub const CAPACITY_PROVIDER_RESERVED_PREFIXES: [&str; 3] = ["aws", "ecs", "fargate"];
 
-/// How many capacity providers one `DescribeCapacityProviders` page carries when the
-/// request names no `maxResults`, and the most it accepts: the member's own doc, "This
-/// value can be between 1 and 10. If this parameter is not used, then
-/// DescribeCapacityProviders returns up to 10 results".
+/// How many capacity providers one `DescribeCapacityProviders` page carries: the most it
+/// serves, and what it serves when the request names no `maxResults`. The member's own
+/// doc: "This value can be between 1 and 10. If this parameter is not used, then
+/// DescribeCapacityProviders returns up to 10 results" — so a request asking for a BIGGER
+/// page is served this one rather than refused.
 pub const DESCRIBE_CAPACITY_PROVIDERS_PAGE_SIZE: usize = 10;
 
 /// How many capacity providers this emulator holds. EMULATOR-CHOSEN, for the same
@@ -2585,8 +2595,11 @@ pub struct CapacityProviderRecord {
     pub cluster: Option<String>,
     pub auto_scaling_group_provider: Option<AutoScalingGroupProvider>,
     pub managed_instances_provider: Option<ManagedInstancesProvider>,
-    /// `CapacityProvider$type`: [`CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES`] for a
-    /// managed-instances provider, and nothing for an Auto Scaling group one.
+    /// `CapacityProvider$type`: the class of capacity this provider binds onto, as a
+    /// `CapacityProviderType` value — [`CAPACITY_PROVIDER_TYPE_MANAGED_INSTANCES`] for a
+    /// managed-instances provider, [`CAPACITY_PROVIDER_TYPE_EC2_AUTOSCALING`] for one over
+    /// a caller's own Auto Scaling group, and the Fargate class itself for each provider
+    /// Amazon ECS manages for every account ([`MANAGED_CAPACITY_PROVIDERS`]).
     pub provider_type: Option<String>,
     pub tags: Vec<Tag>,
 }
@@ -2596,6 +2609,12 @@ impl CapacityProviderRecord {
     /// is stored. `include_tags` is what `DescribeCapacityProviders$include` gates
     /// (`CapacityProviderField` declares exactly `TAGS`); a create reports the tags it
     /// was given, having no `include` member to narrow them with.
+    ///
+    /// `tags` is reported WHATEVER the request asked for: the provider's own tags when the
+    /// request asked for them, and the empty list otherwise — "If this field is omitted,
+    /// tags aren't included in the response" takes the tags out of the list, not the list
+    /// out of the response, so a client reading `tags()` on a provider it did not ask the
+    /// tags of gets an empty list rather than an absent member.
     ///
     /// `updateStatus`/`updateStatusReason` report an update in flight: a create Amazon ECS
     /// had to stand the provider's capacity up for is one, so such a provider carries
@@ -2613,7 +2632,11 @@ impl CapacityProviderRecord {
             managed_instances_provider: self.managed_instances_provider.clone(),
             update_status: self.update_status.clone(),
             update_status_reason: None,
-            tags: include_tags.then(|| self.tags.clone()),
+            tags: Some(if include_tags {
+                self.tags.clone()
+            } else {
+                Vec::new()
+            }),
             r#type: self.provider_type.clone(),
         }
     }

@@ -25,8 +25,12 @@
 //!   `ListTaskDefinitions`, `ListTaskDefinitionFamilies`, `ListContainerInstances`,
 //!   `ListAttributes`, `ListServiceDeployments`, `ListDaemons`,
 //!   `ListDaemonTaskDefinitions` — "This value can be between 1 and 100."
-//! * `ListAccountSettings`, `DescribeCapacityProviders` — "This value can be between 1 and
-//!   10."
+//! * `ListAccountSettings` — "This value can be between 1 and 10."
+//!
+//! `DescribeCapacityProviders` documents the same 1..=10 at its own `maxResults`, but that
+//! range names the page it SERVES rather than the page a request may ask for: a bigger ask
+//! is served that page instead of refused ([`crate::capacity_providers`] pins both ends of
+//! it), so only the end below the range is a refusal here.
 //!
 //! Every case goes through the same front door a client uses, so nothing reaches into the
 //! state struct and a refusal or a page that is not computed from persisted state cannot
@@ -329,12 +333,6 @@ async fn a_long_standing_page_size_names_the_bound_it_crossed_below_and_the_rang
                 json!({ "maxResults": 0 }),
                 below_minimum_sentence(1),
             ),
-            (
-                "a capacity-provider page far above its narrower range",
-                "DescribeCapacityProviders",
-                json!({ "maxResults": 1_000 }),
-                range_sentence(1, 10),
-            ),
         ],
     )
     .await;
@@ -384,12 +382,31 @@ async fn a_long_standing_page_size_names_the_bound_it_crossed_below_and_the_rang
             1,
             10,
         ),
+        (
+            "a capacity-provider page above the page this read serves",
+            "DescribeCapacityProviders",
+            json!({ "maxResults": 1_000 }),
+            1,
+            10,
+        ),
     ] {
         let body = ok(&router, operation, request, case).await;
+        let object = body.as_object().unwrap_or_else(|| {
+            panic!("case {case:?}: expected {operation} to answer an object, got {body}")
+        });
+        // A page inside the range is PAGED with, so whatever list the answer carries holds
+        // at most the page that operation serves — which is also the end of the range a
+        // request may ask beyond.
+        let served = object
+            .values()
+            .filter_map(|value| value.as_array())
+            .map(Vec::len)
+            .max()
+            .unwrap_or_default();
         assert!(
-            body.is_object(),
-            "case {case:?}: expected {operation} to answer a body inside {min}..={max}, \
-             got {body}"
+            served <= max,
+            "case {case:?}: expected {operation} to answer a page inside {min}..={max}, got \
+             {served} entries in {body}"
         );
     }
 }

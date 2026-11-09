@@ -36,18 +36,100 @@ pub(crate) const AWSVPC_START: std::time::Duration = std::time::Duration::from_m
         + 400,
 );
 
-/// A router with just this service mounted on a fresh engine, and the one Amazon VPC subnet
-/// every `awsvpc` placement of these suites names ([`AWSVPC_SUBNET`]) in the account's
-/// records.
+/// A router with this service mounted on a fresh engine beside Amazon EC2 Auto Scaling,
+/// and the one Amazon VPC subnet every `awsvpc` placement of these suites names
+/// ([`AWSVPC_SUBNET`]) in the account's records.
+///
+/// Auto Scaling is mounted because a capacity provider binds onto an Auto Scaling group of
+/// the caller's and a reference naming a group the account does not hold is refused, so a
+/// suite that creates such a provider creates its group first, through that service's OWN
+/// API ([`create_auto_scaling_group`]).
 pub(crate) fn service() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     seed_awsvpc_subnets(&engine);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(engine),
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_autoscaling_autoscaling_2011_01_01::EmulatedService::new(engine),
     );
     router
+}
+
+/// The awsQuery API version an Amazon EC2 Auto Scaling request body carries.
+const AUTO_SCALING_API_VERSION: &str = "2011-01-01";
+
+/// Create one Auto Scaling group named `name` in the account, in [`SIGNED_REGION`], through
+/// Amazon EC2 Auto Scaling's OWN API — never by writing into its store.
+///
+/// `AutoScalingGroupProvider$autoScalingGroupArn` names a group of the caller's, and
+/// `CreateCapacityProvider` resolves it against that service's records, so every provider a
+/// suite creates over a group needs the group to exist first.
+pub(crate) async fn create_auto_scaling_group(
+    router: &MultiServiceRouter,
+    name: &str,
+    case: &str,
+) {
+    create_auto_scaling_group_in(router, SIGNED_REGION, name, case).await;
+}
+
+/// The same, in `region` — for a case about a group of ANOTHER Region, which is a group of
+/// the account that this Region's capacity cannot be bound onto.
+///
+/// The smallest group that API accepts: a name, a zone of the Region to place instances in,
+/// a launch template to launch them from, and a size range that holds none — so nothing is
+/// launched and no transition is owed.
+pub(crate) async fn create_auto_scaling_group_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    name: &str,
+    case: &str,
+) {
+    let zone = format!("{region}a");
+    let body = [
+        ("Action", "CreateAutoScalingGroup"),
+        ("Version", AUTO_SCALING_API_VERSION),
+        ("AutoScalingGroupName", name),
+        ("LaunchTemplate.LaunchTemplateName", "ecs-capacity"),
+        ("MinSize", "0"),
+        ("MaxSize", "0"),
+        ("AvailabilityZones.member.1", zone.as_str()),
+    ]
+    .iter()
+    .map(|(key, value)| {
+        // An `application/x-www-form-urlencoded` value carries only RFC 3986's unreserved
+        // set literally; everything else is percent-encoded.
+        let value =
+            percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC);
+        format!("{key}={value}")
+    })
+    .collect::<Vec<String>>()
+    .join("&");
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://autoscaling.{region}.amazonaws.com/"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDECSTEST/20260101/{region}\
+                 /autoscaling/aws4_request, SignedHeaders=host, Signature=00"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("a well-formed awsQuery request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload = String::from_utf8_lossy(response.body()).to_string();
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected Auto Scaling CreateAutoScalingGroup to answer 200 for \
+         {name} in {region}, got {status} with {payload}"
+    );
 }
 
 /// The subnet id every `awsvpc` placement below names
@@ -384,7 +466,9 @@ pub(crate) async fn register_definition(
 /// A router carrying this service AND the Cloud Map (service discovery) service over ONE
 /// shared engine — the two stores every cross-service registry rule reads across, mounted
 /// the way the production router mounts them. Holds [`AWSVPC_SUBNET`] too, so a placement
-/// of these suites resolves the subnet it names.
+/// of these suites resolves the subnet it names, and Amazon EC2 Auto Scaling, so a capacity
+/// provider these suites create has a group to bind onto
+/// ([`create_auto_scaling_group`]).
 pub(crate) fn emulator_with_cloud_map() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     seed_awsvpc_subnets(&engine);
@@ -394,6 +478,11 @@ pub(crate) fn emulator_with_cloud_map() -> MultiServiceRouter {
         service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(
             Arc::clone(&engine),
         ),
+    );
+    router.register_service(
+        service_com_amazonaws_autoscaling_autoscaling_2011_01_01::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
     );
     router.register_service(
         service_com_amazonaws_servicediscovery_route53autonaming_v20170314::EmulatedService::new(
@@ -450,7 +539,8 @@ pub(crate) async fn cloud_map(
 
 /// A router carrying this service AND the Amazon EC2 service over ONE shared engine — the
 /// two stores the image-fetch rule reads across, mounted the way the production router
-/// mounts them.
+/// mounts them. Amazon EC2 Auto Scaling is mounted beside them, so a capacity provider
+/// these suites create has a group to bind onto ([`create_auto_scaling_group`]).
 pub(crate) fn emulator_with_ec2() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -459,6 +549,11 @@ pub(crate) fn emulator_with_ec2() -> MultiServiceRouter {
         service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(
             Arc::clone(&engine),
         ),
+    );
+    router.register_service(
+        service_com_amazonaws_autoscaling_autoscaling_2011_01_01::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
     );
     router.register_service(
         service_com_amazonaws_ec2_amazonec2::EmulatedService::new(engine),

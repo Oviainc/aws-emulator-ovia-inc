@@ -194,20 +194,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        // "This value can be between 1 and 10."
-        let page_size =
-            i32::try_from(crate::state::DESCRIBE_CAPACITY_PROVIDERS_PAGE_SIZE).unwrap_or(i32::MAX);
-        if let Some(message) = input.max_results.and_then(|max_results| {
-            crate::state::page_size_violation(
-                max_results,
-                crate::state::MIN_LIST_PAGE_SIZE,
-                page_size,
-            )
-        }) {
+        // "This value can be between 1 and 10. If this parameter is not used, then
+        // DescribeCapacityProviders returns up to 10 results": the range names the page
+        // this read SERVES, so a request asking for a BIGGER page is served that page (the
+        // clamp further down) rather than refused. A page size below one asks for no page
+        // at all, which is the one value this member cannot be given, and it is refused as
+        // every other page size below its minimum is.
+        if input
+            .max_results
+            .is_some_and(|max_results| max_results < crate::state::MIN_LIST_PAGE_SIZE)
+        {
             return Err(
                 DescribeCapacityProvidersErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(message),
+                        message: Some(crate::state::below_minimum_message(
+                            &crate::state::member_subject("maxResults"),
+                            crate::state::MIN_LIST_PAGE_SIZE,
+                        )),
                     },
                 )
                 .into(),
@@ -289,10 +292,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 match guard.capacity_provider(&name, &region) {
                     Some(provider) if in_scope(&provider) => named.push(provider),
                     // An id that names nothing in scope is a FAILURE beside the results,
-                    // not an error for the whole call: that is what `failures` is for.
-                    _ => failures.push(crate::state::missing_failure(
-                        &crate::state::capacity_provider_arn(&region, &name),
-                    )),
+                    // not an error for the whole call: that is what `failures` is for. The
+                    // entry echoes the reference AS GIVEN, which is what lets a client
+                    // match it back to the identifier it asked about.
+                    _ => failures
+                        .push(crate::state::capacity_provider_missing_failure(reference)),
                 }
             }
             named
@@ -302,10 +306,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         matching.sort_by(|left, right| left.name.cmp(&right.name));
         matching.dedup_by(|left, right| left.name == right.name);
 
+        // The page a request may ASK for is bounded by the page this read serves
+        // ([`crate::state::DESCRIBE_CAPACITY_PROVIDERS_PAGE_SIZE`]), which is also the page
+        // it serves when the request names none.
         let page_size = input
             .max_results
             .and_then(|max_results| usize::try_from(max_results).ok())
-            .unwrap_or(crate::state::DESCRIBE_CAPACITY_PROVIDERS_PAGE_SIZE);
+            .unwrap_or(crate::state::DESCRIBE_CAPACITY_PROVIDERS_PAGE_SIZE)
+            .min(crate::state::DESCRIBE_CAPACITY_PROVIDERS_PAGE_SIZE);
         // The token is the NAME the next page starts at, so a page is unaffected by
         // providers created or deleted before it.
         let start = match input.next_token.as_deref() {

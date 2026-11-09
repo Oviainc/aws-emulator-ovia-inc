@@ -28,7 +28,10 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::capacity_providers::managed_instances;
-use crate::ecs_wire::{create_cluster, list, ok, refusal, service, string, ACCOUNT, SIGNED_REGION};
+use crate::ecs_wire::{
+    create_auto_scaling_group, create_cluster, list, ok, refusal, service, string, ACCOUNT,
+    SIGNED_REGION,
+};
 
 /// The sentence AWS refuses a daemon over a provider that is not a managed-instances one
 /// with: the fixed text of that error class, naming nothing from the request.
@@ -96,15 +99,19 @@ async fn create_managed_provider(
     string(&body["capacityProvider"], "capacityProviderArn", case)
 }
 
-/// Create a capacity provider bound onto a caller's Auto Scaling group — a provider of
-/// another kind, which carries no `type` at all — and return its ARN.
+/// Create a capacity provider bound onto a caller's Auto Scaling group — a provider whose
+/// `type` is `EC2_AUTOSCALING` rather than the managed instances a daemon needs — and
+/// return its ARN. The group is created first, through Auto Scaling's own API: a provider
+/// over a group the account does not hold is refused.
 async fn create_group_provider(router: &MultiServiceRouter, name: &str, case: &str) -> String {
+    let group = format!("asg-{name}");
+    create_auto_scaling_group(router, &group, case).await;
     let body = ok(
         router,
         "CreateCapacityProvider",
         json!({
             "name": name,
-            "autoScalingGroupProvider": { "autoScalingGroupArn": format!("asg-{name}") },
+            "autoScalingGroupProvider": { "autoScalingGroupArn": group },
         }),
         case,
     )

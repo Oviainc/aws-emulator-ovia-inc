@@ -30,6 +30,13 @@ service-com-amazonaws-servicediscovery-route53autonaming-v20170314 = { workspace
 # resources, held in its own store in the shared engine, so this is a cross-service READ
 # rather than a copy kept here. No cycle: that crate depends on no service crate.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# The Amazon EC2 Auto Scaling service, for ONE read of the Auto Scaling group a capacity
+# provider's `autoScalingGroupProvider` names: whether the account holds that group, which
+# decides whether the provider can be created at all
+# (`crate::state::unresolved_auto_scaling_group_refusal`). The group is that service's own
+# resource, held in its own store in the shared engine, so this is a cross-service READ
+# rather than a copy kept here. No cycle: that crate does not depend on this one.
+service-com-amazonaws-autoscaling-autoscaling-2011-01-01 = { workspace = true }
 # `eventbridge_client`: the ONE in-process EventBridge client an emulated service publishes
 # an event through, so this crate configures no second copy of that hop.
 service-common = { path = "../common" }
@@ -67,6 +74,10 @@ hex = { workspace = true }
 # mounted there is nothing for the publication to reach.
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# `percent-encoding`: RFC 3986 percent-encoding for the `application/x-www-form-urlencoded`
+# body the test harness posts to Amazon EC2 Auto Scaling's awsQuery endpoint, so the group a
+# capacity provider binds onto is created through that service's own API.
+percent-encoding = "2.3"
 
 [lints]
 workspace = true

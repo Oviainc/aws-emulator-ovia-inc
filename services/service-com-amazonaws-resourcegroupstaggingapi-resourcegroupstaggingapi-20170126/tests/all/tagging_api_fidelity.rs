@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime};
 
 // The owning services, aliased to the role they play here, exactly as
 // `src/state/owners.rs` aliases them.
+use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as owner_autoscaling;
 use service_com_amazonaws_ecs_amazonec2containerservicev20141113 as owner_ecs;
 use service_com_amazonaws_eventbridge_awsevents as owner_events;
 use service_com_amazonaws_kms_trentservice as owner_kms;
@@ -43,6 +44,10 @@ const SQS: &str = "sqs";
 const ECS: &str = "ecs";
 const SECRETS: &str = "secretsmanager";
 
+/// The SigV4 signing name of Amazon EC2 Auto Scaling, whose awsQuery endpoint creates the
+/// Auto Scaling group an ECS capacity provider binds onto.
+const AUTO_SCALING: &str = "autoscaling";
+
 /// A router carrying the tagging API and the owning services it resolves ARNs
 /// against, all over ONE engine — exactly the arrangement `core/router` builds.
 fn emulator() -> MultiServiceRouter {
@@ -60,8 +65,63 @@ fn emulator() -> MultiServiceRouter {
     )));
     router.register_service(owner_kms::EmulatedService::new(Arc::clone(&engine)));
     router.register_service(owner_events::EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(owner_autoscaling::EmulatedService::new(Arc::clone(&engine)));
     router.register_service(owner_sfn::EmulatedService::new(engine));
     router
+}
+
+/// Create one Auto Scaling group named `name` in [`REGION`], through Amazon EC2 Auto
+/// Scaling's OWN awsQuery API.
+///
+/// An ECS capacity provider over `autoScalingGroupProvider` binds onto a group of the
+/// caller's, and ECS resolves that reference against this service's records, so the group
+/// has to exist before the provider that binds onto it can be created. The smallest group
+/// that API accepts: a name, a zone of the Region to place instances in, a launch template
+/// to launch them from, and a size range that holds none.
+async fn create_auto_scaling_group(router: &MultiServiceRouter, name: &str) {
+    let zone = format!("{REGION}a");
+    let body = [
+        ("Action", "CreateAutoScalingGroup"),
+        ("Version", "2011-01-01"),
+        ("AutoScalingGroupName", name),
+        ("LaunchTemplate.LaunchTemplateName", "tagging-capacity"),
+        ("MinSize", "0"),
+        ("MaxSize", "0"),
+        ("AvailabilityZones.member.1", zone.as_str()),
+    ]
+    .iter()
+    .map(|(key, value)| {
+        // The form encoding is the ONE this crate's tests carry
+        // ([`crate::elb_tagged_resource_index::encode`]), so an awsQuery body built here
+        // and one built by the load-balancer suite cannot drift.
+        format!(
+            "{}={}",
+            crate::elb_tagged_resource_index::encode(key),
+            crate::elb_tagged_resource_index::encode(value)
+        )
+    })
+    .collect::<Vec<String>>()
+    .join("&");
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://autoscaling.{REGION}.amazonaws.com/"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{AUTO_SCALING}/\
+                 aws4_request, SignedHeaders=host, Signature=0"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("build the request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload = String::from_utf8_lossy(response.body()).to_string();
+    assert_eq!(
+        status, 200,
+        "CreateAutoScalingGroup for {name}: body {payload}"
+    );
 }
 
 /// Call one operation of one service and return its HTTP status and parsed body.
@@ -1256,7 +1316,10 @@ async fn ecs_reports_the_tags_this_api_writes_through_its_own_reader() {
         })
         .to_string();
 
-    // A third kind, the capacity provider, which `TagResource$resourceArn` names too.
+    // A third kind, the capacity provider, which `TagResource$resourceArn` names too. Its
+    // Auto Scaling group is created first, through Auto Scaling's own API: ECS resolves the
+    // reference and refuses a group the account does not hold.
+    create_auto_scaling_group(&router, "asg-propagation").await;
     let (status, provider) = call(
         &router,
         ECS,

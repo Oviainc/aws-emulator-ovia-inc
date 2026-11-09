@@ -27,6 +27,8 @@ mod attachment_state_reports;
 mod awsvpc_configuration_store;
 #[path = "all/awsvpc_interface_subnet_and_identity.rs"]
 mod awsvpc_interface_subnet_and_identity;
+#[path = "all/capacity_provider_surface.rs"]
+mod capacity_provider_surface;
 #[path = "all/capacity_providers.rs"]
 mod capacity_providers;
 #[path = "all/cluster_capacity_and_statistics.rs"]

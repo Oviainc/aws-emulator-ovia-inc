@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    awsvpc_network_configuration, count, create_cluster, list, ok, refusal, register_capacity,
-    register_definition, service, string,
+    awsvpc_network_configuration, count, create_auto_scaling_group, create_cluster, list, ok,
+    refusal, register_capacity, register_definition, service, string,
 };
 
 /// Long enough for one clock-owed task transition (`state::TRANSITION_SPAN` is 500 ms) to
@@ -112,7 +112,9 @@ async fn provider_on(
     managed_scaling: Option<&str>,
     case: &str,
 ) {
-    let mut group = json!({ "autoScalingGroupArn": format!("asg-{provider}") });
+    let group_name = format!("asg-{provider}");
+    create_auto_scaling_group(router, &group_name, case).await;
+    let mut group = json!({ "autoScalingGroupArn": group_name });
     if let Some(status) = managed_scaling {
         group["managedScaling"] = json!({ "status": status, "targetCapacity": 100 });
     }

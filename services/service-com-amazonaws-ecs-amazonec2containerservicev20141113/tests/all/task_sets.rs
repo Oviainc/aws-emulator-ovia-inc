@@ -26,8 +26,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    awsvpc_network_configuration, count, create_cluster, list, ok, refusal, register_capacity,
-    register_definition, service, string, ACCOUNT, SIGNED_REGION,
+    awsvpc_network_configuration, count, create_auto_scaling_group, create_cluster, list, ok,
+    refusal, register_capacity, register_definition, service, string, ACCOUNT, SIGNED_REGION,
 };
 
 /// Long enough for one clock-owed task transition (`state::TRANSITION_SPAN` is 500 ms) to
@@ -721,6 +721,7 @@ async fn the_scheduler_records_why_it_could_not_place_a_task_and_keeps_the_desir
             }
             Capacity::UnscaledProvider => {
                 request["taskDefinition"] = json!("bridgefamily");
+                create_auto_scaling_group(&router, "asg-unscaled", case).await;
                 ok(
                     &router,
                     "CreateCapacityProvider",

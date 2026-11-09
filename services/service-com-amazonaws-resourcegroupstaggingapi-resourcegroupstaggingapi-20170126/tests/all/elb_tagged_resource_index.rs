@@ -103,7 +103,11 @@ async fn tagging(router: &MultiServiceRouter, operation: &str, body: Value) -> (
 
 /// Percent-encode one form component, so an ARN or a path crosses the wire intact.
 /// Escaping every non-alphanumeric byte is always a valid form encoding.
-fn encode(value: &str) -> String {
+///
+/// THE ONE COPY in this crate's tests: every suite that posts an awsQuery form body to an
+/// owning service builds it through here ([`crate::tagging_api_fidelity`] creates an Auto
+/// Scaling group that way).
+pub(crate) fn encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.as_bytes() {
         match byte {

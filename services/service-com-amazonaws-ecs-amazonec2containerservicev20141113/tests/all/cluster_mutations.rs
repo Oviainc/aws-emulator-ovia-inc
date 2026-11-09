@@ -33,7 +33,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ecs_wire::{count, list, ok, refused, register_instance, service};
+use crate::ecs_wire::{
+    count, create_auto_scaling_group, list, ok, refused, register_instance, service,
+};
 
 /// Long enough for one clock-owed transition (`state::TRANSITION_SPAN` is 500 ms) to
 /// fall due, with margin for a loaded test machine.
@@ -996,12 +998,14 @@ async fn a_capacity_provider_strategy_must_name_associated_providers() {
     let mut past_bound = at_bound.clone();
     past_bound.push("provider-too-many".to_string());
     for name in &past_bound {
+        let group = format!("asg-{name}");
+        create_auto_scaling_group(&router, &group, "the providers the association names").await;
         ok(
             &router,
             "CreateCapacityProvider",
             json!({
                 "name": name,
-                "autoScalingGroupProvider": { "autoScalingGroupArn": format!("asg-{name}") },
+                "autoScalingGroupProvider": { "autoScalingGroupArn": group },
             }),
             "the providers the association names",
         )

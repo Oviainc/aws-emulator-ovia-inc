@@ -40,8 +40,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    awsvpc_network_configuration, cluster_with_capacity, create_cluster, list, ok, refusal,
-    register_capacity, service, string, AWSVPC_START,
+    awsvpc_network_configuration, cluster_with_capacity, create_auto_scaling_group, create_cluster,
+    list, ok, refusal, register_capacity, service, string, AWSVPC_START,
 };
 use crate::task_lifecycle::container;
 
@@ -538,6 +538,7 @@ async fn a_task_that_is_not_placed_yet_is_given_no_interface_and_is_on_no_networ
     let router = service();
     create_cluster(&router, CLUSTER, case).await;
     register(&router, "parkediface", "awsvpc", case).await;
+    create_auto_scaling_group(&router, "asg-parkedscaled", case).await;
     ok(
         &router,
         "CreateCapacityProvider",

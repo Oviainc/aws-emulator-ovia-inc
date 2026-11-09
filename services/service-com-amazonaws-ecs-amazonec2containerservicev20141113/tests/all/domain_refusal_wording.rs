@@ -41,8 +41,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    cluster_with_capacity, count, list, ok, refusal, register_definition, service, string, ACCOUNT,
-    SIGNED_REGION,
+    cluster_with_capacity, count, create_auto_scaling_group, list, ok, refusal,
+    register_definition, service, string, ACCOUNT, SIGNED_REGION,
 };
 use crate::resource_tags::{listed, CLUSTER as TAGGED_CLUSTER};
 use crate::task_lifecycle::container;
@@ -700,6 +700,7 @@ const CAPACITY_PROVIDER_NOT_FOUND: &str = "The specified capacity provider was n
 #[tokio::test]
 async fn a_capacity_provider_that_does_not_exist_is_refused_and_changes_no_association() {
     let router = service();
+    create_auto_scaling_group(&router, "asg-real", "setup").await;
     ok(
         &router,
         "CreateCapacityProvider",

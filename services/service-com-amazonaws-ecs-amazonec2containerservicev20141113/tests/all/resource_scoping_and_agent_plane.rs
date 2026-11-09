@@ -52,9 +52,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    answered, awsvpc_network_configuration, cloud_map, cluster_with_capacity, ec2, ec2_element,
-    emulator_with_cloud_map, emulator_with_ec2, list, ok, refusal, register_capacity,
-    register_definition, service, string, ACCOUNT, SIGNED_REGION,
+    answered, awsvpc_network_configuration, cloud_map, cluster_with_capacity,
+    create_auto_scaling_group, ec2, ec2_element, emulator_with_cloud_map, emulator_with_ec2, list,
+    ok, refusal, register_capacity, register_definition, service, string, ACCOUNT, SIGNED_REGION,
 };
 use crate::task_lifecycle::container;
 
@@ -175,14 +175,18 @@ async fn associate(
     .await
 }
 
-/// Create one capacity provider over an Auto Scaling group the ACCOUNT holds.
+/// Create one capacity provider over an Auto Scaling group the ACCOUNT holds — the group
+/// first, through Auto Scaling's own API, since a provider over a group the account does not
+/// hold is refused.
 async fn create_provider(router: &MultiServiceRouter, name: &str, case: &str) {
+    let group = format!("asg-{name}");
+    create_auto_scaling_group(router, &group, case).await;
     ok(
         router,
         "CreateCapacityProvider",
         json!({
             "name": name,
-            "autoScalingGroupProvider": { "autoScalingGroupArn": format!("asg-{name}") },
+            "autoScalingGroupProvider": { "autoScalingGroupArn": group },
         }),
         case,
     )
