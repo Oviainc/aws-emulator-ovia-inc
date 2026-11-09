@@ -47,11 +47,16 @@ use crate::ops::types::{
 mod artifacts;
 /// Which builds the `batch` section of a buildspec declares a batch build is made of.
 mod batchspec;
+/// What ONE command line of a buildspec does, in the build environment's shell.
+mod build_shell;
+/// The phases a buildspec declares, and what running them answered.
+mod buildspec;
 /// The SHAPE of the identifiers the operations that take one as a plain string accept.
 mod identifiers;
 
 pub use artifacts::*;
 pub use batchspec::*;
+pub use buildspec::*;
 pub use identifiers::*;
 
 /// The ARN service segment for this service, as `emulator_arn`'s first argument
@@ -493,15 +498,6 @@ pub const MAX_COMMAND_EXECUTIONS: usize = MAX_SANDBOXES;
 /// [`MAX_SANDBOXES`] puts on the resource these belong to.
 pub const MAX_SANDBOX_CONNECTIONS: usize = MAX_SANDBOXES;
 
-/// Why an emulated build never reaches `SUCCEEDED`.
-///
-/// Nothing in this emulator executes a CodeBuild build container, so a build
-/// cannot report a result for a buildspec that never ran. It ends instead in
-/// CodeBuild's own build-system failure status, `FAULT`, carrying this
-/// explanation as the failing phase's context.
-pub const BUILD_NOT_EXECUTED_MESSAGE: &str = "this emulator does not run CodeBuild build \
-    containers, so the build could not be provisioned and no buildspec was executed";
-
 /// Why a batch build whose specification named no build never reaches `SUCCEEDED`.
 ///
 /// A batch build's first act is `DOWNLOAD_BATCHSPEC`: CodeBuild fetches the
@@ -516,15 +512,6 @@ pub const BUILD_NOT_EXECUTED_MESSAGE: &str = "this emulator does not run CodeBui
 pub const BATCH_SPEC_NOT_DOWNLOADED_MESSAGE: &str = "this emulator does not run CodeBuild \
     build containers, so the batch build specification could not be downloaded and no build \
     of the batch was started";
-
-/// Why a batch build that DID fan out never reaches `SUCCEEDED` either.
-///
-/// The batch started one build per identifier its specification declared, and each of
-/// those builds ends where every emulated build ends ([`BUILD_NOT_EXECUTED_MESSAGE`]),
-/// so the batch's `IN_PROGRESS` phase has no successful build to combine artifacts from
-/// and takes the same build-system failure status its builds did.
-pub const BATCH_BUILDS_NOT_EXECUTED_MESSAGE: &str = "this emulator does not run CodeBuild \
-    build containers, so none of the builds of this batch could be provisioned";
 
 /// The `statusCode` `DeleteBuildBatch` reports for a batch build it removed.
 ///
@@ -987,8 +974,8 @@ pub struct StoredProject {
     /// CodeBuild reports no member for it.
     ///
     /// Nothing READS it yet, and no response can: the one thing that would consult it is
-    /// a build restoring the project's cache, and this emulator runs no build (see
-    /// [`BUILD_NOT_EXECUTED_MESSAGE`]). It is kept because it is the state the reset
+    /// a build restoring the project's cache, and a build's session here keeps no cache
+    /// (see [`buildspec::run_build`]). It is kept because it is the state the reset
     /// produces — a test reads it through the store the handler writes — rather than
     /// because a reader exists for it today.
     pub cache_invalidated_millis: Option<i64>,
@@ -1980,11 +1967,21 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
     /// transitions its builds have been owed since it started them, which is what the
     /// summaries on its build groups report.
     pub fn settled_build_batch(&mut self, id: &str, now_millis: i64) -> Option<&StoredBuildBatch> {
+        self.settle_build_batch(id, now_millis);
+        self.build_batches.get(id)
+    }
+
+    /// Materialise the transitions one batch build has been owed: first the ones its own
+    /// builds were owed, which refresh the summaries its groups carry, and then the
+    /// batch's own, which is decided by those summaries
+    /// ([`StoredBuildBatch::settle`]). Every reader of a batch goes through this, so no
+    /// reader can settle a batch from summaries that have not caught up with its builds.
+    pub fn settle_build_batch(&mut self, id: &str, now_millis: i64) {
         let summarised = self.settled_group_build_statuses(id, now_millis);
-        let stored = self.build_batches.get_mut(id)?;
-        stored.settle(now_millis);
-        stored.refresh_group_summaries(&summarised);
-        Some(stored)
+        if let Some(stored) = self.build_batches.get_mut(id) {
+            stored.refresh_group_summaries(&summarised);
+            stored.settle(now_millis);
+        }
     }
 
     /// The current `buildStatus` of each build one batch's groups name, keyed by that
@@ -2059,25 +2056,28 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         now_millis: i64,
         status: Option<&str>,
     ) -> Vec<String> {
-        type StartKey<'a> = (i64, Option<&'a String>, Option<i64>, &'a String);
+        type StartKey = (i64, Option<String>, Option<i64>, String);
 
-        let mut started: Vec<StartKey<'_>> = Vec::new();
-        for (id, stored) in self.build_batches.iter_mut() {
-            stored.settle(now_millis);
+        let held: Vec<String> = self.build_batches.keys().cloned().collect();
+        for id in &held {
+            self.settle_build_batch(id, now_millis);
+        }
+        let mut started: Vec<StartKey> = Vec::new();
+        for (id, stored) in &self.build_batches {
             let keeps = status.is_none_or(|wanted| {
                 stored.build_batch.build_batch_status.as_deref() == Some(wanted)
             });
             if keeps {
                 started.push((
                     stored.start_millis,
-                    stored.build_batch.project_name.as_ref(),
+                    stored.build_batch.project_name.clone(),
                     stored.build_batch.build_batch_number,
-                    id,
+                    id.clone(),
                 ));
             }
         }
         started.sort();
-        started.into_iter().map(|(.., id)| id.clone()).collect()
+        started.into_iter().map(|(.., id)| id).collect()
     }
 
     /// One project's batch build ids, OLDEST FIRST, keeping only those whose
@@ -2104,10 +2104,12 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
             .get(project_name)
             .cloned()
             .unwrap_or_default();
+        for id in &ids {
+            self.settle_build_batch(id, now_millis);
+        }
         ids.into_iter()
             .filter(|id| {
-                self.build_batches.get_mut(id).is_some_and(|stored| {
-                    stored.settle(now_millis);
+                self.build_batches.get(id).is_some_and(|stored| {
                     status.is_none_or(|wanted| {
                         stored.build_batch.build_batch_status.as_deref() == Some(wanted)
                     })
@@ -2442,19 +2444,21 @@ impl StoredFleet {
 impl StoredBuild {
     /// Materialise this build's terminal state once its due instant has passed.
     ///
-    /// Idempotent and purely a function of the stored instants: a build that is
-    /// already complete, or whose span has not elapsed, is left alone.
+    /// Idempotent and purely a function of the stored instants and of the build's own
+    /// record: a build that is already complete, or whose span has not elapsed, is left
+    /// alone, and the status it takes is what RUNNING its buildspec answered
+    /// ([`buildspec::run_build`]) rather than a status fixed here.
     pub fn settle(&mut self, now_millis: i64) {
         if self.build.build_complete || now_millis < self.settle_due_millis {
             return;
         }
-        let start = self.start_millis;
-        let due = self.settle_due_millis;
-        self.build.build_status = Some("FAULT".to_string());
+        let run = buildspec::run_build(&self.build, self.start_millis, self.settle_due_millis);
+        self.build.build_status = Some(run.status);
         self.build.current_phase = Some("COMPLETED".to_string());
         self.build.build_complete = true;
-        self.build.end_time = Some(datetime(due));
-        self.build.phases = Some(terminal_phases(start, due));
+        self.build.end_time = Some(datetime(self.settle_due_millis));
+        self.build.phases = Some(run.phases);
+        self.build.exported_environment_variables = run.exported_variables;
     }
 }
 
@@ -2485,23 +2489,51 @@ impl StoredBuildBatch {
 
     /// Materialise this batch build's terminal state once its due instant has
     /// passed, under [`StoredBuild::settle`]'s rule: idempotent, and purely a
-    /// function of the stored instants.
+    /// function of the stored instants and of the record itself.
+    ///
+    /// A batch that fanned out takes the status its own builds took, read off the
+    /// summaries its groups carry — which is why this is called through
+    /// [`ComAmazonawsCodebuildCodebuild20161006State::settle_build_batch`], where those
+    /// summaries are refreshed from the build records first. A batch that fanned out
+    /// into nothing never had a specification to act on, which is the batch-system
+    /// failure [`BATCH_SPEC_NOT_DOWNLOADED_MESSAGE`] reports.
     pub fn settle(&mut self, now_millis: i64) {
         if self.build_batch.complete || now_millis < self.settle_due_millis {
             return;
         }
         let start = self.start_millis;
         let due = self.settle_due_millis;
-        let fanned_out = self
-            .build_batch
-            .build_groups
-            .as_ref()
-            .is_some_and(|groups| !groups.is_empty());
-        self.build_batch.build_batch_status = Some("FAULT".to_string());
-        self.build_batch.current_phase = Some("FAILED".to_string());
+        let fan_out = self.fanned_out_outcome();
+        let status = match fan_out {
+            None => "FAULT",
+            Some(true) => buildspec::BUILD_STATUS_SUCCEEDED,
+            Some(false) => buildspec::BUILD_STATUS_FAILED,
+        };
+        self.build_batch.build_batch_status = Some(status.to_string());
+        self.build_batch.current_phase = Some(terminal_batch_phase(fan_out).to_string());
         self.build_batch.complete = true;
         self.build_batch.end_time = Some(datetime(due));
-        self.build_batch.phases = Some(terminal_batch_phases(start, due, fanned_out));
+        self.build_batch.phases = Some(terminal_batch_phases(start, due, fan_out));
+    }
+
+    /// Whether every build this batch fanned out into answered success — `None` when it
+    /// fanned out into no build at all.
+    ///
+    /// A group whose `ignoreFailure` is set does not decide the batch, and a group whose
+    /// build reports no status yet has not succeeded.
+    fn fanned_out_outcome(&self) -> Option<bool> {
+        let groups = self.build_batch.build_groups.as_deref().unwrap_or_default();
+        if groups.is_empty() {
+            return None;
+        }
+        Some(groups.iter().all(|group| {
+            group.ignore_failure
+                || group
+                    .current_build_summary
+                    .as_ref()
+                    .and_then(|summary| summary.build_status.as_deref())
+                    == Some(buildspec::BUILD_STATUS_SUCCEEDED)
+        }))
     }
 }
 
@@ -3629,26 +3661,6 @@ pub fn in_progress_phases(start_millis: i64) -> Vec<BuildPhase> {
     ]
 }
 
-/// The phases of a build that has reached its terminal state: provisioning is
-/// where an emulated build stops, because there is no container to provision.
-fn terminal_phases(start_millis: i64, due_millis: i64) -> Vec<BuildPhase> {
-    vec![
-        finished_phase("SUBMITTED", "SUCCEEDED", start_millis, start_millis, None),
-        finished_phase("QUEUED", "SUCCEEDED", start_millis, due_millis, None),
-        finished_phase(
-            "PROVISIONING",
-            "FAULT",
-            due_millis,
-            due_millis,
-            Some(vec![PhaseContext {
-                status_code: None,
-                message: Some(BUILD_NOT_EXECUTED_MESSAGE.to_string()),
-            }]),
-        ),
-        open_phase("COMPLETED", due_millis),
-    ]
-}
-
 /// The phases of a build that was stopped while in progress: it leaves the queue
 /// with the same status the build took.
 pub fn stopped_phases(start_millis: i64, stopped_millis: i64) -> Vec<BuildPhase> {
@@ -3704,19 +3716,28 @@ pub fn in_progress_batch_phases(start_millis: i64) -> Vec<BuildBatchPhase> {
     ]
 }
 
+/// The terminal `BuildBatchPhaseType` marker a batch ends in: the phase a batch build
+/// reports last, which is its own outcome.
+fn terminal_batch_phase(fan_out: Option<bool>) -> &'static str {
+    if fan_out == Some(true) {
+        buildspec::BUILD_STATUS_SUCCEEDED
+    } else {
+        buildspec::BUILD_STATUS_FAILED
+    }
+}
+
 /// The phases of a batch build that has reached its terminal state.
 ///
-/// Where an emulated batch stops depends on whether its specification declared any
-/// build: a batch that fanned out got past `DOWNLOAD_BATCHSPEC` and stops in
-/// `IN_PROGRESS`, where its builds each faulted ([`BATCH_BUILDS_NOT_EXECUTED_MESSAGE`]),
-/// while one that declared nothing never got a specification to act on at all (see
-/// [`BATCH_SPEC_NOT_DOWNLOADED_MESSAGE`]).
+/// Where a batch ends depends on whether its specification declared any build: a batch
+/// that fanned out got past `DOWNLOAD_BATCHSPEC` and its `IN_PROGRESS` phase ends in the
+/// status its own builds ended in (`fan_out`), while one that declared nothing never got
+/// a specification to act on at all (see [`BATCH_SPEC_NOT_DOWNLOADED_MESSAGE`]).
 fn terminal_batch_phases(
     start_millis: i64,
     due_millis: i64,
-    fanned_out: bool,
+    fan_out: Option<bool>,
 ) -> Vec<BuildBatchPhase> {
-    if !fanned_out {
+    let Some(succeeded) = fan_out else {
         return vec![
             finished_batch_phase("SUBMITTED", "SUCCEEDED", start_millis, start_millis, None),
             finished_batch_phase(
@@ -3731,7 +3752,12 @@ fn terminal_batch_phases(
             ),
             open_batch_phase("FAILED", due_millis),
         ];
-    }
+    };
+    let outcome = if succeeded {
+        buildspec::BUILD_STATUS_SUCCEEDED
+    } else {
+        buildspec::BUILD_STATUS_FAILED
+    };
     vec![
         finished_batch_phase("SUBMITTED", "SUCCEEDED", start_millis, start_millis, None),
         finished_batch_phase(
@@ -3741,17 +3767,8 @@ fn terminal_batch_phases(
             start_millis,
             None,
         ),
-        finished_batch_phase(
-            "IN_PROGRESS",
-            "FAULT",
-            start_millis,
-            due_millis,
-            Some(vec![PhaseContext {
-                status_code: None,
-                message: Some(BATCH_BUILDS_NOT_EXECUTED_MESSAGE.to_string()),
-            }]),
-        ),
-        open_batch_phase("FAILED", due_millis),
+        finished_batch_phase("IN_PROGRESS", outcome, start_millis, due_millis, None),
+        open_batch_phase(outcome, due_millis),
     ]
 }
 

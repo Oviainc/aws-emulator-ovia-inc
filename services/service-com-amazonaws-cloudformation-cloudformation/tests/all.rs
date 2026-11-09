@@ -243,6 +243,8 @@ mod organizations_access;
 mod out_of_band_resource_scan;
 #[path = "all/parameter_and_change_set_conflicts.rs"]
 mod parameter_and_change_set_conflicts;
+#[path = "all/provisioned_ecr_repository.rs"]
+mod provisioned_ecr_repository;
 #[path = "all/provisioned_resources.rs"]
 mod provisioned_resources;
 #[path = "all/public_extension_arn_versions.rs"]

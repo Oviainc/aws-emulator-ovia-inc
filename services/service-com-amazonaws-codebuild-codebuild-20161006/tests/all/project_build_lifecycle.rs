@@ -1137,8 +1137,9 @@ async fn list_projects_orders_by_each_sort_by_criterion() {
 
 /// RULE: the transition out of `IN_PROGRESS` is owed by the CLOCK, so it is
 /// materialised from the stored instants when the build is read — once, and identically
-/// on every later read. Nothing here executes a buildspec, so the build ends in
-/// CodeBuild's build-system failure status with a phase context saying why.
+/// on every later read. What the build ENDS in is what running its buildspec answered
+/// (the suite that owns that rule is `buildspec_execution`); this project declares no
+/// command, so the build runs nothing that could fail.
 #[tokio::test]
 async fn a_build_settles_once_from_stored_state_and_never_changes_again() {
     let router = emulator();
@@ -1158,8 +1159,8 @@ async fn a_build_settles_once_from_stored_state_and_never_changes_again() {
     let (_, settled) = call(&router, "BatchGetBuilds", json!({"ids": [id.clone()]})).await;
     let record = settled["builds"][0].clone();
     assert_eq!(
-        record["buildStatus"], "FAULT",
-        "a build nothing executed must end in FAULT, got {record}"
+        record["buildStatus"], "SUCCEEDED",
+        "a build whose every command succeeded ends SUCCEEDED, got {record}"
     );
     assert_eq!(
         record["buildComplete"], true,
@@ -1174,20 +1175,16 @@ async fn a_build_settles_once_from_stored_state_and_never_changes_again() {
         "a settled build carries an endTime, got {record}"
     );
     let phases = record["phases"].as_array().expect("phases").clone();
-    let failing = phases
-        .iter()
-        .find(|phase| phase["phaseStatus"] == "FAULT")
-        .unwrap_or_else(|| panic!("a settled build has a failing phase, got {record}"));
-    assert_eq!(
-        failing["phaseType"], "PROVISIONING",
-        "the build stops where a container would be provisioned, got {record}"
-    );
     assert!(
-        failing["contexts"][0]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("does not run CodeBuild build containers"),
-        "the failing phase must say why, got {record}"
+        phases
+            .iter()
+            .all(|phase| phase["phaseStatus"] != "FAULT" && phase["phaseStatus"] != "FAILED"),
+        "no phase of this build failed, got {record}"
+    );
+    assert_eq!(
+        phases.last().map(|phase| phase["phaseType"].clone()),
+        Some(json!("COMPLETED")),
+        "a settled build's last phase is the COMPLETED marker, got {record}"
     );
 
     // Read again: identical, because it was computed once from the stored instants.

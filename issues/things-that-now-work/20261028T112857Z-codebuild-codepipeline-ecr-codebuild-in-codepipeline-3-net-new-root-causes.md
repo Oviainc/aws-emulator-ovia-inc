@@ -11,6 +11,8 @@ Issue-Commit: aeaf03eb4bcbb7a6c4e9492334e38170d85c4ec6
 
 > _Note: this issue was identified against the code base at commit `aeaf03eb4bcbb7a6c4e9492334e38170d85c4ec6`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Resolution note: causes 1 and 2 are fixed (a build now runs its buildspec's commands and its status, and the containing pipeline action's, is their outcome; the action reports the build it ran as `externalExecutionId`). Cause 3's own symptom — the check exhausting its ceiling with no settled state — is fixed too: `AWS::ECR::Repository` is now really created in Amazon ECR, the stack reaches `CREATE_COMPLETE` and the execution reaches a terminal status. What remains for that check is its stack's buildspec needing programs a build container provides, which no in-process build environment has; that leg is `assert final_status == "Succeeded"`, carried as Cause 1 of `issues/things-that-do-not-work/20261108T090606Z-codebuild-codepipeline-ecr-pipeline-driven-builds-never-execute.md`, which owns it._
+
 ## Operation
 ListActionExecutions
 

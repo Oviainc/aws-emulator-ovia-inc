@@ -33,8 +33,9 @@ enum Left {
 fn expected_status(left: Left) -> &'static str {
     match left {
         Left::InProgress => "IN_PROGRESS",
-        // Nothing executes a buildspec here, so a build the clock finished is FAULT.
-        Left::Settled => "FAULT",
+        // The default project's buildspec declares no command, so a build the clock
+        // finished ran nothing that could fail and ends SUCCEEDED.
+        Left::Settled => "SUCCEEDED",
         Left::Stopped => "STOPPED",
     }
 }

@@ -1217,6 +1217,206 @@ pub(super) async fn describe_public_repository(
 }
 
 // ---------------------------------------------------------------------------
+// Amazon ECR: AWS::ECR::Repository
+// ---------------------------------------------------------------------------
+
+/// Amazon ECR's signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: ecr`, service shape `AmazonEC2ContainerRegistry_V20150921`), which
+/// speaks `awsJson1_1`.
+pub(super) const ECR_SIGNING_NAME: &str = "ecr";
+pub(super) const ECR_TARGET_PREFIX: &str = "AmazonEC2ContainerRegistry_V20150921";
+
+/// What an `AWS::ECR::Repository`'s declaration states, as `CreateRepository`'s own
+/// members spell it: the property name against the member it is sent under.
+///
+/// Source: AWS's CloudFormation resource reference for the type, member by member
+/// against `CreateRepositoryRequest` (`smithy_query(query="operation",
+/// operation="CreateRepository")`). The nested documents go through as the template
+/// spells them, because each one's members are spelled the same on both sides but for
+/// their first letter — `ImageScanningConfiguration.ScanOnPush` against
+/// `imageScanningConfiguration.scanOnPush`, `EncryptionConfiguration.EncryptionType` /
+/// `.KmsKey` against `encryptionConfiguration.encryptionType` / `.kmsKey` — so they are
+/// mapped member by member rather than passed through
+/// ([`REPOSITORY_DOCUMENT_MEMBERS`]).
+const REPOSITORY_SCALAR_MEMBERS: &[(&str, &str)] = &[("ImageTagMutability", "imageTagMutability")];
+
+/// One nested document of an `AWS::ECR::Repository`: the property it is declared under,
+/// the member `CreateRepository` takes it as, and the property-to-member mapping of its
+/// own members.
+type RepositoryDocument = (&'static str, &'static str, &'static [(&'static str, &'static str)]);
+
+/// The nested documents of an `AWS::ECR::Repository`, as the member each is sent under
+/// and the property-to-member mapping inside it. See [`REPOSITORY_SCALAR_MEMBERS`].
+const REPOSITORY_DOCUMENT_MEMBERS: &[RepositoryDocument] = &[
+    (
+        "ImageScanningConfiguration",
+        "imageScanningConfiguration",
+        &[("ScanOnPush", "scanOnPush")],
+    ),
+    (
+        "EncryptionConfiguration",
+        "encryptionConfiguration",
+        &[("EncryptionType", "encryptionType"), ("KmsKey", "kmsKey")],
+    ),
+];
+
+/// Create the repository an `AWS::ECR::Repository` declares, so a client that pushes to
+/// or reads the registry the stack declared finds it in Amazon ECR itself.
+///
+/// The repository's ARN and URI are read back off the answer: they are the registry's
+/// real identity for this repository, so they replace the ones the naming rules computed.
+/// A declared `RepositoryPolicyText` is the repository's resource-based policy, which
+/// that service sets on the repository this call just created.
+pub(super) async fn create_repository(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let properties = match &resource.properties {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    let mut request = Map::new();
+    // The repository's name is this resource's physical id — "Ref returns the repository
+    // name" — already resolved against the stack's parameters.
+    request.insert(
+        "repositoryName".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    for (property, member) in REPOSITORY_SCALAR_MEMBERS {
+        if let Some(value) = properties.get(*property) {
+            request.insert((*member).to_string(), value.clone());
+        }
+    }
+    for (property, member, mapping) in REPOSITORY_DOCUMENT_MEMBERS {
+        let Some(Value::Object(declared)) = properties.get(*property) else {
+            continue;
+        };
+        let mut document = Map::new();
+        for (inner_property, inner_member) in *mapping {
+            if let Some(value) = declared.get(*inner_property) {
+                document.insert((*inner_member).to_string(), value.clone());
+            }
+        }
+        request.insert((*member).to_string(), Value::Object(document));
+    }
+    // `Tags` is a list of `{Key, Value}` on both sides: ECR's own `Tag` shape spells its
+    // members `Key` and `Value` too, so the declared list goes through as declared,
+    // carrying the tags CloudFormation gives the repository beside them.
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
+    let reported = call_json_rpc(
+        ctx,
+        ECR_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ECR_TARGET_PREFIX}.CreateRepository"),
+        &Value::Object(request),
+    )
+    .await?;
+    if let Some(policy) = repository_policy_text(&properties) {
+        call_json_rpc(
+            ctx,
+            ECR_SIGNING_NAME,
+            region,
+            AWS_JSON_1_1,
+            &format!("{ECR_TARGET_PREFIX}.SetRepositoryPolicy"),
+            &serde_json::json!({
+                "repositoryName": resource.physical_resource_id,
+                "policyText": policy,
+            }),
+        )
+        .await?;
+    }
+    let repository = reported.get("repository");
+    let mut attributes = BTreeMap::new();
+    for (member, attribute) in [("repositoryArn", "Arn"), ("repositoryUri", "RepositoryUri")] {
+        if let Some(value) = repository
+            .and_then(|repository| repository.get(member))
+            .and_then(Value::as_str)
+        {
+            attributes.insert(attribute.to_string(), value.to_string());
+        }
+    }
+    // The repository was created under the name CloudFormation decided.
+    Ok(Created::attributes(attributes))
+}
+
+/// The repository policy an `AWS::ECR::Repository` declares, as the policy TEXT
+/// `SetRepositoryPolicy` takes: the property is a policy document, which a template may
+/// write either as JSON text or as the document itself.
+fn repository_policy_text(properties: &Map<String, Value>) -> Option<String> {
+    match properties.get("RepositoryPolicyText")? {
+        Value::String(text) => Some(text.clone()),
+        Value::Null => None,
+        document => Some(document.to_string()),
+    }
+}
+
+/// Delete the repository a stack created. A repository ECR no longer holds
+/// (`RepositoryNotFoundException`) is already in the state the delete asks for; one that
+/// still holds images is NOT deleted unless the declaration asked for that
+/// (`EmptyOnDelete`: "if true, deleting the repository force deletes the contents of the
+/// repository"), and ECR's own refusal is what the stack reports.
+pub(super) async fn delete_repository(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let force = resource
+        .properties
+        .get("EmptyOnDelete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let request = serde_json::json!({
+        "repositoryName": resource.physical_resource_id,
+        "force": force,
+    });
+    match call_json_rpc(
+        ctx,
+        ECR_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ECR_TARGET_PREFIX}.DeleteRepository"),
+        &request,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == REPOSITORY_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The repository's configuration as Amazon ECR reports it, for drift detection. A
+/// repository it no longer holds (`RepositoryNotFoundException`, and an answer carrying
+/// no repository at all) was deleted.
+pub(super) async fn describe_repository(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "repositoryNames": [physical_resource_id] });
+    match call_json_rpc(
+        ctx,
+        ECR_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ECR_TARGET_PREFIX}.DescribeRepositories"),
+        &request,
+    )
+    .await
+    {
+        Ok(answer) => Ok(first_listed(&answer, "repositories")),
+        Err(refusal) if refusal.code == REPOSITORY_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // OpenSearch Serverless: AWS::OpenSearchServerless::Collection / ::SecurityPolicy
 // ---------------------------------------------------------------------------
 

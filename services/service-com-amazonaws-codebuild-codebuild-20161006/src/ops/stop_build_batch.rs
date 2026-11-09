@@ -139,6 +139,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_millis();
         let mut guard = state.lock();
 
+        // Settled through the store, so the transitions the clock already owes this batch
+        // and the builds it started are materialised before the stop decides on it: a
+        // batch build the clock already finished keeps the outcome it reached, which is
+        // `crate::ops::stop_build`'s rule for the single build.
+        guard.settle_build_batch(&input.id, now);
         let Some(stored) = guard.build_batches.get_mut(&input.id) else {
             drop(guard);
             crate::state::audit(
@@ -159,11 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-
-        // A batch build the clock already finished keeps the outcome it reached:
-        // stopping one is only possible while it is still running, which is
-        // `crate::ops::stop_build`'s rule for the single build.
-        stored.settle(now);
         let stopped = !stored.build_batch.complete;
         if stopped {
             stored.build_batch.build_batch_status = Some("STOPPED".to_string());

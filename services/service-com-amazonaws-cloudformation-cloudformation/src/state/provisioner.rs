@@ -482,7 +482,7 @@ use super::template::{
     CODEDEPLOY_DEPLOYMENT_CONFIG, CODEDEPLOY_DEPLOYMENT_GROUP,
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_SECURITY_GROUP, EC2_SUBNET,
     EC2_VOLUME, EC2_VPC,
-    ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, EKS_ACCESS_ENTRY, EKS_CLUSTER,
+    ECR_PUBLIC_REPOSITORY, ECR_REPOSITORY, ECS_CLUSTER, EKS_ACCESS_ENTRY, EKS_CLUSTER,
     EKS_POD_IDENTITY_ASSOCIATION,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
@@ -618,6 +618,11 @@ pub(super) enum Provisioner {
     CloudWatchMetricStream,
     CloudWatchDashboard,
     EcrPublicRepository,
+    /// `AWS::ECR::Repository`: a repository of the PRIVATE Amazon ECR registry — a
+    /// different service from the public one above — which `CreateRepository` creates
+    /// under the repository name its declaration states and `DeleteRepository` deletes,
+    /// with the resource-based policy its declaration asks for set on it.
+    EcrRepository,
     /// `AWS::EC2::VPC`: a VPC of Amazon EC2, whose `vpc-…` identifier that service assigns.
     Ec2Vpc,
     /// `AWS::EC2::Subnet`: a subnet of one of those VPCs, whose `subnet-…` identifier is
@@ -867,6 +872,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CLOUDWATCH_METRIC_STREAM => Some(Provisioner::CloudWatchMetricStream),
         CLOUDWATCH_DASHBOARD => Some(Provisioner::CloudWatchDashboard),
         ECR_PUBLIC_REPOSITORY => Some(Provisioner::EcrPublicRepository),
+        ECR_REPOSITORY => Some(Provisioner::EcrRepository),
         EC2_VPC => Some(Provisioner::Ec2Vpc),
         EC2_SUBNET => Some(Provisioner::Ec2Subnet),
         EC2_SECURITY_GROUP => Some(Provisioner::Ec2SecurityGroup),
@@ -1034,6 +1040,7 @@ impl Provisioner {
             Self::EcrPublicRepository => {
                 create_public_repository(ctx, region, resource, propagated).await
             }
+            Self::EcrRepository => create_repository(ctx, region, resource, propagated).await,
             Self::Ec2Vpc => create_ec2_vpc(ctx, region, resource, propagated).await,
             Self::Ec2Subnet => create_ec2_subnet(ctx, region, resource, propagated).await,
             Self::Ec2SecurityGroup => {
@@ -1483,6 +1490,10 @@ impl Provisioner {
                 | Self::CodePipelineCustomActionType
                 | Self::EcsCluster
                 | Self::EcrPublicRepository
+                // Amazon ECR refuses a tag key in the reserved namespace on every call
+                // that takes tags — `CreateRepository`'s `tags` and `TagResource` alike —
+                // so a repository carries the stack's own tags without the three.
+                | Self::EcrRepository
                 | Self::FirehoseDeliveryStream
                 // Amazon Kinesis Data Streams refuses a tag key in the reserved namespace
                 // on every call that takes tags — `CreateStream`'s `Tags`, `TagResource` and
@@ -2084,6 +2095,7 @@ impl Provisioner {
             Self::EcrPublicRepository => {
                 delete_public_repository(ctx, region, physical_resource_id).await
             }
+            Self::EcrRepository => delete_repository(ctx, region, resource).await,
             Self::Ec2Vpc => delete_ec2_vpc(ctx, region, physical_resource_id).await,
             Self::Ec2Subnet => delete_ec2_subnet(ctx, region, physical_resource_id).await,
             Self::Ec2SecurityGroup => {
@@ -2482,6 +2494,7 @@ impl Provisioner {
             Self::EcrPublicRepository => {
                 describe_public_repository(ctx, region, physical_resource_id).await
             }
+            Self::EcrRepository => describe_repository(ctx, region, physical_resource_id).await,
             Self::Ec2Vpc => describe_ec2_vpc(ctx, region, physical_resource_id).await,
             Self::Ec2Subnet => describe_ec2_subnet(ctx, region, physical_resource_id).await,
             Self::Ec2SecurityGroup => {

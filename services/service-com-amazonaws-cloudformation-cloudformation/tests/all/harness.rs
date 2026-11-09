@@ -162,6 +162,13 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             Arc::clone(&engine),
         ),
     );
+    // Amazon ECR, for the `AWS::ECR::Repository` a stack really creates there, so a suite
+    // that deploys a registry reads the repository back through that service's own wire.
+    router.register_service(
+        service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     (router, engine)
 }
 

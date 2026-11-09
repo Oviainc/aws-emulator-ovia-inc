@@ -166,6 +166,10 @@ service-com-amazonaws-applicationautoscaling-anyscalefrontendservice = { workspa
 # policy's own put writes them there, so the service that owns them is mounted beside the
 # rest.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# Amazon ECR, for the `AWS::ECR::Repository` a stack really creates there
+# (`state::provisioner`): a suite that deploys one must have its owning service mounted
+# beside CloudFormation, or the create is refused and the stack fails.
+service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { workspace = true }
 
 [lints]
 workspace = true

@@ -256,7 +256,10 @@ async fn a_value_outside_an_enum_is_refused_with_the_set_it_enforced() {
                 "case {case}: expected the sentence naming the set it enforced, got {message:?}"
             );
             assert!(
-                value.is_empty() || !message.contains(&value),
+                // The STATED sentence is what the rule is about: the envelope's
+                // `RequestId` is an opaque per-request id, and this request's id happens
+                // to carry this value's letters, which says nothing about the refusal.
+                value.is_empty() || !stated.contains(&value),
                 "case {case}: the refusal must not echo the rejected value, got {message:?}"
             );
             assert!(

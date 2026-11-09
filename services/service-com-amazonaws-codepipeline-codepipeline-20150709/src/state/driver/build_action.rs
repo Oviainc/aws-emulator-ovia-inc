@@ -18,8 +18,6 @@
 //! report a build that service really holds: a project nothing created is a declaration the
 //! pipeline cannot run, which the action's own `ConfigurationError` failure reports.
 
-use ::std::collections::BTreeMap;
-
 use super::super::execution::JobOutcome;
 use super::{FAILURE_CONFIGURATION_ERROR, FAILURE_JOB_FAILED};
 
@@ -161,9 +159,15 @@ pub(super) async fn run_codebuild_poll(
         // A build is no revision of anything: a build action resolves no source revision.
         revision: None,
         // The variables a CodeBuild action publishes are the ones the build EXPORTED
-        // (`exported-variables` in its buildspec), and a build that exported none
+        // (`exported-variables` in its buildspec), which is what that service reports as
+        // the build's `exportedEnvironmentVariables`; a build that exported none
         // publishes none — nothing is invented here.
-        variables: BTreeMap::new(),
+        variables: build
+            .exported_environment_variables
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|variable| Some((variable.name?, variable.value?)))
+            .collect(),
         external_id: Some(build_id.to_string()),
     }
 }

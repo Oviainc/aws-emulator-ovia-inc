@@ -13,13 +13,14 @@
 //! Three crates have to agree for that to hold (CodePipeline drives the action, CodeBuild
 //! runs the build, Amazon S3 holds the pipeline's artifacts), so this suite lives here.
 //!
-//! What a build ENDS as is CodeBuild's own business and not this suite's: this emulator runs
-//! no build container, so a build it accepts reaches the build-system failure status that
-//! service reports for one (`Build$buildStatus`), and the assertions below hold the ACTION
-//! to whatever the build reported — the state the build ended in, in CodePipeline's own
-//! wording — rather than to a particular outcome. What they do pin is that the action is no
-//! longer refused by the pipeline itself: the pipeline starts a real build, names it, and
-//! says nothing about this emulator in the detail a client reads.
+//! What a build ENDS as is CodeBuild's own business and not this suite's: the assertions
+//! below hold the ACTION to whatever the build reported — the state the build ended in, in
+//! CodePipeline's own wording — rather than to a particular outcome. What they do pin is
+//! that the action is no longer refused by the pipeline itself: the pipeline starts a real
+//! build, names it, and says nothing about this emulator in the detail a client reads. The
+//! last test of this file pins the JOIN between the two services in both directions: a
+//! build whose buildspec commands succeed settles the action and the execution Succeeded,
+//! and one whose commands do not settles them Failed with the state the build ended in.
 //!
 //! The rows differ along whether the project the action names exists, and along the
 //! environment variables the action declares.
@@ -588,6 +589,113 @@ fn a_build_action_naming_no_project_fails_as_a_configuration_error() {
             "case {case:?}: CodeBuild must still hold no such project, got {status} with \
              {listed}"
         );
+    });
+}
+
+/// RULE: the action's outcome is the outcome of the BUILD its project ran, and the build's
+/// outcome is what its buildspec's commands answered — so a pipeline whose project builds
+/// to success reaches `Succeeded`, and one whose project's command fails reaches `Failed`
+/// with the state that build ended in. The build the action reports as its external
+/// execution is the one CodeBuild holds under that id.
+///
+/// The rows differ along what the buildspec's commands answer, which is what the rule
+/// generalises over.
+#[test]
+fn a_build_actions_outcome_is_what_its_buildspecs_commands_answered() {
+    on_a_sized_thread(|| {
+        // (case, the project's buildspec, the build's status, the action's status)
+        let rows = [
+            (
+                "every command of the buildspec succeeds",
+                "version: 0.2\nphases:\n  build:\n    commands:\n      - echo building\n",
+                "SUCCEEDED",
+                "Succeeded",
+            ),
+            (
+                "a command of the buildspec answers failure",
+                "version: 0.2\nphases:\n  build:\n    commands:\n      - exit 7\n",
+                "FAILED",
+                "Failed",
+            ),
+        ];
+        let emulator = Emulator::new();
+        let pipeline_role = emulator.role("cp-spec-pipeline-role", PIPELINE_TRUST);
+        let project_role = emulator.role("cp-spec-project-role", CODEBUILD_TRUST);
+
+        for (index, (case, buildspec, expected_build, expected_action)) in
+            rows.iter().enumerate()
+        {
+            let bucket = format!("cp-spec-bucket-{index}");
+            let project = format!("cp-spec-project-{index}");
+            let pipeline = format!("cp-spec-pipeline-{index}");
+            emulator.bucket_with_source(case, &bucket, "source.zip", b"the source bytes");
+            emulator.cb_ok(
+                case,
+                "CreateProject",
+                &json!({
+                    "name": project,
+                    "serviceRole": project_role,
+                    "source": { "type": "CODEPIPELINE", "buildspec": buildspec },
+                    "artifacts": { "type": "CODEPIPELINE" },
+                    "environment": {
+                        "type": "LINUX_CONTAINER",
+                        "image": "aws/codebuild/amazonlinux2-x86_64-standard:5.0",
+                        "computeType": "BUILD_GENERAL1_SMALL",
+                    },
+                }),
+            );
+            emulator.cp_ok(
+                case,
+                "CreatePipeline",
+                &json!({
+                    "pipeline": declaration(
+                        &pipeline,
+                        &pipeline_role,
+                        &bucket,
+                        &project,
+                        None,
+                    ),
+                }),
+            );
+            emulator.drained(case, &pipeline);
+
+            let execution = emulator.start(case, &pipeline);
+            let status = emulator.settled(case, &pipeline, &execution);
+            assert_eq!(
+                status, *expected_action,
+                "case {case:?}: expected the execution to be {expected_action}, got {status:?}"
+            );
+            let state = emulator.action_state(case, &pipeline, "Build", "Build");
+            let latest = &state["latestExecution"];
+            assert_eq!(
+                latest["status"].as_str(),
+                Some(*expected_action),
+                "case {case:?}: expected the action to be {expected_action}, got {latest}"
+            );
+            // The build the action names is the one CodeBuild holds, and the status it
+                // ended in is the one the rule asks for.
+            let external = latest["externalExecutionId"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: the action must name the build it ran, got {latest}")
+                })
+                .to_string();
+            let build = emulator.build(case, &external);
+            assert_eq!(
+                build["buildStatus"].as_str(),
+                Some(*expected_build),
+                "case {case:?}: expected the build to be {expected_build}, got {build}"
+            );
+            if *expected_build != "SUCCEEDED" {
+                let detail = latest["errorDetails"]["message"].as_str().unwrap_or_default();
+                assert_eq!(
+                    detail,
+                    format!("Build terminated with state: {expected_build}"),
+                    "case {case:?}: the action's detail must be the state the build ended \
+                     in, got {detail:?}"
+                );
+            }
+        }
     });
 }
 

@@ -330,7 +330,9 @@ async fn a_retry_starts_a_new_linked_build_from_the_retried_builds_settings() {
             }
             Before::Settled => {
                 tokio::time::sleep(PAST_THE_SETTLE_SPAN).await;
-                "FAULT"
+                // The project's buildspec declares no command, so the build the clock
+                // finished ran nothing that could fail.
+                "SUCCEEDED"
             }
         };
 

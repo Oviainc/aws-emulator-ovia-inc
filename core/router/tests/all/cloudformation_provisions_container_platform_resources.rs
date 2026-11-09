@@ -41,7 +41,7 @@ const ACCOUNT_ID: &str = "000000000000";
 /// due.
 const PAST_THE_SPAN: Duration = Duration::from_millis(900);
 
-/// The emulator with the two services this suite exercises, mounted on ONE engine exactly
+/// The emulator with the services this suite exercises, mounted on ONE engine exactly
 /// as `core/router/src/lib.rs` mounts them. Request authentication is off, as in every
 /// other suite here; the in-process callback CloudFormation makes signs its request
 /// either way (the credential scope is what routes it).
@@ -55,7 +55,17 @@ fn build_router() -> MultiServiceRouter {
         )),
     );
     router.register_service(
-        service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(engine),
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    // Amazon ECR, for the `AWS::ECR::Repository` one row declares beside the cluster: the
+    // stack really creates it there, so the service that owns it is mounted beside the
+    // rest or that resource's create is refused and the stack fails.
+    router.register_service(
+        service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::EmulatedService::new(
+            engine,
+        ),
     );
     router
 }

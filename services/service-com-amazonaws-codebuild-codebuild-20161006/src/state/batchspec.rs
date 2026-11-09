@@ -68,26 +68,39 @@ const MAX_BATCHSPEC_BYTES: usize = 64 * 1024;
 /// handful of levels.
 const MAX_BATCHSPEC_NESTING: usize = 64;
 
-/// Whether `buildspec` is inside the bounds the parse below is given, checked WITHOUT
-/// parsing: its size, how deeply its flow collections nest, and how deeply any one line
-/// indents (a block collection needs one indentation step, or one `-`/`?` indicator, per
-/// level, so the widest leading run bounds the block nesting too).
-fn within_parse_bounds(buildspec: &str) -> bool {
+/// How many flow-collection indicators a buildspec read here may OPEN at all. THIS
+/// NUMBER IS THE EMULATOR'S, and it is what bounds the loader's recursion BEFORE a
+/// loader runs: a flow collection needs one `[` or `{` per level and no indentation, so a
+/// document's flow nesting can be no deeper than the indicators it carries. Counted
+/// without regard for quoting or comments, which can only make the count too HIGH — an
+/// over-count refuses a document and never admits one — and the document's exact nesting
+/// is then confirmed against [`MAX_BATCHSPEC_NESTING`] by [`structure_within_bounds`].
+/// It is far above any real buildspec's flow collections, and far below a depth the
+/// thread serving a request could not descend.
+const MAX_BATCHSPEC_FLOW_INDICATORS: usize = 2048;
+
+/// Whether `buildspec` is inside the SIZE, INDENTATION and FLOW-INDICATOR bounds the
+/// parse below is given, checked WITHOUT parsing anything: its size, how deeply any one
+/// line indents (a block collection needs one indentation step, or one `-`/`?`
+/// indicator, per level, so the widest leading run bounds the block nesting), and how
+/// many flow collections it opens at all ([`MAX_BATCHSPEC_FLOW_INDICATORS`], which bounds
+/// the flow nesting the same way).
+///
+/// Together these bound every descent a parse can make before one is made. What they
+/// cannot answer is the document's EXACT nesting — a `]` or `}` byte inside a quoted
+/// scalar or a comment closes nothing, so a scan that decremented on one would read a
+/// deep document as shallow. That question is the parser's, and
+/// [`structure_within_bounds`] puts it to the parser.
+fn within_size_bounds(buildspec: &str) -> bool {
     if buildspec.len() > MAX_BATCHSPEC_BYTES {
         return false;
     }
-    let mut depth = 0usize;
-    for byte in buildspec.bytes() {
-        match byte {
-            b'[' | b'{' => {
-                depth += 1;
-                if depth > MAX_BATCHSPEC_NESTING {
-                    return false;
-                }
-            }
-            b']' | b'}' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
+    let opened = buildspec
+        .bytes()
+        .filter(|byte| matches!(byte, b'[' | b'{'))
+        .count();
+    if opened > MAX_BATCHSPEC_FLOW_INDICATORS {
+        return false;
     }
     buildspec.lines().all(|line| {
         line.bytes()
@@ -97,32 +110,54 @@ fn within_parse_bounds(buildspec: &str) -> bool {
     })
 }
 
-/// Whether `buildspec` uses a YAML ALIAS, read from the parser's event stream.
+/// Whether `buildspec`'s own STRUCTURE is inside the bounds the loader is given, read
+/// from the parser's event stream: it nests no deeper than [`MAX_BATCHSPEC_NESTING`] and
+/// it uses no YAML ALIAS.
 ///
-/// This cannot be asked of the loaded tree: `yaml-rust2`'s loader RESOLVES an alias by
-/// copying the anchored node, so by the time a tree exists the expansion has already
-/// happened, and a short chain of nested aliases expands without bound. The event stream
-/// reports an alias and copies nothing, so the document is walked once for this question
-/// and only an alias-free one is ever handed to the loader. An anchor no alias refers to
-/// expands nothing and is accepted.
-fn uses_an_alias(buildspec: &str) -> bool {
+/// Asked only of a document [`within_size_bounds`] has already accepted, so the descent
+/// this walk itself makes is bounded before it starts: no accepted document can open more
+/// than [`MAX_BATCHSPEC_FLOW_INDICATORS`] flow collections or indent further than
+/// [`MAX_BATCHSPEC_NESTING`]. What this walk adds is the EXACT answer, which only the
+/// parser has: it knows which bracket is structure and which is text, so the running
+/// maximum of the collections it reports starting and ending is the document's real
+/// nesting — counted before any TREE exists.
+///
+/// The ALIAS is the other question only the parser can answer: `yaml-rust2`'s loader
+/// RESOLVES an alias by copying the anchored node, so by the time a tree exists the
+/// expansion has already happened, and a short chain of nested aliases expands without
+/// bound; the event stream reports an alias and copies nothing. An anchor no alias refers
+/// to expands nothing and is accepted.
+///
+/// A document that does not parse is outside these bounds too: it declares nothing, which
+/// is what its reader reports.
+fn structure_within_bounds(buildspec: &str) -> bool {
     #[derive(Default)]
-    struct AliasDetector {
+    struct Structure {
+        depth: usize,
+        deepest: usize,
         saw_alias: bool,
     }
-    impl ::yaml_rust2::parser::EventReceiver for AliasDetector {
+    impl ::yaml_rust2::parser::EventReceiver for Structure {
         fn on_event(&mut self, event: ::yaml_rust2::parser::Event) {
-            if matches!(event, ::yaml_rust2::parser::Event::Alias(_)) {
-                self.saw_alias = true;
+            match event {
+                ::yaml_rust2::parser::Event::SequenceStart(..)
+                | ::yaml_rust2::parser::Event::MappingStart(..) => {
+                    self.depth = self.depth.saturating_add(1);
+                    self.deepest = self.deepest.max(self.depth);
+                }
+                ::yaml_rust2::parser::Event::SequenceEnd
+                | ::yaml_rust2::parser::Event::MappingEnd => {
+                    self.depth = self.depth.saturating_sub(1);
+                }
+                ::yaml_rust2::parser::Event::Alias(_) => self.saw_alias = true,
+                _ => {}
             }
         }
     }
 
-    let mut detector = AliasDetector::default();
-    // A document that does not parse declares nothing either way, so a parse error here
-    // is not an alias.
-    let parsed = ::yaml_rust2::parser::Parser::new_from_str(buildspec).load(&mut detector, true);
-    parsed.is_err() || detector.saw_alias
+    let mut structure = Structure::default();
+    let parsed = ::yaml_rust2::parser::Parser::new_from_str(buildspec).load(&mut structure, true);
+    parsed.is_ok() && !structure.saw_alias && structure.deepest <= MAX_BATCHSPEC_NESTING
 }
 
 /// The builds the `batch` section of `buildspec` declares, in the order it declares
@@ -147,16 +182,9 @@ fn uses_an_alias(buildspec: &str) -> bool {
 /// ([`within_parse_bounds`], [`uses_an_alias`]) yields an empty list: there is then no
 /// batch to fan out, which is what the handler reports rather than inventing a group.
 pub fn batch_build_declarations(buildspec: &str) -> Vec<BatchBuildDeclaration> {
-    if !within_parse_bounds(buildspec) || uses_an_alias(buildspec) {
-        return Vec::new();
-    }
-    let Ok(mut documents) = ::yaml_rust2::YamlLoader::load_from_str(buildspec) else {
+    let Some(document) = buildspec_document(buildspec) else {
         return Vec::new();
     };
-    if documents.is_empty() {
-        return Vec::new();
-    }
-    let document = documents.remove(0);
     let Some(batch) = document.as_hash().and_then(|root| mapping_get(root, "batch")) else {
         return Vec::new();
     };
@@ -231,8 +259,23 @@ pub fn declaration_levels(declarations: &[BatchBuildDeclaration]) -> Vec<usize> 
     levels
 }
 
+/// The one document of `buildspec`, when it is YAML inside the bounds this parse is
+/// given ([`within_size_bounds`], [`structure_within_bounds`]) — the single reading every
+/// part of a buildspec is taken from, so the batch section and the phases come off the
+/// same bounded parse.
+pub(super) fn buildspec_document(buildspec: &str) -> Option<::yaml_rust2::Yaml> {
+    if !within_size_bounds(buildspec) || !structure_within_bounds(buildspec) {
+        return None;
+    }
+    let mut documents = ::yaml_rust2::YamlLoader::load_from_str(buildspec).ok()?;
+    if documents.is_empty() {
+        return None;
+    }
+    Some(documents.remove(0))
+}
+
 /// Look `key` up in a YAML mapping.
-fn mapping_get<'doc>(
+pub(super) fn mapping_get<'doc>(
     map: &'doc ::yaml_rust2::yaml::Hash,
     key: &str,
 ) -> Option<&'doc ::yaml_rust2::Yaml> {
@@ -243,7 +286,7 @@ fn mapping_get<'doc>(
 
 /// A batchspec scalar as the string it reads as — an identifier written unquoted, as a
 /// number or as a boolean is the same identifier.
-fn scalar_string(value: &::yaml_rust2::Yaml) -> Option<String> {
+pub(super) fn scalar_string(value: &::yaml_rust2::Yaml) -> Option<String> {
     match value {
         ::yaml_rust2::Yaml::String(text) | ::yaml_rust2::Yaml::Real(text) => Some(text.clone()),
         ::yaml_rust2::Yaml::Integer(number) => Some(number.to_string()),

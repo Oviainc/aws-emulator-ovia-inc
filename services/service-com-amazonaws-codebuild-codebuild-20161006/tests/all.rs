@@ -23,6 +23,8 @@ mod batch_get_reports;
 mod build_artifacts_destination;
 #[path = "all/build_batch_fan_out.rs"]
 mod build_batch_fan_out;
+#[path = "all/buildspec_execution.rs"]
+mod buildspec_execution;
 #[path = "all/command_execution_lifecycle.rs"]
 mod command_execution_lifecycle;
 #[path = "all/delete_build_batch.rs"]
@@ -89,6 +91,8 @@ mod sandbox_idle_timeout;
 mod sandbox_lifecycle;
 #[path = "all/sandbox_sessions.rs"]
 mod sandbox_sessions;
+#[path = "all/shell_probe.rs"]
+mod shell_probe;
 #[path = "all/source_credential_arn_shape.rs"]
 mod source_credential_arn_shape;
 #[path = "all/source_credentials.rs"]
