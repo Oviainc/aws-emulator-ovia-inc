@@ -1645,3 +1645,9 @@ mod account_attributes;
 // each refuse a type the service does not publish, naming the value. Declared at the tail of
 #[path = "all/launch_instance_type_catalog.rs"]
 mod launch_instance_type_catalog;
+// How an idempotency conflict is WORDED: the Network Access Analyzer / Reachability Analyzer
+// actions answer that surface's own sentence beside `IdempotentParameterMismatch`, while the
+// older resource creates of this service answer theirs. Declared at the tail of this file,
+// which is where every new ec2 suite inserts its lines.
+#[path = "all/network_insights_idempotency_wording.rs"]
+mod network_insights_idempotency_wording;

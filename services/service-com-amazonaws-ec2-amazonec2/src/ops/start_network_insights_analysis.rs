@@ -237,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .get(analysis_id)
                 .and_then(|record| record.view.network_insights_path_id.as_deref());
             if analyzed_before.is_some_and(|path_id| path_id != spec.network_insights_path_id) {
-                return Err(state::idempotent_parameter_mismatch());
+                return Err(state::network_insights_idempotent_parameter_mismatch());
             }
         }
 

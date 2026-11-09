@@ -19,8 +19,9 @@
 
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, DRY_RUN_OPERATION, IDEMPOTENT_PARAMETER_MISMATCH,
-    IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE, INVALID_PARAMETER_VALUE, MAX_ACCESS_SCOPE_PATHS,
-    MAX_CLIENT_TOKEN_CHARS, NETWORK_INSIGHTS_ACCESS_SCOPE_ID_PREFIX,
+    INVALID_PARAMETER_VALUE, MAX_ACCESS_SCOPE_PATHS, MAX_CLIENT_TOKEN_CHARS,
+    NETWORK_INSIGHTS_ACCESS_SCOPE_ID_PREFIX,
+    NETWORK_INSIGHTS_IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE,
     RESOURCE_TYPE_NETWORK_INSIGHTS_ACCESS_SCOPE,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
@@ -758,9 +759,9 @@ async fn a_replayed_client_token_answers_the_scope_it_created() {
         );
         let message = error_message(&body);
         assert_eq!(
-            message, IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE,
-            "case {case:?}: expected the message {IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE:?}, \
-             got {message:?}"
+            message, NETWORK_INSIGHTS_IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE,
+            "case {case:?}: expected the message \
+             {NETWORK_INSIGHTS_IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE:?}, got {message:?}"
         );
     }
     let held = stored_scopes(&engine);

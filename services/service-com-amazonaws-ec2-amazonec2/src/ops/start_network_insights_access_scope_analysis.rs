@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if analyzed_before
                 .is_some_and(|scope_id| scope_id != input.network_insights_access_scope_id)
             {
-                return Err(state::idempotent_parameter_mismatch());
+                return Err(state::network_insights_idempotent_parameter_mismatch());
             }
         }
 

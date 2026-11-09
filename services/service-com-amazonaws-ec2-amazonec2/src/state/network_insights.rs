@@ -240,6 +240,37 @@ pub const INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND: &str =
 pub const INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_NOT_FOUND: &str =
     "InvalidNetworkInsightsAccessScopeAnalysisId.NotFound";
 
+/// The message EC2 answers beside [`IDEMPOTENT_PARAMETER_MISMATCH`] on its Network Access
+/// Analyzer and Reachability Analyzer surface — the `NetworkInsights*` actions, whose
+/// `ClientToken` the model makes `@required` (`clientOptional`) rather than optional.
+///
+/// This surface words the idempotency conflict its OWN way: the older EC2 resource creates
+/// answer [`IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE`], and these answer this sentence, so the
+/// two cannot be collapsed into one text. It is FIXED text — it names nothing of the
+/// request, not the token and not the member that differs — so it is the whole wording for
+/// the class rather than one run's sample. Named here so every operation of the surface and
+/// the suites that assert them cannot drift apart.
+pub const NETWORK_INSIGHTS_IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
+    "The request has the same client token as a previous request, but the request parameters \
+     are not the same.";
+
+/// Refuse a `NetworkInsights*` request that reuses an idempotency token for a request that is
+/// not the one that token already named, the way that surface does: HTTP 400
+/// [`IDEMPOTENT_PARAMETER_MISMATCH`] with
+/// [`NETWORK_INSIGHTS_IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE`].
+///
+/// The ONE construction of that refusal for this surface, so the access-scope create and both
+/// analysis starts answer one sentence; every other action of this service answers
+/// [`idempotent_parameter_mismatch`], which is the same code with the wording EC2 words it
+/// with there.
+pub fn network_insights_idempotent_parameter_mismatch<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        IDEMPOTENT_PARAMETER_MISMATCH,
+        400,
+        NETWORK_INSIGHTS_IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE,
+    )
+}
+
 /// The move the clock owes one Network Access Scope analysis: a [`ClockTransition`] to the
 /// `AnalysisStatus` member it reaches, reported as the analysis's `EndDate`.
 ///

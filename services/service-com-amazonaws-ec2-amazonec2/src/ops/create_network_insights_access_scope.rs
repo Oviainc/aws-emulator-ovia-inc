@@ -222,9 +222,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // (`IdempotentParameterMismatch`), so a token replayed with different paths
                 // or different tags is refused rather than answered with a scope the caller
                 // did not ask for. Refused before the DryRun check below, because a dry run
-                // of a request that would have been refused is refused with that reason.
+                // of a request that would have been refused is refused with that reason. The
+                // sentence is the one the `NetworkInsights*` surface words that conflict with
+                // ([`crate::state::network_insights_idempotent_parameter_mismatch`]), which is
+                // not the one the older resource creates of this service word it with.
                 if !same_request(&scope, &content, &paths, &tags) {
-                    return Err(state::idempotent_parameter_mismatch());
+                    return Err(state::network_insights_idempotent_parameter_mismatch());
                 }
                 Some((scope, content))
             }
