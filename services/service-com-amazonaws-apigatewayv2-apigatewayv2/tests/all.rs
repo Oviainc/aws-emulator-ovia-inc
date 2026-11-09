@@ -37,6 +37,8 @@ mod api_mapping_lifecycle;
 mod api_mapping_update;
 #[path = "all/api_reimport.rs"]
 mod api_reimport;
+#[path = "all/api_reimport_identity.rs"]
+mod api_reimport_identity;
 #[path = "all/api_update.rs"]
 mod api_update;
 #[path = "all/authorizer_deletion.rs"]

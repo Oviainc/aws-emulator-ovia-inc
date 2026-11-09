@@ -271,11 +271,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         existing.disable_execute_api_endpoint = definition.disable_execute_api_endpoint;
 
         // The routes and integrations of the PREVIOUS definition are not part of this one,
-        // so they go: this is what changes which route of the api answers a request. What
-        // replaces them is written by the ONE materialisation `ImportApi` uses, so the same
-        // body imports and reimports into the same records.
-        existing.routes.clear();
-        existing.integrations.clear();
+        // so a key this document no longer declares goes: this is what changes which route
+        // of the api answers a request. What replaces them is written by the ONE
+        // materialisation `ImportApi` uses, so the same body imports and reimports into the
+        // same records — and a route this document declares again keeps the `RouteId` and
+        // the target `IntegrationId` it already had, so an id a caller captured before this
+        // call still addresses the route and the integration that key names.
         super::import_api::write_definition_routes(existing, definition.routes);
         // The api's routes and integrations have changed, so every stage of it that
         // auto-deploys has the new configuration released to it.

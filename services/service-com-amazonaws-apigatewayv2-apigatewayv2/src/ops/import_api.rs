@@ -734,29 +734,77 @@ pub fn definition_quota_exceeded(definition: &ImportedApi) -> Option<(&'static s
     None
 }
 
-/// Write the routes `routes` describe, and the integration each one declared, into `api`.
+/// Write the routes `routes` describe, and the integration each one declared, into `api`,
+/// REPLACING the routes and integrations the api held before.
 ///
 /// The ONE materialisation of a read definition, asked by `ImportApi` for the api it mints
 /// and by `ReimportApi` for the api it PUTS over, so an imported and a reimported document
-/// of the same bytes leave the same records. The api's id seeds drive the ids, so a
-/// reimport never reuses an id the api handed out before.
+/// of the same bytes leave the same records.
+///
+/// A route the api ALREADY holds under the key a declaration carries is the same route put
+/// over again, not a new one: it keeps its `RouteId`, and the integration its target names
+/// keeps its `IntegrationId`, while the configuration both carry is rewritten from the
+/// document just read. Only a declaration the api holds nothing for mints a fresh id, and
+/// only a key the document no longer declares is dropped — so an identifier a caller
+/// captured before a re-put still addresses the resource that key names, instead of being
+/// orphaned by one the same document minted again. Each integration is claimed by ONE
+/// declaration: where two routes the api held shared a target, the second declaration to
+/// ask for it mints an integration of its own, so the api holds as many integrations as the
+/// document declares.
+///
+/// What the document does NOT declare is not carried: an OpenAPI definition describes no
+/// route response and no integration response (both are WebSocket-only children and an
+/// imported api is an HTTP one), so a carried route and integration are rebuilt from the
+/// declaration alone and hold none. Their id seeds ARE carried, so an id one of those
+/// children was given is never handed out again.
 pub fn write_definition_routes(api: &mut crate::state::Api, routes: Vec<ImportedRoute>) {
+    // What the api held before this document was put over it, keyed by the natural key a
+    // definition declares a route under — its route key, which is what identifies an
+    // operation of the document (`{Method} {Path}`). Taking the collections out leaves the
+    // api holding exactly what this document declares, whatever it declared before.
+    let mut previous_routes: BTreeMap<String, crate::state::Route> =
+        ::std::mem::take(&mut api.routes)
+            .into_values()
+            .map(|route| (route.route_key.clone(), route))
+            .collect();
+    let previous_integrations = ::std::mem::take(&mut api.integrations);
+
     for imported in routes {
-        // The integration the operation declared, minted FIRST: the route's `Target` is
+        let previous = previous_routes.remove(&imported.route_key);
+        // The integration the operation declared, written FIRST: the route's `Target` is
         // `integrations/{IntegrationId}`, so the integration has to exist before the route
         // that points at it.
         let target = imported.integration.map(|integration| {
-            let integration_id = api.mint_integration_id();
-            api.integrations.insert(
-                integration_id.clone(),
-                integration.into_record(integration_id.clone()),
-            );
+            // The integration this operation was already wired to is the one it is wired
+            // to afterwards, unless an earlier declaration of this document has claimed it
+            // already (two routes may share one target); a route the api held no integration
+            // for, and a second claimant, are given a fresh id.
+            let carried = previous
+                .as_ref()
+                .and_then(crate::state::Route::target_integration_id)
+                .filter(|id| {
+                    previous_integrations.contains_key(*id) && !api.integrations.contains_key(*id)
+                })
+                .map(str::to_string);
+            let integration_id = match carried {
+                Some(integration_id) => integration_id,
+                None => api.mint_integration_id(),
+            };
+            let mut record = integration.into_record(integration_id.clone());
+            // A response id the carried integration handed out is not minted again.
+            record.integration_response_id_seed = previous_integrations
+                .get(&integration_id)
+                .map_or(0, |previous| previous.integration_response_id_seed);
+            api.integrations.insert(integration_id.clone(), record);
             format!(
                 "{}{integration_id}",
                 crate::state::INTEGRATION_TARGET_PREFIX
             )
         });
-        let route_id = api.mint_route_id();
+        let route_id = match &previous {
+            Some(previous) => previous.route_id.clone(),
+            None => api.mint_route_id(),
+        };
         api.routes.insert(
             route_id.clone(),
             crate::state::Route {
@@ -767,6 +815,10 @@ pub fn write_definition_routes(api: &mut crate::state::Api, routes: Vec<Imported
                 // The caller's own definition asked for this route, so API Gateway does not
                 // manage it (`Route$ApiGatewayManaged`).
                 api_gateway_managed: false,
+                // A response id the carried route handed out is not minted again.
+                route_response_id_seed: previous
+                    .as_ref()
+                    .map_or(0, |previous| previous.route_response_id_seed),
                 ..Default::default()
             },
         );
