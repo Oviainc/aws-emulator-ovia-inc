@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMicrosoftTeamsChannelConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMicrosoftTeamsChannelConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: mints a `ChatConfigurationArn` for `ConfigurationName`, persists the
+//! whole configuration in [`crate::state`], and answers with the stored record projected
+//! through [`crate::state::MicrosoftTeamsChannelConfigRecord::view`]. A second create for
+//! a `ConfigurationName` that already exists in the request's region is a 409
+//! `ConflictException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMicrosoftTeamsChannelConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every value the stored configuration reports comes from the request, except the team's
+//! display name, which the account's own authorization for that team supplies when the
+//! request names none.
+//!
+//! A configuration can only be created for a Microsoft Teams team AUTHORIZED with the
+//! account ([`crate::state::ComAmazonawsChatbotWheatleyorchestration20171011State::microsoft_teams_configured_team`]);
+//! a `TeamId` no authorization names is refused with the modelled 400
+//! `InvalidRequestException` carrying [`crate::state::TEAM_NOT_CONFIGURED_MESSAGE`] and
+//! persists nothing, as the Slack create refuses an unauthorized workspace.
+//!
+//! A create past [`crate::state::MAX_MICROSOFT_TEAMS_CHANNEL_CONFIGURATIONS`] is refused
+//! with `LimitExceededException`, so repeated creates cannot grow the store without
+//! bound.
+//!
+//! It returns the created configuration read back out of the store, so a later
+//! `ListMicrosoftTeamsChannelConfigurations` answers the same record.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +195,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMicrosoftTeamsChannelConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMicrosoftTeamsChannelConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMicrosoftTeamsChannelConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateMicrosoftTeamsChannelConfigurationErrorModeled::CreateTeamsChannelConfigurationException(
+                CreateTeamsChannelConfigurationException {
+                    message: Some("the chatbot configuration store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // Resources are regional, so a configuration name is unique per region and the
+        // minted ARN, which carries the region, is the store's key.
+        let region = crate::state::request_region(ctx.parts());
+        let chat_configuration_arn = crate::state::microsoft_teams_channel_configuration_arn(
+            &region,
+            &input.configuration_name,
+        );
+
+        let mut store = state.lock();
+
+        // A channel configuration can only be created for a Microsoft Teams team the
+        // account has AUTHORIZED (the one-time Microsoft Teams client handshake, which no
+        // operation in this model performs). The team registry is the only thing that
+        // decides that — never the spelling or shape of the id — so a team it does not
+        // hold is refused with the modelled 400 and nothing is persisted.
+        let Some(team) = store
+            .microsoft_teams_configured_team(&input.team_id)
+            .cloned()
+        else {
+            return Err(
+                CreateMicrosoftTeamsChannelConfigurationErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            crate::state::TEAM_NOT_CONFIGURED_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        if store
+            .microsoft_teams_channel_configurations
+            .contains_key(&chat_configuration_arn)
+        {
+            return Err(
+                CreateMicrosoftTeamsChannelConfigurationErrorModeled::ConflictException(
+                    ConflictException {
+                        // The conflict names the colliding resource by its ARN, which is
+                        // what the caller can address the existing configuration through.
+                        message: Some(crate::state::resource_already_exists_message(
+                            &chat_configuration_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is bounded: past the cap a create is refused rather than grown. The
+        // count is the WHOLE store's, not the region's, so signing for another region
+        // does not hand the caller a fresh budget.
+        if store.microsoft_teams_channel_configurations.len()
+            >= crate::state::MAX_MICROSOFT_TEAMS_CHANNEL_CONFIGURATIONS
+        {
+            return Err(
+                CreateMicrosoftTeamsChannelConfigurationErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} Microsoft Teams \
+                             channel configurations",
+                            crate::state::MAX_MICROSOFT_TEAMS_CHANNEL_CONFIGURATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::MicrosoftTeamsChannelConfigRecord {
+            chat_configuration_arn: chat_configuration_arn.clone(),
+            configuration_name: input.configuration_name,
+            region,
+            channel_id: input.channel_id,
+            // `ChannelName` and `TeamName` are optional on the request AND on the
+            // modelled configuration, so one the request left out stays absent rather
+            // than being filled in with an id or an invented name. A team's display name
+            // is the team's own, so a request that names none falls back to the one the
+            // account's authorization for that team holds — which is absent too when the
+            // authorization carries none.
+            channel_name: input.channel_name,
+            team_id: input.team_id,
+            team_name: input.team_name.or(team.team_name),
+            tenant_id: input.tenant_id,
+            iam_role_arn: input.iam_role_arn,
+            sns_topic_arns: input.sns_topic_arns.unwrap_or_default(),
+            logging_level: input.logging_level,
+            guardrail_policy_arns: input.guardrail_policy_arns.unwrap_or_default(),
+            user_authorization_required: input.user_authorization_required,
+            state: crate::state::STATE_ENABLED.to_string(),
+            state_reason: None,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.tag_key, tag.tag_value))
+                .collect(),
+        };
+
+        let channel_configuration = record.view();
+        store
+            .microsoft_teams_channel_configurations
+            .insert(chat_configuration_arn, record);
+
+        Ok(CreateMicrosoftTeamsChannelConfigurationOutput {
+            channel_configuration: Some(channel_configuration),
+        })
     }
 }

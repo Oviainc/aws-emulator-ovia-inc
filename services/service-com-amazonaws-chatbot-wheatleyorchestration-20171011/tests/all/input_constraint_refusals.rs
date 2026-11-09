@@ -296,6 +296,18 @@ struct AcceptedCase {
 #[tokio::test]
 async fn input_inside_every_modelled_constraint_is_not_refused_as_a_constraint_violation() {
     let emulator = Emulator::new();
+    // A Microsoft Teams channel configuration can only be created for a team AUTHORIZED
+    // with the account, which is a different refusal from a constraint violation and
+    // would hide the one this suite is about. The team the Teams row names is therefore
+    // authorized here through the state seam standing in for the one-time Microsoft Teams
+    // client handshake, exactly as the Slack rows name a seeded workspace.
+    service_com_amazonaws_chatbot_wheatleyorchestration_20171011::state::authorize_microsoft_teams_team(
+        &*emulator.engine,
+        UUID,
+        UUID,
+        None,
+    )
+    .expect("the shared engine holds the chatbot store");
 
     let cases = vec![
         AcceptedCase {
@@ -350,7 +362,7 @@ async fn input_inside_every_modelled_constraint_is_not_refused_as_a_constraint_v
             label: "Teams create with a TeamId that is a UUID",
             path: "/create-ms-teams-channel-configuration",
             request: teams_create(UUID),
-            expected_status: None,
+            expected_status: Some(200),
         },
     ];
 

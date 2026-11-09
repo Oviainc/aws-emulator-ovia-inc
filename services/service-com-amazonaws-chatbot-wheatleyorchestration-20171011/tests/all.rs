@@ -41,6 +41,8 @@ mod error_message_member;
 mod error_response_contract;
 #[path = "all/input_constraint_refusals.rs"]
 mod input_constraint_refusals;
+#[path = "all/microsoft_teams_channel_configuration.rs"]
+mod microsoft_teams_channel_configuration;
 #[path = "all/microsoft_teams_configured_teams.rs"]
 mod microsoft_teams_configured_teams;
 #[path = "all/slack_channel_configuration.rs"]

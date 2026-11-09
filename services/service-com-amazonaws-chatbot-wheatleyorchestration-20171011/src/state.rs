@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ops::types::{
     AccountPreferences, ChimeWebhookConfiguration, ConfiguredTeam, CustomAction,
     CustomActionAttachment, CustomActionDefinition, SlackChannelConfiguration, SlackWorkspace, Tag,
+    TeamsChannelConfiguration,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -40,11 +41,12 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 pub const ARN_SERVICE: &str = "chatbot";
 
 /// The ARN resource-path segment naming the chat client a configuration configures: a
-/// Slack channel, or an Amazon Chime webhook. A chat configuration ARN is
-/// `chat-configuration/{kind}/{name}`, so the kind is what keeps one client's
-/// configuration name from colliding with another's.
+/// Slack channel, an Amazon Chime webhook, or a Microsoft Teams channel. A chat
+/// configuration ARN is `chat-configuration/{kind}/{name}`, so the kind is what keeps one
+/// client's configuration name from colliding with another's.
 const CHAT_CONFIGURATION_KIND_SLACK: &str = "slack-channel";
 const CHAT_CONFIGURATION_KIND_CHIME: &str = "chime-webhook";
+const CHAT_CONFIGURATION_KIND_MICROSOFT_TEAMS: &str = "microsoft-teams-channel";
 
 /// `State` of a chat configuration AWS Chatbot reports as usable. A chat
 /// configuration is usable the moment it is created — AWS returns no transient
@@ -94,11 +96,20 @@ pub const MAX_CUSTOM_ACTIONS: usize = MAX_PAGE_SIZE;
 /// the emulator's memory without limit.
 pub const MAX_CHIME_WEBHOOK_CONFIGURATIONS: usize = MAX_PAGE_SIZE;
 
+/// The most Microsoft Teams channel configurations this store holds AT ALL, for the same
+/// reason — and on the same (emulator-owned) grounds — as
+/// [`MAX_SLACK_CHANNEL_CONFIGURATIONS`]: AWS enforces a service quota on chat
+/// configurations per account, the model does not carry the number, and past this bound a
+/// create is refused with the modelled `LimitExceededException` rather than growing the
+/// emulator's memory without limit.
+pub const MAX_MICROSOFT_TEAMS_CHANNEL_CONFIGURATIONS: usize = MAX_PAGE_SIZE;
+
 // A `Describe` that names no `MaxResults` answers a region's configurations in ONE page
 // with no `NextToken`. That holds only while the store cannot hold more than one page,
 // so the two bounds are tied here rather than left to drift apart.
 const _: () = assert!(MAX_SLACK_CHANNEL_CONFIGURATIONS <= MAX_PAGE_SIZE);
 const _: () = assert!(MAX_CHIME_WEBHOOK_CONFIGURATIONS <= MAX_PAGE_SIZE);
+const _: () = assert!(MAX_MICROSOFT_TEAMS_CHANNEL_CONFIGURATIONS <= MAX_PAGE_SIZE);
 const _: () = assert!(MAX_CUSTOM_ACTIONS <= MAX_PAGE_SIZE);
 
 /// The `custom-action` resource-type segment of a chatbot ARN
@@ -269,6 +280,10 @@ pub struct ComAmazonawsChatbotWheatleyorchestration20171011State {
     /// for the same reason as the Slack ones: `DescribeChimeWebhookConfigurations`
     /// walks them in one stable total order and resumes that walk from an opaque token.
     pub chime_webhook_configurations: BTreeMap<String, ChimeWebhookConfigRecord>,
+    /// Every Microsoft Teams channel configuration, keyed by its `ChatConfigurationArn`,
+    /// for the same reason as the Slack ones: `ListMicrosoftTeamsChannelConfigurations`
+    /// walks them in one stable total order and resumes that walk from an opaque token.
+    pub microsoft_teams_channel_configurations: BTreeMap<String, MicrosoftTeamsChannelConfigRecord>,
     /// The Slack workspaces AUTHORIZED with this account, keyed by `SlackTeamId`.
     ///
     /// A Slack channel configuration can only be created for a workspace this map
@@ -320,6 +335,7 @@ impl Default for ComAmazonawsChatbotWheatleyorchestration20171011State {
             slack_channel_configurations: BTreeMap::new(),
             custom_actions: BTreeMap::new(),
             chime_webhook_configurations: BTreeMap::new(),
+            microsoft_teams_channel_configurations: BTreeMap::new(),
             slack_workspace_authorizations: seed_slack_workspaces()
                 .into_iter()
                 .map(|workspace| (workspace.slack_team_id.clone(), workspace))
@@ -336,13 +352,20 @@ impl ComAmazonawsChatbotWheatleyorchestration20171011State {
     /// client it configures, or `None` when no configuration is stored under that ARN.
     ///
     /// A chat configuration ARN carries the client kind (`slack-channel`,
-    /// `chime-webhook`) and each kind keeps its own store, so the ARN-addressed tagging
-    /// operations resolve one through here rather than knowing the kinds themselves.
+    /// `chime-webhook`, `microsoft-teams-channel`) and each kind keeps its own store, so
+    /// the ARN-addressed tagging operations resolve one through here rather than knowing
+    /// the kinds themselves.
     pub fn chat_configuration_tags(
         &self,
         chat_configuration_arn: &str,
     ) -> Option<&BTreeMap<String, String>> {
         if let Some(record) = self.slack_channel_configurations.get(chat_configuration_arn) {
+            return Some(&record.tags);
+        }
+        if let Some(record) = self
+            .microsoft_teams_channel_configurations
+            .get(chat_configuration_arn)
+        {
             return Some(&record.tags);
         }
         self.chime_webhook_configurations
@@ -357,6 +380,12 @@ impl ComAmazonawsChatbotWheatleyorchestration20171011State {
     ) -> Option<&mut BTreeMap<String, String>> {
         if let Some(record) = self
             .slack_channel_configurations
+            .get_mut(chat_configuration_arn)
+        {
+            return Some(&mut record.tags);
+        }
+        if let Some(record) = self
+            .microsoft_teams_channel_configurations
             .get_mut(chat_configuration_arn)
         {
             return Some(&mut record.tags);
@@ -694,6 +723,17 @@ pub fn unauthorized_slack_workspace_message(slack_team_id: &str) -> String {
     )
 }
 
+/// The message a create refused for a Microsoft Teams team the account has not configured
+/// carries.
+///
+/// AWS Chatbot words this error class as ONE fixed sentence: the decision is made against
+/// the account's team registry, and the answer names neither the team the request asked
+/// for nor the account, so there is no variable part to fill in. (The Slack create's
+/// counterpart, [`unauthorized_slack_workspace_message`], is worded around the workspace
+/// and the account instead — one sentence per error class, not one per rule.)
+pub const TEAM_NOT_CONFIGURED_MESSAGE: &str =
+    "The team id you are using is not configured in this account";
+
 /// One authorized Microsoft Teams team: what `ListMicrosoftTeamsConfiguredTeams`
 /// reports and what a Microsoft Teams channel configuration is bound to.
 ///
@@ -903,6 +943,72 @@ impl ChimeWebhookConfigRecord {
     }
 }
 
+/// One stored Microsoft Teams channel configuration: everything a later `Get`, `List`,
+/// `Update`, `Delete` or tag call has to be able to answer from.
+///
+/// The Microsoft Teams counterpart of [`SlackChannelConfigRecord`]. `ChannelName` and
+/// `TeamName` are OPTIONAL on the modelled `TeamsChannelConfiguration` (`smithy_query`
+/// shape=TeamsChannelConfiguration), unlike the Slack shape's required channel name, so a
+/// create that carried neither reads back carrying neither rather than an invented name.
+#[derive(Debug, Clone, Default)]
+pub struct MicrosoftTeamsChannelConfigRecord {
+    pub chat_configuration_arn: String,
+    pub configuration_name: String,
+    /// The region the configuration lives in, the one its ARN names. Chat
+    /// configurations are regional, so a listing answers only its own region's.
+    pub region: String,
+    /// The Microsoft Teams channel the configuration delivers to.
+    pub channel_id: String,
+    pub channel_name: Option<String>,
+    /// The Microsoft Teams team the channel belongs to, and the team a listing filters
+    /// on.
+    pub team_id: String,
+    pub team_name: Option<String>,
+    /// The Microsoft Teams tenant the team belongs to.
+    pub tenant_id: String,
+    pub iam_role_arn: String,
+    pub sns_topic_arns: Vec<String>,
+    pub logging_level: Option<String>,
+    pub guardrail_policy_arns: Vec<String>,
+    pub user_authorization_required: Option<bool>,
+    /// `ENABLED` or `DISABLED`; see [`STATE_ENABLED`].
+    pub state: String,
+    pub state_reason: Option<String>,
+    /// Tags keyed by `TagKey`, so `TagResource` merges by key and the list a read
+    /// returns has one entry per key in a stable order.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl MicrosoftTeamsChannelConfigRecord {
+    /// The stored tags as the modelled `Tag` list, in key order.
+    pub fn tag_list(&self) -> Vec<Tag> {
+        tag_list(&self.tags)
+    }
+
+    /// Project the stored record onto the modelled `TeamsChannelConfiguration` every
+    /// Microsoft Teams channel operation returns. The single place that mapping lives, so
+    /// create, update, get and list cannot answer different shapes for one record.
+    pub fn view(&self) -> TeamsChannelConfiguration {
+        TeamsChannelConfiguration {
+            channel_id: self.channel_id.clone(),
+            channel_name: self.channel_name.clone(),
+            team_id: self.team_id.clone(),
+            team_name: self.team_name.clone(),
+            tenant_id: self.tenant_id.clone(),
+            chat_configuration_arn: self.chat_configuration_arn.clone(),
+            iam_role_arn: self.iam_role_arn.clone(),
+            sns_topic_arns: self.sns_topic_arns.clone(),
+            configuration_name: Some(self.configuration_name.clone()),
+            logging_level: self.logging_level.clone(),
+            guardrail_policy_arns: Some(self.guardrail_policy_arns.clone()),
+            user_authorization_required: self.user_authorization_required,
+            tags: Some(self.tag_list()),
+            state: Some(self.state.clone()),
+            state_reason: self.state_reason.clone(),
+        }
+    }
+}
+
 /// The `CustomActionArn` of a custom action:
 /// `arn:aws:chatbot::{account}:custom-action/{action_name}`.
 ///
@@ -958,6 +1064,16 @@ pub fn chime_webhook_configuration_arn(region: &str, configuration_name: &str) -
     chat_configuration_arn(region, CHAT_CONFIGURATION_KIND_CHIME, configuration_name)
 }
 
+/// The `ChatConfigurationArn` of a Microsoft Teams channel configuration:
+/// `arn:aws:chatbot:{region}:{account}:chat-configuration/microsoft-teams-channel/{name}`.
+pub fn microsoft_teams_channel_configuration_arn(region: &str, configuration_name: &str) -> String {
+    chat_configuration_arn(
+        region,
+        CHAT_CONFIGURATION_KIND_MICROSOFT_TEAMS,
+        configuration_name,
+    )
+}
+
 /// The prefix every Slack channel configuration ARN in `region` starts with: the same
 /// ARN with an empty configuration name.
 ///
@@ -979,6 +1095,13 @@ pub fn custom_action_arn_prefix() -> String {
 /// tells a pagination token this service issued from a string a caller made up.
 pub fn chime_webhook_configuration_arn_prefix(region: &str) -> String {
     chime_webhook_configuration_arn(region, "")
+}
+
+/// The prefix every Microsoft Teams channel configuration ARN in `region` starts with:
+/// the same ARN with an empty configuration name. As for the Slack prefix, this is what
+/// tells a pagination token this service issued from a string a caller made up.
+pub fn microsoft_teams_channel_configuration_arn_prefix(region: &str) -> String {
+    microsoft_teams_channel_configuration_arn(region, "")
 }
 
 /// The region this request is addressed to: the SigV4 credential scope's region, or

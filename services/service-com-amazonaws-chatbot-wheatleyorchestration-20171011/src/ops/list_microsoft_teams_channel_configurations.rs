@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMicrosoftTeamsChannelConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMicrosoftTeamsChannelConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: answers the Microsoft Teams channel configurations this account holds in
+//! the region the request is addressed to, read out of [`crate::state`] in
+//! `ChatConfigurationArn` order and projected through
+//! [`crate::state::MicrosoftTeamsChannelConfigRecord::view`], one bounded page at a time.
+//! A read only — the model marks this operation `@readonly` — so it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMicrosoftTeamsChannelConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `TeamId` is a FILTER over that listing, not a lookup: a team the store holds no
+//! configuration for simply matches none, and the account is answered a listing with no
+//! entries rather than a not-found. A `NextToken` the service did not issue names no
+//! position in the scan and is refused with the modelled `InvalidParameterException`.
+//!
+//! A configuration gets into the store through `CreateMicrosoftTeamsChannelConfiguration`,
+//! so an account that created none is listed none.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +94,30 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The opaque `NextToken` for a page whose last configuration is `last_arn`: the cursor
+/// is that ARN, base64-encoded so callers cannot read or construct one.
+///
+/// Standard base64's `A-Za-z0-9+/=` is a subset of the modelled `PaginationToken` pattern
+/// (`^[a-zA-Z0-9=\/+_.\-,#:\\"{}]{4,1276}$`), so every token this mints is a value the
+/// next request can carry back. The codec is the one the framework already vends
+/// (`aws_smithy_types::base64`).
+fn encode_next_token(last_arn: &str) -> String {
+    ::aws_smithy_types::base64::encode(last_arn)
+}
+
+/// The ARN a `NextToken` resumes after, or `None` when the token is not one this service
+/// issued for `region`: a cursor is always one of that region's Microsoft Teams channel
+/// configuration ARNs, so anything else — unparseable, not UTF-8, or a string a caller
+/// made up — names no position in the scan.
+fn decode_next_token(token: &str, region: &str) -> Option<String> {
+    let cursor = String::from_utf8(::aws_smithy_types::base64::decode(token).ok()?).ok()?;
+    cursor
+        .starts_with(&crate::state::microsoft_teams_channel_configuration_arn_prefix(
+            region,
+        ))
+        .then_some(cursor)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +188,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMicrosoftTeamsChannelConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMicrosoftTeamsChannelConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMicrosoftTeamsChannelConfigurations"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListMicrosoftTeamsChannelConfigurationsErrorModeled::ListTeamsChannelConfigurationsException(
+                ListTeamsChannelConfigurationsException {
+                    message: Some("the chatbot configuration store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // Chat configurations are regional, so a listing answers only the ones that live
+        // in the region the request is addressed to.
+        let region = crate::state::request_region(ctx.parts());
+
+        // A token the service did not issue for this region cannot name a position in the
+        // scan.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token, &region).ok_or_else(|| {
+                ListMicrosoftTeamsChannelConfigurationsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "NextToken is not a pagination token issued by this service"
+                                .to_string(),
+                        ),
+                    },
+                )
+            })?),
+            None => None,
+        };
+        // A caller that names no page size still gets a bounded page: the response can
+        // never carry the whole store.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+
+        let store = state.lock();
+        let matching = store
+            .microsoft_teams_channel_configurations
+            .iter()
+            // Only this region's configurations: a chat configuration belongs to the
+            // region its ARN names.
+            .filter(|(_, record)| record.region == region)
+            // `TeamId` is a filter, not a lookup: a team the store holds no configuration
+            // for simply matches nothing.
+            .filter(|(_, record)| {
+                input
+                    .team_id
+                    .as_deref()
+                    .is_none_or(|wanted| record.team_id == wanted)
+            })
+            // The scan resumes strictly after the cursor, so no configuration is returned
+            // on two pages.
+            .filter(|(arn, _)| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|cursor| arn.as_str() > cursor)
+            });
+
+        // One past the page: whether that extra record exists is exactly whether the
+        // caller needs a token to come back for more.
+        let mut page: Vec<_> = matching.take(page_size + 1).collect();
+        let next_token = if page.len() > page_size {
+            page.pop();
+            page.last().map(|(arn, _)| encode_next_token(arn))
+        } else {
+            None
+        };
+
+        Ok(ListMicrosoftTeamsChannelConfigurationsOutput {
+            next_token,
+            team_channel_configurations: Some(
+                page.into_iter().map(|(_, record)| record.view()).collect(),
+            ),
+        })
     }
 }
