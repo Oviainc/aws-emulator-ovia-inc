@@ -1244,6 +1244,41 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
         self.provider_token_sessions.len() < PROVIDER_TOKEN_SESSION_QUOTA
     }
 
+    /// Draw the secret material a token request hands back, and ONLY once the
+    /// bound this store is under has admitted the session that request
+    /// addresses.
+    ///
+    /// Both token handlers reach the credential store through here, so the ORDER
+    /// of the two steps belongs to the store rather than to each handler: `mint`
+    /// is called on the admitted path alone, so a request refused for the bound
+    /// has drawn nothing. Drawing a token is work on the shared credential store
+    /// — a `create` and a `delete` (see [`mint_provider_token`]) — and a token
+    /// request that is going to be refused must do none of it.
+    ///
+    /// `addressed` names the session when the store may already hold it (a
+    /// refresh), and is `None` when the request starts a session this store
+    /// cannot already hold (an exchange, whose session is named by a refresh
+    /// token it has not drawn yet). A `mint` that reports `None` drew no secret
+    /// to build a token from, which is
+    /// [`ProviderTokenRefusal::NothingMinted`].
+    ///
+    /// Call [`Self::expire_provider_token_sessions`] first, so the bound is read
+    /// over the sessions that are still live.
+    pub fn mint_within_token_session_bound<T>(
+        &self,
+        addressed: Option<&ProviderTokenKey>,
+        mint: impl FnOnce() -> Option<T>,
+    ) -> Result<T, ProviderTokenRefusal> {
+        let admitted = match addressed {
+            Some(key) => self.has_room_for_provider_token_session(key),
+            None => self.has_room_for_another_provider_token_session(),
+        };
+        if !admitted {
+            return Err(ProviderTokenRefusal::OverQuota);
+        }
+        mint().ok_or(ProviderTokenRefusal::NothingMinted)
+    }
+
     /// Make `access_token` the live access token of the session `key` names,
     /// from `now`, and report the STORED record — which is what the response is
     /// read off, so a caller is never told a token the store does not hold.
@@ -1753,6 +1788,21 @@ pub const PROVIDER_TOKEN_SESSION_QUOTA: usize = 1_000;
 /// two clients presenting the same token hold two sessions, each with its own
 /// access token, rather than taking each other's.
 pub type ProviderTokenKey = (String, Option<String>, String);
+
+/// Why a token request was handed no token at all: the two conditions
+/// [`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::mint_within_token_session_bound`]
+/// reports, in the order it settles them. Each token handler answers its own
+/// modelled refusal for each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderTokenRefusal {
+    /// The store already holds [`PROVIDER_TOKEN_SESSION_QUOTA`] live sessions and
+    /// the request addresses none of them, so it would start another: settled
+    /// before any secret material is drawn.
+    OverQuota,
+    /// The credential store drew no secret to build a token from — a condition on
+    /// this service's own side rather than a refusal of the request.
+    NothingMinted,
+}
 
 /// One live third-party token session: the access token this service last handed
 /// back for a refresh token, and when that access token stops being live.

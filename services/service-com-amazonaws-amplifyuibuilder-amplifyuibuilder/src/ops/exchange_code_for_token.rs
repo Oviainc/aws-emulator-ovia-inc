@@ -220,36 +220,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The bound, BEFORE anything is minted, so a refused exchange does no work
         // on the credential store: the session an exchange starts is named by a
         // refresh token minted below, so it is never one the store already holds.
-        if !store.has_room_for_another_provider_token_session() {
-            return Err(
-                ExchangeCodeForTokenErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "this emulator already holds the maximum of {} live token sessions",
-                            crate::state::PROVIDER_TOKEN_SESSION_QUOTA
-                        )),
+        // Both steps are settled by the store (`mint_within_token_session_bound`),
+        // which is what keeps that order the same on the refresh path.
+        //
+        // The pair is minted by the emulator's credential store, once the exchange
+        // is settled so a refused one mints nothing: the access token the caller
+        // uses now and the refresh token that names the session. Neither is
+        // constructed here. It happens under the store lock because the session is
+        // KEYED by the refresh token, and it adds no caller-driven work to the
+        // critical section.
+        let credentials = ctx.credential_store();
+        let (access_token, refresh_token) = match store
+            .mint_within_token_session_bound(None, || -> Option<(String, String)> {
+                Some((
+                    crate::state::mint_provider_token(credentials)?,
+                    crate::state::mint_provider_token(credentials)?,
+                ))
+            }) {
+            Ok(pair) => pair,
+            Err(crate::state::ProviderTokenRefusal::OverQuota) => {
+                return Err(
+                    ExchangeCodeForTokenErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(format!(
+                                "this emulator already holds the maximum of {} live token sessions",
+                                crate::state::PROVIDER_TOKEN_SESSION_QUOTA
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            Err(crate::state::ProviderTokenRefusal::NothingMinted) => {
+                return Err(ExchangeCodeForTokenErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "no provider token could be minted for this request".to_string(),
+                        ),
                     },
                 )
-                .into(),
-            );
-        }
-
-        // Minted by the emulator's credential store, once the exchange is settled
-        // so a refused one mints nothing: the access token the caller uses now and
-        // the refresh token that names the session. Neither is constructed here.
-        // It happens under the store lock because the session is KEYED by the
-        // refresh token, and it adds no caller-driven work to the critical section.
-        let credentials = ctx.credential_store();
-        let (Some(access_token), Some(refresh_token)) = (
-            crate::state::mint_provider_token(credentials),
-            crate::state::mint_provider_token(credentials),
-        ) else {
-            return Err(ExchangeCodeForTokenErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some("no provider token could be minted for this request".to_string()),
-                },
-            )
-            .into());
+                .into());
+            }
         };
 
         // The session the pair belongs to, named the way a refresh names one:

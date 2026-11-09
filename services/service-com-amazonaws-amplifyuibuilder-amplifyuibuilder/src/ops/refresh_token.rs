@@ -192,18 +192,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Minted by the emulator's credential store, outside the store lock: a service
-        // never constructs secret material itself.
-        let Some(access_token) = crate::state::mint_provider_token(ctx.credential_store())
-        else {
-            return Err(RefreshTokenErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some("no access token could be minted for this request".to_string()),
-                },
-            )
-            .into());
-        };
-
         let now = ::std::time::SystemTime::now();
         // The session this refresh addresses. `provider` is an `@httpLabel` targeting
         // the `TokenProviders` enum, so the only values that reach here are the ones the
@@ -218,17 +206,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read, so a caller is never refused over access tokens that have run out.
         store.expire_provider_token_sessions(now);
 
-        if !store.has_room_for_provider_token_session(&key) {
-            return Err(RefreshTokenErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "this emulator already holds the maximum of {} live token sessions",
-                        crate::state::PROVIDER_TOKEN_SESSION_QUOTA
-                    )),
-                },
-            )
-            .into());
-        }
+        // The bound FIRST and the mint only after it, both settled by the store (see
+        // `mint_within_token_session_bound`): a refresh this bound refuses does no work
+        // on the shared credential store, exactly as a refused exchange does none. The
+        // access token is drawn BY the emulator's credential store — a service never
+        // constructs secret material itself.
+        let credentials = ctx.credential_store();
+        let access_token = match store
+            .mint_within_token_session_bound(Some(&key), || {
+                crate::state::mint_provider_token(credentials)
+            }) {
+            Ok(access_token) => access_token,
+            Err(crate::state::ProviderTokenRefusal::OverQuota) => {
+                return Err(RefreshTokenErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this emulator already holds the maximum of {} live token sessions",
+                            crate::state::PROVIDER_TOKEN_SESSION_QUOTA
+                        )),
+                    },
+                )
+                .into());
+            }
+            Err(crate::state::ProviderTokenRefusal::NothingMinted) => {
+                return Err(RefreshTokenErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "no access token could be minted for this request".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
 
         // The response is read off the STORED session, so what the caller is handed and
         // what the store holds for that session cannot differ.
