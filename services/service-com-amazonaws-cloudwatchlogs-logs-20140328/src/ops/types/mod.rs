@@ -79,6 +79,7 @@ pub mod get_log_anomaly_detector_types;
 pub mod get_log_events_types;
 pub mod get_log_fields_types;
 pub mod get_log_group_fields_types;
+pub mod get_log_object_types;
 pub mod get_log_record_types;
 pub mod get_lookup_table_types;
 pub mod get_query_results_types;
@@ -263,6 +264,8 @@ pub use get_log_events_types::*;
 pub use get_log_fields_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_log_group_fields_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_log_object_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_log_record_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

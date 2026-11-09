@@ -125,11 +125,14 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-/// The operation the generated routing table cannot serve: its output member
-/// `responseStream` targets a `@streaming` union, so the generated shim declines the
-/// request and [`EmulatedService::override_operation`] — which the router consults
-/// FIRST — hands it to the hand-authored operation instead.
-const EVENT_STREAM_OPERATION: &str = "StartLiveTail";
+/// The operations the generated routing table cannot serve: each one's output member
+/// targets a `@streaming` union (`StartLiveTail$responseStream`,
+/// `GetLogObject$fieldStream`), so the generated shim declines the request and
+/// [`EmulatedService::override_operation`] — which the router consults FIRST — hands it to
+/// the hand-authored operation instead.
+const START_LIVE_TAIL_OPERATION: &str = "StartLiveTail";
+/// See [`START_LIVE_TAIL_OPERATION`].
+const GET_LOG_OBJECT_OPERATION: &str = "GetLogObject";
 
 /// CloudWatch Logs' error for a parameter it will not accept: "A parameter is specified
 /// incorrectly" (HTTP 400). Declared by all but the operations named in
@@ -539,13 +542,18 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// operation's refusal code into [`Service::override_refusal`]. Held on the service
     /// because that seam returns a borrow of `self`.
     refusal_scope: OperationScopedRefusal,
-    /// This service's one event-stream operation, `StartLiveTail`. It is NOT in the
+    /// One of this service's two event-stream operations, `StartLiveTail`. It is NOT in the
     /// entry's routing table in a servable form: the generated `ErasedOperation` shim of
     /// an operation whose output is a `@streaming` union declines the request (it cannot
     /// drive `serialize_as_event_stream<P>` through an object-safe `run`), so it is held
     /// here behind an [`EventStreamRoute`] and routed by
     /// [`EmulatedService::override_operation`].
     start_live_tail: EventStreamRoute<crate::ops::start_live_tail::StartLiveTail<Eng>>,
+    /// This service's other event-stream operation, `GetLogObject`, held and routed for
+    /// the same reason as `start_live_tail` above: its output member `fieldStream` is a
+    /// `@streaming` union, so the generated shim in the entry's routing table declines the
+    /// request.
+    get_log_object: EventStreamRoute<crate::ops::get_log_object::GetLogObject<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -557,6 +565,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             refusal_scope: OperationScopedRefusal,
             start_live_tail: EventStreamRoute(crate::ops::start_live_tail::StartLiveTail::new(
+                Arc::clone(&engine),
+            )),
+            get_log_object: EventStreamRoute(crate::ops::get_log_object::GetLogObject::new(
                 engine,
             )),
         }
@@ -592,12 +603,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // here so the framework's routing-error path stays exactly as it was.
         let operation = self.definition().protocol().routing_key(req).ok()?;
         self.definition().routing_table().get(operation)?;
-        // The one exception is the event-stream operation, whose generated shim in that
-        // table declines the request: it is served by the hand-authored operation, which
+        // The exceptions are the event-stream operations, whose generated shims in that
+        // table decline the request: each is served by its hand-authored operation, which
         // owns the whole request-to-response step and therefore words its own refusals
-        // (`crate::ops::start_live_tail`) rather than reaching `override_refusal`.
-        if operation == EVENT_STREAM_OPERATION {
+        // (`crate::ops::start_live_tail`, `crate::ops::get_log_object`) rather than
+        // reaching `override_refusal`.
+        if operation == START_LIVE_TAIL_OPERATION {
             return Some(&self.start_live_tail as &dyn ErasedOperation);
+        }
+        if operation == GET_LOG_OBJECT_OPERATION {
+            return Some(&self.get_log_object as &dyn ErasedOperation);
         }
         Some(&self.refusal_scope)
     }
