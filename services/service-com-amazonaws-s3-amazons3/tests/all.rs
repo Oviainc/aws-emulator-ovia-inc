@@ -315,6 +315,8 @@ mod rename_object_query_parameter;
 mod replication_role_trust;
 #[path = "all/reserved_tag_key_prefix.rs"]
 mod reserved_tag_key_prefix;
+#[path = "all/role_session_object_authorization.rs"]
+mod role_session_object_authorization;
 #[path = "all/scratch_probe.rs"]
 mod scratch_probe;
 #[path = "all/served_envelope_values.rs"]

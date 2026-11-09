@@ -621,6 +621,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // this was called, so that in-process hop is never made while this service's own
         // guard is held — the copies this write owes are made by S3 assuming it.
 
+        // WHO is asking, resolved BEFORE this service's own store is locked, so the STS and
+        // IAM stores the calling principal and its policies are read from are never reached
+        // while this service's guard is held. Both halves of this copy — the write of the
+        // destination and the read of the source — are judged against it below.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
+
         // Taken for the READS this copy makes of the destination and the source; the guard is
         // released again before the cross-service decision below and taken afresh for the
         // write.
@@ -682,7 +688,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             copy_source: Some(input.copy_source.as_str()),
             metadata_directive: input.metadata_directive.as_deref(),
         };
-        if let Some(message) = crate::service::authorization::policy_denial(
+        if let Some(message) = crate::service::request_authorization::denial(
+            &caller,
             destination.policy.as_deref(),
             PUT_OBJECT_ACTION,
             &crate::state::object_arn(&input.bucket, &input.key),
@@ -726,14 +733,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
 
         // WHO is asking, for the READ half of this copy. "You must have READ access to the
         // source object" (`CopyObject`'s own documentation), which is `s3:GetObject` on the
-        // object `x-amz-copy-source` names — a permission the SOURCE bucket's own policy
-        // decides, separately from the destination write judged above. A caller the source
-        // policy denies the read to is refused, and no destination object is created: a
-        // principal that may write a bucket cannot otherwise copy into it any object it can
-        // name.
-        if let Some(message) = crate::service::authorization::policy_denial(
+        // object `x-amz-copy-source` names — or the version-scoped action when the reference
+        // names a `versionId` ([`crate::service::request_authorization::get_object_action`]
+        // carries that rule, which is `GetObject`'s own). The decision is the SOURCE bucket's
+        // policy together with the documents in force on the calling principal, separately
+        // from the destination write judged above. A caller no authority in force leaves the
+        // read to is refused, and no destination object is created: a principal that may
+        // write a bucket cannot otherwise copy into it any object it can name.
+        if let Some(message) = crate::service::request_authorization::denial(
+            &caller,
             source_bucket.policy.as_deref(),
-            crate::state::GET_OBJECT_ACTION,
+            crate::service::request_authorization::get_object_action(source.version_id.as_deref()),
             &crate::state::object_arn(&source.bucket, &source.key),
             &crate::service::authorization::read_conditions(),
         ) {
@@ -1301,7 +1311,7 @@ fn names_grants(input: &CopyObjectInput) -> bool {
 /// The code and status S3 answers a copy its authorization refuses with, whichever half of
 /// the copy the refusal is about: the read of the source, or the write of the destination.
 /// The message is the one that refusal words
-/// ([`crate::service::authorization::policy_denial`]).
+/// ([`crate::service::request_authorization::denial`]).
 const ACCESS_DENIED_CODE: &str = "AccessDenied";
 /// See [`ACCESS_DENIED_CODE`].
 const ACCESS_DENIED_STATUS: u16 = 403;
@@ -1309,7 +1319,8 @@ const ACCESS_DENIED_STATUS: u16 = 403;
 /// The IAM action the WRITE half of a copy is performed under: a copy stores an object at
 /// the destination, which is what `s3:PutObject` authorizes ("you must have WRITE access to
 /// the destination bucket", `CopyObject`'s own documentation). The read half is authorized
-/// under [`crate::state::GET_OBJECT_ACTION`].
+/// under the action the source reference asks for
+/// ([`crate::service::request_authorization::get_object_action`]).
 const PUT_OBJECT_ACTION: &str = "s3:PutObject";
 
 /// The four copy-source conditional members this request carried, for the one rule every

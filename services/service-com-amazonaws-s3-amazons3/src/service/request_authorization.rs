@@ -354,14 +354,10 @@ pub fn object_read_denial(
     let conditions = authorization::read_conditions();
     let policy = bucket.policy.as_deref();
     if addressed.is_some() {
-        let action = match version_id {
-            Some(_) => GET_OBJECT_VERSION_ACTION,
-            None => GET_OBJECT_ACTION,
-        };
         return denial(
             caller,
             policy,
-            action,
+            get_object_action(version_id),
             &state::object_arn(name, key),
             &conditions,
         );
@@ -373,6 +369,21 @@ pub fn object_read_denial(
         &bucket.arn(name),
         &conditions,
     )
+}
+
+/// The IAM action a read of `version_id` is authorized under: the version-scoped one for a
+/// read that NAMES a version, and the plain one for a read that names none (see
+/// [`GET_OBJECT_VERSION_ACTION`]).
+///
+/// One place, so every operation that READS an object's bytes — the read itself, the HEAD of
+/// it, and the copy that reads its source — asks for the same permission for the same kind of
+/// reference.
+#[must_use]
+pub fn get_object_action(version_id: Option<&str>) -> &'static str {
+    match version_id {
+        Some(_) => GET_OBJECT_VERSION_ACTION,
+        None => GET_OBJECT_ACTION,
+    }
 }
 
 /// The IAM action a delete of `version_id` is authorized under: the version-scoped one for a

@@ -368,6 +368,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the shared S3 store is unreachable from this engine",
             ));
         };
+        // WHO is asking, resolved BEFORE this service's own store is locked, so the STS and
+        // IAM stores the calling principal and its policies are read from are never reached
+        // while this service's guard is held — the same order `CopyObject` resolves it in.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
 
         // The DESTINATION of the copy: the upload this part belongs to, addressed by its id
@@ -412,6 +416,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .naming_bucket(&source.bucket));
         };
+        // WHO is asking, for the READ this part copy makes of its source. "You must have READ
+        // access to the source object" (`UploadPartCopy`'s own documentation of the
+        // permissions it needs), which is `s3:GetObject` on the object `x-amz-copy-source`
+        // names — or the version-scoped action when the reference names a `versionId`
+        // ([`crate::service::request_authorization::get_object_action`] carries that rule).
+        // The decision is the SOURCE bucket's policy together with the documents in force on
+        // the calling principal, exactly as `CopyObject` judges the same read, and a caller no
+        // authority in force leaves it to is refused before any of the source's bytes are
+        // read into the upload.
+        if let Some(message) = crate::service::request_authorization::denial(
+            &caller,
+            source_bucket.policy.as_deref(),
+            crate::service::request_authorization::get_object_action(source.version_id.as_deref()),
+            &crate::state::object_arn(&source.bucket, &source.key),
+            &crate::service::authorization::read_conditions(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
         let held = match source.version_id.as_deref() {
             None => source_bucket.object(&source.key).cloned(),
             Some(version_id) => {
