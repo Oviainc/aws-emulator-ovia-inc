@@ -235,6 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .get_mut(environment_id)
                 .expect("resolved from the store above");
             environment.cname = cname;
+            // Only the name each environment ANSWERS at moves. The CNAME
+            // reservation an environment took when it was created
+            // (`Environment::reserved_cname`) is not carried across, so each
+            // side now serves a name it never reserved and the name it gave
+            // away is reserved by nobody — which is what `CheckDNSAvailability`
+            // reports on.
             environment.date_updated = at;
         }
 

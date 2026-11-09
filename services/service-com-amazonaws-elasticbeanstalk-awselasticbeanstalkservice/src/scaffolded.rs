@@ -271,6 +271,19 @@ pub const MISSING_PARAMETER: &str = "MissingParameter";
 /// router (it always mounts the shared `InMemoryEngine`).
 pub const INTERNAL_FAILURE: &str = "InternalFailure";
 
+/// `AccessDenied`: the IAM policies in force on the calling principal do not
+/// permit the action the request asks for.
+///
+/// The refusal is taken at the IAM layer, ahead of the service looking at the
+/// resource, so it is not a statement about this account's Elastic Beanstalk
+/// state and none of the codes above fits it; it is the code — with HTTP 403 —
+/// AWS answers a call its identity-based policies do not allow. The modelled
+/// `InsufficientPrivilegesException` is a different failure: "the specified
+/// account does not have sufficient privileges for one or more Amazon Web
+/// Services services", i.e. the privileges Elastic Beanstalk itself needs
+/// elsewhere. See `crate::service::authorization`.
+pub const ACCESS_DENIED: &str = "AccessDenied";
+
 /// The payload of a query client error: the code a client branches on, the status
 /// it is returned with, and the message explaining what to fix.
 #[derive(Debug, Clone)]
@@ -385,6 +398,16 @@ impl<E> Scaffolded<E> {
         Self::Service(ServiceError {
             code: MISSING_PARAMETER,
             status: 400,
+            message: message.into(),
+        })
+    }
+
+    /// Refuse the request with HTTP 403 [`ACCESS_DENIED`]: the IAM policies in
+    /// force on the calling principal do not permit the action.
+    pub fn access_denied(message: impl Into<String>) -> Self {
+        Self::Service(ServiceError {
+            code: ACCESS_DENIED,
+            status: 403,
             message: message.into(),
         })
     }

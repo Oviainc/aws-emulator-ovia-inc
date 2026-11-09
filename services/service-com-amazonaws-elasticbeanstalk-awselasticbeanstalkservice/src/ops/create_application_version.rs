@@ -206,7 +206,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // archive to download: it falls back to the sample application below.
         if let Some(source_bundle) = input.source_bundle.as_ref() {
             if let Some(message) =
-                crate::state::archive_download_refusal(ctx, &region, source_bundle).await
+                crate::state::archive_download_refusal(&*self.engine, ctx, &region, source_bundle)
+                    .await
             {
                 return Err(CreateApplicationVersionError::invalid_parameter_combination(
                     message,

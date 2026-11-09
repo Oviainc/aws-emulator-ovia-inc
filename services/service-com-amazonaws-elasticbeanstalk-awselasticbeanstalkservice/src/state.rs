@@ -711,6 +711,18 @@ const DENIED_ARCHIVE_CODES: &[&str] = &["AccessDenied", "AllAccessDisabled"];
 /// there.
 const ARCHIVE_NOT_FOUND_REASON: &str = "Not Found";
 
+/// The IAM action the archive read is authorized as: `HeadObject` "needs the
+/// s3:GetObject permission for this operation" (Amazon S3 API reference), which is
+/// also the permission the download of the archive itself needs.
+const ARCHIVE_READ_ACTION: &str = "s3:GetObject";
+
+/// The ARN of the Amazon S3 object `key` in `bucket` — the resource the archive read
+/// is authorized against. An Amazon S3 object ARN carries no region and no account
+/// segment: `arn:aws:s3:::<bucket>/<key>`.
+fn archive_object_arn(bucket: &str, key: &str) -> String {
+    format!("arn:aws:s3:::{bucket}/{key}")
+}
+
 /// The message Elastic Beanstalk refuses a create whose Amazon S3 archive it could
 /// not download with, built from the request:
 ///
@@ -724,6 +736,26 @@ const ARCHIVE_NOT_FOUND_REASON: &str = "Not Found";
 /// that failed.
 pub fn unable_to_download_message(bucket: &str, key: &str, reason: &str) -> String {
     format!("Unable to download from S3 location (Bucket: {bucket}  Key: {key}). Reason: {reason}")
+}
+
+/// The message Elastic Beanstalk refuses a create whose Amazon S3 archive the read
+/// was NOT PERMITTED to fetch with, built from the request:
+///
+/// ```text
+/// Unable to download from S3 location (Bucket: <bucket>  Key: <key>). Reason: Forbidden: S3Bucket=<bucket>, S3Key=<key>
+/// ```
+///
+/// The same sentence [`unable_to_download_message`] builds, with the reason phrase
+/// of the 403 such a read answers, and the Amazon S3 location the refused read
+/// named stated after it — as the recorded refusal of a forbidden archive read
+/// carries it, which is what tells a client WHICH object it may not read. Both
+/// members are the request's own (`S3Location$S3Bucket`, `S3Location$S3Key`), so
+/// nothing of any one run is written into it.
+pub fn unable_to_read_archive_message(bucket: &str, key: &str) -> String {
+    format!(
+        "{}: S3Bucket={bucket}, S3Key={key}",
+        unable_to_download_message(bucket, key, archive_reason(Some(ARCHIVE_DENIED_STATUS)))
+    )
 }
 
 /// The Amazon S3 client an operation reads a caller-named archive's metadata through,
@@ -805,7 +837,16 @@ pub(crate) fn answer_is_about_the_object(status: Option<u16>, code: &str) -> boo
 /// archive — an emulator assembled without object storage answers the router's own
 /// `UnknownService`, an authentication refusal is about the signer, and a transport
 /// failure answers nothing at all — so it is logged and the create proceeds.
-pub async fn archive_download_refusal(
+///
+/// The read is made for the CALLER, so it is the caller's own permissions that decide
+/// whether it may be made at all: a caller whose policies do not allow reading that
+/// object is answered the refusal object storage's own 403 produces, and the read is
+/// not made. The decision is the one shared gate's
+/// ([`crate::service::authorization::permits`]) — this emulator's in-process callback
+/// signs with the emulator's own credential rather than the caller's, so asking the
+/// caller's policies here is what keeps the read attributed to the caller.
+pub async fn archive_download_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     location: &S3Location,
@@ -822,6 +863,14 @@ pub async fn archive_download_refusal(
             key,
             ARCHIVE_NOT_FOUND_REASON,
         ));
+    }
+    if !crate::service::authorization::permits(
+        engine,
+        ctx,
+        ARCHIVE_READ_ACTION,
+        &archive_object_arn(bucket, key),
+    ) {
+        return Some(unable_to_read_archive_message(bucket, key));
     }
     let failure = match s3_client(ctx, region)
         .head_object()
@@ -850,14 +899,29 @@ pub async fn archive_download_refusal(
         );
         return None;
     }
-    // The reason the refusal carries is the HTTP reason phrase of the read that
-    // failed (404 -> `Not Found`, 403 -> `Forbidden`), so it is read off the status
-    // Amazon S3 answered rather than written out per error code.
-    let reason = status
+    // ONE sentence per condition: a read object storage would not permit is the
+    // same refusal whether the caller's own policies settled it above or object
+    // storage answered the 403 itself, and every other answer about the object
+    // carries the reason phrase of the status it answered (404 -> `Not Found`),
+    // read off that status rather than written out per error code.
+    if status == Some(ARCHIVE_DENIED_STATUS) {
+        return Some(unable_to_read_archive_message(bucket, key));
+    }
+    Some(unable_to_download_message(
+        bucket,
+        key,
+        archive_reason(status),
+    ))
+}
+
+/// The reason phrase a failed archive read's refusal carries: the HTTP reason phrase
+/// of the status the read answered (404 -> `Not Found`, 403 -> `Forbidden`), so it is
+/// read off the status rather than written out per error code.
+fn archive_reason(status: Option<u16>) -> &'static str {
+    status
         .and_then(|status| ::http::StatusCode::from_u16(status).ok())
         .and_then(|status| status.canonical_reason())
-        .unwrap_or(ARCHIVE_NOT_FOUND_REASON);
-    Some(unable_to_download_message(bucket, key, reason))
+        .unwrap_or(ARCHIVE_NOT_FOUND_REASON)
 }
 
 /// The HTTP status Amazon S3 answers a `CreateBucket` whose name the one bucket
@@ -2558,6 +2622,15 @@ pub struct Environment {
     pub template_name: Option<String>,
     pub description: Option<String>,
     pub cname: String,
+    /// The CNAME this environment RESERVED: the name its own `CNAMEPrefix`
+    /// formed when it was created.
+    ///
+    /// A reservation is what `CheckDNSAvailability` reports on, and an
+    /// environment answers for the name it took only while it still carries it
+    /// — so a `SwapEnvironmentCNAMEs` that hands its CNAME to the other
+    /// environment leaves it carrying a name it never reserved, and the name it
+    /// gave away is reserved by nobody. See [`environment_reserving_cname`].
+    pub reserved_cname: String,
     pub endpoint_url: Option<String>,
     pub tier: Option<EnvironmentTier>,
     pub option_settings: Vec<ConfigurationOptionSetting>,
@@ -4456,6 +4529,27 @@ pub fn missing_configuration_template_message(template_name: &str) -> String {
     format!("No Configuration Template named '{template_name}' found.")
 }
 
+/// The message this service refuses a `ResourceArn` that is not one of its own
+/// resources' ARNs with, built from the request: `The name '<arn>' isn't a valid
+/// ARN of an Elastic Beanstalk resource.`
+///
+/// `ListTagsForResource$ResourceArn` and `UpdateTagsForResource$ResourceArn` are
+/// both documented "must be the ARN of an Elastic Beanstalk resource", so the
+/// value that is any other service's ARN — or no ARN at all — is refused with
+/// this one sentence whichever of the two was called.
+pub fn invalid_resource_arn_message(resource_arn: &str) -> String {
+    format!("The name '{resource_arn}' isn't a valid ARN of an Elastic Beanstalk resource.")
+}
+
+/// The message this service refuses an `UpdateTagsForResource` whose `TagsToAdd`
+/// and `TagsToRemove` name the same key with.
+///
+/// WHOLLY FIXED text: the contradiction is a property of the request's SHAPE
+/// rather than of any one key, so the sentence names no key, no list and no
+/// resource.
+pub const TAG_KEY_IN_BOTH_LISTS_MESSAGE: &str =
+    "A tag with the same key can't be added and removed in a single operation.";
+
 /// How many characters an `EnvironmentId` body carries: `e-` plus 13 lowercase
 /// alphanumerics is the form the real service issues one in.
 pub const ENVIRONMENT_ID_BODY_LENGTH: usize = 13;
@@ -4497,10 +4591,15 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 // ---------------------------------------------------------------------------
 // The CNAME reservation rule
 //
-// A CNAME ([`environment_cname`]) is held by at most ONE live environment, and
-// a prefix that cannot be a host name label names no CNAME at all. Both halves
-// live here, together, because `CheckDNSAvailability` reports on them and
-// `CreateEnvironment` enforces them, and the two must not disagree.
+// A CNAME ([`environment_cname`]) is RESERVED by at most ONE live environment —
+// the one that took it when it was created and still carries it
+// ([`environment_reserving_cname`]) — and is SERVED by at most one live
+// environment, which is whichever one carries it now
+// ([`environment_serving_cname`]); the two differ exactly for a name a
+// `SwapEnvironmentCNAMEs` has moved. A prefix that cannot be a host name label
+// names no CNAME at all. All of it lives here, together, because
+// `CheckDNSAvailability` reports on the reservations and `CreateEnvironment`
+// enforces both, and the three must not disagree.
 // ---------------------------------------------------------------------------
 
 /// Whether `prefix` can be the leftmost label of an environment CNAME at all.
@@ -4522,11 +4621,32 @@ pub fn is_legal_cname_prefix(prefix: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
-/// The live environment in `store` that holds `cname`, if any — the one record
-/// that has that DNS name reserved. A terminated environment holds nothing, so
-/// its CNAME is free again. DNS names are case-insensitive, so the comparison
-/// is too.
-pub fn environment_holding_cname<'store>(
+/// The live environment in `store` that holds the RESERVATION for `cname` — the
+/// one that took that DNS name when it was created and still carries it, which
+/// is what `CheckDNSAvailability` reports a prefix as unavailable for. A
+/// terminated environment holds nothing, and neither does one whose CNAME a swap
+/// has moved: it carries a name it never reserved, and the name it reserved is
+/// now carried by the environment it swapped with. DNS names are
+/// case-insensitive, so the comparison is too.
+pub fn environment_reserving_cname<'store>(
+    store: &'store ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
+    cname: &str,
+) -> Option<&'store Environment> {
+    environment_serving_cname(store, cname)
+        .filter(|environment| environment.reserved_cname.eq_ignore_ascii_case(cname))
+}
+
+/// The live environment in `store` whose URL IS `cname` — the one answering at
+/// that DNS name, whether it reserved the name itself or took it in a swap. Two
+/// environments cannot answer at one host name, which is what `CreateEnvironment`
+/// refuses a prefix already in use for.
+///
+/// DELIBERATELY not the same question [`environment_reserving_cname`] answers: a
+/// name a swap moved is served by the environment that received it and reserved
+/// by nobody, so `CheckDNSAvailability` reports it available (which is what the
+/// recorded answer for a swapped prefix carries) while a create still refuses it.
+/// Keep the two predicates apart.
+pub fn environment_serving_cname<'store>(
     store: &'store ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
     cname: &str,
 ) -> Option<&'store Environment> {

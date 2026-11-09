@@ -317,6 +317,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "TemplateName: The name of the Elastic Beanstalk configuration
+        // template to use with the environment", with which "Elastic Beanstalk
+        // sets the configuration values to the ones the template holds". A
+        // template name is unique per application, so the pair resolves one
+        // record — and a name this application has no template for names no
+        // configuration to launch with, which is refused with the same sentence
+        // every other operation that resolves a template answers.
+        let template = match input.template_name.as_ref() {
+            Some(template_name) => {
+                let Some(template) = store
+                    .configuration_templates
+                    .get(&(input.application_name.clone(), template_name.clone()))
+                else {
+                    return Err(CreateEnvironmentError::invalid_parameter_value(
+                        crate::state::missing_configuration_template_message(template_name),
+                    ));
+                };
+                Some(template.clone())
+            }
+            None => None,
+        };
+
         // "PlatformArn: The Amazon Resource Name (ARN) of the custom platform to
         // use with the environment." A platform version is either CUSTOM — created
         // in this account by `CreatePlatformVersion` — or MANAGED, one of the
@@ -356,7 +378,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
             let cname = crate::state::environment_cname(cname_prefix, &region);
-            if crate::state::environment_holding_cname(&store, &cname).is_some() {
+            // Two environments cannot answer at one host name, so the name any
+            // live environment is serving cannot be taken — including one it
+            // took in a swap rather than reserved itself.
+            if crate::state::environment_serving_cname(&store, &cname).is_some() {
                 return Err(CreateEnvironmentError::invalid_parameter_value(format!(
                     "DNS name ({cname}) is not available."
                 )));
@@ -400,20 +425,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name or an ARN the catalog does not publish resolves to nothing and
         // the member stays absent rather than carrying a made-up value — a
         // CUSTOM platform version, in particular, has no solution stack name
-        // this service can derive.
+        // this service can derive. A request naming neither form launches on
+        // the version the configuration template it names holds, which is the
+        // same resolution `UpdateEnvironment` makes for a template it deploys.
+        let (requested_stack, requested_platform_arn) =
+            match (&input.solution_stack_name, &input.platform_arn) {
+                (None, None) => match template.as_ref() {
+                    Some(template) => (
+                        template.solution_stack_name.clone(),
+                        template.platform_arn.clone(),
+                    ),
+                    None => (None, None),
+                },
+                (solution_stack_name, platform_arn) => {
+                    (solution_stack_name.clone(), platform_arn.clone())
+                }
+            };
         let resolved_stack = crate::state::named_platform_version(
             &region,
-            input.solution_stack_name.as_deref(),
-            input.platform_arn.as_deref(),
+            requested_stack.as_deref(),
+            requested_platform_arn.as_deref(),
         );
-        let platform_arn = input
-            .platform_arn
+        let platform_arn = requested_platform_arn
             .clone()
             .or_else(|| resolved_stack.as_ref().map(|stack| stack.platform_arn(&region)));
-        let solution_stack_name = input
-            .solution_stack_name
+        let solution_stack_name = requested_stack
             .clone()
             .or_else(|| resolved_stack.as_ref().map(|stack| stack.name()));
+        // The configuration this launch deploys: the template's settings when
+        // the request names one ("Elastic Beanstalk sets the configuration
+        // values to the ones the template holds"), with the request's own
+        // `OptionSettings` over them — the same precedence every other
+        // configuration source has, so an option the request states wins and
+        // one it leaves out is the template's.
+        let option_settings = crate::state::merge_option_settings(
+            template
+                .as_ref()
+                .map(|template| template.option_settings.as_slice())
+                .unwrap_or_default(),
+            input.option_settings.as_deref().unwrap_or_default(),
+        );
+        if option_settings.len() > crate::state::MAX_CONFIGURATION_OPTION_SETTINGS {
+            return Err(CreateEnvironmentError::invalid_parameter_value(
+                crate::state::too_many_option_settings_message(option_settings.len()),
+            ));
+        }
         let created = crate::state::now();
         let mut environment = crate::state::Environment {
             environment_id: environment_id.clone(),
@@ -431,6 +487,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             template_name: input.template_name.clone(),
             description: input.description.clone(),
             cname: crate::state::environment_cname(&cname_prefix, &region),
+            // The launch RESERVES the name the prefix forms, which is what
+            // `CheckDNSAvailability` reports a prefix as taken for until this
+            // environment stops carrying it.
+            reserved_cname: crate::state::environment_cname(&cname_prefix, &region),
             // `EndpointURL` is "the URL to the LoadBalancer" or "the IP address
             // of the instance". Neither serves application traffic here, so
             // there is no reachable endpoint to report and none is invented.
@@ -441,7 +501,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tier: Some(crate::state::environment_tier_with_defaults(
                 input.tier.as_ref(),
             )),
-            option_settings: input.option_settings.clone().unwrap_or_default(),
+            option_settings,
             // A launch deploys the configuration the request carries, so there
             // is no configuration waiting to be deployed beside it: a DRAFT
             // configuration is what an UPDATE of a running environment creates.

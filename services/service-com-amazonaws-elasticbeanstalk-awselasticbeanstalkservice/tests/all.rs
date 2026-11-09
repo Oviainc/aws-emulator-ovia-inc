@@ -21,6 +21,8 @@ mod application_version_processing;
 mod application_version_updates;
 #[path = "all/application_versions.rs"]
 mod application_versions;
+#[path = "all/cname_reservation.rs"]
+mod cname_reservation;
 #[path = "all/configuration_options.rs"]
 mod configuration_options;
 #[path = "all/configuration_resolution.rs"]
@@ -29,6 +31,10 @@ mod configuration_resolution;
 mod configuration_set_deployment_status;
 #[path = "all/configuration_templates.rs"]
 mod configuration_templates;
+#[path = "all/create_platform_version_authorization.rs"]
+mod create_platform_version_authorization;
+#[path = "all/custom_platform_version_registration.rs"]
+mod custom_platform_version_registration;
 #[path = "all/custom_platform_version_tags.rs"]
 mod custom_platform_version_tags;
 #[path = "all/delete_platform_version.rs"]
@@ -51,6 +57,8 @@ mod environment_info_request_shape;
 mod environment_operations;
 #[path = "all/environment_resources.rs"]
 mod environment_resources;
+#[path = "all/environment_template_configuration.rs"]
+mod environment_template_configuration;
 #[path = "all/events.rs"]
 mod events;
 // Not a suite of its own: the name the suites below import the shared harness
@@ -101,6 +109,8 @@ mod storage_location;
 mod swap_environment_cnames;
 #[path = "all/tag_batch_conflicts.rs"]
 mod tag_batch_conflicts;
+#[path = "all/tag_refusal_messages.rs"]
+mod tag_refusal_messages;
 #[path = "all/update_application.rs"]
 mod update_application;
 #[path = "all/update_application_lifecycle_projection.rs"]

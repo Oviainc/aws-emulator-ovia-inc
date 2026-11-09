@@ -90,9 +90,9 @@ fn refused(
     match refusal {
         // "Must be the ARN of an Elastic Beanstalk resource."
         crate::state::ResourceArnRefusal::NotThisService => {
-            ListTagsForResourceError::invalid_parameter_value(format!(
-                "Resource ARN '{resource_arn}' is not an Elastic Beanstalk resource ARN."
-            ))
+            ListTagsForResourceError::invalid_parameter_value(
+                crate::state::invalid_resource_arn_message(resource_arn),
+            )
         }
         crate::state::ResourceArnRefusal::UnsupportedType => {
             ListTagsForResourceErrorModeled::ResourceTypeNotSupportedException(

@@ -292,6 +292,10 @@ fn platform_name(version: &ListedPlatformVersion) -> &str {
     }
 }
 
+/// The `PlatformOwner` value that names the CALLING account instead of spelling
+/// its id. See [`Attribute::resolved`], where it is applied.
+const CALLER_OWNER_ALIAS: &str = "self";
+
 /// The platform-version attribute a filter term is applied to.
 ///
 /// The set is `PlatformFilter$Type`'s: "Valid values: `PlatformName` |
@@ -374,6 +378,23 @@ impl Attribute {
                 .map(String::as_str)
                 .collect(),
         }
+    }
+
+    /// The value of a term on this attribute, with the alias a caller may spell
+    /// instead of a literal value resolved to what a platform version REPORTS.
+    ///
+    /// `PlatformOwner` is "the Amazon Web Services account ID of the person who
+    /// created the platform version", and AWS documents selecting an account's
+    /// OWN custom platform versions by the alias `self` rather than by spelling
+    /// that id ("Elastic Beanstalk Developer Guide", listing custom platform
+    /// versions: `--filters Type=PlatformOwner,Operator==,Values=self`), so the
+    /// alias names the calling account's id wherever a term carries it. Every
+    /// other attribute is compared against the value as it arrived.
+    fn resolved(self, value: &str) -> String {
+        if self == Self::PlatformOwner && value.eq_ignore_ascii_case(CALLER_OWNER_ALIAS) {
+            return ::engine::emulator_account_id().to_string();
+        }
+        value.to_string()
     }
 
     /// Whether this attribute's values are compared WITHOUT regard to case.
@@ -505,7 +526,7 @@ impl FilterTerm {
         Ok(Self {
             attribute,
             operator,
-            value: value.clone(),
+            value: attribute.resolved(value),
         })
     }
 

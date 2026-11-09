@@ -3,10 +3,12 @@
 //! `CheckDNSAvailability`, over the service's awsQuery HTTP surface.
 //!
 //! The rule under test: the CNAME a prefix forms is
-//! `<prefix>.<region>.elasticbeanstalk.com`, it can be held by at most ONE live
-//! environment in that region, and it is available exactly when the prefix can
-//! be a host name label at all and no live environment holds that name. Checking
-//! a prefix is a REPORT: it reserves nothing and releases nothing.
+//! `<prefix>.<region>.elasticbeanstalk.com`, it can be RESERVED by at most ONE
+//! live environment — the one that took it when it was created and still carries
+//! it — and it is available exactly when the prefix can be a host name label at
+//! all and no live environment holds that reservation. Checking a prefix is a
+//! REPORT: it reserves nothing and releases nothing. What a swap leaves of those
+//! reservations is `cname_reservation.rs`.
 //!
 //! The HTTP harness (the router, the form encoder and the XML element reader) is
 //! the one `lifecycle.rs` already owns in this same test binary, so this suite

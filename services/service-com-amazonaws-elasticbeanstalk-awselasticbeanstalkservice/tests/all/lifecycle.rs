@@ -49,6 +49,11 @@ const API_VERSION: &str = "2010-12-01";
 /// is asserted against something that is not the default.
 pub(crate) const TEST_REGION: &str = "us-west-2";
 
+/// The access key id every suite signs with unless it is asserting WHO the caller
+/// is: a key neither the IAM store nor any session holds a record for, which is
+/// the position the account's own published credential is in.
+pub(crate) const ACCOUNT_KEY_ID: &str = "AKIDTESTEXAMPLE";
+
 /// A platform for an environment to run on: a `SolutionStackName` from the service's
 /// OWN published catalogue (`eb::state::SOLUTION_STACKS`, what
 /// `ListAvailableSolutionStacks` reports), derived through the same
@@ -109,17 +114,42 @@ impl Emulator {
     /// Amazon SNS in process, so a suite that asserts the delivery needs SNS
     /// answering and a queue of its own to read the notification from.
     pub(crate) fn with_notification_services() -> Self {
-        Self::mounting(false, true)
+        Self::mounting(false, true, false)
+    }
+
+    /// A fresh emulator with object storage and the IAM service mounted beside
+    /// Elastic Beanstalk on the SAME engine — which is what the assembled
+    /// emulator does.
+    ///
+    /// A request is authorized against the policies the IAM store holds for the
+    /// principal its access key id speaks for (`crate::service::authorization`),
+    /// so a suite that drives a caller OTHER than the account's own published
+    /// credential needs IAM answering — and object storage beside it, because the
+    /// creates such a caller makes read a caller-named archive.
+    pub(crate) fn with_identity_services() -> Self {
+        Self::mounting(true, false, true)
+    }
+
+    /// The one shared engine the mounted services reach their stores through, for
+    /// a suite that has to SEED a record in ANOTHER mounted service's store (the
+    /// IAM role and policy a caller is judged on) before driving this service
+    /// over HTTP.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// The one construction path both constructors use, so they cannot drift.
     fn over_engine(with_object_storage: bool) -> Self {
-        Self::mounting(with_object_storage, false)
+        Self::mounting(with_object_storage, false, false)
     }
 
     /// Mount Elastic Beanstalk, and the other services a suite needs answering
     /// beside it, on one shared engine.
-    fn mounting(with_object_storage: bool, with_notification_services: bool) -> Self {
+    fn mounting(
+        with_object_storage: bool,
+        with_notification_services: bool,
+        with_identity_services: bool,
+    ) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(eb::EmulatedService::new(Arc::clone(&engine)));
@@ -137,6 +167,13 @@ impl Emulator {
             router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
                 Arc::clone(&engine),
             ));
+        }
+        if with_identity_services {
+            router.register_service(
+                service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                    Arc::clone(&engine),
+                ),
+            );
         }
         Self { router, engine }
     }
@@ -171,6 +208,19 @@ impl Emulator {
         action: &str,
         params: &[(&str, &str)],
     ) -> Answer {
+        self.call_as(ACCOUNT_KEY_ID, region, action, params).await
+    }
+
+    /// Call `action` signed with `access_key_id` in the SigV4 credential scope —
+    /// which is what names the principal the request speaks for, and so what the
+    /// authorization decision is taken on.
+    pub(crate) async fn call_as(
+        &self,
+        access_key_id: &str,
+        region: &str,
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> Answer {
         let mut form = vec![
             format!("Action={}", form_encoded(action)),
             format!("Version={}", form_encoded(API_VERSION)),
@@ -181,7 +231,7 @@ impl Emulator {
         // The router resolves both the service and the region from the SigV4
         // credential scope, exactly as it does for a real signed request.
         let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDTESTEXAMPLE/20261021/{region}/elasticbeanstalk/aws4_request, \
+            "AWS4-HMAC-SHA256 Credential={access_key_id}/20261021/{region}/elasticbeanstalk/aws4_request, \
              SignedHeaders=host;x-amz-date, Signature=0123456789abcdef"
         );
         let request = http::Request::builder()

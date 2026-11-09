@@ -107,9 +107,9 @@ fn refused(
 ) -> UpdateTagsForResourceError {
     match refusal {
         crate::state::ResourceArnRefusal::NotThisService => {
-            UpdateTagsForResourceError::invalid_parameter_value(format!(
-                "Resource ARN '{resource_arn}' is not an Elastic Beanstalk resource ARN."
-            ))
+            UpdateTagsForResourceError::invalid_parameter_value(
+                crate::state::invalid_resource_arn_message(resource_arn),
+            )
         }
         crate::state::ResourceArnRefusal::UnsupportedType => {
             UpdateTagsForResourceErrorModeled::ResourceTypeNotSupportedException(
@@ -319,13 +319,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .filter_map(|tag| tag.key.as_deref())
             .collect();
-        if let Some(key) = tags_to_remove
+        if tags_to_remove
             .iter()
-            .find(|key| keys_to_add.contains(key.as_str()))
+            .any(|key| keys_to_add.contains(key.as_str()))
         {
-            return Err(UpdateTagsForResourceError::invalid_parameter_value(format!(
-                "The tag key '{key}' cannot be specified in both TagsToAdd and TagsToRemove."
-            )));
+            return Err(UpdateTagsForResourceError::invalid_parameter_value(
+                crate::state::TAG_KEY_IN_BOTH_LISTS_MESSAGE,
+            ));
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

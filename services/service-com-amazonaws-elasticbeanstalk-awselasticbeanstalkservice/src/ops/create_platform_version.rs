@@ -5,13 +5,19 @@
 //! `Creating` until the clock makes the build completion due. This is the ONLY file to
 //! touch for this operation.
 //!
+//! Whether the caller may create it at all is IAM's decision, taken before anything is
+//! read or written (`crate::service::authorization`): a caller whose identity-based
+//! policies do not allow `elasticbeanstalk:CreatePlatformVersion` on the version this
+//! request names is refused and nothing is recorded.
+//!
 //! The `Tags` the request carries ("Specifies the tags applied to the new platform
 //! version") are stored ON that version, so `ListTagsForResource` and
 //! `UpdateTagsForResource` read and write them by the `PlatformArn` this call answered
 //! with; the environments a client then launches on the version hold their own tags.
 //!
 //! The platform definition archive named by `PlatformDefinitionBundle` is DOWNLOADED —
-//! a create whose archive object storage cannot hand back is refused — but its contents
+//! for the CALLER, so a create whose archive the caller may not read, or whose archive
+//! object storage cannot hand back, is refused — but its contents
 //! are not interpreted and no builder environment is launched, so every value a built
 //! platform would report from the archive (its category, maintainer, operating system,
 //! languages, frameworks) and the `Builder` of the response are absent rather than
@@ -160,6 +166,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx);
+        let arn = crate::state::platform_version_arn(
+            &region,
+            &input.platform_name,
+            &input.platform_version,
+        );
+        // IAM decides whether this caller may create the platform version the
+        // request names BEFORE anything is read, downloaded or written, so a
+        // caller its policies do not permit is refused and the call leaves
+        // nothing behind — no platform version, and no archive fetched for one.
+        if let Some(message) = crate::service::authorization::refusal(
+            &*self.engine,
+            ctx,
+            <Self as smithy_server_runtime::Operation>::NAME,
+            &arn,
+        ) {
+            return Err(CreatePlatformVersionError::access_denied(message));
+        }
         // "PlatformDefinitionBundle: The location of the platform definition archive
         // in Amazon S3" — the version is built FROM that archive, so Elastic Beanstalk
         // downloads it while serving this call and refuses the request when it cannot,
@@ -167,6 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal carries for this operation: the bundle parameter names something
         // that cannot be used.
         if let Some(message) = crate::state::archive_download_refusal(
+            &*self.engine,
             ctx,
             &region,
             &input.platform_definition_bundle,
@@ -183,11 +207,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due_transitions();
 
-        let arn = crate::state::platform_version_arn(
-            &region,
-            &input.platform_name,
-            &input.platform_version,
-        );
         if store.platform_versions.contains_key(&arn) {
             return Err(CreatePlatformVersionError::invalid_parameter_value(format!(
                 "Platform version '{}' of platform '{}' already exists.",
@@ -196,16 +215,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "TooManyPlatformsException: You have exceeded the maximum number of
         // allowed platforms associated with the account." Enforcing the bound is
-        // also what keeps the platform store bounded.
+        // also what keeps the platform store bounded. The refusal carries the
+        // modelled code and status alone: the quota error of this operation
+        // states no message member, so none is invented for it.
         if store.platform_versions.len() >= crate::state::MAX_PLATFORM_VERSIONS {
             return Err(CreatePlatformVersionErrorModeled::TooManyPlatformsException(
-                TooManyPlatformsException {
-                    message: Some(format!(
-                        "The number of custom platform versions in this account has reached \
-                         the limit of {}.",
-                        crate::state::MAX_PLATFORM_VERSIONS
-                    )),
-                },
+                TooManyPlatformsException { message: None },
             )
             .into());
         }

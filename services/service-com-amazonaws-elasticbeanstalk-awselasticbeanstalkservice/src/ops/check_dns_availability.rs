@@ -2,10 +2,11 @@
 
 //! @op CheckDNSAvailability
 //! Implemented: reports whether the CNAME the requested prefix forms in the request's
-//! region is still free — no live environment in the store holds it, and the prefix can
-//! form a DNS label at all — and the fully qualified CNAME that prefix would reserve.
-//! Reserves nothing: this is a report on the store, not a claim on the name. This is
-//! the ONLY file to touch for this operation.
+//! region is still free — no live environment in the store holds the RESERVATION for it
+//! ([`crate::state::environment_reserving_cname`]), and the prefix can form a DNS label
+//! at all — and the fully qualified CNAME that prefix would reserve. Reserves nothing:
+//! this is a report on the store, not a claim on the name. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,10 +150,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // prefix WOULD form, and `Available` is what says it cannot be had.
         let fully_qualified_cname = crate::state::environment_cname(&input.cname_prefix, &region);
         // Available unless the name cannot exist at all, or a live environment
-        // already holds it. Nothing is written for the answer: checking a prefix
-        // neither reserves a free one nor releases a held one.
+        // holds the RESERVATION for it. Nothing is written for the answer:
+        // checking a prefix neither reserves a free one nor releases a held one.
         let available = crate::state::is_legal_cname_prefix(&input.cname_prefix)
-            && crate::state::environment_holding_cname(&store, &fully_qualified_cname).is_none();
+            && crate::state::environment_reserving_cname(&store, &fully_qualified_cname).is_none();
 
         Ok(CheckDNSAvailabilityOutput {
             available: Some(available),

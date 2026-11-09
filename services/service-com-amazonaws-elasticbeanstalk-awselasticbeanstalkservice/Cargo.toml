@@ -49,6 +49,13 @@ yaml-rust2 = { version = "0.10", default-features = false }
 # subscribed (`state::event_notifications`). Only the generated client is needed — the
 # emulator supplies the transport.
 aws-sdk-sns = { version = "1", default-features = false }
+# The ONE shared evaluation of IAM policy documents against a request, which the
+# authorization gate (`service::authorization`) takes its decision through.
+service-common = { path = "../common" }
+# The account's own identities: the IAM store holds the role session a temporary
+# credential speaks for and the user a long-term key belongs to, plus the policy documents
+# in force on each, which is what that gate reads the caller's permissions from.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

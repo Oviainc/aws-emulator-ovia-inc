@@ -53,6 +53,7 @@
 //! pre-dispatch refusal. Everything else about those paths — status, `<Type>`, `<Code>`,
 //! `<Message>` — stays with the framework.
 
+pub mod authorization;
 pub mod query_error_envelope;
 
 use query_error_envelope::{ElasticBeanstalkDefinition, RequestIdEnvelopeOperation};
