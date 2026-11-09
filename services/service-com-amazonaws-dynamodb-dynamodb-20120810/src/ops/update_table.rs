@@ -529,14 +529,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_projection_budget(
             indexes
                 .iter()
-                .map(|index| &index.projection)
+                .map(|index| crate::state::projected_non_key_attributes(&index.projection))
+                .chain(table.local_secondary_indexes.iter().map(|index| {
+                    crate::state::projected_non_key_attributes(&index.projection)
+                }))
                 .chain(
-                    table
-                        .local_secondary_indexes
+                    vector_indexes
                         .iter()
-                        .map(|index| &index.projection),
-                )
-                .chain(vector_indexes.iter().map(|index| &index.projection)),
+                        .map(crate::state::vector_projected_non_key_attributes),
+                ),
         )
         .map_err(lift)?;
         // Only the attribute definitions some key schema still uses are kept, so a

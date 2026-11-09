@@ -118,15 +118,24 @@ async fn a_write_is_held_to_the_shape_the_vector_index_was_created_with() {
     // components, the MAGNITUDE of a component (one past what a 32-bit float holds), and
     // the type of a search-schema attribute — plus the two accepting rows, an item of the
     // index's own shape and one that carries none of its attributes at all. Each refusal
-    // states the CONSTRAINT the item broke, over the attribute, the counts and the types
-    // the request and the index carry.
-    let dimensions = format!(
-        "One or more parameter values were invalid: The number of dimensions in the vector \
-         attribute emb must match the number of dimensions configured for the vector index \
-         idx-emb: {DIMENSIONS}"
-    );
-    let not_numbers = "One or more parameter values were invalid: The vector attribute emb must \
-                       hold only numbers, each a 32-bit IEEE-754 floating point value"
+    // reports the attribute as the PARAMETER at fault beside the index that requires it:
+    // the type the parameter has to be, the position and type of the element that is not
+    // one, or the count the index was built for beside the count supplied.
+    let dimensions = |actual: usize| {
+        format!(
+            "One or more parameter values were invalid. Invalid size for parameter emb, \
+             Expected: {DIMENSIONS}, Actual: {actual} IndexName: idx-emb"
+        )
+    };
+    let element = |position: usize, actual: &str| {
+        format!(
+            "One or more parameter values were invalid. Invalid type for parameter \
+             emb[{position}], Expected: 32-bit floating point number, Actual: {actual}. \
+             IndexName: idx-emb"
+        )
+    };
+    let not_a_list = "One or more parameter values were invalid. Invalid type for parameter emb, \
+                      Expected: 32-bit floating point number list IndexName: idx-emb"
         .to_string();
     let schema_type = "One or more parameter values were invalid: Type mismatch for Index Key \
                        tier Expected: S Actual: N IndexName: idx-emb";
@@ -134,38 +143,38 @@ async fn a_write_is_held_to_the_shape_the_vector_index_was_created_with() {
         (
             "one component short",
             vector_of(DIMENSIONS - 1),
-            Some(dimensions.clone()),
+            Some(dimensions(DIMENSIONS - 1)),
         ),
         (
             "one component long",
             vector_of(DIMENSIONS + 1),
-            Some(dimensions.clone()),
+            Some(dimensions(DIMENSIONS + 1)),
         ),
-        ("a single component", vector_of(1), Some(dimensions.clone())),
+        ("a single component", vector_of(1), Some(dimensions(1))),
         (
             "no components at all",
             json!({"L": []}),
-            Some(dimensions.clone()),
+            Some(dimensions(0)),
         ),
         (
             "a value that is not a list",
             json!({"S": "1,0,0"}),
-            Some(dimensions),
+            Some(not_a_list),
         ),
         (
             "a list of strings",
             json!({"L": [{"S": "1"}, {"S": "0"}, {"S": "0"}]}),
-            Some(not_numbers.clone()),
+            Some(element(0, "S")),
         ),
         (
             "a list with one component that is not a number",
             json!({"L": [{"N": "1"}, {"BOOL": true}, {"N": "0"}]}),
-            Some(not_numbers.clone()),
+            Some(element(1, "BOOL")),
         ),
         (
             "a component past the 32-bit float range",
             json!({"L": [{"N": "1"}, {"N": "1e40"}, {"N": "0"}]}),
-            Some(not_numbers),
+            Some(element(1, "N")),
         ),
         (
             "a component at the 32-bit float range",

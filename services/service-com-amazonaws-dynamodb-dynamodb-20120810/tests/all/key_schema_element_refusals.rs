@@ -8,7 +8,10 @@
 //! whose `KeyType` is not the one its position requires is refused with a 400
 //! `ValidationException` naming that element's ordinal position and the key type it
 //! should have carried (`Invalid KeySchema: The second KeySchemaElement is not a RANGE
-//! key type`), and a schema whose every position is right is accepted and read back.
+//! key type`), and a schema whose every position is right is accepted and read back. One
+//! defect is stated as the rule instead of as a position: a partition key that FOLLOWS a
+//! sort key, where a schema may carry several partition keys and no single element is the
+//! one at fault.
 //!
 //! The rows differ along what the rule generalises over: the key type at each position,
 //! the number of elements, the order they appear in, the attribute names and their
@@ -272,9 +275,11 @@ async fn an_index_key_refusal_names_the_element_that_broke_the_rule() {
                 json!({"AttributeName": "r0", "KeyType": "RANGE"}),
                 json!({"AttributeName": "h1", "KeyType": "HASH"}),
             ],
+            // The ORDER of the two kinds of key is stated as the rule itself: with
+            // several partition keys allowed, no single element is the one at fault.
             Some(
-                "Invalid KeySchema for index idx: The third KeySchemaElement is not a RANGE key \
-                 type"
+                "One or more parameter values were invalid: All HASH key attributes must \
+                 precede RANGE key attributes in the KeySchema"
                     .to_string(),
             ),
         ),

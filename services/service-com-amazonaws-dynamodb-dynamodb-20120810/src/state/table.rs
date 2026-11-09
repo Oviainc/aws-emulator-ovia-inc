@@ -14,11 +14,12 @@ const CONDITION_PARAMETER_TYPE_MESSAGE: &str =
     "One or more parameter values were invalid: Condition parameter type does not match \
      schema type";
 
-/// Whether `value` is a vector at all: the one reading of that attribute this service
-/// has ([`vector_values`]).
-fn value_is_vector(value: &AttributeValue) -> bool {
-    vector_values(value).is_some()
-}
+/// The type a vector index requires of the attribute it indexes, as DynamoDB names it in
+/// the refusals [`Table::check_vector_attributes`] states: "Each element is a 32-bit
+/// IEEE-754 floating point number, provided in DynamoDB list format"
+/// (`SearchVectors$SearchVector`), so the attribute is a LIST of that type and each of its
+/// elements is one.
+const VECTOR_PARAMETER_TYPE: &str = "32-bit floating point number";
 
 /// The least a write to a vector index meters: a vector write is denominated in BYTES
 /// ("VectorWriteRequestBytes" — `ConsumedCapacity$VectorIndexes`) with a 1 KB floor, so a
@@ -27,26 +28,32 @@ fn value_is_vector(value: &AttributeValue) -> bool {
 pub const MIN_VECTOR_WRITE_BYTES: i64 = 1024;
 
 /// What one dimension of a STORED vector costs: a vector attribute is a list of 32-bit
-/// IEEE-754 floats ([`value_is_vector`]), so each dimension is four bytes once it is held
+/// IEEE-754 floats ([`vector_values`]), so each dimension is four bytes once it is held
 /// as the index holds it rather than as the decimal text the request sent.
 pub const BYTES_PER_VECTOR_DIMENSION: i64 = 4;
 
 impl VectorIndex {
-    /// The bytes one write of `item` meters on this index, BEFORE the floor every vector
-    /// write is held to ([`MIN_VECTOR_WRITE_BYTES`]).
+    /// The bytes one write of an item this index covers meters on it, where `key_bytes` is
+    /// the stored size of that item's primary KEY.
     ///
-    /// What the index stores for the item: the attributes it holds, sized the way this
-    /// store sizes an item, with the vector itself counted at
-    /// [`BYTES_PER_VECTOR_DIMENSION`] per dimension of the index instead of as the text
-    /// the request spelled it with — which is what makes the figure grow with the
-    /// index's `Dimensions` rather than with the way a client wrote the numbers.
-    pub fn write_request_bytes(&self, item: &Item) -> i64 {
-        let written = item
-            .get(&self.vector_attribute.attribute_name)
-            .map_or(0, attribute_value_size);
-        item_size(item)
-            .saturating_sub(written)
-            .saturating_add(self.dimensions.saturating_mul(BYTES_PER_VECTOR_DIMENSION))
+    /// What a vector write meters is the index ENTRY, not the item it was written from,
+    /// and the entry is sized the way this store sizes an item: the key it is held under,
+    /// plus the vector attribute — its name, and four bytes per dimension of the index
+    /// ([`BYTES_PER_VECTOR_DIMENSION`]) for the vector itself rather than the decimal text
+    /// the request spelled it with. The figure is then held to the per-write floor
+    /// ([`MIN_VECTOR_WRITE_BYTES`]).
+    ///
+    /// So it grows with the index's `Dimensions`, a small vector meters the floor however
+    /// large the item around it is, and the attributes that item carries beside the vector
+    /// are metered on the table's own capacity rather than here.
+    pub fn write_request_bytes(&self, key_bytes: i64) -> i64 {
+        let attribute =
+            i64::try_from(self.vector_attribute.attribute_name.len()).unwrap_or(i64::MAX);
+        self.dimensions
+            .saturating_mul(BYTES_PER_VECTOR_DIMENSION)
+            .saturating_add(attribute)
+            .saturating_add(key_bytes)
+            .max(MIN_VECTOR_WRITE_BYTES)
     }
 }
 
@@ -442,6 +449,13 @@ impl Table {
     /// item that carries NO value for the attribute is simply not covered by the index
     /// ([`VectorIndex::covers`]) and is written as it stands.
     ///
+    /// Each refusal is DynamoDB's parameter sentence for what the value broke, reporting
+    /// the attribute as the PARAMETER at fault beside the index that requires it: a value
+    /// of another type is told the type the parameter has to be, an element of another
+    /// type is named by its position in the list and reports the type it arrived as, and a
+    /// list of the wrong length reports the count the index was built for beside the count
+    /// supplied — which is the only place a caller is told either figure.
+    ///
     /// Every write path that stores an item reaches this, through
     /// [`Self::check_index_keys`] or beside it, so one rule decides what a table with a
     /// vector index accepts whichever operation the write arrived on.
@@ -451,23 +465,38 @@ impl Table {
             let Some(value) = item.get(name) else {
                 continue;
             };
-            let dimensions = match value {
-                AttributeValue::L(values) => i64::try_from(values.len()).unwrap_or(i64::MAX),
-                _ => -1,
-            };
-            if dimensions != index.dimensions {
+            // The TYPE of the attribute and of each of its elements before the COUNT of
+            // them: a value that is no list of 32-bit floats has no dimensions to compare
+            // with the index's, so the caller is told what the parameter has to be before
+            // being told how many of them to send.
+            let AttributeValue::L(elements) = value else {
                 return Err(RequestError::Validation(format!(
-                    "{INVALID_PARAMETER_CLAUSE}: The number of dimensions in the vector \
-                     attribute {name} must match the number of dimensions configured for the \
-                     vector index {}: {}",
-                    index.name, index.dimensions
+                    "{INVALID_PARAMETER_CLAUSE}. Invalid type for parameter {name}, Expected: \
+                     {VECTOR_PARAMETER_TYPE} list IndexName: {}",
+                    index.name
                 )));
+            };
+            for (position, element) in elements.iter().enumerate() {
+                if vector_component(element).is_none() {
+                    // WHICH element is at fault is reported here and nowhere else, so the
+                    // position is part of the parameter named, beside the
+                    // `AttributeValue` type the element arrived as.
+                    return Err(RequestError::Validation(format!(
+                        "{INVALID_PARAMETER_CLAUSE}. Invalid type for parameter \
+                         {name}[{position}], Expected: {VECTOR_PARAMETER_TYPE}, Actual: {}. \
+                         IndexName: {}",
+                        attribute_value_type(element),
+                        index.name
+                    )));
+                }
             }
-            let numeric = value_is_vector(value);
-            if !numeric {
+            if i64::try_from(elements.len()).unwrap_or(i64::MAX) != index.dimensions {
                 return Err(RequestError::Validation(format!(
-                    "{INVALID_PARAMETER_CLAUSE}: The vector attribute {name} must hold only \
-                     numbers, each a 32-bit IEEE-754 floating point value"
+                    "{INVALID_PARAMETER_CLAUSE}. Invalid size for parameter {name}, Expected: {}, \
+                     Actual: {} IndexName: {}",
+                    index.dimensions,
+                    elements.len(),
+                    index.name
                 )));
             }
             // The search schema partitions and filters by the VALUE of each attribute it
@@ -1203,18 +1232,17 @@ impl Table {
         // `PutItem$ConsumedCapacity`), so each index the write reached carries its own
         // figure beside the capacity breakdown above.
         for index in &self.vector_indexes {
-            let metered = [before, after]
+            let reached = [before, after]
                 .into_iter()
                 .flatten()
-                .filter(|item| index.covers(item))
-                .map(|item| index.write_request_bytes(item))
-                .max();
-            if let Some(bytes) = metered {
+                .find(|item| index.covers(item));
+            if let Some(item) = reached {
+                let key_bytes = item_size(&self.key_attributes(item));
                 capacity.vector_indexes.insert(
                     index.name.clone(),
                     // Exact: the store admits far fewer bytes than an `f64` carries
                     // whole numbers for, so the figure reported is the figure counted.
-                    bytes.max(MIN_VECTOR_WRITE_BYTES) as f64,
+                    index.write_request_bytes(key_bytes) as f64,
                 );
             }
         }

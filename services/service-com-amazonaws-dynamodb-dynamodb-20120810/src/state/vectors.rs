@@ -22,14 +22,21 @@ pub fn vector_values(value: &AttributeValue) -> Option<Vec<f32>> {
     let AttributeValue::L(values) = value else {
         return None;
     };
-    values
-        .iter()
-        .map(|element| match element {
-            AttributeValue::N(text) => text
-                .parse::<f32>()
-                .ok()
-                .filter(|number| number.is_finite()),
-            _ => None,
-        })
-        .collect()
+    values.iter().map(vector_component).collect()
+}
+
+/// The number ONE element of a vector holds, or `None` when the element is no component
+/// of one: a value of another type, or a number no 32-bit float can hold.
+///
+/// This is the per-element half of [`vector_values`], stated once so that a caller which
+/// has to report WHICH element is at fault walks the list by the same reading as a caller
+/// that only asks whether the whole value is a vector.
+pub fn vector_component(element: &AttributeValue) -> Option<f32> {
+    match element {
+        AttributeValue::N(text) => text
+            .parse::<f32>()
+            .ok()
+            .filter(|number| number.is_finite()),
+        _ => None,
+    }
 }

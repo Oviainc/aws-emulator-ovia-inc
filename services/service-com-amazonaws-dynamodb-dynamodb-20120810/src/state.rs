@@ -221,19 +221,12 @@ pub const MAX_PROJECTED_NON_KEY_ATTRIBUTES: usize = 100;
 /// Counted the way the doc counts: one entry per NAME PER INDEX, so a name projected
 /// into two indexes spends two of the budget. `ALL` and `KEYS_ONLY` projections name no
 /// attributes and spend none — "This limit only applies when you specify the
-/// ProjectionType of INCLUDE".
-pub fn check_projection_budget<'p>(
-    projections: impl IntoIterator<Item = &'p Projection>,
-) -> Result<(), RequestError> {
-    let projected: usize = projections
-        .into_iter()
-        .map(|projection| {
-            projection
-                .non_key_attributes
-                .as_ref()
-                .map_or(0, |attributes| attributes.len())
-        })
-        .sum();
+/// ProjectionType of INCLUDE". `counts` is what each index of the table spends
+/// ([`projected_non_key_attributes`] for a secondary index,
+/// [`vector_projected_non_key_attributes`] for a vector index, whose own attributes spend
+/// from the same budget).
+pub fn check_projection_budget(counts: impl IntoIterator<Item = usize>) -> Result<(), RequestError> {
+    let projected: usize = counts.into_iter().sum();
     if projected > MAX_PROJECTED_NON_KEY_ATTRIBUTES {
         return Err(RequestError::Validation(format!(
             "One or more parameter values were invalid: Number of projected attributes in all \
@@ -242,6 +235,30 @@ pub fn check_projection_budget<'p>(
         )));
     }
     Ok(())
+}
+
+/// What ONE secondary index's projection spends from that budget: the names it projects.
+pub fn projected_non_key_attributes(projection: &Projection) -> usize {
+    projection
+        .non_key_attributes
+        .as_ref()
+        .map_or(0, |attributes| attributes.len())
+}
+
+/// What ONE vector index spends from it: the names its projection carries, plus the
+/// attributes the index itself holds — "The total number of projected non-key attributes
+/// is shared across the vector attribute (counts as 1) and INLINE_FILTER search schema
+/// elements (each counts as 1). HASH search schema elements do not count toward this
+/// limit" (`CreateTable$VectorIndexes`).
+pub fn vector_projected_non_key_attributes(index: &VectorIndex) -> usize {
+    let inline_filters = index
+        .search_schema
+        .iter()
+        .filter(|element| element.search_schema_element_type == "INLINE_FILTER")
+        .count();
+    projected_non_key_attributes(&index.projection)
+        .saturating_add(1)
+        .saturating_add(inline_filters)
 }
 
 /// The most `HASH` and the most `RANGE` elements a TABLE's primary key may carry: "A

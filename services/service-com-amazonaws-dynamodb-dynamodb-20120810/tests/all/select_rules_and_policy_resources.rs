@@ -822,13 +822,30 @@ async fn a_schema_defect_is_worded_over_the_request_and_the_tables_own_schema() 
                     "Projection": {"ProjectionType": "ALL"},
                 }],
             }),
-            "Invalid KeySchema for index idx: The third KeySchemaElement is not a RANGE key type"
+            "One or more parameter values were invalid: All HASH key attributes must precede \
+             RANGE key attributes in the KeySchema"
                 .to_string(),
         ),
         (
+            // Every definition is used, so the key with nothing declared for it is the
+            // only fact there is to state, and the sentence interpolates nothing.
             "a table key attribute with no definition",
             json!({
                 "TableName": "UndefinedTableKey",
+                "BillingMode": "PAY_PER_REQUEST",
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"},
+                              {"AttributeName": "sk", "KeyType": "RANGE"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            }),
+            "Invalid KeySchema: Some index key attribute have no definition".to_string(),
+        ),
+        (
+            // The two sets differ BOTH ways round — a key with no definition beside a
+            // definition no key schema uses — so each list is reported, in the order a
+            // name-keyed table renders it rather than the one the request stated.
+            "a table key attribute with no definition beside an unused definition",
+            json!({
+                "TableName": "UndefinedTableKeyAndExtra",
                 "BillingMode": "PAY_PER_REQUEST",
                 "KeySchema": [{"AttributeName": "SK", "KeyType": "HASH"},
                               {"AttributeName": "PK", "KeyType": "RANGE"}],
@@ -840,23 +857,33 @@ async fn a_schema_defect_is_worded_over_the_request_and_the_tables_own_schema() 
                 .to_string(),
         ),
         (
+            // Neither list is reported in the order the request stated it: both are
+            // rendered out of a name-keyed table, so the position of a name is decided by
+            // the name alone.
             "an index key attribute with no definition",
             json!({
                 "TableName": "UndefinedIndexKey",
                 "BillingMode": "PAY_PER_REQUEST",
-                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
-                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"},
-                                         {"AttributeName": "rank", "AttributeType": "N"}],
-                "GlobalSecondaryIndexes": [{
-                    "IndexName": "idx",
-                    "KeySchema": [{"AttributeName": "status", "KeyType": "HASH"},
-                                  {"AttributeName": "rank", "KeyType": "RANGE"}],
-                    "Projection": {"ProjectionType": "ALL"},
-                }],
+                "KeySchema": [{"AttributeName": "PK", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "PK", "AttributeType": "S"},
+                                         {"AttributeName": "EXTRA", "AttributeType": "S"}],
+                "GlobalSecondaryIndexes": [
+                    {
+                        "IndexName": "idx",
+                        "KeySchema": [{"AttributeName": "PK", "KeyType": "HASH"},
+                                      {"AttributeName": "SK", "KeyType": "RANGE"}],
+                        "Projection": {"ProjectionType": "ALL"},
+                    },
+                    {
+                        "IndexName": "extra",
+                        "KeySchema": [{"AttributeName": "EXTRA", "KeyType": "HASH"}],
+                        "Projection": {"ProjectionType": "ALL"},
+                    },
+                ],
             }),
             "One or more parameter values were invalid: Some index key attributes are not \
-             defined in AttributeDefinitions. Keys: [status, rank], AttributeDefinitions: \
-             [pk, rank]"
+             defined in AttributeDefinitions. Keys: [SK, PK], AttributeDefinitions: \
+             [EXTRA, PK]"
                 .to_string(),
         ),
         (
@@ -868,8 +895,8 @@ async fn a_schema_defect_is_worded_over_the_request_and_the_tables_own_schema() 
                 "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
                 "ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1},
             }),
-            "One or more parameter values were invalid: ProvisionedThroughput cannot be \
-             specified when BillingMode is PAY_PER_REQUEST"
+            "One or more parameter values were invalid: Neither ReadCapacityUnits nor \
+             WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST"
                 .to_string(),
         ),
         (
@@ -899,7 +926,8 @@ async fn a_schema_defect_is_worded_over_the_request_and_the_tables_own_schema() 
                     "Projection": {"ProjectionType": "ALL"},
                 }],
             }),
-            "One or more parameter values were invalid: Dimensions must be between 1 and 4096"
+            "One or more parameter values were invalid: Number of dimensions must be between 1 \
+             and 4096 inclusive."
                 .to_string(),
         ),
     ];

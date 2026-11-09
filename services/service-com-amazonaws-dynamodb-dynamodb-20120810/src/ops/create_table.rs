@@ -375,18 +375,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(lift)?;
         // The projection budget is summed across EVERY index of the table, the VECTOR
         // indexes included — "the total count of NonKeyAttributes summed across all of the
-        // secondary indexes, must not exceed 100" (`Projection$NonKeyAttributes`) — so it
-        // can only be checked once all of them are known.
+        // secondary indexes, must not exceed 100" (`Projection$NonKeyAttributes`), and a
+        // vector index's own attributes spend from it too — so it can only be checked
+        // once all of them are known.
         crate::state::check_projection_budget(
             global_secondary_indexes
                 .iter()
-                .map(|index| &index.projection)
+                .map(|index| crate::state::projected_non_key_attributes(&index.projection))
+                .chain(local_secondary_indexes.iter().map(|index| {
+                    crate::state::projected_non_key_attributes(&index.projection)
+                }))
                 .chain(
-                    local_secondary_indexes
+                    vector_indexes
                         .iter()
-                        .map(|index| &index.projection),
-                )
-                .chain(vector_indexes.iter().map(|index| &index.projection)),
+                        .map(crate::state::vector_projected_non_key_attributes),
+                ),
         )
         .map_err(lift)?;
 
@@ -881,6 +884,11 @@ pub(crate) const DUPLICATE_INDEX_KEY_ATTRIBUTE_MESSAGE: &str =
 /// position required — `Invalid KeySchema: The second KeySchemaElement is not a RANGE key
 /// type` — so a caller is told WHICH element to fix rather than the whole rule.
 ///
+/// One defect is stated as the RULE and not as a position: a partition key that follows a
+/// sort key leaves no single element at fault, since a schema may carry several partition
+/// keys, so DynamoDB answers it with the fixed sentence that states the order the two
+/// kinds of key have to come in ([`HASH_AFTER_RANGE_MESSAGE`]).
+///
 /// `index_name` is `None` for a table's own primary key and the index's name for an
 /// index key, which DynamoDB scopes its refusal to.
 fn validated_key_type_order(
@@ -897,6 +905,16 @@ fn validated_key_type_order(
             // Only partition keys may lead a key schema, so the first element is never a
             // sort key.
             "RANGE" if position > 0 => saw_sort_key = true,
+            // A partition key AFTER a sort key breaks the ORDER of the schema rather
+            // than the type one position requires, and DynamoDB states that rule with
+            // its own fixed sentence ([`HASH_AFTER_RANGE_MESSAGE`]) instead of naming an
+            // element: with several partition keys allowed, no single position is the one
+            // at fault.
+            "HASH" if saw_sort_key => {
+                return Err(crate::state::RequestError::Validation(
+                    HASH_AFTER_RANGE_MESSAGE.to_string(),
+                ));
+            }
             _ => {
                 let expected = if hash_allowed { "HASH" } else { "RANGE" };
                 let scope =
@@ -945,24 +963,6 @@ fn validated_key_schema(
     // one attribute twice leaves an element with nothing of its own to key on, which is
     // the fact DynamoDB states for a TABLE's own key with the sentence below.
     check_distinct_key_attributes(&key_schema, UNDEFINED_TABLE_KEY_MESSAGE)?;
-    for element in &key_schema {
-        let name = element.attribute_name.as_str();
-        let Some(definition) = definitions
-            .iter()
-            .find(|definition| definition.attribute_name == name)
-        else {
-            // The same fact as for a secondary index's key, stated the same way: AWS's
-            // parameter-value sentence over the WHOLE key schema the request declared
-            // and the attribute names it defined.
-            return Err(undefined_schema_keys(&key_schema, &definitions));
-        };
-        if !matches!(definition.attribute_type.as_str(), "S" | "N" | "B") {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid AttributeDefinition: {name} must have AttributeType S, N or B, got {}",
-                definition.attribute_type
-            )));
-        }
-    }
     // The key attributes of every requested index, collected ONCE: the loop below asks
     // whether each definition is used, and a per-definition scan of every index's key
     // schema would be the product of two request-chosen counts. Both index kinds declare
@@ -991,6 +991,43 @@ fn validated_key_schema(
                 .flat_map(vector_index_attributes),
         )
         .collect();
+    // Whether the request's key schemas and its definitions name the same attributes in
+    // ONE direction only — every definition used, so the sets can differ only by a key
+    // with nothing declared for it. That is what decides WHICH sentence an undefined
+    // table key earns below.
+    let every_definition_used = definitions.iter().all(|definition| {
+        let name = definition.attribute_name.as_str();
+        key_schema
+            .iter()
+            .any(|element| element.attribute_name == name)
+            || index_key_attributes.contains(name)
+    });
+    for element in &key_schema {
+        let name = element.attribute_name.as_str();
+        let Some(definition) = definitions
+            .iter()
+            .find(|definition| definition.attribute_name == name)
+        else {
+            // A key with no definition, with every definition used, is the ONE fact there
+            // is to state, and DynamoDB states it with its fixed sentence, which
+            // interpolates nothing. A request that ALSO declares an attribute no key
+            // schema uses has the two sets differing both ways round, and is told what
+            // each of them holds instead ([`undefined_schema_keys`]) — the same wording a
+            // secondary index's key schema earns.
+            return Err(match every_definition_used {
+                true => crate::state::RequestError::Validation(
+                    UNDEFINED_TABLE_KEY_MESSAGE.to_string(),
+                ),
+                false => undefined_schema_keys(&key_schema, &definitions),
+            });
+        };
+        if !matches!(definition.attribute_type.as_str(), "S" | "N" | "B") {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid AttributeDefinition: {name} must have AttributeType S, N or B, got {}",
+                definition.attribute_type
+            )));
+        }
+    }
     for definition in &definitions {
         // "Some AttributeDefinitions are not used in any KeySchema": every defined
         // attribute must be consumed by a schema of the table — its own key, the key of
@@ -1389,14 +1426,20 @@ pub(crate) const INCLUDE_WITHOUT_NON_KEY_ATTRIBUTES_MESSAGE: &str =
 /// this service's to state.
 pub(crate) const MAX_VECTOR_DIMENSIONS: i64 = 4096;
 
-/// Hold one vector index's `Dimensions` to that ceiling. AWS states it as a
-/// parameter-value sentence naming the member and the range it has to fall in, and
-/// nothing of the index: the quota is the same for every index of every table.
+/// The fewest dimensions one vector may carry: the model bounds
+/// [`VectorIndex$Dimensions`] with a `@range` minimum of 1, so an index of no dimensions
+/// holds no vector at all.
+pub(crate) const MIN_VECTOR_DIMENSIONS: i64 = 1;
+
+/// Hold one vector index's `Dimensions` to that range. AWS states it as a
+/// parameter-value sentence naming the quantity and the inclusive range it has to fall
+/// in, and nothing of the index or of the value supplied: the quota is the same for every
+/// index of every table.
 pub(crate) fn check_vector_dimensions(dimensions: i64) -> Result<(), crate::state::RequestError> {
-    if dimensions > MAX_VECTOR_DIMENSIONS {
+    if !(MIN_VECTOR_DIMENSIONS..=MAX_VECTOR_DIMENSIONS).contains(&dimensions) {
         return Err(crate::state::RequestError::Validation(format!(
-            "One or more parameter values were invalid: Dimensions must be between 1 and \
-             {MAX_VECTOR_DIMENSIONS}"
+            "One or more parameter values were invalid: Number of dimensions must be between \
+             {MIN_VECTOR_DIMENSIONS} and {MAX_VECTOR_DIMENSIONS} inclusive."
         )));
     }
     Ok(())
@@ -1411,6 +1454,15 @@ pub(crate) const THROUGHPUT_WITH_PAY_PER_REQUEST_MESSAGE: &str =
     "One or more parameter values were invalid: ProvisionedThroughput cannot be specified when \
      BillingMode is PAY_PER_REQUEST";
 
+/// AWS's fixed text for a table CREATED on-demand that also states a
+/// `ProvisionedThroughput`: the sentence names the two CAPACITY members the block carries
+/// rather than the block itself, since those are what a `PAY_PER_REQUEST` table has no
+/// setting for, and nothing of the table. The index-level refusal states the same two
+/// members ([`validated_index_throughput`]).
+pub(crate) const CAPACITY_WITH_PAY_PER_REQUEST_MESSAGE: &str =
+    "One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits \
+     can be specified when BillingMode is PAY_PER_REQUEST";
+
 /// AWS's fixed text for a `PROVISIONED` table that states no `ProvisionedThroughput`:
 /// "If you set BillingMode as PROVISIONED, you must specify this property"
 /// (`CreateTable$ProvisionedThroughput`).
@@ -1424,16 +1476,23 @@ pub(crate) const THROUGHPUT_WITHOUT_PROVISIONED_MESSAGE: &str =
 pub(crate) const UNDEFINED_TABLE_KEY_MESSAGE: &str =
     "Invalid KeySchema: Some index key attribute have no definition";
 
+/// AWS's fixed text for a key schema whose partition keys do not all precede its sort
+/// keys: the whole sentence is fixed, stating the ORDER the elements have to be in and
+/// naming neither an element nor the schema it belongs to.
+pub(crate) const HASH_AFTER_RANGE_MESSAGE: &str =
+    "One or more parameter values were invalid: All HASH key attributes must precede RANGE key \
+     attributes in the KeySchema";
+
 /// The refusal for KEY attributes `AttributeDefinitions` does not declare: AWS's
 /// parameter-value template over the WHOLE key schema the request declared and the
 /// attribute names it defined.
 ///
-/// The keys are the schema's own, in schema order — AWS reports the keys the schema is
-/// built on rather than only the ones with no definition, which is what tells the caller
-/// which of the two lists to extend — and the definitions are the ones the request
-/// declared, in the order it declared them. One wording for a table's own key and for a
-/// secondary index's, because it is one rule: "The attributes in KeySchema must also be
-/// defined in the AttributeDefinitions array" (`CreateTable$KeySchema`).
+/// The keys are the whole key schema of the index at fault — AWS reports the keys the
+/// schema is built on rather than only the ones with no definition, which is what tells
+/// the caller which of the two lists to extend — and the definitions are the ones the
+/// request declared. Neither list is in the order the request stated it
+/// ([`hash_table_order`]). A TABLE's own key schema is refused with its own fixed
+/// sentence instead ([`UNDEFINED_TABLE_KEY_MESSAGE`]).
 pub(crate) fn undefined_schema_keys(
     key_schema: &[KeySchemaElement],
     definitions: &[AttributeDefinition],
@@ -1449,9 +1508,56 @@ pub(crate) fn undefined_schema_keys(
     crate::state::RequestError::Validation(format!(
         "One or more parameter values were invalid: Some index key attributes are not defined \
          in AttributeDefinitions. Keys: [{}], AttributeDefinitions: [{}]",
-        keys.join(", "),
-        defined.join(", ")
+        hash_table_order(&keys).join(", "),
+        hash_table_order(&defined).join(", ")
     ))
+}
+
+/// The order DynamoDB renders a list of attribute NAMES in, inside the refusal above.
+///
+/// Neither list follows the request: a create whose definitions were declared in one
+/// order has them reported in another, and the same holds for a key schema's own
+/// elements, so each list is rendered out of a name-keyed hash table rather than out of
+/// the request. Which name lands where is decided by the NAME alone, so the same names
+/// declared in any order are reported the same way.
+///
+/// The table has a power-of-two count of slots — the smallest that holds the names at a
+/// 3/4 load factor — and a name's slot is its 32-bit polynomial hash (each UTF-16 code
+/// unit added to 31 times the running value) folded with its own high half, taken modulo
+/// that count. Names that share a slot keep the order they were declared in, and a name
+/// declared twice occupies one slot, as a name-keyed table holds one entry per name.
+///
+/// The slot count GROWS with the list rather than being fixed: a five-name list declared
+/// in one order is reported in an order no fixed count of sixteen slots produces, while
+/// the growth rule above reproduces that list and every shorter recorded one. The
+/// recorded lists are what the rule was settled against ([`undefined_schema_keys`]'s
+/// suite), and the permutation is computed from the names a request carries, never from a
+/// recorded list.
+fn hash_table_order<'a>(names: &[&'a str]) -> Vec<&'a str> {
+    let mut ordered: Vec<&str> = Vec::with_capacity(names.len());
+    for name in names {
+        if !ordered.contains(name) {
+            ordered.push(name);
+        }
+    }
+    let mut slots: usize = 2;
+    while ordered.len() * 4 > slots * 3 {
+        slots *= 2;
+    }
+    // A stable sort is what keeps two names of one slot in the order they arrived in, and
+    // the cached key hashes each name once rather than once per comparison.
+    ordered.sort_by_cached_key(|name| name_slot(name, slots));
+    ordered
+}
+
+/// Which of `slots` slots `name` occupies in the table [`hash_table_order`] renders.
+fn name_slot(name: &str, slots: usize) -> usize {
+    let mut hash: i32 = 0;
+    for unit in name.encode_utf16() {
+        hash = hash.wrapping_mul(31).wrapping_add(i32::from(unit));
+    }
+    let hash = hash as u32;
+    ((hash ^ (hash >> 16)) as usize) & (slots - 1)
 }
 
 /// One index's provisioned throughput, held to the table's billing mode: a
@@ -1504,7 +1610,7 @@ fn validated_throughput(
     match (on_demand, input.provisioned_throughput.clone()) {
         (true, None) => Ok((billing_mode, None)),
         (true, Some(_)) => Err(crate::state::RequestError::Validation(
-            THROUGHPUT_WITH_PAY_PER_REQUEST_MESSAGE.to_string(),
+            CAPACITY_WITH_PAY_PER_REQUEST_MESSAGE.to_string(),
         )),
         (false, Some(throughput)) => {
             if throughput.read_capacity_units < 1 || throughput.write_capacity_units < 1 {

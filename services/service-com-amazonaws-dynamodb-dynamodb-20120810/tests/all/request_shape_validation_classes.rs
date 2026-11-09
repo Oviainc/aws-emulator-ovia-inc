@@ -396,8 +396,8 @@ async fn a_capacity_mode_outside_the_declared_set_is_refused_as_the_member_it_is
                        "ProvisionedThroughput": {"ReadCapacityUnits": 1,
                                                  "WriteCapacityUnits": 1}}),
             ),
-            "One or more parameter values were invalid: ProvisionedThroughput cannot be \
-             specified when BillingMode is PAY_PER_REQUEST",
+            "One or more parameter values were invalid: Neither ReadCapacityUnits nor \
+             WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST",
         ),
         (
             "an on-demand update that names both the mode and capacity",
