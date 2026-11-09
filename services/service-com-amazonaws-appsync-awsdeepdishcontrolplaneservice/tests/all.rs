@@ -111,6 +111,8 @@ mod api_key_version_and_tagging_refusals;
 mod tag_resource;
 #[path = "all/tagging_arn_vendor_refusal.rs"]
 mod tagging_arn_vendor_refusal;
+#[path = "all/type_delete.rs"]
+mod type_delete;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
 #[path = "all/flush_api_cache.rs"]

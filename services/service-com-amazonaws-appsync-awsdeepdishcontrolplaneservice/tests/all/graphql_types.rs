@@ -46,15 +46,20 @@ const ACCOUNT: &str = "000000000000";
 
 /// One answer from the emulator: the parts a client branches on.
 #[derive(Debug, Clone)]
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// The `x-amzn-errortype` header restJson1 resolves the error shape from.
-    error_type: String,
-    body: Value,
+    pub(crate) error_type: String,
+    pub(crate) body: Value,
 }
 
 /// Send one request and return what the emulator answered.
-async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Option<Value>) -> Answer {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Answer {
     let payload = body.map_or_else(Bytes::new, |value| {
         Bytes::from(serde_json::to_vec(&value).expect("the request body serializes"))
     });
@@ -94,7 +99,7 @@ async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Optio
 }
 
 /// Create one GraphQL API through the shared helper and return its `apiId`.
-async fn create_api(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_api(router: &MultiServiceRouter, name: &str) -> String {
     let api = create_graphql_api(
         router,
         json!({
@@ -110,7 +115,7 @@ async fn create_api(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 /// Create one type under `api_id` from `definition`, reported in `format`.
-async fn create_type(
+pub(crate) async fn create_type(
     router: &MultiServiceRouter,
     api_id: &str,
     definition: &str,
@@ -126,7 +131,7 @@ async fn create_type(
 }
 
 /// Read the type `type_name` of `api_id` back, in `format`.
-async fn get_type(
+pub(crate) async fn get_type(
     router: &MultiServiceRouter,
     api_id: &str,
     type_name: &str,
@@ -143,19 +148,19 @@ async fn get_type(
 
 /// Both `TypeDefinitionFormat` values. Source: `smithy_query` shape
 /// `TypeDefinitionFormat` (`SDL`, `JSON`).
-const FORMATS: &[&str] = &[state::SDL_FORMAT, state::JSON_FORMAT];
+pub(crate) const FORMATS: &[&str] = &[state::SDL_FORMAT, state::JSON_FORMAT];
 
 /// One row of the round-trip table: a type definition, and what it declares.
 #[derive(Debug, Clone)]
-struct Row {
+pub(crate) struct Row {
     /// The SDL the create carries.
-    definition: &'static str,
+    pub(crate) definition: &'static str,
     /// The name the definition declares, which the type is addressed by.
-    name: &'static str,
+    pub(crate) name: &'static str,
     /// The introspection kind the definition's keyword declares.
-    kind: &'static str,
+    pub(crate) kind: &'static str,
     /// The definition's own description, which is the type's description.
-    description: Option<&'static str>,
+    pub(crate) description: Option<&'static str>,
 }
 
 /// Every kind of type a GraphQL SDL definition can declare, one row each.
@@ -169,7 +174,7 @@ struct Row {
 ///
 /// The rows are ordered so that a type another row refers to is created before it,
 /// which is what lets the JSON rendering resolve those references.
-fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     vec![
         Row {
             definition: "\"\"\"Anything addressable by id.\"\"\"\n\
@@ -230,7 +235,13 @@ fn rows() -> Vec<Row> {
 }
 
 /// Assert `reported` is the type `row` declares, reported in `format` under `api_id`.
-fn assert_projects(row: &Row, api_id: &str, format: &str, reported: &Value, source: &str) {
+pub(crate) fn assert_projects(
+    row: &Row,
+    api_id: &str,
+    format: &str,
+    reported: &Value,
+    source: &str,
+) {
     assert_eq!(
         reported["name"],
         json!(row.name),

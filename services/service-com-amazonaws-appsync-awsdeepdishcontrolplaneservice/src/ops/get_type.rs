@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // create was refused.
         let Some(record) = api.types.get(&input.type_name) else {
             return Err(GetTypeErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::type_not_found_message(&input.type_name)),
+                message: Some(crate::state::TYPE_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         };

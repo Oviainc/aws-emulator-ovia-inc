@@ -775,15 +775,17 @@ pub fn type_resource(api_id: &str, type_name: &str) -> String {
 }
 
 /// The text a `NotFoundException` (HTTP 404) carries for a type the named API does not
-/// hold: the absent type, which is what the caller has to act on.
+/// hold.
+///
+/// The service words this one as a FIXED sentence with no variable part — it names the
+/// kind of resource that was not found and nothing of the request — so there is nothing
+/// to interpolate and this is a constant rather than a template.
 ///
 /// Shared by every operation that addresses a type by name, so they cannot disagree
-/// about how a missing type is reported. Worded after the service's other
-/// absent-resource sentences (`crate::state::data_source_not_found_message`); the
-/// requirement it answers is the 404 and the `NotFoundException`.
-pub fn type_not_found_message(type_name: &str) -> String {
-    format!("Type {type_name} not found")
-}
+/// about how a missing type is reported. The wording is the one a recorded `DeleteType`
+/// refusal carries; should a read ever be recorded answering a different sentence, the
+/// readers would need their own text rather than this one.
+pub const TYPE_NOT_FOUND_MESSAGE: &str = "Type not found.";
 
 /// The text a `BadRequestException` (HTTP 400) carries for a create whose type name is
 /// already taken within the API: the name, which is the member the caller has to
