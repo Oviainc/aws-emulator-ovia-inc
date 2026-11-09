@@ -615,7 +615,7 @@ async fn a_compute_that_cannot_be_found_is_reported_as_the_identifier_asked_for(
     ));
 
     for (label, fleet, identifier) in &cases {
-        let expected = format!("Compute ({identifier}) not found");
+        let expected = format!("Host ({identifier}) not found.");
         assert_refused(
             &gamelift,
             "DescribeCompute",
@@ -890,7 +890,7 @@ async fn the_fleets_computes_are_listed_once_each_narrowed_and_paged() {
 
 /// A deregistered compute leaves the fleet: the describe and the list stop reporting it,
 /// the fleet's other computes are untouched, the name it held is free to register again,
-/// and a second deregister of it is refused as a compute the fleet does not hold.
+/// and a second deregister of it has nothing to remove and succeeds.
 ///
 /// The rows differ along which of the forms `ComputeNameOrArn` accepts the deregister
 /// names the compute by, the name's own form, and the fleet location it resides in.
@@ -978,7 +978,7 @@ async fn a_deregistered_compute_leaves_the_fleet_and_frees_its_name() {
             .await;
 
         // Gone from both read paths.
-        let expected = format!("Compute ({}) not found", case.name);
+        let expected = format!("Host ({}) not found.", case.name);
         assert_refused(
             &gamelift,
             "DescribeCompute",
@@ -1007,16 +1007,31 @@ async fn a_deregistered_compute_leaves_the_fleet_and_frees_its_name() {
             "case {label:?}: the fleet's other compute must survive, got {names:?}"
         );
 
-        // A second deregister of it has nothing to remove.
+        // A second deregister of it has nothing to remove, and says so by succeeding: the
+        // removal is idempotent, so the compute is still absent and the fleet's other
+        // compute is untouched.
+        gamelift
+            .ok(
+                "DeregisterCompute",
+                json!({"FleetId": &fleet_id, "ComputeName": &identifier}),
+            )
+            .await;
         assert_refused(
             &gamelift,
-            "DeregisterCompute",
-            json!({"FleetId": &fleet_id, "ComputeName": &identifier}),
+            "DescribeCompute",
+            json!({"FleetId": &fleet_id, "ComputeName": case.name}),
             "NotFoundException",
-            &format!("Compute ({identifier}) not found"),
+            &expected,
             label,
         )
         .await;
+        let kept = describe_compute(&gamelift, &fleet_id, "kept-host").await;
+        assert_eq!(
+            kept["ComputeName"],
+            json!("kept-host"),
+            "case {label:?}: a repeated deregister must leave the fleet's other compute, got \
+             {kept}"
+        );
 
         // And the name is free: registering it again stores a NEW compute at the address
         // that register gives it.

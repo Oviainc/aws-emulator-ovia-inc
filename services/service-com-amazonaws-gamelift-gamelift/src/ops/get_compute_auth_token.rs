@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetComputeAuthToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetComputeAuthToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetComputeAuthToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +178,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetComputeAuthToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetComputeAuthTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetComputeAuthToken"))
+        let internal = |message: &str| -> Self::Error {
+            GetComputeAuthTokenErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some(message.to_string()),
+            })
+            .into()
+        };
+        let not_found = |message: String| -> Self::Error {
+            GetComputeAuthTokenErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // "Requests an authentication token ... for a compute resource": this operation
+        // MINTS, so the token material comes from the emulator's credential store — the
+        // only thing that creates secrets — and is minted BEFORE the compute store is
+        // locked, so no other component's lock is taken while that guard is held. A
+        // compute that already holds a valid token is answered with THAT token, and this
+        // candidate is dropped (see `issue_compute_auth_token`).
+        let Some(minted) = crate::state::mint_compute_auth_token(ctx.credential_store()) else {
+            return Err(internal(
+                "an authentication token could not be minted for the compute",
+            ));
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal("the GameLift emulator state is unavailable"));
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // "A unique identifier for the fleet that the compute is registered to" and "the
+        // name of the compute resource you are requesting the authentication token for":
+        // this operation acts on ONE named resource, so an identifier that names no stored
+        // resource is the modelled `NotFoundException` ("the requested resource was not
+        // found. The resource was either not created yet or deleted") — for the fleet the
+        // request names as much as for the compute registered with it.
+        let Some(fleet_id) = state.resolve_fleet_id(&input.fleet_id) else {
+            return Err(not_found(crate::state::fleet_not_found_message(
+                &input.fleet_id,
+            )));
+        };
+        let Some((compute_name, compute_arn, fleet_arn)) = state
+            .resolve_compute(&fleet_id, &input.compute_name)
+            .map(|compute| {
+                (
+                    compute.compute_name.clone(),
+                    compute.compute_arn.clone(),
+                    compute.fleet_arn.clone(),
+                )
+            })
+        else {
+            return Err(not_found(crate::state::compute_not_found_message(
+                &input.compute_name,
+            )));
+        };
+
+        // The token the compute already holds, or the minted one when it holds none that
+        // is valid at `now`. The response is read off the STORED record, so the next
+        // request for this compute's token can only agree with it.
+        let Some(issued) = state.issue_compute_auth_token(&fleet_id, &compute_name, minted, now)
+        else {
+            return Err(internal(
+                "the compute's authentication token could not be read back",
+            ));
+        };
+
+        Ok(GetComputeAuthTokenOutput {
+            fleet_id: Some(fleet_id),
+            fleet_arn: Some(fleet_arn),
+            compute_name: Some(compute_name),
+            compute_arn: Some(compute_arn),
+            auth_token: Some(issued.token),
+            expiration_timestamp: Some(crate::state::to_date_time(issued.expires_at)),
+        })
     }
 }

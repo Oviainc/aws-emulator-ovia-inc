@@ -25,6 +25,8 @@ mod aliases;
 mod anywhere_computes;
 #[path = "all/builds.rs"]
 mod builds;
+#[path = "all/compute_auth_tokens.rs"]
+mod compute_auth_tokens;
 #[path = "all/custom_location_deletion.rs"]
 mod custom_location_deletion;
 #[path = "all/error_message_templates.rs"]

@@ -407,6 +407,17 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// state errors it causes.
 pub const WORKFLOW_DELAY: Duration = Duration::from_millis(400);
 
+/// How long an authentication token issued for a compute stays valid.
+///
+/// `GetComputeAuthToken`'s own doc: "Authentication tokens are valid for a limited time
+/// span, so you need to request a fresh token before the current token expires", and
+/// `GetComputeAuthTokenOutput$ExpirationTimestamp` is "the amount of time until the
+/// authentication token is no longer valid". Neither the model nor the docs name that
+/// span, so it is CHOSEN: long enough for the game server processes on a compute to start
+/// and pass the token they hold to the server SDK's `InitSDK()`, and short enough that the
+/// token is plainly temporary and has to be re-requested over the life of a compute.
+pub const COMPUTE_AUTH_TOKEN_VALIDITY: Duration = Duration::from_secs(15 * 60);
+
 /// A fresh opaque id of the shape AWS mints for a GameLift resource: a UUID, which the
 /// modelled patterns accept (`FleetId` `^[a-z]*fleet-[a-zA-Z0-9\-]+$`, `PlayerSessionId`
 /// `^psess-\S+$`, `IdStringModel` `^[a-zA-Z0-9-]+$`) and the docs show
@@ -426,14 +437,27 @@ pub fn mint_uuid(counter: &mut u64, kind: &str) -> String {
     hasher.update(process_seed().to_be_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
     let hex = hex::encode(digest);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
+    // A SHA-256 digest renders as 64 hexadecimal characters, so the grouping always applies.
+    as_uuid(&hex).unwrap_or(hex)
+}
+
+/// The first 32 hexadecimal characters of `hex`, written the way a UUID is (8-4-4-4-12),
+/// or `None` when `hex` holds fewer than 32.
+///
+/// The one place this emulator writes that grouping, so every UUID it hands out — a
+/// resource id ([`mint_uuid`]) and a compute's authentication token
+/// ([`mint_compute_auth_token`]) alike — reads the same way.
+fn as_uuid(hex: &str) -> Option<String> {
+    (hex.len() >= 32).then(|| {
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )
+    })
 }
 
 /// A seed drawn once per process, so ids minted by two emulator processes from the same
@@ -938,13 +962,16 @@ pub fn fleet_not_found_message(id_or_arn: &str) -> String {
 /// shared by every operation that names ONE compute, so the same missing compute reads the
 /// same way whichever of them was called.
 ///
-/// The same template every other GameLift resource this store holds is reported missing
-/// with ([`alias_not_found_message`], [`build_not_found_message`]): the resource kind leads
-/// the sentence and the identifier the CALLER supplied is its one variable part, carried
-/// verbatim in parentheses, since either of the two forms the member accepts
+/// The service calls a compute of a fleet a HOST in this sentence, and ends it with a full
+/// stop: that is the wording recorded for a compute an Anywhere fleet no longer holds, on
+/// the `DescribeCompute` of fixture `gamelift-multi-compute-isolation` (step `task#11`) and
+/// on the reads of the behavioural unit
+/// `gamelift.anywhere-fleet-register-compute-lifecycle`. The one variable part is the
+/// identifier the CALLER supplied, carried verbatim in parentheses, since either of the two
+/// forms the member accepts
 /// (`^([a-zA-Z0-9\-]+(\/[a-zA-Z0-9\-]+)?|arn:.*:compute\/...)$`) selects the same compute.
 pub fn compute_not_found_message(name_or_arn: &str) -> String {
-    format!("Compute ({name_or_arn}) not found")
+    format!("Host ({name_or_arn}) not found.")
 }
 
 /// The Amazon GameLift Servers SDK endpoint a game server process on a registered compute
@@ -958,6 +985,83 @@ pub fn compute_not_found_message(name_or_arn: &str) -> String {
 /// Region the compute is registered in, which is the one variable part of the endpoint.
 pub fn service_sdk_endpoint(region: &str) -> String {
     format!("wss://{region}.api.amazongamelift.com")
+}
+
+/// A fresh authentication token for the game server processes running on one compute, for
+/// `GetComputeAuthToken`.
+///
+/// The token authenticates a game server process to the Amazon GameLift Servers service
+/// through the server SDK rather than a request to this emulator, so it must never be
+/// accepted as a SigV4 credential — but it is still a secret handed to a caller, and
+/// nothing in a service may construct a secret itself. It is therefore minted by the one
+/// component that generates secrets, the emulator's credential store, and removed from
+/// that store again: the caller gets the secret, the emulator keeps no credential it
+/// would accept, and nothing accumulates per call.
+///
+/// `ComputeAuthToken` is modelled `len 1..64, pattern ^[a-zA-Z0-9\-]+$` and the docs of
+/// this service write the values it mints as UUIDs
+/// (`compute-a1234567-b8c9-0d1e-2fa3-b45c6d7e8912`), so the token is the minted secret's
+/// own randomness read off as hexadecimal characters and grouped the way [`as_uuid`]
+/// writes one.
+///
+/// `None` when the store minted no secret material long enough to read a token off, which
+/// leaves the operation to refuse rather than report a token it made up. Every secret of
+/// the minted credential is read, so the 32 characters a token needs do not depend on one
+/// of them alone.
+pub fn mint_compute_auth_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let secrets: String = [
+        ::emulator_server::aws_credentials::SESSION_TOKEN,
+        ::emulator_server::aws_credentials::SECRET_ACCESS_KEY,
+    ]
+    .iter()
+    .filter_map(|name| minted.secret(name))
+    .collect();
+    // A compute's auth token is not a credential of this emulator; see above.
+    if let Err(error) = store.delete(&minted.id) {
+        ::tracing::warn!(
+            reason = ?error,
+            "a compute authentication token could not be withdrawn from the credential store"
+        );
+    }
+    let hex: String = secrets
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    as_uuid(&hex)
+}
+
+/// An authentication token issued to a compute, and the instant it stops being valid.
+#[derive(Clone)]
+pub struct ComputeAuthTokenRecord {
+    /// The token value itself, as `GetComputeAuthToken` reported it
+    /// ([`mint_compute_auth_token`]).
+    pub token: String,
+    /// When the token stops being valid, which `GetComputeAuthTokenOutput`'s
+    /// `ExpirationTimestamp` reports ([`COMPUTE_AUTH_TOKEN_VALIDITY`] after it was
+    /// issued).
+    pub expires_at: SystemTime,
+}
+
+/// Prints when the token expires but NOT the token, so a formatted or logged value — of
+/// this record, of the compute holding it, or of the whole store — leaks no secret
+/// material; the shape the credential store's own minted-credential type takes for the
+/// same reason.
+impl ::std::fmt::Debug for ComputeAuthTokenRecord {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.debug_struct("ComputeAuthTokenRecord")
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ComputeAuthTokenRecord {
+    /// Whether this token is still valid at `now`: "authentication tokens are valid for a
+    /// limited time span", which ends at its expiration.
+    pub fn is_valid_at(&self, now: SystemTime) -> bool {
+        now < self.expires_at
+    }
 }
 
 /// A compute resource registered with an Anywhere fleet, as `RegisterCompute` persisted
@@ -984,6 +1088,11 @@ pub struct ComputeRecord {
     /// The endpoint this compute's game server processes connect to the service through
     /// (see [`service_sdk_endpoint`]).
     pub service_sdk_endpoint: String,
+    /// The authentication token this compute's game server processes present to the
+    /// service, while it is still valid: "all game servers that are running on [a] compute
+    /// have access to a valid auth token", so a compute holds the ONE token
+    /// `GetComputeAuthToken` last issued for it, and none until the first request for one.
+    pub auth_token: Option<ComputeAuthTokenRecord>,
 }
 
 impl ComputeRecord {
@@ -2343,6 +2452,20 @@ impl ComAmazonawsGameliftGameliftState {
             }
         }
 
+        // An authentication token issued for a compute stops being valid at its
+        // expiration, which the clock makes due whether or not anybody called: the compute
+        // then holds none until a fresh one is requested, and the emulator keeps no secret
+        // past its life.
+        for compute in self.computes.values_mut() {
+            if compute
+                .auth_token
+                .as_ref()
+                .is_some_and(|token| !token.is_valid_at(now))
+            {
+                compute.auth_token = None;
+            }
+        }
+
         // A build whose files the service has finished reading is READY: "the game build
         // has been successfully uploaded. You can now create new fleets for this build."
         for build in self.builds.values_mut() {
@@ -2736,6 +2859,41 @@ impl ComAmazonawsGameliftGameliftState {
             self.computes
                 .get(&(fleet_id.to_string(), name_or_arn.to_string()))
         }
+    }
+
+    /// The authentication token the compute registered under `(fleet_id, compute_name)`
+    /// presents at `now`, issuing `minted` as that compute's token when it holds no valid
+    /// one.
+    ///
+    /// `GetComputeAuthToken`'s doc has every game server process on a compute working from
+    /// the same token — "all game servers that are running on all fleet instances have
+    /// access to a valid auth token" — and has a caller "request a fresh token before the
+    /// current token expires", so a compute holds ONE token at a time: while that token is
+    /// still valid every request for it is answered with it, and the first request after it
+    /// expires is answered with a freshly minted one, valid for
+    /// [`COMPUTE_AUTH_TOKEN_VALIDITY`] from the instant it was issued. `None` when no
+    /// compute is registered under the pair.
+    pub fn issue_compute_auth_token(
+        &mut self,
+        fleet_id: &str,
+        compute_name: &str,
+        minted: String,
+        now: SystemTime,
+    ) -> Option<ComputeAuthTokenRecord> {
+        let compute = self
+            .computes
+            .get_mut(&(fleet_id.to_string(), compute_name.to_string()))?;
+        let issued = compute
+            .auth_token
+            .take()
+            .filter(|held| held.is_valid_at(now))
+            .unwrap_or(ComputeAuthTokenRecord {
+                token: minted,
+                expires_at: now + COMPUTE_AUTH_TOKEN_VALIDITY,
+            });
+        // Reported from the record the compute keeps, so this response and the next
+        // request for the same compute's token can only agree.
+        Some(compute.auth_token.insert(issued).clone())
     }
 
     /// The computes registered with `fleet_id`, oldest first, so a paginated walk is

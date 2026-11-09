@@ -36,6 +36,10 @@ pub(crate) fn gamelift_arn(resource: &str) -> String {
 /// dispatch path.
 pub(crate) struct GameLift {
     router: MultiServiceRouter,
+    /// The one engine the services below are mounted on, so a suite can read the state a
+    /// request wrote (or set up state whose span no test can wait out) through
+    /// [`Self::state`].
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl GameLift {
@@ -53,9 +57,20 @@ impl GameLift {
         // that one object store, so the two are mounted together here as well. It claims
         // only requests scoped to `s3`, so every call below still reaches GameLift.
         router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
-            engine,
+            Arc::clone(&engine),
         ));
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// This service's store in that engine, exactly as a handler reaches it
+    /// (`crate::state::service_state(&*self.engine)`).
+    pub(crate) fn state(
+        &self,
+    ) -> engine::ServiceState<
+        service_com_amazonaws_gamelift_gamelift::ComAmazonawsGameliftGameliftState,
+    > {
+        service_com_amazonaws_gamelift_gamelift::state::service_state(&*self.engine)
+            .expect("the GameLift store is reachable through the engine the service is mounted on")
     }
 
     /// Send `GameLift.<operation>` with `body` and return the status and parsed body.

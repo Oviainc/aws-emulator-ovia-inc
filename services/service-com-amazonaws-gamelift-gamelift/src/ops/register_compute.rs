@@ -322,6 +322,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             location,
             creation_time: now,
             service_sdk_endpoint: crate::state::service_sdk_endpoint(&region),
+            // A compute holds no authentication token until one is requested for it:
+            // `GetComputeAuthToken` is the operation that issues one.
+            auth_token: None,
         };
         state.computes.insert(key.clone(), record);
 

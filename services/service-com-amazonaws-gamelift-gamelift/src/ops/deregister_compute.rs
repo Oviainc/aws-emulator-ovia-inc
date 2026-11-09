@@ -158,11 +158,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.tick(::std::time::SystemTime::now());
 
-        // "To deregister a compute, ... specify the compute name and the fleet ID." This
-        // operation acts on ONE named resource, so an identifier that names no stored
-        // resource is the modelled `NotFoundException` ("The requested resource was not
-        // found. The resource was either not created yet or deleted") — for the fleet the
-        // request names as much as for the compute registered with it.
+        // "To deregister a compute, ... specify the compute name and the fleet ID." The
+        // fleet is the resource this removal is scoped to, so a fleet identifier that names
+        // no stored fleet is the modelled `NotFoundException` ("The requested resource was
+        // not found. The resource was either not created yet or deleted"); the compute
+        // itself is what the removal is FOR, and one the fleet no longer holds is handled
+        // below.
         let Some(fleet_id) = state.resolve_fleet_id(&input.fleet_id) else {
             return Err(DeregisterComputeErrorModeled::NotFoundException(
                 NotFoundException {
@@ -175,14 +176,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resolve_compute(&fleet_id, &input.compute_name)
             .map(|compute| compute.compute_name.clone())
         else {
-            return Err(DeregisterComputeErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::compute_not_found_message(
-                        &input.compute_name,
-                    )),
-                },
-            )
-            .into());
+            // "Removes a compute resource from an Anywhere fleet": a compute the fleet no
+            // longer holds is already in the state this operation asks for, so the removal
+            // has nothing left to do and reports success. That is what the recorded
+            // behavioural unit `gamelift.anywhere-fleet-register-compute-lifecycle` shows:
+            // it deregisters its compute, asserts the READ paths then refuse it with the
+            // NotFoundException message `compute_not_found_message` carries, and
+            // deregisters the same compute again — a call the recording serves with a
+            // 2xx and an empty body, so this removal is idempotent. The modelled
+            // `NotFoundException` still answers a FLEET the store does not hold, above.
+            return Ok(DeregisterComputeOutput {});
         };
 
         // "Removes a compute resource from an Anywhere fleet. Deregistered computes can no
