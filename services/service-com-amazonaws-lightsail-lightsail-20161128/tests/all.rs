@@ -249,6 +249,8 @@ mod instance_snapshot_read;
 mod instance_start_addresses;
 #[path = "all/inverted_time_window.rs"]
 mod inverted_time_window;
+#[path = "all/key_pair_create.rs"]
+mod key_pair_create;
 #[path = "all/key_pair_delete.rs"]
 mod key_pair_delete;
 #[path = "all/key_pair_listing.rs"]

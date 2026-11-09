@@ -31,11 +31,12 @@
 //! `SHA256:`-prefixed form it prints by default — because this operation reports
 //! the fingerprint and never parses it.
 //!
-//! Nothing this emulator serves creates a key pair yet — `CreateKeyPair`,
-//! `ImportKeyPair` and `DownloadDefaultKeyPair` are still scaffold stubs with
-//! issues of their own — so seeding the store the handler reads
-//! (`state::with_state`) is the only way to drive a case where the account HOLDS
-//! key pairs, exactly as the sibling `key_pair_read` and `key_pair_delete` suites
+//! The rows below hold key pairs with chosen ids, instants and fingerprint
+//! forms, none of which a create lets a caller pick — `CreateKeyPair` mints its
+//! own material, and `ImportKeyPair` and `DownloadDefaultKeyPair` are still
+//! scaffold stubs with issues of their own — so seeding the store the handler
+//! reads (`state::with_state`) is how a case drives the account HOLDING key
+//! pairs, exactly as the sibling `key_pair_read` and `key_pair_delete` suites
 //! do. Everything the listing answers is asserted through the wire.
 
 use std::collections::BTreeSet;
@@ -205,9 +206,8 @@ async fn published_regions(emulator: &Emulator) -> Vec<String> {
     regions
 }
 
-/// Put every key pair this row describes in the store, as a `CreateKeyPair` or an
-/// `ImportKeyPair` would once either is implemented, answering them sorted by
-/// name.
+/// Put every key pair this row describes in the store, under the ids, instants
+/// and fingerprint forms the row names, answering them sorted by name.
 async fn hold(emulator: &Emulator, row: &Row) -> Vec<Held> {
     let regions = published_regions(emulator).await;
 

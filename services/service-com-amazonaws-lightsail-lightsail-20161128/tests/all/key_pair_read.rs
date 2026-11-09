@@ -20,12 +20,13 @@
 //! * A read changes nothing a later caller sees: repeating it answers the same
 //!   record, leaves the store as it was and writes no operation-log entry.
 //!
-//! Nothing this emulator serves creates a key pair yet — `CreateKeyPair`,
-//! `ImportKeyPair` and `DownloadDefaultKeyPair` are still scaffold stubs with
-//! issues of their own — so seeding the store the handler reads
-//! (`state::with_state`) is the only way to drive a case where the account HOLDS
-//! the key pair a read names, exactly as the sibling `key_pair_delete` suite
-//! does. Everything the read answers is asserted through the wire.
+//! The rows below hold a key pair with a chosen id, instant and fingerprint
+//! FORM, none of which a create lets a caller pick — `CreateKeyPair` mints its
+//! own material, and `ImportKeyPair` and `DownloadDefaultKeyPair` are still
+//! scaffold stubs with issues of their own — so seeding the store the handler
+//! reads (`state::with_state`) is how a case drives the account HOLDING the key
+//! pair a read names, exactly as the sibling `key_pair_delete` suite does.
+//! Everything the read answers is asserted through the wire.
 
 use std::collections::BTreeSet;
 
@@ -127,8 +128,8 @@ fn key_pair_id(index: usize) -> String {
     format!("05859e3d-331d-48ba-9034-1234512345{index:02}")
 }
 
-/// Put every key pair `ROWS` describes in the store, as a `CreateKeyPair` or an
-/// `ImportKeyPair` would once either is implemented.
+/// Put every key pair `ROWS` describes in the store, under the id, instant and
+/// fingerprint form each row names.
 fn hold(emulator: &Emulator) {
     let held = state::with_state(emulator.engine(), |store| {
         for (index, row) in ROWS.iter().enumerate() {

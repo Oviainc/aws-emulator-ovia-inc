@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateKeyPair
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateKeyPair`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creating an SSH key pair mints a real RSA key pair, holds the PUBLIC half for
+//! the account under the name the request names and hands the private half back
+//! to the caller once — the one call that ever reports it. Both halves come from
+//! the key this store generated ([`crate::state::MintedKeyPairMaterial`]), in
+//! the encodings this operation's output documents, and the `fingerprint` the
+//! record keeps is the digest of that key's DER-encoded public half.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateKeyPair::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +170,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateKeyPair` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateKeyPairErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateKeyPair"))
+        // A key pair belongs to one Region: Lightsail's API is regional, and the
+        // modelled `KeyPair$location` is "the region and Availability Zone where
+        // the key pair was created" — so the Region of the request's SigV4
+        // credential scope is what the pair is recorded in. A key pair is not
+        // zonal: nothing in this request picks an Availability Zone, so there is
+        // none to report.
+        let region = crate::state::request_region(ctx.parts());
+        let location = crate::state::StoredLocation::regional(&region);
+        let now = crate::state::now_ms();
+
+        // `keyPairName` is a modelled `@required` member carrying the modelled
+        // `ResourceName` pattern, so the centralized walk refused an absent or
+        // malformed one before this body ran.
+        let name = input.key_pair_name;
+        // The request's list BECOMES the tags this resource carries, so it is
+        // bounded AND collapsed by key here: the tags of a resource obey one
+        // rule whether a create or a later tag change put them there.
+        let tags = crate::state::tags_created_from(input.tags.as_deref()).map_err(invalid)?;
+
+        // A name this account already holds is refused BEFORE a key is generated,
+        // so a cheap repeated request cannot make this emulator mint an RSA key
+        // pair per refused call. It is NOT the authoritative check: that is the
+        // one under the exclusive hold below, which is what decides a race
+        // between two creates of one free name.
+        if crate::state::with_state(&*self.engine, |store| store.key_pair(&name).is_some())
+            .ok_or_else(unavailable)?
+        {
+            return Err(invalid(crate::state::names_already_in_use_message(&name)));
+        }
+
+        // Generating an RSA key pair is hundreds of milliseconds of CPU, so it runs
+        // on the blocking pool rather than on the worker serving this request:
+        // `spawn_blocking(..).await` is a real await point, so one key pair cannot
+        // starve the worker that serves health checks and every other request. It
+        // also runs BEFORE the store is reached, so no other request waits on the
+        // store while it runs — and a request that loses the race for the name
+        // below simply discards the material it minted, which was never reported
+        // or held.
+        let minted = match ::tokio::task::spawn_blocking(
+            crate::state::MintedKeyPairMaterial::mint,
+        )
+        .await
+        {
+            Ok(Some(minted)) => minted,
+            // The key did not generate or did not encode: there is no key pair to
+            // hold or to hand back.
+            Ok(None) => return Err(no_key_material()),
+            // The blocking generation did not run to completion — it panicked or
+            // was cancelled. The caller is answered the same way, because there is
+            // still no key pair; the cause is traced so the two are told apart
+            // from the outside. The key material itself is never traced.
+            Err(error) => {
+                ::tracing::warn!(
+                    error = %error,
+                    "the key pair generation task did not run to completion"
+                );
+                return Err(no_key_material());
+            }
+        };
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A key pair name addresses one key pair, so creating one this
+            // account already holds is refused rather than replacing the public
+            // key every instance launched with that pair is reachable through.
+            // The check and the insert below run under ONE exclusive hold on the
+            // store, so concurrent creates of one name cannot both be served:
+            // exactly one wins and the rest are refused.
+            if store.key_pair(&name).is_some() {
+                return Err(invalid(crate::state::names_already_in_use_message(&name)));
+            }
+            if store.key_pairs.len() >= crate::state::MAX_KEY_PAIRS {
+                return Err(invalid(format!(
+                    "creating a key pair would take this account past the {} this emulator \
+                     holds",
+                    crate::state::MAX_KEY_PAIRS
+                )));
+            }
+
+            let id = store.mint_uuid();
+            // The PUBLIC half alone is held: "Lightsail … removing the public
+            // key from Amazon Lightsail" is the whole of what a delete deletes,
+            // so the private half this call answers is never stored and cannot
+            // be read back by a later call.
+            store.insert_key_pair(crate::state::StoredKeyPair {
+                name: name.clone(),
+                arn: crate::state::key_pair_arn(&region, &id),
+                support_code: crate::state::support_code(&id),
+                created_at_ms: now,
+                location: location.clone(),
+                tags: tags.clone(),
+                fingerprint: minted.fingerprint.clone(),
+            });
+            // The pair exists as this call returns — a `KeyPair` carries no
+            // status member, so there is nothing for the clock to settle later —
+            // which is why the operation it logs is answered terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_KEY_PAIR,
+                crate::state::RESOURCE_TYPE_KEY_PAIR,
+                &name,
+                &location,
+                None,
+            );
+            // `keyPair` is the record this call just stored, read back through
+            // the one projection every key pair read answers with, so a create
+            // and a later `GetKeyPair` cannot report the pair differently.
+            let key_pair = store.key_pair(&name).map(crate::state::StoredKeyPair::view);
+            // The halves are MOVED into the answer: this is the one call that
+            // reports them, so no second copy of the private half is made.
+            Ok(CreateKeyPairOutput {
+                key_pair,
+                public_key_base64: Some(minted.public_key),
+                private_key_base64: Some(minted.private_key),
+                operation: Some(operation.view()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateKeyPairError {
+    CreateKeyPairErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The key material did not encode, so there is no key pair to hold or to hand
+/// back: the modelled `OperationFailureException` — "Lightsail throws this
+/// exception when an operation fails to execute" — rather than a record with no
+/// key behind it.
+fn no_key_material() -> CreateKeyPairError {
+    CreateKeyPairErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some("the key pair's key material could not be generated".to_string()),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateKeyPairError {
+    CreateKeyPairErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail key pair store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

@@ -96,6 +96,13 @@ pub const MAX_EXPORT_SNAPSHOT_RECORDS: usize = 500;
 /// the modelled `InvalidInputException`.
 pub const MAX_STATIC_IPS: usize = 500;
 
+/// The most SSH key pairs this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
+/// refused with the modelled `InvalidInputException`, exactly as a create past
+/// [`MAX_STATIC_IPS`] is.
+pub const MAX_KEY_PAIRS: usize = 500;
+
 /// The most recordset entries this emulator will hold in one domain.
 ///
 /// Emulator resource guard, NOT an AWS quota: an entry is caller-sized and the

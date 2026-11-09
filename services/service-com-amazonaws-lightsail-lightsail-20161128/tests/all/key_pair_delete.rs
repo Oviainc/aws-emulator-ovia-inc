@@ -24,14 +24,15 @@
 //!   service holds, while for every other key pair an absent, empty or
 //!   disagreeing fingerprint is ignored and the delete is served.
 //!
-//! Nothing this emulator serves creates a key pair yet: `CreateKeyPair`,
+//! The rows below hold a key pair with a chosen id, instant and fingerprint
+//! FORM — the MD5 colon-hex form and the `SHA256:` one — none of which a create
+//! lets a caller pick: `CreateKeyPair` mints its own material, and
 //! `ImportKeyPair` and `DownloadDefaultKeyPair` are still scaffold stubs with
-//! issues of their own, so seeding the store the handlers read
-//! (`state::with_state`) is the only way to drive a case where the account HOLDS
-//! the key pair a delete names. Every assertion about what the delete did is
-//! made through the wire — the operation it answered, the operation log,
-//! `GetActiveNames` and `TagResource` — plus the store itself, which is what the
-//! removal is about.
+//! issues of their own. So seeding the store the handlers read
+//! (`state::with_state`) is how a case drives the account HOLDING the key pair a
+//! delete names. Every assertion about what the delete did is made through the
+//! wire — the operation it answered, the operation log, `GetActiveNames` and
+//! `TagResource` — plus the store itself, which is what the removal is about.
 
 use std::collections::BTreeSet;
 
@@ -157,8 +158,8 @@ fn delete_body(name: &str, fingerprint: Option<String>) -> Value {
     }
 }
 
-/// Put the key pairs `rows` describes in the store, as a `CreateKeyPair` or an
-/// `ImportKeyPair` would once either is implemented.
+/// Put the key pairs `rows` describes in the store, under the id, instant and
+/// fingerprint form each row names.
 ///
 /// The ids the ARN and support code are built from are this suite's own, so two
 /// rows never share one; everything else is what the row says the account holds.

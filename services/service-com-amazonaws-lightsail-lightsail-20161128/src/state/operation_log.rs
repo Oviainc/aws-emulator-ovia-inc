@@ -231,6 +231,8 @@ pub const OPERATION_TYPE_DELETE_AUTO_SNAPSHOT: &str = "DeleteAutoSnapshot";
 /// See [`OPERATION_TYPE_COPY_SNAPSHOT`].
 pub const OPERATION_TYPE_EXPORT_SNAPSHOT: &str = "ExportSnapshot";
 /// See [`OPERATION_TYPE_COPY_SNAPSHOT`].
+pub const OPERATION_TYPE_CREATE_KEY_PAIR: &str = "CreateKeyPair";
+/// See [`OPERATION_TYPE_COPY_SNAPSHOT`].
 pub const OPERATION_TYPE_DELETE_KEY_PAIR: &str = "DeleteKeyPair";
 /// See [`OPERATION_TYPE_COPY_SNAPSHOT`].
 pub const OPERATION_TYPE_PEER_VPC: &str = "PeerVpc";

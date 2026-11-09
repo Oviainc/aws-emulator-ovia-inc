@@ -336,8 +336,12 @@ fn openssh_sha1_fingerprint(body: &str) -> Option<String> {
 
 /// `bytes` as the colon-separated lowercase hex an X.509 certificate's
 /// fingerprint is published in, the form `fingerprintSHA1`'s own RDP example
-/// shows.
-fn colon_hex(bytes: &[u8]) -> String {
+/// shows — and the form an RSA key pair's `fingerprint` is published in
+/// ([`MintedKeyPairMaterial::mint`]).
+///
+/// The ONE owner of that rendering, so every colon-hex digest this store
+/// publishes is built the same way.
+pub fn colon_hex(bytes: &[u8]) -> String {
     bytes
         .iter()
         .map(|byte| format!("{byte:02x}"))

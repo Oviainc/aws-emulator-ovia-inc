@@ -31,8 +31,21 @@ hex = { workspace = true }
 service-com-amazonaws-s3-amazons3 = { workspace = true }
 # The OpenSSH key, certificate and fingerprint formats: the temporary key pair
 # `GetInstanceAccessDetails` grants, and the SSH host key it records for an
-# instance, are real Ed25519 key material described by this crate.
+# instance, are real Ed25519 key material described by this crate, and the
+# `ssh-rsa` public key line `CreateKeyPair` answers is written with it too.
 ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "getrandom"] }
+# The RSA key pair `CreateKeyPair` mints; already in this workspace's lock file,
+# where another service generates its RSA key pairs with it.
+aws-lc-rs = "1"
+# The PKCS#1 `RSAPrivateKey` an "RSA PRIVATE KEY" PEM carries, and the PKCS#8
+# wrapper the generated key arrives in: the two encodings a minted RSA key pair
+# is read out of and published in.
+pkcs1 = "0.7"
+pkcs8 = "0.10"
+# The DER and PEM framing those two encodings are written with.
+der = { version = "0.7", features = ["alloc", "pem"] }
+# The MD5 digest an AWS RSA key pair fingerprint is published as.
+md-5 = "0.10"
 # The X.509 RDP certificate an RDP access to a Windows instance witnesses.
 rcgen = "0.13"
 # The SHA-1 half of a host key's two published fingerprints.
@@ -50,6 +63,13 @@ hex = { workspace = true }
 # The granted temporary key material is read back with the SAME OpenSSH key crate
 # the service writes it with, so a test asserts a real key rather than a shape.
 ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "getrandom"] }
+# A created key pair's two halves are re-read, and the DER its published
+# fingerprint is the digest of is rebuilt from the public half the call reported,
+# so the fingerprint rule is checked rather than re-stated.
+pkcs1 = { version = "0.7", features = ["pkcs8"] }
+spki = "0.7"
+der = { version = "0.7", features = ["alloc", "pem"] }
+md-5 = "0.10"
 # The DER behind a reported RDP certificate's PEM, which its published
 # fingerprints are checked against.
 base64 = "0.22"

@@ -454,9 +454,9 @@ async fn wait_until_all_in_state(emulator: &Emulator, operation: &str, member: &
     }
 }
 
-/// Put `count` key pairs in the store, as `CreateKeyPair` or `ImportKeyPair` would
-/// once either is implemented — the only way to stock this listing, exactly as the
-/// `key_pair_listing` suite does, because both calls are still 501 scaffolds.
+/// Put `count` key pairs in the store with the ids and instants this walk needs,
+/// which a create does not let a caller pick — exactly as the `key_pair_listing`
+/// suite stocks its own listing.
 fn seed_key_pairs(emulator: &Emulator, names: &[String]) {
     let seeded = state::with_state(emulator.engine(), |store| {
         // Seeded in REVERSE name order, like every other row's records.

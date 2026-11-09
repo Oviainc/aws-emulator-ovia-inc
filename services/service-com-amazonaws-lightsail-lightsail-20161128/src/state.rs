@@ -4214,6 +4214,19 @@ pub fn support_code(id: &str) -> String {
     format!("{}/{id}", ::engine::emulator_account_id())
 }
 
+/// How Lightsail words the refusal of a create whose name the account already
+/// holds, naming the name the request asked for: "Some names are already in use:
+/// <name>".
+///
+/// Plural because the sentence is the one Lightsail answers whether the create
+/// names one resource or several (`CreateInstances` takes a list of names), so
+/// the wording does not change with the count — only the names it reports do.
+/// The owner of that wording for the key-pair create, and where another create
+/// of this crate adopts it rather than keeping a second copy.
+pub fn names_already_in_use_message(name: &str) -> String {
+    format!("Some names are already in use: {name}")
+}
+
 /// How a refusal words the condition "the resource is the origin of a
 /// distribution", given how many of this account's distributions pull their
 /// content from it, and `None` when none does.

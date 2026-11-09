@@ -37,9 +37,9 @@ use serde_json::{json, Value};
 // (`smithy_query(query="shape", shape="OperationType")`), so which calls the
 // enum declares is read off the model rather than copied into this suite.
 use service_com_amazonaws_lightsail_lightsail_20161128::ops::types::OPERATION_TYPE_VALUES;
-// The store this service answers every read from, for the one fixture no
-// implemented call can produce: a key pair the account HOLDS, because
-// `CreateKeyPair` and `ImportKeyPair` are still scaffold stubs (seeded exactly as
+// The store this service answers every read from, for the one fixture an
+// implemented call cannot produce as this suite needs it: a key pair the account
+// holds under a chosen id, instant and fingerprint (seeded exactly as
 // `key_pair_delete.rs` seeds one).
 use service_com_amazonaws_lightsail_lightsail_20161128::state as lightsail_state;
 
@@ -313,10 +313,9 @@ async fn succeeded_export_name(emulator: &Emulator, case: &str, snapshot_name: &
     }
 }
 
-/// Put the key pair this suite deletes in the store, as `CreateKeyPair` or
-/// `ImportKeyPair` would once either is implemented — both are still scaffold
-/// stubs, so the store is the only way to hold one (`key_pair_delete.rs` seeds
-/// its own the same way).
+/// Put the key pair this suite deletes in the store under the id, instant and
+/// fingerprint the cases below name — none of which a create lets a caller pick
+/// (`key_pair_delete.rs` seeds its own the same way).
 fn hold_key_pair(emulator: &Emulator) {
     let id = "7f3c1d58-9b24-4e6a-8c05-2f1a6b7d4e90";
     let held = lightsail_state::with_state(emulator.engine(), |store| {
