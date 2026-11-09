@@ -131,6 +131,20 @@ pub struct Planned {
     pub stopped_at: Option<asl::RedriveStep>,
 }
 
+impl Planned {
+    /// The instant the jobs this run ABANDONED are stopped at: the instant its own
+    /// terminal outcome comes due.
+    ///
+    /// It is the failure around the task that abandons the job, and that failure is
+    /// owed to the clock — the walk accumulated the `Wait` states the failing branch
+    /// passed and slept for none of them — so the job it abandoned is stopped when
+    /// that failure happens and not when the run was planned. `None` for a run that
+    /// reached no outcome, which owes the clock nothing.
+    pub fn abandoned_stop_at(&self) -> Option<SystemTime> {
+        self.pending.as_ref().map(|pending| pending.due_at)
+    }
+}
+
 /// One Map Run a planned run started, ready for the store to record.
 ///
 /// This is [`asl::StartedMapRun`] with the run's offsets turned into instants: the

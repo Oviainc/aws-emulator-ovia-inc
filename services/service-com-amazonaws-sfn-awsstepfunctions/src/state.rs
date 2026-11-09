@@ -586,6 +586,14 @@ pub const EVENT_PARALLEL_STATE_SUCCEEDED: &str = "ParallelStateSucceeded";
 /// The history event a `Parallel` state writes when one of its branches failed.
 pub const EVENT_PARALLEL_STATE_FAILED: &str = "ParallelStateFailed";
 
+/// The history event a state writes for an expression OF ITS OWN that could not be
+/// evaluated: "details about an evaluation failure that occurred while processing a
+/// state, for example, when a JSONata expression throws an error".
+///
+/// It is written beside the failure the state reports rather than instead of it: the
+/// execution then ends on its own terminal event, carrying the same error and cause.
+pub const EVENT_EVALUATION_FAILED: &str = "EvaluationFailed";
+
 /// The history event an execution that one of its states failed ends on.
 pub const EVENT_EXECUTION_FAILED: &str = "ExecutionFailed";
 
@@ -1541,6 +1549,11 @@ pub struct EventDetails {
     /// The error and cause a failure reported.
     pub error: Option<String>,
     pub cause: Option<String>,
+    /// "The location of the field in the state in which the evaluation error
+    /// occurred": the field of the definition whose expression misevaluated, for the
+    /// event an evaluation failure writes. `None` where the diagnosis names no single
+    /// field of its own.
+    pub location: Option<String>,
     /// The bounds the scheduling state declared for it.
     pub timeout_seconds: Option<u64>,
     pub heartbeat_seconds: Option<u64>,
@@ -1584,6 +1597,7 @@ impl EventDetails {
             + text(&self.worker_name)
             + text(&self.error)
             + text(&self.cause)
+            + text(&self.location)
             + self
                 .assigned_variables
                 .iter()

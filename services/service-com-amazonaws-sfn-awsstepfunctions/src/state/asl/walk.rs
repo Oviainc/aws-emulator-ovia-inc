@@ -302,8 +302,62 @@ impl Interpreter<'_> {
         scope: &Scope,
     ) -> Result<StateStep, Fault> {
         let entered = self.next_event_id();
-        self.run_state(name, state, raw, at, scope, entered)
-            .map_err(|fault| diagnosed(name, entered, fault))
+        match self.run_state(name, state, raw, at, scope, entered) {
+            Ok(step) => Ok(step),
+            Err(fault) => {
+                let fault = diagnosed(name, entered, fault);
+                self.push_evaluation_failure(name, &fault);
+                Err(fault)
+            }
+        }
+    }
+
+    /// Record the event a state writes for an EXPRESSION of its own that could not be
+    /// evaluated, for a fault that is such a failure.
+    ///
+    /// "This event will only be present in state machines that have QueryLanguage set
+    /// to JSONata, or individual states set to JSONata": the event is written for the
+    /// one error name an expression fails under ([`QUERY_EVALUATION_ERROR`]) and for
+    /// no other fault, and it carries the error and the cause the execution itself
+    /// reports — the same bytes, so a caller reading the history and a caller reading
+    /// the execution are told the same thing — beside the field of the definition the
+    /// diagnosis names ([`super::super::jsonata::diagnosed_field`]).
+    ///
+    /// ONE event per failure, written for the state the expression is written IN. A
+    /// `Map` iteration's or a `Parallel` branch's failure is carried to the state that
+    /// encloses it unchanged, and that state's own turn ends on the same fault, so a
+    /// failure this walk has already recorded is not recorded again: the cause names
+    /// the state and the event it was entered at, so an identical one is that same
+    /// failure travelling outwards rather than a second expression failing.
+    fn push_evaluation_failure(&mut self, name: &str, fault: &Fault) {
+        if fault.failure.name() != QUERY_EVALUATION_ERROR {
+            return;
+        }
+        // Held to the bytes the modelled `SensitiveCause` carries exactly as the
+        // execution's own cause is, so the two really are the same bytes.
+        let cause = fault.failure.cause.clone().map(clip_cause);
+        let recorded = self.steps.iter().any(|step| {
+            step.event_type == super::super::EVENT_EVALUATION_FAILED
+                && step.details.cause == cause
+        });
+        if recorded {
+            return;
+        }
+        let location = cause
+            .as_deref()
+            .and_then(super::super::jsonata::diagnosed_field)
+            .map(str::to_string);
+        self.push_detailed(
+            super::super::EVENT_EVALUATION_FAILED,
+            name,
+            fault.at,
+            super::super::EventDetails {
+                error: fault.failure.error.clone(),
+                cause,
+                location,
+                ..super::super::EventDetails::default()
+            },
+        );
     }
 
     /// The id the next history event this walk records will carry.
@@ -404,7 +458,7 @@ impl Interpreter<'_> {
                 self.push_entered("WaitStateEntered", name, at, &raw);
                 let waited = self
                     .wait_duration(state, language, &effective, &context, at)
-                    .map_err(|why| wait_failure(name, why).at(at))?;
+                    .map_err(|failure| wait_failure(name, failure).at(at))?;
                 let at = at + waited;
                 let value = self
                     .produced(state, language, &raw, &effective, None, &context, false)
@@ -657,6 +711,34 @@ impl Interpreter<'_> {
         }
         let bindings = self.bindings(input, context, None, None);
         super::super::jsonata::field(node, &bindings, &mut self.jsonata_budget())
+            .map_err(jsonata_failure)
+    }
+
+    /// A FIELD of a state whose value the language requires to be of ONE JSON type:
+    /// the field's own expression for a state written in JSONata, held to that type;
+    /// the literal the definition wrote otherwise.
+    ///
+    /// `field` is that field's own place in the definition, which the diagnosis of an
+    /// expression that misevaluated names ([`super::super::jsonata::typed`]) — so a
+    /// state declaring many such fields says WHICH one the execution failed on. A
+    /// literal is carried through unchecked here and answered for by the caller's own
+    /// reading of the member, because a literal of the wrong type is something the
+    /// definition's own validation refuses rather than an expression that
+    /// misevaluated.
+    pub(super) fn typed_field(
+        &self,
+        language: &'static str,
+        node: &Value,
+        field: &str,
+        expected: super::super::jsonata::Kind,
+        input: &Value,
+        context: &Value,
+    ) -> Result<Value, Failure> {
+        if language != JSONATA {
+            return Ok(node.clone());
+        }
+        let bindings = self.bindings(input, context, None, None);
+        super::super::jsonata::typed(node, field, expected, &bindings, &mut self.jsonata_budget())
             .map_err(jsonata_failure)
     }
 
@@ -1225,9 +1307,17 @@ impl Interpreter<'_> {
         context: &Value,
     ) -> Result<Option<String>, Failure> {
         if let Some(literal) = state.get(member) {
-            let evaluated = self
-                .literal(language, literal, input, context)?
-                .unwrap_or(Value::Null);
+            // The member is a string in both languages, so a JSONata expression
+            // written in it is held to that type and diagnosed where it produced
+            // something else or nothing at all.
+            let evaluated = self.typed_field(
+                language,
+                literal,
+                member,
+                super::super::jsonata::Kind::String,
+                input,
+                context,
+            )?;
             let text = evaluated.as_str().map(str::to_string).ok_or_else(|| {
                 runtime(format!("a 'Fail' state's '{member}' must be a string"))
             })?;
@@ -1265,6 +1355,11 @@ impl Interpreter<'_> {
     /// WROTE — `SecondsPath` where the definition carries a `SecondsPath` — because the
     /// member name is what points a reader at the field to correct, and a definition
     /// carrying one of the pair does not carry the other.
+    ///
+    /// Each member is a FIELD of one type ([`Interpreter::typed_field`]): a JSONata
+    /// expression written in it is held to that type and diagnosed under the
+    /// language's own query-evaluation failure, while the figure the member carries
+    /// being out of range is this state's own refusal.
     pub(super) fn wait_duration(
         &self,
         state: &Map<String, Value>,
@@ -1272,54 +1367,84 @@ impl Interpreter<'_> {
         input: &Value,
         context: &Value,
         at: Duration,
-    ) -> Result<Duration, String> {
-        let evaluated = |node: &Value| -> Result<Option<Value>, String> {
-            self.literal(language, node, input, context)
-                .map_err(|failure| failure.cause.unwrap_or_default())
-        };
+    ) -> Result<Duration, Failure> {
         let (member, seconds) = match (state.get("Seconds"), state.get("SecondsPath")) {
-            (Some(seconds), _) => ("Seconds", evaluated(seconds)?),
+            (Some(seconds), _) => (
+                "Seconds",
+                Some(self.typed_field(
+                    language,
+                    seconds,
+                    "Seconds",
+                    super::super::jsonata::Kind::Number,
+                    input,
+                    context,
+                )?),
+            ),
             (None, Some(Value::String(path))) => (
                 "SecondsPath",
-                Some(member_path_value("SecondsPath", path, input, context)?),
+                Some(
+                    member_path_value("SecondsPath", path, input, context)
+                        .map_err(runtime)?,
+                ),
             ),
             (None, Some(other)) => {
-                return Err(format!("'SecondsPath' must be a JSONPath string, not {other}"));
+                return Err(runtime(format!(
+                    "'SecondsPath' must be a JSONPath string, not {other}"
+                )));
             }
             (None, None) => ("Seconds", None),
         };
         if let Some(seconds) = seconds {
             let seconds = seconds.as_u64().ok_or_else(|| {
-                format!("'{member}' must be a non-negative whole number, not {seconds}")
+                runtime(format!(
+                    "'{member}' must be a non-negative whole number, not {seconds}"
+                ))
             })?;
             if seconds > MAX_WAIT_SECONDS {
-                return Err(format!(
+                return Err(runtime(format!(
                     "'{member}' is {seconds}, more than the {MAX_WAIT_SECONDS} seconds a 'Wait' \
                      state may wait for"
-                ));
+                )));
             }
             return Ok(Duration::from_secs(seconds));
         }
 
         let (member, timestamp) = match (state.get("Timestamp"), state.get("TimestampPath")) {
-            (Some(timestamp), _) => ("Timestamp", evaluated(timestamp)?),
+            (Some(timestamp), _) => (
+                "Timestamp",
+                Some(self.typed_field(
+                    language,
+                    timestamp,
+                    "Timestamp",
+                    super::super::jsonata::Kind::String,
+                    input,
+                    context,
+                )?),
+            ),
             (None, Some(Value::String(path))) => (
                 "TimestampPath",
-                Some(member_path_value("TimestampPath", path, input, context)?),
+                Some(
+                    member_path_value("TimestampPath", path, input, context)
+                        .map_err(runtime)?,
+                ),
             ),
             (None, Some(other)) => {
-                return Err(format!(
+                return Err(runtime(format!(
                     "'TimestampPath' must be a JSONPath string, not {other}"
-                ));
+                )));
             }
             (None, None) => ("Timestamp", None),
         };
         if let Some(timestamp) = timestamp {
             let text = timestamp.as_str().ok_or_else(|| {
-                format!("'{member}' must be an ISO 8601 instant, not {timestamp}")
+                runtime(format!(
+                    "'{member}' must be an ISO 8601 instant, not {timestamp}"
+                ))
             })?;
             let due_millis = iso_millis(text).map_err(|_| {
-                format!("'{member}' must be an ISO 8601 instant, not {timestamp}")
+                runtime(format!(
+                    "'{member}' must be an ISO 8601 instant, not {timestamp}"
+                ))
             })?;
             let reached = super::super::epoch_millis(self.start)
                 .saturating_add(i64::try_from(at.as_millis()).unwrap_or(i64::MAX));
@@ -1328,14 +1453,16 @@ impl Interpreter<'_> {
             // `Seconds`, and is NOT silently shortened to the maximum.
             let remaining = u64::try_from(due_millis.saturating_sub(reached)).unwrap_or(0);
             if remaining > MAX_WAIT_SECONDS.saturating_mul(1_000) {
-                return Err(format!(
+                return Err(runtime(format!(
                     "'{member}' is {text}, further ahead than the {MAX_WAIT_SECONDS} seconds a \
                      'Wait' state may wait for"
-                ));
+                )));
             }
             return Ok(Duration::from_millis(remaining));
         }
-        Err("a 'Wait' state must carry 'Seconds' or 'Timestamp'".to_string())
+        Err(runtime(
+            "a 'Wait' state must carry 'Seconds' or 'Timestamp'".to_string(),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -1377,7 +1504,7 @@ impl Interpreter<'_> {
                 choices.len()
             )));
         }
-        for rule in choices {
+        for (index, rule) in choices.iter().enumerate() {
             let rule = rule.as_object().ok_or_else(|| {
                 runtime("every member of 'Choices' must be a JSON object".to_string())
             })?;
@@ -1391,6 +1518,7 @@ impl Interpreter<'_> {
                     let bindings = self.bindings(input, context, None, None);
                     super::super::jsonata::condition(
                         condition,
+                        &choice_condition_field(index),
                         &bindings,
                         &mut self.jsonata_budget(),
                     )
@@ -2194,11 +2322,17 @@ impl Interpreter<'_> {
         let selected = match state.get("Items") {
             // "Items — an array, or a JSONata expression that evaluates to an array":
             // the member is the array itself in either language, and in JSONata it may
-            // be the expression that produces one.
+            // be the expression that produces one — held to that type, so an
+            // expression that produced something else says so.
             Some(items) => match language {
-                JSONATA => self
-                    .literal(language, items, effective, context)?
-                    .unwrap_or(Value::Null),
+                JSONATA => self.typed_field(
+                    language,
+                    items,
+                    "Items",
+                    super::super::jsonata::Kind::Array,
+                    effective,
+                    context,
+                )?,
                 _ => payload_template(items, effective, context)?,
             },
             None => match state.get("ItemsPath") {
@@ -2895,8 +3029,16 @@ impl Interpreter<'_> {
         let (member, value) = match (state.get(member), state.get(&path_member)) {
             (Some(value), _) => (
                 member.to_string(),
-                self.literal(language, value, input, context)?
-                    .unwrap_or(Value::Null),
+                // The member is a figure in both languages, so a JSONata expression
+                // written in it is held to that type.
+                self.typed_field(
+                    language,
+                    value,
+                    member,
+                    super::super::jsonata::Kind::Number,
+                    input,
+                    context,
+                )?,
             ),
             (None, Some(Value::String(path))) => (
                 path_member.clone(),
@@ -2933,5 +3075,14 @@ fn member_path_value(
     expression(path, input, context).map_err(|failure| {
         member_path_diagnosis(member, path, failure.cause.unwrap_or_default())
     })
+}
+
+/// Where in a definition the `Condition` of the `Choice` rule at `index` is written.
+///
+/// RECORDED: the field a diagnosis names is the path to it through the state's own
+/// members, and a rule's position in the `Choices` array is what tells one rule from
+/// the next — so a state of many rules says which of them the execution failed on.
+fn choice_condition_field(index: usize) -> String {
+    format!("Choices[{index}]/Condition")
 }
 

@@ -18,7 +18,19 @@
 //! carries such an expression.
 //!
 //! What THIS module adds is the Amazon States Language's own half: which reserved
-//! terms an expression of a state reads, and what one visit to a state may ask for.
+//! terms an expression of a state reads, what one visit to a state may ask for, and
+//! how an expression that MISEVALUATED is reported.
+//!
+//! ## A template and a field
+//!
+//! A TEMPLATE — an `Output`, an `Assign`, a `Task`'s `Arguments` — builds a document
+//! out of whatever its members produce, and a member whose expression produced nothing
+//! is left out of it ([`render`]). A FIELD holds ONE value the language requires a
+//! type of — a `Choice` rule's boolean `Condition`, a `Wait`'s numeric `Seconds`, a
+//! `Map`'s array of `Items`, a `Fail`'s string `Error` — so a field whose expression
+//! produced another type, or produced nothing, is reported rather than carried
+//! ([`typed`]). The diagnosis is the service's own: the expression as the definition
+//! wrote it, the field of the definition it is written in, and the types.
 //!
 //! ## What an expression reads
 //!
@@ -357,6 +369,138 @@ fn render_at(
     }
 }
 
+/// How the language opens its diagnosis of a field's expression that MISEVALUATED,
+/// and the clause that names the field inside it.
+///
+/// RECORDED wording: a diagnosis names the expression as the definition wrote it
+/// (inside the delimiters, which it does not repeat), then the field of the definition
+/// that expression is written in, then what was wrong with the value it produced. The
+/// two are also what reads the field back OUT of a diagnosis this module worded
+/// ([`diagnosed_field`]), so the one place that words it is the one place that knows
+/// its shape.
+pub const DIAGNOSIS_OPENING: &str = "The JSONata expression '";
+const FIELD_CLAUSE: &str = "' specified for the field '";
+
+/// What the diagnosis says of an expression that produced NOTHING, which the
+/// language's own `undefined` is: a field whose value the language requires has none.
+const RETURNED_NOTHING: &str = "returned nothing (undefined).";
+
+/// The JSON type ONE field of a state requires the expression in it to produce.
+///
+/// A field is not a TEMPLATE: a template builds a document of whatever its members
+/// produce, while a field holds one value the language requires a type of — a boolean
+/// `Condition`, a numeric `Seconds`, a string `Error`, an array of `Items` — so a
+/// value of another type, and a field with no value at all, are reported rather than
+/// carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Boolean,
+    Number,
+    String,
+    Array,
+}
+
+impl Kind {
+    /// This type's name, as the JSON types are spelled.
+    fn named(self) -> &'static str {
+        match self {
+            Kind::Boolean => "boolean",
+            Kind::Number => "number",
+            Kind::String => "string",
+            Kind::Array => "array",
+        }
+    }
+
+    /// Whether `value` is of this type.
+    fn holds(self, value: &Value) -> bool {
+        match self {
+            Kind::Boolean => value.is_boolean(),
+            Kind::Number => value.is_number(),
+            Kind::String => value.is_string(),
+            Kind::Array => value.is_array(),
+        }
+    }
+}
+
+/// The JSON type `value` IS, as the types are spelled.
+fn type_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => Kind::Boolean.named(),
+        Value::Number(_) => Kind::Number.named(),
+        Value::String(_) => Kind::String.named(),
+        Value::Array(_) => Kind::Array.named(),
+        Value::Object(_) => "object",
+    }
+}
+
+/// The diagnosis of the expression `text`, written in the definition field `field`:
+/// the expression as the definition wrote it, the field it is written in, and `what`
+/// was wrong with the value it produced.
+fn misevaluated(text: &str, field: &str, what: &str) -> Refusal {
+    Refusal::NotEvaluated(format!(
+        "{DIAGNOSIS_OPENING}{}{FIELD_CLAUSE}{field}' {what}",
+        inner(text)
+    ))
+}
+
+/// The field a diagnosis this module worded names — "the location of the field in the
+/// state in which the evaluation error occurred", which the event reporting the
+/// failure carries.
+///
+/// The clause is read from the END of the diagnosis: the expression the diagnosis
+/// echoes is the DEFINITION'S text and can carry anything, that clause included,
+/// while what follows the field is this module's own fixed text — so the last
+/// occurrence is the one this module wrote, whatever a definition writes in its
+/// expression.
+///
+/// `None` for every other cause, and for a TEMPLATE: its members build one document
+/// rather than naming one field, so there is no single field to report.
+pub fn diagnosed_field(cause: &str) -> Option<&str> {
+    if !cause.contains(DIAGNOSIS_OPENING) {
+        return None;
+    }
+    let (_, named) = cause.rsplit_once(FIELD_CLAUSE)?;
+    let (field, _) = named.split_once('\'')?;
+    Some(field)
+}
+
+/// What the definition field `field` carries, held to the type the language requires
+/// there.
+///
+/// A field whose value is ONE whole expression is evaluated and the value checked:
+/// an expression that produced nothing, and one that produced a value of another
+/// type, are the language's own query-evaluation failures, diagnosed as the service
+/// diagnoses them ([`misevaluated`]) so a caller reads the expression, the field it is
+/// written in and the type it expected. Every other field value is the literal it is
+/// written as, carried through for the caller's own reading of the member to answer
+/// for.
+pub fn typed(
+    node: &Value,
+    field: &str,
+    expected: Kind,
+    bindings: &Bindings<'_>,
+    budget: &mut Budget,
+) -> Result<Value, Refusal> {
+    let text = match node {
+        Value::String(text) if is_expression(text) => text,
+        other => return Ok(other.clone()),
+    };
+    match evaluate(text, bindings, budget)? {
+        None => Err(misevaluated(text, field, RETURNED_NOTHING)),
+        Some(value) if expected.holds(&value) => Ok(value),
+        Some(value) => Err(misevaluated(
+            text,
+            field,
+            &format!(
+                "returned an unexpected type. Expected '{}' but was '{}'.",
+                expected.named(),
+                type_of(&value)
+            ),
+        )),
+    }
+}
+
 /// A field that is EITHER one whole expression or the literal value it is written as:
 /// a `Wait`'s `Seconds`, a `Map`'s `Items`, a `Fail`'s `Error`.
 ///
@@ -376,10 +520,17 @@ pub fn field(
 /// Whether the `Condition` of one `Choice` rule holds.
 ///
 /// "Condition — a boolean expression": a rule whose expression produces anything
-/// other than a boolean is a rule the service cannot decide, so it is reported rather
-/// than taken as false.
+/// other than a boolean, and one whose expression produces nothing at all, is a rule
+/// the service cannot decide, so each is reported — under the language's own
+/// query-evaluation failure, diagnosed as the service diagnoses a field's expression
+/// that misevaluated ([`typed`]) — rather than taken as false.
+///
+/// `field` is the rule's own place in the definition (`Choices[<index>]/Condition`),
+/// which is what tells the offending rule from every other rule of a state that
+/// declares many.
 pub fn condition(
     node: &Value,
+    field: &str,
     bindings: &Bindings<'_>,
     budget: &mut Budget,
 ) -> Result<bool, Refusal> {
@@ -395,13 +546,9 @@ pub fn condition(
             super::asl::echoed(text)
         )));
     }
-    match evaluate(text, bindings, budget)? {
-        Some(Value::Bool(holds)) => Ok(holds),
-        // An expression that resolved to nothing decided nothing: the rule did not
-        // match, which is what JSONata's own `undefined` means in a boolean position.
-        None => Ok(false),
-        Some(other) => Err(Refusal::NotEvaluated(format!(
-            "a 'Choice' rule's 'Condition' must produce a boolean, and this one produced {other}"
-        ))),
-    }
+    // Every other value and an expression that produced nothing are already refused,
+    // so what comes back is the boolean the rule decides on.
+    Ok(typed(node, field, Kind::Boolean, bindings, budget)?
+        .as_bool()
+        .unwrap_or(false))
 }

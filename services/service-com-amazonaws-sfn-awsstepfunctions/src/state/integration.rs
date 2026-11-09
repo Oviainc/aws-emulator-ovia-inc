@@ -3258,16 +3258,49 @@ const URI_PATH_PUNCTUATION: &[u8] = b"-._~:$/";
 /// makes for a job the execution it stops was parked at, for the same reason: a job
 /// nothing will resolve is not left running.
 ///
+/// `not_before` is the instant the failure that abandoned the job comes due — the
+/// instant the execution around it ENDS, which the walk computed from the `Wait`
+/// states the failing branch passed and nothing slept for. The job stays running
+/// until then: it is the sibling's failure that stops it, so a job abandoned by a
+/// failure the clock has not reached yet is still a job of its own service, readable
+/// and stoppable there, exactly as it is on the service. Reaching that instant is
+/// handed to a task of its own, because the call that planned the run must answer
+/// while the job is still running; a `None`, and an instant already past, stop it
+/// here.
+///
+/// That wait is the definition's to choose, so a job whose abandoning failure is owed
+/// further out than this process holds a job at all
+/// ([`crate::state::MAX_PARKED_JOB_DURATION`]) is LET GO of instead, exactly as the
+/// job a task is still parked at is once that span runs out: the alternative is
+/// stopping it at the ceiling, which would report the job ended before the failure
+/// that ends it had happened.
+///
 /// What the invoked service answers changes nothing here: the task's own outcome is
 /// already the failure of the state around it.
 pub async fn stop_abandoned(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     abandoned: &[crate::state::PlannedJob],
+    not_before: Option<std::time::SystemTime>,
 ) {
+    let owed = not_before
+        .and_then(|due| due.duration_since(crate::state::now()).ok())
+        .unwrap_or_default();
+    if owed > crate::state::MAX_PARKED_JOB_DURATION {
+        return;
+    }
     for job in abandoned {
         let (call, request) = stopping(job.api, job.job, &job.job_id, &job.naming);
-        let _answered = call_api(callback, region, &call, &request).await;
+        if owed.is_zero() {
+            let _answered = call_api(callback, region, &call, &request).await;
+            continue;
+        }
+        let callback = callback.clone();
+        let region = region.to_string();
+        ::tokio::spawn(async move {
+            ::tokio::time::sleep(owed).await;
+            let _answered = call_api(&callback, &region, &call, &request).await;
+        });
     }
 }
 

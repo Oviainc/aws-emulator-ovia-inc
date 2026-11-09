@@ -377,6 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ctx.callback(),
             &crate::state::arn_region(&machine_arn),
             &planned.abandoned,
+            planned.abandoned_stop_at(),
         )
         .await;
 

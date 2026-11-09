@@ -526,8 +526,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // through its own integration, so no job is left running behind a task that
         // will never finish. Done here, with no store of this service locked, as every
         // other call this operation makes is.
-        crate::state::integration::stop_abandoned(ctx.callback(), &region, &planned.abandoned)
-            .await;
+        crate::state::integration::stop_abandoned(
+            ctx.callback(),
+            &region,
+            &planned.abandoned,
+            planned.abandoned_stop_at(),
+        )
+        .await;
         let candidate = crate::state::Execution {
             arn: arn.clone(),
             state_machine_arn: machine_arn.clone(),

@@ -688,6 +688,20 @@ fn projected(
         crate::state::EVENT_MAP_ITERATION_ABORTED => {
             event.map_iteration_aborted_event_details = Some(iteration(stored));
         }
+        // An expression of a state that could not be evaluated: "the name of the
+        // state in which the evaluation error occurred" is required, so an event
+        // whose record names no state reports no detail at all, and the location is
+        // the field of the definition the diagnosis named.
+        crate::state::EVENT_EVALUATION_FAILED => {
+            if let Some(state) = stored.state_name.clone() {
+                event.evaluation_failed_event_details = Some(EvaluationFailedEventDetails {
+                    error: stored.details.error.clone(),
+                    cause: stored.details.cause.clone(),
+                    location: stored.details.location.clone(),
+                    state,
+                });
+            }
+        }
         _ => {}
     }
     event

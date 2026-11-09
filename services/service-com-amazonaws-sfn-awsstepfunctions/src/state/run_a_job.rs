@@ -253,7 +253,13 @@ async fn resolve<Eng: Send + Sync + 'static>(
     // A job this continuation STARTED and then abandoned is stopped through its own
     // integration, as a start's own is: no job is left running behind a task that
     // will never finish. Done with no store of this service locked.
-    integration::stop_abandoned(callback, &region, &planned.abandoned).await;
+    integration::stop_abandoned(
+        callback,
+        &region,
+        &planned.abandoned,
+        planned.abandoned_stop_at(),
+    )
+    .await;
 
     // Phase 3, under the lock again: record it. Everything is re-read, because the
     // execution could have been stopped while the walk ran. The lock is held for THIS

@@ -109,6 +109,8 @@ mod interpreter_data_fidelity;
 mod intrinsic_functions;
 #[path = "all/json_parse_diagnostics.rs"]
 mod json_parse_diagnostics;
+#[path = "all/jsonata_field_diagnostics.rs"]
+mod jsonata_field_diagnostics;
 #[path = "all/jsonata_states.rs"]
 mod jsonata_states;
 #[path = "all/lambda_function_timeout.rs"]
@@ -159,6 +161,8 @@ mod saga_compensation_on_task_failure;
 mod sdk_response_envelope;
 #[path = "all/send_task_failure.rs"]
 mod send_task_failure;
+#[path = "all/sibling_abort_timing.rs"]
+mod sibling_abort_timing;
 #[path = "all/state_data_in_history.rs"]
 mod state_data_in_history;
 #[path = "all/state_machine_aliases.rs"]

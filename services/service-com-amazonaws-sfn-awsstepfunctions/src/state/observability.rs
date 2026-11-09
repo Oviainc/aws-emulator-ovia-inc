@@ -682,6 +682,16 @@ fn log_details(
                 Some(stored.index.map_or(0, i64::from)),
             );
         }
+        // An expression of a state that could not be evaluated: the error and the
+        // cause the state reports, the field of the definition the diagnosis named,
+        // and the state it happened in — which is required, so an event whose record
+        // names none carries no detail, exactly as the history API reports it.
+        super::EVENT_EVALUATION_FAILED => {
+            event.state_name.as_deref()?;
+            failure(&mut details, stored);
+            text(&mut details, "location", stored.location.as_deref());
+            text(&mut details, "state", event.state_name.as_deref());
+        }
         // Every other event type the model gives no detail structure at all.
         _ => return None,
     }
