@@ -510,13 +510,14 @@ impl CopySourceFault {
 /// `?versionId=<version-id>` to that value
 /// (`smithy_query(query="doc",shape="CopyObjectRequest",member="CopySource")`).
 ///
-/// So the value is DECODED first and read afterwards: the whole path half is percent-decoded
-/// in one pass and the bucket is then what stands before the FIRST slash of the decoded
-/// text, with the key — slashes of its own included — after it. A client that encodes the
-/// separator too (`bucket%2Fdir%2Ffile`, which every SDK produces for a key carrying a
-/// slash or a space) therefore names exactly the object a client that left it literal does,
-/// instead of naming no bucket-and-key pair. The member's own pattern (`^\/?.+\/.+$`) allows
-/// one leading slash, which is stripped before the split.
+/// So the value is DECODED first and read afterwards: the whole path half is decoded in one
+/// pass as the URL-encoded text the member says it is ([`url_decoded`] states what that
+/// means character for character) and the bucket is then what stands before the FIRST slash
+/// of the decoded text, with the key — slashes of its own included — after it. A client that
+/// encodes the separator too (`bucket%2Fdir%2Ffile`, which every SDK produces for a key
+/// carrying a slash or a space) therefore names exactly the object a client that left it
+/// literal does, instead of naming no bucket-and-key pair. The member's own pattern
+/// (`^\/?.+\/.+$`) allows one leading slash, which is stripped before the split.
 ///
 /// The bucket half has to be SHAPED like a bucket name
 /// ([`crate::service::bucket_name_shaped`]): a value whose first segment cannot be a bucket
@@ -574,8 +575,8 @@ pub fn copy_source_fault(value: &str) -> Option<CopySourceFault> {
 }
 
 /// One `x-amz-copy-source` value in the form the modelled member's own pattern is applied
-/// to: the path half percent-decoded, with the two characters that decoding gives a meaning
-/// of their own put back as escapes, and the `?versionId=` half left exactly as it arrived.
+/// to: the path half decoded, with the characters that decoding gives a meaning of their own
+/// put back as escapes, and the `?versionId=` half left exactly as it arrived.
 ///
 /// The member's pattern (`^\/?.+\/.+$`) is enforced against the value AS SENT, and a value
 /// whose separator is encoded (`bucket%2Fdir%2Ffile`) carries no literal slash to satisfy it
@@ -584,11 +585,11 @@ pub fn copy_source_fault(value: &str) -> Option<CopySourceFault> {
 /// ([`parse_copy_source`] states the rule), and this is where the request's own header is
 /// put into that form, so the pattern is applied to the DECODED reference.
 ///
-/// `%` and `?` are re-escaped because the decoded text is read by [`parse_copy_source`]
-/// again: left literal, a `%` would be taken for the start of an escape and a `?` for the
-/// subresource delimiter, so a key carrying either would come out as a different key.
-/// Everything else is left decoded, which makes this form stable — a value already in it is
-/// returned unchanged.
+/// `%`, `?` and `+` are re-escaped because the decoded text is read by [`parse_copy_source`]
+/// again: left literal, a `%` would be taken for the start of an escape, a `?` for the
+/// subresource delimiter and a `+` for a space, so a key carrying any of them would come out
+/// as a different key. Everything else is left decoded, which makes this form stable — a
+/// value already in it is returned unchanged.
 ///
 /// `None` when the escapes do not decode to UTF-8, which no bucket name or object key this
 /// store holds is: such a value is left exactly as it arrived for the handler to refuse.
@@ -603,19 +604,42 @@ pub fn canonical_copy_source(value: &str) -> Option<String> {
     })
 }
 
-/// The two characters a DECODED copy source keeps as escapes — see
-/// [`canonical_copy_source`] for why each has to: they are the two that
+/// The three characters a DECODED copy source keeps as escapes — see
+/// [`canonical_copy_source`] for why each has to: they are the three that
 /// [`parse_copy_source`] reads as something other than themselves.
-const COPY_SOURCE_RESERVED: ::percent_encoding::AsciiSet =
-    ::percent_encoding::AsciiSet::EMPTY.add(b'%').add(b'?');
+const COPY_SOURCE_RESERVED: ::percent_encoding::AsciiSet = ::percent_encoding::AsciiSet::EMPTY
+    .add(b'%')
+    .add(b'?')
+    .add(b'+');
 
-/// One percent-encoded element of a copy source, decoded — or `None` when its escapes do
-/// not decode to UTF-8, which no bucket name or object key this store holds is.
+/// One URL-ENCODED element of a copy source, decoded — or `None` when its escapes do not
+/// decode to UTF-8, which no bucket name or object key this store holds is.
+///
+/// The member's value "must be URL-encoded"
+/// (`smithy_query(query="doc",shape="CopyObjectRequest",member="CopySource")`), so it is read
+/// as one URL-encoded string: every `%XX` escape stands for the byte it spells, and a `+`
+/// stands for a SPACE — the two substitutions URL encoding makes. A key that really carries a
+/// plus therefore has to arrive as `%2B`, exactly as a key carrying a slash of its own has to
+/// arrive as `%2F` for the separator to stay the separator; a value spelling the plus
+/// literally names the key with a space in that position, and resolves (or fails to resolve)
+/// against the object of THAT name. The `?versionId=` half is read by the same rule, because
+/// it is part of the same URL-encoded value.
+///
+/// The same reading a QUERY parameter gets (`smithy_server_runtime`'s own query decode) and
+/// the opposite of the one a PATH LABEL gets, where a plus is a plus
+/// (`service_common::percent_decode_path_label`, which documents the distinction). Neither
+/// stands in for this one: both are lossy on an escape that is not UTF-8, where a copy source
+/// has to report that it names no object this store could hold rather than carry a
+/// replacement character into a key.
 pub(super) fn url_decoded(value: &str) -> Option<String> {
-    ::percent_encoding::percent_decode_str(value)
+    let spaced: ::std::borrow::Cow<'_, str> = match value.contains('+') {
+        true => ::std::borrow::Cow::Owned(value.replace('+', " ")),
+        false => ::std::borrow::Cow::Borrowed(value),
+    };
+    ::percent_encoding::percent_decode_str(&spaced)
         .decode_utf8()
         .ok()
-        .map(::std::borrow::Cow::into_owned)
+        .map(|decoded| decoded.into_owned())
 }
 
 /// The prefix of the second documented `x-amz-copy-source` form — the ARN of an object "as

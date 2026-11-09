@@ -2148,7 +2148,46 @@ fn element_text(document: &[u8], element: &str) -> Option<String> {
     }
 }
 
-/// The OBJECT a request addresses, read off its PATH-STYLE path and its query string: the/// `{Key+}` label below the bucket segment, decoded the way the codec decodes a path label,
+/// `path` with every TRAILING slash of the key it addresses written as an escape, or `None`
+/// for a path whose key does not end in one — which is every path that needs nothing here.
+///
+/// An object key is "a sequence of Unicode characters whose UTF-8 encoding is at most 1,024
+/// bytes long" (`smithy_query(query="doc",shape="ObjectKey")`), and `/` is one of them: a key
+/// may carry slashes anywhere, the trailing position included, which is exactly how the
+/// "folder" objects every console and CLI creates are named (`sourc/`). The key is the
+/// `{Key+}` greedy label of the request path, so what the client sent after the bucket
+/// segment IS the key, decoded once and otherwise verbatim.
+///
+/// The codec that binds a greedy label matches the path by its SEGMENTS, having trimmed the
+/// separators off BOTH ends first, which drops an empty trailing one — so
+/// `PUT /<bucket>/sourc/` would bind `sourc` and the write would land on another key, one the
+/// client never named. That is a gap in the shared codec, filed as
+/// `issues/.../gap-smithy-schema-server-greedy-label-drops-a-trailing-separator.md`; this
+/// adapter is what stands in for it until the codec keeps the segment, and should be deleted
+/// with it. Escaping the trailing slashes puts them inside the last segment, where the
+/// label's own percent-decode turns them back into the slashes the request carried: the key
+/// the handler stores is then the key the client addressed, and a read, a listing, a delete
+/// and a copy source all name that one key.
+///
+/// Nothing else about the path changes, and a path whose key carries no trailing slash is
+/// left exactly as it arrived.
+fn key_trailing_slashes_escaped(path: &str) -> Option<String> {
+    let (bucket, key) = path.strip_prefix('/')?.split_once('/')?;
+    if !key.ends_with('/') {
+        return None;
+    }
+    let kept = key.trim_end_matches('/');
+    let escaped = ESCAPED_PATH_SEPARATOR.repeat(key.len() - kept.len());
+    Some(format!("/{bucket}/{kept}{escaped}"))
+}
+
+/// The separator [`key_trailing_slashes_escaped`] writes as an escape, in the one spelling
+/// the codec's percent-decode reads back as a slash: left literal it would be read as the end
+/// of the path rather than as part of the key.
+const ESCAPED_PATH_SEPARATOR: &str = "%2F";
+
+/// The OBJECT a request addresses, read off its PATH-STYLE path and its query string: the
+/// `{Key+}` label below the bucket segment, decoded the way the codec decodes a path label,
 /// and the `versionId` parameter when the request carries one. `None` for a path that
 /// addresses a bucket or the service root, which names no object at all.
 ///
@@ -2481,15 +2520,24 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         if let Some(violation) = union_arity_violation(request, input_schema) {
             return Err(ProtocolError::Invalid(vec![violation]));
         }
-        // The PATH the `@httpLabel` members are bound from. A VIRTUAL-HOSTED-STYLE request
-        // names its bucket in the host and leaves its path as the key alone, so the bucket
-        // is put back in front of it — the same normalization the routing seam resolved the
-        // operation from (`super::Service::override_operation`), so the operation that was
-        // matched binds the bucket that was addressed. `None` for a path-style request,
-        // whose path already IS the path the labels bind from.
+        // The PATH the `@httpLabel` members are bound from, when it is not the path the
+        // request arrived with. A VIRTUAL-HOSTED-STYLE request names its bucket in the host
+        // and leaves its path as the key alone, so the bucket is put back in front of it —
+        // the same normalization the routing seam resolved the operation from
+        // (`super::Service::override_operation`), so the operation that was matched binds the
+        // bucket that was addressed. And a key that ENDS in a slash keeps it, as an escape
+        // the label's own decode undoes ([`key_trailing_slashes_escaped`]), in either address
+        // form. `None` for a request that needs neither, whose path already IS the path the
+        // labels bind from.
         let host_style_path = self
             .addressed_in_host(request)
             .map(|bucket| super::path_with_bucket(&bucket, request_path(request.uri())));
+        let bound_path = key_trailing_slashes_escaped(
+            host_style_path
+                .as_deref()
+                .unwrap_or_else(|| request_path(request.uri())),
+        )
+        .or(host_style_path);
         // The HEADERS the bound members are read from, normalized where a value the request
         // carried is not one the framework's codec reads as the request meant it — a MODE
         // spelled in another case, a percent-encoded copy source, an HTTP-date, and the one
@@ -2560,7 +2608,7 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                 let uri = request.uri();
                 let binding = HttpBindingDeserializer::new(
                     input_schema.http().map(|http| http.uri()),
-                    host_style_path.as_deref().unwrap_or(request_path(uri)),
+                    bound_path.as_deref().unwrap_or(request_path(uri)),
                     folded_query.as_deref().unwrap_or_else(|| request_query(uri)),
                     folded_headers.unwrap_or_else(|| request_headers(request)),
                     OwnedXmlBody {
@@ -2571,15 +2619,15 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                 return Ok(Box::new(binding));
             }
         }
-        if host_style_path.is_some() || folded_headers.is_some() || folded_query.is_some() {
+        if bound_path.is_some() || folded_headers.is_some() || folded_query.is_some() {
             // The framework's own deserializer reads the path, the query and the headers off
             // the request, which for a virtual-hosted-style request carries no bucket in its
-            // path, for a request spelling a mode in another case carries a value the model's
-            // enum does not list, and for a page bound the operation judges carries a value
-            // the codec cannot read — so this one is built over the normalized path, query
-            // and headers instead. Everything else is the framework's: the same binding
-            // deserializer, over the same body.
-            let path = match host_style_path {
+            // path, for a key that ends in a separator loses it, for a request spelling a mode
+            // in another case carries a value the model's enum does not list, and for a page
+            // bound the operation judges carries a value the codec cannot read — so this one
+            // is built over the normalized path, query and headers instead. Everything else
+            // is the framework's: the same binding deserializer, over the same body.
+            let path = match bound_path {
                 Some(path) => path,
                 None => request_path(request.uri()).to_string(),
             };

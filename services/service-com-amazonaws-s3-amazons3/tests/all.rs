@@ -127,6 +127,8 @@ mod checksum_mode_header_case;
 mod cli_download_legs;
 #[path = "all/copy_source_header_envelopes.rs"]
 mod copy_source_header_envelopes;
+#[path = "all/copy_source_url_encoding.rs"]
+mod copy_source_url_encoding;
 #[path = "all/directory_bucket_conditional_deletes.rs"]
 mod directory_bucket_conditional_deletes;
 #[path = "all/directory_bucket_listings.rs"]
@@ -225,6 +227,8 @@ mod object_encryption_update;
 mod object_event_notifications;
 #[path = "all/object_event_sequencer_order.rs"]
 mod object_event_sequencer_order;
+#[path = "all/object_key_label_verbatim.rs"]
+mod object_key_label_verbatim;
 #[path = "all/object_legal_hold.rs"]
 mod object_legal_hold;
 #[path = "all/object_listing_and_deletion.rs"]
