@@ -191,3 +191,5 @@ mod config_snapshot_delivery;
 mod delivery_channel_bucket_policy;
 #[path = "all/delivery_channel_recorder_role.rs"]
 mod delivery_channel_recorder_role;
+#[path = "all/validation_clause_quotes_the_submitted_value.rs"]
+mod validation_clause_quotes_the_submitted_value;

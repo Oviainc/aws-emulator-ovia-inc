@@ -20,9 +20,10 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `override_operation` — EDITED HERE: the key and the handler stay the generated
+//!   table's, but every modelled operation is served through [`WithSubmittedValues`], so
+//!   a request refused before its handler ran quotes the value the CALLER submitted
+//!   rather than the framework's elided rendering of it.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -69,11 +70,27 @@
 //! Everything else about a clause — its frame, and the requirement each constraint
 //! class states — is read back off the framework's own rendering ([`requirement`]),
 //! so a constraint class cannot arrive here with wording of its own.
+//!
+//! ## The value a clause quotes
+//!
+//! A clause quotes the value the REQUEST carried, whatever its length — that quoted text
+//! is the only place the refusal reports the rejected input back, so a caller comparing it
+//! against what it sent has to see its own bytes. The framework's constraint walk stores a
+//! BOUNDED rendering of the value on each violation instead, so a value past that bound
+//! reaches a renderer as a prefix of itself plus a marker naming its size — text no service
+//! emits. The refusal seam above cannot repair that, because it is handed the violations
+//! alone and never the request they came from, so each modelled operation is served
+//! through [`WithSubmittedValues`], which re-reads the request where the value still
+//! exists ([`MAX_QUOTED_VALUE`] bounds what one clause quotes).
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::constraints::{path, EnumTrait};
+use aws_smithy_schema_server::ProtocolError;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable,
+    Refusal, Refused, Service, Violation, ViolationKind,
 };
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// The error code this service answers a request-validation failure with.
@@ -85,6 +102,27 @@ use std::sync::Arc;
 /// code and the message TOGETHER, so a reworded message would otherwise drop the
 /// code with it.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The HTTP status a request-validation failure is answered with, as the modelled
+/// `com.amazonaws.configservice#ValidationException` declares it (`httpError` 400, the
+/// default for a client error) and as the framework's refusal channel renders it. Restated
+/// here only to classify the telemetry row for a refusal this file answers.
+const VALIDATION_EXCEPTION_STATUS: u16 = 400;
+
+/// The largest `@length` maximum any member of this model declares: `TemplateBody`, the
+/// CloudFormation template a conformance pack is created from
+/// (`smithy_query(query="shape",shape="TemplateBody")` gives `@length` 1..51200).
+const LARGEST_DECLARED_LENGTH: usize = 51_200;
+
+/// The largest single value one clause of this service quotes.
+///
+/// A constraint clause quotes the value the request carried, and a value that BREAKS a
+/// declared maximum is longer than that maximum — so a ceiling able to quote the refusal of
+/// this model's largest member has to sit above [`LARGEST_DECLARED_LENGTH`]. Twice it, so a
+/// value some way past the largest member's bound is still quoted whole while one clause
+/// can never carry request-sized content: a MODEL constant rather than a request-sized one.
+/// Past it the framework's own bounded rendering stands, which is the fail-safe direction.
+const MAX_QUOTED_VALUE: usize = 2 * LARGEST_DECLARED_LENGTH;
 
 /// The marker that separates a clause's SUBJECT from the requirement it failed.
 ///
@@ -502,6 +540,29 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// Every modelled operation the generated table holds, as a [`WithSubmittedValues`]
+    /// wrapper keyed by the routing key the protocol resolves — the key the generated
+    /// table itself uses. The wrappers hold no engine and no operation instance: a
+    /// request none of them refuses is served by the generated table's own instance, so
+    /// there is no second copy of any operation and no second store.
+    with_submitted_values: OperationRoutingTable,
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table` as a
+/// [`WithSubmittedValues`] wrapper, keyed by the operation's own modelled name — the
+/// routing key `ServerHttpProtocol::routing_key` resolves and the generated table is
+/// keyed by, read off the operation rather than typed again here.
+macro_rules! wrap_operations {
+    ($table:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+                ::std::boxed::Box::new(
+                    WithSubmittedValues::<crate::ops::$module::$operation<Eng>>::new(),
+                ) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -511,8 +572,255 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            with_submitted_values: Self::quoting_submitted_values(),
         }
     }
+
+    /// The wrapper table: every operation this model declares, so the value a clause
+    /// quotes is the submitted one wherever a constraint is broken rather than only on
+    /// the operations a recording happened to cover. The inline test
+    /// `every_modelled_operation_quotes_the_submitted_value` holds this list to the
+    /// model's own surface.
+    fn quoting_submitted_values() -> OperationRoutingTable {
+        let mut table = OperationRoutingTable::new();
+        wrap_operations!(
+            table,
+            associate_resource_types::AssociateResourceTypes,
+            batch_get_aggregate_resource_config::BatchGetAggregateResourceConfig,
+            batch_get_resource_config::BatchGetResourceConfig,
+            delete_aggregation_authorization::DeleteAggregationAuthorization,
+            delete_config_rule::DeleteConfigRule,
+            delete_configuration_aggregator::DeleteConfigurationAggregator,
+            delete_configuration_recorder::DeleteConfigurationRecorder,
+            delete_conformance_pack::DeleteConformancePack,
+            delete_connector::DeleteConnector,
+            delete_delivery_channel::DeleteDeliveryChannel,
+            delete_evaluation_results::DeleteEvaluationResults,
+            delete_organization_config_rule::DeleteOrganizationConfigRule,
+            delete_organization_conformance_pack::DeleteOrganizationConformancePack,
+            delete_pending_aggregation_request::DeletePendingAggregationRequest,
+            delete_remediation_configuration::DeleteRemediationConfiguration,
+            delete_remediation_exceptions::DeleteRemediationExceptions,
+            delete_resource_config::DeleteResourceConfig,
+            delete_retention_configuration::DeleteRetentionConfiguration,
+            delete_service_linked_configuration_recorder::DeleteServiceLinkedConfigurationRecorder,
+            delete_stored_query::DeleteStoredQuery,
+            deliver_config_snapshot::DeliverConfigSnapshot,
+            describe_aggregate_compliance_by_config_rules::DescribeAggregateComplianceByConfigRules,
+            describe_aggregate_compliance_by_conformance_packs::DescribeAggregateComplianceByConformancePacks,
+            describe_aggregation_authorizations::DescribeAggregationAuthorizations,
+            describe_compliance_by_config_rule::DescribeComplianceByConfigRule,
+            describe_compliance_by_resource::DescribeComplianceByResource,
+            describe_config_rule_evaluation_status::DescribeConfigRuleEvaluationStatus,
+            describe_config_rules::DescribeConfigRules,
+            describe_configuration_aggregator_sources_status::DescribeConfigurationAggregatorSourcesStatus,
+            describe_configuration_aggregators::DescribeConfigurationAggregators,
+            describe_configuration_recorder_status::DescribeConfigurationRecorderStatus,
+            describe_configuration_recorders::DescribeConfigurationRecorders,
+            describe_conformance_pack_compliance::DescribeConformancePackCompliance,
+            describe_conformance_pack_status::DescribeConformancePackStatus,
+            describe_conformance_packs::DescribeConformancePacks,
+            describe_delivery_channel_status::DescribeDeliveryChannelStatus,
+            describe_delivery_channels::DescribeDeliveryChannels,
+            describe_organization_config_rule_statuses::DescribeOrganizationConfigRuleStatuses,
+            describe_organization_config_rules::DescribeOrganizationConfigRules,
+            describe_organization_conformance_pack_statuses::DescribeOrganizationConformancePackStatuses,
+            describe_organization_conformance_packs::DescribeOrganizationConformancePacks,
+            describe_pending_aggregation_requests::DescribePendingAggregationRequests,
+            describe_remediation_configurations::DescribeRemediationConfigurations,
+            describe_remediation_exceptions::DescribeRemediationExceptions,
+            describe_remediation_execution_status::DescribeRemediationExecutionStatus,
+            describe_retention_configurations::DescribeRetentionConfigurations,
+            disassociate_resource_types::DisassociateResourceTypes,
+            get_aggregate_compliance_details_by_config_rule::GetAggregateComplianceDetailsByConfigRule,
+            get_aggregate_config_rule_compliance_summary::GetAggregateConfigRuleComplianceSummary,
+            get_aggregate_conformance_pack_compliance_summary::GetAggregateConformancePackComplianceSummary,
+            get_aggregate_discovered_resource_counts::GetAggregateDiscoveredResourceCounts,
+            get_aggregate_resource_config::GetAggregateResourceConfig,
+            get_compliance_details_by_config_rule::GetComplianceDetailsByConfigRule,
+            get_compliance_details_by_resource::GetComplianceDetailsByResource,
+            get_compliance_summary_by_config_rule::GetComplianceSummaryByConfigRule,
+            get_compliance_summary_by_resource_type::GetComplianceSummaryByResourceType,
+            get_conformance_pack_compliance_details::GetConformancePackComplianceDetails,
+            get_conformance_pack_compliance_summary::GetConformancePackComplianceSummary,
+            get_connector::GetConnector,
+            get_custom_rule_policy::GetCustomRulePolicy,
+            get_discovered_resource_counts::GetDiscoveredResourceCounts,
+            get_organization_config_rule_detailed_status::GetOrganizationConfigRuleDetailedStatus,
+            get_organization_conformance_pack_detailed_status::GetOrganizationConformancePackDetailedStatus,
+            get_organization_custom_rule_policy::GetOrganizationCustomRulePolicy,
+            get_resource_config_history::GetResourceConfigHistory,
+            get_resource_evaluation_summary::GetResourceEvaluationSummary,
+            get_stored_query::GetStoredQuery,
+            list_aggregate_discovered_resources::ListAggregateDiscoveredResources,
+            list_configuration_recorders::ListConfigurationRecorders,
+            list_conformance_pack_compliance_scores::ListConformancePackComplianceScores,
+            list_connectors::ListConnectors,
+            list_discovered_resources::ListDiscoveredResources,
+            list_resource_evaluations::ListResourceEvaluations,
+            list_stored_queries::ListStoredQueries,
+            list_tags_for_resource::ListTagsForResource,
+            put_aggregation_authorization::PutAggregationAuthorization,
+            put_config_rule::PutConfigRule,
+            put_configuration_aggregator::PutConfigurationAggregator,
+            put_configuration_recorder::PutConfigurationRecorder,
+            put_conformance_pack::PutConformancePack,
+            put_connector::PutConnector,
+            put_delivery_channel::PutDeliveryChannel,
+            put_evaluations::PutEvaluations,
+            put_external_evaluation::PutExternalEvaluation,
+            put_organization_config_rule::PutOrganizationConfigRule,
+            put_organization_conformance_pack::PutOrganizationConformancePack,
+            put_remediation_configurations::PutRemediationConfigurations,
+            put_remediation_exceptions::PutRemediationExceptions,
+            put_resource_config::PutResourceConfig,
+            put_retention_configuration::PutRetentionConfiguration,
+            put_service_linked_configuration_recorder::PutServiceLinkedConfigurationRecorder,
+            put_stored_query::PutStoredQuery,
+            put_third_party_service_linked_configuration_recorder::PutThirdPartyServiceLinkedConfigurationRecorder,
+            select_aggregate_resource_config::SelectAggregateResourceConfig,
+            select_resource_config::SelectResourceConfig,
+            start_config_rules_evaluation::StartConfigRulesEvaluation,
+            start_configuration_recorder::StartConfigurationRecorder,
+            start_remediation_execution::StartRemediationExecution,
+            start_resource_evaluation::StartResourceEvaluation,
+            stop_configuration_recorder::StopConfigurationRecorder,
+            tag_resource::TagResource,
+            untag_resource::UntagResource,
+        );
+        table
+    }
+}
+
+/// One modelled operation, served so that a constraint refusal quotes the value the
+/// CALLER submitted.
+///
+/// A Config constraint violation is stated in the AWS envelope
+/// (`N validation error(s) detected: Value '<value>' at '<member path>' failed to satisfy
+/// constraint: <requirement>`), and the value between the quotes is BUILT FROM THE REQUEST:
+/// it is the only place the refusal reports the rejected input back, so a caller that reads
+/// it to recover what it sent must see its own bytes. The framework's walk stores a BOUNDED
+/// rendering of that value on each violation, so a value past that bound arrives as a
+/// prefix of itself followed by a marker naming its size — text no service emits.
+///
+/// [`Service::override_refusal`] cannot restore it — that seam is handed the violations
+/// alone, never the request they came from — so the restoring step happens here, per
+/// operation, where the input can be re-read.
+///
+/// Zero-sized: the wrapper holds no engine and no operation instance. It carries the
+/// operation TYPE, which is all it needs — the input shape to read the request into and the
+/// input `Schema` to read it against — and hands a request it does not refuse to the one
+/// instance the generated routing table built from the shared engine, so there is no second
+/// instance of any operation and no second store.
+///
+/// Nothing else is re-implemented and no check is repeated with different words: the
+/// violations come from the framework's own machinery (the protocol's deserializer and
+/// `constraints::validate` over the built input, through
+/// [`service_common::validation::refusing_violations_quoting_up_to`]), the clauses and the
+/// envelope from [`constraint_envelope`] — the same renderer [`Service::override_refusal`]
+/// uses, so the two cannot drift — and the code and status from the framework's refusal
+/// channel. The cost is DELIBERATE: a request this wrapper does not refuse is read twice,
+/// once here and once in the operation's own sequence, because the framework hands no
+/// already-built input to an operation.
+struct WithSubmittedValues<Op> {
+    operation: PhantomData<fn() -> Op>,
+}
+
+impl<Op> WithSubmittedValues<Op> {
+    /// The wrapper for one operation type. Const because it holds nothing.
+    const fn new() -> Self {
+        Self {
+            operation: PhantomData,
+        }
+    }
+}
+
+impl<Op: Operation> ErasedOperation for WithSubmittedValues<Op> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            // The definition is read, used and dropped inside this one block:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the
+            // await below would make this future non-`Send`.
+            let refused = {
+                let definition = svc.definition();
+                let violations =
+                    ::service_common::validation::refusing_violations_quoting_up_to::<Op>(
+                        definition.protocol(),
+                        req,
+                        MAX_QUOTED_VALUE,
+                    );
+                // A violation set this service has no wording for leaves the request to
+                // the layers behind this wrapper, which refuse it in the framework's own
+                // envelope: the fail-safe direction.
+                constraint_envelope(&violations).map(|message| {
+                    definition.refusal_response(
+                        ProtocolError::Invalid(violations),
+                        Some(Refused {
+                            code: VALIDATION_EXCEPTION.to_string(),
+                            message,
+                        }),
+                        req,
+                    )
+                })
+            };
+            if let Some(response) = refused {
+                // The row the framework's own sequence would have recorded for this
+                // request, so a refusal answered here is not a hole in the telemetry
+                // series.
+                record_refusal::<Op>(ctx, started.elapsed());
+                return response;
+            }
+            // Nothing to state: the request is served by the generated operation, which
+            // runs the whole framework sequence (deserialize, validate, handle, serialize)
+            // plus its telemetry over the same bytes. Reached through the routing table
+            // rather than through `override_operation`, which would route straight back
+            // here. Bound in its own statement so nothing borrowed from the definition is
+            // held across the await.
+            let served = svc.definition().routing_table().get(Op::NAME);
+            match served {
+                Some(operation) => operation.run(svc, req, ctx).await,
+                // Unreachable in practice: this wrapper is only reachable under the key
+                // the generated table registered. Answer the framework's own
+                // no-such-operation response rather than inventing one.
+                None => svc.definition().routing_error_response(req),
+            }
+        })
+    }
+
+    /// `None` — the framework reads the schemes off the MODELLED operation the request's
+    /// routing key names, which is what the model bakes them on, so wrapping an operation
+    /// cannot change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        None
+    }
+}
+
+/// Record the refusal answered above as the operation row the framework's sequence would
+/// have recorded: the same classification (the status and error code of this service's
+/// constraint refusal), the same folded handle (this service's signing name and the
+/// operation's own name), and the same already-sanitized request metadata. Gated on a
+/// client collecting, exactly as the framework gates it.
+fn record_refusal<Op: Operation>(ctx: &OperationContext<'_>, latency: std::time::Duration) {
+    if !emulator_telemetry::recording_active() {
+        return;
+    }
+    let handle =
+        emulator_telemetry::OperationHandle::folded(ctx.identity().signing_name_static(), Op::NAME);
+    emulator_telemetry::record_generated_operation_with_handle(
+        &handle,
+        latency,
+        Some(emulator_telemetry::OperationFailure::classify(
+            VALIDATION_EXCEPTION_STATUS,
+            VALIDATION_EXCEPTION,
+        )),
+        smithy_server_runtime::RequestTelemetry::from_headers(&ctx.parts().headers).into_metadata(),
+    );
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -537,12 +845,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol resolves,
+        // and the operation it names is the one served — through [`WithSubmittedValues`],
+        // so a constraint refusal quotes the value the caller submitted. A key the model
+        // does not name resolves to `None` here exactly as it does in the generated table,
+        // so the router's routing-error path is unchanged.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.with_submitted_values.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -566,6 +875,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // An authentication refusal is not an input-constraint failure and keeps
         // the framework's wording.
+        //
+        // [`WithSubmittedValues`] answers a refusal of a MODELLED operation before the
+        // walk reaches here, with the same code and through this same renderer — and with
+        // the clause's value quoted as the caller submitted it, which this seam cannot do
+        // because it is handed no request. This body therefore still words a refusal
+        // raised outside that path, and the two cannot drift: both render through
+        // [`constraint_envelope`].
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),
@@ -1072,5 +1388,60 @@ mod tests {
             stated.is_none(),
             "case no violations: expected None, got {stated:?}"
         );
+    }
+
+    /// This service's Smithy model, as it ships beside this crate. Read at test time
+    /// rather than embedded: it is megabytes of JSON that no non-test build needs.
+    const MODEL_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/smithy-model/com-amazonaws-configservice-starlingdoveservice.json"
+    );
+
+    /// RULE applied to the whole surface: every operation the model declares is served
+    /// through [`WithSubmittedValues`], under the same key the generated routing table is
+    /// keyed by — so the value a clause quotes is the submitted one wherever a constraint
+    /// is broken, not only on the operations a recording covered.
+    ///
+    /// The names come from the MODEL rather than from a second hand-written list, so an
+    /// operation added to the model and not to `wrap_operations!` fails here instead of
+    /// silently quoting a bounded rendering of a value in a refusal — and a key spelled
+    /// differently from the generated table's fails here instead of silently never being
+    /// reached by `override_operation`.
+    #[test]
+    fn every_modelled_operation_quotes_the_submitted_value() {
+        let model = std::fs::read_to_string(MODEL_PATH)
+            .expect("the model that generated this crate ships beside it");
+        let model: serde_json::Value =
+            serde_json::from_str(&model).expect("the model that generated this crate is JSON");
+        let shapes = model["shapes"]
+            .as_object()
+            .expect("a Smithy model declares shapes");
+        let operations: Vec<&str> = shapes
+            .iter()
+            .filter(|(_, shape)| shape["type"] == "operation")
+            .filter_map(|(id, _)| id.rsplit('#').next())
+            .collect();
+        assert_eq!(
+            operations.len(),
+            102,
+            "case the model's surface: expected this service's 102 operations, got {}",
+            operations.len()
+        );
+
+        let service = EmulatedService::new(Arc::new(engine::InMemoryEngine::new()));
+        for operation in operations {
+            assert!(
+                service.entry.routing_table().get(operation).is_some(),
+                "case {operation}: the generated table keys an operation by its shape \
+                 name; this one resolved to nothing, so the wrapper's key spelling is wrong"
+            );
+            assert!(
+                service.with_submitted_values.get(operation).is_some(),
+                "case {operation}: every modelled operation is served through \
+                 WithSubmittedValues; this one is missing from wrap_operations!, so a \
+                 constraint refusal of it quotes the framework's bounded rendering of a \
+                 value instead of the value the caller submitted"
+            );
+        }
     }
 }
