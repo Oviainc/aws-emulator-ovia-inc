@@ -37,12 +37,20 @@ mod error_envelope;
 mod geo_locations;
 #[path = "all/geolocation_routing.rs"]
 mod geolocation_routing;
+// Declared beside the other health-check suites: this one is the type gate both
+// readers of a health check's checker observations apply.
+#[path = "all/health_check_calculated_reads.rs"]
+mod health_check_calculated_reads;
 // Declared beside the other health-check suites: this one is the members of a
 // `HealthCheckConfig` the service decides for a request that leaves them out.
 #[path = "all/health_check_config_defaults.rs"]
 mod health_check_config_defaults;
 #[path = "all/health_check_creation.rs"]
 mod health_check_creation;
+// Declared beside the creation suite: this one is the request-schema enumeration a
+// health check's probe cadence is held to, which is refused before any handler runs.
+#[path = "all/health_check_request_interval_enumeration.rs"]
+mod health_check_request_interval_enumeration;
 // Declared beside the other health-check suites: this one is the `ChildHealthChecks`
 // length bound, which the creation suite's tables do not reach.
 #[path = "all/health_check_child_list_bound.rs"]
@@ -74,6 +82,10 @@ mod health_checks;
 mod hosted_zone_config;
 #[path = "all/hosted_zone_count.rs"]
 mod hosted_zone_count;
+// Declared beside the zone suites: this one is the domain-name format every
+// caller-supplied DNS name is held to, across the operations that take one.
+#[path = "all/hosted_zone_dns_name_validation.rs"]
+mod hosted_zone_dns_name_validation;
 #[path = "all/hosted_zone_features.rs"]
 mod hosted_zone_features;
 // Declared beside the features suite: this one is the `Features` CONTAINER every

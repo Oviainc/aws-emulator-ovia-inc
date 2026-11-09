@@ -155,9 +155,10 @@
 use super::types::*;
 
 use crate::state::{
-    canonical_dns_name, no_such_delegation_set, normalize_delegation_set_id, resource_location,
-    vpc_id_is_well_formed, vpc_region_is_modelled, RecordKey, StoredZone,
-    HOSTED_ZONE_ALREADY_EXISTS_MESSAGE, MAX_HOSTED_ZONES, MAX_HOSTED_ZONES_PER_DELEGATION_SET,
+    canonical_dns_name, invalid_domain_name_message, no_such_delegation_set,
+    normalize_delegation_set_id, resource_location, vpc_id_is_well_formed, vpc_region_is_modelled,
+    RecordKey, StoredZone, HOSTED_ZONE_ALREADY_EXISTS_MESSAGE, MAX_HOSTED_ZONES,
+    MAX_HOSTED_ZONES_PER_DELEGATION_SET,
 };
 use std::collections::BTreeMap;
 
@@ -301,6 +302,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // A zone's name has to be a domain name before it can be a zone's name:
+        // every rule of the domain-name format counts, and the refusal states
+        // the rule that was broken and quotes the name the request sent.
+        if let Some(problem) = invalid_domain_name_message(&input.name) {
+            return Err(CreateHostedZoneErrorModeled::InvalidDomainName(InvalidDomainName {
+                message: Some(problem),
+            })
+            .into());
+        }
         // A hosted zone is stored and reported under the ONE canonical form of
         // its name, whatever spelling it was created with.
         let name = canonical_dns_name(&input.name);

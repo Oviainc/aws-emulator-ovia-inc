@@ -47,6 +47,10 @@ pub mod geo_location;
 /// health check carries it.
 pub mod monitored_alarm;
 
+/// The VPCs the calling account holds, which a request naming a VPC is resolved
+/// against.
+pub mod account_vpcs;
+
 use crate::ops::types::create_cidr_collection_types::CidrCollection;
 use crate::ops::types::create_reusable_delegation_set_types::HostedZoneNotFound;
 use crate::ops::types::delete_vpc_association_authorization_types::VPCAssociationAuthorizationNotFound;
@@ -1557,6 +1561,35 @@ pub fn health_check_config_problem(config: &HealthCheckConfig) -> Option<String>
     }
 }
 
+/// The refusal text a read of a CALCULATED health check's checker observations
+/// is answered with (`InvalidInput`, HTTP 400).
+///
+/// A CALCULATED health check has no endpoint and no checkers: "for health checks
+/// that monitor the status of other health checks, Route 53 adds up the number
+/// of health checks that Route 53 health checkers consider to be healthy and
+/// compares that number with the value of HealthThreshold"
+/// (`HealthCheckConfig$Type`). Its health is therefore a function of its
+/// children, published as a CloudWatch metric, and not an observation any
+/// checker made — so the operations that report per-checker observations refuse
+/// it rather than answering with a list.
+///
+/// A CONSTANT: the sentence carries no request or state value at all, and it
+/// names the status reader on BOTH of those paths — one refusal, one wording,
+/// whichever of the two readers was called.
+pub const CALCULATED_HEALTH_CHECK_OBSERVATIONS_MESSAGE: &str =
+    "Invalid parameter : To get the status of a calculated health check, use either the Route 53 \
+     console or the CloudWatch console. The GetHealthCheckStatus action can't return the health \
+     of calculated health checks.";
+
+/// Whether `config` is a health check whose health is computed from other health
+/// checks rather than observed by Route 53's checkers.
+///
+/// The ONE predicate the two observation readers gate on, so they cannot
+/// disagree about which health checks have checker observations to report.
+pub fn health_check_is_calculated(config: &HealthCheckConfig) -> bool {
+    config.r#type == HEALTH_CHECK_TYPE_CALCULATED
+}
+
 /// One version of a traffic policy: the document that version holds, and the
 /// values read off it.
 ///
@@ -2645,31 +2678,41 @@ pub fn dns_name_fault(name: &str) -> Option<DnsNameFault> {
     None
 }
 
-/// Why `name` is no DNS name Route 53 can hold a zone for, or `None` when it is
-/// one.
+/// The problem clause this service states one [`DnsNameFault`] as: the fault's
+/// own code and the parenthesised sentence beside it.
+///
+/// ONE vocabulary for every path that judges a submitted DNS name — the record
+/// data of a `CNAME`, `NS` or `PTR` record set, and the `DNSName` a listing is
+/// positioned at — so one broken rule of the domain-name format is stated
+/// identically whichever operation was asked to accept the name.
+pub fn dns_name_fault_clause(fault: DnsNameFault) -> &'static str {
+    match fault {
+        DnsNameFault::EmptyLabel => "DomainLabelEmpty (Domain label is empty)",
+        DnsNameFault::LabelTooLong(_) => "DomainLabelTooLong (Domain label is too long)",
+        DnsNameFault::NameTooLong(_) => "DomainTooLong (Domain name is too long)",
+    }
+}
+
+/// The refusal text a request submitting the unusable domain name `name` is
+/// answered with (`InvalidDomainName`, HTTP 400), or `None` when `name` breaks
+/// no rule of the domain-name format.
 ///
 /// The modelled `@length` on a `DNSName` member bounds the REQUEST field (up to
 /// 1024 characters), which is far looser than what DNS itself allows, so a name
 /// that satisfies every modelled constraint can still be unusable as a domain
-/// name — and that is the refusal `InvalidDomainName` names. The two bounds are
-/// the documented label and whole-name lengths, as [`dns_name_fault`] measures
-/// them.
-pub fn dns_name_problem(name: &str) -> Option<String> {
-    match dns_name_fault(name) {
-        Some(DnsNameFault::LabelTooLong(octets)) => Some(format!(
-            "a label may carry at most {MAX_DNS_LABEL_OCTETS} octets, and this name has one of \
-             {octets}"
-        )),
-        Some(DnsNameFault::NameTooLong(octets)) => Some(format!(
-            "a domain name may carry at most {MAX_DNS_NAME_OCTETS} octets including the dots, \
-             and this one carries {octets}"
-        )),
-        // A name whose labels are within the documented bounds is one this
-        // service can hold a zone for; an empty label is a rule of the
-        // domain-name format rather than one of the two length bounds
-        // `InvalidDomainName` is raised over here.
-        Some(DnsNameFault::EmptyLabel) | None => None,
-    }
+/// name — and that is the refusal `InvalidDomainName` names. Every rule of the
+/// format counts, as [`dns_name_fault`] measures them: the documented label and
+/// whole-name lengths, and a label with no octets at all.
+///
+/// The sentence states the rule that was broken ([`dns_name_fault_clause`]) and
+/// quotes the name that broke it verbatim from the request, so it is built
+/// wholly from the request.
+pub fn invalid_domain_name_message(name: &str) -> Option<String> {
+    let fault = dns_name_fault(name)?;
+    Some(format!(
+        "FATAL problem: {} encountered with '{name}'",
+        dns_name_fault_clause(fault)
+    ))
 }
 
 /// Whether `name` is inside `zone_name` — the same name, or a subdomain of it.

@@ -126,7 +126,8 @@
 use super::types::*;
 
 use crate::state::{
-    dns_name_problem, dns_sort_key, normalize_zone_id, DnsNameKey, StoredZone, DEFAULT_PAGE_SIZE,
+    dns_sort_key, invalid_domain_name_message, normalize_zone_id, DnsNameKey, StoredZone,
+    DEFAULT_PAGE_SIZE,
 };
 
 /// The most hosted zones one response carries.
@@ -241,12 +242,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A name that is no domain name positions nothing, however well it fits
-        // the modelled length of the field.
+        // the modelled length of the field: every rule of the domain-name format
+        // counts, the empty label included, and the refusal states the rule that
+        // was broken and quotes the name that broke it.
         if let Some(name) = start_name {
-            if let Some(problem) = dns_name_problem(name) {
+            if let Some(problem) = invalid_domain_name_message(name) {
                 return Err(ListHostedZonesByNameErrorModeled::InvalidDomainName(
                     InvalidDomainName {
-                        message: Some(format!("{name:?} is not a valid domain name: {problem}")),
+                        message: Some(problem),
                     },
                 )
                 .into());

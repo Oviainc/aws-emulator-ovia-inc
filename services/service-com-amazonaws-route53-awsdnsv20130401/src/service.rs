@@ -54,6 +54,11 @@
 
 pub mod envelope;
 
+/// The request-schema check every request this service serves passes through
+/// before it is read: an element whose accepted values the schema enumerates is
+/// held to that set.
+pub mod xml_schema;
+
 use smithy_server_runtime::{
     http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };

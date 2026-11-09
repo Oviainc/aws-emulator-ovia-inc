@@ -30,7 +30,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_route53_awsdnsv20130401::ops::types::HEALTH_CHECK_REGION_VALUES;
 use service_com_amazonaws_route53_awsdnsv20130401::state::{
-    HEALTH_CHECK_TYPE_TCP, STATUS_HTTP_OK, STATUS_TCP_CONNECTION_ESTABLISHED,
+    HEALTH_CHECK_TYPE_CALCULATED, HEALTH_CHECK_TYPE_TCP, STATUS_HTTP_OK,
+    STATUS_TCP_CONNECTION_ESTABLISHED,
 };
 
 use crate::checker_ip_ranges::reported_blocks;
@@ -233,6 +234,18 @@ async fn one_checker_per_health_checking_region_reports_on_a_health_check_that_p
         let created =
             create_health_check(&router, &format!("status-{}", row.kind), &row.config(&child)).await;
         let id = health_check_id(&created, row.kind);
+        // A CALCULATED health check has no endpoint and no checkers, so this
+        // reader refuses it rather than answering with a list; the refusal's
+        // status and wording are asserted in `health_check_calculated_reads`.
+        if row.kind == HEALTH_CHECK_TYPE_CALCULATED {
+            let reply = get_status(&router, &id).await;
+            assert_eq!(
+                reply.status, 400,
+                "case {:?}: expected 400 from GetHealthCheckStatus, got {} with body {}",
+                row.kind, reply.status, reply.body
+            );
+            continue;
+        }
         let reported = observations(&router, &id, row.kind).await;
 
         if !row.endpoint_probe {

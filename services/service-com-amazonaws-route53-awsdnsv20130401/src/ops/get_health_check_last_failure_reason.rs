@@ -65,7 +65,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{no_such_health_check, now_millis};
+use crate::state::{
+    health_check_is_calculated, no_such_health_check, now_millis,
+    CALCULATED_HEALTH_CHECK_OBSERVATIONS_MESSAGE,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -157,6 +160,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     no_such_health_check(&input.health_check_id),
                 )
             })?;
+
+        // The same gate the sibling status reader applies, under the same
+        // sentence: a CALCULATED health check has no endpoint and no checkers, so
+        // neither reader of its checker observations has anything to report and
+        // both refuse rather than answer with invented ones. AFTER the id is
+        // resolved, so an id that names no health check is still the 404.
+        if health_check_is_calculated(&health_check.config) {
+            return Err(GetHealthCheckLastFailureReasonErrorModeled::InvalidInput(
+                InvalidInput {
+                    message: Some(CALCULATED_HEALTH_CHECK_OBSERVATIONS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
 
         // "A list that contains one Observation element for each Amazon Route 53
         // health checker that is reporting a last failure reason": the checkers

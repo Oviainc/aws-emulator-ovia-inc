@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The endpoint host the tests address, which is also the routing signal the
@@ -33,7 +34,47 @@ pub(crate) const ENDPOINT: &str = "route53.amazonaws.com";
 /// `pub(crate)` so a sibling suite in this test target drives the service
 /// through the SAME harness rather than growing a second copy of it.
 pub(crate) fn router() -> MultiServiceRouter {
+    router_holding_vpcs(&[])
+}
+
+/// The IPv4 block every VPC [`router_holding_vpcs`] registers carries. The block
+/// itself is immaterial to Route 53 — nothing here reads it — but a VPC of the
+/// account has one, so the record is stored as Amazon EC2 would report it.
+const HELD_VPC_CIDR_BLOCK: &str = "10.0.0.0/16";
+
+/// A router with just this service mounted on a fresh shared engine whose
+/// account already HOLDS each `(VPCId, VPCRegion)` of `vpcs` in its Amazon EC2
+/// VPC inventory.
+///
+/// Which VPCs an account has is a fact of that inventory — the one
+/// `DescribeVpcs` answers from — and it is what Route 53 resolves the VPC a
+/// request names against, so a suite whose request must be SERVED for a VPC
+/// registers that VPC here first. Written into the Amazon EC2 store directly
+/// (both the record and the Region it belongs to), because the id has to be the
+/// one the request names and `CreateVpc` mints its own.
+///
+/// `pub(crate)` for the same reason [`router`] is.
+pub(crate) fn router_holding_vpcs(vpcs: &[(&str, &str)]) -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    {
+        let state = ec2::state::service_state(&*engine)
+            .expect("the shared engine must carry the Amazon EC2 store");
+        let mut store = state.lock();
+        for (vpc_id, vpc_region) in vpcs {
+            store.vpcs.insert(
+                (*vpc_id).to_string(),
+                ec2::ops::types::Vpc {
+                    vpc_id: Some((*vpc_id).to_string()),
+                    cidr_block: Some(HELD_VPC_CIDR_BLOCK.to_string()),
+                    state: Some(ec2::state::VPC_STATE_AVAILABLE.to_string()),
+                    ..Default::default()
+                },
+            );
+            store
+                .vpc_regions
+                .insert((*vpc_id).to_string(), (*vpc_region).to_string());
+        }
+    }
     let mut router = MultiServiceRouter::new();
     router.register_service(
         service_com_amazonaws_route53_awsdnsv20130401::EmulatedService::new(engine),

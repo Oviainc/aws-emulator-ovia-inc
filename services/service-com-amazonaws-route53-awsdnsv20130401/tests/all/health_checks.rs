@@ -350,11 +350,14 @@ async fn a_created_health_check_reads_back_as_it_was_created() {
 #[tokio::test]
 async fn a_request_that_asks_for_its_own_interval_and_threshold_keeps_them() {
     // The defaults are what the service fills in for a member the request left
-    // out; a request that names one keeps its own value. `RequestInterval` is
-    // `range 10..30` and `FailureThreshold` is `range 1..10`, so the rows below
-    // are both published bounds of each.
+    // out; a request that names one keeps its own value. `FailureThreshold` is
+    // `range 1..10`, so the rows below carry both of its published bounds and
+    // one inside them, crossed with the two `RequestInterval` values the
+    // service's request schema accepts (an interval outside that enumeration is
+    // refused before any handler runs, which
+    // `health_check_request_interval_enumeration` asserts).
     let router = router();
-    for (index, (interval, threshold)) in [(10, 1), (30, 10), (17, 4)].iter().enumerate() {
+    for (index, (interval, threshold)) in [(10, 1), (30, 10), (10, 4), (30, 7)].iter().enumerate() {
         let case = format!("RequestInterval {interval}, FailureThreshold {threshold}");
         let created = create_health_check(
             &router,

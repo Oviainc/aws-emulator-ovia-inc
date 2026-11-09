@@ -29,10 +29,18 @@ tracing = { workspace = true }
 # id the error envelope carries is mixed by a reviewed implementation rather than
 # a hand-written one.
 sha2 = { workspace = true }
+# The request-schema check (`service::xml_schema`) reads the request body with a
+# maintained XML reader rather than looking at the text, and takes the position a
+# schema violation names from that reader's own progress through the body.
+quick-xml = "0.41"
 # A health check's aggregate assessment is published as CloudWatch metric data in the
 # `AWS/Route53` namespace, which lives in the CloudWatch emulator's own metric store: it is
 # reached through the shared engine and needs the owning service's state TYPE.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# Which VPCs the account holds is a fact of its Amazon EC2 inventory — the one `DescribeVpcs`
+# answers from — so the VPC a Route 53 request names is resolved against that store through
+# the shared engine, which needs the owning service's state TYPE.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

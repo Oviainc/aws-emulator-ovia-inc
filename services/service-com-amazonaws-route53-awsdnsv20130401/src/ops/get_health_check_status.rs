@@ -67,7 +67,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{no_such_health_check, now_millis};
+use crate::state::{
+    health_check_is_calculated, no_such_health_check, now_millis,
+    CALCULATED_HEALTH_CHECK_OBSERVATIONS_MESSAGE,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,6 +158,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.health_check_id,
             ))
         })?;
+
+        // A CALCULATED health check has no endpoint and no checkers: its health
+        // is computed from the health checks it names, so there is no
+        // observation to report and the read is refused rather than answered
+        // with invented ones. The gate goes AFTER the id is resolved, so an id
+        // that names no health check is still the 404 it would otherwise be.
+        if health_check_is_calculated(&health_check.config) {
+            return Err(GetHealthCheckStatusErrorModeled::InvalidInput(InvalidInput {
+                message: Some(CALCULATED_HEALTH_CHECK_OBSERVATIONS_MESSAGE.to_string()),
+            })
+            .into());
+        }
 
         // "A list that contains one HealthCheckObservation element for each
         // Amazon Route 53 health checker that is reporting a status about the

@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::hosted_zone_records::{call, escape_xml, router, Reply};
+use crate::hosted_zone_records::{call, escape_xml, router, router_holding_vpcs, Reply};
 use crate::vpc_associations::{
     associate, associations, bare_zone_id, create_private_zone, create_zone, get_zone, vpc_block,
     CREATION_VPC, HOME_REGION,
@@ -192,7 +192,9 @@ async fn disassociating_a_vpc_removes_exactly_that_association() {
         },
     ];
 
-    let router = router();
+    let router = router_holding_vpcs(
+        &[&[(CREATION_VPC, HOME_REGION)][..], &members[..]].concat(),
+    );
     let zone_id = create_private_zone(
         &router,
         "disassociate.example.com",

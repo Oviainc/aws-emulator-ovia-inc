@@ -212,6 +212,14 @@ impl ErasedOperation for ErrorEnvelope {
             let Some(op) = modelled_operation(svc, req) else {
                 return with_request_id(svc.definition().routing_error_response(req));
             };
+            // The request SCHEMA is checked before the request is read, exactly as
+            // the service checks it while parsing the body: an element whose
+            // accepted values the schema enumerates is held to that set here, so no
+            // handler is ever given a value the service would not have parsed. The
+            // renderer it answers through already finishes the envelope.
+            if let Some(refused) = crate::service::xml_schema::refusal(svc, req) {
+                return refused;
+            }
             with_request_id(op.run(svc, req, ctx).await)
         })
     }

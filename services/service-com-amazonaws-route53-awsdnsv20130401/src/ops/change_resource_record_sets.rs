@@ -107,10 +107,10 @@
 use super::types::*;
 
 use crate::state::{
-    canonical_dns_name, dns_name_fault, dns_sort_key, name_is_in_zone,
+    canonical_dns_name, dns_name_fault, dns_name_fault_clause, dns_sort_key, name_is_in_zone,
     name_not_permitted_in_zone_message, no_such_health_check, no_such_hosted_zone,
     normalize_zone_id, record_set_already_exists_message, record_set_label,
-    zone_record_set_limit_message, DnsNameFault, DnsNameKey, RecordKey, MAX_CHANGES_PER_BATCH,
+    zone_record_set_limit_message, DnsNameKey, RecordKey, MAX_CHANGES_PER_BATCH,
     MAX_RECORD_SETS_PER_ZONE, MAX_REPORTED_CHANGE_PROBLEMS,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -513,14 +513,10 @@ fn record_value_problem(rr_type: &str, value: &str) -> Option<String> {
             .then_some("AAAARRDATAIllegalIPv6Address (Value is not a valid IPv6 address)"),
         "TXT" | "SPF" => (!is_quoted_character_strings(value))
             .then_some("InvalidCharacterString (Value should be enclosed in quotation marks)"),
-        "CNAME" | "NS" | "PTR" => match dns_name_fault(value) {
-            Some(DnsNameFault::EmptyLabel) => Some("DomainLabelEmpty (Domain label is empty)"),
-            Some(DnsNameFault::LabelTooLong(_)) => {
-                Some("DomainLabelTooLong (Domain label is too long)")
-            }
-            Some(DnsNameFault::NameTooLong(_)) => Some("DomainTooLong (Domain name is too long)"),
-            None => None,
-        },
+        // A domain name's own rules are the service's, stated in the one
+        // vocabulary every path that judges a submitted name uses
+        // (`dns_name_fault_clause`).
+        "CNAME" | "NS" | "PTR" => dns_name_fault(value).map(dns_name_fault_clause),
         _ => None,
     }?;
     Some(format!(

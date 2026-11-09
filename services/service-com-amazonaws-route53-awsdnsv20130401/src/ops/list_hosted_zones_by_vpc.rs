@@ -99,6 +99,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::account_vpcs::{account_holds_vpc, vpc_not_owned_message};
 use crate::state::{invalid_pagination_token, DEFAULT_PAGE_SIZE};
 
 /// The most hosted zones one page carries.
@@ -248,6 +249,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ListHostedZonesByVPC request" — echoed as sent, while `page_size`
         // above bounds the work and the response size.
         let reported_max_items = input.max_items.unwrap_or(DEFAULT_PAGE_SIZE);
+
+        // The VPC a request asks about has to be one the calling account HOLDS:
+        // a VPC belongs to the account's own Amazon EC2 inventory, in the Region
+        // it was created in, and a request naming a pair that inventory does not
+        // hold is asking about another account's VPC — which is an authorization
+        // failure, not an empty listing. Resolved with this service's store
+        // UNLOCKED, because the inventory lives in another service's store and
+        // the two are never locked at once.
+        if !account_holds_vpc(&*self.engine, vpc_id, vpc_region) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                vpc_not_owned_message(vpc_id, vpc_region),
+            ));
+        }
 
         let store = state.lock();
         // Zones are keyed by id in a `BTreeMap`, so this walk is a stable total

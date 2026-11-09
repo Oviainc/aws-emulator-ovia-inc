@@ -26,6 +26,8 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_route53_awsdnsv20130401::state::HEALTH_CHECK_TYPE_CALCULATED;
+
 use crate::health_check_status::{get_status, observations_in, Observation};
 use crate::health_check_updates::update_health_check;
 use crate::health_checks::{child_for, create_health_check, health_check_count, health_check_id, CATALOG};
@@ -139,6 +141,19 @@ async fn the_last_failure_reason_is_reported_for_every_checker_that_has_one() {
         )
         .await;
         let id = health_check_id(&created, row.kind);
+        // A CALCULATED health check has no endpoint and no checkers, so BOTH
+        // readers of its observations refuse it rather than answering with a
+        // list; `health_check_calculated_reads` asserts that refusal.
+        if row.kind == HEALTH_CHECK_TYPE_CALCULATED {
+            let reply = get_last_failure_reason(&router, &id).await;
+            assert_eq!(
+                reply.status, 400,
+                "case {:?}: expected 400 from GetHealthCheckLastFailureReason, got {} with \
+                 body {}",
+                row.kind, reply.status, reply.body
+            );
+            continue;
+        }
         assert_agrees_with_the_status(&router, &id, row.kind).await;
 
         if !row.endpoint_probe {

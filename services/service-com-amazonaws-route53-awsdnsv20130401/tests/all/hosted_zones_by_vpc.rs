@@ -5,19 +5,24 @@
 //! The rules under test, each over a TABLE that spans the class it generalises
 //! over rather than the one VPC that exposed it:
 //!
-//! 1. The operation REPORTS the associations held by the hosted zones in state:
-//!    a zone is listed exactly when it holds an association naming both the
-//!    requested VPC id and the requested VPC region, so a public zone, a zone
-//!    associated with another VPC, and a zone whose association names the same
-//!    VPC id in a different region are all left out. The summaries come back in
-//!    hosted-zone-id order, each carrying the zone's id, its normalized name,
-//!    and an owner that is the account the emulator presents (never an Amazon
-//!    Web Services service, since every zone here was created through this API).
-//! 2. A page carries at most `MaxItems` summaries, `NextToken` names the first
+//! 1. The VPC a request names is resolved against the VPCs the calling account
+//!    HOLDS — its own Amazon EC2 inventory, in the Region each VPC was created
+//!    in — and a pair that inventory does not hold is another account's VPC,
+//!    which is `AccessDenied` (HTTP 403) rather than an empty listing.
+//! 2. For a VPC the account does hold, the operation REPORTS the associations
+//!    held by the hosted zones in state: a zone is listed exactly when it holds
+//!    an association naming both the requested VPC id and the requested VPC
+//!    region, so a public zone, a zone associated with another VPC, and a zone
+//!    whose association names the same VPC id in a different region are all left
+//!    out. The summaries come back in hosted-zone-id order, each carrying the
+//!    zone's id, its normalized name, and an owner that is the account the
+//!    emulator presents (never an Amazon Web Services service, since every zone
+//!    here was created through this API).
+//! 3. A page carries at most `MaxItems` summaries, `NextToken` names the first
 //!    zone the page left out, and the next request resumes there — so walking
 //!    the pages yields every associated zone exactly once, in the same order,
 //!    whatever the page size. `MaxItems` is echoed as the caller sent it.
-//! 3. A `NextToken` this operation never minted identifies no page, so it is
+//! 4. A `NextToken` this operation never minted identifies no page, so it is
 //!    the modelled `InvalidPaginationToken` (400); a request whose required
 //!    `VPCId` names no VPC at all is `InvalidInput` (400).
 //!
@@ -27,7 +32,7 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::hosted_zone_records::{call, create_zone_body, router, Reply};
+use crate::hosted_zone_records::{call, create_zone_body, router_holding_vpcs, Reply};
 
 /// The account every zone in this emulator belongs to, read from the runtime
 /// rather than written as a literal.
@@ -71,8 +76,12 @@ const ZONES: &[ZoneFixture] = &[
         vpc: Some(("vpc-00000000000000003", "us-west-2")),
     },
     ZoneFixture {
-        // The SAME VPC id as the row above, in another region: the association
-        // names a pair, so this zone belongs to the other region's listing.
+        // The SAME VPC id as the row above, with the association naming another
+        // region: an association names a PAIR, so this zone is not one the
+        // listing for that id in its own region reports. The account holds the
+        // VPC in one region only ([`HELD_VPCS`]) — a VPC belongs to the region it
+        // was created in — so the listing for this pair is refused, which rule 1
+        // covers.
         name: "south.shared.example.com",
         vpc: Some(("vpc-00000000000000003", "ap-south-1")),
     },
@@ -81,6 +90,31 @@ const ZONES: &[ZoneFixture] = &[
         vpc: None,
     },
 ];
+
+/// A VPC the account holds that no hosted zone is associated with: the listing
+/// for it is EMPTY rather than refused, which is what separates "you hold this
+/// VPC and nothing is associated with it" from "this is not your VPC".
+const HELD_VPC_WITHOUT_ZONES: (&str, &str) = ("vpc-0000000000000ffff", "us-east-1");
+
+/// A VPC the account does NOT hold, in a Region of the modelled `VPCRegion`
+/// enum: nothing registers it, so every request about it is refused.
+const UNHELD_VPC: (&str, &str) = ("vpc-00000000000000000", "us-west-2");
+
+/// Every `(VPCId, VPCRegion)` the account HOLDS for these tests — each VPC in
+/// the ONE region it was created in, which is what its own Amazon EC2 inventory
+/// records: the three VPCs the fixture zones are associated with, plus a VPC no
+/// zone names.
+const HELD_VPCS: &[(&str, &str)] = &[
+    ("vpc-00000000000000001", "us-east-1"),
+    ("vpc-00000000000000002", "eu-west-1"),
+    ("vpc-00000000000000003", "us-west-2"),
+    HELD_VPC_WITHOUT_ZONES,
+];
+
+/// A router whose account holds exactly [`HELD_VPCS`].
+fn router() -> MultiServiceRouter {
+    router_holding_vpcs(HELD_VPCS)
+}
 
 /// Create every fixture zone and return `name -> bare zone id`.
 async fn seed(router: &MultiServiceRouter) -> Vec<(&'static str, String)> {
@@ -167,7 +201,102 @@ fn summaries(reply: &Reply) -> Vec<(String, String)> {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 1: which zones a VPC's listing reports
+// Rule 1: whose VPC the request is about
+// ---------------------------------------------------------------------------
+
+/// One request about a VPC the account does not hold: why the pair resolves to
+/// no VPC of this account.
+struct OwnershipRow {
+    case: &'static str,
+    vpc_id: &'static str,
+    vpc_region: &'static str,
+}
+
+#[tokio::test]
+async fn a_vpc_the_account_does_not_hold_is_refused() {
+    // The rows differ along WHY the account holds no such VPC: an id its
+    // inventory never held at all, an id it holds in another Region (a VPC
+    // belongs to the Region it was created in, so the pair is what resolves),
+    // and an id of the other VPC id form. Each Region is a member of the
+    // modelled `VPCRegion` enum
+    // (smithy_query(query="shape",shape="VPCRegion")).
+    let rows = [
+        OwnershipRow {
+            case: "an id the account's inventory does not hold",
+            vpc_id: UNHELD_VPC.0,
+            vpc_region: UNHELD_VPC.1,
+        },
+        OwnershipRow {
+            case: "a VPC the account holds, asked about in another Region",
+            vpc_id: "vpc-00000000000000001",
+            vpc_region: "eu-central-1",
+        },
+        OwnershipRow {
+            case: "a VPC the account holds, asked about in the region one of its own \
+                   associations names",
+            vpc_id: "vpc-00000000000000003",
+            vpc_region: "ap-south-1",
+        },
+        OwnershipRow {
+            case: "an id of the 8-character form the account does not hold",
+            vpc_id: "vpc-1a2b3c4d",
+            vpc_region: "eu-west-1",
+        },
+    ];
+
+    let router = router();
+    let _created = seed(&router).await;
+
+    for row in &rows {
+        let reply = list_by_vpc(&router, row.vpc_id, row.vpc_region, None, None).await;
+        assert_eq!(
+            reply.status, 403,
+            "case {:?}: expected HTTP 403, got {} with body {}",
+            row.case, reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            "AccessDenied",
+            "case {:?}: expected the AccessDenied code, got body {}",
+            row.case,
+            reply.body
+        );
+        // The envelope states whose fault the refusal is: a request about
+        // another account's VPC is the caller's.
+        assert_eq!(
+            reply.first("Error/Type"),
+            Some("Sender"),
+            "case {:?}: expected Error/Type Sender, got {:?}; body {}",
+            row.case,
+            reply.first("Error/Type"),
+            reply.body
+        );
+        // The sentence is built from the REQUEST: the id and the Region it was
+        // asked about, both verbatim.
+        let expected = format!(
+            "The VPC: {} in region {} that you provided is not owned by you.",
+            row.vpc_id, row.vpc_region
+        );
+        let got = reply.first("Error/Message").unwrap_or("");
+        assert_eq!(
+            got, expected,
+            "case {:?}: expected message {expected:?}, got {got:?}; body {}",
+            row.case, reply.body
+        );
+        // A refusal reports no zones at all, so nothing of the account leaks
+        // through it.
+        assert!(
+            summaries(&reply).is_empty(),
+            "case {:?}: a refusal carries no summaries, got {:?}; body {}",
+            row.case,
+            summaries(&reply),
+            reply.body
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 2: which zones a VPC's listing reports
 // ---------------------------------------------------------------------------
 
 /// One row of the listing table: the VPC asked about, and the fixture zone
@@ -199,27 +328,15 @@ async fn a_vpcs_listing_reports_exactly_the_zones_associated_with_it() {
             expect_zones: &["only.reporting.example.org"],
         },
         ListingRow {
-            case: "the same VPC id, in the region its first zone names",
+            case: "the same VPC id, in the region the account holds it in",
             vpc_id: "vpc-00000000000000003",
             vpc_region: "us-west-2",
             expect_zones: &["west.shared.example.com"],
         },
         ListingRow {
-            case: "the same VPC id, in the region its second zone names",
-            vpc_id: "vpc-00000000000000003",
-            vpc_region: "ap-south-1",
-            expect_zones: &["south.shared.example.com"],
-        },
-        ListingRow {
-            case: "a known VPC id asked about in a region it has no zone in",
-            vpc_id: "vpc-00000000000000001",
-            vpc_region: "eu-central-1",
-            expect_zones: &[],
-        },
-        ListingRow {
-            case: "a VPC no zone is associated with",
-            vpc_id: "vpc-0000000000000ffff",
-            vpc_region: "us-east-1",
+            case: "a VPC the account holds that no zone is associated with",
+            vpc_id: HELD_VPC_WITHOUT_ZONES.0,
+            vpc_region: HELD_VPC_WITHOUT_ZONES.1,
             expect_zones: &[],
         },
     ];
@@ -337,7 +454,7 @@ async fn the_listing_reflects_the_association_a_zone_was_created_with() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 2: pagination
+// Rule 3: pagination
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -462,7 +579,7 @@ async fn a_token_past_every_associated_zone_lists_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 3: refusals
+// Rule 4: refusals
 // ---------------------------------------------------------------------------
 
 /// One refused request: what makes it bad, and the modelled refusal it earns.

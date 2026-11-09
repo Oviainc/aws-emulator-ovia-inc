@@ -122,7 +122,10 @@ fn bare_id(reply: &Reply) -> String {
 }
 
 /// One `ListHostedZonesByName` request.
-async fn list_by_name(
+///
+/// `pub(crate)` so the sibling suite asserting the domain-name refusal sends the
+/// same request this one does.
+pub(crate) async fn list_by_name(
     router: &MultiServiceRouter,
     dns_name: Option<&str>,
     hosted_zone_id: Option<&str>,

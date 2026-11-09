@@ -26,7 +26,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_route53_awsdnsv20130401::state::DEFAULT_PAGE_SIZE;
 
 use crate::health_checks::create_health_check;
-use crate::hosted_zone_records::{call, create_zone_ok, router, Reply};
+use crate::hosted_zone_records::{call, create_zone_ok, router_holding_vpcs, Reply};
 use crate::reusable_delegation_sets::create_set;
 use crate::traffic_policies::{create_policy, document_with_start_endpoint};
 use crate::traffic_policy_versions::create_version;
@@ -42,6 +42,12 @@ const RECORD_SET_PAGE_SIZE: i32 = 300;
 /// The VPC a private fixture zone is associated with, which the
 /// `ListHostedZonesByVPC` row addresses.
 const FIXTURE_VPC: &str = "vpc-0f1e2d3c4b5a69780";
+
+/// A router whose account holds [`FIXTURE_VPC`], so the by-VPC listing below is
+/// served rather than refused as another account's VPC.
+fn router() -> MultiServiceRouter {
+    router_holding_vpcs(&[(FIXTURE_VPC, HOME_REGION)])
+}
 
 /// One row of the listing table.
 struct ListingRow {
