@@ -1412,6 +1412,17 @@ pub struct ExportTaskRecord {
     /// [`Self::running_due_ms`]. `None` once the task is in a terminal status, which owes no
     /// further transition.
     pub completion_due_ms: Option<i64>,
+    /// Whether the export's OWN work has finished — the selected events are in the
+    /// destination bucket ([`export_worker`]).
+    ///
+    /// `COMPLETED` is the service's statement that the log data has been delivered, so the
+    /// clock alone cannot put a task in it: a task reaches it only once the export it was
+    /// created for has run ([`Self::record_export_written`]). Until then the export is still
+    /// moving data, which is what `RUNNING` says — and what keeps the account's one active
+    /// export slot held.
+    ///
+    /// [`export_worker`]: crate::state::export_worker
+    pub export_written: bool,
 }
 
 impl ExportTaskRecord {
@@ -1448,6 +1459,21 @@ impl ExportTaskRecord {
             completion_due_ms: Some(
                 running_due_ms.saturating_add(EXPORT_TASK_COMPLETION_DELAY_MS),
             ),
+            export_written: false,
+        }
+    }
+
+    /// Record that the export's own work finished at `now_ms`: its objects are in the
+    /// destination bucket, so the task may now reach `COMPLETED`.
+    ///
+    /// The completion the clock owes is never pulled EARLIER by this — an export that
+    /// delivered its data still takes the span this emulator gives the transition — and it is
+    /// pushed out when the data landed after that instant, so the instant the task reports as
+    /// its completion is never before the instant the data was there.
+    pub fn record_export_written(&mut self, now_ms: i64) {
+        self.export_written = true;
+        if let Some(due) = self.completion_due_ms {
+            self.completion_due_ms = Some(due.max(now_ms));
         }
     }
 
@@ -1474,9 +1500,10 @@ impl ExportTaskRecord {
 
     /// Materialise the status changes the clock owes this task: a pending export whose start
     /// instant has passed is `RUNNING`, and a running one whose completion instant has passed
-    /// is `COMPLETED` — each stamped AT that instant and not at the time something happened
-    /// to look. A task the clock finishes carries the status message that terminal status
-    /// carries, the way every status an export task settles at does.
+    /// AND whose data is delivered is `COMPLETED` — each stamped AT that instant and not at
+    /// the time something happened to look. A task the clock finishes carries the status
+    /// message that terminal status carries, the way every status an export task settles at
+    /// does.
     pub fn materialize_due_transitions(&mut self, now_ms: i64) {
         if let Some(due) = self.running_due_ms {
             if due <= now_ms {
@@ -1485,6 +1512,12 @@ impl ExportTaskRecord {
             }
         }
         if self.running_due_ms.is_some() {
+            return;
+        }
+        // `COMPLETED` says the export delivered the log data, so the clock completes a task
+        // only once the export itself has ([`Self::export_written`]); one still moving data
+        // when its completion instant passes stays `RUNNING` until it has.
+        if !self.export_written {
             return;
         }
         if let Some(due) = self.completion_due_ms {

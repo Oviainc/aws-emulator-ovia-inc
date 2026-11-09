@@ -36,12 +36,15 @@ const HOST: &str = "s3.eu-west-2.amazonaws.com";
 const HOUR: i64 = 60 * 60 * 1_000;
 
 /// CloudWatch Logs and Amazon S3 on one shared engine, reached over the wire.
-struct Emulator {
+///
+/// Shared with the suites whose subject is also what an export LANDS in the destination
+/// bucket, so there is one definition of "both services on one engine" in this target.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signing is not the subject here, so requests are unauthenticated; the credential
@@ -67,7 +70,7 @@ impl Emulator {
     }
 
     /// One CloudWatch Logs call: its status and body.
-    async fn logs(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn logs(&self, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -89,7 +92,7 @@ impl Emulator {
     }
 
     /// One CloudWatch Logs call that must succeed.
-    async fn logs_ok(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn logs_ok(&self, case: &str, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.logs(operation, body).await;
         assert_eq!(
             status, 200,
@@ -113,7 +116,7 @@ impl Emulator {
     }
 
     /// `PUT /<bucket>` — S3's `CreateBucket`, naming the Region this suite signs for.
-    async fn create_bucket(&self, case: &str, bucket: &str) {
+    pub(crate) async fn create_bucket(&self, case: &str, bucket: &str) {
         let (status, body) = self
             .s3(
                 "PUT",
@@ -135,8 +138,16 @@ impl Emulator {
         );
     }
 
+    /// Every key `bucket` holds — the whole-bucket listing, which is what shows an export
+    /// that wrote somewhere else, or nowhere. "Limits the response to keys that begin with the
+    /// specified prefix" (`ListObjectsV2Input$Prefix`), and every key begins with the empty
+    /// one.
+    pub(crate) async fn all_keys(&self, case: &str, bucket: &str) -> Vec<String> {
+        self.keys_under(case, bucket, "").await
+    }
+
     /// Every key under `prefix`, read through `ListObjectsV2`.
-    async fn keys_under(&self, case: &str, bucket: &str, prefix: &str) -> Vec<String> {
+    pub(crate) async fn keys_under(&self, case: &str, bucket: &str, prefix: &str) -> Vec<String> {
         let (status, body) = self
             .s3(
                 "GET",
@@ -172,7 +183,7 @@ impl Emulator {
     }
 
     /// The exported text under `prefix`: every object there, gunzipped and concatenated.
-    async fn exported_text(&self, case: &str, bucket: &str, prefix: &str) -> String {
+    pub(crate) async fn exported_text(&self, case: &str, bucket: &str, prefix: &str) -> String {
         let mut text = String::new();
         for key in self.keys_under(case, bucket, prefix).await {
             let body = self.object(case, bucket, &key).await;
@@ -188,7 +199,7 @@ impl Emulator {
     }
 
     /// The status code `DescribeExportTasks` reports for `task_id`.
-    async fn task_status(&self, case: &str, task_id: &str) -> String {
+    pub(crate) async fn task_status(&self, case: &str, task_id: &str) -> String {
         let page = self
             .logs_ok(case, "DescribeExportTasks", &json!({"taskId": task_id}))
             .await;

@@ -6,10 +6,11 @@
 //! `CreateExportTask` "creates an export task so that you can efficiently export data from a
 //! log group to an Amazon S3 bucket", and "this is an asynchronous call" — so the call that
 //! starts an export ANSWERS while the export is still owed, and the objects are what the
-//! export produces. They are therefore written here, off the response path and BEFORE the
-//! task reaches `COMPLETED`, so a caller that waits for the terminal status and then reads
-//! the destination prefix finds the exported data there: a completed task is evidence that
-//! data was written.
+//! export produces. They are therefore written here, off the response path, and the task
+//! RECORDS that it wrote them ([`super::ExportTaskRecord::record_export_written`]), which is
+//! what lets the clock complete it: a caller that waits for `COMPLETED` and then reads the
+//! destination prefix finds the exported data there, because the status says the data was
+//! delivered and nothing but the delivery can produce it.
 //!
 //! What is written follows the task:
 //!
@@ -40,6 +41,12 @@
 //! events, which the store itself caps ([`super::MAX_STREAM_EVENTS`],
 //! [`super::MAX_STREAM_BYTES`]). There is no loop over the clock and no retry: the worker
 //! waits once, writes once per stream, records the outcome and ends.
+//!
+//! Because the task's own completion waits on that outcome, every path out of the worker
+//! either records one or leaves no task behind to wait for it: the record lives in the very
+//! store the worker reads, so a store it cannot reach holds no task either, and a task the
+//! store no longer holds has been dropped. The one task the worker deliberately leaves alone
+//! is a cancelled one, which is already terminal and owes no further transition.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -50,8 +57,9 @@ use super::callback_client::callback_client;
 
 /// How long after the task is created its objects are written: the span the task is
 /// `PENDING` for, so the write happens while it is `RUNNING` — after the export has started
-/// moving data and before the clock completes it
-/// ([`super::EXPORT_TASK_RUNNING_DELAY_MS`], [`super::EXPORT_TASK_COMPLETION_DELAY_MS`]).
+/// moving data, and within the further span the clock takes to complete it
+/// ([`super::EXPORT_TASK_RUNNING_DELAY_MS`], [`super::EXPORT_TASK_COMPLETION_DELAY_MS`]), which
+/// a write that takes longer than that pushes out rather than overrunning.
 const WRITE_DELAY_MS: i64 = super::EXPORT_TASK_RUNNING_DELAY_MS;
 
 /// The status message an export task that could not write its objects reports beside
@@ -94,6 +102,8 @@ async fn run<Eng: Send + Sync + 'static>(
     ))
     .await;
 
+    // The task's record lives in this very store, so a store that is not there holds no task
+    // whose export is owed.
     let Some(state) = super::service_state(&**engine) else {
         return;
     };
@@ -105,6 +115,8 @@ async fn run<Eng: Send + Sync + 'static>(
         // The statuses the clock already owes are materialised first, so the status read
         // here is the current one.
         store.materialize_due_export_transitions(super::now_ms());
+        // A task the store no longer holds was dropped from it, so there is no export left to
+        // do and nothing left to record it on.
         let Some(task) = store.export_tasks.get(task_id) else {
             return;
         };
@@ -115,12 +127,13 @@ async fn run<Eng: Send + Sync + 'static>(
         if is_cancelled(&task.status_code) {
             return;
         }
-        let Some(group) = store.log_groups.get(&task.log_group_name) else {
-            return;
-        };
-        let objects: Vec<(String, Vec<u8>)> = group
-            .streams
-            .values()
+        // A group that is no longer there exports nothing — there are no events left to
+        // select — which is an export of an empty selection and not an export left undone.
+        let objects: Vec<(String, Vec<u8>)> = store
+            .log_groups
+            .get(&task.log_group_name)
+            .into_iter()
+            .flat_map(|group| group.streams.values())
             .filter(|stream| {
                 task.log_stream_name_prefix
                     .as_deref()
@@ -166,21 +179,26 @@ async fn run<Eng: Send + Sync + 'static>(
         }
     }
 
-    if written {
+    // What the write did is recorded on the task, which is what lets it settle: a delivered
+    // export may now be completed by the clock, and one the destination refused ends FAILED —
+    // the status CloudWatch Logs reports for an export that stopped on an error — rather than
+    // being completed over nothing.
+    let mut store = state.lock();
+    let Some(task) = store.export_tasks.get_mut(task_id) else {
+        return;
+    };
+    if is_cancelled(&task.status_code) {
         return;
     }
-    // The destination did not take the data, so the export did not do what it was created to
-    // do: it ends FAILED rather than being completed by the clock over nothing.
-    let mut store = state.lock();
-    if let Some(task) = store.export_tasks.get_mut(task_id) {
-        if !is_cancelled(&task.status_code) {
-            task.status_code = super::EXPORT_TASK_STATUS_FAILED.to_string();
-            task.status_message = Some(WRITE_FAILED_STATUS_MESSAGE.to_string());
-            task.completion_time_ms = Some(super::now_ms());
-            task.running_due_ms = None;
-            task.completion_due_ms = None;
-        }
+    if written {
+        task.record_export_written(super::now_ms());
+        return;
     }
+    task.status_code = super::EXPORT_TASK_STATUS_FAILED.to_string();
+    task.status_message = Some(WRITE_FAILED_STATUS_MESSAGE.to_string());
+    task.completion_time_ms = Some(super::now_ms());
+    task.running_due_ms = None;
+    task.completion_due_ms = None;
 }
 
 /// Whether `status_code` is the status of an export a caller STOPPED — the one status that

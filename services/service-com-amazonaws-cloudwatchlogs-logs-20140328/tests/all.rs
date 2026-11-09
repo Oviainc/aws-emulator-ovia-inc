@@ -89,6 +89,8 @@ mod export_task_active_window;
 mod export_task_cancellation;
 #[path = "all/export_task_objects.rs"]
 mod export_task_objects;
+#[path = "all/export_task_quota_delivery.rs"]
+mod export_task_quota_delivery;
 #[path = "all/export_task_status_messages.rs"]
 mod export_task_status_messages;
 #[path = "all/export_tasks.rs"]
