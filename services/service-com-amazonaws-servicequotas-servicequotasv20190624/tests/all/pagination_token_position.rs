@@ -117,7 +117,8 @@ struct Row {
 /// plus the `DesiredValue` to store.
 ///
 /// The quotas are seeded rows of this service's own catalog
-/// (`src/state.rs::vpc_quotas`), each named by the `QuotaCode` AWS publishes for it,
+/// (`src/state/quota_rows/vpc.rs::vpc_quotas`), each named by the `QuotaCode` AWS
+/// publishes for it,
 /// with a value above its published default. Held in ONE Region and ONE service, so the
 /// template's key order — `(ServiceCode, AwsRegion, QuotaCode)` — is the `QuotaCode`
 /// order, which is what lets a row place its mutation before or after a page boundary.
@@ -128,10 +129,10 @@ struct Entry {
 
 /// The template entries the rows draw on, in the template's own key order.
 const ENTRIES: &[Entry] = &[
-    // Network interfaces per Region, published default 5,000.
+    // Outstanding VPC peering connection requests, published default 25.
     Entry {
-        quota_code: "L-045E6E9C",
-        desired: 6_000.0,
+        quota_code: "L-12E49864",
+        desired: 50.0,
     },
     // Subnets per VPC, published default 200.
     Entry {
@@ -281,7 +282,7 @@ fn history_rows() -> Vec<Row> {
             setup: vec![
                 raise("vpc", "L-F678F1CE", 10.0, None),
                 raise("vpc", "L-A4707A72", 10.0, None),
-                raise("vpc", "L-045E6E9C", 6_000.0, None),
+                raise("vpc", "L-12E49864", 50.0, None),
                 raise("vpc", "L-407747CB", 400.0, None),
             ],
             mutation: vec![raise("vpc", "L-589F43AA", 400.0, None)],

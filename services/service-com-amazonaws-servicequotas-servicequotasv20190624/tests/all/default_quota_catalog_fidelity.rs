@@ -302,7 +302,12 @@ const USAGE_METRIC_SERVICE_NAMES: &[(&str, &str)] = &[
     ("scheduler", "EventBridge Scheduler"),
     ("secretsmanager", "Secrets Manager"),
     ("ses", "SES"),
+    ("sns", "SNS"),
+    ("timestream", "Timestream"),
     ("vpc", "EC2"),
+    ("wafv2", "WAFV2"),
+    ("workspaces", "WorkSpaces"),
+    ("xray", "X-Ray"),
 ];
 
 /// The `(ServiceCode, QuotaCode)` pairs this catalog must NOT publish: the recorded

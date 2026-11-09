@@ -161,12 +161,12 @@ const PUBLISHED: &[Published] = &[
     // A fixed quota that publishes NO description: an absent member stays absent rather
     // than borrowing a neighbour's text.
     Published {
-        service_code: "vpc",
-        quota_code: "L-085A6257",
-        quota_name: "IPv6 CIDR blocks per VPC",
+        service_code: "apigateway",
+        quota_code: "L-8C2F9A1D",
+        quota_name: "Throttle burst rate",
         description: None,
         unit: "None",
-        value: 1.0,
+        value: 5000.0,
         adjustable: false,
         global_quota: false,
         period: None,

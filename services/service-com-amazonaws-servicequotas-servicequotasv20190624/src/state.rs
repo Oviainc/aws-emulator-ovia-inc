@@ -3833,19 +3833,12 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "sns",
             "Amazon Simple Notification Service (Amazon SNS)",
-            vec![
-                quota("Topics per account", 100000.0),
-                quota("Subscriptions per topic", 12500000.0),
-                quota("Pending subscriptions per account", 5000.0),
-            ],
+            sns_quotas(),
         ),
         service(
             "sqs",
             "Amazon Simple Queue Service (Amazon SQS)",
-            vec![
-                quota("FIFO queue transactions per second", 3000.0).fixed(),
-                quota("Messages in flight per standard queue", 120000.0).fixed(),
-            ],
+            sqs_quotas(),
         ),
         service(
             "ssm",
@@ -3855,11 +3848,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 quota("Concurrently executing automations per account", 100.0),
             ],
         ),
-        service(
-            "sso",
-            "AWS IAM Identity Center",
-            vec![quota("Permission sets", 500.0).global()],
-        ),
+        service("sso", "AWS IAM Identity Center", sso_quotas()),
         service(
             "states",
             "AWS Step Functions",
@@ -3871,7 +3860,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "storagegateway",
             "AWS Storage Gateway",
-            vec![quota("Gateways per Region", 50.0)],
+            storagegateway_quotas(),
         ),
         service(
             "swf",
@@ -3881,11 +3870,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 quota("Workflow executions per domain", 100000.0),
             ],
         ),
-        service(
-            "timestream",
-            "Amazon Timestream",
-            vec![quota("Databases per account", 500.0)],
-        ),
+        service("timestream", "Amazon Timestream", timestream_quotas()),
         service(
             "transfer",
             "AWS Transfer Family",
@@ -3896,34 +3881,15 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "Amazon Virtual Private Cloud (Amazon VPC)",
             vpc_quotas(),
         ),
-        service(
-            "vpc-lattice",
-            "Amazon VPC Lattice",
-            vec![quota("Service networks per account", 10.0)],
-        ),
-        service(
-            "wafv2",
-            "AWS WAF",
-            vec![
-                quota("Web ACLs per Region", 100.0),
-                quota("Rule groups per Region", 100.0),
-            ],
-        ),
+        service("vpc-lattice", "Amazon VPC Lattice", vpc_lattice_quotas()),
+        service("wafv2", "AWS WAF", wafv2_quotas()),
         service(
             "workmail",
             "Amazon WorkMail",
             vec![quota("Organizations per account", 5.0)],
         ),
-        service(
-            "workspaces",
-            "Amazon WorkSpaces",
-            vec![quota("WorkSpaces", 1.0)],
-        ),
-        service(
-            "xray",
-            "AWS X-Ray",
-            vec![quota("Sampling rules", 1000.0)],
-        ),
+        service("workspaces", "Amazon WorkSpaces", workspaces_quotas()),
+        service("xray", "AWS X-Ray", xray_quotas()),
     ]
 }
 

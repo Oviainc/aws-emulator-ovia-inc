@@ -45,6 +45,8 @@ mod cross_region_settlement;
 mod default_catalogs_batch_through_codepipeline;
 #[path = "all/default_catalogs_keyed_on_aws_codes.rs"]
 mod default_catalogs_keyed_on_aws_codes;
+#[path = "all/default_catalogs_sns_through_xray.rs"]
+mod default_catalogs_sns_through_xray;
 #[path = "all/default_quota_catalog.rs"]
 mod default_quota_catalog;
 #[path = "all/default_quota_catalog_fidelity.rs"]

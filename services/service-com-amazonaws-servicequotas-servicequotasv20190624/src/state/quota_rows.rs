@@ -31,6 +31,16 @@ mod cloudtrail;
 mod codeartifact;
 mod codedeploy;
 mod codepipeline;
+mod sns;
+mod sqs;
+mod sso;
+mod storagegateway;
+mod timestream;
+mod vpc;
+mod vpc_lattice;
+mod wafv2;
+mod workspaces;
+mod xray;
 
 pub(super) use batch::batch_quotas;
 pub(super) use cassandra::cassandra_quotas;
@@ -40,6 +50,16 @@ pub(super) use cloudtrail::cloudtrail_quotas;
 pub(super) use codeartifact::codeartifact_quotas;
 pub(super) use codedeploy::codedeploy_quotas;
 pub(super) use codepipeline::codepipeline_quotas;
+pub(super) use sns::sns_quotas;
+pub(super) use sqs::sqs_quotas;
+pub(super) use sso::sso_quotas;
+pub(super) use storagegateway::storagegateway_quotas;
+pub(super) use timestream::timestream_quotas;
+pub(super) use vpc::vpc_quotas;
+pub(super) use vpc_lattice::vpc_lattice_quotas;
+pub(super) use wafv2::wafv2_quotas;
+pub(super) use workspaces::workspaces_quotas;
+pub(super) use xray::xray_quotas;
 
 /// Amazon API Gateway's published default-quota catalog.
 ///
@@ -411,44 +431,6 @@ pub(super) fn ec2_resource_quotas() -> Vec<QuotaRow> {
         quota("Active EC2 Fleets per Region", 1000.0),
         quota("Target capacity per EC2 Fleet", 5000.0),
         quota("Attributes per launch template", 300.0).fixed(),
-    ]
-}
-
-/// Amazon VPC's published quota catalog.
-pub(super) fn vpc_quotas() -> Vec<QuotaRow> {
-    vec![
-        // The recorded AWS response for this quota carries all three of the optional
-        // members a `ServiceQuota` can publish: a description, the CloudWatch usage
-        // metric, and a `Period`.
-        quota("VPCs per Region", 5.0)
-            .code("L-F678F1CE")
-            .metric(vpcs_per_region_usage_metric())
-            .period(5, "MINUTE")
-            .describe(
-                "The maximum number of VPCs per Region. This quota is directly tied to the \
-                 maximum number of internet gateways per Region.",
-            ),
-        quota("Internet gateways per Region", 5.0).code("L-A4707A72"),
-        quota("Network interfaces per Region", 5000.0).code("L-045E6E9C"),
-        // AWS publishes this one as not adjustable.
-        quota("IPv6 CIDR blocks per VPC", 1.0).code("L-085A6257").fixed(),
-        // The rows below carry the codes AWS publishes these quotas under ("Amazon VPC
-        // quotas", Amazon VPC User Guide), so a client holding a code read out of AWS's
-        // catalog resolves the quota it names here too.
-        quota("Subnets per VPC", 200.0).code("L-407747CB"),
-        quota("Security groups per VPC", 2500.0),
-        quota("Inbound or outbound rules per security group", 60.0).code("L-0EA8095F"),
-        quota("Security groups per network interface", 5.0).code("L-2AFB9258"),
-        quota("Route tables per VPC", 200.0).code("L-589F43AA"),
-        quota("Routes per route table", 50.0).code("L-93826ACB"),
-        quota("Network ACLs per VPC", 200.0).code("L-B4A6D682"),
-        quota("Rules per network ACL", 20.0).code("L-2AEEBF1A"),
-        quota("NAT gateways per Availability Zone", 5.0).code("L-FE5A380F"),
-        quota("Egress-only internet gateways per Region", 5.0).code("L-45FE3B85"),
-        quota("Active VPC peering connections per VPC", 50.0).code("L-7E9ECCDB"),
-        quota("Gateway VPC endpoints per Region", 20.0).code("L-1B52E74A"),
-        quota("Interface VPC endpoints per VPC", 50.0).code("L-29B6F2EB"),
-        quota("Prefix lists per Region", 100.0),
     ]
 }
 

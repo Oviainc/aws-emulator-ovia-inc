@@ -137,7 +137,7 @@ const ROWS: &[StopCase] = &[
         exclusions: &[
             ("ec2", &["L-1216C47A", "L-0263D0A3"]),
             ("dynamodb", &["L-F98FE922"]),
-            ("vpc", &["L-045E6E9C"]),
+            ("vpc", &["L-DF5E4CA3"]),
         ],
         start_region: "us-gov-west-1",
         stop_region: "us-west-2",

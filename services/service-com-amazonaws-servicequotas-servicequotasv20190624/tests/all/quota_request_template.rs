@@ -848,9 +848,9 @@ async fn a_put_outside_the_rule_is_refused_and_stores_nothing() {
 
     // The rows are the ways a put can name something the rule does not admit: a service
     // and a quota the catalog does not hold, a Region that is not one, a quota AWS
-    // publishes as not adjustable (`vpc` `L-085A6257`, "IPv6 CIDR blocks per VPC"), and
-    // a value that is not an increase on the quota's AWS default (`vpc` `L-F678F1CE`
-    // defaults to 5), at the default itself and below it.
+    // publishes as not adjustable (`vpc` `L-2C462E13`, "Expiry time for an unaccepted VPC
+    // peering connection request"), and a value that is not an increase on the quota's
+    // AWS default (`vpc` `L-F678F1CE` defaults to 5), at the default itself and below it.
     let rows: Vec<(&str, Value, &str)> = vec![
         (
             "a ServiceCode the catalog does not hold",
@@ -886,9 +886,9 @@ async fn a_put_outside_the_rule_is_refused_and_stores_nothing() {
             "a quota AWS publishes as not adjustable",
             json!({
                 "ServiceCode": "vpc",
-                "QuotaCode": "L-085A6257",
+                "QuotaCode": "L-2C462E13",
                 "AwsRegion": "us-east-1",
-                "DesiredValue": 10.0,
+                "DesiredValue": 336.0,
             }),
             "IllegalArgumentException",
         ),

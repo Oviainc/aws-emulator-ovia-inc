@@ -386,7 +386,7 @@ async fn updating_overwrites_only_the_members_it_names() {
             case: "every member at once",
             opt_in_type: Some("NotifyOnly"),
             notification: Some("second-channel"),
-            exclusions: Some(&[("dynamodb", &["L-F98FE922"]), ("vpc", &["L-045E6E9C"])]),
+            exclusions: Some(&[("dynamodb", &["L-F98FE922"]), ("vpc", &["L-DF5E4CA3"])]),
         },
     ];
 
@@ -490,7 +490,7 @@ async fn stopping_removes_the_whole_configuration() {
             case: "a configuration with every member set",
             opt_in_type: "NotifyOnly",
             notification: Some("quota-alerts"),
-            exclusions: &[("vpc", &["L-045E6E9C"])],
+            exclusions: &[("vpc", &["L-DF5E4CA3"])],
         },
     ];
 
@@ -825,7 +825,7 @@ const OPTIONAL_MEMBERS: [(&str, Option<&str>, Option<Exclusions>); 4] = [
 ];
 
 /// The exclusion list the running configuration of the update rows carries.
-const RUNNING_EXCLUSIONS: &[(&str, &[&str])] = &[("vpc", &["L-045E6E9C"])];
+const RUNNING_EXCLUSIONS: &[(&str, &[&str])] = &[("vpc", &["L-DF5E4CA3"])];
 
 /// A request body naming `requested` as its `OptInType`, plus the optional members of a
 /// row. `OptInLevel` is included only for the writer that requires it.
