@@ -26,18 +26,13 @@ pub struct UpdateIdentityPoolInput {
     pub identity_pool_tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cognitoidentity#IdentityPool")]
-#[derive(Debug, Clone, Default)]
-pub struct UpdateIdentityPoolOutput {
-    pub identity_pool_id: String,
-    pub identity_pool_name: String,
-    pub allow_unauthenticated_identities: bool,
-    pub allow_classic_flow: Option<bool>,
-    pub supported_login_providers: Option<std::collections::HashMap<String, String>>,
-    pub developer_provider_name: Option<String>,
-    pub open_id_connect_provider_ar_ns: Option<Vec<String>>,
-    pub cognito_identity_providers: Option<Vec<CognitoIdentityProvider>>,
-    pub saml_provider_ar_ns: Option<Vec<String>>,
-    pub identity_pool_tags: Option<std::collections::HashMap<String, String>>,
-}
+/// `UpdateIdentityPool` answers with the `IdentityPool` shape, so its output IS
+/// [`ReportedIdentityPool`] — the one projection of a stored pool this service's
+/// pool-answering operations share. Its INPUT is that same modelled shape and keeps the
+/// derive: a request carries only what the model declares.
+pub type UpdateIdentityPoolOutput = ReportedIdentityPool;
+
+/// The output schema `UpdateIdentityPool` names, as the derive would have emitted it.
+pub static UPDATE_IDENTITY_POOL_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    REPORTED_IDENTITY_POOL_SCHEMA;
 

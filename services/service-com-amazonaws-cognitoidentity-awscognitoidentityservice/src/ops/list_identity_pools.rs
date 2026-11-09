@@ -245,10 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ListIdentityPools
         let identity_pools: Vec<IdentityPoolShortDescription> = identity_pool_ids[start..end]
             .iter()
             .filter_map(|identity_pool_id| store.identity_pools.get(identity_pool_id))
-            .map(|pool| IdentityPoolShortDescription {
-                identity_pool_id: Some(pool.identity_pool_id.clone()),
-                identity_pool_name: Some(pool.identity_pool_name.clone()),
-            })
+            .map(IdentityPoolShortDescription::from)
             .collect();
 
         // The token is absent on the last page, which is how a caller knows it is done.

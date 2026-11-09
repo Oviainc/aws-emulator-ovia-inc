@@ -309,9 +309,9 @@ async fn a_pool_emptied_by_a_removal_can_be_tagged_again() {
 }
 
 /// RULE: a pool that carries no tag set at all accepts a removal — there is simply nothing
-/// to remove — and keeps reporting exactly the stored set it had, down to the distinction
-/// between a pool that carries no `IdentityPoolTags` member and one that carries an empty
-/// one: a removal does not materialise the member.
+/// to remove — and keeps reporting exactly the stored set it had: the `IdentityPoolTags`
+/// member is on the response either way, as the empty map, and a removal that removed
+/// nothing leaves it exactly as it was.
 #[tokio::test]
 async fn untagging_a_pool_that_carries_no_tags_removes_nothing() {
     let emulator = Emulator::new();
@@ -336,9 +336,9 @@ async fn untagging_a_pool_that_carries_no_tags_removes_nothing() {
         let member_before = before.get("IdentityPoolTags").cloned();
         assert_eq!(
             member_before,
-            created.clone(),
-            "case {case:?}: expected DescribeIdentityPool to carry IdentityPoolTags \
-             {created:?} before the removal, got {member_before:?}"
+            Some(tag_map([])),
+            "case {case:?}: expected DescribeIdentityPool to carry IdentityPoolTags as the \
+             empty map before the removal, got {member_before:?}"
         );
 
         let (status, body) = untag_call(
@@ -358,7 +358,7 @@ async fn untagging_a_pool_that_carries_no_tags_removes_nothing() {
             "case {case:?}: expected an empty Tags map, got {listed:?}"
         );
 
-        // The RAW member afterwards: absent stays absent, an empty map stays an empty map.
+        // The RAW member afterwards: the empty map the pool carries, unchanged.
         let after = emulator
             .ok(
                 "DescribeIdentityPool",

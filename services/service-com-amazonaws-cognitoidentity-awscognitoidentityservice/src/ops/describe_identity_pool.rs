@@ -230,23 +230,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DescribeIdentityP
             .into());
         };
 
-        Ok(DescribeIdentityPoolOutput {
-            identity_pool_id: record.identity_pool_id.clone(),
-            identity_pool_name: record.identity_pool_name.clone(),
-            allow_unauthenticated_identities: record.allow_unauthenticated_identities,
-            allow_classic_flow: record.allow_classic_flow,
-            supported_login_providers: record
-                .supported_login_providers
-                .clone()
-                .map(|providers| providers.into_iter().collect()),
-            developer_provider_name: record.developer_provider_name.clone(),
-            open_id_connect_provider_ar_ns: record.open_id_connect_provider_arns.clone(),
-            cognito_identity_providers: record.cognito_identity_providers.clone(),
-            saml_provider_ar_ns: record.saml_provider_arns.clone(),
-            identity_pool_tags: record
-                .identity_pool_tags
-                .clone()
-                .map(|tags| tags.into_iter().collect()),
-        })
+        Ok(DescribeIdentityPoolOutput::from(record))
     }
 }

@@ -314,8 +314,8 @@ async fn an_update_of_a_pool_this_service_does_not_hold_is_not_found() {
 
 /// What an update leaves on a pool's tag set, as `(case, the tags the pool was created
 /// with, the `IdentityPoolTags` the update carries, the tag set the pool has afterwards)`.
-/// A `None` means the member is not sent at all, and a `Value::Null` expectation means the
-/// pool carries no tag member at all afterwards.
+/// A `None` means the member is not sent at all; the expectation is always a map, because the
+/// response carries the member for every pool — the empty map for one with no tags.
 ///
 /// The rows differ in the count of tags, in whether the update carries the member, in
 /// whether the set it carries overlaps the stored one, and in key and value length:
@@ -333,7 +333,7 @@ fn tag_cases() -> Vec<(&'static str, Option<Value>, Option<Value>, Value)> {
             "no tags at all, an update that omits the member",
             None,
             None,
-            Value::Null,
+            json!({}),
         ),
         (
             "an update carrying a disjoint set replaces the stored one",

@@ -264,13 +264,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UntagResource<Eng
             .into());
         };
 
-        // Only the named keys go, and only from a set the pool actually has: a pool that
-        // was never given the member keeps carrying no tag set at all rather than gaining
-        // an empty one, which is the distinction `DescribeIdentityPool` reports. A key the
-        // set does not hold removes nothing and is not an error, so the same call made
-        // twice leaves the same set.
+        // Only the named keys go, and only from a set the pool actually has: a key the set
+        // does not hold removes nothing and is not an error, so the same call made twice
+        // leaves the same set. The record's last-modified instant moves only when a key
+        // really went, so a removal that removed nothing changes nothing about the pool.
         if let Some(assigned) = record.identity_pool_tags.as_mut() {
+            let held = assigned.len();
             assigned.retain(|tag_key, _| !removed.contains(tag_key.as_str()));
+            if assigned.len() != held {
+                record.last_modified_date = ::std::time::SystemTime::now();
+            }
         }
         Ok(UntagResourceOutput {})
     }

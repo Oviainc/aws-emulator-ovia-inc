@@ -278,7 +278,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> TagResource<Eng> 
         // carries, with the call's value winning for a key that is already there. The
         // ceiling is on the RESULT, so re-assigning keys a pool already holds never takes
         // it past the limit however many tags the call carries.
-        let mut assigned = record.identity_pool_tags.clone().unwrap_or_default();
+        let held = record.identity_pool_tags.clone().unwrap_or_default();
+        let mut assigned = held.clone();
         for (tag_key, tag_value) in requested {
             assigned.insert(tag_key.clone(), tag_value.clone());
         }
@@ -288,11 +289,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> TagResource<Eng> 
             ));
         }
 
-        // A call carrying no tags assigns nothing, so it leaves the record untouched —
-        // including the distinction between a pool created with an empty tag map and one
-        // that was never given the member at all, which `DescribeIdentityPool` reports.
-        if !input.tags.is_empty() {
+        // A call that leaves the pool holding the set it already held changed nothing, so it
+        // leaves the record untouched — including the instant it was last modified. That
+        // covers a call carrying no key at all and one re-assigning the value a key already
+        // has, and it is the same rule `UntagResource` moves the instant by: the instant
+        // moves when the stored tag set really changes.
+        if assigned != held {
             record.identity_pool_tags = Some(assigned);
+            record.last_modified_date = ::std::time::SystemTime::now();
         }
         Ok(TagResourceOutput {})
     }

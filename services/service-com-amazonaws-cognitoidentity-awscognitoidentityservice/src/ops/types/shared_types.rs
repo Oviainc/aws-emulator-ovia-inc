@@ -19,9 +19,21 @@ pub struct CognitoIdentityProvider {
     pub server_side_token_check: Option<bool>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cognitoidentity#IdentityPool")]
+/// One identity pool as every operation that answers with a pool reports it: the `IdentityPool`
+/// members the model declares, in the model's own member order, and the three members the
+/// service reports on every pool it answers with appended last.
+///
+/// Member set and order from
+/// `smithy_query(query="shape", shape="IdentityPool")`, plus `IdentityPoolArn`, `CreationDate`
+/// and `LastModifiedDate` — members the real service carries on every identity-pool response
+/// and the on-disk model omits, which is why the schema and the codec come from
+/// `types/recorded_member_wire.rs` rather than from the derive (see that module's note).
+///
+/// `CreateIdentityPool`, `DescribeIdentityPool` and `UpdateIdentityPool` all answer with this
+/// one shape, so they share this one projection of the stored pool
+/// ([`From<&crate::state::IdentityPool>`]) and cannot drift apart.
 #[derive(Debug, Clone, Default)]
-pub struct CreateIdentityPoolOutput {
+pub struct ReportedIdentityPool {
     pub identity_pool_id: String,
     pub identity_pool_name: String,
     pub allow_unauthenticated_identities: bool,
@@ -32,7 +44,161 @@ pub struct CreateIdentityPoolOutput {
     pub cognito_identity_providers: Option<Vec<CognitoIdentityProvider>>,
     pub saml_provider_ar_ns: Option<Vec<String>>,
     pub identity_pool_tags: Option<std::collections::HashMap<String, String>>,
+    pub identity_pool_arn: Option<String>,
+    pub creation_date: Option<::aws_smithy_types::DateTime>,
+    pub last_modified_date: Option<::aws_smithy_types::DateTime>,
 }
+
+ci_schema_and_codec!(
+    ReportedIdentityPool,
+    REPORTED_IDENTITY_POOL_SCHEMA,
+    "com.amazonaws.cognitoidentity#IdentityPool",
+    "com.amazonaws.cognitoidentity",
+    "IdentityPool",
+    (M_IDENTITY_POOL_ID, identity_pool_id, "IdentityPoolId", 0, req, string),
+    (
+        M_IDENTITY_POOL_NAME,
+        identity_pool_name,
+        "IdentityPoolName",
+        1,
+        req,
+        string
+    ),
+    (
+        M_ALLOW_UNAUTHENTICATED_IDENTITIES,
+        allow_unauthenticated_identities,
+        "AllowUnauthenticatedIdentities",
+        2,
+        req,
+        boolean
+    ),
+    (
+        M_ALLOW_CLASSIC_FLOW,
+        allow_classic_flow,
+        "AllowClassicFlow",
+        3,
+        opt,
+        boolean
+    ),
+    (
+        M_SUPPORTED_LOGIN_PROVIDERS,
+        supported_login_providers,
+        "SupportedLoginProviders",
+        4,
+        opt,
+        map_of_string
+    ),
+    (
+        M_DEVELOPER_PROVIDER_NAME,
+        developer_provider_name,
+        "DeveloperProviderName",
+        5,
+        opt,
+        string
+    ),
+    (
+        M_OPEN_ID_CONNECT_PROVIDER_AR_NS,
+        open_id_connect_provider_ar_ns,
+        "OpenIdConnectProviderARNs",
+        6,
+        opt,
+        list_of_string
+    ),
+    (
+        M_COGNITO_IDENTITY_PROVIDERS,
+        cognito_identity_providers,
+        "CognitoIdentityProviders",
+        7,
+        opt,
+        list_of_struct(CognitoIdentityProvider)
+    ),
+    (
+        M_SAML_PROVIDER_AR_NS,
+        saml_provider_ar_ns,
+        "SamlProviderARNs",
+        8,
+        opt,
+        list_of_string
+    ),
+    (
+        M_IDENTITY_POOL_TAGS,
+        identity_pool_tags,
+        "IdentityPoolTags",
+        9,
+        opt,
+        map_of_string
+    ),
+    (
+        M_IDENTITY_POOL_ARN,
+        identity_pool_arn,
+        "IdentityPoolArn",
+        10,
+        opt,
+        recorded("com.amazonaws.cognitoidentity.recorded", string)
+    ),
+    (
+        M_CREATION_DATE,
+        creation_date,
+        "CreationDate",
+        11,
+        opt,
+        recorded("com.amazonaws.cognitoidentity.recorded", timestamp)
+    ),
+    (
+        M_LAST_MODIFIED_DATE,
+        last_modified_date,
+        "LastModifiedDate",
+        12,
+        opt,
+        recorded("com.amazonaws.cognitoidentity.recorded", timestamp)
+    ),
+);
+
+impl From<&crate::state::IdentityPool> for ReportedIdentityPool {
+    /// The ONE projection of a stored pool onto the `IdentityPool` shape, which every
+    /// operation answering with a pool reports it through.
+    ///
+    /// The pool's ARN and its two instants are read off the record (the ARN is the pool's own
+    /// id in this service's ARN form, [`crate::state::identity_pool_arn`]), and the tag map is
+    /// always reported — as the empty map for a pool that carries no tags — because the
+    /// service reports the member on every pool it answers with.
+    fn from(pool: &crate::state::IdentityPool) -> Self {
+        Self {
+            identity_pool_id: pool.identity_pool_id.clone(),
+            identity_pool_name: pool.identity_pool_name.clone(),
+            allow_unauthenticated_identities: pool.allow_unauthenticated_identities,
+            allow_classic_flow: pool.allow_classic_flow,
+            supported_login_providers: pool
+                .supported_login_providers
+                .clone()
+                .map(|providers| providers.into_iter().collect()),
+            developer_provider_name: pool.developer_provider_name.clone(),
+            open_id_connect_provider_ar_ns: pool.open_id_connect_provider_arns.clone(),
+            cognito_identity_providers: pool.cognito_identity_providers.clone(),
+            saml_provider_ar_ns: pool.saml_provider_arns.clone(),
+            identity_pool_tags: Some(
+                pool.identity_pool_tags
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+            ),
+            identity_pool_arn: Some(crate::state::identity_pool_arn(&pool.identity_pool_id)),
+            creation_date: Some(::aws_smithy_types::DateTime::from(pool.creation_date)),
+            last_modified_date: Some(::aws_smithy_types::DateTime::from(
+                pool.last_modified_date,
+            )),
+        }
+    }
+}
+
+/// `CreateIdentityPool` answers with the `IdentityPool` shape, so its output IS
+/// [`ReportedIdentityPool`].
+pub type CreateIdentityPoolOutput = ReportedIdentityPool;
+
+/// The output schema `CreateIdentityPool` names, as the derive would have emitted it.
+pub static CREATE_IDENTITY_POOL_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    REPORTED_IDENTITY_POOL_SCHEMA;
 
 #[smithy_macros::smithy(shape = "com.amazonaws.cognitoidentity#InternalErrorException")]
 #[derive(Debug, Clone, Default)]

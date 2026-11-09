@@ -695,13 +695,24 @@ async fn the_records_of_one_metric_arrive_in_publish_order() {
     // One publish per period, oldest first: 100 two periods back, 200 one period back, 300 in
     // the period the clock is in.
     let published: [(i64, f64); 3] = [(2, 100.0), (1, 200.0), (0, 300.0)];
+    // The period each row is published INTO, read off the clock ONCE per row and used both for
+    // the datapoint's stamp and for what the record is expected to carry: a period boundary
+    // crossed while the pipeline delivers moves `period_of` on, but not the stamp a record
+    // already carries, so re-reading it at assertion time would compare two different periods.
+    let mut periods: Vec<f64> = Vec::new();
     for (periods_back, value) in published {
-        publish(
+        let period = period_of(periods_back);
+        periods.push(period);
+        publish_datum(
             &emulator,
             "Custom/Ordering",
-            "Streamed",
-            value,
-            periods_back,
+            json!({
+                "MetricName": "Streamed",
+                "Value": value,
+                "Unit": "Count",
+                // The MIDDLE of the period, for the reason `stamp` records.
+                "Timestamp": period + PERIOD_SECS / 2.0,
+            }),
         )
         .await;
     }
@@ -728,9 +739,9 @@ async fn the_records_of_one_metric_arrive_in_publish_order() {
     let timestamps: Vec<i64> = records.iter().map(timestamp).collect();
     assert_eq!(
         timestamps,
-        published
+        periods
             .iter()
-            .map(|(periods_back, _)| (period_of(*periods_back) * 1_000.0) as i64)
+            .map(|period| (period * 1_000.0) as i64)
             .collect::<Vec<i64>>(),
         "each record must be stamped at its own period, got {timestamps:?}"
     );

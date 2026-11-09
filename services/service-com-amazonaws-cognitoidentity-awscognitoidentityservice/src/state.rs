@@ -5,8 +5,9 @@
 //! The identity-pool lifecycle and the identity/credential flow are stored here, in the
 //! single shared engine, so every handler in this crate observes the same store across
 //! requests. The records below are the SERVICE's own view of a resource; the modelled
-//! wire shapes live in `crate::ops::types` and each handler builds its own output from
-//! the record it read.
+//! wire shapes live in `crate::ops::types`, and a shape several operations answer with is
+//! projected from its record once, there, so those operations cannot report it differently
+//! (`ReportedIdentityPool`, `IdentityPoolShortDescription`).
 
 /// Whether IAM lets a request to this service do what it asks — the authorization gate
 /// every developer-credentials operation of this service consults before it reads or
@@ -90,6 +91,14 @@ pub struct IdentityPool {
     pub cognito_identity_providers: Option<Vec<CognitoIdentityProvider>>,
     pub saml_provider_arns: Option<Vec<String>>,
     pub identity_pool_tags: Option<BTreeMap<String, String>>,
+    /// The instant the pool was created, as every reader of the pool reports it. Fixed when
+    /// the record is first written and never touched again, so the id, the ARN and this
+    /// instant name the same pool for as long as it is stored.
+    pub creation_date: SystemTime,
+    /// The instant the stored record last CHANGED — its configuration (`UpdateIdentityPool`)
+    /// or its tag set (`TagResource`/`UntagResource`). Equal to [`Self::creation_date`] on a
+    /// pool nothing has changed since it was created, and never moved by a read.
+    pub last_modified_date: SystemTime,
 }
 
 impl IdentityPool {
@@ -3594,6 +3603,8 @@ mod tests {
             cognito_identity_providers: None,
             saml_provider_arns: None,
             identity_pool_tags: None,
+            creation_date: SystemTime::UNIX_EPOCH,
+            last_modified_date: SystemTime::UNIX_EPOCH,
         }
     }
 

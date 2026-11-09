@@ -63,3 +63,33 @@ Smithy: IdentityPool.IdentityPoolTags (map), SetPrincipalTagAttributeMapResponse
 2. Replay cognito-identity-identity-pool-create-time-tags-persist#task#2 and #task#4 (DescribeIdentityPool) -> no CreationDate/LastModifiedDate/IdentityPoolArn.
 3. Replay cogid-login-list-identity-pools-next-token-pagination#task#3 and cognito-identity-identity-pool-lifecycle#task#5 (ListIdentityPools) -> entries carry only id and name.
 4. Replay cognito-identity-principal-tag-attribute-mapping#task#4 then #task#5 -> the 'client' principal-tag key is absent from both the Set echo and the Get read-back.
+
+## Resolution
+
+Every operation that answers with an identity pool now projects the stored pool once
+(`ReportedIdentityPool` / `IdentityPoolShortDescription`, built from
+`crate::state::IdentityPool`): the pool's ARN, the instant it was created, the instant it
+last changed and its tag set — the tag set as the empty map for a pool with no tags. The
+pool record now holds both instants; `UpdateIdentityPool`, `TagResource` and
+`UntagResource` move the last-modified one when they really change the stored pool, and no
+read moves either. Covered by
+`tests/all/identity_pool_response_members.rs`.
+
+Causes 1-6 (the `IdentityPoolTags`, `IdentityPoolArn`, `CreationDate` and
+`LastModifiedDate` members of CreateIdentityPool, UpdateIdentityPool,
+DescribeIdentityPool and the ListIdentityPools entries) are fixed: the ten Issue-Keys over
+those four operations no longer diverge on replay.
+
+Causes 7 and 8 (the `client` -> `aud` principal-tag entry echoed by
+SetPrincipalTagAttributeMap and read back by GetPrincipalTagAttributeMap) were already
+satisfied by the code before this change — `crate::state::DEFAULT_PRINCIPAL_TAGS` carries
+that entry and `tests/all/principal_tag_attribute_map.rs` covers the echo and the
+read-back — and both their steps (`cognito-identity-principal-tag-attribute-mapping#task#4`
+and `#task#5`) now replay clean. The same fixture still diverges at two LATER steps, which
+are NOT keys of this issue and are tracked on their own:
+`#task#6` (the 400 ValidationException message for a 51-entry `PrincipalTags` map renders
+the map sorted by key instead of in AWS's order) by
+`20261031T043446Z-cognito-identity-validation-error-messages-render-constraint-collections.md`,
+and `#task#8` (AWS serves a mapping for an `IdentityProviderName` the pool does not
+declare, where this emulator refuses it) by
+`20261029T230931Z-cognito-identity-vended-tokens-and-credentials-are-not.md`.

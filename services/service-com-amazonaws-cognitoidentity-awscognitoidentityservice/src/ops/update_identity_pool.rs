@@ -290,7 +290,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateIdentityPoo
         // default value" (this service's model), so the request REPLACES the pool's
         // configuration rather than merging into it: a member the request omits is left
         // unset on the stored record, not carried over from the previous one. The id is
-        // the pool's name and is the one thing the request cannot change.
+        // the pool's name and is the one thing the request cannot change, and the instant the
+        // pool was CREATED belongs to the pool rather than to this call, so it is carried
+        // over while the last-modified instant becomes this call's.
         let record = crate::state::IdentityPool {
             identity_pool_id: input.identity_pool_id.clone(),
             identity_pool_name: input.identity_pool_name,
@@ -304,28 +306,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateIdentityPoo
             cognito_identity_providers: input.cognito_identity_providers,
             saml_provider_arns: input.saml_provider_ar_ns,
             identity_pool_tags,
+            creation_date: stored.creation_date,
+            last_modified_date: ::std::time::SystemTime::now(),
         };
 
-        // The response is the stored record, so what the caller reads back is what the
-        // pool's readers will report — because they are the same thing.
-        let output = UpdateIdentityPoolOutput {
-            identity_pool_id: record.identity_pool_id.clone(),
-            identity_pool_name: record.identity_pool_name.clone(),
-            allow_unauthenticated_identities: record.allow_unauthenticated_identities,
-            allow_classic_flow: record.allow_classic_flow,
-            supported_login_providers: record
-                .supported_login_providers
-                .clone()
-                .map(|providers| providers.into_iter().collect()),
-            developer_provider_name: record.developer_provider_name.clone(),
-            open_id_connect_provider_ar_ns: record.open_id_connect_provider_arns.clone(),
-            cognito_identity_providers: record.cognito_identity_providers.clone(),
-            saml_provider_ar_ns: record.saml_provider_arns.clone(),
-            identity_pool_tags: record
-                .identity_pool_tags
-                .clone()
-                .map(|tags| tags.into_iter().collect()),
-        };
+        // The response is the stored record, through the ONE projection every operation that
+        // answers with a pool reports it by, so what the caller reads back is what the pool's
+        // readers will report — because they are the same thing.
+        let output = UpdateIdentityPoolOutput::from(&record);
         store
             .identity_pools
             .insert(input.identity_pool_id, record);

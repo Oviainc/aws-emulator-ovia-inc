@@ -45,6 +45,8 @@ mod identity_data_events;
 mod identity_link_lifecycle;
 #[path = "all/identity_pool_flow.rs"]
 mod identity_pool_flow;
+#[path = "all/identity_pool_response_members.rs"]
+mod identity_pool_response_members;
 #[path = "all/identity_pool_roles.rs"]
 mod identity_pool_roles;
 #[path = "all/identity_pool_roles_presence.rs"]

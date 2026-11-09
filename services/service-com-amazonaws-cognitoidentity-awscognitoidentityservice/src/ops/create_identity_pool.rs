@@ -289,6 +289,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateIdentityPoo
         }
         let identity_pool_id = store.new_identity_pool_id(&region);
 
+        // The instant the pool comes into being: its creation, and — nothing having changed
+        // it yet — its last modification too.
+        let created_at = ::std::time::SystemTime::now();
         let record = crate::state::IdentityPool {
             identity_pool_id: identity_pool_id.clone(),
             identity_pool_name: input.identity_pool_name,
@@ -304,28 +307,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateIdentityPoo
             identity_pool_tags: input
                 .identity_pool_tags
                 .map(|tags| tags.into_iter().collect()),
+            creation_date: created_at,
+            last_modified_date: created_at,
         };
 
-        // The response is the stored record, so a caller cannot tell the echo of its own
+        // The response is the stored record, through the ONE projection every operation that
+        // answers with a pool reports it by, so a caller cannot tell the echo of its own
         // request from what was persisted — because they are the same thing.
-        let output = CreateIdentityPoolOutput {
-            identity_pool_id: record.identity_pool_id.clone(),
-            identity_pool_name: record.identity_pool_name.clone(),
-            allow_unauthenticated_identities: record.allow_unauthenticated_identities,
-            allow_classic_flow: record.allow_classic_flow,
-            supported_login_providers: record
-                .supported_login_providers
-                .clone()
-                .map(|providers| providers.into_iter().collect()),
-            developer_provider_name: record.developer_provider_name.clone(),
-            open_id_connect_provider_ar_ns: record.open_id_connect_provider_arns.clone(),
-            cognito_identity_providers: record.cognito_identity_providers.clone(),
-            saml_provider_ar_ns: record.saml_provider_arns.clone(),
-            identity_pool_tags: record
-                .identity_pool_tags
-                .clone()
-                .map(|tags| tags.into_iter().collect()),
-        };
+        let output = CreateIdentityPoolOutput::from(&record);
         store.identity_pools.insert(identity_pool_id, record);
         Ok(output)
     }

@@ -14,6 +14,12 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+// The schema and codec macros a structure needs when the wire carries a member the on-disk
+// model does not declare — see that module's own note. `#[macro_use]`, and declared FIRST, so
+// the macros are in the textual scope of every `*_types` module below.
+#[macro_use]
+pub mod recorded_member_wire;
+
 pub mod create_identity_pool_types;
 pub mod delete_identities_types;
 pub mod delete_identity_pool_types;

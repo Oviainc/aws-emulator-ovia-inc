@@ -25,10 +25,86 @@ pub struct ListIdentityPoolsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cognitoidentity#IdentityPoolShortDescription")]
+/// One entry of a `ListIdentityPools` page: the `IdentityPoolShortDescription` members the
+/// model declares, in the model's own member order, and the three members the service reports
+/// on every pool it answers with appended last.
+///
+/// Member set and order from
+/// `smithy_query(query="shape", shape="IdentityPoolShortDescription")`, plus `IdentityPoolArn`,
+/// `CreationDate` and `LastModifiedDate` — members the real service carries on every listed
+/// pool and the on-disk model omits, which is why the schema and the codec come from
+/// `types/recorded_member_wire.rs` rather than from the derive (see that module's note). Each
+/// one is read off the stored pool ([`From<&crate::state::IdentityPool>`]), never fixed here.
 #[derive(Debug, Clone, Default)]
 pub struct IdentityPoolShortDescription {
     pub identity_pool_id: Option<String>,
     pub identity_pool_name: Option<String>,
+    pub identity_pool_arn: Option<String>,
+    pub creation_date: Option<::aws_smithy_types::DateTime>,
+    pub last_modified_date: Option<::aws_smithy_types::DateTime>,
+}
+
+ci_schema_and_codec!(
+    IdentityPoolShortDescription,
+    IDENTITY_POOL_SHORT_DESCRIPTION_SCHEMA,
+    "com.amazonaws.cognitoidentity#IdentityPoolShortDescription",
+    "com.amazonaws.cognitoidentity",
+    "IdentityPoolShortDescription",
+    (
+        M_IDENTITY_POOL_ID,
+        identity_pool_id,
+        "IdentityPoolId",
+        0,
+        opt,
+        string
+    ),
+    (
+        M_IDENTITY_POOL_NAME,
+        identity_pool_name,
+        "IdentityPoolName",
+        1,
+        opt,
+        string
+    ),
+    (
+        M_IDENTITY_POOL_ARN,
+        identity_pool_arn,
+        "IdentityPoolArn",
+        2,
+        opt,
+        recorded("com.amazonaws.cognitoidentity.recorded", string)
+    ),
+    (
+        M_CREATION_DATE,
+        creation_date,
+        "CreationDate",
+        3,
+        opt,
+        recorded("com.amazonaws.cognitoidentity.recorded", timestamp)
+    ),
+    (
+        M_LAST_MODIFIED_DATE,
+        last_modified_date,
+        "LastModifiedDate",
+        4,
+        opt,
+        recorded("com.amazonaws.cognitoidentity.recorded", timestamp)
+    ),
+);
+
+impl From<&crate::state::IdentityPool> for IdentityPoolShortDescription {
+    /// The ONE projection of a stored pool onto a listing entry: the pool's id and name, and
+    /// the same ARN and instants the pool's own readers report for it.
+    fn from(pool: &crate::state::IdentityPool) -> Self {
+        Self {
+            identity_pool_id: Some(pool.identity_pool_id.clone()),
+            identity_pool_name: Some(pool.identity_pool_name.clone()),
+            identity_pool_arn: Some(crate::state::identity_pool_arn(&pool.identity_pool_id)),
+            creation_date: Some(::aws_smithy_types::DateTime::from(pool.creation_date)),
+            last_modified_date: Some(::aws_smithy_types::DateTime::from(
+                pool.last_modified_date,
+            )),
+        }
+    }
 }
 
