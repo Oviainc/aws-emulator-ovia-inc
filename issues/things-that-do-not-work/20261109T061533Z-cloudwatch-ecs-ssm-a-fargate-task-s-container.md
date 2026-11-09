@@ -1,0 +1,38 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudwatch__ecs__ssm.fargate-task-role-without-ssm-get-parameter-is-denied-the-latency-flag
+Issue-Key: cloudwatch__ecs__ssm.fargate-task-role-without-ssm-get-parameter-is-denied-the-latency-flag|total#30|Timeout|return (sum(p["SampleCount"] for p in pts), min((p["Minimum"] for p in pts), default=None))
+Issue-Commit: 37c80e55e89881237cfb2c32173143a5950fe67d
+
+# cloudwatch__ecs__ssm: a Fargate task's container never runs, so the ssm:GetParameter permission chain (denied read, then repair) publishes no CloudWatch metrics at all
+
+> _Note: this issue was identified against the code base at commit `37c80e55e89881237cfb2c32173143a5950fe67d`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+RunTask
+
+## Description
+Cause 1 of 1: a Fargate task launched with an `aws-cli` image and a task role never executes its container, so nothing it would publish ever appears and the whole task-role permission chain across ECS, SSM and CloudWatch is unobservable.
+  AWS: RunTask with `launchType=FARGATE` and an awsvpc network configuration places the task and its container really runs under the TASK ROLE's credentials, which it obtains from the task metadata/credentials endpoint. The container's loop calls `ssm get-parameter --name <flag>` and `cloudwatch put-metric-data`, so within the task's startup window GetMetricStatistics/GetMetricData for the check's namespace report `FlagReads{Result=ok}` samples (and the dependency `APILatency` samples the flag implies) for the role that HAS `ssm:GetParameter`, and `FlagReads{Result=denied}` samples with NO `APILatency` for the role that lacks it — a GetParameter refused by IAM is HTTP 400 `AccessDeniedException` in the container's stderr. Granting the one missing `ssm:GetParameter` statement to the SAME role must make the SAME already-running task start reading the flag and publishing `FlagReads{ok}` plus the degraded latency. Smithy (com.amazonaws.ecs#AmazonEC2ContainerServiceV20141113): RunTask input {taskDefinition (required), cluster, count, launchType (LaunchType enum), networkConfiguration, overrides, ...} -> output {tasks, failures}, errors AccessDeniedException 403, ClientException/ClusterNotFoundException/InvalidParameterException/ConflictException/PlatformTaskDefinitionIncompatibilityException/UnsupportedFeatureException 400, ServerException 500. The model says nothing about container execution or metric publication — that part is recorded behavior only, and in the recording both tasks publish their first samples well inside the check's budget.
+  Emulator: the check is cut at `Error: Check timed out after 180.0s`, inside the differential barrier that polls CloudWatch for at least 3 `FlagReads{Result=ok}` samples from the allowed task and 3 `FlagReads{Result=denied}` samples from the denied task (`description="the control reading the flag and the denied task reporting refusals"`). Neither counter ever moves: no container output, no SSM read attempt, and no metric datum is produced for either task, so neither the denial nor the post-grant repair can be observed.
+  Why: a client cannot tell an IAM-denied task apart from a task that never ran. The emulator's RunTask returns a task ARN, so the control plane reads as success while the data plane produces nothing — a user debugging a missing-permission outage sees the same empty metric stream whether the policy is wrong or right, and the repair (adding the one missing statement) is unverifiable.
+  Fix: the RunTask handler's Fargate task-execution path — the container must actually run, be given the task role's credentials via the task credentials endpoint, and have its outbound SSM/CloudWatch calls evaluated against that role (refused with AccessDeniedException when the statement is absent, allowed after it is granted) so the published metrics differ between the two roles.
+  Related open issue, which does NOT carry this check's replay key: 20261104T062603Z-cloudwatch-ecs-ssm-a-deployed-service-latency-alarm.md (it owns this service's other failing check, e2e-diagnose-cloudwatch-alarm-firing-lifecycle). The broader execution gap is also described in 20261104T062603Z-ecs-containers-never-execute-no-in-container-behaviour.md; neither names this check, so closing either without replaying the id below leaves it unrun.
+  Traces: cloudwatch__ecs__ssm.fargate-task-role-without-ssm-get-parameter-is-denied-the-latency-flag.
+
+## Evidence
+Expected (recorded AWS): two Fargate tasks from the same task definition, one task role WITH `ssm:GetParameter` on the flag parameter and one WITHOUT, both with `cloudwatch:PutMetricData`. Within the task deadline, `cloudwatch get-metric-statistics --namespace sim2real/behav/... --metric-name FlagReads --dimensions Name=Result,Value=ok` returns >=3 samples for the allowed task and 0 for the denied task; `--dimensions Name=Result,Value=denied` returns >=3 samples for the denied task; `APILatency{Service=Quartz,Operation=ReportPerson}` has >=3 samples with minimum >= 18000 for the allowed task and 0 samples for the denied task. After `iam put-role-policy` adds the single `ssm:GetParameter` statement to the denied role, that SAME running task publishes >=1 `FlagReads{ok}` and >=1 `APILatency` sample with minimum >= 18000.
+
+Actual (emulator):
+  Error: Check timed out after 180.0s
+The body is cut inside `_poll(lambda: (total("allowed", "FlagReads", ok_dims)[0], total("denied", "FlagReads", no_dims)[0]), lambda r: r[0] >= 3 and r[1] >= 3, timeout_s=420, interval_s=10, description="the control reading the flag and the denied task reporting refusals")` — the barrier that must be satisfied before any absence is asserted. Both counters stay at 0, so none of the later assertions (`FlagReads{ok} == 0` for the denied role, `APILatency == 0` for the denied role, and the post-grant repair) is ever reached. The namespace suffix, role names, parameter name and metric values are per-run values; the divergence is that no container output and no metric datum is ever produced.
+
+## Steps to Reproduce
+1. `ssm put-parameter --name <flag> --type String --value degraded`.
+2. Create two task roles with `cloudwatch:PutMetricData`; grant `ssm:GetParameter` on <flag> to the FIRST one only. Create an execution role that can pull `public.ecr.aws/aws-cli/aws-cli:latest` and write logs.
+3. `ecs create-cluster --cluster-name <c>`; `ecs register-task-definition` twice (same container, the two different task roles) with a command that loops: `aws ssm get-parameter --name <flag>` then `aws cloudwatch put-metric-data` publishing `FlagReads{Result=ok|denied}` and, only on a successful read, `APILatency{Service=Quartz,Operation=ReportPerson}`.
+4. `ecs run-task --cluster <c> --task-definition <td> --launch-type FARGATE --count 1 --network-configuration 'awsvpcConfiguration={subnets=[<s>],assignPublicIp=ENABLED}'` for each task definition.
+5. Poll `cloudwatch get-metric-statistics` for `FlagReads{Result=ok}` (allowed task) and `FlagReads{Result=denied}` (denied task) -> both stay at 0 samples for the whole budget; on AWS each reaches >=3 samples. Nothing the containers would print or publish exists.
+6. `iam put-role-policy` adding `ssm:GetParameter` to the second role -> on AWS the same running task starts publishing `FlagReads{ok}` and degraded `APILatency`; on the emulator there is still nothing to observe.
+Replay: cloudwatch__ecs__ssm.fargate-task-role-without-ssm-get-parameter-is-denied-the-latency-flag.
