@@ -56,6 +56,12 @@ mod workspace_lockfile_covers_every_manifest;
 mod s3_notification_invokes_its_lambda_target;
 #[path = "all/cloudformation_asset_bucket_publishing_role.rs"]
 mod cloudformation_asset_bucket_publishing_role;
+// Declared here, in this same head region, for the reason the entries above record: what a
+// client SEES of an EventBridge rule's and an SNS subscription's deliveries to their Lambda and
+// SNS targets, which spans EventBridge, SNS, Lambda, CloudWatch Logs, SQS, IAM and
+// CloudFormation at once.
+#[path = "all/events_sns_lambda_delivery_observed_in_logs.rs"]
+mod events_sns_lambda_delivery_observed_in_logs;
 // appended tail and the sorted `c…` span (where every cloudformation suite lands) are both
 // regions concurrently landing suites add their line to.
 #[path = "all/cloudformation_sfn_reference_starts_execution.rs"]
