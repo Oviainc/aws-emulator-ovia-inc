@@ -263,6 +263,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 destinations.len()
             )));
         }
+
+        // Authorization, in the place and for the reasons `send_email.rs` records:
+        // the caller's identity policies decide this send before anything the
+        // account holds is read, and after only the recipient-set ceiling that
+        // bounds how much of the request the decision reads.
+        crate::service::authorization::authorize_send(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &region,
+            &crate::service::authorization::SendingRequest::new(
+                &input.source,
+                &destinations,
+                input.return_path.as_deref(),
+            ),
+        )?;
+
         // "If a recipient email address is invalid (that is, it is not in the
         // format UserName@[SubDomain.]Domain.TopLevelDomain), the entire message
         // is rejected, even if the message contains other recipients that are

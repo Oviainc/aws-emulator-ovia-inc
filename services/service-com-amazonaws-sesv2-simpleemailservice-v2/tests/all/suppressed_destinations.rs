@@ -1294,8 +1294,8 @@ async fn a_next_token_this_listing_never_minted_is_refused() {
         );
         assert_eq!(
             reply.message(),
-            "Token is invalid.",
-            "case {case:?}: expected the refusal to read \"Token is invalid.\", got {:?}",
+            "Invalid next token.",
+            "case {case:?}: expected the refusal to read \"Invalid next token.\", got {:?}",
             reply.message()
         );
     }

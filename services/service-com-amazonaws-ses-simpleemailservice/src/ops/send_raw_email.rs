@@ -228,6 +228,12 @@ const CONTENT_TYPE_FIELD_NAME: &[u8] = b"content-type";
 /// the message" (`SendRawEmailRequest$Source`).
 const FROM_HEADER: &str = "From";
 
+/// The header line naming where bounces and complaints go, which is where a raw
+/// message states the feedback address a sending statement's `ses:FeedbackAddress`
+/// condition key is answered from — the same address the `ReturnPath` parameter of
+/// the non-raw sends carries.
+const RETURN_PATH_HEADER: &str = "Return-Path";
+
 /// The header lines a message's recipients sit on: "A recipient address includes
 /// any address on the To:, CC:, or BCC: lines" (this operation's own
 /// documentation).
@@ -601,6 +607,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 destinations.len()
             )));
         }
+
+        // Authorization, in the place and for the reasons `send_email.rs` records:
+        // the caller's identity policies decide this send before anything the
+        // account holds is read, and after only the recipient-set ceiling that
+        // bounds how much of the request the decision reads. A raw send states its
+        // `From` and — when the request carries no `Destinations` — its recipients
+        // in the MESSAGE, so the decision is taken once both have been read off it
+        // rather than before it could be parsed at all; the `Return-Path` header is
+        // where such a message states its feedback address.
+        //
+        // The From value is the `Source` parameter when the request carries one and
+        // the message's own `From` line otherwise — the same precedence the sender
+        // itself was resolved under above. A message with NEITHER was already
+        // refused there, so the decision below is never taken on an empty From.
+        let return_path = ::mailparse::MailHeaderMap::get_first_value(headers, RETURN_PATH_HEADER);
+        crate::service::authorization::authorize_send(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &region,
+            &crate::service::authorization::SendingRequest::new(
+                input
+                    .source
+                    .as_deref()
+                    .unwrap_or(from_header.as_deref().unwrap_or_default()),
+                &destinations,
+                return_path.as_deref(),
+            ),
+        )?;
+
         // "If you send a single message to more than one recipient address, and
         // one of the recipient addresses isn't in a valid format (that is, it's
         // not in the format UserName@[SubDomain.]Domain.TopLevelDomain), Amazon

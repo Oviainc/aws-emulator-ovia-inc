@@ -882,12 +882,12 @@ async fn a_request_this_operation_cannot_read_is_refused() {
         (
             "a token this listing never handed out".to_string(),
             json!({"NextToken": "bm90LWEtdG9rZW4="}),
-            "Token is invalid.".to_string(),
+            "Invalid next token.".to_string(),
         ),
         (
             "a token another listing of this service handed out".to_string(),
             json!({"NextToken": ::aws_smithy_types::base64::encode(format!("{CONTACT_LISTS_PAGE_TOKEN_TAG}{SETTLED}"))}),
-            "Token is invalid.".to_string(),
+            "Invalid next token.".to_string(),
         ),
     ];
     for (case, body, expected) in cases {

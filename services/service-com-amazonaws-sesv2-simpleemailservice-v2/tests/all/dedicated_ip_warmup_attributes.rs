@@ -768,8 +768,8 @@ async fn a_next_token_this_listing_did_not_hand_out_is_refused() {
         );
         assert_eq!(
             reply.message(),
-            "Token is invalid.",
-            "case {case:?}: expected \"Token is invalid.\", got {:?}",
+            "Invalid next token.",
+            "case {case:?}: expected \"Invalid next token.\", got {:?}",
             reply.message()
         );
     }

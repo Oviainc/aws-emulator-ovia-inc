@@ -286,13 +286,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The request's own shape is read first, ahead of anything the account
         // holds, as every send of this service reads its recipient set first:
         // "You can specify up to 50 Destination objects within a Destinations
-        // array."
+        // array." It is read ahead of the authorization decision below — the one
+        // thing that is — because that decision is taken over every recipient of
+        // every destination, so this ceiling is what bounds how much of a
+        // caller's request it has to read.
         if input.destinations.len() > MAX_DESTINATIONS {
             return Err(rejected(format!(
                 "Destinations may include at most {MAX_DESTINATIONS} Destination objects, got {}",
                 input.destinations.len()
             )));
         }
+
+        // Authorization, as `send_email.rs` records: the caller's identity
+        // policies decide this call before anything the account holds is read.
+        // One bulk call is one authorization decision, so `ses:Recipients`
+        // carries every recipient of every `Destination` it would send to.
+        let all_recipients: Vec<String> = input
+            .destinations
+            .iter()
+            .flat_map(|bulk_destination| {
+                crate::state::destination_recipients(&bulk_destination.destination)
+            })
+            .collect();
+        crate::service::authorization::authorize_send(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &region,
+            &crate::service::authorization::SendingRequest::new(
+                &input.source,
+                &all_recipients,
+                input.return_path.as_deref(),
+            ),
+        )?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // See `verify_email_identity.rs`: an engine with no store for this

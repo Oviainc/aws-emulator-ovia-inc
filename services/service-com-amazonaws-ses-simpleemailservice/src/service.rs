@@ -61,6 +61,10 @@ use std::sync::Arc;
 /// which error code it names. Applied through [`EmulatedService::override_refusal`].
 pub mod validation;
 
+/// Whether IAM lets a request SEND the message it carries: the request-authorization
+/// decision every send of this service takes before it reads the account's identities.
+pub mod authorization;
+
 /// This service's endpoint prefix, as its model gives it
 /// (`smithy_query(query="service_info")`: `awsService.endpointPrefix` `email`) — the name
 /// a host-addressed request resolves to, beside the SigV4 signing name (`ses`) the

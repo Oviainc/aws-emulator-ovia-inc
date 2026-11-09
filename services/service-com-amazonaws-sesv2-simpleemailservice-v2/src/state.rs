@@ -3581,14 +3581,18 @@ fn boundary_clause(violation: &Violation) -> String {
     }
 }
 
-/// How this service words `InvalidNextTokenException` for a `NextToken` that is not
-/// a position in the listing being read.
+/// How this service words the refusal of a `NextToken` that is not a position in the
+/// listing being read.
 ///
-/// The sentence carries no part of the request: a token is refused for being
-/// something this listing never handed out, and there is nothing else to say about
-/// it. One wording for every listing that models the error.
+/// AWS's own sentence for the bad-cursor class, which is wholly FIXED text: a token is
+/// refused for being something this listing never handed out, and there is nothing else
+/// to say about it — in particular the rejected token is never echoed back. ONE wording
+/// for every listing of this service, whichever error shape carries it (the page-cursor
+/// refusals this service renders as `BadRequestException`, and the listings that model
+/// `InvalidNextTokenException`), because it is one condition: a second sentence for it
+/// would be exactly the drift this function exists to prevent.
 pub fn invalid_next_token() -> String {
-    "Token is invalid.".to_string()
+    "Invalid next token.".to_string()
 }
 
 /// The version prefix an outbound message id carries: SES spells the id of a

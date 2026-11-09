@@ -210,6 +210,36 @@ pub static INVALID_PARAMETER_VALUE_SCHEMA: Schema = Schema::new_struct(
     &[&INVALID_PARAMETER_VALUE_MESSAGE],
 );
 
+/// The `message` member of the synthetic `AccessDenied` error shape.
+static ACCESS_DENIED_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#AccessDenied$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `AccessDenied` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the shape
+/// is not in any service's model, so it must not collide with a modeled one — and it
+/// CANNOT be in this one's. `AccessDenied` is the answer of the IAM AUTHORIZATION layer
+/// that runs ahead of a handler, not of the operation: no operation of this model declares
+/// it, while every IAM-authorized action of this service can be refused with it.
+pub static ACCESS_DENIED_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#AccessDenied",
+        "smithy.framework",
+        "AccessDenied",
+    ),
+    ShapeType::Structure,
+    &[&ACCESS_DENIED_MESSAGE],
+);
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -235,6 +265,15 @@ pub enum Scaffolded<E> {
     /// single `message` member; only the wire code differs from
     /// [`Scaffolded::ValidationException`].
     InvalidParameterValue(ValidationException),
+    /// The request was refused by AUTHORIZATION, with HTTP 403 and the error code
+    /// `AccessDenied` — the answer the IAM layer gives ahead of the handler, which no
+    /// operation of this model declares as one of its own errors.
+    ///
+    /// The payload is the same single `message` member; what differs from the refusals
+    /// above is the status (403, not 400) and the code a client branches on. Reach for it
+    /// only where a request-authorization decision was really taken
+    /// ([`crate::service::authorization`]) — never as a stand-in for a modelled refusal.
+    AccessDenied(ValidationException),
     /// A modeled error answered under the `Error.Code` the REAL service puts on the
     /// query wire, where that is not the code this service's model annotates the
     /// error shape with.
@@ -290,6 +329,12 @@ impl<E> Scaffolded<E> {
         Self::InvalidParameterValue(ValidationException::new(message))
     }
 
+    /// Refuse the request as one the caller's IAM policies do not allow, with HTTP 403
+    /// `AccessDenied`. See [`Scaffolded::AccessDenied`].
+    pub fn access_denied(message: impl Into<String>) -> Self {
+        Self::AccessDenied(ValidationException::new(message))
+    }
+
     /// Answer `error` under the query `Error.Code` `query_code` rather than the code
     /// its own shape is annotated with. See [`Scaffolded::ModeledWithQueryCode`].
     pub fn modeled_with_query_code(error: E, query_code: &'static str) -> Self {
@@ -304,6 +349,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::Modeled(e) | Self::ModeledWithQueryCode { error: e, .. } => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::InvalidParameterValue(e) => write!(f, "{e}"),
+            Self::AccessDenied(e) => write!(f, "AccessDenied: {}", e.message),
         }
     }
 }
@@ -317,6 +363,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::Modeled(e) | Self::ModeledWithQueryCode { error: e, .. } => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::InvalidParameterValue(e) => e.source(),
+            Self::AccessDenied(e) => e.source(),
         }
     }
 }
@@ -332,6 +379,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) | Self::ModeledWithQueryCode { error: e, .. } => e.as_serializable(),
             Self::ValidationException(e) => e,
             Self::InvalidParameterValue(e) => e,
+            Self::AccessDenied(e) => e,
         }
     }
 
@@ -341,6 +389,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) | Self::ModeledWithQueryCode { error: e, .. } => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::InvalidParameterValue(_) => &INVALID_PARAMETER_VALUE_SCHEMA,
+            Self::AccessDenied(_) => &ACCESS_DENIED_SCHEMA,
         }
     }
 
@@ -354,6 +403,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) | Self::ModeledWithQueryCode { error: e, .. } => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
             Self::InvalidParameterValue(_) => "InvalidParameterValue",
+            Self::AccessDenied(_) => "AccessDenied",
         }
     }
 
@@ -367,6 +417,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) | Self::ModeledWithQueryCode { error: e, .. } => e.http_status(),
             Self::ValidationException(_) => 400,
             Self::InvalidParameterValue(_) => 400,
+            // The status the authorization layer answers an unauthorized request with,
+            // which is what a client distinguishes a permission problem by.
+            Self::AccessDenied(_) => 403,
         }
     }
 
@@ -386,6 +439,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope renders from `shape_name` is already the code SES answers
             // this refusal with.
             Self::InvalidParameterValue(_) => None,
+            // And again: `AccessDenied` is already the code the authorization layer puts
+            // in the envelope's `<Code>`.
+            Self::AccessDenied(_) => None,
         }
     }
 }

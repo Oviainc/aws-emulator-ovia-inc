@@ -247,6 +247,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 destinations.len()
             )));
         }
+
+        // Amazon SES is IAM-authorized, and the authorization decision is taken
+        // before anything the account holds is read: a caller whose identity
+        // policies do not allow this send — for this `Source`, under the sending
+        // condition keys the message carries — is refused by the authorization
+        // layer rather than told anything about the identities the account holds.
+        // It is taken after only the recipient-set ceiling above, which is what
+        // bounds how much of the request the decision reads: `ses:Recipients`
+        // carries one value per recipient.
+        crate::service::authorization::authorize_send(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &region,
+            &crate::service::authorization::SendingRequest::new(
+                &input.source,
+                &destinations,
+                input.return_path.as_deref(),
+            ),
+        )?;
+
         // "If a recipient email address is invalid (that is, it is not in the
         // format UserName@[SubDomain.]Domain.TopLevelDomain), the entire message
         // is rejected, even if the message contains other recipients that are

@@ -97,6 +97,8 @@ mod ses_reorder_receipt_rule_set;
 mod ses_send_bulk_templated_email;
 #[path = "all/ses_send_raw_email.rs"]
 mod ses_send_raw_email;
+#[path = "all/ses_send_request_authorization.rs"]
+mod ses_send_request_authorization;
 #[path = "all/ses_send_templated_email.rs"]
 mod ses_send_templated_email;
 #[path = "all/ses_set_receipt_rule_position.rs"]

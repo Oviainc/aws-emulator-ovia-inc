@@ -763,7 +763,7 @@ async fn a_token_this_listing_never_handed_out_is_refused() {
         );
         assert_eq!(
             reply.message(),
-            "Token is invalid.",
+            "Invalid next token.",
             "case {case:?}: expected the refusal this service words for a token that is not a \
              position in the listing, got {:?}",
             reply.message()

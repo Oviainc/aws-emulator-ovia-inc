@@ -123,6 +123,8 @@ mod message_insights;
 mod metric_data;
 #[path = "all/multi_region_endpoints.rs"]
 mod multi_region_endpoints;
+#[path = "all/page_cursor_refusal_wording.rs"]
+mod page_cursor_refusal_wording;
 #[path = "all/recommendations.rs"]
 mod recommendations;
 #[path = "all/reputation_entities.rs"]
