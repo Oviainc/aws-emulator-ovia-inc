@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListModelPackageGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListModelPackageGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListModelPackageGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: filters, sorts and pages the model package groups
+//! `CreateModelPackageGroup` stored in `crate::state`. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +111,27 @@ impl From<ListModelPackageGroupsErrorModeled> for ListModelPackageGroupsError {
     }
 }
 
+/// `SortBy`'s documented default for this listing ("The field to sort results by. The
+/// default is `CreationTime`."), which is what [`crate::state::DEFAULT_SORT_BY`] already
+/// holds, so the shared constant is reused rather than restated.
+const DEFAULT_SORT_BY: &str = crate::state::DEFAULT_SORT_BY;
+
+/// `SortOrder`'s documented default for this listing ("The sort order for results. The
+/// default is `Ascending`.") — the opposite of [`crate::state::DEFAULT_SORT_ORDER`], which
+/// is what `ListModels` and `ListEndpoints` document instead.
+const DEFAULT_SORT_ORDER: &str = crate::state::ORDER_ASCENDING;
+
+/// `ModelPackageGroupSortBy`'s name-valued member, matched by name so the sort key is
+/// never chosen by comparing a bare literal. The accepted value SET is the generated
+/// [`MODEL_PACKAGE_GROUP_SORT_BY_VALUES`], so a refusal stays in step with the model.
+const SORT_BY_NAME: &str = "Name";
+
+/// `CrossAccountFilterOption`'s members, as the model declares them
+/// ([`CROSS_ACCOUNT_FILTER_OPTION_VALUES`]).
+const CROSS_ACCOUNT: &str = "CrossAccount";
+/// See [`CROSS_ACCOUNT`].
+const SAME_ACCOUNT: &str = "SameAccount";
+
 /// The `ListModelPackageGroups` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -151,20 +166,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListModelPackageGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListModelPackageGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListModelPackageGroups"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let sort_by = input.sort_by.as_deref().unwrap_or(DEFAULT_SORT_BY);
+        if !MODEL_PACKAGE_GROUP_SORT_BY_VALUES.contains(&sort_by) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                MODEL_PACKAGE_GROUP_SORT_BY_VALUES.join(", ")
+            )));
+        }
+        let sort_order = input.sort_order.as_deref().unwrap_or(DEFAULT_SORT_ORDER);
+        if !SORT_ORDER_VALUES.contains(&sort_order) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}; got \"{sort_order}\".",
+                SORT_ORDER_VALUES.join(", ")
+            )));
+        }
+        let descending = sort_order == crate::state::ORDER_DESCENDING;
+
+        // "When the value is CrossAccount, the results show the resources made
+        // discoverable to you from other accounts." Nothing makes another account's model
+        // group discoverable to this one — every group this emulator holds belongs to the
+        // one account — so that option selects none of them, where `SameAccount` and the
+        // null default select them all.
+        let cross_account = match input.cross_account_filter_option.as_deref() {
+            None | Some(SAME_ACCOUNT) => false,
+            Some(CROSS_ACCOUNT) => true,
+            Some(other) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "CrossAccountFilterOption must be one of {}; got \"{other}\".",
+                    CROSS_ACCOUNT_FILTER_OPTION_VALUES.join(", ")
+                )))
+            }
+        };
+
+        let after = input.creation_time_after.map(crate::state::timestamp_key);
+        let before = input.creation_time_before.map(crate::state::timestamp_key);
+
+        // A reporting call: this listing only reads the store, so the group it reports is
+        // exactly the one a later `DescribeModelPackageGroup` replays. A model group is
+        // created `Completed`, so there is no clock-owed transition to materialise here.
+        let store = state.lock();
+        let mut matching: Vec<&crate::state::ModelPackageGroup> = if cross_account {
+            Vec::new()
+        } else {
+            store
+                .model_package_groups
+                .values()
+                .filter(|group| {
+                    input
+                        .name_contains
+                        .as_deref()
+                        .is_none_or(|needle| group.name.contains(needle))
+                })
+                .filter(|group| {
+                    // Both bounds are inclusive, as the rest of this service's listings
+                    // apply them, so a timestamp copied straight out of a prior response's
+                    // `CreationTime` still selects the group carrying it.
+                    let created =
+                        crate::state::timestamp_key(crate::state::timestamp(group.creation_time));
+                    after.is_none_or(|bound| created >= bound)
+                        && before.is_none_or(|bound| created <= bound)
+                })
+                .collect()
+        };
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays
+        // `ModelPackageGroupName` ascending in both directions, so two groups sharing a
+        // sort key keep one order whichever way the page is sorted — and a `NextToken`
+        // resolved against a freshly computed result set lands on the same boundary.
+        matching.sort_by(|left, right| {
+            let by_key = if sort_by == SORT_BY_NAME {
+                left.name.cmp(&right.name)
+            } else {
+                crate::state::timestamp_key(crate::state::timestamp(left.creation_time)).cmp(
+                    &crate::state::timestamp_key(crate::state::timestamp(right.creation_time)),
+                )
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.name.cmp(&right.name))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|name| matching.iter().position(|group| group.name == name))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(
+                            "NextToken does not name a page boundary of this result set; \
+                             restart the listing without it.",
+                        )
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // This operation documents no `MaxResults` default, so an absent one takes the
+        // service's own page ceiling, which also caps an explicit one: no single call can
+        // serialise the whole store. The token below is emitted whenever anything is left,
+        // so a paginating client walks the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < matching.len() => Some(crate::state::encode_page_token(&last.name)),
+            _ => None,
+        };
+
+        Ok(ListModelPackageGroupsOutput {
+            model_package_group_summary_list: page
+                .iter()
+                .map(|group| ModelPackageGroupSummary {
+                    model_package_group_name: group.name.clone(),
+                    model_package_group_arn: group.arn.clone(),
+                    model_package_group_description: group.description.clone(),
+                    creation_time: crate::state::timestamp(group.creation_time),
+                    model_package_group_status: group.status.clone(),
+                    managed_configuration: group.managed_configuration.clone(),
+                })
+                .collect(),
+            next_token,
+        })
     }
 }

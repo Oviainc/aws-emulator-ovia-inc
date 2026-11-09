@@ -127,6 +127,8 @@ mod list_endpoints;
 mod list_images;
 #[path = "all/list_model_card_export_jobs.rs"]
 mod list_model_card_export_jobs;
+#[path = "all/list_model_package_groups.rs"]
+mod list_model_package_groups;
 #[path = "all/list_model_packages.rs"]
 mod list_model_packages;
 #[path = "all/list_pipeline_execution_steps.rs"]
