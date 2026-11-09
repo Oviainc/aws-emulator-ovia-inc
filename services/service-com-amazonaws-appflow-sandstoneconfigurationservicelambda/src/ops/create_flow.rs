@@ -189,6 +189,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.tags.clone().unwrap_or_default().into_iter().collect();
         let mut store = state.lock();
 
+        // Every connector profile the definition names has to EXIST: "You must create a
+        // connector profile before calling this API"
+        // (`smithy_query(query="doc", shape="CreateFlow")`), and a profile that was never
+        // created is "[t]he resource specified in the request (such as the source or
+        // destination connector profile) … not found"
+        // (`smithy_query(query="shape", shape="ResourceNotFoundException")`). Checked
+        // before anything is stored, so a flow that could never run is not left behind.
+        if let Some(missing) = store.unresolved_connector_profile(
+            &input.source_flow_config,
+            &input.destination_flow_config_list,
+        ) {
+            return Err(CreateFlowErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::no_such_connector_profile(missing)),
+                },
+            )
+            .into());
+        }
+
+        // Every Amazon S3 location the definition names has to be one AppFlow could
+        // actually use: the bucket exists and its policy grants AppFlow the actions a run
+        // takes on that end of the transfer. Judged before anything is stored, so a flow
+        // that could never move data is refused rather than created.
+        if let Some(reason) = crate::state::beyond_destination_ceiling(
+            &input.destination_flow_config_list,
+        )
+        .or_else(|| {
+            crate::state::unusable_s3_location(
+                &*self.engine,
+                &input.flow_name,
+                &crate::state::flow_arn(&region, &input.flow_name),
+                &input.source_flow_config,
+                &input.destination_flow_config_list,
+            )
+        }) {
+            return Err(CreateFlowErrorModeled::ValidationException(ValidationException {
+                message: Some(reason),
+            })
+            .into());
+        }
+
         // The definition AppFlow STORES, rather than the sparse body it arrived in: the
         // containers AppFlow materialises are filled in, and the flow's encryption key
         // is resolved, before the definition is compared or persisted — so a retry
@@ -260,10 +301,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if store.flows.contains_key(&input.flow_name) {
             return Err(CreateFlowErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "A flow with the name {} already exists in this account",
-                    input.flow_name
-                )),
+                message: Some(crate::state::flow_name_already_exists(&input.flow_name)),
             })
             .into());
         }

@@ -122,22 +122,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let flow = store.flows.get_mut(&input.flow_name).ok_or_else(|| {
             DeleteFlowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "No flow named {} exists in this account",
-                    input.flow_name
-                )),
+                message: Some(crate::state::no_such_flow(&input.flow_name)),
             })
         })?;
         flow.settle_due_executions(::std::time::SystemTime::now());
 
-        // `forceDelete` is what allows a flow that is in use by a run to be deleted;
-        // without it, a flow with a run still in progress is left alone.
-        if !input.force_delete && flow.has_running_execution() {
+        // `forceDelete` is the caller's explicit opt-in to destroying a flow that is IN
+        // USE — "whether Amazon AppFlow should delete the flow, even if it is currently in
+        // use" (`smithy_query(query="doc", shape="DeleteFlowRequest",
+        // member="forceDelete")`). A flow is in use while its trigger is armed, which is
+        // the `Active` status, and while a run of it has not finished; without the opt-in
+        // such a flow is left exactly as it was, and the caller is told the two ways
+        // forward.
+        if !input.force_delete
+            && (flow.flow_status == crate::state::FlowStatus::Active
+                || flow.has_running_execution())
+        {
             return Err(DeleteFlowErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Flow {} has a run in progress. Delete it with forceDelete to remove it anyway",
-                    flow.flow_name
-                )),
+                message: Some(crate::state::flow_is_active(&flow.flow_name)),
             })
             .into());
         }

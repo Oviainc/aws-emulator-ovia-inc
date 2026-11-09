@@ -141,86 +141,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
 
-        let mut store = state.lock();
-        let flow = store.flows.get_mut(&input.flow_name).ok_or_else(|| {
-            StartFlowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "No flow named {} exists in this account",
-                    input.flow_name
-                )),
-            })
-        })?;
-        flow.settle_due_executions(now);
+        // The DECISION, under the store's guard: whether this call starts a run at all,
+        // and the part of the flow's definition a run of it would move. The guard is
+        // released before the transfer, so the work below runs on no lock.
+        let (flow_arn, flow_status, execution_id, plan) = {
+            let mut store = state.lock();
+            let flow = store.flows.get_mut(&input.flow_name).ok_or_else(|| {
+                StartFlowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::no_such_flow(&input.flow_name)),
+                })
+            })?;
+            flow.settle_due_executions(now);
 
-        // A retried StartFlow carrying the same `@idempotencyToken` answers with the run
-        // the FIRST call recorded, rather than starting a second one.
-        if let Some(execution) = input
-            .client_token
-            .as_deref()
-            .and_then(|token| flow.execution_for_client_token(token))
-        {
-            return Ok(StartFlowOutput {
-                flow_arn: Some(flow.flow_arn.clone()),
-                flow_status: Some(flow.flow_status.as_str().to_string()),
-                execution_id: Some(execution.execution_id.clone()),
+            // A retried StartFlow carrying the same `@idempotencyToken` answers with the
+            // run the FIRST call recorded, rather than starting a second one.
+            if let Some(execution) = input
+                .client_token
+                .as_deref()
+                .and_then(|token| flow.execution_for_client_token(token))
+            {
+                return Ok(StartFlowOutput {
+                    flow_arn: Some(flow.flow_arn.clone()),
+                    flow_status: Some(flow.flow_status.as_str().to_string()),
+                    execution_id: Some(execution.execution_id.clone()),
+                });
+            }
+
+            if flow.has_running_execution() {
+                return Err(StartFlowErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::CONCURRENT_RUN_CONFLICT.to_string()),
+                })
+                .into());
+            }
+            // Starting a schedule- or event-triggered flow ARMS its trigger, so one whose
+            // trigger is already armed has nothing left to start.
+            if !flow.is_on_demand() && flow.flow_status == crate::state::FlowStatus::Active {
+                return Err(StartFlowErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::flow_already_activated(&flow.flow_name)),
+                })
+                .into());
+            }
+
+            // Starting a flow does not re-define it, so nothing about the stored
+            // definition moves here: `lastUpdatedAt`/`lastUpdatedBy` describe the
+            // definition, and only the trigger and the run history below change.
+            //
+            // A flow that runs ITSELF is activated rather than run now, and reports no
+            // run: `executionId` "[r]eturns the internal execution ID of an on-demand
+            // flow when the flow is started. For scheduled or event-triggered flows, this
+            // value is null" (`smithy_query(query="doc", shape="StartFlowResponse",
+            // member="executionId")`). Only an on-demand flow starts a run here.
+            if flow.activate_trigger() {
+                return Ok(StartFlowOutput {
+                    flow_arn: Some(flow.flow_arn.clone()),
+                    flow_status: Some(flow.flow_status.as_str().to_string()),
+                    execution_id: None,
+                });
+            }
+
+            // The run is recorded IN PROGRESS before the work begins, which is what makes
+            // a second, concurrent StartFlow a conflict rather than a second run. The
+            // clock owes it nothing yet: its terminal status falls due when the work is
+            // done ([`crate::state::Flow::attach_run_outcome`]).
+            let execution_id = crate::state::new_execution_id();
+            flow.record_execution(crate::state::FlowExecution {
+                execution_id: execution_id.clone(),
+                client_token: input.client_token,
+                execution_status: crate::state::ExecutionStatus::InProgress,
+                execution_result: None,
+                started_at: now,
+                last_updated_at: now,
+                settles_at: None,
+                outcome: None,
+                data_pull_start_time: None,
+                data_pull_end_time: None,
             });
-        }
+            (
+                flow.flow_arn.clone(),
+                flow.flow_status.as_str().to_string(),
+                execution_id,
+                flow.run_plan(),
+            )
+        };
 
-        if flow.has_running_execution() {
-            return Err(StartFlowErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Flow {} is already running and cannot be started again",
-                    flow.flow_name
-                )),
-            })
-            .into());
-        }
-        // Starting a schedule- or event-triggered flow ARMS its trigger, so one whose
-        // trigger is already armed has nothing left to start.
-        if !flow.is_on_demand() && flow.flow_status == crate::state::FlowStatus::Active {
-            return Err(StartFlowErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Flow {} is already activated and cannot be started again",
-                    flow.flow_name
-                )),
-            })
-            .into());
-        }
+        // The RUN itself: an on-demand flow "runs the flow immediately"
+        // (`smithy_query(query="doc", shape="StartFlow")`), so the transfer between the
+        // locations this flow names happens HERE — off this service's guard, and bounded
+        // by the ceilings and the wall-clock budget `crate::state::perform_run` states. A
+        // flow with an endpoint this emulator does not connect to has no plan at all, and
+        // a run of one performs nothing.
+        let outcome = match plan.as_ref() {
+            Some(plan) => {
+                Some(crate::state::perform_run(&*self.engine, plan, &execution_id, now).await)
+            }
+            None => None,
+        };
 
-        // Starting a flow does not re-define it, so nothing about the stored definition
-        // moves here: `lastUpdatedAt`/`lastUpdatedBy` describe the definition, and only
-        // the trigger and the run history below change.
-        //
-        // A flow that runs ITSELF is activated rather than run now, and reports no run:
-        // `executionId` "[r]eturns the internal execution ID of an on-demand flow when
-        // the flow is started. For scheduled or event-triggered flows, this value is
-        // null" (`smithy_query(query="doc", shape="StartFlowResponse",
-        // member="executionId")`). Only an on-demand flow starts a run here.
-        if flow.activate_trigger() {
-            return Ok(StartFlowOutput {
-                flow_arn: Some(flow.flow_arn.clone()),
-                flow_status: Some(flow.flow_status.as_str().to_string()),
-                execution_id: None,
-            });
+        // The OUTCOME, under the guard again: from here the clock owes the run its
+        // terminal status, which a later read materialises.
+        if let Some(flow) = state.lock().flows.get_mut(&input.flow_name) {
+            flow.attach_run_outcome(&execution_id, outcome, ::std::time::SystemTime::now());
         }
-
-        let execution_id = crate::state::new_execution_id();
-        flow.record_execution(crate::state::FlowExecution {
-            execution_id: execution_id.clone(),
-            client_token: input.client_token,
-            execution_status: crate::state::ExecutionStatus::InProgress,
-            execution_result: None,
-            started_at: now,
-            last_updated_at: now,
-            // The terminal status this run is owed, which a later read materialises.
-            settles_at: Some(now + crate::state::EXECUTION_SETTLES_AFTER),
-            data_pull_start_time: None,
-            data_pull_end_time: None,
-        });
 
         Ok(StartFlowOutput {
-            flow_arn: Some(flow.flow_arn.clone()),
-            flow_status: Some(flow.flow_status.as_str().to_string()),
+            flow_arn: Some(flow_arn),
+            flow_status: Some(flow_status),
             execution_id: Some(execution_id),
         })
     }

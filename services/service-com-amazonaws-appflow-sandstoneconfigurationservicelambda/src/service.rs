@@ -23,9 +23,10 @@
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
-//! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//! - `override_refusal` — EDITED HERE. A request refused for violating a modelled
+//!   constraint is stated the way AppFlow states it: the framework's own envelope and
+//!   clause, with a `@pattern` requirement quoted as the expression the SERVICE validates
+//!   against. See "How this service words a refusal" below.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -39,11 +40,67 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! # How this service words a refusal
+//!
+//! The envelope, the clause and the requirement are the framework's — `N validation
+//! error(s) detected: Value '<submitted>' at '<member path>' failed to satisfy constraint:
+//! <requirement>` — reached through the one shared statement of that wording
+//! ([`::service_common::validation_message::aws_validation_refusal_with`]), so a
+//! constraint class the framework gains later cannot arrive with a sentence of this
+//! service's own. The clause QUOTES BACK the value the request submitted, which is the
+//! only part of the message built from the request rather than chosen.
+//!
+//! One part of the clause is AppFlow's: a `@pattern` requirement is quoted as the
+//! expression the SERVICE validates a value against ([`stated_pattern`]) rather than as
+//! the model spells it — without the `^`/`$` anchors Smithy writes to turn a find into a
+//! whole-string match, and, for a member whose service-side expression admits a narrower
+//! character class than the published model's, as the service's own expression
+//! ([`NAMED_BY_THE_SERVICE`]). Both are properties of a SHAPE, so they hold for every
+//! member that reaches it and every operation that takes one, and neither depends on the
+//! request. The CHECK is unaffected: it is still the model's pattern as written, so only
+//! the quoting changes.
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The `@pattern` expressions this service VALIDATES with that its published model spells
+/// differently, as (what the model declares, what the service names) pairs.
+///
+/// The declared expression is what identifies the shape here: the walk hands this seam a
+/// pattern violation's EXPRESSION, not the shape that declared it, and the pair below is
+/// the one expression of this service's model whose recorded refusals quote a different
+/// character class — `FlowName`, which AppFlow validates without the `#` the published
+/// model admits (`smithy_query(query="shape", shape="FlowName")`). Every other pattern is
+/// quoted as the model declares it, minus its anchors.
+///
+/// A pair is a property of the SHAPE rather than of one request, so it is the same for
+/// every member that reaches it (`CreateFlow`, `UpdateFlow`, `StartFlow`, `StopFlow`,
+/// `DeleteFlow`, `DescribeFlow`, … all take a `FlowName`) and for every operation that
+/// takes one.
+const NAMED_BY_THE_SERVICE: [(&str, &str); 1] = [(
+    r"^[a-zA-Z0-9][\w!@#.-]+$",
+    r"[a-zA-Z0-9][\w!@.-]+",
+)];
+
+/// The expression a refusal quotes for the `@pattern` `declared`: the one the SERVICE
+/// validates against.
+///
+/// That is [`NAMED_BY_THE_SERVICE`]'s for a shape whose service-side expression differs
+/// from the published one, and otherwise the model's own expression without the anchors a
+/// whole-value pattern wraps it in — the shared rendering
+/// ([`::service_common::validation::unanchored`]), so this service cannot drop an anchor
+/// differently from any other.
+fn stated_pattern(declared: &str) -> String {
+    for (model_names, service_names) in NAMED_BY_THE_SERVICE {
+        if declared == model_names {
+            return service_names.to_string();
+        }
+    }
+    ::service_common::validation::unanchored(declared)
+}
 
 /// The `com-amazonaws-appflow-sandstoneconfigurationservicelambda` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -97,16 +154,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. AppFlow states such a refusal in the framework's own envelope and
+        // clause — the submitted value quoted back included — with a `@pattern`
+        // requirement quoted as the expression the service validates against; see "How
+        // this service words a refusal" at the top of this file.
+        ::service_common::validation_message::aws_validation_refusal_with(refusal, stated_pattern)
     }
 
     fn override_routing_error(

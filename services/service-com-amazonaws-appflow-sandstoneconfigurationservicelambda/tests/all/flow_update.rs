@@ -489,7 +489,14 @@ async fn updating_a_flow_that_does_not_exist_is_not_found() {
         created.status,
         created.body
     );
-    let deleted = call(&router, "/delete-flow", &json!({ "flowName": "deleted-flow" })).await;
+    // An on-demand flow is active from the moment it is created, so deleting it is the
+    // forced delete AppFlow requires for a flow that is in use.
+    let deleted = call(
+        &router,
+        "/delete-flow",
+        &json!({ "flowName": "deleted-flow", "forceDelete": true }),
+    )
+    .await;
     assert!(
         deleted.is_ok(),
         "expected DeleteFlow to succeed, got {} {:?}",
@@ -522,7 +529,7 @@ async fn updating_a_flow_that_does_not_exist_is_not_found() {
         );
         assert_eq!(
             answer.string("message"),
-            format!("No flow named {flow_name} exists in this account"),
+            format!("There is no flow with the name {flow_name}"),
             "case {flow_name:?}: expected the message to name the flow, got {:?}",
             answer.get("message")
         );

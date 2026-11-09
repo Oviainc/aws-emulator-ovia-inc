@@ -25,6 +25,15 @@ use crate::ops::types::{
     ExecutionResult, FlowDefinition, MetadataCatalogConfig, SourceFlowConfig, Task, TriggerConfig,
 };
 
+/// What a flow RUN does: the transfer `StartFlow` performs between the source and the
+/// destination a flow's definition names.
+mod flow_run;
+/// The sentences this service refuses a request with.
+mod refusals;
+
+pub use flow_run::*;
+pub use refusals::*;
+
 /// The region an ARN carries when the request is not SigV4-signed (an anonymous
 /// request names no region). Generated emulators default to `us-east-1`; see
 /// `emulator_server::emulator_arn`.
@@ -234,6 +243,22 @@ impl ExecutionStatus {
     }
 }
 
+/// What the clock owes a run when its span elapses: the status it ends in and the
+/// result it reports.
+///
+/// Both are decided when the run is STARTED, by the transfer that run performed then
+/// (see [`perform_run`]) — the work is what the run did, and only the TRANSITION to its
+/// terminal status is owed by the clock. So a read that materialises the transition
+/// reports the outcome of work already done rather than performing any.
+#[derive(Debug, Clone)]
+pub struct ExecutionOutcome {
+    pub status: ExecutionStatus,
+    pub result: ExecutionResult,
+    /// When the run began and finished reading the source, for a run that read one.
+    pub data_pull_start_time: Option<SystemTime>,
+    pub data_pull_end_time: Option<SystemTime>,
+}
+
 /// One recorded run of a flow, as `StartFlow` appended it.
 #[derive(Debug, Clone)]
 pub struct FlowExecution {
@@ -248,6 +273,11 @@ pub struct FlowExecution {
     pub last_updated_at: SystemTime,
     /// When the clock owes this run its terminal status. `None` once settled.
     pub settles_at: Option<SystemTime>,
+    /// The outcome of the transfer this run PERFORMED when it was started, which the
+    /// clock owes it at [`FlowExecution::settles_at`]. `None` for a run whose work this
+    /// emulator could not perform at all, which ends in the service's modelled failure
+    /// state instead.
+    pub outcome: Option<ExecutionOutcome>,
     pub data_pull_start_time: Option<SystemTime>,
     pub data_pull_end_time: Option<SystemTime>,
 }
@@ -377,11 +407,36 @@ impl Flow {
     /// (`smithy_query(query="doc", shape="StartFlowResponse", member="executionId")`).
     /// An on-demand flow has no trigger to arm — it is already active — so nothing moves
     /// for one.
+    ///
+    /// A flow whose trigger was DEACTIVATED ([`Flow::deactivate_trigger`]) is armed again
+    /// by the same call: activation is about the trigger's current state, so a suspended
+    /// flow resumes rather than being refused.
     pub fn activate_trigger(&mut self) -> bool {
-        if self.is_on_demand() || self.flow_status != FlowStatus::Draft {
+        if self.is_on_demand()
+            || !matches!(self.flow_status, FlowStatus::Draft | FlowStatus::Suspended)
+        {
             return false;
         }
         self.flow_status = FlowStatus::Active;
+        true
+    }
+
+    /// Disarm the trigger of a flow that runs ITSELF, answering whether this call
+    /// disarmed it.
+    ///
+    /// `StopFlow` "[d]eactivates the existing flow. For on-demand flows, this operation
+    /// returns an unsupportedOperationException error message. For schedule and
+    /// event-triggered flows, this operation deactivates the flow"
+    /// (`smithy_query(query="doc", shape="StopFlow")`), and a deactivated flow is
+    /// `Suspended` — the modelled status of a flow whose trigger is no longer armed
+    /// (`smithy_query(query="shape", shape="FlowStatus")`). An on-demand flow has no
+    /// trigger to disarm, and nor has one that is not active, so nothing moves for
+    /// either.
+    pub fn deactivate_trigger(&mut self) -> bool {
+        if self.is_on_demand() || self.flow_status != FlowStatus::Active {
+            return false;
+        }
+        self.flow_status = FlowStatus::Suspended;
         true
     }
 
@@ -424,8 +479,10 @@ impl Flow {
     /// something was read.
     ///
     /// WHICH terminal status is owed follows from the status the run is leaving: a run
-    /// whose cancellation had started completes as `Canceled`, and any other pending
-    /// run ends in the service's modelled failure state.
+    /// whose cancellation had started completes as `Canceled`, and any other pending run
+    /// ends with the outcome of the transfer it performed when it was started
+    /// ([`FlowExecution::outcome`]) — or, for a run whose work this emulator could not
+    /// perform at all, in the service's modelled failure state.
     pub fn settle_due_executions(&mut self, now: SystemTime) {
         for execution in &mut self.executions {
             let Some(due) = execution.settles_at else {
@@ -436,8 +493,6 @@ impl Flow {
             }
             execution.settles_at = None;
             execution.last_updated_at = due;
-            // No data was pulled, so there is no data-pull window to report: both
-            // instants stay `None` rather than describing a transfer that never ran.
             if execution.execution_status == ExecutionStatus::CancelStarted {
                 // The cancellation this run was already undergoing has completed, so it
                 // ends cancelled rather than failed, and nothing went wrong for an
@@ -446,11 +501,24 @@ impl Flow {
                 execution.execution_result = Some(nothing_transferred(None));
                 continue;
             }
-            execution.execution_status = ExecutionStatus::Error;
-            execution.execution_result = Some(nothing_transferred(Some(ErrorInfo {
-                put_failures_count: Some(0),
-                execution_message: Some(EXECUTION_NOT_PERFORMED_MESSAGE.to_string()),
-            })));
+            match execution.outcome.take() {
+                Some(outcome) => {
+                    execution.execution_status = outcome.status;
+                    execution.execution_result = Some(outcome.result);
+                    execution.data_pull_start_time = outcome.data_pull_start_time;
+                    execution.data_pull_end_time = outcome.data_pull_end_time;
+                }
+                None => {
+                    // No data was pulled, so there is no data-pull window to report: both
+                    // instants stay `None` rather than describing a transfer that never
+                    // ran.
+                    execution.execution_status = ExecutionStatus::Error;
+                    execution.execution_result = Some(nothing_transferred(Some(ErrorInfo {
+                        put_failures_count: Some(0),
+                        execution_message: Some(EXECUTION_NOT_PERFORMED_MESSAGE.to_string()),
+                    })));
+                }
+            }
         }
     }
 
@@ -463,6 +531,35 @@ impl Flow {
         }
     }
 
+    /// Attach to the run `execution_id` the outcome the transfer it performed reached, and
+    /// hand it to the clock: from `now` the run is owed its terminal status, which a later
+    /// read materialises.
+    ///
+    /// The outcome is attached AFTER the work, because the work does not run under this
+    /// store's guard (see [`perform_run`]) — so a caller reading in between sees the run
+    /// still in progress, which it is. `None` is a run whose work this emulator could not
+    /// perform at all; such a run ends in the service's modelled failure state.
+    ///
+    /// A run whose cancellation has already started keeps the instant that cancellation
+    /// set, so finishing the work cannot postpone it.
+    pub fn attach_run_outcome(
+        &mut self,
+        execution_id: &str,
+        outcome: Option<ExecutionOutcome>,
+        now: SystemTime,
+    ) {
+        let Some(execution) = self
+            .executions
+            .iter_mut()
+            .find(|execution| execution.execution_id == execution_id)
+        else {
+            return;
+        };
+        execution.outcome = outcome;
+        if execution.execution_status == ExecutionStatus::InProgress {
+            execution.settles_at = Some(now + EXECUTION_SETTLES_AFTER);
+        }
+    }
     /// The run a repeated `StartFlow` token already recorded, if any.
     pub fn execution_for_client_token(&self, client_token: &str) -> Option<&FlowExecution> {
         self.executions
@@ -612,6 +709,30 @@ impl ComAmazonawsAppflowSandstoneconfigurationservicelambdaState {
         self.flows
             .values()
             .find(|flow| flow.client_token.as_deref() == Some(client_token))
+    }
+
+    /// The connector profile a flow definition names that this account does NOT hold, in
+    /// the order the definition names them: its source first, then each of its
+    /// destinations. `None` when every profile it names exists — which includes a
+    /// definition that names none at all, because a connector AppFlow vends (Amazon S3,
+    /// EventBridge) needs no profile to read from or write to.
+    ///
+    /// Shared by every operation that STORES a definition (`CreateFlow`, `UpdateFlow`), so
+    /// the two cannot accept a flow the other would refuse; the answer borrows from the
+    /// definition, which is what lets the refusal name the profile the request asked for.
+    pub fn unresolved_connector_profile<'definition>(
+        &self,
+        source_flow_config: &'definition SourceFlowConfig,
+        destination_flow_config_list: &'definition [DestinationFlowConfig],
+    ) -> Option<&'definition str> {
+        ::std::iter::once(source_flow_config.connector_profile_name.as_deref())
+            .chain(
+                destination_flow_config_list
+                    .iter()
+                    .map(|config| config.connector_profile_name.as_deref()),
+            )
+            .flatten()
+            .find(|name| !self.connector_profiles.contains_key(*name))
     }
 
     /// The ARN of the AppFlow-managed KMS key for a flow in `region`, minting the key on

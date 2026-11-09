@@ -197,12 +197,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+
+        // The flow being re-defined is resolved first — a request about a flow that does
+        // not exist is that absence, whatever else it carries — and then the same rule
+        // `CreateFlow` applies to a definition it stores: every connector profile the new
+        // definition names has to exist, or the re-defined flow could never run.
+        if !store.flows.contains_key(&input.flow_name) {
+            return Err(UpdateFlowErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::no_such_flow(&input.flow_name)),
+                },
+            )
+            .into());
+        }
+        if let Some(missing) = store.unresolved_connector_profile(
+            &input.source_flow_config,
+            &input.destination_flow_config_list,
+        ) {
+            return Err(UpdateFlowErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::no_such_connector_profile(missing)),
+                },
+            )
+            .into());
+        }
+        // And every Amazon S3 location the new definition names has to be one AppFlow
+        // could use, by the same rule and through the same resolution `CreateFlow` applies
+        // — so a re-definition cannot leave behind a flow that `CreateFlow` would have
+        // refused.
+        if let Some(reason) = crate::state::beyond_destination_ceiling(
+            &input.destination_flow_config_list,
+        )
+        .or_else(|| {
+            crate::state::unusable_s3_location(
+                &*self.engine,
+                &input.flow_name,
+                &crate::state::flow_arn(
+                    &crate::state::request_region(ctx.parts()),
+                    &input.flow_name,
+                ),
+                &input.source_flow_config,
+                &input.destination_flow_config_list,
+            )
+        }) {
+            return Err(UpdateFlowErrorModeled::ValidationException(ValidationException {
+                message: Some(reason),
+            })
+            .into());
+        }
         let flow = store.flows.get_mut(&input.flow_name).ok_or_else(|| {
             UpdateFlowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "No flow named {} exists in this account",
-                    input.flow_name
-                )),
+                message: Some(crate::state::no_such_flow(&input.flow_name)),
             })
         })?;
 

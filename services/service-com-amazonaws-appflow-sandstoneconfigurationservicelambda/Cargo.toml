@@ -16,17 +16,32 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `time` beyond the workspace default: a flow RUN bounds its own caller-sized work with
+# a wall-clock budget (`tokio::time::timeout`), so the timer driver has to be compiled in.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The one object store in this emulator is the Amazon S3 service's: a flow whose source
+# and destination are Amazon S3 locations reads and writes its records there.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# `iam_authorization`: the one reading of a resource-based policy, shared with every other
+# service that asks whether a bucket policy admits what it is about to do.
+service-common = { path = "../common" }
+# The `CSV` file type a flow's source and destination can declare, read and written by a
+# maintained CSV implementation rather than by hand.
+csv = "1.3"
+# The `PARQUET` file type a flow's destination can declare, written by the Apache
+# implementation of the format, so what lands in the bucket is a file any Parquet reader
+# reads. `snap` is the one compression codec it needs; the rest of the crate's backends
+# are left out.
+parquet = { version = "60", default-features = false, features = ["snap"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-
 [lints]
 workspace = true

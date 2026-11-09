@@ -152,10 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let flow = store.flows.get_mut(&input.flow_name).ok_or_else(|| {
             DescribeFlowExecutionRecordsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No flow named {} exists in this account",
-                        input.flow_name
-                    )),
+                    message: Some(crate::state::no_such_flow(&input.flow_name)),
                 },
             )
         })?;

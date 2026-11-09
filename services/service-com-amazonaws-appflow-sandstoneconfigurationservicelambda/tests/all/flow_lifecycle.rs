@@ -12,10 +12,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::ops::types::ConnectorProfile;
 use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::state::{
     service_state, ExecutionStatus, Flow, FlowExecution, FlowStatus, MAX_EXECUTIONS_PER_FLOW,
     MAX_FLOWS_PER_ACCOUNT,
 };
+use service_com_amazonaws_s3_amazons3::state as object_store;
 use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -29,12 +31,108 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// The account every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
 pub(crate) const ACCOUNT: &str = "000000000000";
 
+/// The Region every request here is signed for, and the one the fixture buckets are in.
+pub(crate) const REGION: &str = "us-east-1";
+
 /// Longer than the span a run takes to settle, so a call made after this sleep must
 /// observe the terminal status the clock owed it.
 ///
 /// Waited with `std::thread::sleep`, not `tokio::time::sleep`: this workspace enables
 /// tokio's `macros`/`rt` features only, so the timer driver is not compiled in.
 pub(crate) const AFTER_RUN_SETTLES: Duration = Duration::from_millis(900);
+
+/// The connector profiles the fixture account holds, as (name, connectorType).
+///
+/// A flow definition that names a `connectorProfileName` is created only in an account
+/// that HOLDS that profile — "You must create a connector profile before calling this
+/// API" — so the fixtures that name one ([`salesforce_source`], `marketo_source`) run
+/// against an account that has it. Seeded into the store directly because
+/// `CreateConnectorProfile` is still a scaffold stub; a flow whose connectors are ones
+/// AppFlow vends (Amazon S3, EventBridge) names no profile and needs none of this.
+pub(crate) const FIXTURE_CONNECTOR_PROFILES: [(&str, &str); 2] = [
+    ("salesforce-profile", "Salesforce"),
+    ("marketo-profile", "Marketo"),
+];
+
+/// The Amazon S3 locations the fixtures of this crate's suites name.
+///
+/// A flow is stored only when every Amazon S3 location it names is one AppFlow could use —
+/// the bucket exists and its policy grants the AppFlow service principal what a run needs
+/// — so the harness stands each of these up in the one object store with the bucket policy
+/// AppFlow's documentation asks for. The fixtures name them; nothing here depends on which
+/// bucket a case picks, and a case naming a bucket that is NOT here is refused loudly
+/// rather than silently served.
+pub(crate) const FIXTURE_BUCKETS: [&str; 34] = [
+    "cancel-in",
+    "cancel-out",
+    "contacts",
+    "curated-events",
+    "delete-in",
+    "delete-out",
+    "dupes-in",
+    "dupes-out",
+    "events-in",
+    "fanout-in",
+    "fanout-out",
+    "fanout-plain",
+    "maps-in",
+    "maps-out",
+    "orders-archive",
+    "orders-curated",
+    "orders-in",
+    "orders-landing",
+    "orders-out",
+    "other-in",
+    "other-out",
+    "populated-in",
+    "populated-out",
+    "quota-in",
+    "quota-out",
+    "raw-events",
+    "runs-in",
+    "runs-out",
+    "salesforce-archive",
+    "sf-archive",
+    "sparse-in",
+    "sparse-out",
+    "update-in",
+    "update-out",
+];
+
+/// The actions AppFlow's published SOURCE and DESTINATION bucket policies grant, and
+/// every action a run takes on either end — what a bucket serving as both kinds of
+/// location grants.
+pub(crate) const SOURCE_POLICY_ACTIONS: [&str; 2] = ["s3:ListBucket", "s3:GetObject"];
+pub(crate) const DESTINATION_POLICY_ACTIONS: [&str; 3] =
+    ["s3:PutObject", "s3:GetBucketAcl", "s3:PutObjectAcl"];
+pub(crate) const EVERY_RUN_ACTION: [&str; 3] =
+    ["s3:ListBucket", "s3:GetObject", "s3:PutObject"];
+
+/// The bucket policy AppFlow asks a caller to place on a bucket it reads or writes: an
+/// `Allow` of `actions`, to the AppFlow service principal, on the bucket and on every
+/// object in it, confined to this account's flows.
+///
+/// Stated once for the whole test crate: the harness places it on every fixture bucket
+/// with [`EVERY_RUN_ACTION`], and a case that needs one end's grant alone names that end's
+/// actions.
+pub(crate) fn appflow_bucket_policy(bucket: &str, actions: &[&str]) -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AllowAppFlow",
+            "Effect": "Allow",
+            "Principal": { "Service": "appflow.amazonaws.com" },
+            "Action": actions,
+            "Resource": [
+                format!("arn:aws:s3:::{bucket}"),
+                format!("arn:aws:s3:::{bucket}/*"),
+            ],
+            "Condition": {
+                "StringEquals": { "aws:SourceAccount": ACCOUNT }
+            }
+        }]
+    })
+}
 
 /// One AppFlow service on one shared engine, with the engine handed back so a case can
 /// seed the store directly instead of driving a thousand requests to reach a bound.
@@ -43,6 +141,28 @@ pub(crate) fn appflow_with_engine() -> (MultiServiceRouter, Arc<engine::InMemory
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    if let Some(state) = service_state(&*engine) {
+        let mut store = state.lock();
+        for (connector_profile_name, connector_type) in FIXTURE_CONNECTOR_PROFILES {
+            store.connector_profiles.insert(
+                connector_profile_name.to_string(),
+                ConnectorProfile {
+                    connector_profile_name: Some(connector_profile_name.to_string()),
+                    connector_type: Some(connector_type.to_string()),
+                    ..ConnectorProfile::default()
+                },
+            );
+        }
+    }
+    if let Some(objects) = object_store::service_state(&*engine) {
+        let mut store = objects.lock();
+        for bucket in FIXTURE_BUCKETS {
+            store.create_bucket(bucket, REGION);
+            if let Some(held) = store.bucket_mut(bucket) {
+                held.policy = Some(appflow_bucket_policy(bucket, &EVERY_RUN_ACTION).to_string());
+            }
+        }
+    }
     (router, engine)
 }
 
@@ -676,33 +796,30 @@ async fn start_flow_records_a_run_that_describe_flow_execution_records_returns()
     assert_eq!(runs.len(), 1, "expected still one run, got {runs:?}");
     assert_eq!(
         runs[0].get("executionStatus").and_then(Value::as_str),
-        Some(ExecutionStatus::Error.as_str()),
-        "expected the settled run to carry the modelled failure state, got {:?}",
+        Some(ExecutionStatus::Successful.as_str()),
+        "expected the settled run to carry the status its transfer reached, got {:?}",
         runs[0].get("executionStatus")
     );
     let result = runs[0].get("executionResult").cloned().unwrap_or(Value::Null);
-    let message = result
-        .get("errorInfo")
-        .and_then(|info| info.get("executionMessage"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     assert!(
-        !message.is_empty(),
-        "expected the failed run to say why it did not run, got {result:?}"
+        result.get("errorInfo").is_none_or(Value::is_null),
+        "expected a successful run to report no error, got {result:?}"
     );
-    for counter in ["bytesProcessed", "bytesWritten", "recordsProcessed"] {
+    // The source prefix of this flow holds nothing, so the run moved no record — and says
+    // so with true zeros rather than an invented volume.
+    for counter in ["bytesProcessed", "recordsProcessed"] {
         assert_eq!(
             result.get(counter).and_then(Value::as_i64),
             Some(0),
-            "expected {counter} to report that nothing was transferred, got {:?}",
+            "expected {counter} to report what the run read, got {:?}",
             result.get(counter)
         );
     }
-    // No transfer ran, so no data-pull window is reported for one.
+    // The run read the source, so it reports the window in which it did.
     for instant in ["dataPullStartTime", "dataPullEndTime"] {
         assert!(
-            runs[0].get(instant).is_none_or(Value::is_null),
-            "expected {instant} to be absent for a run nothing performed, got {:?}",
+            runs[0].get(instant).is_some_and(|at| !at.is_null()),
+            "expected {instant} to be reported for a run that read the source, got {:?}",
             runs[0].get(instant)
         );
     }
@@ -714,13 +831,14 @@ async fn start_flow_records_a_run_that_describe_flow_execution_records_returns()
         .clone();
     assert_eq!(
         details.get("mostRecentExecutionStatus").and_then(Value::as_str),
-        Some(ExecutionStatus::Error.as_str()),
+        Some(ExecutionStatus::Successful.as_str()),
         "expected the flow to summarise its most recent run, got {details:?}"
     );
-    assert_eq!(
-        details.get("mostRecentExecutionMessage").and_then(Value::as_str),
-        Some(message),
-        "expected the summary to carry the run's own message, got {details:?}"
+    assert!(
+        details
+            .get("mostRecentExecutionMessage")
+            .is_none_or(Value::is_null),
+        "expected no message for a run that went fine, got {details:?}"
     );
     assert_eq!(
         described.string("flowStatus"),
@@ -1291,6 +1409,8 @@ pub(crate) fn stored_execution(execution_id: &str, started_at: SystemTime) -> Fl
         started_at,
         last_updated_at: started_at,
         settles_at: None,
+        // Already settled, so the clock owes this run nothing.
+        outcome: None,
         data_pull_start_time: None,
         data_pull_end_time: None,
     }

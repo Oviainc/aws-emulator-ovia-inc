@@ -364,7 +364,7 @@ async fn cancelling_without_naming_runs_ends_every_unfinished_run_of_that_flow()
         settled_untouched
             .get(&runs[untouched_flow])
             .map(String::as_str),
-        Some(ExecutionStatus::Error.as_str()),
+        Some(ExecutionStatus::Successful.as_str()),
         "case {:?}: expected an uncancelled run to settle on its own terminal status, got {:?}",
         untouched_flow,
         settled_untouched.get(&runs[untouched_flow])
