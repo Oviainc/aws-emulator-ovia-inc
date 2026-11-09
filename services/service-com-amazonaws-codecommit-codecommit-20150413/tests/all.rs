@@ -195,6 +195,8 @@ mod repository_rename;
 mod repository_triggers;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/rule_content_sha256_precondition_message.rs"]
+mod rule_content_sha256_precondition_message;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/unreferenced_merge_commits.rs"]

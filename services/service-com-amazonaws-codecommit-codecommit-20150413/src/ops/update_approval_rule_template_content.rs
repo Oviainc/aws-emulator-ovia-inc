@@ -89,6 +89,26 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// `InvalidRuleContentSha256Exception`'s message for a conditional update whose
+/// `existingRuleContentSha256` is not the signature of the content currently stored.
+///
+/// The signature is a PRECONDITION the caller states about what it read, so the
+/// refusal is worded around the value the CALLER supplied — echoed back so it can see
+/// which stale signature it sent — and ends with the read that reports the current
+/// one. The signature the store holds is NOT disclosed: a caller that wants it calls
+/// that read, which is exactly what the sentence tells it to do.
+///
+/// Worded here rather than in `crate::state` because the sentence names the operation
+/// that reports the signature of THIS resource (`GetApprovalRuleTemplate` for a
+/// template), so it is one operation's text rather than one shared by every operation
+/// raising the code.
+fn rule_content_sha256_mismatch_message(supplied: &str) -> String {
+    format!(
+        "The SHA-256 hash for the current rule content does not match the hash you provided: \
+         {supplied}. Use GetApprovalRuleTemplate to get the SHA-256 of the current approval rule."
+    )
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -219,25 +239,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // `existingRuleContentSha256` is the signature of the content the caller
-        // believes is stored. A value that is not a SHA-256 signature at all states
-        // nothing about any content, so it is refused before the store is read.
-        if let Some(supplied) = &input.existing_rule_content_sha256 {
-            if !crate::state::is_content_sha256(supplied) {
-                return Err(
-                    UpdateApprovalRuleTemplateContentErrorModeled::InvalidRuleContentSha256Exception(
-                        InvalidRuleContentSha256Exception {
-                            message: Some(format!(
-                                "the SHA-256 hash signature for the rule content is not valid: \
-                                 {supplied}"
-                            )),
-                        },
-                    )
-                    .into(),
-                );
-            }
-        }
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // An unreachable store is an internal mounting fault, not a modelled
             // CodeCommit failure; every handler in this crate refuses it this way.
@@ -263,20 +264,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
-        // That signature is a claim about what is stored: when it does not match the
-        // stored content's signature, the content is not what the caller read, so the
-        // update is refused rather than overwriting a change it never saw.
+        // `existingRuleContentSha256` is a claim about what is stored: the caller
+        // states the signature of the content it means to replace. Every value that is
+        // not the stored content's signature — a stale digest, the digest of another
+        // document, or a string that is no digest at all — fails that one comparison
+        // the same way (hex, so the comparison ignores case), and the update is
+        // refused rather than overwriting a change the caller never saw.
         if let Some(supplied) = &input.existing_rule_content_sha256 {
             let stored = crate::state::content_sha256(&template.content);
             if !supplied.eq_ignore_ascii_case(&stored) {
                 return Err(
                     UpdateApprovalRuleTemplateContentErrorModeled::InvalidRuleContentSha256Exception(
                         InvalidRuleContentSha256Exception {
-                            message: Some(format!(
-                                "the SHA-256 hash signature for the rule content is not valid: \
-                                 the content stored for {} has signature {stored}",
-                                input.approval_rule_template_name
-                            )),
+                            message: Some(rule_content_sha256_mismatch_message(supplied)),
                         },
                     )
                     .into(),

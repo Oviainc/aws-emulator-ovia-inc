@@ -695,3 +695,59 @@ async fn a_repository_at_its_association_bound_fails_only_its_own_entry() {
         "case {label:?}: the served entry must be recorded"
     );
 }
+
+/// The per-entry `errorMessage` for a name the account holds no repository under: a
+/// batch call reports a failing name ONLY through its entry, so the entry carries the
+/// sentence CodeCommit words that cause with — fixed text whose single slot is the
+/// name the request asked for — rather than an internal rendering of the lookup that
+/// failed.
+///
+/// The rows span the names `RepositoryName` allows (`len 1..100`, pattern
+/// `^[\w\.-]+$` — `smithy_query(query="shape",shape="RepositoryName")`): the
+/// 1-character minimum, the 100-character maximum, and names mixing digits, dots,
+/// hyphens and underscores, none of them a name this suite holds a repository for.
+#[tokio::test]
+async fn an_absent_name_s_entry_carries_the_sentence_for_that_cause() {
+    let router = seeded().await;
+    let absent: Vec<String> = vec![
+        "q".to_string(),
+        "n".repeat(100),
+        "absent.repo-9".to_string(),
+        "Absent_Repo".to_string(),
+        "9".to_string(),
+    ];
+
+    for name in &absent {
+        let payload = ok(
+            &router,
+            "BatchAssociateApprovalRuleTemplateWithRepositories",
+            &json!({
+                "approvalRuleTemplateName": TEMPLATE,
+                "repositoryNames": [name],
+            }),
+        )
+        .await;
+        assert_eq!(
+            strings_of(&list_at(&payload, "associatedRepositoryNames"), name),
+            Vec::<String>::new(),
+            "case {name:?}: a name no repository is held under associates nothing, got {payload}"
+        );
+        let entries = list_at(&payload, "errors");
+        assert_eq!(
+            entries.len(),
+            1,
+            "case {name:?}: exactly one entry reports the failing name, got {payload}"
+        );
+        let expected = format!(
+            "No repository with the name {name} was found. Please specify a valid repository name"
+        );
+        let message = entries[0]
+            .get("errorMessage")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {name:?}: no errorMessage in {payload}"));
+        assert_eq!(
+            message, expected,
+            "case {name:?}: expected the entry's message {expected:?}, got {message:?}"
+        );
+    }
+}
