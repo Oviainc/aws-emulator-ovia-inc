@@ -35,6 +35,8 @@ mod legacy_target_group_detach;
 mod metric_collection_catalog;
 #[path = "all/reference_data_catalogs.rs"]
 mod reference_data_catalogs;
+#[path = "all/rollback_instance_refresh.rs"]
+mod rollback_instance_refresh;
 #[path = "all/scale_out_launches_ec2_instances.rs"]
 mod scale_out_launches_ec2_instances;
 #[path = "all/set_desired_capacity_on_subnet_placed_groups.rs"]

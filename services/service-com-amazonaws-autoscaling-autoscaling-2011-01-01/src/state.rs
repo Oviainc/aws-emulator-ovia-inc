@@ -24,7 +24,10 @@
 //!   [`INSTANCE_REFRESH_REPLACEMENT`] and succeeds once it has replaced them all
 //!   ([`StoredInstanceRefresh`]);
 //! * a refresh a caller cancelled is reported `Cancelling` and becomes `Cancelled`
-//!   ([`INSTANCE_REFRESH_CANCELLATION`]).
+//!   ([`INSTANCE_REFRESH_CANCELLATION`]);
+//! * a refresh a caller rolled back replaces its OWN replacements back, one per
+//!   [`INSTANCE_REFRESH_REPLACEMENT`], and is reported `RollbackSuccessful` once it
+//!   has replaced them all ([`AutoScalingState::roll_back_instance_refresh`]).
 //!
 //! # The instances a group holds
 //!
@@ -135,6 +138,38 @@ pub const REFRESH_FAILED: &str = "Failed";
 pub const REFRESH_CANCELLING: &str = "Cancelling";
 /// A refresh whose cancellation has completed.
 pub const REFRESH_CANCELLED: &str = "Cancelled";
+/// A refresh that is being rolled back: the replacements it made are themselves
+/// being replaced, with the configuration the group was using before it started.
+pub const REFRESH_ROLLBACK_IN_PROGRESS: &str = "RollbackInProgress";
+/// A refresh whose rollback replaced every instance the refresh had replaced.
+pub const REFRESH_ROLLBACK_SUCCESSFUL: &str = "RollbackSuccessful";
+/// A refresh whose rollback could not finish.
+pub const REFRESH_ROLLBACK_FAILED: &str = "RollbackFailed";
+
+/// What `RollbackDetails$RollbackReason` reports for a rollback a CALLER asked for.
+///
+/// The member reports "the reason for this instance refresh rollback (for example,
+/// whether a manual or automatic rollback was initiated)"
+/// (`smithy_query(query="doc",shape="RollbackDetails",member="RollbackReason")`), and
+/// every rollback this service starts is one a caller asked for: nothing here starts
+/// one on its own.
+pub const MANUAL_ROLLBACK_REASON: &str = "A manual rollback was initiated.";
+
+/// The prefix an Amazon EC2 launch template's `ImageId` carries when it names a
+/// Systems Manager parameter rather than an AMI id is Amazon EC2's own reading of that
+/// member ([`ec2_instances::resolves_image_through_ssm_parameter`]), so nothing here
+/// spells the form out a second time.
+///
+/// The `Version` of a launch template specification that means "whichever version is
+/// the default when the instance is launched", from the model's own documentation for
+/// `LaunchTemplateSpecification$Version`: "The version number, `$Latest`, or
+/// `$Default`. … The default value is `$Default`" — so a specification carrying no
+/// version at all uses this one.
+pub const LAUNCH_TEMPLATE_VERSION_DEFAULT: &str = "$Default";
+
+/// The `Version` that means "whichever version is the latest when the instance is
+/// launched" (same documentation).
+pub const LAUNCH_TEMPLATE_VERSION_LATEST: &str = "$Latest";
 
 /// `Strategy` when a `StartInstanceRefresh` request omits it.
 ///
@@ -430,15 +465,51 @@ pub struct StoredInstanceRefresh {
     /// How many instances the refresh set out to replace, which is what its
     /// percentage complete is a percentage OF.
     pub instances_at_start: i32,
-    /// The instances it has still to replace, in the order it replaces them.
+    /// The instances it has still to replace, in the order it replaces them. Once a
+    /// rollback is under way this holds what the ROLLBACK has still to replace — the
+    /// replacements the refresh had made, which the rollback replaces back.
     pub pending_instance_ids: Vec<String>,
+    /// The instances the refresh LAUNCHED as replacements, in replacement order: the
+    /// only instances of the group the refresh changed, and so exactly what a rollback
+    /// has to replace back.
+    pub replaced_instance_ids: Vec<String>,
     /// `PercentageComplete`.
     pub percentage_complete: i32,
     /// `InstancesToUpdate`.
     pub instances_to_update: i32,
+    /// The rollback of this refresh, once one has been asked for: `RollbackDetails`.
+    pub rollback: Option<StoredRollback>,
     /// When the next replacement — or the refresh's own completion — comes due;
     /// `None` once it has reached a terminal status.
     pub next_step_due: Option<SystemTime>,
+}
+
+/// The rollback of an instance refresh — the `RollbackDetails` a refresh reports once
+/// one has been asked for: why it was started, when it started, and the progress the
+/// refresh had made at that instant.
+#[derive(Debug, Clone)]
+pub struct StoredRollback {
+    /// `RollbackReason`.
+    pub reason: String,
+    /// `RollbackStartTime`.
+    pub start_time: SystemTime,
+    /// `PercentageCompleteOnRollback`: "the value of PercentageComplete at the time the
+    /// rollback started".
+    pub percentage_complete_on_rollback: i32,
+    /// `InstancesToUpdateOnRollback`: "the value of InstancesToUpdate at the time the
+    /// rollback started".
+    pub instances_to_update_on_rollback: i32,
+}
+
+/// Why a group's instance refresh could not be rolled back, for the operation to
+/// answer the error class each situation belongs to.
+#[derive(Debug)]
+pub enum RollbackRefusal {
+    /// The group has no instance refresh in progress, and no rollback either, so there
+    /// is nothing for a rollback to act on.
+    NoneInProgress,
+    /// The refresh in progress cannot be reversed; the sentence says why.
+    Irreversible(String),
 }
 
 impl StoredInstanceRefresh {
@@ -446,7 +517,23 @@ impl StoredInstanceRefresh {
     /// the group's ACTIVE refresh: a group may have only one at a time, and one whose
     /// cancellation has not completed still holds its group.
     pub fn is_active(&self) -> bool {
-        self.is_in_progress() || self.status == REFRESH_CANCELLING
+        self.is_in_progress() || self.status == REFRESH_CANCELLING || self.is_rolling_back()
+    }
+
+    /// Whether this refresh is BEING ROLLED BACK: the status that means its own
+    /// replacements are being replaced back, which is a rollback a later call finds
+    /// already running rather than one it starts.
+    pub fn is_rolling_back(&self) -> bool {
+        self.status == REFRESH_ROLLBACK_IN_PROGRESS
+    }
+
+    /// Whether a cancellation acts on this refresh: `CancelInstanceRefresh` "cancels an
+    /// instance refresh OR ROLLBACK that is in progress"
+    /// (`smithy_query(query="operation",operation="CancelInstanceRefresh")`), so the
+    /// replacements a rollback is part way through are stopped by the same call that
+    /// stops a refresh's own.
+    pub fn is_cancellable(&self) -> bool {
+        self.is_in_progress() || self.is_rolling_back()
     }
 
     /// Whether this refresh is IN PROGRESS: the statuses that mean it is still
@@ -566,11 +653,118 @@ impl AutoScalingState {
             .instance_refreshes
             .iter_mut()
             .find(|refresh| {
-                refresh.auto_scaling_group_name == group_name && refresh.is_in_progress()
+                refresh.auto_scaling_group_name == group_name && refresh.is_cancellable()
             })?;
         refresh.status = REFRESH_CANCELLING.to_string();
         refresh.next_step_due = Some(in_flight_settled + INSTANCE_REFRESH_CANCELLATION);
         Some(refresh.instance_refresh_id.clone())
+    }
+
+    /// Start the rollback of the group's instance refresh at `now`, answering the id of
+    /// the refresh the rollback acts on.
+    ///
+    /// A rollback "cancels an instance refresh that is in progress and rolls back any
+    /// changes that it made": the replacements the refresh had made are themselves
+    /// replaced, from the group's own launch source — the configuration it was using
+    /// before the refresh started, since a refresh's desired configuration reaches the
+    /// group only once that refresh has succeeded. The replacements are owed by the
+    /// clock, one per [`INSTANCE_REFRESH_REPLACEMENT`], exactly as the refresh's own
+    /// were ([`Self::advance_instance_refreshes`]).
+    ///
+    /// A rollback already under way is the one this call finds: it answers that
+    /// refresh's id and restarts nothing, so asking twice replaces no instance twice.
+    pub fn roll_back_instance_refresh<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        group_name: &str,
+        now: SystemTime,
+    ) -> Result<String, RollbackRefusal> {
+        if let Some(refresh) = self
+            .instance_refreshes
+            .iter()
+            .find(|refresh| refresh.auto_scaling_group_name == group_name && refresh.is_rolling_back())
+        {
+            return Ok(refresh.instance_refresh_id.clone());
+        }
+        let Some(index) = self.instance_refreshes.iter().position(|refresh| {
+            refresh.auto_scaling_group_name == group_name && refresh.is_in_progress()
+        }) else {
+            return Err(RollbackRefusal::NoneInProgress);
+        };
+        if let Some(reason) = self.irreversible_reason(engine, group_name, index) {
+            return Err(RollbackRefusal::Irreversible(reason));
+        }
+
+        // What the rollback has to replace back: the replacements the refresh made that
+        // the group still holds. One the group has since lost is not replaced again —
+        // the rollback restores the configuration, not a capacity change somebody else
+        // made.
+        let held: Vec<String> = self
+            .groups
+            .get(group_name)
+            .into_iter()
+            .flat_map(StoredGroup::active_instances)
+            .map(|instance| instance.instance_id.clone())
+            .collect();
+        let Some(refresh) = self.instance_refreshes.get_mut(index) else {
+            return Err(RollbackRefusal::NoneInProgress);
+        };
+        refresh.pending_instance_ids = refresh
+            .replaced_instance_ids
+            .iter()
+            .filter(|instance_id| held.contains(instance_id))
+            .cloned()
+            .collect();
+        refresh.rollback = Some(StoredRollback {
+            reason: MANUAL_ROLLBACK_REASON.to_string(),
+            start_time: now,
+            percentage_complete_on_rollback: refresh.percentage_complete,
+            instances_to_update_on_rollback: refresh.instances_to_update,
+        });
+        refresh.status = REFRESH_ROLLBACK_IN_PROGRESS.to_string();
+        refresh.next_step_due = Some(now + INSTANCE_REFRESH_REPLACEMENT);
+        Ok(refresh.instance_refresh_id.clone())
+    }
+
+    /// Why the refresh at `index` cannot be rolled back, when it cannot: the sentence
+    /// the refusal carries, or `None` for a refresh a rollback can reverse.
+    ///
+    /// The situations are the ones the error class itself names: "a desired
+    /// configuration was not found or an incompatible launch template (uses a Systems
+    /// Manager parameter instead of an AMI ID) or launch template version (`$Latest` or
+    /// `$Default`) is present on the Auto Scaling group"
+    /// (`smithy_query(query="shape",shape="IrreversibleInstanceRefreshFault")`). Each is
+    /// a configuration the pre-refresh state cannot be reconstructed from: without a
+    /// desired configuration the refresh changed nothing to go back from, and a floating
+    /// version or a parameter-resolved image pins no version to go back TO.
+    fn irreversible_reason<Eng: Send + Sync + 'static>(
+        &self,
+        engine: &Eng,
+        group_name: &str,
+        index: usize,
+    ) -> Option<String> {
+        let refresh = self.instance_refreshes.get(index)?;
+        if refresh.desired_configuration.is_none() {
+            return Some(ROLLBACK_WITHOUT_DESIRED_CONFIGURATION_MESSAGE.to_string());
+        }
+        let group = self.groups.get(group_name)?;
+        let specification = launch_template_of(
+            group.launch_template.as_ref(),
+            group.mixed_instances_policy.as_ref(),
+        )?;
+        let version = specification
+            .version
+            .as_deref()
+            .unwrap_or(LAUNCH_TEMPLATE_VERSION_DEFAULT);
+        if version == LAUNCH_TEMPLATE_VERSION_DEFAULT || version == LAUNCH_TEMPLATE_VERSION_LATEST {
+            return Some(floating_launch_template_version_message(version));
+        }
+        // What the template's own version says the instances run, from the account's
+        // Amazon EC2 store: an image named through a Systems Manager parameter is not an
+        // AMI id, so the image the group was running before the refresh is not pinned
+        // either.
+        ec2_instances::resolves_image_through_ssm_parameter(engine, specification)
+            .then(|| SSM_PARAMETER_IMAGE_ID_MESSAGE.to_string())
     }
 
     /// Append a scaling activity that finishes at `completes_at`.
@@ -1015,8 +1209,8 @@ impl AutoScalingState {
     }
 
     /// Retire the one step the refresh at `index` owes at `due`: complete its
-    /// cancellation, replace its next instance, or — with none left to replace —
-    /// finish it.
+    /// cancellation, replace its next instance — or, while it is being rolled back,
+    /// replace one of its own replacements back — or, with none left, finish it.
     fn advance_one_instance_refresh<Eng: Send + Sync + 'static>(
         &mut self,
         engine: &Eng,
@@ -1031,6 +1225,7 @@ impl AutoScalingState {
         let desired_configuration = refresh.desired_configuration.clone();
         let next_instance_id = refresh.pending_instance_ids.first().cloned();
         let cancelling = refresh.status == REFRESH_CANCELLING;
+        let rolling_back = refresh.is_rolling_back();
 
         // A cancellation replaces nothing further and rolls nothing back, so the only
         // step a refresh being cancelled owes is the end of that cancellation — which
@@ -1049,7 +1244,11 @@ impl AutoScalingState {
         // finish: the group it was started for no longer exists.
         if !self.groups.contains_key(&group_name) {
             if let Some(refresh) = self.instance_refreshes.get_mut(index) {
-                refresh.status = REFRESH_FAILED.to_string();
+                refresh.status = if rolling_back {
+                    REFRESH_ROLLBACK_FAILED.to_string()
+                } else {
+                    REFRESH_FAILED.to_string()
+                };
                 refresh.status_reason = Some(
                     "The Auto Scaling group was deleted while the instance refresh was in \
                      progress."
@@ -1062,6 +1261,22 @@ impl AutoScalingState {
         }
 
         let Some(instance_id) = next_instance_id else {
+            if rolling_back {
+                // Every replacement the refresh had made has been replaced back, so the
+                // rollback has restored the group to the configuration it was using
+                // before the refresh started. "PercentageComplete does not include
+                // instances that are replaced during a rollback. This value gradually
+                // goes back down to zero during a rollback"
+                // (smithy_query(query="doc",shape="InstanceRefresh",
+                // member="PercentageComplete")), so it has reached zero here.
+                if let Some(refresh) = self.instance_refreshes.get_mut(index) {
+                    refresh.status = REFRESH_ROLLBACK_SUCCESSFUL.to_string();
+                    refresh.percentage_complete = 0;
+                    refresh.end_time = Some(due);
+                    refresh.next_step_due = None;
+                }
+                return;
+            }
             // Every instance the refresh set out to replace has been replaced, so the
             // refresh has succeeded — and the model documents that the group's own
             // settings then reflect the desired configuration it ran with.
@@ -1087,12 +1302,24 @@ impl AutoScalingState {
             return;
         };
 
-        let replaced_instance = self.replace_group_instance(
+        // A rollback launches from the group's OWN launch source — the configuration it
+        // was using before the refresh started, since a desired configuration reaches
+        // the group's settings only once the refresh has succeeded — while the refresh's
+        // own replacements launch from the configuration it is moving the group to.
+        let launched_instance_id = self.replace_group_instance(
             engine,
             &group_name,
             &instance_id,
-            desired_configuration.as_ref(),
-            &instance_refresh_id,
+            if rolling_back {
+                None
+            } else {
+                desired_configuration.as_ref()
+            },
+            &if rolling_back {
+                Self::instance_refresh_rollback_cause(&instance_refresh_id)
+            } else {
+                Self::instance_refresh_cause(&instance_refresh_id)
+            },
             due,
         );
 
@@ -1103,55 +1330,76 @@ impl AutoScalingState {
         // documents that "an instance refresh might fail for several reasons, such as
         // EC2 launch failures": the instance stays pending, unreplaced, and the
         // refresh fails rather than reporting progress nothing made.
-        if !replaced_instance {
-            refresh.status = REFRESH_FAILED.to_string();
-            refresh.status_reason = Some(
-                "The instance refresh failed because a replacement instance could not be \
-                 launched."
-                    .to_string(),
-            );
+        let Some(launched_instance_id) = launched_instance_id else {
+            if rolling_back {
+                refresh.status = REFRESH_ROLLBACK_FAILED.to_string();
+                refresh.status_reason = Some(
+                    "The instance refresh rollback failed because a replacement instance could \
+                     not be launched."
+                        .to_string(),
+                );
+            } else {
+                refresh.status = REFRESH_FAILED.to_string();
+                refresh.status_reason = Some(
+                    "The instance refresh failed because a replacement instance could not be \
+                     launched."
+                        .to_string(),
+                );
+            }
             refresh.end_time = Some(due);
             refresh.next_step_due = None;
             return;
-        }
+        };
         if !refresh.pending_instance_ids.is_empty() {
             refresh.pending_instance_ids.remove(0);
         }
-        refresh.status = REFRESH_IN_PROGRESS.to_string();
-        refresh.instances_to_update =
-            i32::try_from(refresh.pending_instance_ids.len()).unwrap_or(i32::MAX);
-        let replaced = (refresh.instances_at_start - refresh.instances_to_update).max(0);
-        refresh.percentage_complete = if refresh.instances_at_start > 0 {
-            (replaced.saturating_mul(100) / refresh.instances_at_start).clamp(0, 100)
+        let outstanding = i32::try_from(refresh.pending_instance_ids.len()).unwrap_or(i32::MAX);
+        if rolling_back {
+            // The instances the refresh never got to "don't need to be replaced as part
+            // of the rollback" (smithy_query(query="doc",shape="InstanceRefresh",
+            // member="InstancesToUpdate")), so what is left to update is what it was
+            // when the rollback started; what comes down is the progress the refresh had
+            // made, one replaced-back instance at a time.
+            refresh.percentage_complete = if refresh.instances_at_start > 0 {
+                (outstanding.saturating_mul(100) / refresh.instances_at_start).clamp(0, 100)
+            } else {
+                0
+            };
         } else {
-            100
-        };
+            refresh.replaced_instance_ids.push(launched_instance_id);
+            refresh.status = REFRESH_IN_PROGRESS.to_string();
+            refresh.instances_to_update = outstanding;
+            let replaced = (refresh.instances_at_start - outstanding).max(0);
+            refresh.percentage_complete = if refresh.instances_at_start > 0 {
+                (replaced.saturating_mul(100) / refresh.instances_at_start).clamp(0, 100)
+            } else {
+                100
+            };
+        }
         refresh.next_step_due = Some(due + INSTANCE_REFRESH_REPLACEMENT);
     }
 
-    /// Replace ONE instance of a group: launch its replacement from the refresh's
-    /// desired configuration (or the group's own launch source) and terminate the
-    /// instance it replaces, recording the scaling activity each of those changes
-    /// produces.
+    /// Replace ONE instance of a group: launch its replacement from the configuration
+    /// `desired_configuration` names (or the group's own launch source) and terminate
+    /// the instance it replaces, recording the scaling activity each of those changes
+    /// produces under `cause`.
     ///
     /// The instance being replaced is taken out only once its replacement exists, so
     /// a replacement Amazon EC2 could not place leaves the group's instances alone and
-    /// records the failed launch instead. Answers whether the instance WAS replaced,
-    /// which is what the caller reports progress from.
+    /// records the failed launch instead. Answers the id of the replacement that was
+    /// launched, which is what the caller reports progress from — and, for a refresh,
+    /// what a later rollback has to replace back.
     fn replace_group_instance<Eng: Send + Sync + 'static>(
         &mut self,
         engine: &Eng,
         group_name: &str,
         instance_id: &str,
         desired_configuration: Option<&DesiredConfiguration>,
-        instance_refresh_id: &str,
+        cause: &str,
         now: SystemTime,
-    ) -> bool {
-        let Some(arn) = self.groups.get(group_name).map(|group| group.arn.clone()) else {
-            return false;
-        };
+    ) -> Option<String> {
+        let arn = self.groups.get(group_name).map(|group| group.arn.clone())?;
         let due = now + LIFECYCLE_TRANSITION;
-        let cause = Self::instance_refresh_cause(instance_refresh_id);
         let (launched_ids, unplaced) = self.launch_into_group(
             engine,
             &GroupLaunch {
@@ -1168,12 +1416,12 @@ impl AutoScalingState {
         };
         self.terminate_group_instances(engine, group_name, &replaced, due);
 
-        for launched_id in launched_ids {
+        for launched_id in &launched_ids {
             self.record_activity(
                 group_name,
                 &arn,
                 format!("Launching a new EC2 instance: {launched_id}"),
-                cause.clone(),
+                cause.to_string(),
                 GROUP_STATE_IN_SERVICE,
                 now,
                 Some(due),
@@ -1184,7 +1432,7 @@ impl AutoScalingState {
                 group_name,
                 &arn,
                 format!("Terminating EC2 instance: {replaced_id}"),
-                cause.clone(),
+                cause.to_string(),
                 GROUP_STATE_IN_SERVICE,
                 now,
                 Some(due),
@@ -1195,11 +1443,11 @@ impl AutoScalingState {
                 group_name,
                 &arn,
                 "Launching a new EC2 instance failed: the account could not place it".to_string(),
-                cause.clone(),
+                cause.to_string(),
                 now,
             );
         }
-        !replaced.is_empty()
+        launched_ids.first().cloned()
     }
 
     /// The cause an Auto Scaling capacity change records: what asked for it, and
@@ -1214,6 +1462,16 @@ impl AutoScalingState {
         format!(
             "an instance refresh is replacing the instances of the group: instance refresh \
              {instance_refresh_id}."
+        )
+    }
+
+    /// The cause the replacements of an instance refresh ROLLBACK record: which
+    /// refresh's rollback asked for them, so the activity log tells the replacements a
+    /// refresh made apart from the ones that put them back.
+    pub fn instance_refresh_rollback_cause(instance_refresh_id: &str) -> String {
+        format!(
+            "an instance refresh rollback is replacing the instances of the group: instance \
+             refresh {instance_refresh_id}."
         )
     }
 }
@@ -1605,6 +1863,31 @@ pub fn absent_group_message_in_prose(name: &str) -> String {
 /// travels as the literal token `null`: the whole message is fixed text and no part of
 /// the request appears in it.
 pub const ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL: &str = "AutoScalingGroup name not found - null";
+
+/// The sentence a rollback of a refresh that carries no desired configuration is
+/// refused with: the first of the situations the error class names, and the whole of
+/// the message — the refusal is about the refresh's own configuration, so no part of
+/// the request appears in it.
+pub const ROLLBACK_WITHOUT_DESIRED_CONFIGURATION_MESSAGE: &str =
+    "The instance refresh cannot be rolled back because there is no desired configuration \
+     specified for the instance refresh.";
+
+/// The sentence a rollback of a group whose launch template version floats is refused
+/// with, naming the version the group uses: the pre-refresh configuration is not
+/// pinned to a version a rollback could go back to.
+pub fn floating_launch_template_version_message(version: &str) -> String {
+    format!(
+        "The instance refresh cannot be rolled back because the Auto Scaling group uses the \
+         launch template's {version} version."
+    )
+}
+
+/// The sentence a rollback of a group whose launch template resolves its image through
+/// a Systems Manager parameter is refused with.
+pub const SSM_PARAMETER_IMAGE_ID_MESSAGE: &str =
+    "The instance refresh cannot be rolled back because the Auto Scaling group has a launch \
+     template that uses a Systems Manager parameter instead of an AMI ID for the ImageId \
+     property.";
 
 /// The launch template specification a launch source names: the one it carries
 /// directly, or the one its mixed instances policy carries.

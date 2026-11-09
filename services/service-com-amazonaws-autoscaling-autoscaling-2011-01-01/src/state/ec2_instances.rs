@@ -474,3 +474,22 @@ fn template_data(
         .get(&version)
         .map(|version| version.data.clone())
 }
+
+/// Whether the launch-template version `specification` names resolves its image through
+/// a Systems Manager parameter rather than naming an AMI id.
+///
+/// The form such an `ImageId` carries is Amazon EC2's own
+/// ([`ec2::ssm_image_alias_parameter`], the one reading of that member in this
+/// emulator), so this service — the consumer of the template — asks EC2 what the value
+/// means instead of reading it a second way. `false` for a template the account does not
+/// hold: there is then no image to read.
+pub fn resolves_image_through_ssm_parameter<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    specification: &LaunchTemplateSpecification,
+) -> bool {
+    launch_template_data(engine, specification)
+        .and_then(|data| data.image_id)
+        .as_deref()
+        .and_then(ec2::ssm_image_alias_parameter)
+        .is_some()
+}

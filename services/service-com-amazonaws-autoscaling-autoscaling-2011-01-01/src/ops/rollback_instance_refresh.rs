@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RollbackInstanceRefresh
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RollbackInstanceRefresh`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RollbackInstanceRefresh::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels the instance refresh a group has in progress and rolls back what it had
+//! done: the refresh is reported `RollbackInProgress`, the clock replaces the
+//! replacements it had made back — from the group's own launch source, the
+//! configuration it was using before the refresh started — and the refresh is reported
+//! `RollbackSuccessful` once they have all been put back. The answer carries the id of
+//! the refresh the rollback acts on. A group with neither a refresh nor a rollback in
+//! progress has nothing to roll back, and a refresh whose pre-refresh configuration is
+//! not pinned cannot be reversed at all.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +166,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RollbackInstanceRefresh` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RollbackInstanceRefreshErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RollbackInstanceRefresh"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RollbackInstanceRefreshErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.auto_scaling_group_name;
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, now);
+
+        // The group the rollback acts on is resolved FIRST: a name no group answers to
+        // is refused for the group, in the wording THIS operation reports — the detail
+        // after the fixed text names the resource in the service's own prose, as the
+        // cancellation of a refresh does.
+        if !state.groups.contains_key(&name) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::absent_group_message_in_prose(&name),
+            ));
+        }
+
+        match state.roll_back_instance_refresh(&*self.engine, &name, now) {
+            Ok(instance_refresh_id) => {
+                crate::state::audit(
+                    ctx.parts(),
+                    "RollbackInstanceRefresh",
+                    &name,
+                    "instance refresh rollback started",
+                );
+                Ok(RollbackInstanceRefreshOutput {
+                    instance_refresh_id: Some(instance_refresh_id),
+                })
+            }
+            // "The request failed because an active instance refresh or rollback for the
+            // specified Auto Scaling group was not found"
+            // (smithy_query(query="shape",shape="ActiveInstanceRefreshNotFoundFault")):
+            // nothing is in progress for a rollback to reverse, which is asked before
+            // anything about the configuration it would reverse to.
+            Err(crate::state::RollbackRefusal::NoneInProgress) => Err(
+                RollbackInstanceRefreshErrorModeled::ActiveInstanceRefreshNotFoundFault(
+                    ActiveInstanceRefreshNotFoundFault {
+                        message: Some(no_rollable_refresh_message(&name)),
+                    },
+                )
+                .into(),
+            ),
+            // A refresh whose pre-refresh configuration cannot be reconstructed: the
+            // sentence says which of the situations the error class names it is.
+            Err(crate::state::RollbackRefusal::Irreversible(reason)) => Err(
+                RollbackInstanceRefreshErrorModeled::IrreversibleInstanceRefreshFault(
+                    IrreversibleInstanceRefreshFault {
+                        message: Some(reason),
+                    },
+                )
+                .into(),
+            ),
+        }
     }
+}
+
+/// The sentence Amazon EC2 Auto Scaling refuses a rollback of a group that has nothing
+/// to roll back with.
+///
+/// The statuses it names are the ones a rollback can act on — a refresh still replacing
+/// instances, or one waiting out its bake time — and the group it names is the
+/// request's own; the rest of the sentence, punctuation included, is fixed text. The
+/// cancellation of a refresh answers the same error class with its OWN sentence, which
+/// is why neither operation shares the other's.
+fn no_rollable_refresh_message(group_name: &str) -> String {
+    format!(
+        "No in progress or baking Instance Refresh found for Auto Scaling group {group_name}."
+    )
 }

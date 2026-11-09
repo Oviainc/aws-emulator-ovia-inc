@@ -280,8 +280,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 desired_configuration: input.desired_configuration.clone(),
                 instances_at_start,
                 pending_instance_ids,
+                // Nothing has been replaced yet, so a rollback asked for now has
+                // nothing to replace back.
+                replaced_instance_ids: Vec::new(),
                 percentage_complete: 0,
                 instances_to_update: instances_at_start,
+                // Nobody has asked to roll this refresh back.
+                rollback: None,
                 next_step_due: Some(now + crate::state::INSTANCE_REFRESH_REPLACEMENT),
             });
 

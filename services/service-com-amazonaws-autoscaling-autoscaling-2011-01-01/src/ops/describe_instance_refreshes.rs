@@ -265,9 +265,17 @@ fn refresh_view(refresh: &crate::state::StoredInstanceRefresh) -> InstanceRefres
         progress_details: None,
         preferences: refresh.preferences.clone(),
         desired_configuration: refresh.desired_configuration.clone(),
-        // The rollback details of a refresh nothing has rolled back:
-        // `RollbackInstanceRefresh` is still scaffolded, so no refresh has any.
-        rollback_details: None,
+        // What the rollback of this refresh has done, for a refresh somebody rolled
+        // back; a refresh nobody rolled back has none.
+        rollback_details: refresh.rollback.as_ref().map(|rollback| RollbackDetails {
+            rollback_reason: Some(rollback.reason.clone()),
+            rollback_start_time: Some(crate::state::to_date_time(rollback.start_time)),
+            percentage_complete_on_rollback: Some(rollback.percentage_complete_on_rollback),
+            instances_to_update_on_rollback: Some(rollback.instances_to_update_on_rollback),
+            // Warm-pool progress, like `ProgressDetails` above: no group holds a warm
+            // pool, so there is none to report beside the group's own.
+            progress_details_on_rollback: None,
+        }),
         strategy: Some(refresh.strategy.clone()),
     }
 }
