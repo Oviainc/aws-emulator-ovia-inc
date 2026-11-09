@@ -45,6 +45,8 @@ mod collection_group_lifecycle;
 mod collection_group_membership;
 #[path = "all/collection_lifecycle.rs"]
 mod collection_lifecycle;
+#[path = "all/collection_search_determinism.rs"]
+mod collection_search_determinism;
 #[path = "all/delete_token_replay.rs"]
 mod delete_token_replay;
 #[path = "all/effective_lifecycle_policy.rs"]
