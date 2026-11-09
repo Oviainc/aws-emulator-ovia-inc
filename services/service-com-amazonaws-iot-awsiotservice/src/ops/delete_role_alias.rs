@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRoleAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRoleAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRoleAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the role alias the store holds under the requested name
+//! ([`crate::state::ComAmazonawsIotAwsiotserviceState::role_aliases`]), so every later
+//! reader of that store stops reporting it: `DescribeRoleAlias` of that name refuses,
+//! and a later `CreateRoleAlias` may take the name again.
+//!
+//! The name is the alias's identity and its key in the store, so removing that one
+//! record is the whole write. A name the account holds no alias under is refused the
+//! modelled `ResourceNotFoundException` (HTTP 404) — this operation models it, and a
+//! delete that names a resource the account does not have has nothing to delete — with
+//! the one missing-alias sentence every reader of a single role alias uses
+//! ([`crate::state::missing_role_alias_message`]), so the refusal and
+//! `DescribeRoleAlias`'s cannot drift.
+//!
+//! The modelled `DeleteConflictException` is for an alias "attached to one or more
+//! resources"; nothing this service persists refers to a role alias, so no record in
+//! this store can hold one back and that refusal is unreachable here. Whether the caller
+//! MAY delete the alias is likewise not decided here: this emulator evaluates no
+//! permissions for any operation, so the modelled `UnauthorizedException` is unreachable
+//! from this handler.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +119,34 @@ impl From<DeleteRoleAliasErrorModeled> for DeleteRoleAliasError {
     }
 }
 
+/// Record this state-changing call for attribution: the operation, the identity the
+/// request PRESENTED (the SigV4 access key id, a public identifier and never a secret),
+/// the request target, the alias the call named and how the call ended.
+///
+/// A delete is the one call that makes a role alias stop existing, so without a record
+/// nothing about it is observable afterwards — the alias it removed is gone. Every
+/// request-derived field goes through [`crate::state::audit_field`], which bounds it and
+/// strips the control characters that would otherwise forge a second record; the
+/// subscriber supplies the timestamp.
+fn audit(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    role_alias: &str,
+    outcome: &'static str,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        target: "emulator::audit",
+        service = ctx.identity().signing_name(),
+        operation = "DeleteRoleAlias",
+        access_key_id = %crate::state::audit_field(&::engine::extract_akid(&parts.headers)),
+        request_target =
+            %crate::state::audit_field(&format!("{} {}", parts.method, parts.uri.path())),
+        role_alias = %crate::state::audit_field(role_alias),
+        outcome,
+        "state-changing operation"
+    );
+}
+
 /// The `DeleteRoleAlias` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -144,18 +183,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRoleAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRoleAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRoleAlias"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteRoleAliasErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // "Deletes a role alias": the name is the alias's identity and its key in the
+        // role-alias store, so deleting it is removing that one record. The alias is
+        // addressed by NAME alone — nothing about the request's region takes part, because
+        // the name is the key — and a removed record is gone for every reader of the
+        // store rather than merely flagged, leaving every other alias as it was.
+        let removed = state.lock().role_aliases.remove(&input.role_alias);
+
+        // What the call DID, which is the one thing a later reader cannot recover: a
+        // removed alias leaves nothing behind to be read.
+        audit(
+            ctx,
+            &input.role_alias,
+            if removed.is_some() {
+                "deleted"
+            } else {
+                "no-such-role-alias"
+            },
+        );
+
+        // A name the account holds no alias under is refused rather than answered with a
+        // hollow success: the operation models `ResourceNotFoundException` ("The
+        // specified resource does not exist", HTTP 404), and the message is the one
+        // sentence every reader of a single role alias refuses a missing name with, with
+        // the name taken from the request.
+        if removed.is_none() {
+            return Err(DeleteRoleAliasErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::missing_role_alias_message(&input.role_alias)),
+                },
+            )
+            .into());
+        }
+
+        // `DeleteRoleAliasResponse` models no members: a successful delete reports
+        // nothing, and that the alias is gone is read back through `DescribeRoleAlias`.
+        Ok(DeleteRoleAliasOutput {})
     }
 }

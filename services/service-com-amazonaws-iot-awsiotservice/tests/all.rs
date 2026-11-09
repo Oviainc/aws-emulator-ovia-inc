@@ -57,6 +57,8 @@ mod package_version_update;
 mod package_versions;
 #[path = "all/policy_registry.rs"]
 mod policy_registry;
+#[path = "all/role_alias_deletion.rs"]
+mod role_alias_deletion;
 #[path = "all/role_alias_registry.rs"]
 mod role_alias_registry;
 #[path = "all/state_roundtrip.rs"]

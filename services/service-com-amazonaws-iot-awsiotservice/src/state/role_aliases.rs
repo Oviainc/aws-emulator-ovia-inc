@@ -52,10 +52,11 @@ pub fn role_alias_arn(region: &str, role_alias: &str) -> String {
     ::emulator_server::emulator_arn("iot", region, &format!("rolealias/{role_alias}"))
 }
 
-/// The message every reader of one role alias refuses a name the account holds no
-/// alias under with.
+/// The message every operation that addresses ONE role alias refuses a name the account
+/// holds no alias under with: the family's fixed text, with the name taken from the
+/// request.
 pub fn missing_role_alias_message(role_alias: &str) -> String {
-    format!("Role alias {role_alias} does not exist")
+    format!("Role alias {role_alias} not found")
 }
 
 /// One role alias in the role-alias store, as this service persists it.
