@@ -79,6 +79,16 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
 # The grant Lambda's own resource policy carries for `apigateway.amazonaws.com` is read
 # through `GetPolicy` on the same client. Only the generated client is needed.
 aws-sdk-lambda = { version = "1", default-features = false }
+# An `AWS` integration whose `uri` names a QUEUE action is performed by making that call
+# over the same in-process transport (`service::invoke::aws_integration::sqs`), so this
+# service builds no request for Amazon SQS's API by hand. Only the generated client is
+# needed; the version the sibling sns/configservice crates declare for the same hop.
+aws-sdk-sqs = { version = "1", default-features = false }
+# Reads the `application/x-www-form-urlencoded` body an `AWS` integration's request template
+# renders — the wire form a query api names an action and its parameters in — as the
+# maintained reader for that media type, so a field whose value carries a `&`, a `=` or a
+# percent escape is read as the one value it is rather than by a split written here.
+form_urlencoded = "1"
 # Base64 for the two members a Lambda proxy integration encodes a payload that is not UTF-8
 # text in — the event's own `isBase64Encoded` body and the handler's response body — and for
 # the `Blob` member a web ACL's `ByteMatchStatement$SearchString` is in this crate's tests.

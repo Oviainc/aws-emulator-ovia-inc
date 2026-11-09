@@ -22,9 +22,12 @@
 //! the way it answers an integration it cannot perform:
 //!
 //! * a reference naming a variable, a method or a name outside that set — a `$context`
-//!   member this call has no value for, a stage variable the stage does not define, a
-//!   `$util` transformation (those are Java-library conversions whose exact output AWS's
-//!   own documentation does not state, so a rendering of one would be guesswork);
+//!   member this call has no value for, a stage variable the stage does not define, or one
+//!   of the `$util` transformations whose exact output AWS's own documentation does not
+//!   state (`escapeJavaScript`, `parseJson`, `validateProperty`), so a rendering of one
+//!   would be guesswork. The two `$util` conversions that ARE stated exactly — the
+//!   `application/x-www-form-urlencoded` encode and decode — are performed, by the
+//!   maintained coder for that format;
 //! * a `$input` reference to the payload where the call has no payload the template can
 //!   read (see [`TemplateInputs::payload`]);
 //! * a DIRECTIVE (`#set`, `#if`, `#foreach`, …), which is the half of the language that is
@@ -605,6 +608,32 @@ impl Render<'_> {
                     })
                     .ok_or_else(unresolved)
             }
+            // "$util" — "contains utility functions", each documented with the conversion
+            // it performs. The two whose output that documentation STATES exactly are the
+            // two form-encoding conversions, and each is performed by the maintained coder
+            // for that format rather than by a rule written here; every other `$util`
+            // method (`escapeJavaScript`, `parseJson`, `validateProperty`) stays
+            // unresolved, for the reason the module docs give.
+            "util" => match reference.steps.as_slice() {
+                [Step::Call(method, arguments)] => {
+                    let text = self.one_argument(arguments)?.ok_or_else(unresolved)?;
+                    self.spend(text.len())?;
+                    match method.as_str() {
+                        // "$util.urlEncode(String) — Converts a string into
+                        // 'application/x-www-form-urlencoded' format."
+                        "urlEncode" => Ok(::form_urlencoded::byte_serialize(text.as_bytes())
+                            .collect::<String>()),
+                        // "$util.urlDecode(String) — Decodes an
+                        // 'application/x-www-form-urlencoded' string back into its
+                        // original form." The decoder is the framework's one QUERY decoder,
+                        // which resolves every escape and folds `+` to a space as that
+                        // format's rule is.
+                        "urlDecode" => Ok(::smithy_server_runtime::percent_decode(&text)),
+                        _ => Err(unresolved()),
+                    }
+                }
+                _ => Err(unresolved()),
+            },
             _ => Err(unresolved()),
         }
     }

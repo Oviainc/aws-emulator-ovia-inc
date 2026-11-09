@@ -17,17 +17,16 @@
 // else appends to.
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
-// Declared here, in this same head region, for the reason the entry above records: what a
-// load balancer PUBLISHES for the target groups it routes to, and what it holds in the
-// account's EC2 inventory, which spans three services.
-#[path = "all/elbv2_host_counts_and_interfaces.rs"]
-mod elbv2_host_counts_and_interfaces;
+// Declared here, in this same head region, for the reason the entry above records: the two
+// services sharing the `agent-registry` signing name are two crates, so neither crate's own
+// test target can mount both and ask which of them claims a request.
+#[path = "all/agent_registry_signing_name_routing.rs"]
+mod agent_registry_signing_name_routing;
 // Declared here, in this same head region, for the reason the entry above records: the
 // account's verified sending identity, which one SES surface records and the other
 // discovers.
 #[path = "all/ses_v1_discovers_a_verified_sending_identity.rs"]
 mod ses_v1_discovers_a_verified_sending_identity;
-// Declared here, in this same head region, for the reason the entry above records: the
 // secret a stack declares, which has to exist in AWS Secrets Manager under the ARN the
 // stack publishes for it.
 #[path = "all/cloudformation_provisions_secrets_manager_secrets.rs"]
@@ -56,10 +55,8 @@ mod workspace_lockfile_covers_every_manifest;
 mod s3_notification_invokes_its_lambda_target;
 #[path = "all/cloudformation_asset_bucket_publishing_role.rs"]
 mod cloudformation_asset_bucket_publishing_role;
-// Declared here, in this same head region, for the reason the entries above record: what a
 // client SEES of an EventBridge rule's and an SNS subscription's deliveries to their Lambda and
 // SNS targets, which spans EventBridge, SNS, Lambda, CloudWatch Logs, SQS, IAM and
-// CloudFormation at once.
 #[path = "all/events_sns_lambda_delivery_observed_in_logs.rs"]
 mod events_sns_lambda_delivery_observed_in_logs;
 // appended tail and the sorted `c…` span (where every cloudformation suite lands) are both
@@ -140,6 +137,8 @@ mod greengrass_signing_name_routing;
 // the sorted `c…` span (where every cloudformation suite lands) are both regions
 #[path = "all/cloudformation_deployed_domain_index_lifecycle.rs"]
 mod cloudformation_deployed_domain_index_lifecycle;
+#[path = "all/cloudformation_domain_access_policy_revision.rs"]
+mod cloudformation_domain_access_policy_revision;
 // the sorted `g…` span (beside the other glue suites) are both regions concurrently landing
 // suites add their line to.
 #[path = "all/glue_studio_notebook_catalog_through_the_router.rs"]
@@ -285,10 +284,6 @@ mod signer_revocation_status_across_services;
 // the sorted `e…` span (where the other ecs/elbv2 suites land) are both regions concurrently
 #[path = "all/ecs_awsvpc_configuration_over_an_ec2_network.rs"]
 mod ecs_awsvpc_configuration_over_an_ec2_network;
-// The ONE Amazon VPC seeding fixture the suites whose requests name a subnet literally
-// share, so no suite writes a second copy of those records.
-#[path = "all/ec2_network.rs"]
-mod ec2_network;
 // the sorted `l…` span are both regions concurrently landing suites add their line to.
 #[path = "all/log_alarm_scheduled_query.rs"]
 mod log_alarm_scheduled_query;
@@ -987,11 +982,6 @@ mod cloudformation_provisions_mq_brokers;
 mod cloudformation_refuses_mq_brokers;
 #[path = "all/cloudformation_provisions_agentcore_workload_identities.rs"]
 mod cloudformation_provisions_agentcore_workload_identities;
-// Declared here, beside the sibling suites it shares its rule with: the whole deployed
-// pipeline, from an `AWS::Events::Rule`/`AWS::Lambda::Permission` template to the permitted
-// target's own work product and the un-permitted sibling's dead letter.
-#[path = "all/cloudformation_events_rule_lambda_target_permission_boundary.rs"]
-mod cloudformation_events_rule_lambda_target_permission_boundary;
 #[path = "all/events_lambda_target_dead_letter_capture.rs"]
 mod events_lambda_target_dead_letter_capture;
 #[path = "all/events_lambda_target_resource_policy.rs"]
@@ -1211,25 +1201,35 @@ mod cloudformation_apigateway_access_control;
 // or earlier in the tail, where their own entry records why they were placed there: two
 // concurrent changes appending one entry is a redefinition that stops this target from
 // compiling, so the duplicate lines are gone and ONE declaration of each stands.
+// Declared here, in the appended tail: what an invocation PRINTS, through the metric filter on
+// its log group, the alarm over that metric, the SNS action and the queues subscribed to it.
+#[path = "all/lambda_log_metric_filter_drives_the_alarm_chain.rs"]
+mod lambda_log_metric_filter_drives_the_alarm_chain;
 #[path = "all/bedrock_catalogue_is_invocable.rs"]
 mod bedrock_catalogue_is_invocable;
 #[path = "all/bedrock_logging_destination_region.rs"]
 mod bedrock_logging_destination_region;
+// The ONE Amazon VPC seeding fixture the suites whose requests name a subnet literally
+// share, so no suite writes a second copy of those records.
+#[path = "all/ec2_network.rs"]
+mod ec2_network;
 #[path = "all/cloudformation_provisions_bedrock_guardrails.rs"]
 mod cloudformation_provisions_bedrock_guardrails;
-// Declared here, in this same head region, for the reason the entry above records: the two
-// services sharing the `agent-registry` signing name are two crates, so neither crate's own
-// test target can mount both and ask which of them claims a request.
-#[path = "all/agent_registry_signing_name_routing.rs"]
-mod agent_registry_signing_name_routing;
-#[path = "all/cloudformation_domain_access_policy_revision.rs"]
-mod cloudformation_domain_access_policy_revision;
+// Declared here, beside the sibling suites it shares its rule with: the whole deployed
+// pipeline, from an `AWS::Events::Rule`/`AWS::Lambda::Permission` template to the permitted
+// target's own work product and the un-permitted sibling's dead letter.
+#[path = "all/cloudformation_events_rule_lambda_target_permission_boundary.rs"]
+mod cloudformation_events_rule_lambda_target_permission_boundary;
+// Declared in the appended tail: a deployed method whose integration is an `AWS` call on a
+// QUEUE, served by making that call — across API Gateway, Amazon SQS and IAM on one engine.
+#[path = "all/apigateway_sqs_service_integration.rs"]
+mod apigateway_sqs_service_integration;
+// load balancer PUBLISHES for the target groups it routes to, and what it holds in the
+// account's EC2 inventory, which spans three services.
+#[path = "all/elbv2_host_counts_and_interfaces.rs"]
+mod elbv2_host_counts_and_interfaces;
 // Declared in the appended tail, which is where every new suite inserts its lines: the whole
 // deploy -> fire -> deliver -> stack-delete round trip of a stack-deployed
 // `AWS::Scheduler::Schedule`.
 #[path = "all/cloudformation_deployed_schedule_invokes_its_target.rs"]
 mod cloudformation_deployed_schedule_invokes_its_target;
-// Declared here, in the appended tail: what an invocation PRINTS, through the metric filter on
-// its log group, the alarm over that metric, the SNS action and the queues subscribed to it.
-#[path = "all/lambda_log_metric_filter_drives_the_alarm_chain.rs"]
-mod lambda_log_metric_filter_drives_the_alarm_chain;

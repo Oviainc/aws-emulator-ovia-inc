@@ -463,4 +463,9 @@ mod domain_name_access_association_endpoint;
 // page a read of it covers.
 #[path = "all/usage_plan_usage_report.rs"]
 mod usage_plan_usage_report;
+// Appended for the reason the note above gives: the two `$util` conversions a mapping
+// template may apply — the `application/x-www-form-urlencoded` encode and decode — and the
+// `$util` methods this emulator still resolves nothing for.
+#[path = "all/stage_template_url_conversions.rs"]
+mod stage_template_url_conversions;
 

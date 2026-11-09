@@ -13,19 +13,26 @@
 //! forms: `path/{resource-path}`, the service's own REST path, or
 //! `action/{ActionName}&{parameter}={value}`.
 //!
-//! The service this module serves is AMAZON S3, whose object actions are the ones the
-//! `path` form addresses as a path (`path/{bucket}/{key}`). The call is made THROUGH THE
-//! EMULATOR this service is running within, over the in-process transport
-//! `OperationContext::callback` hands a handler: nothing is invented and NO CONNECTION IS
-//! OPENED, so what the method request is answered with is what Amazon S3 itself answered
-//! the integration request — its status, its content type and its bytes. The destination is
-//! not an address this data plane dials: the `uri`'s own Region label only names which
-//! Region's endpoint the client is configured for, the transport serves it in process
-//! whatever that label says, and a `uri` naming any other service's action — or a form this
-//! module does not read — is left to [`super::perform_integration`]'s refusal, which states
-//! the configuration rather than inventing a backend answer. An answer the transport itself
-//! refused, rather than Amazon S3, is told apart from a backend answer and reported as an
-//! integration that reached nothing ([`refused`]).
+//! The SUBDOMAIN decides which service is called, and each service's own reading of the
+//! resource decides which of its calls that is:
+//!
+//! * AMAZON S3, whose object actions are the ones the `path` form addresses as a path
+//!   (`path/{bucket}/{key}`);
+//! * AMAZON SQS, whose queue actions the `path` form addresses by the queue
+//!   (`path/{account-id}/{queue-name}`) and whose action and parameters the integration
+//!   request then carries as its own query api's wire form does ([`sqs`]).
+//!
+//! The call is made THROUGH THE EMULATOR this service is running within, over the
+//! in-process transport `OperationContext::callback` hands a handler: nothing is invented
+//! and NO CONNECTION IS OPENED, so what the method request is answered with is what that
+//! service itself answered the integration request. The destination is not an address this
+//! data plane dials: the `uri`'s own Region label only names which Region's endpoint the
+//! client is configured for, the transport serves it in process whatever that label says,
+//! and a `uri` naming any other service's action — or a form this module does not read — is
+//! left to [`super::perform_integration`]'s refusal, which states the configuration rather
+//! than inventing a backend answer. An answer the transport itself refused, rather than the
+//! service, is told apart from a backend answer and reported as an integration that reached
+//! nothing ([`refusal_of`]).
 //!
 //! # Who the call is made as
 //!
@@ -41,10 +48,10 @@
 //!   through the api's `API_CONFIGURATION_ERROR` gateway response, exactly as every other
 //!   integration this stage cannot perform is;
 //! * the call it would make has to be one the role's own identity-based policies allow on
-//!   the object it addresses ([`::service_common::iam_authorization`], the tree's one
+//!   the resource it addresses ([`::service_common::iam_authorization`], the tree's one
 //!   evaluation of policy documents). A call they do not allow is REFUSED, and it is
 //!   refused the way the service it was addressed to refuses an unauthorized call: HTTP
-//!   403 with the `AccessDenied` code and the sentence Amazon S3 publishes for it. That
+//!   403 with the `AccessDenied` code and the sentence that service publishes for it. That
 //!   refusal is then mapped like any other backend answer (below), which is what lets an
 //!   api that declares an integration response for the 4xx class answer its caller 403 and
 //!   one that declares none answer through its default.
@@ -68,7 +75,7 @@
 //! response based on the response from the back end … If the back end is an AWS Lambda
 //! function, the AWS Lambda function error header is matched. For all other HTTP and AWS
 //! back ends, the HTTP status code is matched." So the pattern is matched against the
-//! status Amazon S3 answered with, the integration response with no pattern is the
+//! status the service answered with, the integration response with no pattern is the
 //! fallback ([`super::default_integration_response`]), and the `statusCode` of the one
 //! selected is the status the CALLER sees. Its response template renders the body when it
 //! declares one, read off what the backend answered; with no template the backend's own
@@ -94,6 +101,8 @@ use super::{
     METHOD_REQUEST_HEADER_PREFIX, METHOD_REQUEST_PATH_PREFIX, METHOD_REQUEST_QUERY_PREFIX,
 };
 
+mod sqs;
+
 /// The integration type whose `uri` names an AWS service action: `AWS`, "for integrating
 /// the API method request with an AWS service action" (`IntegrationType`). `AWS_PROXY` is
 /// the Lambda proxy type and is not this one.
@@ -103,9 +112,12 @@ const AWS_SERVICE_INTEGRATION_TYPE: &str = "AWS";
 /// `Integration$uri` documents: `arn:aws:apigateway:{region}:{subdomain}:path|action/…`.
 const APIGATEWAY_VENDOR: &str = "apigateway";
 
-/// The subdomain field that names Amazon S3, which is the service whose calls this module
+/// The subdomain field that names Amazon S3, one of the services whose calls this module
 /// makes.
 const S3_SUBDOMAIN: &str = "s3";
+
+/// What Amazon S3 is called in the sentence an integration that reached no answer carries.
+const S3_SERVICE_NAME: &str = "Amazon S3";
 
 /// The resource prefix of the PATH form: the rest of the resource is the service's own
 /// REST path, which for Amazon S3 is `/{bucket}/{key}`.
@@ -245,18 +257,6 @@ struct Answered {
     body: Vec<u8>,
 }
 
-impl Answered {
-    /// The refusal an AWS service answers a call the caller may not make with, as the
-    /// service's own REST error body ([`ACCESS_DENIED_CODE`]).
-    fn access_denied(resource: &str) -> Self {
-        Self {
-            status: ACCESS_DENIED_STATUS,
-            content_type: Some(XML_CONTENT_TYPE.to_string()),
-            body: error_body(ACCESS_DENIED_CODE, ACCESS_DENIED_MESSAGE, resource),
-        }
-    }
-}
-
 /// Amazon S3's REST error body: the code, the sentence and the resource the call
 /// addressed, which is the envelope every Amazon S3 refusal carries.
 fn error_body(code: &str, message: &str, resource: &str) -> Vec<u8> {
@@ -283,17 +283,105 @@ pub(super) async fn performed(
     if integration.r#type.as_deref() != Some(AWS_SERVICE_INTEGRATION_TYPE) {
         return None;
     }
-    let addressed = addressed_object(integration, region, &call.inputs)?;
-    let object = match addressed {
-        Ok(object) => object,
-        Err(reason) => {
-            return Some(Err(UnservedIntegration {
-                refusal: API_CONFIGURATION_ERROR,
-                reason,
-            }))
-        }
+    let addressed = addressed_call(integration, region, call)?;
+    let target = match addressed {
+        Ok(target) => target,
+        Err(unserved) => return Some(Err(unserved)),
     };
-    Some(served(ctx, integration, method, call, &object).await)
+    Some(served(ctx, integration, method, call, &target).await)
+}
+
+/// What `integration`'s `uri` addresses, over the services this module makes calls to, or
+/// `None` when it names none of them — which leaves it to the caller's own refusal.
+///
+/// The SUBDOMAIN of the integration ARN names the service, so each service's own reader is
+/// asked in turn and the first that claims the `uri` decides what the call is; a `uri` that
+/// IS that service's and still places no call is a configuration this stage cannot serve
+/// rather than one left to another reader.
+fn addressed_call(
+    integration: &GetIntegrationOutput,
+    default_region: &str,
+    call: &MethodRequest,
+) -> Option<Result<ServiceCall, UnservedIntegration>> {
+    if let Some(object) = addressed_object(integration, default_region, &call.inputs) {
+        return Some(
+            object
+                .map(ServiceCall::Object)
+                .map_err(|reason| unanswered(&reason)),
+        );
+    }
+    if let Some(queue) = sqs::addressed_queue(integration, default_region, call) {
+        return Some(queue.map(ServiceCall::Queue));
+    }
+    None
+}
+
+/// The call an `AWS` integration's `uri` addresses, in whichever of the services this
+/// module makes calls to. Everything the role check, the dispatch and the refusal need of
+/// one is read through this, so a service is added by teaching it one more call rather than
+/// by a second copy of those rules.
+#[derive(Debug)]
+enum ServiceCall {
+    /// An Amazon S3 object action.
+    Object(ObjectCall),
+    /// An Amazon SQS queue action.
+    Queue(sqs::QueueCall),
+}
+
+impl ServiceCall {
+    /// The Region of the service endpoint the call is made at.
+    fn region(&self) -> &str {
+        match self {
+            Self::Object(object) => &object.region,
+            Self::Queue(queue) => queue.region(),
+        }
+    }
+
+    /// The IAM action a call of it is authorized by.
+    fn iam_action(&self) -> &'static str {
+        match self {
+            Self::Object(object) => object.action.iam_action(),
+            Self::Queue(queue) => queue.iam_action(),
+        }
+    }
+
+    /// The ARN of the resource it addresses, which is what an identity-based policy grants
+    /// that action on.
+    fn resource_arn(&self) -> String {
+        match self {
+            Self::Object(object) => object.object_arn(),
+            Self::Queue(queue) => queue.queue_arn(),
+        }
+    }
+
+    /// The refusal the service answers a call the caller may not make with, in that
+    /// service's own error envelope and naming the resource the call addressed.
+    fn access_denied(&self) -> Answered {
+        match self {
+            Self::Object(object) => Answered {
+                status: ACCESS_DENIED_STATUS,
+                content_type: Some(XML_CONTENT_TYPE.to_string()),
+                body: error_body(
+                    ACCESS_DENIED_CODE,
+                    ACCESS_DENIED_MESSAGE,
+                    &format!("/{}/{}", object.bucket, object.key),
+                ),
+            },
+            Self::Queue(queue) => sqs::access_denied(queue),
+        }
+    }
+
+    /// Make the call, in process, and report what the service answered.
+    async fn answered(
+        &self,
+        ctx: &OperationContext<'_>,
+        call: &MethodRequest,
+    ) -> Result<Answered, UnservedIntegration> {
+        match self {
+            Self::Object(object) => answered_by_s3(ctx, object, call).await,
+            Self::Queue(queue) => sqs::answered(ctx, queue, call).await,
+        }
+    }
 }
 
 /// The method response this call earns: the role decides whether the call is made, the
@@ -303,17 +391,12 @@ async fn served(
     integration: &GetIntegrationOutput,
     method: &MethodEntry,
     call: &MethodRequest,
-    object: &ObjectCall,
+    target: &ServiceCall,
 ) -> Result<IntegratedResponse, UnservedIntegration> {
-    let answered = match authorization(ctx, integration, object).await {
-        Authorization::Unassumable(reason) => {
-            return Err(UnservedIntegration {
-                refusal: API_CONFIGURATION_ERROR,
-                reason,
-            })
-        }
-        Authorization::Withheld(resource) => Answered::access_denied(&resource),
-        Authorization::Admitted => answered_by_s3(ctx, object, call).await?,
+    let answered = match authorization(ctx, integration, target).await {
+        Authorization::Unassumable(reason) => return Err(unanswered(&reason)),
+        Authorization::Withheld => target.access_denied(),
+        Authorization::Admitted => target.answered(ctx, call).await?,
     };
     mapped(method, integration, call, answered)
 }
@@ -328,16 +411,16 @@ enum Authorization {
     /// sentence says which role and why, for the log and for the execution log
     /// `TestInvokeMethod` reports.
     Unassumable(String),
-    /// The role may not make this call, so the service refuses it: the object's own path,
-    /// which the refusal names as the resource.
-    Withheld(String),
+    /// The role may not make this call, so the service refuses it in its own words
+    /// ([`ServiceCall::access_denied`]).
+    Withheld,
 }
 
-/// What the integration's `credentials` role makes of the call `object` addresses.
+/// What the integration's `credentials` role makes of the call `target` addresses.
 async fn authorization(
     ctx: &OperationContext<'_>,
     integration: &GetIntegrationOutput,
-    object: &ObjectCall,
+    target: &ServiceCall,
 ) -> Authorization {
     let role_arn = integration
         .credentials
@@ -349,7 +432,7 @@ async fn authorization(
     };
     if ::service_common::iam_role::role_is_unassumable(
         ctx,
-        &object.region,
+        target.region(),
         role_arn,
         SERVICE_PRINCIPAL,
     )
@@ -363,19 +446,19 @@ async fn authorization(
     // The permissions in force on the role are what IAM holds for it; a role whose
     // policies could not be READ grounds no refusal, so only an enumeration IAM ANSWERED
     // decides this.
-    let Some(documents) = role_identity_documents(ctx, &object.region, role_arn).await else {
+    let Some(documents) = role_identity_documents(ctx, target.region(), role_arn).await else {
         return Authorization::Admitted;
     };
-    let resource = object.object_arn();
-    let request = iam::Request::new(object.action.iam_action(), &resource, &[]);
+    let resource = target.resource_arn();
+    let request = iam::Request::new(target.iam_action(), &resource, &[]);
     if iam::identity_decision(&documents, &request) == Decision::Allowed {
         return Authorization::Admitted;
     }
     ::tracing::warn!(
-        action = %object.action.iam_action(),
+        action = %target.iam_action(),
         "the integration's execution role may not make this call, so the service refuses it"
     );
-    Authorization::Withheld(format!("/{}/{}", object.bucket, object.key))
+    Authorization::Withheld
 }
 
 /// Every identity-based policy document IAM holds for the role `role_arn` names — the
@@ -561,11 +644,89 @@ fn bounded(bytes: usize) -> Result<(), UnservedIntegration> {
 }
 
 /// What the service answered a call it REFUSED, read off the answer itself: the status it
-/// sent and the body it sent, so the mapping sees the service's own refusal.
+/// sent, the media type and the bytes it sent, the code and sentence it reported, and the
+/// headers it carried — for the service's own renderer to shape into the body a mapped
+/// method response carries.
 ///
-/// A failure that is not the service answering — the call did not reach it, or its answer
-/// could not be read — is an integration that produced no answer, so it is reported as one
-/// this stage could not perform rather than as a refusal nothing sent.
+/// `Err` only where there is no answer FROM THE SERVICE to report at all — the call did not
+/// reach it, its answer could not be read, or the answer came from the front door rather
+/// than from the service — because an integration that produced no answer is one this stage
+/// could not perform rather than one refused by something nothing asked.
+///
+/// The FRONT DOOR's own refusal is not an answer from the service: a deployment with that
+/// service not mounted answers the integration request that way, and mapping it as a
+/// backend answer would hand the caller a status and a body for a call nothing made.
+/// `service_common` owns the one reading of that refusal.
+fn refusal_of<E>(
+    error: &SdkError<E, HttpResponse>,
+    service: &str,
+) -> Result<Refusal, UnservedIntegration>
+where
+    E: ProvideErrorMetadata + ::std::error::Error + 'static,
+{
+    let SdkError::ServiceError(answered) = error else {
+        ::tracing::warn!(
+            error = %::aws_smithy_types::error::display::DisplayErrorContext(error),
+            "the integration request was not answered by the service its uri names"
+        );
+        return Err(unanswered(&format!(
+            "the integration request to {service} was not answered, so there is no backend \
+             answer to map"
+        )));
+    };
+    let answer = answered.raw();
+    // The body the service sent, when the answer carried one that was buffered; a refusal
+    // whose body was not is left empty, and each service's renderer writes its own envelope
+    // from the code and sentence the answer itself reported.
+    let body = answer.body().bytes().unwrap_or_default().to_vec();
+    if ::service_common::in_process_refusal::is_transport_refusal(&body) {
+        ::tracing::warn!(
+            status = answer.status().as_u16(),
+            "the integration request reached no such service: this emulator mounts none, so \
+             there is no backend answer to map"
+        );
+        return Err(unanswered(&format!(
+            "the integration request reached no {service} in this emulator, so there is no \
+             backend answer to map"
+        )));
+    }
+    Ok(Refusal {
+        status: answer.status().as_u16(),
+        content_type: answer
+            .headers()
+            .get(::http::header::CONTENT_TYPE.as_str())
+            .map(str::to_string),
+        code: answered.err().code().map(str::to_string),
+        message: answered.err().message().map(str::to_string),
+        headers: answer
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.to_string()))
+            .collect(),
+        body,
+    })
+}
+
+/// A refusal the service itself answered with, as [`refusal_of`] read it off the answer.
+#[derive(Debug)]
+struct Refusal {
+    status: u16,
+    /// The media type the answer declared, or `None` for one that declared none.
+    content_type: Option<String>,
+    /// The error code the answer reported, or `None` for one that reported none.
+    code: Option<String>,
+    /// The sentence it reported beside that code.
+    message: Option<String>,
+    /// The bytes the answer carried, empty for one that carried none.
+    body: Vec<u8>,
+    /// Every header the answer carried, by lowercased name — which is where a service whose
+    /// model is `awsQueryCompatible` reports the legacy query code of the class it threw.
+    headers: BTreeMap<String, String>,
+}
+
+/// What Amazon S3 answered a call it refused, as the method response maps it: the service's
+/// own bytes where it sent any, and otherwise its REST error envelope rendered from the
+/// code and sentence the answer reported.
 fn refused<E>(
     error: &SdkError<E, HttpResponse>,
     object: &ObjectCall,
@@ -573,51 +734,21 @@ fn refused<E>(
 where
     E: ProvideErrorMetadata + ::std::error::Error + 'static,
 {
-    let SdkError::ServiceError(service) = error else {
-        ::tracing::warn!(
-            error = %::aws_smithy_types::error::display::DisplayErrorContext(error),
-            "the integration request was not answered by Amazon S3"
-        );
-        return Err(unanswered(
-            "the integration request to Amazon S3 was not answered, so there is no backend \
-             answer to map",
-        ));
-    };
-    let answer = service.raw();
-    let status = answer.status().as_u16();
-    let content_type = answer
-        .headers()
-        .get(::http::header::CONTENT_TYPE.as_str())
-        .map(str::to_string);
-    // The body the service sent, when the answer carried one that was buffered; a refusal
-    // whose body was not is rendered from the code and sentence the answer itself reported.
-    let body = match answer.body().bytes() {
-        Some(bytes) if !bytes.is_empty() => bytes.to_vec(),
-        _ => error_body(
-            service.err().code().unwrap_or(ACCESS_DENIED_CODE),
-            service.err().message().unwrap_or(ACCESS_DENIED_MESSAGE),
+    let refusal = refusal_of(error, S3_SERVICE_NAME)?;
+    let body = match refusal.body.is_empty() {
+        false => refusal.body,
+        true => error_body(
+            refusal.code.as_deref().unwrap_or(ACCESS_DENIED_CODE),
+            refusal.message.as_deref().unwrap_or(ACCESS_DENIED_MESSAGE),
             &format!("/{}/{}", object.bucket, object.key),
         ),
     };
-    // The FRONT DOOR's own refusal is not an answer from Amazon S3: a deployment with no
-    // object store mounted answers the integration request that way, and mapping it as a
-    // backend answer would hand the caller a status and a body for a call nothing made.
-    // `service_common` owns the one reading of that refusal.
-    if ::service_common::in_process_refusal::is_transport_refusal(&body) {
-        ::tracing::warn!(
-            status,
-            "the integration request reached no Amazon S3: this emulator mounts none, so \
-             there is no backend answer to map"
-        );
-        return Err(unanswered(
-            "the integration request reached no Amazon S3 in this emulator, so there is no \
-             backend answer to map",
-        ));
-    }
     bounded(body.len())?;
     Ok(Answered {
-        status,
-        content_type: content_type.or_else(|| Some(XML_CONTENT_TYPE.to_string())),
+        status: refusal.status,
+        content_type: refusal
+            .content_type
+            .or_else(|| Some(XML_CONTENT_TYPE.to_string())),
         body,
     })
 }
