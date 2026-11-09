@@ -41,6 +41,10 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# Percent-encoding for the `tagKeys` query a `UntagResource` case sends: a tag key can
+# carry `+`, `=`, `:` and `/`, so the suite encodes each value with the maintained crate
+# rather than escaping bytes by hand.
+urlencoding = "2"
 # The DataIntegration suite mounts the KMS service beside AppIntegrations on one engine,
 # because `CreateDataIntegration` resolves its required `KmsKey` by calling it.
 service-com-amazonaws-kms-trentservice = { workspace = true }

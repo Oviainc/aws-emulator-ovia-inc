@@ -120,6 +120,11 @@ pub const APPLICATION_RESOURCE: &str = "Application";
 /// (`UpdateDataIntegrationAssociation`'s `DataIntegrationAssociationIdentifier` label).
 pub const DATA_INTEGRATION_ASSOCIATION_RESOURCE: &str = "DataIntegrationAssociation";
 
+/// The same, for an application association — the one resource of this service no
+/// operation of this API creates (see [`ApplicationAssociationRecord`]), named here
+/// because an ARN can still claim its type.
+pub const APPLICATION_ASSOCIATION_RESOURCE: &str = "ApplicationAssociation";
+
 /// What a resource addressed by its `Name` member is called in a not-found message.
 pub const ADDRESSED_BY_NAME: &str = "name";
 
@@ -174,6 +179,82 @@ pub fn data_integration_association_not_found(identifier: &str) -> String {
 /// reports it the same way.
 pub fn modeled_tags(tags: &BTreeMap<String, String>) -> HashMap<String, String> {
     tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// The most tags one resource of this service carries at once: the maximum the modelled
+/// `TagMap` admits (`smithy_query(query="operation", operation="TagResource")`: `tags`
+/// is a `TagMap` of `len 1..200`, and the same shape is what every read reports back),
+/// so a tag set this service stores is one it can also report.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// What a resource addressed by its ARN is called in a not-found message.
+pub const ADDRESSED_BY_ARN: &str = "ARN";
+
+/// The resource-type word a not-found message uses for an ARN that names none of the
+/// resource types this service mints ARNs for: the tagging operations address "the
+/// resource" by ARN (`smithy_query(query="doc", shape="ListTagsForResourceRequest",
+/// member="resourceArn")`) without naming a type, so an ARN carrying no type of this
+/// service is reported with the generic word.
+pub const UNTYPED_RESOURCE: &str = "Resource";
+
+/// The ARN resource-type segment of an application, the part before the `/` in
+/// `arn:aws:app-integrations:<region>:<account>:application/<id>`.
+pub const APPLICATION_ARN_SEGMENT: &str = "application";
+
+/// The ARN resource-type segment of an event integration.
+pub const EVENT_INTEGRATION_ARN_SEGMENT: &str = "event-integration";
+
+/// The ARN resource-type segment of a data integration.
+pub const DATA_INTEGRATION_ARN_SEGMENT: &str = "data-integration";
+
+/// The ARN resource-type segment of a data integration association.
+pub const DATA_INTEGRATION_ASSOCIATION_ARN_SEGMENT: &str = "data-integration-association";
+
+/// The ARN resource-type segment of an application association.
+pub const APPLICATION_ARN_ASSOCIATION_SEGMENT: &str = "application-association";
+
+/// The resource-type segment `arn` carries, for an ARN of THIS service: the part of its
+/// resource field before the first `/`, and `None` when the ARN is not one of this
+/// service's (a different vendor, or no ARN at all).
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`, so the service
+/// field has to be this one's (`ARN_NAMESPACE`) before the resource field says anything
+/// about a resource type here.
+fn arn_resource_segment(arn: &str) -> Option<&str> {
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let _partition = fields.next()?;
+    if fields.next()? != ARN_NAMESPACE {
+        return None;
+    }
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    let resource = fields.next()?;
+    Some(resource.split('/').next().unwrap_or(resource))
+}
+
+/// The resource TYPE a not-found message spells for the ARN a tagging operation named:
+/// the Smithy shape name of the resource the ARN's own type segment claims, or
+/// [`UNTYPED_RESOURCE`] when it claims none of this service's.
+pub fn arn_resource_type(arn: &str) -> &'static str {
+    match arn_resource_segment(arn) {
+        Some(APPLICATION_ARN_SEGMENT) => APPLICATION_RESOURCE,
+        Some(EVENT_INTEGRATION_ARN_SEGMENT) => EVENT_INTEGRATION_RESOURCE,
+        Some(DATA_INTEGRATION_ARN_SEGMENT) => DATA_INTEGRATION_RESOURCE,
+        Some(DATA_INTEGRATION_ASSOCIATION_ARN_SEGMENT) => DATA_INTEGRATION_ASSOCIATION_RESOURCE,
+        Some(APPLICATION_ARN_ASSOCIATION_SEGMENT) => APPLICATION_ASSOCIATION_RESOURCE,
+        _ => UNTYPED_RESOURCE,
+    }
+}
+
+/// [`not_found_message`] for the `ResourceArn` a tagging operation named and this
+/// account holds no taggable resource under — worded through the same template as every
+/// other 404 of this service, with the type the ARN claims (see [`arn_resource_type`])
+/// and the ARN the request sent.
+pub fn tagged_resource_not_found(arn: &str) -> String {
+    not_found_message(arn_resource_type(arn), ADDRESSED_BY_ARN, arn)
 }
 
 /// The `ApplicationType` of an application whose create named none, which is a value
@@ -826,6 +907,56 @@ impl ComAmazonawsAppintegrationsAmazonappintegrationserviceState {
             self.idempotency.insert(token, name);
         }
     }
+
+    /// The stored tag set of the resource `arn` names, or `None` when this account holds
+    /// no taggable resource under that ARN.
+    ///
+    /// A tag set is part of the record of the resource it belongs to — an application,
+    /// an event integration or a data integration, the three resources whose create
+    /// takes `Tags` — so the tagging operations and every `Get`/`List` that reports
+    /// `Tags` read the one copy. The ARN is matched against the stored one in FULL,
+    /// exactly as [`Self::data_integration_id`] matches a data integration's, so an ARN
+    /// of another account, Region, vendor or resource type names no resource here.
+    pub fn tags_of(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        if let Some(record) = self.applications.values().find(|record| record.arn == arn) {
+            return Some(&record.tags);
+        }
+        if let Some(record) = self
+            .event_integrations
+            .values()
+            .find(|record| record.arn == arn)
+        {
+            return Some(&record.tags);
+        }
+        self.data_integrations
+            .values()
+            .find(|record| record.arn == arn)
+            .map(|record| &record.tags)
+    }
+
+    /// [`Self::tags_of`] for a caller that changes the set: the tag set `TagResource`
+    /// merges into and `UntagResource` removes keys from, on the resource's own record,
+    /// so a later read of that resource reports the change.
+    pub fn tags_of_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        if let Some(record) = self
+            .applications
+            .values_mut()
+            .find(|record| record.arn == arn)
+        {
+            return Some(&mut record.tags);
+        }
+        if let Some(record) = self
+            .event_integrations
+            .values_mut()
+            .find(|record| record.arn == arn)
+        {
+            return Some(&mut record.tags);
+        }
+        self.data_integrations
+            .values_mut()
+            .find(|record| record.arn == arn)
+            .map(|record| &mut record.tags)
+    }
 }
 
 /// The region of the request being served: the third field of its SigV4
@@ -840,13 +971,21 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// The ARN of an application in `region`:
 /// `arn:aws:app-integrations:<region>:<account>:application/<id>`.
 pub fn application_arn(region: &str, id: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("application/{id}"))
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{APPLICATION_ARN_SEGMENT}/{id}"),
+    )
 }
 
 /// The ARN of an event integration in `region`:
 /// `arn:aws:app-integrations:<region>:<account>:event-integration/<name>`.
 pub fn event_integration_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("event-integration/{name}"))
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{EVENT_INTEGRATION_ARN_SEGMENT}/{name}"),
+    )
 }
 
 /// The ARN of a data integration in `region`:
@@ -855,7 +994,11 @@ pub fn event_integration_arn(region: &str, name: &str) -> String {
 /// Built from the minted `Id`, not from the caller's `Name`: `Id` is what this
 /// resource's identity is, and the ARN is the other form of it.
 pub fn data_integration_arn(region: &str, id: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("data-integration/{id}"))
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{DATA_INTEGRATION_ARN_SEGMENT}/{id}"),
+    )
 }
 
 /// The ARN of a data integration association in `region`:
@@ -872,7 +1015,7 @@ pub fn data_integration_association_arn(
     ::engine::emulator_arn(
         ARN_NAMESPACE,
         region,
-        &format!("data-integration-association/{integration_id}/{association_id}"),
+        &format!("{DATA_INTEGRATION_ASSOCIATION_ARN_SEGMENT}/{integration_id}/{association_id}"),
     )
 }
 
@@ -891,7 +1034,7 @@ pub fn application_association_arn(
     ::engine::emulator_arn(
         ARN_NAMESPACE,
         region,
-        &format!("application-association/{application_id}/{association_id}"),
+        &format!("{APPLICATION_ARN_ASSOCIATION_SEGMENT}/{application_id}/{association_id}"),
     )
 }
 

@@ -31,6 +31,8 @@ mod harness;
 mod not_found_messages;
 #[path = "all/request_body_rejection.rs"]
 mod request_body_rejection;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/server_defaulted_members.rs"]
 mod server_defaulted_members;
 #[path = "all/state_roundtrip.rs"]
