@@ -141,14 +141,17 @@
 use super::types::*;
 use crate::state::{resource_types, template};
 
-/// How a request that does not name exactly ONE template is refused.
+/// How a request that does not name exactly ONE template is refused, in the service's own
+/// wording.
 ///
 /// "Conditional: You must specify only one of the following parameters: StackName,
 /// StackSetName, TemplateBody, or TemplateURL" (`GetTemplateSummaryInput$TemplateBody` and
 /// each of its three alternatives), so a request naming none of them and one naming two
-/// are refused the same way: neither names the one template a summary is of.
-const ONE_TEMPLATE_ONLY: &str = "You must specify only one of the following parameters: \
-     StackName, StackSetName, TemplateBody, or TemplateURL";
+/// are refused the same way: neither names the one template a summary is of. The sentence
+/// is fixed text — it names no member of the request — and is what this condition answers
+/// however many sources the request states.
+const ONE_TEMPLATE_ONLY: &str =
+    "Exactly one of Template URL, Template Body, Stack Name must be specified.";
 
 /// Which template the request asks for a summary of.
 enum Summarised<'a> {
@@ -191,7 +194,7 @@ fn parameter_declaration(declared: &template::DeclaredParameter) -> ParameterDec
 fn summary_of(
     body: &str,
     declared: &template::Template,
-    unrecognized: Vec<String>,
+    unrecognized: Option<Vec<String>>,
 ) -> GetTemplateSummaryOutput {
     let required = crate::state::template_summary::required_capabilities(body, declared);
     GetTemplateSummaryOutput {
@@ -214,9 +217,10 @@ fn summary_of(
         // `ValidateTemplate` reports (`crate::state::template_summary`).
         capabilities: (!required.capabilities.is_empty()).then_some(required.capabilities),
         capabilities_reason: required.reason,
-        // "A list of all the template resource types that are defined in the template": the
-        // SET of types its resources have, in the order that set is reported in.
-        resource_types: Some(crate::state::template_summary::resource_types(declared)),
+        // "A list of all the template resource types that are defined in the template": one
+        // entry per resource its `Resources` section declares, in the order the body declares
+        // them.
+        resource_types: Some(crate::state::template_summary::resource_types(body, declared)),
         // "The Amazon Web Services template format version, which identifies the
         // capabilities of the template": the version in FORCE for this template — the one it
         // states, or the latest, which is what a template stating none conforms to.
@@ -236,7 +240,7 @@ fn summary_of(
         // properties whose values name an existing resource of it
         // (`crate::state::primary_identifier`).
         resource_identifier_summaries: Some(
-            crate::state::template_summary::identifier_summaries(declared)
+            crate::state::template_summary::identifier_summaries(body, declared)
                 .into_iter()
                 .map(|summary| ResourceIdentifierSummary {
                     resource_type: Some(summary.resource_type),
@@ -248,9 +252,13 @@ fn summary_of(
         // "A list of all of the unrecognized resource types. This is only returned if the
         // TemplateSummaryConfig parameter has the TreatUnrecognizedResourceTypesAsWarnings
         // configuration set to True" — the only configuration under which such a template
-        // is summarised at all rather than refused.
-        warnings: (!unrecognized.is_empty()).then_some(Warnings {
-            unrecognized_resource_types: Some(unrecognized),
+        // is summarised at all rather than refused. So the WARNINGS are reported exactly
+        // when that configuration asked for them, whether or not the template declares a
+        // type CloudFormation does not recognise: an absent `Warnings` says warnings were
+        // not produced, while the warnings a configured call reports with no unrecognized
+        // type to name say there was none.
+        warnings: unrecognized.map(|unrecognized| Warnings {
+            unrecognized_resource_types: (!unrecognized.is_empty()).then_some(unrecognized),
         }),
     }
 }
@@ -365,13 +373,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // template is read: a caller-sized body is parsed outside it.
         let template_body: String = match summarised {
             Summarised::Body(body) => {
-                // The documented `TemplateBody` maximum and the documented per-template
-                // quotas, which the model carries no constraint for — the same rules every
-                // operation that takes a body is held to.
-                crate::state::validate_template_body(body)
-                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-                crate::state::validate_template_quotas(body)
-                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                // The size of a template this operation READS is the size of a template
+                // CloudFormation reads at all (`crate::state::TEMPLATE_MAX_BYTES`), not the
+                // quota on one submitted for deployment: this call creates nothing, so the
+                // body it summarises is held to the template's own ceiling. The documented
+                // per-template quotas, which the model carries no constraint for, hold here
+                // exactly as they do for every other operation that takes a body.
+                crate::state::validate_template_body_within(
+                    body,
+                    crate::state::TEMPLATE_MAX_BYTES,
+                )
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                crate::state::validate_template_quotas_within(
+                    body,
+                    crate::state::TEMPLATE_MAX_BYTES,
+                )
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
                 body.to_string()
             }
             Summarised::Stack(name_or_id) => {
@@ -460,10 +477,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // Read by the SAME reader every other operation reads a template with, so the
-        // summary and the deployment cannot disagree about what a body declares, and a body
-        // it will not read is refused with the one wording every such operation gives it.
-        let Some(declared) = crate::state::declared_template(&template_body) else {
+        // Read by the SAME reader every other operation reads a template with — under this
+        // operation's own ceiling on the body (see above), so the summary and the deployment
+        // cannot disagree about what a body declares, and a body it will not read is refused
+        // with the one wording every such operation gives it.
+        let Some(declared) = crate::state::declared_template_within(
+            &template_body,
+            crate::state::TEMPLATE_MAX_BYTES,
+        ) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 template::not_well_formed(&template_body),
             ));
@@ -472,6 +493,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // wording every operation that reads a body gives it: for the untyped entry it
         // names, or for the section declaring nothing at all.
         if let Some(refusal) = template::resources_refusal(&declared) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
+        }
+        // The template-FORMAT rules about how a section is SPELLED — a `Description` past its
+        // documented maximum, a `Mappings` member that is no map — in the one wording every
+        // operation that reads a body gives them: a template CloudFormation will not read is
+        // not summarised as a valid one (`crate::state::template::format_refusal`).
+        if let Some(refusal) = template::format_refusal(&template_body, &declared) {
             return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
         }
         // An `Fn::Sub` reads a dotted `${Name.Attribute}` as a resource attribute and
@@ -492,7 +520,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reading such a template for deployment gives it. Which types those are, and the
         // rule that a template declaring a transform is held to no catalogue at all, come
         // from the one place that owns them.
-        let unrecognized = resource_types::unrecognized_in(&declared);
+        let unrecognized = resource_types::unrecognized_in(&template_body, &declared);
         let treat_as_warnings = input
             .template_summary_config
             .as_ref()
@@ -504,6 +532,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        Ok(summary_of(&template_body, &declared, unrecognized))
+        Ok(summary_of(
+            &template_body,
+            &declared,
+            treat_as_warnings.then_some(unrecognized),
+        ))
     }
 }

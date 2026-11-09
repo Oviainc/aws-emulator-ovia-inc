@@ -255,6 +255,10 @@ pub mod provisioning;
 /// declares.
 pub mod template;
 
+/// The order a template body declares the entries of one of its sections in, which is part
+/// of what a client reads back about the template.
+pub mod declaration_order;
+
 /// What a submitted template is held to before a stack operation acts on it: the
 /// template-validation rules CloudFormation applies synchronously, and the refusal each
 /// one answers.
@@ -691,6 +695,16 @@ pub const MAX_CLIENT_REQUEST_TOKENS_PER_STACK: usize = 1_000;
 /// `@length(min: 1)`, so the handler is what enforces the documented maximum.
 pub const TEMPLATE_BODY_MAX_BYTES: usize = 51_200;
 
+/// The most bytes of template this service READS, whatever member carried it.
+///
+/// [`TEMPLATE_BODY_MAX_BYTES`] is the quota on a body a request SUBMITS for deployment; this
+/// is the size of the biggest template CloudFormation reads at all — "the URL must point to a
+/// template (max size: 1 MB)" (`TemplateURL`), the same ceiling the documented quotas put on a
+/// template in an Amazon S3 object. An operation that only REPORTS on a template reads a body
+/// up to this size: the quota it is not held to is the one on submitting a template for
+/// deployment.
+pub const TEMPLATE_MAX_BYTES: usize = 1_048_576;
+
 /// How many items one page of a paginated read carries.
 ///
 /// CloudFormation pages `DescribeStacks`, `ListStacks` and `DescribeStackEvents` by
@@ -710,8 +724,21 @@ pub const MAX_DESCRIBED_STACK_RESOURCES: usize = 100;
 /// `Err(message)` for a `TemplateBody` past its documented maximum, naming the member and
 /// the constraint it failed.
 pub fn validate_template_body(template_body: &str) -> Result<(), String> {
-    if template_body.len() > TEMPLATE_BODY_MAX_BYTES {
-        return Err(template_body_too_long(Some(template_body)));
+    validate_template_body_within(template_body, TEMPLATE_BODY_MAX_BYTES)
+}
+
+/// [`validate_template_body`] under the caller's OWN ceiling on the body, naming that ceiling
+/// as the constraint the value failed.
+///
+/// The maximum SIZE of a body is a quota of the API that takes it rather than a property of
+/// the template format ([`TEMPLATE_MAX_BYTES`]), so an operation held to a ceiling of its own
+/// states that one.
+pub fn validate_template_body_within(
+    template_body: &str,
+    max_bytes: usize,
+) -> Result<(), String> {
+    if template_body.len() > max_bytes {
+        return Err(template_body_too_long_within(Some(template_body), max_bytes));
     }
     Ok(())
 }
@@ -758,14 +785,19 @@ pub fn validate_one_template_source(
 /// body refused by its reported length alone, before any of it was read, states the
 /// constraint without a value it never held.
 pub fn template_body_too_long(submitted: Option<&str>) -> String {
+    template_body_too_long_within(submitted, TEMPLATE_BODY_MAX_BYTES)
+}
+
+/// [`template_body_too_long`] naming the ceiling the body was held to, for an operation whose
+/// ceiling is one of its own ([`TEMPLATE_MAX_BYTES`]).
+pub fn template_body_too_long_within(submitted: Option<&str>, max_bytes: usize) -> String {
     let value = match submitted {
         Some(body) => format!("'{}' ", quoted_template_body(body)),
         None => String::new(),
     };
     format!(
         "1 validation error detected: Value {value}at 'templateBody' failed to satisfy \
-         constraint: Member must have length less than or equal to \
-         {TEMPLATE_BODY_MAX_BYTES}"
+         constraint: Member must have length less than or equal to {max_bytes}"
     )
 }
 
@@ -777,10 +809,10 @@ pub fn template_body_too_long(submitted: Option<&str>) -> String {
 /// than the value (`vendor/smithy-schema-server/src/constraints.rs`), and the shared rule for
 /// what such a message echoes says a service whose member is larger than the default ceiling
 /// states its own ceiling (`service_common::validation`). This is that ceiling for the one
-/// member of this service a caller sizes, and it is CHOSEN: enough of the document for its
-/// author to recognise which body was refused, and a constant, so the refusal's size does not
-/// follow the request's.
-pub const QUOTED_TEMPLATE_PREFIX: usize = 50;
+/// member of this service a caller sizes: the leading characters of the document the recorded
+/// refusals of an over-long `TemplateBody` quote, and a constant, so the refusal's size does
+/// not follow the request's.
+pub const QUOTED_TEMPLATE_PREFIX: usize = 100;
 
 /// The template body as a refusal QUOTES it: itself where it is no longer than
 /// [`QUOTED_TEMPLATE_PREFIX`], else that much of its leading text followed by a marker
@@ -790,8 +822,9 @@ pub const QUOTED_TEMPLATE_PREFIX: usize = 50;
 /// value is quoted so the caller can see what was refused — which its leading text and its
 /// total length answer, while a message as large as the request would make the refusal a
 /// second copy of the template. What it keeps is cut at a separator where the kept text has
-/// one (so the quote ends on a whole word of the document), else at the character the budget
-/// runs out at, which is what a body written as one unbroken run of characters is quoted by.
+/// one (so the quote ends on a whole word of the document, which is how a recorded refusal of
+/// a body written with separators quotes it), else at the character the budget runs out at,
+/// which is what a body written as one unbroken run of characters is quoted by.
 pub fn quoted_template_body(body: &str) -> String {
     let characters = body.chars().count();
     if characters <= QUOTED_TEMPLATE_PREFIX {
@@ -851,7 +884,17 @@ pub fn missing_auto_expand_capability(
 /// service's reader will not read at all, which is a template-FORM question the submitting
 /// operation answers on its own terms.
 pub fn validate_template_quotas(template_body: &str) -> Result<(), String> {
-    match template::quota_violation(template_body) {
+    validate_template_quotas_within(template_body, TEMPLATE_BODY_MAX_BYTES)
+}
+
+/// [`validate_template_quotas`] under the caller's OWN ceiling on the body
+/// ([`template::quota_violation_within`]): the quotas are the same whatever carried the body,
+/// and the ceiling is the one the operation reading it is held to.
+pub fn validate_template_quotas_within(
+    template_body: &str,
+    max_bytes: usize,
+) -> Result<(), String> {
+    match template::quota_violation_within(template_body, max_bytes) {
         Some(message) => Err(message),
         None => Ok(()),
     }
@@ -866,7 +909,7 @@ pub fn validate_template_quotas(template_body: &str) -> Result<(), String> {
 /// hold to the catalogue and is answered by the template-format rules instead.
 pub fn validate_resource_types(template_body: &str) -> Result<(), String> {
     match template::parse(template_body) {
-        Some(template) => resource_types::refuse_unrecognized(&template),
+        Some(template) => resource_types::refuse_unrecognized(template_body, &template),
         None => Ok(()),
     }
 }
@@ -906,6 +949,25 @@ pub fn validate_submitted_template(
     region: &str,
 ) -> Result<(), String> {
     match template_validation::refusal(template_body, processed, parameters, region) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
+/// `Err(message)` for a template body `ValidateTemplate` refuses — the template-validation
+/// rules a body submitted only to be VALIDATED is held to.
+///
+/// "Validates a specified template" is a verdict on the DOCUMENT, so the rules it applies are
+/// the ones the document decides on its own: the pass is the same list in the same order as
+/// the one a submitted body is held to, minus what resolving the template's intrinsics would
+/// decide ([`template_validation`] owns both readings, so they cannot drift apart).
+pub fn validate_template_for_validation(
+    template_body: &str,
+    processed: &template::Processed,
+    parameters: &BTreeMap<String, String>,
+    region: &str,
+) -> Result<(), String> {
+    match template_validation::validation_refusal(template_body, processed, parameters, region) {
         Some(message) => Err(message),
         None => Ok(()),
     }
@@ -1906,6 +1968,9 @@ pub struct SubmittedChangeSet<'a> {
     pub include_nested_stacks: bool,
     pub import_existing_resources: bool,
     pub deployment_mode: Option<&'a str>,
+    /// `ClientToken`: "a unique identifier for this CreateChangeSet request", which is the
+    /// attribute that says WHICH request a change set under this name was created by.
+    pub client_token: Option<&'a str>,
 }
 
 /// One drift-detection operation on one stack: what `DetectStackDrift` started and
@@ -3416,7 +3481,17 @@ pub fn output_views(outputs: &[StoredOutput]) -> Option<Vec<crate::ops::types::O
 /// `None` for a body this service will not read at all; `Some([])` for one that declares no
 /// resources — which `CreateChangeSet` refuses, since a change set is a plan over resources.
 pub fn declared_template(template_body: &str) -> Option<template::Template> {
-    let mut declared = template::parse(template_body)?;
+    declared_template_within(template_body, TEMPLATE_BODY_MAX_BYTES)
+}
+
+/// [`declared_template`] under the caller's OWN ceiling on the body
+/// ([`template::parse_within`]), for an operation that reads a template larger than the quota
+/// on one submitted for deployment ([`TEMPLATE_MAX_BYTES`]).
+pub fn declared_template_within(
+    template_body: &str,
+    max_bytes: usize,
+) -> Option<template::Template> {
+    let mut declared = template::parse_within(template_body, max_bytes)?;
     declared
         .resources
         .sort_by(|left, right| left.logical_id.cmp(&right.logical_id));
@@ -4224,9 +4299,48 @@ pub fn no_stack_instance_in_region(region: &str) -> String {
 ///
 /// The ONE wording of that condition, shared by every operation whose input carries the
 /// three members (`UpdateStack`, `CreateChangeSet`, `UpdateStackSet`), so the sentence cannot
-/// drift between them.
+/// drift between them. It answers the request that names NO source at all; a request that
+/// reuses the stack's template AND submits one of its own is refused for that COMBINATION
+/// ([`PREVIOUS_AND_SUBMITTED_TEMPLATE`]).
 pub const ONE_TEMPLATE_SOURCE: &str =
     "You must specify exactly one of TemplateBody, TemplateURL or UsePreviousTemplate";
+
+/// The refusal for a request that asks to reuse the stack's existing template AND submits a
+/// template of its own.
+///
+/// `UsePreviousTemplate` ("Reuse the existing template that is associated with the stack")
+/// and a submitted `TemplateBody`/`TemplateURL` are two different templates to act on, so the
+/// request states no one template — a distinct condition from naming no source at all, and
+/// the service words it as its own sentence, naming the member in the lower case the service
+/// spells it with there. The ONE wording of it, shared by every operation whose input carries
+/// the three members, so neither the condition nor its wording is restated per operation.
+pub const PREVIOUS_AND_SUBMITTED_TEMPLATE: &str =
+    "You cannot specify both usePreviousTemplate and Template Body/Template URL.";
+
+/// `Err(message)` for a request that does not state exactly ONE source for the template it
+/// submits, where the input carries all three ways of stating one — the RULE every operation
+/// whose input carries that trio is held to, in one place.
+///
+/// The three conditions are three distinct refusals, each worded for what the request really
+/// states: a template submitted BOTH by value and by reference ([`BOTH_TEMPLATE_SOURCES`],
+/// the rule a request carrying only that pair is held to), a request that reuses the stack's
+/// template while submitting one of its own ([`PREVIOUS_AND_SUBMITTED_TEMPLATE`]), and one
+/// that states no source at all ([`ONE_TEMPLATE_SOURCE`]).
+pub fn validate_template_sources(
+    template_body: Option<&str>,
+    template_url: Option<&str>,
+    use_previous_template: bool,
+) -> Result<(), String> {
+    validate_one_template_source(template_body, template_url)?;
+    let submitted = template_body.is_some() || template_url.is_some();
+    if use_previous_template && submitted {
+        return Err(PREVIOUS_AND_SUBMITTED_TEMPLATE.to_string());
+    }
+    if !use_previous_template && !submitted {
+        return Err(ONE_TEMPLATE_SOURCE.to_string());
+    }
+    Ok(())
+}
 
 /// The `StackStatusReason` of a deletion CloudFormation cancelled because it would have
 /// removed an exported output value another stack still imports: the export, and the stack

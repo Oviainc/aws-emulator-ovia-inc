@@ -290,29 +290,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // "Conditional: You must specify only one of the following parameters: TemplateBody
-        // or TemplateURL—or set UsePreviousTemplate to true." A request carrying the template
-        // BOTH by value and by reference states two templates, which is the condition every
-        // operation whose input carries that pair is held to, in the one place that owns it;
-        // every other way of not naming exactly one source states the condition the model
-        // documents, worded as `UpdateStack` words the same condition in this crate.
-        crate::state::validate_one_template_source(
+        // or TemplateURL—or set UsePreviousTemplate to true." Each way of not stating exactly
+        // one source is its own refusal — the template stated both by value and by reference,
+        // the StackSet's own template reused ALONGSIDE a submitted one, and no source at
+        // all — in the one place that owns the rule and its three sentences.
+        crate::state::validate_template_sources(
             input.template_body.as_deref(),
             input.template_url.as_deref(),
+            input.use_previous_template == Some(true),
         )
         .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-        let template_sources = [
-            input.template_body.is_some(),
-            input.template_url.is_some(),
-            input.use_previous_template == Some(true),
-        ]
-        .into_iter()
-        .filter(|specified| *specified)
-        .count();
-        if template_sources != 1 {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::ONE_TEMPLATE_SOURCE,
-            ));
-        }
         // A `TemplateURL` says WHERE the revised template is, not what it means: the object
         // it addresses is read from this emulator's own Amazon S3 and becomes the body the
         // StackSet carries, so a template submitted by reference and the same one submitted

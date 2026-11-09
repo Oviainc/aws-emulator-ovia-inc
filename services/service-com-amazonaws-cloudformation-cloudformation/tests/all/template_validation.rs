@@ -189,9 +189,20 @@ fn refused() -> Vec<Refused> {
             message: "Unresolved resource dependencies [Stage] in the Resources block",
         },
         Refused {
+            // A lookup into a map the `Mappings` section does not declare is diagnosed for
+            // the MISSING MAP — the section is where its author has to add it — rather than
+            // for the lookup path it took.
             case: "an Fn::FindInMap whose map the Mappings section does not carry",
             template: r#"{"Mappings":{"M":{"top":{"second":"v"}}},"Resources":{"Topic":{"Type":"AWS::SNS::Topic"}},"Outputs":{"V":{"Value":{"Fn::FindInMap":["Other","top","second"]}}}}"#,
-            message: "Unable to get mapping for Other::top::second",
+            message: "Mapping named 'Other' is not present in the 'Mappings' section of template.",
+        },
+        Refused {
+            // A template declaring NO `Mappings` section at all declares no map either, so a
+            // lookup is refused for the map it named there too.
+            case: "an Fn::FindInMap in a template declaring no Mappings section",
+            template: r#"{"Resources":{"Topic":{"Type":"AWS::SNS::Topic"}},"Outputs":{"V":{"Value":{"Fn::FindInMap":["Absent","top","second"]}}}}"#,
+            message:
+                "Mapping named 'Absent' is not present in the 'Mappings' section of template.",
         },
         Refused {
             case: "an Fn::FindInMap whose top-level key the map does not carry",

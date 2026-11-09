@@ -9776,6 +9776,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml",
  "regex",
+ "serde",
  "serde_json",
  "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-apigatewayv2-apigatewayv2",

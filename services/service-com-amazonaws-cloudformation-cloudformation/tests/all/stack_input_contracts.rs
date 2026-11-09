@@ -602,10 +602,13 @@ async fn an_update_is_held_to_the_resource_types_its_request_states() {
 /// A JSON template body of exactly `bytes` characters, padded with `pad` — a single
 /// character, so a body of any size is one unbroken run of text or, where the padding is a
 /// space, a body carrying separators.
+///
+/// The padding goes in `Metadata`, a section whose content the template format bounds by
+/// nothing, rather than in `Description`, which a template may carry only 1024 bytes of.
 fn template_of_size(bytes: usize, pad: char) -> String {
-    const WRAPPER: usize = 18;
+    const WRAPPER: usize = 23;
     format!(
-        r#"{{"Description":"{}"}}"#,
+        r#"{{"Metadata":{{"Pad":"{}"}}}}"#,
         pad.to_string().repeat(bytes - WRAPPER)
     )
 }
@@ -696,22 +699,29 @@ async fn an_inline_template_body_past_its_maximum_is_refused_quoting_the_value()
 
     // One refusal pinned to the LITERAL message a known body is answered with, so the suite
     // states the whole sentence once rather than only agreeing with how it is built: a body
-    // of 51201 `d` characters under the `{"Description":"…"}` wrapper, quoted to the 50
-    // characters a refusal keeps.
+    // of 51201 `d` characters under the `{"Metadata":{"Pad":"…"}}` wrapper, quoted to the
+    // width a refusal keeps — which the sentence below states, so a changed width fails here.
+    assert_eq!(
+        state::QUOTED_TEMPLATE_PREFIX, 100,
+        "the quoted width is the one the recorded refusals of an over-long body show"
+    );
     let body_text = template_of_size(TEMPLATE_BODY_MAX_BYTES + 1, 'd');
     let (code, body) = create_stack(&router, "sized-literal", &body_text, &[]).await;
     assert_eq!(
         code, 400,
         "case \"the pinned refusal\": the body is past the bound, got {code} {body}"
     );
+    let pinned = format!(
+        "1 validation error detected: Value '{{\"Metadata\":{{\"Pad\":\"{}...<51201 chars \
+         total>' at 'templateBody' failed to satisfy constraint: Member must have length less \
+         than or equal to 51200",
+        // The quoted value is the body's leading text: the wrapper, and `d`s up to the width.
+        "d".repeat(state::QUOTED_TEMPLATE_PREFIX - r#"{"Metadata":{"Pad":""#.len())
+    );
     assert_eq!(
         xml_text(&body, "Message").as_deref(),
-        Some(
-            "1 validation error detected: Value '{\"Description\":\"dddddddddddddddddddddddd\
-             dddddddddd...<51201 chars total>' at 'templateBody' failed to satisfy \
-             constraint: Member must have length less than or equal to 51200"
-        ),
-        "case \"the pinned refusal\": expected the whole sentence, got {body}"
+        Some(pinned.as_str()),
+        "case \"the pinned refusal\": expected {pinned:?}, got {body}"
     );
 }
 

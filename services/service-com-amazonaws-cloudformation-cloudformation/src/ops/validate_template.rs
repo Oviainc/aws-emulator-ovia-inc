@@ -230,16 +230,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(refusal) = template::resources_refusal(&template) {
             return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
         }
-        if template
-            .description
-            .as_ref()
-            .is_some_and(|description| description.len() > template::MAX_DESCRIPTION_BYTES)
-        {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "Template format error: Description must be no longer than {} bytes",
-                template::MAX_DESCRIPTION_BYTES
-            )));
-        }
+        // A `Description` past its documented maximum, and a `Mappings` member that is no
+        // map, are template-FORMAT errors this verdict gives in the one wording every
+        // operation that reads a body gives them (`crate::state::template`) — reached below,
+        // with the rest of the template-validation pass.
         // A resource type CloudFormation does not recognise is a template-FORMAT error, and
         // this verdict on the body is held to the same catalogue the operations that SUBMIT
         // a body for deployment hold it to, worded identically: a client validating a
@@ -254,14 +248,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // verdict too, and the body is held to exactly the pass the operations that SUBMIT
         // one hold it to, worded identically
         // (`crate::state::template_validation`). The values in force are the template's own
-        // `Default`s, which is every value a request carrying nothing but a body fixes.
+        // `Default`s, which is every value a request carrying nothing but a body fixes. What
+        // an intrinsic RESOLVES to is not part of the verdict: this operation gives it
+        // without evaluating the template's expressions, so a `Mappings` lookup it makes is
+        // left to the operation that deploys the body.
         let parameters: ::std::collections::BTreeMap<String, String> =
             crate::state::parameters_in_force(template_body, Vec::new())
                 .into_iter()
                 .map(|parameter| (parameter.key, parameter.value))
                 .collect();
         let processed = template::process_with_parameters(template_body, &parameters);
-        crate::state::validate_submitted_template(
+        crate::state::validate_template_for_validation(
             template_body,
             &processed,
             &parameters,

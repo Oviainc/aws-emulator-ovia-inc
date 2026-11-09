@@ -14,8 +14,6 @@
 //! Nothing here reads or writes stored state: every answer is a function of the template
 //! document alone.
 
-use ::std::collections::{BTreeMap, BTreeSet};
-
 use super::template::{self, RequiredCapabilities, Template};
 
 /// Whether `body` INVOKES a macro, so a request submitting it has to acknowledge
@@ -60,19 +58,35 @@ pub fn required_capabilities(body: &str, declared: &Template) -> RequiredCapabil
     required
 }
 
-/// "A list of all the template resource types that are defined in the template": the SET of
-/// types the template's resources have, each once.
+/// "A list of all the template resource types that are defined in the template": ONE entry
+/// per resource the template declares, in the order the BODY declares them.
 ///
-/// A set has no order of its own, and the one CloudFormation reports is not the order the
-/// template happens to declare its resources in — a template declaring a bucket before a role
-/// is summarised with the role first — so the types are reported sorted by name. That is one
-/// answer per template body, however the body spells its `Resources` section and in whatever
-/// order a reader walked it.
-pub fn resource_types(declared: &Template) -> Vec<String> {
-    let types: BTreeSet<String> = template::declared_resource_types(declared)
+/// `ResourceTypes` is a LIST of `ResourceType` rather than a set (the model puts no
+/// `@uniqueItems` on it), and what it reports is what the template DEFINES: a template
+/// declaring the same type for several resources defines that type several times, and a
+/// caller sizing a deployment from this list reads one entry per resource. The order is the
+/// template's own ([`super::declaration_order`]), which `body` is where it is read from — a
+/// resource some other reader contributed (a transform's expansion) follows the declared
+/// ones.
+pub fn resource_types(body: &str, declared: &Template) -> Vec<String> {
+    resources_as_declared(body, declared)
         .into_iter()
-        .collect();
-    types.into_iter().collect()
+        .map(|resource| resource.resource_type.clone())
+        .collect()
+}
+
+/// The template's resources in the order the BODY declares them, which is the order every
+/// member of a summary that reports per-resource is reported in.
+fn resources_as_declared<'a>(
+    body: &str,
+    declared: &'a Template,
+) -> Vec<&'a template::DeclaredResource> {
+    super::declaration_order::as_declared(
+        body,
+        super::declaration_order::RESOURCES,
+        &declared.resources,
+        |resource| resource.logical_id.as_str(),
+    )
 }
 
 /// One `ResourceIdentifierSummary`: the resources of ONE type the template declares, and the
@@ -96,32 +110,31 @@ pub struct IdentifierSummary {
 /// resources": one entry per resource TYPE the template declares, carrying the logical ids
 /// declared with that type and the properties that identify a resource of it.
 ///
-/// A summary describes the resources an import would ADDRESS, so it is ordered by the logical
-/// ids it names: each entry's ids in order, and the entries by the first id of each type. That
-/// is one answer per template body — the order a reader happened to walk the `Resources`
-/// section in is not part of it, and this crate's reader walks a JSON object in whichever
-/// order the build's `serde_json` gives it.
-pub fn identifier_summaries(declared: &Template) -> Vec<IdentifierSummary> {
-    let mut logical_ids: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for resource in &declared.resources {
-        logical_ids
-            .entry(resource.resource_type.as_str())
-            .or_default()
-            .insert(resource.logical_id.as_str());
+/// Everything about the answer follows the order the BODY declares its resources in
+/// ([`super::declaration_order`]): "the logical IDs of the target resources of the specified
+/// ResourceType, AS DEFINED IN THE IMPORT TEMPLATE" are listed in that order, and the entries
+/// themselves follow the first resource declared with each type.
+pub fn identifier_summaries(body: &str, declared: &Template) -> Vec<IdentifierSummary> {
+    let mut summaries: Vec<IdentifierSummary> = Vec::new();
+    for resource in resources_as_declared(body, declared) {
+        match summaries
+            .iter_mut()
+            .find(|summary| summary.resource_type == resource.resource_type)
+        {
+            Some(summary) => {
+                if !summary.logical_resource_ids.contains(&resource.logical_id) {
+                    summary.logical_resource_ids.push(resource.logical_id.clone());
+                }
+            }
+            None => summaries.push(IdentifierSummary {
+                resource_identifiers: super::primary_identifier::properties(
+                    &resource.resource_type,
+                ),
+                resource_type: resource.resource_type.clone(),
+                logical_resource_ids: vec![resource.logical_id.clone()],
+            }),
+        }
     }
-    let mut summaries: Vec<IdentifierSummary> = logical_ids
-        .into_iter()
-        .map(|(resource_type, ids)| IdentifierSummary {
-            resource_identifiers: super::primary_identifier::properties(resource_type),
-            resource_type: resource_type.to_string(),
-            logical_resource_ids: ids.into_iter().map(str::to_string).collect(),
-        })
-        .collect();
-    summaries.sort_by(|one, other| {
-        one.logical_resource_ids
-            .first()
-            .cmp(&other.logical_resource_ids.first())
-    });
     summaries
 }
 
@@ -178,41 +191,44 @@ mod tests {
         }
     }
 
-    /// The types a template defines are reported as a SET, sorted by name rather than in the
-    /// order the body declares its resources.
+    /// The types a template defines are reported one per DECLARED RESOURCE, in the order the
+    /// BODY declares them — a repeated type is reported as many times as it is declared.
     #[test]
-    fn the_resource_types_are_the_sorted_set_of_the_types_declared() {
+    fn the_resource_types_report_one_entry_per_declared_resource() {
         let body = r#"{"Resources":{
             "Zebra":{"Type":"AWS::S3::Bucket"},
             "Alpha":{"Type":"AWS::IAM::Role"},
             "Beta":{"Type":"AWS::S3::Bucket"}}}"#;
         let declared = template::parse(body).expect("a readable template");
-        let reported = resource_types(&declared);
+        let reported = resource_types(body, &declared);
         assert_eq!(
             reported,
-            vec!["AWS::IAM::Role".to_string(), "AWS::S3::Bucket".to_string()],
-            "case \"a bucket declared before a role\": expected the sorted set, got \
-             {reported:?}"
+            vec![
+                "AWS::S3::Bucket".to_string(),
+                "AWS::IAM::Role".to_string(),
+                "AWS::S3::Bucket".to_string()
+            ],
+            "case \"two buckets and a role, declared out of alphabetical order\": expected one \
+             entry per declared resource in declared order, got {reported:?}"
         );
     }
 
     /// One summary per type, carrying every logical id declared with it and that type's
-    /// primary identifier, ordered by the logical ids they name — whichever order the build's
-    /// reader walked the `Resources` section in.
+    /// primary identifier, in the order the BODY declares the resources.
     #[test]
     fn one_identifier_summary_describes_each_type_the_template_declares() {
         let body = r#"{"Resources":{
             "Data":{"Type":"AWS::S3::Bucket"},
-            "Archive":{"Type":"AWS::S3::Bucket"},
-            "Notify":{"Type":"AWS::SNS::Topic"}}}"#;
+            "Notify":{"Type":"AWS::SNS::Topic"},
+            "Archive":{"Type":"AWS::S3::Bucket"}}}"#;
         let declared = template::parse(body).expect("a readable template");
-        let reported = identifier_summaries(&declared);
+        let reported = identifier_summaries(body, &declared);
         assert_eq!(
             reported,
             vec![
                 IdentifierSummary {
                     resource_type: "AWS::S3::Bucket".to_string(),
-                    logical_resource_ids: vec!["Archive".to_string(), "Data".to_string()],
+                    logical_resource_ids: vec!["Data".to_string(), "Archive".to_string()],
                     resource_identifiers: vec!["BucketName".to_string()],
                 },
                 IdentifierSummary {
@@ -221,7 +237,7 @@ mod tests {
                     resource_identifiers: vec!["TopicArn".to_string()],
                 },
             ],
-            "case \"two buckets and a topic\": got {reported:?}"
+            "case \"a bucket, a topic and a second bucket\": got {reported:?}"
         );
     }
 }

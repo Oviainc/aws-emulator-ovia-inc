@@ -132,6 +132,76 @@ pub const MAX_OUTPUTS_PER_TEMPLATE: usize = 200;
 /// members that report it (`ValidateTemplateOutput$Description`).
 pub const MAX_DESCRIPTION_BYTES: usize = 1024;
 
+/// How the service refuses a template whose `Description` is past that maximum: the SECTION
+/// it is about, quoted, and the length it may not exceed.
+///
+/// Worded once, in the one place the bound lives, so the operations that read a body cannot
+/// word the same template-format error two ways.
+pub fn description_too_long() -> String {
+    format!("Template format error: 'Description' length is greater than {MAX_DESCRIPTION_BYTES}.")
+}
+
+/// How the service refuses a `Mappings` member that is not a map: "Mappings: a mapping of keys
+/// and associated values", so each member of the section is a mapping of its top-level keys to
+/// the mappings that hold their values, and the refusal names the member that is not one.
+fn mappings_member_not_a_map(name: &str) -> String {
+    format!("Template format error: Every Mappings member {name} must be a map")
+}
+
+/// Whether one member of the `Mappings` section is spelled as a mapping is: an object whose
+/// own members are the mappings a lookup's second key reads
+/// (`Mappings` → map name → top-level key → second-level key → value).
+///
+/// A top-level key whose value is EMPTY (a YAML key with nothing under it) states no entry
+/// rather than a wrong structure, exactly as an empty SECTION does ([`section_map`]), and a
+/// top-level key whose name is a language-extensions DIRECTIVE ([`FOR_EACH_PREFIX`]) is a loop
+/// over entries rather than one of them — answered by the rules about that directive.
+fn is_a_mapping(stated: &Value) -> bool {
+    stated.as_object().is_some_and(|declared| {
+        declared.iter().all(|(key, value)| {
+            value.is_object() || value.is_null() || key.starts_with(FOR_EACH_PREFIX)
+        })
+    })
+}
+
+/// `Some(message)` for a template document whose SECTIONS are spelled in a way the template
+/// format does not admit, or `None` for one whose spelling it does.
+///
+/// These are template-FORMAT rules: each is decided from the document alone, with nothing
+/// resolved and nothing deployed, which is why every operation that READS a body — the ones
+/// that submit it, the one that validates it and the ones that only report on it — gives the
+/// same verdict, worded once here.
+///
+/// * `Description` "must be a literal string that's between 0 and 1024 bytes in length"
+///   ([`MAX_DESCRIPTION_BYTES`]);
+/// * each member of `Mappings` is "a mapping of keys and associated values", so a member that
+///   is not one — one that is no object, or whose own top-level keys do not hold the mappings
+///   a lookup reads ([`is_a_mapping`]) — declares no mapping at all. The member reported is
+///   the FIRST one the body declares ([`super::declaration_order`]), which is where its author
+///   reads it; a member whose name is a language-extensions DIRECTIVE ([`FOR_EACH_PREFIX`])
+///   declares no mapping either way and is answered by the rules about that directive.
+///
+/// The sections are checked in the order a template states them.
+pub fn format_refusal(body: &str, declared: &Template) -> Option<String> {
+    if declared
+        .description
+        .as_deref()
+        .is_some_and(|description| description.len() > MAX_DESCRIPTION_BYTES)
+    {
+        return Some(description_too_long());
+    }
+    let members: Vec<(&String, &Value)> = declared.mappings.as_object()?.iter().collect();
+    super::declaration_order::as_declared(
+        body,
+        super::declaration_order::MAPPINGS,
+        &members,
+        |(name, _)| name.as_str(),
+    )
+    .into_iter()
+    .find(|(name, stated)| !is_a_mapping(stated) && !name.starts_with(FOR_EACH_PREFIX))
+    .map(|(name, _)| mappings_member_not_a_map(name))
+}
+
 /// The most attributes one provisioned resource records for `Fn::GetAtt` to read.
 ///
 /// A resource's attributes are its type's published return values, the conventional
@@ -153,6 +223,10 @@ pub const AVAILABILITY_ZONES_PER_REGION: usize = 3;
 /// The most parameters one template declares. The documented CloudFormation quota
 /// ("Parameters — maximum number of parameters that you can declare in a template: 200").
 pub const MAX_PARAMETERS_PER_TEMPLATE: usize = 200;
+
+/// The most mappings one template declares. The documented CloudFormation quota ("Mappings —
+/// maximum number of mappings that you can declare in your template: 200").
+pub const MAX_MAPPINGS_PER_TEMPLATE: usize = 200;
 
 /// How deep one intrinsic-function expression may nest before it is left unevaluated.
 /// Chosen: deeper than any `Fn::Join`/`Fn::Sub`/`Fn::GetAtt` composition a template
@@ -281,7 +355,7 @@ impl Default for Budget {
 /// depth only while it is open. Over-counting (a `[` inside a quoted scalar) is the only
 /// failure mode, and each bound sits far above the nesting a CloudFormation template
 /// written in YAML reaches.
-fn guard_yaml_body(body: &str, max_bytes: usize) -> Option<()> {
+pub(super) fn guard_yaml_body(body: &str, max_bytes: usize) -> Option<()> {
     if body.len() > max_bytes {
         return None;
     }
@@ -740,7 +814,14 @@ pub fn insufficient_capabilities_message(missing: &[String]) -> String {
 /// reader will not read declares no resources and no outputs rather than a subset of them.
 /// [`not_well_formed`] is how every operation refuses such a body.
 pub fn parse(body: &str) -> Option<Template> {
-    let mut document = document(body)?;
+    parse_within(body, super::TEMPLATE_BODY_MAX_BYTES)
+}
+
+/// [`parse`] under the caller's OWN ceiling on the body ([`document_within`]): the maximum
+/// SIZE of a body is a quota of the API that takes it rather than a property of the format, so
+/// an operation that reads a template larger than the inline-submission quota reads it here.
+pub fn parse_within(body: &str, max_bytes: usize) -> Option<Template> {
+    let mut document = document_within(body, max_bytes)?;
     super::sam::expand(&mut document);
     template_of(&document)
 }
@@ -934,7 +1015,14 @@ pub fn resources_refusal(declared: &Template) -> Option<String> {
 /// `DescribeAccountLimits` advertises, and an advertised ceiling a write is not held to is
 /// no ceiling.
 pub fn quota_violation(body: &str) -> Option<String> {
-    let mut document = document(body)?;
+    quota_violation_within(body, super::TEMPLATE_BODY_MAX_BYTES)
+}
+
+/// [`quota_violation`] under the caller's OWN ceiling on the body, for an operation that reads
+/// a template larger than the inline-submission quota ([`parse_within`]): the per-template
+/// quotas are the same whatever carried the body.
+pub fn quota_violation_within(body: &str, max_bytes: usize) -> Option<String> {
+    let mut document = document_within(body, max_bytes)?;
     super::sam::expand(&mut document);
     quota_violation_in(&document)
 }
@@ -947,31 +1035,66 @@ fn quota_violation_in(document: &Value) -> Option<String> {
     // however its body is spelled.
     METERED_SECTIONS
         .iter()
-        .find_map(|(section, counted, quota)| {
+        .find_map(|(section, worded, quota)| {
             let declared = document
                 .get(section)
                 .and_then(Value::as_object)
                 .map_or(0, Map::len);
-            (declared > *quota).then(|| {
-                format!(
-                    "Template format error: {counted} count {declared} is greater than max \
-                     allowed {quota}"
-                )
-            })
+            (declared > *quota).then(|| worded(declared, *quota))
         })
 }
 
-/// The sections the template reader meters, each with the quota on it and the noun its
-/// refusal counts that section's entries by.
+/// How the service words the refusal of a section past the count quota on it: the noun the
+/// limit is stated with, the count the template DECLARES and the maximum.
 ///
-/// The noun is the SERVICE's wording for that ONE limit rather than something derived from
-/// the section's key: a parameter and a resource are counted in the singular, the outputs by
-/// the section's own plural. Recorded behaviour, so each is listed rather than computed —
-/// pluralising or singularising them together would word one limit's refusal with another's.
-const METERED_SECTIONS: &[(&str, &str, usize)] = &[
-    ("Parameters", "Parameter", MAX_PARAMETERS_PER_TEMPLATE),
-    ("Resources", "Resource", MAX_RESOURCES_PER_TEMPLATE),
-    ("Outputs", "Outputs", MAX_OUTPUTS_PER_TEMPLATE),
+/// The sections the template reader meters do not share ONE sentence — recorded behaviour, so
+/// each form is written out rather than derived from the section's key. The `Resources` quota
+/// is worded as a NUMBER OF things against a maximum ([`numbered_section_violation`]); the
+/// `Parameters`, `Mappings` and `Outputs` quotas are worded as a COUNT against a maximum
+/// ([`counted_section_violation`]), each with the noun that limit is stated with.
+fn numbered_section_violation(plural: &str, declared: usize, quota: usize) -> String {
+    format!(
+        "Template format error: Number of {plural}, {declared}, is greater than maximum \
+         allowed, {quota}"
+    )
+}
+
+/// See [`numbered_section_violation`].
+fn counted_section_violation(counted: &str, declared: usize, quota: usize) -> String {
+    format!(
+        "Template format error: {counted} count {declared} is greater than max allowed {quota}"
+    )
+}
+
+/// The sections the template reader meters, each with the quota on it and the sentence its
+/// refusal is worded with.
+///
+/// The wording is the SERVICE's for that ONE limit rather than something derived from the
+/// section's key, so each is listed rather than computed — wording them together would word
+/// one limit's refusal with another's.
+type SectionQuota = (&'static str, fn(usize, usize) -> String, usize);
+
+const METERED_SECTIONS: &[SectionQuota] = &[
+    (
+        "Parameters",
+        |declared, quota| counted_section_violation("Parameter", declared, quota),
+        MAX_PARAMETERS_PER_TEMPLATE,
+    ),
+    (
+        "Mappings",
+        |declared, quota| counted_section_violation("Mappings", declared, quota),
+        MAX_MAPPINGS_PER_TEMPLATE,
+    ),
+    (
+        "Resources",
+        |declared, quota| numbered_section_violation("resources", declared, quota),
+        MAX_RESOURCES_PER_TEMPLATE,
+    ),
+    (
+        "Outputs",
+        |declared, quota| counted_section_violation("Outputs", declared, quota),
+        MAX_OUTPUTS_PER_TEMPLATE,
+    ),
 ];
 
 /// The `Description` a template declares, if it declares one.

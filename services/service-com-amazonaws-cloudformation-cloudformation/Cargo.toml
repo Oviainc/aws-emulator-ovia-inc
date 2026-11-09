@@ -30,6 +30,11 @@ tokio = { workspace = true, features = ["time", "rt"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# Reads the ORDER a template body declares one of its sections in, which a loaded
+# `serde_json::Value` no longer carries (its object members are sorted): the JSON spelling is
+# walked with serde's own map visitor rather than with a second parser of the format
+# (`state::declaration_order`).
+serde = { workspace = true }
 tracing = { workspace = true }
 # Signs the in-process call a stack's resource provisioning makes to the service that
 # owns the resource: the emulator verifies every request signature, and the credential

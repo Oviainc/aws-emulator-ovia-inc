@@ -82,6 +82,11 @@ const ONE_TEMPLATE_SOURCE: &str =
 /// out here for the same reason.
 const BOTH_TEMPLATE_SOURCES: &str = "You cannot specify both Template URL and Template Body.";
 
+/// The refusal for a request that asks to keep the StackSet's own template AND submits one of
+/// its own, spelled out here for the same reason.
+const PREVIOUS_AND_SUBMITTED_TEMPLATE: &str =
+    "You cannot specify both usePreviousTemplate and Template Body/Template URL.";
+
 /// A `TemplateURL` for the rows that name a second template source: the refusal for naming
 /// more than one is answered before anything is fetched, so what the URL addresses never
 /// matters to those rows.
@@ -610,12 +615,19 @@ async fn an_update_must_name_exactly_one_source_for_its_template() {
             "case {case:?}: expected <Code>ValidationError</Code>, got {body}"
         );
         // A row naming the template BOTH by value and by reference states two templates,
-        // which is the refusal every operation that takes that pair gives it; every other
-        // way of not naming exactly one source states the three-way condition.
-        let names_both = source.members.iter().any(|(key, _)| *key == "TemplateBody")
-            && source.members.iter().any(|(key, _)| *key == "TemplateURL");
-        let expected = if names_both {
+        // which is the refusal every operation that takes that pair gives it; a row that
+        // keeps the StackSet's own template while submitting one of its own is refused for
+        // that combination; and a row naming no source at all states the three-way condition.
+        let states = |name: &str| source.members.iter().any(|(key, _)| *key == name);
+        let expected = if states("TemplateBody") && states("TemplateURL") {
             BOTH_TEMPLATE_SOURCES
+        } else if source
+            .members
+            .iter()
+            .any(|(key, value)| *key == "UsePreviousTemplate" && *value == "true")
+            && (states("TemplateBody") || states("TemplateURL"))
+        {
+            PREVIOUS_AND_SUBMITTED_TEMPLATE
         } else {
             ONE_TEMPLATE_SOURCE
         };

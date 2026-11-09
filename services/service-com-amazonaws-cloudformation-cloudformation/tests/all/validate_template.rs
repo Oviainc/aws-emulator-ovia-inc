@@ -527,7 +527,7 @@ async fn validate_template_refuses_a_body_it_cannot_report_on() {
             code: "ValidationError",
             // The bound comes from the one place that carries it, so a row cannot
             // re-state a literal the handler also spells.
-            message: format!("Description must be no longer than {MAX_DESCRIPTION_BYTES} bytes"),
+            message: format!("'Description' length is greater than {MAX_DESCRIPTION_BYTES}."),
         },
         RefusalCase {
             case: "neither TemplateBody nor TemplateURL",

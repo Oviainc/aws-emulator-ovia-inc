@@ -9,27 +9,30 @@
 //! and the maximum it is past — rather than accepting it and deploying a stack holding none
 //! of what it declared. A body AT a quota is accepted and deployed in full.
 //!
-//! The table spans the class the rule generalises over: each of the three sections the
-//! template reader meters (`Parameters`, `Resources`, `Outputs`), each at its published
+//! The table spans the class the rule generalises over: each of the sections the template
+//! reader meters (`Parameters`, `Mappings`, `Resources`, `Outputs`), each at its published
 //! bound and one entry past it, and each operation that takes a `TemplateBody`
-//! (`CreateStack`, `UpdateStack`, `CreateChangeSet`, `ValidateTemplate`). The quotas
+//! (`CreateStack`, `UpdateStack`, `CreateChangeSet`, `ValidateTemplate`,
+//! `GetTemplateSummary`). The quotas
 //! themselves are the crate's own constants, which are also the ceilings
 //! `DescribeAccountLimits` advertises for the account (`account_limits.rs`).
 
 use crate::stack_lifecycle::{call, create_stack, member, router, wait_for_the_transition, xml_text};
 use service_com_amazonaws_cloudformation_cloudformation::state::template::{
-    MAX_OUTPUTS_PER_TEMPLATE, MAX_PARAMETERS_PER_TEMPLATE, MAX_RESOURCES_PER_TEMPLATE,
+    MAX_MAPPINGS_PER_TEMPLATE, MAX_OUTPUTS_PER_TEMPLATE, MAX_PARAMETERS_PER_TEMPLATE,
+    MAX_RESOURCES_PER_TEMPLATE,
 };
 
 /// One section of a template, its documented quota, and a declaration to repeat in it.
 struct Section {
     /// The section as the template spells it.
     name: &'static str,
-    /// The noun the refusal counts this section's entries by. It is the SERVICE's wording
-    /// for that one limit rather than anything derived from the section's key — a parameter
-    /// and a resource are counted in the singular, the outputs by the section's own plural
-    /// — so each row spells the noun its own limit is worded with.
-    entry_name: &'static str,
+    /// The sentence the refusal of a body past this section's quota is worded with, given
+    /// the count the body declares. It is the SERVICE's wording for that ONE limit rather
+    /// than anything derived from the section's key — the resources are counted as a NUMBER
+    /// OF things, the other sections by a COUNT, each with its own noun — so each row spells
+    /// the sentence its own limit is refused with.
+    refusal: fn(usize, usize) -> String,
     quota: usize,
     /// One entry of this section, given its index.
     entry: fn(usize) -> (String, serde_json::Value),
@@ -40,7 +43,12 @@ fn sections() -> Vec<Section> {
     vec![
         Section {
             name: "Parameters",
-            entry_name: "Parameter",
+            refusal: |declared, quota| {
+                format!(
+                    "Template format error: Parameter count {declared} is greater than max \
+                     allowed {quota}"
+                )
+            },
             quota: MAX_PARAMETERS_PER_TEMPLATE,
             // A parameter carrying a default needs no value from the request, so a body at
             // the quota is submittable as it stands.
@@ -52,8 +60,29 @@ fn sections() -> Vec<Section> {
             },
         },
         Section {
+            name: "Mappings",
+            refusal: |declared, quota| {
+                format!(
+                    "Template format error: Mappings count {declared} is greater than max \
+                     allowed {quota}"
+                )
+            },
+            quota: MAX_MAPPINGS_PER_TEMPLATE,
+            entry: |index| {
+                (
+                    format!("Map{index:04}"),
+                    serde_json::json!({"us-east-1": {"Value": "value"}}),
+                )
+            },
+        },
+        Section {
             name: "Resources",
-            entry_name: "Resource",
+            refusal: |declared, quota| {
+                format!(
+                    "Template format error: Number of resources, {declared}, is greater than \
+                     maximum allowed, {quota}"
+                )
+            },
             quota: MAX_RESOURCES_PER_TEMPLATE,
             entry: |index| {
                 (
@@ -64,7 +93,12 @@ fn sections() -> Vec<Section> {
         },
         Section {
             name: "Outputs",
-            entry_name: "Outputs",
+            refusal: |declared, quota| {
+                format!(
+                    "Template format error: Outputs count {declared} is greater than max \
+                     allowed {quota}"
+                )
+            },
             quota: MAX_OUTPUTS_PER_TEMPLATE,
             entry: |index| {
                 (
@@ -85,10 +119,7 @@ fn template_with(section: &Section, count: usize) -> String {
 
 /// The refusal a body past `section`'s quota is answered with.
 fn expected_message(section: &Section, declared: usize) -> String {
-    format!(
-        "Template format error: {} count {declared} is greater than max allowed {}",
-        section.entry_name, section.quota
-    )
+    (section.refusal)(declared, section.quota)
 }
 
 #[tokio::test]
@@ -187,6 +218,12 @@ async fn every_operation_that_submits_a_template_is_held_to_the_same_quota() {
         ),
         (
             "ValidateTemplate",
+            vec![member("TemplateBody", &over_quota)],
+        ),
+        // The operations that only READ a body are held to the same quotas: a template
+        // CloudFormation will never accept is not summarised as a valid one.
+        (
+            "GetTemplateSummary",
             vec![member("TemplateBody", &over_quota)],
         ),
     ] {

@@ -12,6 +12,9 @@
 //! the refusal the same way: the three that submit one for deployment — `CreateStack`,
 //! `UpdateStack`, `CreateChangeSet` — and `ValidateTemplate`, whose whole answer IS a
 //! verdict on the body, over the values the template's own `Default`s put in force.
+//! `ValidateTemplate` reads that pass through [`validation_refusal`]: its verdict is on what
+//! the DOCUMENT decides, so the one rule it is not held to is the one that evaluates what an
+//! intrinsic resolves to.
 //!
 //! Every rule here is decided from the template DOCUMENT alone, which is what makes it a
 //! rule about the request rather than about the deployment:
@@ -37,7 +40,10 @@
 //!   unresolved dependency too — the creation order it asks for cannot be resolved, and that
 //!   is decided from the document before anything is provisioned;
 //! * an `Fn::FindInMap` whose keys the `Mappings` section does not carry resolves to
-//!   nothing — unless the lookup names a `DefaultValue` to fall back to;
+//!   nothing — unless the lookup names a `DefaultValue` to fall back to — and one naming a
+//!   map that section does not declare at all is reported for the missing map; this is the
+//!   one rule decided by EVALUATING the lookup, so only a body submitted for deployment is
+//!   held to it;
 //! * and a dependency CYCLE among the declared resources is refused, since no creation
 //!   order satisfies it.
 //!
@@ -100,6 +106,44 @@ pub fn refusal(
     supplied: &BTreeMap<String, String>,
     region: &str,
 ) -> Option<String> {
+    pass(body, processed, supplied, region, Pass::Submitted)
+}
+
+/// Which pass over a body this is: what the operation reading it DOES with the template is
+/// what decides which rules the body is held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// A body submitted for DEPLOYMENT (`CreateStack`, `UpdateStack`, `CreateChangeSet`):
+    /// every rule here, since the values the deployment would run with are the ones in force.
+    Submitted,
+    /// A body submitted only to be VALIDATED (`ValidateTemplate`): the rules the DOCUMENT
+    /// decides on its own. What a `Mappings` lookup resolves to is not among them — "validates
+    /// a specified template" is a verdict on the template's form and its own declarations, and
+    /// CloudFormation does not evaluate the template's intrinsics to give it, so a lookup this
+    /// body makes is left to the operation that deploys it.
+    Validated,
+}
+
+/// [`refusal`] for a body submitted to be VALIDATED rather than deployed: every rule the
+/// DOCUMENT decides on its own, and none that evaluates what an intrinsic resolves to.
+pub fn validation_refusal(
+    body: &str,
+    processed: &template::Processed,
+    supplied: &BTreeMap<String, String>,
+    region: &str,
+) -> Option<String> {
+    pass(body, processed, supplied, region, Pass::Validated)
+}
+
+/// The whole pass, which [`refusal`] and [`validation_refusal`] are the two readings of: one
+/// list of rules in one order, so the two cannot drift apart about anything they share.
+fn pass(
+    body: &str,
+    processed: &template::Processed,
+    supplied: &BTreeMap<String, String>,
+    region: &str,
+    reading: Pass,
+) -> Option<String> {
     // A body that is no template DOCUMENT at all is refused for its FORM, in the one place
     // that verdict lives: "CloudFormation first checks if the template is valid JSON ... if
     // both these checks fail, CloudFormation returns a template validation error", and a body
@@ -138,25 +182,37 @@ pub fn refusal(
     // A body past a documented per-template quota is refused by that rule, which the
     // submitting operation applies on its own; nothing here reports part of such a template.
     let template = template::parse(deployed)?;
+    // A section whose own STRUCTURE the template format fixes is held to it: a `Description`
+    // past its documented maximum, and a `Mappings` member that is no map. Both are
+    // template-FORMAT errors decided from the document alone, which is why this pass and the
+    // operations that only report on a body give the same verdict
+    // ([`super::template::format_refusal`]).
+    if let Some(message) = template::format_refusal(deployed, &template) {
+        return Some(message);
+    }
     if let Some(message) = arity_refusal(&template) {
         return Some(message);
     }
     if let Some(message) = unresolved_refusal(&template) {
         return Some(message);
     }
-    // What an expression inside a lookup resolves to: the parameters in force — the values
-    // the request passed, over the template's own declared defaults — and the pseudo
-    // parameters whose value this request fixes.
-    let mut values = template.parameter_defaults();
-    for (key, value) in supplied {
-        values.insert(key.clone(), value.clone());
-    }
-    let resolved = Resolution {
-        parameters: &values,
-        region,
-    };
-    if let Some(message) = mapping_refusal(&template, &resolved) {
-        return Some(message);
+    // What a `Mappings` lookup resolves to is EVALUATED work: the values the deployment would
+    // run with decide it, so only the pass over a body submitted FOR DEPLOYMENT makes it.
+    if reading == Pass::Submitted {
+        // What an expression inside a lookup resolves to: the parameters in force — the values
+        // the request passed, over the template's own declared defaults — and the pseudo
+        // parameters whose value this request fixes.
+        let mut values = template.parameter_defaults();
+        for (key, value) in supplied {
+            values.insert(key.clone(), value.clone());
+        }
+        let resolved = Resolution {
+            parameters: &values,
+            region,
+        };
+        if let Some(message) = mapping_refusal(&template, &resolved) {
+            return Some(message);
+        }
     }
     cycle_refusal(&template)
 }
@@ -502,10 +558,11 @@ fn countable(argument: &Value) -> bool {
 const LENGTH_PARAMETERS: &str = "Template error: every Fn::Length object requires a list, \
                                  or a function that returns one";
 
-/// How an `Fn::FindInMap` that does not name a map and two keys is refused.
+/// How an `Fn::FindInMap` that does not name a map and two keys is refused. Fixed text, as
+/// the service words it: the three parameters are named as that refusal names them.
 const FIND_IN_MAP_PARAMETERS: &str = "Template error: every Fn::FindInMap object requires \
-                                      three parameters, the map name, the top-level key, \
-                                      and the second-level key";
+                                      three parameters, the map name, map key and the \
+                                      attribute for return value";
 
 /// How an `Fn::If` that does not name a condition and both values is refused.
 const IF_PARAMETERS: &str = "Template error: every Fn::If object requires three \
@@ -913,6 +970,11 @@ fn mapping_in(
 }
 
 /// `Some(message)` when ONE `Fn::FindInMap`'s lookup misses and it carries no default.
+///
+/// The miss is diagnosed where it happens: a lookup naming a map the `Mappings` section does
+/// not declare at all is reported for that MAP — the section is where its author has to add
+/// it — while one whose map is declared but whose keys that map does not carry is reported
+/// for the lookup it made.
 fn lookup_refusal(
     argument: &Value,
     mappings: &Value,
@@ -930,9 +992,21 @@ fn lookup_refusal(
     if found_in(mappings, &map, &top, &second).is_some() || carries_default(keys) {
         return None;
     }
+    if mappings.get(map.as_str()).is_none() {
+        return Some(mapping_not_present(&map));
+    }
     Some(format!(
         "Template error: Unable to get mapping for {map}::{top}::{second}"
     ))
+}
+
+/// How a lookup into a map the template does not declare is refused: the map it named, taken
+/// from the intrinsic, inside fixed text naming the section that would have to declare it.
+fn mapping_not_present(map: &str) -> String {
+    format!(
+        "Template error: Mapping named '{map}' is not present in the 'Mappings' section of \
+         template."
+    )
 }
 
 /// Whether an `Fn::FindInMap`'s arguments name a `DefaultValue` for the lookup to fall back

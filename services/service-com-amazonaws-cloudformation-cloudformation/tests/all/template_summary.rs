@@ -190,8 +190,9 @@ fn cases() -> Vec<Case> {
             capabilities: Vec::new(),
             reason_types: Vec::new(),
             // "A list of all the template resource types that are defined in the template":
-            // a type two resources share is one entry.
-            resource_types: vec!["AWS::S3::Bucket", "AWS::SNS::Topic"],
+            // one entry per declared resource, so a type two resources share is two entries,
+            // in the order the reader holds the resources in (by logical id).
+            resource_types: vec!["AWS::S3::Bucket", "AWS::SNS::Topic", "AWS::S3::Bucket"],
             transforms: Vec::new(),
         },
         Case {
@@ -218,8 +219,8 @@ fn cases() -> Vec<Case> {
             resource_types: vec![
                 "AWS::S3::Bucket",
                 "AWS::S3Tables::TableBucket",
-                "AWS::S3Vectors::Index",
                 "AWS::S3Vectors::VectorBucket",
+                "AWS::S3Vectors::Index",
             ],
             transforms: Vec::new(),
         },
@@ -415,8 +416,7 @@ async fn get_template_summary_reports_what_the_template_declares() {
         assert_eq!(
             wire_list(&body, "ResourceTypes"),
             case.resource_types,
-            "case {label:?}: expected the sorted set of every declared resource type, got \
-             {body}"
+            "case {label:?}: expected one entry per declared resource type, got {body}"
         );
         assert_eq!(
             wire_list(&body, "DeclaredTransforms"),
@@ -643,7 +643,26 @@ fn warning_cases() -> Vec<WarningCase> {
             })
             .to_string(),
             unrecognized: vec!["AWS::Nonesuch::Thing", "Example::Private::Resource"],
-            resource_types: vec!["AWS::Nonesuch::Thing", "Example::Private::Resource"],
+            resource_types: vec![
+                "AWS::Nonesuch::Thing",
+                "AWS::Nonesuch::Thing",
+                "Example::Private::Resource",
+            ],
+        },
+        WarningCase {
+            // The configuration asked for warnings and this template gives them nothing to
+            // name: the warnings are reported all the same, which is what lets a caller tell
+            // "no unrecognized types" from "warnings not produced".
+            case: "a template of recognised types only",
+            template: json!({
+                "Resources": {
+                    "Bucket": {"Type": "AWS::S3::Bucket"},
+                    "Topic": {"Type": "AWS::SNS::Topic"}
+                }
+            })
+            .to_string(),
+            unrecognized: Vec::new(),
+            resource_types: vec!["AWS::S3::Bucket", "AWS::SNS::Topic"],
         },
     ]
 }
@@ -655,28 +674,42 @@ async fn unrecognized_resource_types_are_warnings_only_where_the_request_asks_fo
         let label = case.case;
         // Without the configuration: "any unrecognized resource types generate warnings and
         // not an error" is what the configuration BUYS, so a template declaring one is
-        // refused here.
+        // refused here — and one declaring none is summarised, with no warnings at all.
         let (status, body) = summarise_body(&router, &case.template).await;
-        assert_eq!(
-            status, 400,
-            "case {label:?}: expected 400 without the warnings configuration, got \
-             {status} {body}"
-        );
-        assert_eq!(
-            xml_text(&body, "Code").as_deref(),
-            Some("ValidationError"),
-            "case {label:?}: expected the wire code ValidationError, got {body}"
-        );
-        let message = xml_text(&body, "Message").unwrap_or_default();
-        for unrecognized in &case.unrecognized {
-            assert!(
-                message.contains(unrecognized),
-                "case {label:?}: expected the refusal to name {unrecognized:?}, got \
-                 {message:?}"
+        if case.unrecognized.is_empty() {
+            assert_eq!(
+                status, 200,
+                "case {label:?}: expected 200 for a template of recognised types, got \
+                 {status} {body}"
             );
+            assert!(
+                !body.contains("<Warnings"),
+                "case {label:?}: expected no Warnings where the request asked for none, got \
+                 {body}"
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {label:?}: expected 400 without the warnings configuration, got \
+                 {status} {body}"
+            );
+            assert_eq!(
+                xml_text(&body, "Code").as_deref(),
+                Some("ValidationError"),
+                "case {label:?}: expected the wire code ValidationError, got {body}"
+            );
+            let message = xml_text(&body, "Message").unwrap_or_default();
+            for unrecognized in &case.unrecognized {
+                assert!(
+                    message.contains(unrecognized),
+                    "case {label:?}: expected the refusal to name {unrecognized:?}, got \
+                     {message:?}"
+                );
+            }
         }
 
-        // With it: the summary is answered, and the warning names the types.
+        // With it: the summary is answered, and the warnings are reported — naming the types
+        // the catalogue does not recognise, and naming none where there is none to name.
         let (status, body) = call(
             &router,
             "GetTemplateSummary",
@@ -693,6 +726,10 @@ async fn unrecognized_resource_types_are_warnings_only_where_the_request_asks_fo
             status, 200,
             "case {label:?}: expected 200 with the warnings configuration, got \
              {status} {body}"
+        );
+        assert!(
+            body.contains("<Warnings"),
+            "case {label:?}: expected the warnings the configuration asked for, got {body}"
         );
         assert_eq!(
             wire_list(&body, "UnrecognizedResourceTypes"),
@@ -762,7 +799,9 @@ async fn get_template_summary_refuses_a_request_it_cannot_summarise() {
             members: Vec::new(),
             status: 400,
             code: "ValidationError",
-            message: "only one of the following parameters".to_string(),
+            message: "Exactly one of Template URL, Template Body, Stack Name must be \
+                      specified."
+                .to_string(),
         },
         RefusalCase {
             case: "a TemplateBody and a StackName together",
@@ -775,7 +814,23 @@ async fn get_template_summary_refuses_a_request_it_cannot_summarise() {
             ],
             status: 400,
             code: "ValidationError",
-            message: "only one of the following parameters".to_string(),
+            message: "Exactly one of Template URL, Template Body, Stack Name must be \
+                      specified."
+                .to_string(),
+        },
+        RefusalCase {
+            // A THIRD way of naming more than one source: the sentence is fixed text, so it
+            // is the same whichever pair the request states.
+            case: "a StackName and a StackSetName together",
+            members: vec![
+                member("StackName", "a-stack"),
+                member("StackSetName", "a-stack-set"),
+            ],
+            status: 400,
+            code: "ValidationError",
+            message: "Exactly one of Template URL, Template Body, Stack Name must be \
+                      specified."
+                .to_string(),
         },
         RefusalCase {
             // A `TemplateURL` is resolved by reading the object it addresses out of this

@@ -1415,13 +1415,16 @@ async fn a_next_token_this_service_never_issued_is_refused() {
     }
 }
 
-/// A JSON template body of exactly `bytes` bytes: `{"Description":"<pad>"}`, whose
-/// wrapper is 18 bytes (`{"Description":"` plus `"}`). `pad` must be one ASCII byte.
+/// A JSON template body of exactly `bytes` bytes: `{"Metadata":{"Pad":"<pad>"}}`, whose
+/// wrapper is 23 bytes (`{"Metadata":{"Pad":"` plus `"}}`). `pad` must be one ASCII byte.
+///
+/// The padding goes in `Metadata` — a section whose content the template format bounds by
+/// nothing — rather than in `Description`, which a template may carry only 1024 bytes of.
 fn template_of_size(bytes: usize, pad: &str) -> String {
-    const WRAPPER_BYTES: usize = 18;
+    const WRAPPER_BYTES: usize = 23;
     assert_eq!(pad.len(), 1, "the padding must be a single-byte string");
     format!(
-        "{{\"Description\":\"{}\"}}",
+        "{{\"Metadata\":{{\"Pad\":\"{}\"}}}}",
         pad.repeat(bytes - WRAPPER_BYTES)
     )
 }

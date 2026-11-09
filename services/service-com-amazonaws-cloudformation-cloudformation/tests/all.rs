@@ -429,6 +429,8 @@ mod superseded_failure_events;
 mod tags_only_stack_updates;
 #[path = "all/template_by_reference.rs"]
 mod template_by_reference;
+#[path = "all/template_limits_and_declared_order.rs"]
+mod template_limits_and_declared_order;
 #[path = "all/template_outputs.rs"]
 mod template_outputs;
 #[path = "all/template_planning_surfaces.rs"]

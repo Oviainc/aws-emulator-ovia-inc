@@ -285,11 +285,19 @@ impl StoredChangeSet {
     /// (`TemplateBody`, `TemplateURL`, `UsePreviousTemplate`) are three ways of stating, so
     /// naming any one of them would name a member the conflicting request need not have
     /// carried at all.
+    ///
+    /// `ClientToken` is one of those attributes: "specify this token if you plan to retry
+    /// requests so that CloudFormation knows that you're not attempting to create another
+    /// change set with the same name", so the token a change set was created under is what
+    /// says which request it belongs to — a second request under the same name stating a
+    /// different one (or none) is not that request, however alike the plans are. It is
+    /// compared LAST, so a request that also submits a different plan is still refused for
+    /// the plan it submits.
     pub fn mismatching_attribute(
         &self,
         submitted: &SubmittedChangeSet<'_>,
     ) -> Option<&'static str> {
-        let comparisons: [(&'static str, bool); 14] = [
+        let comparisons: [(&'static str, bool); 15] = [
             ("ChangeSetType", self.change_set_type == submitted.change_set_type),
             (
                 "Parameters",
@@ -324,6 +332,10 @@ impl StoredChangeSet {
             (
                 "DeploymentMode",
                 self.deployment_mode.as_deref() == submitted.deployment_mode,
+            ),
+            (
+                "ClientToken",
+                self.client_token.as_deref() == submitted.client_token,
             ),
         ];
         comparisons

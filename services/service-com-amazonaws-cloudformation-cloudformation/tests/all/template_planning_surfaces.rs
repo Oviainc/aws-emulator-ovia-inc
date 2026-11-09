@@ -28,11 +28,11 @@
 //!   differ along how the macro is invoked (the `Transform` section, an `Fn::Transform`
 //!   intrinsic), whether an IAM resource is declared beside it, and a template invoking
 //!   nothing.
-//! * **A template summary reports the template's format version, the SET of resource types it
+//! * **A template summary reports the template's format version, the resource types it
 //!   defines and the properties an import of each of those types takes**: the version in
-//!   force, the types sorted by name whatever order the body declares them in, and one
+//!   force, one type per DECLARED RESOURCE in the order the body declares them, and one
 //!   `ResourceIdentifierSummary` per type carrying that type's primary identifier and the
-//!   logical ids declared with it, following the template's own resource order. The rows
+//!   logical ids declared with it, in that same order. The rows
 //!   differ along where the summarised template comes from (the request's own body, a
 //!   deployed stack, a StackSet) and the identifier kind each type is named by (a name
 //!   property, an ARN, a service-assigned id).
@@ -557,22 +557,23 @@ struct SummaryCase<'a> {
 }
 
 fn summary_cases() -> Vec<SummaryCase<'static>> {
+    // The bodies of the rows whose DECLARED ORDER is part of what they assert are written
+    // out as text rather than built with `json!`, which states an object's members in
+    // whichever order the build's `serde_json` serialises them in: the order a summary
+    // follows is the order the body itself states, so each such row states it.
     vec![
         SummaryCase {
-            // The identifier is the type's NAME property. The types are reported as a sorted
-            // SET, while the identifier summaries follow the template, which declares the
-            // bucket first.
+            // The identifier is the type's NAME property. The types are reported one per
+            // declared resource, in the order the BODY declares them, and so are the logical
+            // ids of each identifier summary.
             case: "a bucket declared before a role",
-            template: json!({
-                "AWSTemplateFormatVersion": "2010-09-09",
-                "Resources": {
-                    "Bucket": {"Type": "AWS::S3::Bucket"},
-                    "Role": {"Type": "AWS::IAM::Role"},
-                },
-            })
-            .to_string(),
+            template: r#"{"AWSTemplateFormatVersion":"2010-09-09",
+                "Resources":{
+                    "Bucket":{"Type":"AWS::S3::Bucket"},
+                    "Role":{"Type":"AWS::IAM::Role"}}}"#
+                .to_string(),
             version: "2010-09-09",
-            resource_types: vec!["AWS::IAM::Role", "AWS::S3::Bucket"],
+            resource_types: vec!["AWS::S3::Bucket", "AWS::IAM::Role"],
             summaries: vec![
                 summary("AWS::S3::Bucket", &["Bucket"], &["BucketName"]),
                 summary("AWS::IAM::Role", &["Role"], &["RoleName"]),
@@ -582,39 +583,34 @@ fn summary_cases() -> Vec<SummaryCase<'static>> {
             // A type whose `Ref` returns an ARN is identified by that ARN, and one whose
             // `Ref` returns a URL by the URL.
             case: "a topic and a queue, each identified by what its Ref returns",
-            template: json!({
-                "Resources": {
-                    "Topic": {"Type": "AWS::SNS::Topic"},
-                    "Queue": {"Type": "AWS::SQS::Queue"},
-                },
-            })
-            .to_string(),
+            template: r#"{"Resources":{
+                    "Topic":{"Type":"AWS::SNS::Topic"},
+                    "Queue":{"Type":"AWS::SQS::Queue"}}}"#
+                .to_string(),
             // A template declaring no format version still conforms to one, which is the
             // version a summary reports.
             version: "2010-09-09",
             resource_types: vec!["AWS::SNS::Topic", "AWS::SQS::Queue"],
             summaries: vec![
-                summary("AWS::SQS::Queue", &["Queue"], &["QueueUrl"]),
                 summary("AWS::SNS::Topic", &["Topic"], &["TopicArn"]),
+                summary("AWS::SQS::Queue", &["Queue"], &["QueueUrl"]),
             ],
         },
         SummaryCase {
-            // Several resources of ONE type: the type is reported once, carrying every
-            // logical id declared with it.
+            // Several resources of ONE type: the identifier summary of that type is reported
+            // once, carrying every logical id declared with it in declared order, while
+            // `ResourceTypes` carries one entry per declared RESOURCE.
             case: "three resources of two types",
-            template: json!({
-                "Resources": {
-                    "Data": {"Type": "AWS::S3::Bucket"},
-                    "Archive": {"Type": "AWS::S3::Bucket"},
-                    "Vpc": {"Type": "AWS::EC2::VPC",
-                            "Properties": {"CidrBlock": "10.0.0.0/16"}},
-                },
-            })
-            .to_string(),
+            template: r#"{"Resources":{
+                    "Data":{"Type":"AWS::S3::Bucket"},
+                    "Archive":{"Type":"AWS::S3::Bucket"},
+                    "Vpc":{"Type":"AWS::EC2::VPC",
+                           "Properties":{"CidrBlock":"10.0.0.0/16"}}}}"#
+                .to_string(),
             version: "2010-09-09",
-            resource_types: vec!["AWS::EC2::VPC", "AWS::S3::Bucket"],
+            resource_types: vec!["AWS::S3::Bucket", "AWS::S3::Bucket", "AWS::EC2::VPC"],
             summaries: vec![
-                summary("AWS::S3::Bucket", &["Archive", "Data"], &["BucketName"]),
+                summary("AWS::S3::Bucket", &["Data", "Archive"], &["BucketName"]),
                 summary("AWS::EC2::VPC", &["Vpc"], &["VpcId"]),
             ],
         },
@@ -652,7 +648,7 @@ async fn a_template_summary_reports_its_version_types_and_identifier_summaries()
         let reported = wire_resource_types(&body);
         assert_eq!(
             reported, row.resource_types,
-            "case {case:?}: expected the sorted set of types {:?}, got {reported:?}",
+            "case {case:?}: expected one entry per declared resource {:?}, got {reported:?}",
             row.resource_types
         );
         let reported = wire_summaries(&body);
@@ -783,8 +779,7 @@ async fn a_request_that_names_a_template_twice_is_refused_by_every_operation_tha
         // further template sources beside these two — so it is the one row with a sentence
         // of its own.
         let expected = if action == "GetTemplateSummary" {
-            "You must specify only one of the following parameters: StackName, StackSetName, \
-             TemplateBody, or TemplateURL"
+            "Exactly one of Template URL, Template Body, Stack Name must be specified."
         } else {
             "You cannot specify both Template URL and Template Body."
         };

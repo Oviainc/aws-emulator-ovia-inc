@@ -971,14 +971,16 @@ pub fn is_recognized(resource_type: &str) -> bool {
     resource_type.starts_with(AWS_NAMESPACE_PREFIX) && is_published(resource_type)
 }
 
-/// The types `declared` names that [`is_recognized`] does not, in declaration order and
-/// without repetition.
+/// The types `declared` names that [`is_recognized`] does not, in the order of the
+/// declarations given and without repetition.
 ///
 /// A resource the template declares under a `Condition` counts: the type has to be
 /// recognised for CloudFormation to read the template at all, which happens before any
 /// condition is evaluated — the same way an IAM resource under a condition still requires
 /// its capability (`super::template::required_capabilities`).
-pub fn unrecognized(declared: &[DeclaredResource]) -> Vec<String> {
+pub fn unrecognized<'a>(
+    declared: impl IntoIterator<Item = &'a DeclaredResource>,
+) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for resource in declared {
         if is_recognized(&resource.resource_type) || found.contains(&resource.resource_type) {
@@ -1010,15 +1012,25 @@ pub fn unrecognized_message(types: &[String]) -> String {
 /// expansion is what CloudFormation validates (see the module docs) and the only macro this
 /// emulator expands has already been expanded by the time a template reaches here.
 ///
+/// The types are listed in the order the BODY declares the resources that have them
+/// ([`super::declaration_order`]), which is the order the refusal names them in and the order
+/// they are reported as warnings in.
+///
 /// The ONE place that rule lives: [`refuse_unrecognized`] is this list refused, and an
 /// operation that REPORTS the types instead (`GetTemplateSummary`'s
 /// `Warnings$UnrecognizedResourceTypes`, where the request asks for warnings rather than an
 /// error) reports this same list.
-pub fn unrecognized_in(template: &Template) -> Vec<String> {
+pub fn unrecognized_in(body: &str, template: &Template) -> Vec<String> {
     if !template.transforms.is_empty() {
         return Vec::new();
     }
-    unrecognized(&template.resources)
+    let declared = super::declaration_order::as_declared(
+        body,
+        super::declaration_order::RESOURCES,
+        &template.resources,
+        |resource| resource.logical_id.as_str(),
+    );
+    unrecognized(declared)
 }
 
 /// `Err(message)` for a template declaring a resource type CloudFormation does not
@@ -1026,8 +1038,8 @@ pub fn unrecognized_in(template: &Template) -> Vec<String> {
 ///
 /// `Ok(())` for a template that declares a `Transform`, which [`unrecognized_in`] is what
 /// decides.
-pub fn refuse_unrecognized(template: &Template) -> Result<(), String> {
-    let unrecognized = unrecognized_in(template);
+pub fn refuse_unrecognized(body: &str, template: &Template) -> Result<(), String> {
+    let unrecognized = unrecognized_in(body, template);
     if unrecognized.is_empty() {
         return Ok(());
     }

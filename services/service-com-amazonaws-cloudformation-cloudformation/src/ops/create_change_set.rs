@@ -256,6 +256,11 @@ use crate::state::{
     StoredChangeSet, StoredStack,
 };
 
+/// The `OnStackFailure` value that is only valid for a change set which CREATES its stack:
+/// "DELETE — Deletes the change set if the stack creation fails. This is only valid when the
+/// ChangeSetType parameter is set to CREATE."
+const ON_STACK_FAILURE_DELETE: &str = "DELETE";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -327,29 +332,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // "Conditional: You must specify only one of the following parameters:
-        // TemplateBody, TemplateURL, or set the UsePreviousTemplate to true." A request
-        // carrying the template BOTH by value and by reference states two templates, which
-        // is the condition every operation whose input carries that pair is held to, in the
-        // one place that owns it; every other way of not naming exactly one source is the
-        // three-way condition this input documents.
-        crate::state::validate_one_template_source(
+        // TemplateBody, TemplateURL, or set the UsePreviousTemplate to true." Each way of
+        // not stating exactly one source is its own refusal — the template stated both by
+        // value and by reference, the stack's own template reused ALONGSIDE a submitted one,
+        // and no source at all — in the one place that owns the rule and its three
+        // sentences.
+        crate::state::validate_template_sources(
             input.template_body.as_deref(),
             input.template_url.as_deref(),
+            input.use_previous_template == Some(true),
         )
         .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-        let template_sources = [
-            input.template_body.is_some(),
-            input.template_url.is_some(),
-            input.use_previous_template == Some(true),
-        ]
-        .into_iter()
-        .filter(|specified| *specified)
-        .count();
-        if template_sources != 1 {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::ONE_TEMPLATE_SOURCE,
-            ));
-        }
         // A `TemplateURL` says WHERE the revised template is, not what it means: the
         // object it addresses is read from this emulator's own Amazon S3 and becomes the
         // body everything below plans from, so a template submitted by reference and the
@@ -386,6 +379,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 crate::state::resource_import::RESOURCES_TO_IMPORT_REQUIRED,
             ));
+        }
+        // "DELETE — Deletes the change set if the stack creation fails. This is only valid
+        // when the ChangeSetType parameter is set to CREATE": what becomes of a stack whose
+        // CREATION failed is only a question for a change set that would create the stack, so
+        // a request stating that outcome for any other type of change set is refused before
+        // the plan is written.
+        if input.on_stack_failure.as_deref() == Some(ON_STACK_FAILURE_DELETE)
+            && requested_type != change_set_type::CREATE
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "OnStackFailure parameter can only be specified to \
+                 {ON_STACK_FAILURE_DELETE} when ChangeSetType is {}.",
+                change_set_type::CREATE
+            )));
         }
         // The rollback configuration this change set would put on the stack is held to the
         // same rule a create's and an update's is: a trigger naming a type CloudFormation
@@ -980,6 +987,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             include_nested_stacks: input.include_nested_stacks.unwrap_or(false),
             import_existing_resources: input.import_existing_resources.unwrap_or(false),
             deployment_mode: input.deployment_mode.as_deref(),
+            client_token: input.client_token.as_deref(),
         };
 
         // A change set of this stack that this very request already created: "Specify this
