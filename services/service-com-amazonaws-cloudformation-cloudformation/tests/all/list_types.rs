@@ -5,9 +5,13 @@
 //! The rule every case here holds the service to: **`ListTypes` reports one bounded page
 //! of the extension records the registry of the request's account and Region holds — the
 //! ones this account registered or activated and the public extensions Amazon Web Services
-//! publishes — each at its default version, keeping only the records every filter the
-//! request gives admits, in an order that is a property of the records, with `MaxResults`
-//! bounding the page and the `NextToken` resuming immediately past it.**
+//! and third-party publishers publish — each at its default version, keeping only the records
+//! every filter the request gives admits, in an order that is a property of the records, with
+//! `MaxResults` bounding the page and the `NextToken` resuming immediately past it.
+//! `Visibility` narrows by the SCOPE a record is in: `PRIVATE` is what this account and
+//! Region can use ("private extensions you have registered in this account and Region.
+//! Public extensions that you have activated in this account and Region"), `PUBLIC` is what
+//! is publicly visible and activatable.**
 //!
 //! The tables below are one row per way a request can narrow the listing (each visibility,
 //! each extension kind, each deprecation status, each provisioning behaviour, each
@@ -135,8 +139,9 @@ async fn walk_names(
 /// Source: `crate::state::registry::aws_published_resource_types` (every resource type
 /// Amazon Web Services provides a record for here — the ones this emulator provisions and
 /// the ones no resource provider stands behind) and
-/// `crate::state::registry::PUBLIC_EXTENSION_CATALOG` (the extensions it has PUBLISHED,
-/// which are of another kind) — the two catalogues
+/// `crate::state::registry::PUBLIC_EXTENSION_CATALOG` (the extensions PUBLISHED to the
+/// registry, Amazon Web Services' own Hooks and the resource types third-party publishers
+/// published) — the two catalogues
 /// `crate::state::registry::aws_published` answers single reads from, so this suite and
 /// `extension_registry.rs` cannot disagree about which published extensions exist.
 fn published_catalog() -> Vec<String> {
@@ -147,6 +152,30 @@ fn published_catalog() -> Vec<String> {
                 .iter()
                 .map(|published| published.type_name.to_string()),
         )
+        .collect();
+    names.sort();
+    names
+}
+
+/// The resource types Amazon Web Services PROVIDES, which carry no publisher id: what a
+/// listing narrowed to `AWS_TYPES` ("extensions available for use from Amazon") must report
+/// of the published catalogue, since every extension PUBLISHED to the registry belongs to the
+/// publisher that published it.
+fn aws_provided_resource_types() -> Vec<String> {
+    let mut names: Vec<String> = aws_published_resource_types()
+        .map(|name| name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Every extension PUBLISHED to the registry, whatever its kind: what a listing narrowed to
+/// `THIRD_PARTY` reports of the catalogue, since each of those records carries the publisher
+/// id of the publisher that published it.
+fn published_catalog_by_a_publisher() -> Vec<String> {
+    let mut names: Vec<String> = PUBLIC_EXTENSION_CATALOG
+        .iter()
+        .map(|published| published.type_name.to_string())
         .collect();
     names.sort();
     names
@@ -173,22 +202,31 @@ fn published_catalog_of_kind(type_kind: &str) -> Vec<String> {
 /// a listing filtered by that `ProvisioningType` must report of it.
 ///
 /// Source: `crate::state::registry::published_provisioning_type`, the one place the class a
-/// published resource type is reported in is decided, so this suite and the records the
+/// published resource type is reported in is decided, and the class each catalogued extension
+/// carries itself (`PublishedExtension::provisioning_type`), so this suite and the records the
 /// registry builds cannot disagree about which class a type is in.
 fn published_catalog_provisioned(provisioning: &str) -> Vec<String> {
     let mut names: Vec<String> = aws_published_resource_types()
         .filter(|type_name| published_provisioning_type(type_name) == provisioning)
         .map(|name| name.to_string())
+        .chain(
+            PUBLIC_EXTENSION_CATALOG
+                .iter()
+                .filter(|published| published.provisioning_type == Some(provisioning))
+                .map(|published| published.type_name.to_string()),
+        )
         .collect();
     names.sort();
     names
 }
 
 /// Every name a `PUBLIC` listing of this Region must carry: the published catalogue plus
-/// the two seeded public records.
+/// the seeded public record no third party published.
+///
+/// The seeded ACTIVATION is not among them: an activation is visible and usable within the
+/// account that made it, which is the `PRIVATE` scope.
 fn public_names() -> Vec<String> {
     let mut names = published_catalog();
-    names.push(ACTIVATED_PUBLIC.to_string());
     names.push(PUBLIC_NO_PUBLISHER.to_string());
     names.sort();
     names
@@ -219,10 +257,12 @@ fn list_cases() -> Vec<ListCase> {
         ListCase {
             // "The default is PRIVATE" for `Visibility`, and the registry's deprecation
             // filter defaults to LIVE — so the seeded private resource type, whose DEFAULT
-            // version is deprecated, is not among them.
+            // version is deprecated, is not among them. The activated public extension IS:
+            // the private scope is what this account and Region can use, and "public
+            // extensions that you have activated in this account and Region" are in it.
             case: "no filters at all: the account's own LIVE extensions",
             members: vec![],
-            listed: names(&[PRIVATE_HOOK, PRIVATE_MODULE]),
+            listed: names(&[PRIVATE_HOOK, PRIVATE_MODULE, ACTIVATED_PUBLIC]),
         },
         ListCase {
             case: "DeprecatedStatus=DEPRECATED: the record deregistered at its default version",
@@ -232,7 +272,7 @@ fn list_cases() -> Vec<ListCase> {
         ListCase {
             case: "Visibility=PRIVATE, stated rather than defaulted",
             members: vec![("Visibility", visibility::PRIVATE)],
-            listed: names(&[PRIVATE_HOOK, PRIVATE_MODULE]),
+            listed: names(&[PRIVATE_HOOK, PRIVATE_MODULE, ACTIVATED_PUBLIC]),
         },
         ListCase {
             case: "Type=MODULE",
@@ -245,11 +285,12 @@ fn list_cases() -> Vec<ListCase> {
             listed: names(&[PRIVATE_HOOK]),
         },
         ListCase {
-            // The one private resource type is deprecated at its default version, so the
-            // kind filter and the deprecation default admit nothing together.
-            case: "Type=RESOURCE, whose only private record is deprecated",
+            // The one private resource type is deprecated at its default version, so what
+            // this kind filter and the deprecation default admit together is the activation,
+            // which the private scope includes.
+            case: "Type=RESOURCE, whose only private registration is deprecated",
             members: vec![("Type", registry_type::RESOURCE)],
-            listed: Vec::new(),
+            listed: names(&[ACTIVATED_PUBLIC]),
         },
         ListCase {
             case: "Type=RESOURCE with DeprecatedStatus=DEPRECATED",
@@ -274,10 +315,10 @@ fn list_cases() -> Vec<ListCase> {
         },
         ListCase {
             // The module's version carries no provisioning behaviour, so a request that
-            // asks for one does not report it.
-            case: "ProvisioningType=FULLY_MUTABLE, which no private LIVE record carries",
+            // asks for one does not report it; the activation's version carries this one.
+            case: "ProvisioningType=FULLY_MUTABLE, which only the activation carries",
             members: vec![("ProvisioningType", provisioning_type::FULLY_MUTABLE)],
-            listed: Vec::new(),
+            listed: names(&[ACTIVATED_PUBLIC]),
         },
         ListCase {
             case: "Visibility=PUBLIC: the activated, the published and the catalogue",
@@ -295,7 +336,6 @@ fn list_cases() -> Vec<ListCase> {
             ],
             listed: {
                 let mut listed = published_catalog_of_kind(registry_type::RESOURCE);
-                listed.push(ACTIVATED_PUBLIC.to_string());
                 listed.push(PUBLIC_NO_PUBLISHER.to_string());
                 listed.sort();
                 listed
@@ -337,8 +377,8 @@ fn list_cases() -> Vec<ListCase> {
         },
         ListCase {
             // The other side of that narrowing: the published types a provider does
-            // provision, plus the two seeded public resource records, whose own versions
-            // carry that behaviour.
+            // provision, plus the seeded public resource record, whose own version carries
+            // that behaviour.
             case: "Visibility=PUBLIC, Type=RESOURCE, ProvisioningType=FULLY_MUTABLE",
             members: vec![
                 ("Visibility", visibility::PUBLIC),
@@ -347,7 +387,6 @@ fn list_cases() -> Vec<ListCase> {
             ],
             listed: {
                 let mut listed = published_catalog_provisioned(provisioning_type::FULLY_MUTABLE);
-                listed.push(ACTIVATED_PUBLIC.to_string());
                 listed.push(PUBLIC_NO_PUBLISHER.to_string());
                 listed.sort();
                 listed
@@ -363,10 +402,10 @@ fn list_cases() -> Vec<ListCase> {
             ],
             listed: {
                 // The resource types Amazon Web Services PROVIDES carry no publisher id,
-                // which is what puts them in this category; the extensions it published
-                // belong to the publisher that published them, so they are in THIRD_PARTY
-                // below.
-                let mut listed = published_catalog_of_kind(registry_type::RESOURCE);
+                // which is what puts them in this category; the extensions PUBLISHED to the
+                // registry belong to the publisher that published them, so they are in
+                // THIRD_PARTY below.
+                let mut listed = aws_provided_resource_types();
                 listed.push(PUBLIC_NO_PUBLISHER.to_string());
                 listed.sort();
                 listed
@@ -374,13 +413,14 @@ fn list_cases() -> Vec<ListCase> {
         },
         ListCase {
             // "ACTIVATED: public extensions that have been activated for this account and
-            // Region."
+            // Region" — which are in the PRIVATE scope, so the public listing holds none of
+            // them even though the extension they were activated from is published.
             case: "Category=ACTIVATED under PUBLIC",
             members: vec![
                 ("Visibility", visibility::PUBLIC),
                 ("Filters.Category", "ACTIVATED"),
             ],
-            listed: names(&[ACTIVATED_PUBLIC]),
+            listed: Vec::new(),
         },
         ListCase {
             // "THIRD_PARTY: extensions available for use from publishers other than
@@ -391,22 +431,17 @@ fn list_cases() -> Vec<ListCase> {
                 ("Visibility", visibility::PUBLIC),
                 ("Filters.Category", "THIRD_PARTY"),
             ],
-            listed: {
-                // Every public record a PUBLISHER published, which is what carrying a
-                // publisher id states — the activated third-party record of the fixture,
-                // and the extensions this registry publishes.
-                let mut listed = published_catalog_of_kind(registry_type::HOOK);
-                listed.push(ACTIVATED_PUBLIC.to_string());
-                listed.sort();
-                listed
-            },
+            // Every public record a PUBLISHER published, which is what carrying a publisher
+            // id states: the extensions published to this registry, of either kind.
+            listed: published_catalog_by_a_publisher(),
         },
         ListCase {
             // The same category under PRIVATE: "this includes private extensions
-            // registered in the account".
+            // registered in the account", and the account's activation of a third party's
+            // extension is in the private scope too.
             case: "Category=THIRD_PARTY under PRIVATE",
             members: vec![("Filters.Category", "THIRD_PARTY")],
-            listed: names(&[PRIVATE_HOOK, PRIVATE_MODULE]),
+            listed: names(&[PRIVATE_HOOK, PRIVATE_MODULE, ACTIVATED_PUBLIC]),
         },
         ListCase {
             // "REGISTERED: private extensions that have been registered for this account
@@ -424,6 +459,14 @@ fn list_cases() -> Vec<ListCase> {
             listed: Vec::new(),
         },
         ListCase {
+            // "ACTIVATED: public extensions that have been activated for this account and
+            // Region" — reported in the private scope, which is the scope an activation puts
+            // the extension into.
+            case: "Category=ACTIVATED under PRIVATE",
+            members: vec![("Filters.Category", "ACTIVATED")],
+            listed: names(&[ACTIVATED_PUBLIC]),
+        },
+        ListCase {
             // The model's own example of an incompatible pair: "specifying AWS_TYPES for
             // Category and PRIVATE for Visibility returns an empty list of types, but
             // specifying PUBLIC for Visibility returns the desired list".
@@ -434,7 +477,7 @@ fn list_cases() -> Vec<ListCase> {
         ListCase {
             case: "Filters.PublisherId naming the publisher of the activated record",
             members: vec![
-                ("Visibility", visibility::PUBLIC),
+                ("Visibility", visibility::PRIVATE),
                 ("Filters.PublisherId", PUBLISHER_ID),
             ],
             listed: names(&[ACTIVATED_PUBLIC]),
@@ -690,7 +733,10 @@ async fn an_activated_third_party_summary_reports_its_publisher_and_versions() {
     let (status, body) = list_types(
         &router,
         &[
-            ("Visibility", visibility::PUBLIC),
+            // The activation is in the PRIVATE scope — "public extensions that you have
+            // activated in this account and Region" — and still carries every member the
+            // model reports for a public third-party extension.
+            ("Visibility", visibility::PRIVATE),
             ("Filters.TypeNamePrefix", ACTIVATED_PUBLIC),
         ],
     )
@@ -885,7 +931,7 @@ async fn every_listed_record_is_describable_at_the_arn_it_reported() {
         (
             "the activated third-party record",
             vec![
-                ("Visibility", visibility::PUBLIC),
+                ("Visibility", visibility::PRIVATE),
                 ("Filters.TypeNamePrefix", ACTIVATED_PUBLIC),
             ],
         ),

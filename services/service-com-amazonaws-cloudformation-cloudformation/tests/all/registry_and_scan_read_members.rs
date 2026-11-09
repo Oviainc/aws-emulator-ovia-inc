@@ -45,7 +45,7 @@ use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_cloudformation_cloudformation::state::publisher::identity_provider;
 use service_com_amazonaws_cloudformation_cloudformation::state::registry::{
-    public_type_arn, published_publisher_id, registry_type, visibility, StoredExtension,
+    published_catalog_arn, published_publisher_id, registry_type, visibility, StoredExtension,
     StoredTypeVersion, FIRST_PUBLIC_VERSION_NUMBER, PUBLIC_EXTENSION_CATALOG,
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::resource_scans as scans;
@@ -499,7 +499,10 @@ async fn the_published_catalogue_reports_its_publisher_and_version_metadata() {
         );
         let summary = &listed[0];
         let publisher_id = published_publisher_id(published.publisher_name);
-        let type_arn = public_type_arn(REGION, published.type_kind, published.type_name);
+        // The ARN the registry addresses a catalogued extension by: the one that names its
+        // publisher where a third party published it, and the one that names none where
+        // Amazon Web Services did.
+        let type_arn = published_catalog_arn(REGION, published);
         for (tag, expected) in [
             ("Type", published.type_kind.to_string()),
             ("TypeName", published.type_name.to_string()),

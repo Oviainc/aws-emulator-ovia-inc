@@ -394,7 +394,10 @@ fn read_cases() -> Vec<ReadCase> {
             reported: vec![
                 ("Arn", present(&type_version_arn(&public_arn, "00000001"))),
                 ("TypeName", present("MyAlias::Sample::Resource")),
-                ("Visibility", present(visibility::PUBLIC)),
+                // "The scope at which the extension is visible and usable": an activation is
+                // usable within the account and Region that made it, which is PRIVATE, while
+                // the extension it was activated FROM stays published.
+                ("Visibility", present(visibility::PRIVATE)),
                 ("PublisherId", present(PUBLISHER_ID)),
                 ("IsActivated", present("true")),
                 ("AutoUpdate", present("true")),
@@ -409,10 +412,13 @@ fn read_cases() -> Vec<ReadCase> {
                 // "This only applies if you specify a public extension, and you don't
                 // specify a version."
                 ("LatestPublicVersion", present("2.1.0")),
+                // `DEPRECATED` is "the extension has been deactivated or deregistered", which
+                // is a statement about the copy this account activated — so the activation
+                // reports its own status, LIVE until something deactivates it.
+                ("DeprecatedStatus", present(deprecated_status::LIVE)),
                 // Withheld from a public third-party record, however the store holds them.
                 ("DefaultVersionId", None),
                 ("IsDefaultVersion", None),
-                ("DeprecatedStatus", None),
                 ("TypeTestsStatus", None),
                 ("ExecutionRoleArn", None),
                 ("LogRoleArn", None),

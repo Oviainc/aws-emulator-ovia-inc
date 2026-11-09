@@ -24,7 +24,9 @@
 //!
 //! What the activation installs comes from the PUBLIC extension it activates, where this
 //! Region's registry holds the publication it was published by
-//! ([`crate::state::ComAmazonawsCloudformationCloudformationState::published_extension`]), so
+//! ([`crate::state::ComAmazonawsCloudformationCloudformationState::published_extension`]) or
+//! publishes it itself ([`crate::state::registry::PUBLIC_EXTENSION_CATALOG`], the public
+//! extensions every account and Region's registry holds without anybody registering them), so
 //! the activated version's schema and its published version number are that record's rather
 //! than invented. An activation of a public RESOURCE extension that names no
 //! `ExecutionRoleArn` is refused with the registry's own modelled `CFNRegistryException`
@@ -258,14 +260,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The version of the PUBLIC extension being activated, where this Region's registry
-        // holds the publication it was published by ([`state::published_extension`]): the
+        // holds the publication it was published by ([`state::published_extension`]) or the
+        // registry publishes it itself ([`registry::aws_published`], the public extensions
+        // every account and Region's registry holds without anybody registering them): the
         // activated extension is that version, so its schema and its published version
-        // number are the activation's. A public extension this registry does not hold is
-        // activated from what the request names alone — this emulator does not mirror the
-        // public registry AWS runs — so the activation records no schema rather than one it
+        // number are the activation's. A public extension neither source holds is activated
+        // from what the request names alone — this emulator does not mirror the whole public
+        // registry AWS runs — so the activation records no schema rather than one it
         // invented.
         let published = store
             .published_extension(&region, &named.type_kind, &named.type_name)
+            .cloned()
+            .or_else(|| {
+                registry::aws_published(&region, &named.type_kind, &named.type_name)
+                    .filter(|public| public.publisher_id.is_some())
+            })
             .and_then(|public| {
                 public
                     .versions
@@ -288,9 +297,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .as_ref()
                         .map(|(public_arn, _)| public_arn.clone())
                         .unwrap_or_else(|| {
-                            registry::public_type_arn(
+                            // The ARN of the public extension the activation installed: it
+                            // carries the publisher the request named it by, since that is
+                            // the ARN a published extension is addressable at.
+                            registry::public_extension_arn(
                                 &region,
                                 &named.type_kind,
+                                publisher_id.as_deref(),
                                 &named.type_name,
                             )
                         }),

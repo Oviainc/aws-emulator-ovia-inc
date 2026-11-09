@@ -30,7 +30,13 @@
 //! what the model means by "filters must be compatible with Visibility to return valid
 //! results. For example, specifying AWS_TYPES for Category and PRIVATE for Visibility
 //! returns an empty list of types": the two narrow the same listing, so an incompatible
-//! pair narrows it to nothing. `Visibility` defaults to `PRIVATE` and `DeprecatedStatus`
+//! pair narrows it to nothing. `Visibility` is the SCOPE a record is in rather than the
+//! `Visibility` member a read reports for it: "PRIVATE: extensions that are visible and
+//! usable within this account and Region. This includes: private extensions you have
+//! registered in this account and Region. Public extensions that you have activated in this
+//! account and Region", so a listing narrowed to `PRIVATE` reports this account's
+//! registrations and its activations alike. `Visibility` defaults to `PRIVATE` and
+//! `DeprecatedStatus`
 //! to `LIVE` (the defaults the model states for them); `Type`, `ProvisioningType` and each
 //! member of `Filters` narrow nothing when absent.
 //!
@@ -205,7 +211,7 @@ impl<'a> Narrowing<'a> {
     /// Whether this record, at the version the summary would report, is one the request
     /// asked for.
     fn admits(&self, extension: &StoredExtension, version: &StoredTypeVersion) -> bool {
-        extension.visibility == self.visibility
+        self.visible_at(extension)
             && version.deprecated_status == self.deprecated_status
             && self
                 .type_kind
@@ -222,6 +228,18 @@ impl<'a> Narrowing<'a> {
             && self
                 .type_name_prefix
                 .is_none_or(|prefix| extension.type_name.starts_with(prefix))
+    }
+
+    /// Whether this record is in the SCOPE the request narrows the listing to.
+    ///
+    /// The scope a record is in is the one a read of it reports
+    /// ([`StoredExtension::reported_visibility`]) — one rule, so the listing and the detailed
+    /// read cannot disagree about where an extension is visible and usable: "PRIVATE:
+    /// extensions that are visible and usable within this account and Region. This includes:
+    /// private extensions you have registered in this account and Region. Public extensions
+    /// that you have activated in this account and Region."
+    fn visible_at(&self, extension: &StoredExtension) -> bool {
+        extension.reported_visibility() == self.visibility
     }
 }
 

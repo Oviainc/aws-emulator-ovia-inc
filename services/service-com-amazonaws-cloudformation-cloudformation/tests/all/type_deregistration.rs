@@ -5,11 +5,13 @@
 //!
 //! The rule every case here holds the service to: **`DeregisterType` marks what the request
 //! identifies — by `Arn`, or by `Type` and `TypeName`, at the version `VersionId` or an
-//! extension-version ARN names — `DEPRECATED` in this account and Region's registry: a
-//! request naming no version deprecates every version of the extension, one naming a version
-//! deprecates that version alone, and deprecating the last version in active use leaves the
-//! extension itself deregistered. The default version cannot be deprecated while other
-//! versions are still in active use (the modelled `CFNRegistryException`, 400). What the
+//! extension-version ARN names — `DEPRECATED` in this account and Region's registry. A
+//! request naming a VERSION deprecates that version alone, and it must be one in active use
+//! and not the record's DEFAULT version, the version in use (the modelled
+//! `CFNRegistryException`, 400, whose message names the remedy). A request naming NO version
+//! deprecates every version of the extension, which it can do only once no more than one is
+//! left in active use — "to deregister an entire extension, you must individually deregister
+//! all active versions of that extension" — and is otherwise the same modelled error. What the
 //! operation can name is a private registration of THIS Region still holding a version in
 //! active use; anything else is the modelled `TypeNotFoundException` (404) — a public
 //! extension, a record another Region holds, a registration already fully deprecated, a
@@ -18,12 +20,19 @@
 //! refusal writes nothing, and a deregistration leaves every other record exactly as it
 //! was.**
 //!
+//! Which form takes the DEFAULT version out of active use is recorded behavior: the version
+//! form refuses it whether or not another version is still in use, so the extension form is
+//! what deprecates it — and "if you do deregister the default version of an extension, the
+//! extension type itself is deregistered as well and marked as deprecated" is the outcome
+//! that form leaves. The rows below hold the service to that division in both directions.
+//!
 //! The table spans the class the rule generalises over: both ways a request can identify an
 //! extension (`Type` and `TypeName`, the extension's own ARN) and both ways it can name a
 //! version (`VersionId`, an extension-version ARN), over registrations of every extension
-//! kind the model admits (`RESOURCE`, `MODULE`, `HOOK`), with version counts of one and of
-//! three so "every version" is more than one row of the record and a default version is
-//! distinguishable from a non-default one; and, on the refusal side, over every kind of
+//! kind the model admits (`RESOURCE`, `MODULE`, `HOOK`), with version counts of one, two and
+//! three so a record holding one version in active use is distinguishable from one holding
+//! several and a default version from a non-default one; and, on the refusal side, over every
+//! kind of
 //! record the registry can hold that is not a live private registration of this Region, every
 //! way a version can fail to resolve, and every way the conditional input rules can be
 //! broken. The recorded trace this suite was written for is ONE row of the refusal table: a
@@ -100,6 +109,13 @@ const TWO_IDENTITIES: &str = "Specify either Arn, or Type and TypeName, but not 
 /// The refusal the registry answers a request that identifies no extension at all.
 const NO_IDENTITY: &str =
     "Either Arn, or both Type and TypeName, must be specified to identify an extension";
+
+/// The refusal the registry answers a request to deregister the WHOLE extension while more
+/// than one version of it is still in active use: entirely fixed text, so every row that
+/// reaches it expects the same sentence.
+const MORE_THAN_ONE_ACTIVE_VERSION: &str =
+    "This type has more than one active version. Please deregister non-default active versions \
+     before attempting to deregister the type.";
 
 /// An instant to register the seeded versions at, so nothing a case asserts comes from the
 /// clock.
@@ -350,26 +366,30 @@ fn deregistration_cases() -> Vec<DeregistrationCase> {
     let multi_arn = type_arn(REGION, registry_type::RESOURCE, MULTI_VERSION_RESOURCE);
     vec![
         DeregistrationCase {
-            case: "a three-version RESOURCE registration, by Type and TypeName",
+            case: "a single-version RESOURCE registration, by Type and TypeName",
             members: vec![
                 ("Type", registry_type::RESOURCE.to_string()),
-                ("TypeName", MULTI_VERSION_RESOURCE.to_string()),
+                ("TypeName", SINGLE_VERSION_RESOURCE.to_string()),
             ],
             type_kind: registry_type::RESOURCE,
-            type_name: MULTI_VERSION_RESOURCE,
-            version_ids: &MULTI_VERSION_IDS,
-            deprecated: MULTI_VERSION_IDS.to_vec(),
+            type_name: SINGLE_VERSION_RESOURCE,
+            version_ids: &[SINGLE_VERSION_ID],
+            deprecated: vec![SINGLE_VERSION_ID],
         },
         DeregistrationCase {
-            case: "a two-version MODULE registration, by the ARN it carries in this Region",
-            members: vec![(
-                "Arn",
-                type_arn(REGION, registry_type::MODULE, MODULE_TYPE_NAME),
-            )],
+            case: "one NON-default version of a two-version MODULE registration, by the ARN \
+                   it carries in this Region",
+            members: vec![
+                (
+                    "Arn",
+                    type_arn(REGION, registry_type::MODULE, MODULE_TYPE_NAME),
+                ),
+                ("VersionId", MODULE_VERSION_IDS[1].to_string()),
+            ],
             type_kind: registry_type::MODULE,
             type_name: MODULE_TYPE_NAME,
             version_ids: &MODULE_VERSION_IDS,
-            deprecated: MODULE_VERSION_IDS.to_vec(),
+            deprecated: vec![MODULE_VERSION_IDS[1]],
         },
         DeregistrationCase {
             case: "a single-version HOOK registration, by Type and TypeName",
@@ -417,16 +437,15 @@ fn deregistration_cases() -> Vec<DeregistrationCase> {
             deprecated: vec![MULTI_VERSION_IDS[0]],
         },
         DeregistrationCase {
-            case: "the DEFAULT version of a record that holds only that one",
-            members: vec![
-                ("Type", registry_type::RESOURCE.to_string()),
-                ("TypeName", SINGLE_VERSION_RESOURCE.to_string()),
-                ("VersionId", SINGLE_VERSION_ID.to_string()),
-            ],
-            type_kind: registry_type::RESOURCE,
-            type_name: SINGLE_VERSION_RESOURCE,
-            version_ids: &[SINGLE_VERSION_ID],
-            deprecated: vec![SINGLE_VERSION_ID],
+            case: "a single-version HOOK registration, by the ARN it carries in this Region",
+            members: vec![(
+                "Arn",
+                type_arn(REGION, registry_type::HOOK, HOOK_TYPE_NAME),
+            )],
+            type_kind: registry_type::HOOK,
+            type_name: HOOK_TYPE_NAME,
+            version_ids: &[HOOK_VERSION_ID],
+            deprecated: vec![HOOK_VERSION_ID],
         },
     ]
 }
@@ -578,10 +597,51 @@ fn refused_cases() -> Vec<RefusedCase> {
                 ("VersionId", MULTI_DEFAULT_VERSION_ID.to_string()),
             ],
             format!(
-                "Cannot deregister {}: you can't deregister the default version of an \
-                 extension if there are other active versions of that extension",
-                type_version_arn(&multi_arn, MULTI_DEFAULT_VERSION_ID)
+                "Version '{MULTI_DEFAULT_VERSION_ID}' is the default version and cannot be \
+                 deregistered. Deregister the resource type '{MULTI_VERSION_RESOURCE}' \
+                 instead."
             ),
+        ),
+        refused(
+            // Recorded behavior: the version form refuses the default version whether or not
+            // another version is in active use — the remedy it names, the extension form, is
+            // what takes the last version out of use.
+            "the DEFAULT version of a record that holds only that one",
+            vec![
+                ("Type", registry_type::RESOURCE.to_string()),
+                ("TypeName", SINGLE_VERSION_RESOURCE.to_string()),
+                ("VersionId", SINGLE_VERSION_ID.to_string()),
+            ],
+            format!(
+                "Version '{SINGLE_VERSION_ID}' is the default version and cannot be \
+                 deregistered. Deregister the resource type '{SINGLE_VERSION_RESOURCE}' \
+                 instead."
+            ),
+        ),
+        refused(
+            "the DEFAULT version by the ARN of that version",
+            vec![(
+                "Arn",
+                type_version_arn(&multi_arn, MULTI_DEFAULT_VERSION_ID),
+            )],
+            format!(
+                "Version '{MULTI_DEFAULT_VERSION_ID}' is the default version and cannot be \
+                 deregistered. Deregister the resource type '{MULTI_VERSION_RESOURCE}' \
+                 instead."
+            ),
+        ),
+        refused(
+            "the WHOLE extension while three versions are still in active use",
+            by_name(registry_type::RESOURCE, MULTI_VERSION_RESOURCE),
+            MORE_THAN_ONE_ACTIVE_VERSION.to_string(),
+        ),
+        refused(
+            "the WHOLE extension, by its ARN, while two versions are still in active use",
+            vec![(
+                "Arn",
+                type_arn(REGION, registry_type::MODULE, MODULE_TYPE_NAME),
+            )],
+            MORE_THAN_ONE_ACTIVE_VERSION.to_string(),
         ),
         refused(
             "a request identifying no extension at all",
@@ -660,9 +720,9 @@ async fn deregister_type_refuses_what_is_no_live_registration_of_this_account_an
 }
 
 /// "To deregister an entire extension, you must individually deregister all active versions of
-/// that extension": the non-default versions go one at a time, and the default version — which
-/// cannot go while another is still in active use — goes last, which is what leaves the
-/// extension itself deregistered.
+/// that extension": the non-default versions go one at a time, and the extension itself goes
+/// last — the default version, the one in use, never goes on its own, so the extension form is
+/// what takes it out of use and leaves the record deregistered.
 #[tokio::test]
 async fn versions_deregistered_one_at_a_time_leave_the_extension_deregistered() {
     let (router, _engine) = router_with_registrations();
@@ -673,6 +733,24 @@ async fn versions_deregistered_one_at_a_time_leave_the_extension_deregistered() 
             ("VersionId", version_id.to_string()),
         ]
     };
+    let whole_extension = vec![
+        ("Type", registry_type::RESOURCE.to_string()),
+        ("TypeName", MULTI_VERSION_RESOURCE.to_string()),
+    ];
+
+    // The extension cannot go first: three of its versions are still in active use.
+    let case = "deregistering the extension while every version is still in use";
+    let (status_code, body) = deregister_type(&router, &whole_extension).await;
+    assert_eq!(
+        status_code, 400,
+        "case {case:?}: expected the call refused with 400, got {status_code} {body}"
+    );
+    let reported = xml_text(&body, "Message");
+    assert_eq!(
+        reported.as_deref(),
+        Some(MORE_THAN_ONE_ACTIVE_VERSION),
+        "case {case:?}: expected {MORE_THAN_ONE_ACTIVE_VERSION:?}, got {reported:?}"
+    );
 
     // The two non-default versions, in the order the record carries them.
     for version_id in [MULTI_VERSION_IDS[0], MULTI_VERSION_IDS[2]] {
@@ -685,12 +763,19 @@ async fn versions_deregistered_one_at_a_time_leave_the_extension_deregistered() 
         );
     }
 
-    // The default version is now the only one left in active use, so the rule that held it
-    // in place no longer does: "if you do deregister the default version of an extension, the
-    // extension type itself is deregistered as well and marked as deprecated".
+    // The default version is the only one left in active use, and it still cannot go on its
+    // own: the refusal names the remedy, which is to deregister the extension.
     let case = "deregistering the default version, now the last in active use";
     let (status_code, body) =
         deregister_type(&router, &by_version(MULTI_DEFAULT_VERSION_ID)).await;
+    assert_eq!(
+        status_code, 400,
+        "case {case:?}: expected the call refused with 400, got {status_code} {body}"
+    );
+
+    // The extension itself, now that no other version is in active use.
+    let case = "deregistering the extension, its default version the last in use";
+    let (status_code, body) = deregister_type(&router, &whole_extension).await;
     assert_eq!(
         status_code, 200,
         "case {case:?}: expected the deregistration accepted with 200, got {status_code} {body}"
@@ -712,14 +797,7 @@ async fn versions_deregistered_one_at_a_time_leave_the_extension_deregistered() 
     // Nothing of the extension is left in active use, so a further deregistration of it names
     // nothing: the record is deregistered.
     let case = "deregistering the extension again, after every version has gone";
-    let (status_code, body) = deregister_type(
-        &router,
-        &[
-            ("Type", registry_type::RESOURCE.to_string()),
-            ("TypeName", MULTI_VERSION_RESOURCE.to_string()),
-        ],
-    )
-    .await;
+    let (status_code, body) = deregister_type(&router, &whole_extension).await;
     assert_eq!(
         status_code, 404,
         "case {case:?}: expected the call refused with 404, got {status_code} {body}"

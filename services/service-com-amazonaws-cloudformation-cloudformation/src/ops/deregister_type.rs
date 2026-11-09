@@ -21,21 +21,34 @@
 //! 2. it DEPRECATES what was identified
 //!    ([`crate::state::registry::StoredTypeVersion::deprecate`] for one version,
 //!    [`crate::state::registry::StoredExtension::deprecate_every_version`] for the extension
-//!    itself). A request that names no version deregisters the extension, which is every
-//!    version of it: "to deregister an entire extension, you must individually deregister all
-//!    active versions of that extension", and a record with none left in active use is the
-//!    extension "itself being deregistered and marked as deprecated in the registry" — so
-//!    deregistering the LAST active version deregisters the extension with it, without a
-//!    second write.
+//!    itself). The two forms divide the work between them, and the message each refusal
+//!    carries is what states that division:
 //!
-//! One rule gates the version form: "you can't deregister the default version of an extension
-//! if there are other active version of that extension" — the default version is the one
-//! "used when the extension version isn't specified", so taking it out of use while other
-//! versions are still in it would leave the record with no version to resolve to. That is the
-//! registry's own modelled `CFNRegistryException` (400), writing nothing. ("If you do
-//! deregister the default version of an extension, the extension type itself is deregistered
-//! as well": the version form is allowed on the default version exactly when it is the last
-//! one in active use, and then it deprecates the whole record.)
+//!    * a request naming a VERSION deregisters that version, which has to be one in active
+//!      use and not the record's DEFAULT version — the default version is the one "used when
+//!      the extension version isn't specified", so it is the version in use, and the refusal
+//!      names the remedy: deregister the extension instead;
+//!    * a request naming NO version deregisters the extension, which is every version of it
+//!      at once, and it can do that only once no more than ONE version is left in active use:
+//!      "to deregister an entire extension, you must individually deregister all active
+//!      versions of that extension". A record with no version left in active use is the
+//!      extension "itself being deregistered and marked as deprecated in the registry".
+//!
+//!    Both refusals are the registry's own modelled `CFNRegistryException` (400), writing
+//!    nothing.
+//!
+//!    Which form takes the DEFAULT version out of use is recorded behavior, and it is the
+//!    extension form: a deregistration of the default version is refused whether or not
+//!    another version is still in active use, and it is refused with the sentence that sends
+//!    the caller to the extension form. That form is what the two sentences the operation
+//!    documents describe the outcome of — "if an extension has only a single active version,
+//!    deregistering that version results in the extension itself being deregistered and
+//!    marked as deprecated in the registry", and "if you do deregister the default version of
+//!    an extension, the extension type itself is deregistered as well and marked as
+//!    deprecated": deregistering the extension deprecates every version of it, the default
+//!    one included, so the documented outcome is exactly what the extension form leaves
+//!    behind. What is NOT available is reaching that outcome through the version form, which
+//!    is what the recorded refusal of a default version says.
 //!
 //! What this operation can name is exactly the records that are PRIVATE registrations of this
 //! account and Region still in active use
@@ -222,9 +235,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let version_id = match wanted {
             // "To deregister an entire extension, you must individually deregister all active
-            // versions of that extension": a request that names no version is the whole
-            // extension, so every version of it leaves active use at once.
+            // versions of that extension": the whole extension can be deregistered only once
+            // it holds no more than ONE version in active use — every other version has to go
+            // individually first — and that last one leaving use is what leaves the extension
+            // itself deregistered.
             Wanted::Extension => {
+                if extension.live_versions().count() > 1 {
+                    return Err(registry_exception(
+                        MORE_THAN_ONE_ACTIVE_VERSION.to_string(),
+                    ));
+                }
                 extension.deprecate_every_version();
                 return Ok(DeregisterTypeOutput {});
             }
@@ -234,20 +254,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The version the request names, which has to be one the record holds in active use:
         // a version already deprecated is already out of use, so there is none of it left to
         // deregister.
-        let version = extension
+        if extension
             .version(version_id)
-            .filter(|version| version.is_live())
-            .ok_or_else(|| type_not_found(&wanted.named_under(identifier.named())))?;
-        let version_arn = version.arn.clone();
-        // "You can't deregister the default version of an extension if there are other
-        // active version of that extension."
-        if extension.is_default_version(version_id)
-            && extension
-                .live_versions()
-                .any(|live| live.version_id != version_id)
+            .is_none_or(|version| !version.is_live())
         {
+            return Err(type_not_found(&wanted.named_under(identifier.named())));
+        }
+        // The version form deregisters a NON-DEFAULT version: the default version is the one
+        // "used when the extension version isn't specified", so it is the version in use and
+        // the refusal states the remedy — deregister the extension instead, which is the form
+        // that takes its last version out of use. Recorded behavior: a deregistration of the
+        // default version is refused whether or not another version is still in active use, so
+        // this precondition is not a count of the other versions.
+        if extension.is_default_version(version_id) {
+            let type_name = extension.type_name.clone();
             return Err(registry_exception(cannot_deregister_default_version(
-                &version_arn,
+                version_id,
+                &type_name,
             )));
         }
 
@@ -255,11 +278,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Unreachable for the same reason as above: resolved under this lock.
             return Err(type_not_found(&wanted.named_under(identifier.named())));
         };
-        // "If an extension has only a single active version, deregistering that version
-        // results in the extension itself being deregistered and marked as deprecated in the
-        // registry": the record's deprecation IS every version of it being deprecated, so
-        // taking the last active version out of use leaves the extension deregistered without
-        // a second write.
         version.deprecate();
 
         Ok(DeregisterTypeOutput {})
@@ -394,12 +412,29 @@ fn registry_exception(message: String) -> DeregisterTypeError {
 /// use while other versions are still in it, which is the rule `DeregisterType` states: the
 /// default version is the one a request naming none resolves to, so it is the last version of
 /// the record to leave use.
-fn cannot_deregister_default_version(version_arn: &str) -> String {
+///
+/// Fixed text, with exactly two variable parts: the `VersionId` of the version the request
+/// named, and the name of the extension it is a version of — the remedy the sentence states,
+/// since deregistering the extension is what takes its default version out of use.
+///
+/// The noun is part of the FIXED text, not of the extension's kind: the recorded refusal
+/// words it "the resource type" for a type name that ends in `::MODULE`, so it is the same
+/// sentence whatever kind the record is.
+fn cannot_deregister_default_version(version_id: &str, type_name: &str) -> String {
     format!(
-        "Cannot deregister {version_arn}: you can't deregister the default version of an \
-         extension if there are other active versions of that extension"
+        "Version '{version_id}' is the default version and cannot be deregistered. Deregister \
+         the resource type '{type_name}' instead."
     )
 }
+
+/// The message answered a request to deregister the WHOLE extension while more than one
+/// version of it is still in active use: the rule `DeregisterType` states as "to deregister an
+/// entire extension, you must individually deregister all active versions of that extension".
+///
+/// Entirely fixed text: no part of it comes from the request or from the store.
+const MORE_THAN_ONE_ACTIVE_VERSION: &str =
+    "This type has more than one active version. Please deregister non-default active versions \
+     before attempting to deregister the type.";
 
 /// The modelled 404: "The specified extension doesn't exist in the CloudFormation
 /// registry."

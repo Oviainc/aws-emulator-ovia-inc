@@ -395,9 +395,13 @@ async fn deactivate_type_deactivates_the_activation_the_request_identifies() {
         let reported_visibility = xml_text(&read_body, "Visibility");
         assert_eq!(
             reported_visibility.as_deref(),
-            Some(visibility::PUBLIC),
-            "case {case:?}: expected the record still PUBLIC, got {reported_visibility:?} from \
-             {read_body}"
+            Some(visibility::PRIVATE),
+            // "The scope at which the extension is visible and usable": the record is this
+            // account's own copy of the public extension, and leaving active use does not put
+            // it into any other account's reach, so the scope it is reported in does not
+            // change when it is deactivated.
+            "case {case:?}: expected the deactivated activation still reported in this \
+             account's own scope, got {reported_visibility:?} from {read_body}"
         );
 
         // "Once deactivated, an extension can't be used in any CloudFormation operation",

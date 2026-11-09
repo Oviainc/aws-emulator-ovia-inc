@@ -21,9 +21,10 @@
 //! The rows differ along what the rule generalises over: each kind the modelled
 //! `ThirdPartyType` admits, a name carrying the `::MODULE` suffix, and the ways an ARN can
 //! carry no type name — a name segment that is a version number, one with too few segments,
-//! one with a segment below the modelled minimum, one past the modelled maximum, a publisher
-//! segment the modelled pattern does not admit (the ARN shape that carries the name one
-//! segment to the left), and a value naming no `type/` path at all. Each refusal is read back
+//! one with a segment below the modelled minimum, one past the modelled maximum, an ARN whose
+//! name position holds a version id because the segments ahead of it are not the publisher
+//! form (the ARN shape that carries the name one segment to the left), and a value naming no
+//! `type/` path at all. Each refusal is read back
 //! through `DescribeType`, so a refusal is shown to have written nothing.
 //!
 //! `third_party_extensions.rs` is the suite for what an accepted activation WRITES; this one
@@ -124,21 +125,19 @@ fn arn_cases() -> Vec<ArnCase> {
             refused_with: registry::INVALID_TYPE_NAME,
         },
         ArnCase {
-            // The ARN's segments are read by what they ARE rather than by their position: a
-            // publisher id is "^[0-9a-zA-Z]{12,40}$" and an extension name is three
-            // alphanumeric `-`-joined segments, so an ARN whose segment after the kind is a
-            // NAME names that extension — with whatever follows it pinned past the name,
-            // which for a public extension is a version number the registry refuses an
-            // activation of. That is the reading that lets an extension Amazon Web Services
-            // published, whose ARN carries no publisher segment at all, be activated by the
-            // ARN this registry publishes it under.
-            case: "a name segment that is a version number, under a publisher segment the \
-                   modelled pattern does not admit",
+            // The ARN's segments are read by their POSITION: the segment after the kind is
+            // the PUBLISHER where a further segment follows it, and the extension's own NAME
+            // where none does — so an ARN of this shape carries `00000001` where the name
+            // belongs, which is no extension type name, and resolves no extension at all.
+            // (An ARN that names no publisher is the form an extension Amazon Web Services
+            // published carries, which is why that form keeps resolving its own name.)
+            case: "a version id past a name, under a publisher segment the modelled pattern \
+                   does not admit",
             kind: registry::registry_type::RESOURCE,
             publisher: "SomeVendor-Thing-Thing".to_string(),
             name_segment: "00000001".to_string(),
             activates: None,
-            refused_with: registry::PUBLIC_VERSION_NUMBER_IN_ARN,
+            refused_with: registry::INVALID_TYPE_NAME,
         },
         ArnCase {
             case: "a name segment that is a version number, under a well-formed publisher",

@@ -127,6 +127,8 @@ mod executed_change_set_create_outcomes;
 mod extension_registrations;
 #[path = "all/extension_registry.rs"]
 mod extension_registry;
+#[path = "all/extension_registry_lifecycle.rs"]
+mod extension_registry_lifecycle;
 #[path = "all/failed_create_rollback.rs"]
 mod failed_create_rollback;
 #[path = "all/forced_deletion_is_gated_by_status.rs"]

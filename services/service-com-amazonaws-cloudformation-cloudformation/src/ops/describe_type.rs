@@ -25,7 +25,12 @@
 //! the record does not carry, are both answered with the modelled `TypeNotFoundException`
 //! (404, "The specified extension doesn't exist in the CloudFormation registry"), and a
 //! request that identifies no extension at all is refused with the registry's own modelled
-//! `CFNRegistryException` (400).
+//! `CFNRegistryException` (400). A PRIVATE registration that has been DEREGISTERED — one with
+//! no version left in active use — is no longer an extension this registry holds at all, so a
+//! request that names no version of it, and therefore resolves its default version ("the
+//! version used when the extension version isn't specified"), is that same 404; a request
+//! naming one of its versions still reports that version, since "to view the deprecation
+//! status of an extension or extension version, use DescribeType".
 //!
 //! The registry has two sources, and this handler reads them in that order: the records
 //! this account's registry writes persist, and the public extensions Amazon Web Services
@@ -330,6 +335,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 type_name,
             } => store.extension_by_name(&region, type_kind, type_name),
         };
+        // "If you specify a VersionId, DescribeType returns information about that specific
+        // extension version. Otherwise, it returns information about the default extension
+        // version": a request that names no version resolves the record's default version, and
+        // a PRIVATE registration every version of which has been deregistered has none left in
+        // active use — "deregistering that version results in the extension itself being
+        // deregistered" — so there is no extension left for such a request to describe. A
+        // request that names one of its versions resolves that version instead, which is the
+        // read "to view the deprecation status of an extension or extension version".
+        // `LatestPublicVersion` "only applies if you specify a public extension, and you
+        // don't specify a version" — and a request that names no version is also the one that
+        // resolves the record's DEFAULT version.
+        let named_no_version = matches!(wanted, Wanted::Default);
+        let stored = stored
+            .filter(|extension| !named_no_version || !extension.is_private() || extension.is_live());
         // The registry also holds the public extensions Amazon Web Services publishes,
         // which are in every account's registry without anybody registering them (see
         // [`crate::state::registry::aws_published`]). A name this account registered
@@ -377,9 +396,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // specify VersionId" — a version ARN pins the same version id, so it counts as
         // naming one.
         let named_a_version_id = matches!(wanted, Wanted::Id(_));
-        // `LatestPublicVersion` "only applies if you specify a public extension, and you
-        // don't specify a version".
-        let named_no_version = matches!(wanted, Wanted::Default);
 
         Ok(DescribeTypeOutput {
             // The permissions the extension's handlers require, read out of the schema that
@@ -423,8 +439,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: version.description.clone(),
             schema: version.schema.clone(),
             provisioning_type: version.provisioning_type.clone(),
-            // "For public third-party extensions, CloudFormation returns null."
-            deprecated_status: (!public_third_party).then(|| version.deprecated_status.clone()),
+            // "For public third-party extensions, CloudFormation returns null" — the
+            // published extension's own record carries no deprecation status, since nothing
+            // has deactivated or deregistered it. This account's own ACTIVATION of one does:
+            // `DEPRECATED` is "the extension has been deactivated or deregistered and can no
+            // longer be used in CloudFormation operations", which is a statement about the
+            // copy this account activated, so a read of that copy reports it.
+            deprecated_status: (!public_third_party || extension.is_activation())
+                .then(|| version.deprecated_status.clone()),
             // "This applies only to private extensions you have registered in your
             // account. For public extensions ... CloudFormation returns null."
             logging_config: private
@@ -442,7 +464,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             execution_role_arn: private
                 .then(|| version.execution_role_arn.clone())
                 .flatten(),
-            visibility: Some(extension.visibility.clone()),
+            // "The scope at which the extension is visible and usable in CloudFormation
+            // operations": the scope the record is in
+            // ([`crate::state::registry::StoredExtension::reported_visibility`]), which for
+            // an extension this account ACTIVATED is this account and Region alone.
+            visibility: Some(extension.reported_visibility().to_string()),
             source_url: version.source_url.clone(),
             documentation_url: version.documentation_url.clone(),
             last_updated: version.last_updated.map(crate::state::timestamp),

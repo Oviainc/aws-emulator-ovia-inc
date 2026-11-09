@@ -424,16 +424,42 @@ impl StoredTypeRegistration {
     }
 }
 
-/// The ARN of a PUBLIC extension: `arn:aws:cloudformation:<region>::type/<kind>/<Name>`.
+/// The ARN of a PUBLIC extension Amazon Web Services published:
+/// `arn:aws:cloudformation:<region>::type/<kind>/<Name>`.
 ///
 /// A public extension belongs to no account, so its ARN carries an EMPTY account segment —
 /// which the modelled `TypeArn` pattern admits (`:([0-9]{12})?:type/.+$`) and which
 /// [`::emulator_server::emulator_arn`] cannot express, since that helper always stamps the
 /// emulator's canonical account id. The partition is the one every ARN this emulator mints
 /// belongs to ([`crate::state::template::PARTITION`]).
+///
+/// An extension a PUBLISHER published is addressed by the ARN that names that publisher
+/// between the kind and the name ([`public_extension_arn`]).
 pub fn public_type_arn(region: &str, type_kind: &str, type_name: &str) -> String {
+    public_extension_arn(region, type_kind, None, type_name)
+}
+
+/// The ARN of a PUBLIC extension, carrying the publisher that published it where one did.
+///
+/// CloudFormation addresses a public extension a PUBLISHER published by
+/// `…::type/<kind>/<publisher id>/<Type-Name>` — the form the modelled `ThirdPartyTypeArn`
+/// states (`^arn:aws…::type/.+/[0-9a-zA-Z]{12,40}/.+$`, whose third segment is a
+/// `PublisherId`) and so the only form an activation can name a published extension by — and
+/// one Amazon Web Services published by `…::type/<kind>/<Type-Name>`, since "extensions
+/// published by Amazon aren't assigned a publisher ID" and such an ARN names no publisher at
+/// all. Both are read back by [`split_public_type_arn`].
+pub fn public_extension_arn(
+    region: &str,
+    type_kind: &str,
+    publisher_id: Option<&str>,
+    type_name: &str,
+) -> String {
+    let publisher_segment = publisher_id
+        .filter(|publisher_id| !publisher_id.is_empty())
+        .map(|publisher_id| format!("{publisher_id}/"))
+        .unwrap_or_default();
     format!(
-        "arn:{}:{}:{region}::type/{}/{}",
+        "arn:{}:{}:{region}::type/{}/{publisher_segment}{}",
         crate::state::template::PARTITION,
         crate::state::ARN_NAMESPACE,
         arn_kind_segment(type_kind),
@@ -493,22 +519,29 @@ pub fn arn_extension_name(arn: &str) -> Option<String> {
 /// extension ARN carries.
 ///
 /// CloudFormation addresses a public extension by `…::type/<kind>/<publisher id>/<Type-Name>`
-/// where a PUBLISHER published it, and by `…::type/<kind>/<Type-Name>` where AMAZON WEB
+/// where a PUBLISHER published it ([`public_extension_arn`], the form the modelled
+/// `ThirdPartyTypeArn` pattern states), and by `…::type/<kind>/<Type-Name>` where AMAZON WEB
 /// SERVICES did — "extensions published by Amazon aren't assigned a publisher ID"
 /// (`ListTypeVersionsInput$PublisherId`), so such an ARN carries no publisher segment at all,
 /// which is also the form this registry PUBLISHES one under ([`public_type_arn`]). Both are
-/// read here, told apart by whether the segment after the kind is an extension TYPE NAME
-/// ([`is_type_name`]): a publisher id is "^[0-9a-zA-Z]{12,40}$", which no type name is, and a
-/// dashed type name is three alphanumeric segments, which no publisher id is — so the
-/// reading is unambiguous either way, and an ARN this registry handed out can be used to
-/// activate the extension it names.
+/// read here, by the POSITION each segment occupies rather than by what it looks like: the
+/// segment after the kind is the PUBLISHER where a further name segment follows it, and the
+/// extension's own name where none does. So the extension's name is the last segment before
+/// anything the ARN pins past it, whatever that name happens to resemble.
 ///
 /// A registry ARN spells the kind in lower case and the `::` separators of a type name as `-`
 /// ([`arn_kind_segment`], [`arn_type_name`]), so both are read back into the spellings the
 /// registry keys a record by, and a kind the registry does not name is read as the extension
 /// kind it spells. Anything PAST the name segment is the public version number the ARN pins,
-/// reported in [`PublicTypeArnParts::public_version_number`]. `None` for an ARN carrying no
-/// such segments at all.
+/// reported in [`PublicTypeArnParts::public_version_number`].
+///
+/// `None` for an ARN that carries no extension to resolve: one with no `type/` path, and one
+/// carrying no segments after the kind.
+///
+/// What the name segment it carries is NOT checked here: whether that name is an extension
+/// type name at all ([`is_type_name`]) is the registry's own resolution rule, answered by the
+/// caller after the rules it reads off the ARN's shape — so an ARN pinning a version is
+/// refused for pinning one whatever name it carries.
 ///
 /// The registry PARSES this ARN itself rather than leaving it to a syntax gate, which is why
 /// this reading is shared: the refusal an unresolvable one gets is the registry's own
@@ -522,14 +555,11 @@ pub fn split_public_type_arn(arn: &str) -> Option<PublicTypeArnParts> {
     if type_kind.is_empty() || after_kind.is_empty() {
         return None;
     }
-    // Whether the segment after the kind is the extension's own NAME — the form an extension
-    // Amazon Web Services published carries, which names no publisher — or the publisher that
-    // published it, with the name in the segment after that.
-    let publishers_own = is_type_name(&after_kind.replace('-', "::"));
-    let (publisher_id, type_name, pinned_at) = if publishers_own {
-        ("", after_kind, 2)
-    } else {
-        (after_kind, segments.next()?, 3)
+    // Which segment is the extension's NAME: the one after the publisher where the ARN names
+    // a publisher, and the one right after the kind where it names none.
+    let (publisher_id, type_name, pinned_at) = match segments.next() {
+        Some(type_name) => (after_kind, type_name, 3),
+        None => ("", after_kind, 2),
     };
     if type_name.is_empty() {
         return None;
@@ -744,8 +774,18 @@ pub fn arn_names_this_account(arn: &str) -> bool {
 /// passing "into DescribeType to monitor the current test status") and one with three names
 /// the extension itself. A dashed type name carries no `/` of its own, so the count is
 /// unambiguous.
+///
+/// A PUBLIC extension's ARN carries no account id and may name the PUBLISHER that published
+/// it between the kind and the name ([`public_extension_arn`]), so its name sits one segment
+/// further along and a version is pinned one further still: the count that tells a version
+/// apart is read against the form the ARN is in.
 pub fn split_version_arn(arn: &str) -> (&str, Option<&str>) {
-    if arn.matches('/').count() < 3 {
+    let segments_before_a_version = if public_arn_region(arn).is_some() {
+        PUBLIC_ARN_SEGMENTS_BEFORE_A_VERSION
+    } else {
+        ARN_SEGMENTS_BEFORE_A_VERSION
+    };
+    if arn.matches('/').count() < segments_before_a_version {
         return (arn, None);
     }
     match arn.rsplit_once('/') {
@@ -753,6 +793,12 @@ pub fn split_version_arn(arn: &str) -> (&str, Option<&str>) {
         None => (arn, None),
     }
 }
+
+/// How many `/`-separated segments an extension ARN carries before the one that pins a
+/// version: `type/<kind>/<Type-Name>` for an extension of an account, and
+/// `type/<kind>/<publisher id>/<Type-Name>` for a public one a publisher published.
+const ARN_SEGMENTS_BEFORE_A_VERSION: usize = 3;
+const PUBLIC_ARN_SEGMENTS_BEFORE_A_VERSION: usize = 4;
 
 /// What contract testing concluded about one extension version, held until the clock makes
 /// reporting the conclusion due.
@@ -1100,6 +1146,36 @@ impl StoredExtension {
         self.visibility == visibility::PRIVATE
     }
 
+    /// The SCOPE this record is visible and usable in, which is what `Visibility` reports for
+    /// it and what a listing narrowed by `Visibility` selects on.
+    ///
+    /// "PRIVATE: the extension is only visible and usable within the account in which it is
+    /// registered"; "PUBLIC: the extension is publicly visible and usable within any Amazon
+    /// Web Services account". An ACTIVATION is in the first scope: activating a public
+    /// extension makes it "available for use in stack templates in your current account and
+    /// Region" under a name and an account-scoped ARN only this account addresses, and no
+    /// other account can use that activation — which is also why `ListTypes` documents its
+    /// `PRIVATE` scope as including "public extensions that you have activated in this
+    /// account and Region".
+    ///
+    /// The extension the activation was made FROM keeps its own `PUBLIC` scope: it is still
+    /// published, and this account deactivating it changes nothing about that. So the record's
+    /// stored visibility is the extension's own — which is what gates the members the model
+    /// reports per visibility — and this is the scope a read reports.
+    ///
+    /// An activation that has since been DEACTIVATED is still this account's own copy
+    /// ([`Self::is_activation`]): "once deactivated, an extension can't be used in any
+    /// CloudFormation operation", which is what its `DEPRECATED` versions state, and it is in
+    /// no other account either — so the scope it is reported in does not change when it leaves
+    /// use.
+    pub fn reported_visibility(&self) -> &str {
+        if self.is_activation() {
+            visibility::PRIVATE
+        } else {
+            &self.visibility
+        }
+    }
+
     /// Whether this is a public THIRD-PARTY extension: public and carrying a publisher id,
     /// which "extensions provided by Amazon Web Services are not assigned". The members
     /// documented as applying "only to public third-party extensions" are reported for
@@ -1107,6 +1183,16 @@ impl StoredExtension {
     /// withheld from them.
     pub fn is_public_third_party(&self) -> bool {
         !self.is_private() && self.publisher_id.is_some()
+    }
+
+    /// Whether this record is this account and Region's own ACTIVATION of a public extension,
+    /// rather than the published extension itself.
+    ///
+    /// `OriginalTypeName` is "for public extensions that have been activated for this account
+    /// and Region, the type name of the public extension", so only an activation carries one —
+    /// whether it is activated right now or has since been deactivated.
+    pub fn is_activation(&self) -> bool {
+        self.original_type_name.is_some() || self.original_type_arn.is_some()
     }
 
     /// Whether this record is a public third-party extension that is ACTIVATED in this
@@ -1405,18 +1491,33 @@ pub struct PublishedExtension {
     pub publisher_name: &'static str,
     /// `Description`, "the description of the extension".
     pub description: &'static str,
+    /// `ProvisioningType`, "for resource types, the provisioning behavior of the resource
+    /// type" — so a RESOURCE extension carries one and a Hook or a module carries none. An
+    /// extension whose provider publishes create, read, update and delete handlers is
+    /// `FULLY_MUTABLE`: "the resource type includes an update handler to process updates to
+    /// the type during stack update operations".
+    pub provisioning_type: Option<&'static str>,
 }
 
-/// The public extensions this registry holds that are NOT resource types: the HOOKS Amazon
-/// Web Services publishes to the CloudFormation registry, which a client enumerating the
-/// public registry sees beside the resource types.
+/// The public extensions this registry holds that are NOT the resource types Amazon Web
+/// Services provides ([`aws_published_record`]): the extensions PUBLISHED to the
+/// CloudFormation registry, which a client enumerating the public registry sees beside those.
 ///
-/// Source: the Hook types the CloudFormation Hooks documentation publishes by name — a Guard
-/// Hook, which evaluates Guard rules against a stack operation's targets, and a Lambda Hook,
-/// which hands those targets to a Lambda function. This service's own model names the first
-/// of them (`GetHookResultOutput$TypeName`: "if you activate AWS::Hooks::GuardHook with a
-/// type name alias"), which is why the registry can report a record for it rather than
+/// Source for the Hooks: the Hook types the CloudFormation Hooks documentation publishes by
+/// name — a Guard Hook, which evaluates Guard rules against a stack operation's targets, and a
+/// Lambda Hook, which hands those targets to a Lambda function. This service's own model names
+/// the first of them (`GetHookResultOutput$TypeName`: "if you activate AWS::Hooks::GuardHook
+/// with a type name alias"), which is why the registry can report a record for it rather than
 /// inventing one.
+///
+/// Source for the resource types: the extensions THIRD-PARTY publishers publish to the
+/// CloudFormation public registry, each named by its publisher's own CloudFormation resource
+/// documentation — `Datadog::Monitors::Monitor` (Datadog's monitor resource) and
+/// `MongoDB::Atlas::Cluster` (MongoDB Atlas's cluster resource). "The public extension
+/// registry is populated independently of the caller's account": these are in every account
+/// and Region's `PUBLIC` listing without anybody registering or activating them, which is what
+/// makes `ListTypes(Visibility=PUBLIC, Type=RESOURCE, Filters={Category: THIRD_PARTY})` ->
+/// `ActivateType` -> `DeactivateType` reachable at all.
 ///
 /// It carries no MODULE: a module is a package of template fragments its PUBLISHER authors
 /// ("for modules, `company_or_organization::service::type::MODULE`",
@@ -1430,6 +1531,7 @@ pub const PUBLIC_EXTENSION_CATALOG: &[PublishedExtension] = &[
         publisher_name: AWS_PUBLISHER_NAME,
         description: "Evaluates the targets of a stack operation against a set of \
                       CloudFormation Guard rules.",
+        provisioning_type: None,
     },
     PublishedExtension {
         type_kind: registry_type::HOOK,
@@ -1437,6 +1539,23 @@ pub const PUBLIC_EXTENSION_CATALOG: &[PublishedExtension] = &[
         publisher_name: AWS_PUBLISHER_NAME,
         description: "Invokes a Lambda function to evaluate the targets of a stack \
                       operation.",
+        provisioning_type: None,
+    },
+    PublishedExtension {
+        type_kind: registry_type::RESOURCE,
+        type_name: "Datadog::Monitors::Monitor",
+        publisher_name: "Datadog",
+        description: "Datadog Monitor resource, which alerts on a metric query crossing a \
+                      threshold.",
+        provisioning_type: Some(provisioning_type::FULLY_MUTABLE),
+    },
+    PublishedExtension {
+        type_kind: registry_type::RESOURCE,
+        type_name: "MongoDB::Atlas::Cluster",
+        publisher_name: "MongoDB",
+        description: "MongoDB Atlas Cluster resource, which provisions a cluster in an Atlas \
+                      project.",
+        provisioning_type: Some(provisioning_type::FULLY_MUTABLE),
     },
 ];
 
@@ -1504,17 +1623,22 @@ pub fn published_publisher_id(publisher_name: &str) -> String {
 ///
 /// What it deliberately does NOT carry: a `Schema`, because the document that defines a
 /// published extension comes from the handler package its publisher registered and no
-/// package was uploaded here; a provisioning behaviour, which is a resource type's
-/// ("for resource types, the provisioning behavior of the resource type"); and a source or
-/// documentation URL, which the catalogue does not record.
+/// package was uploaded here; and a source or documentation URL, which the catalogue does not
+/// record.
+///
+/// It is addressed by the ARN the publisher that published it makes it addressable at
+/// ([`published_catalog_arn`]), so the ARN a listing of the public registry reports for it is
+/// the one an activation names it by.
 fn published_catalog_record(region: &str, published: &PublishedExtension) -> StoredExtension {
-    let arn = public_type_arn(region, published.type_kind, published.type_name);
+    let arn = published_catalog_arn(region, published);
     let version = StoredTypeVersion {
         version_id: AWS_PUBLISHED_VERSION_ID.to_string(),
         arn: arn.clone(),
         description: Some(published.description.to_string()),
         schema: None,
-        provisioning_type: None,
+        // "For resource types, the provisioning behavior of the resource type": the class the
+        // catalogue holds the extension in, and none for a kind that has none.
+        provisioning_type: published.provisioning_type.map(str::to_string),
         deprecated_status: deprecated_status::LIVE.to_string(),
         type_tests_status: None,
         type_tests_status_description: None,
@@ -1561,6 +1685,25 @@ fn published_catalog_entry(type_kind: &str, type_name: &str) -> Option<&'static 
         .find(|published| published.type_kind == type_kind && published.type_name == type_name)
 }
 
+/// The ARN one catalogued public extension is addressed by.
+///
+/// A public extension a PUBLISHER published is addressed by the ARN that names that publisher
+/// ([`public_extension_arn`]) — the form the modelled `ThirdPartyTypeArn` states — and one
+/// Amazon Web Services published by the ARN that names none, since "extensions published by
+/// Amazon aren't assigned a publisher ID". One rule, read by the listing that reports the ARN
+/// and by the ARN lookup that resolves it ([`aws_published_by_arn`]), so a client can hand the
+/// ARN a listing gave it straight to `ActivateType`.
+pub fn published_catalog_arn(region: &str, published: &PublishedExtension) -> String {
+    let publisher_id = (published.publisher_name != AWS_PUBLISHER_NAME)
+        .then(|| published_publisher_id(published.publisher_name));
+    public_extension_arn(
+        region,
+        published.type_kind,
+        publisher_id.as_deref(),
+        published.type_name,
+    )
+}
+
 /// [`aws_published`], for a request that named the extension by ARN.
 ///
 /// A public extension's ARN carries no account id and spells its name with `-` separators,
@@ -1571,9 +1714,10 @@ pub fn aws_published_by_arn(region: &str, arn: &str) -> Option<StoredExtension> 
     if public_arn_region(arn) != Some(region) {
         return None;
     }
-    if let Some(published) = PUBLIC_EXTENSION_CATALOG.iter().find(|published| {
-        public_type_arn(region, published.type_kind, published.type_name) == arn
-    }) {
+    if let Some(published) = PUBLIC_EXTENSION_CATALOG
+        .iter()
+        .find(|published| published_catalog_arn(region, published) == arn)
+    {
         return Some(published_catalog_record(region, published));
     }
     let type_name = aws_published_resource_types()
@@ -1844,6 +1988,15 @@ pub fn ascii_configuration(configuration: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The catalogued public extension a THIRD-PARTY publisher published, which the registry
+    /// addresses by the ARN that names that publisher.
+    fn third_party_catalog_entry() -> &'static PublishedExtension {
+        PUBLIC_EXTENSION_CATALOG
+            .iter()
+            .find(|published| published.publisher_name != AWS_PUBLISHER_NAME)
+            .expect("the catalogue publishes a third party's extension")
+    }
+
     /// Every ARN this registry PUBLISHES for a public extension is one it reads back: the
     /// form an extension a publisher published carries (with its publisher id) and the form
     /// one Amazon Web Services published carries (with none), each with and without a public
@@ -1861,7 +2014,7 @@ mod tests {
             case: &'static str,
             arn: String,
             type_kind: &'static str,
-            publisher_id: &'static str,
+            publisher_id: String,
             type_name: &'static str,
             pinned: Option<&'static str>,
         }
@@ -1870,7 +2023,7 @@ mod tests {
                 case: "a Hook Amazon Web Services published, as this registry mints its ARN",
                 arn: public_type_arn(REGION, registry_type::HOOK, "AWS::Hooks::GuardHook"),
                 type_kind: registry_type::HOOK,
-                publisher_id: "",
+                publisher_id: String::new(),
                 type_name: "AWS::Hooks::GuardHook",
                 pinned: None,
             },
@@ -1878,7 +2031,7 @@ mod tests {
                 case: "a resource type Amazon Web Services published",
                 arn: public_type_arn(REGION, registry_type::RESOURCE, "AWS::SQS::Queue"),
                 type_kind: registry_type::RESOURCE,
-                publisher_id: "",
+                publisher_id: String::new(),
                 type_name: "AWS::SQS::Queue",
                 pinned: None,
             },
@@ -1886,7 +2039,7 @@ mod tests {
                 case: "a module Amazon Web Services published, whose name carries MODULE",
                 arn: public_type_arn(REGION, registry_type::MODULE, "AWS::Network::Vpc::MODULE"),
                 type_kind: registry_type::MODULE,
-                publisher_id: "",
+                publisher_id: String::new(),
                 type_name: "AWS::Network::Vpc::MODULE",
                 pinned: None,
             },
@@ -1896,8 +2049,17 @@ mod tests {
                     "arn:aws:cloudformation:{REGION}::type/hook/{PUBLISHER}/Example-Guard-Hook"
                 ),
                 type_kind: registry_type::HOOK,
-                publisher_id: PUBLISHER,
+                publisher_id: PUBLISHER.to_string(),
                 type_name: "Example::Guard::Hook",
+                pinned: None,
+            },
+            Row {
+                case: "a catalogued extension a third-party publisher published, as this \
+                       registry mints its ARN",
+                arn: published_catalog_arn(REGION, third_party_catalog_entry()),
+                type_kind: third_party_catalog_entry().type_kind,
+                publisher_id: published_publisher_id(third_party_catalog_entry().publisher_name),
+                type_name: third_party_catalog_entry().type_name,
                 pinned: None,
             },
             Row {
@@ -1906,19 +2068,9 @@ mod tests {
                     "arn:aws:cloudformation:{REGION}::type/resource/{PUBLISHER}/Example-Store-Bucket/1.0.0"
                 ),
                 type_kind: registry_type::RESOURCE,
-                publisher_id: PUBLISHER,
+                publisher_id: PUBLISHER.to_string(),
                 type_name: "Example::Store::Bucket",
                 pinned: Some("1.0.0"),
-            },
-            Row {
-                case: "an AWS-published extension with a public version pinned past the name",
-                arn: format!(
-                    "arn:aws:cloudformation:{REGION}::type/hook/AWS-Hooks-LambdaHook/2.1.0"
-                ),
-                type_kind: registry_type::HOOK,
-                publisher_id: "",
-                type_name: "AWS::Hooks::LambdaHook",
-                pinned: Some("2.1.0"),
             },
         ];
         for row in rows {
@@ -1935,7 +2087,7 @@ mod tests {
                 read,
                 Some(PublicTypeArnParts {
                     type_kind: (*type_kind).to_string(),
-                    publisher_id: (*publisher_id).to_string(),
+                    publisher_id: publisher_id.clone(),
                     type_name: (*type_name).to_string(),
                     public_version_number: pinned.map(str::to_string),
                 }),
@@ -1949,27 +2101,76 @@ mod tests {
         }
     }
 
-    /// An ARN that names no public extension is read as naming none.
+    /// A value that is no public-extension ARN at all is read as naming none: the reading
+    /// itself rejects it, before the registry's own resolution rule is reached.
     #[test]
-    fn an_arn_that_names_no_public_extension_reads_as_none() {
+    fn a_value_that_is_no_public_extension_arn_reads_as_none() {
         let rows: &[(&str, &str)] = &[
             ("no type path at all", "arn:aws:cloudformation:us-east-1::stack/a/0000"),
             ("nothing after the kind", "arn:aws:cloudformation:us-east-1::type/hook"),
             ("an empty kind", "arn:aws:cloudformation:us-east-1::type//Example-Guard-Hook"),
             (
-                "a publisher with no name after it",
-                "arn:aws:cloudformation:us-east-1::type/hook/abcdef0123456789abcd",
-            ),
-            (
-                "a segment that is neither a name nor a publisher with a name",
-                "arn:aws:cloudformation:us-east-1::type/hook/garbage",
+                "an empty name segment after a publisher",
+                "arn:aws:cloudformation:us-east-1::type/hook/abcdef0123456789abcd/",
             ),
         ];
         for (case, arn) in rows {
             let read = split_public_type_arn(arn);
             assert!(
                 read.is_none(),
-                "case {case:?}: expected {arn} to name no public extension, got {read:?}"
+                "case {case:?}: expected {arn} to be read as no public extension ARN, got \
+                 {read:?}"
+            );
+        }
+    }
+
+    /// An ARN whose NAME POSITION carries no extension type name resolves no extension: the
+    /// reading answers what the ARN says, and [`is_type_name`] — the registry's own resolution
+    /// rule — is what rejects the name it read.
+    ///
+    /// The rows differ along what stands in the name's position: a publisher id (an ARN naming
+    /// no publisher at all), a segment that is neither, a public version number and a version
+    /// id (both of them ARNs whose name sits one segment to the left of where a caller put
+    /// it).
+    #[test]
+    fn an_arn_carrying_no_type_name_in_the_names_position_resolves_no_extension() {
+        let rows: &[(&str, &str, &str)] = &[
+            (
+                "a publisher id where the name belongs",
+                "arn:aws:cloudformation:us-east-1::type/hook/abcdef0123456789abcd",
+                "abcdef0123456789abcd",
+            ),
+            (
+                "a segment that is neither a name nor a publisher with a name",
+                "arn:aws:cloudformation:us-east-1::type/hook/garbage",
+                "garbage",
+            ),
+            (
+                // The name is read by its POSITION: with a further segment behind it, the
+                // segment after the kind is the publisher and the one after that is the name,
+                // so an ARN of this shape carries a version number where the name belongs.
+                "a version number where the name belongs",
+                "arn:aws:cloudformation:us-east-1::type/hook/AWS-Hooks-LambdaHook/2.1.0",
+                "2.1.0",
+            ),
+            (
+                "a version id where the name belongs",
+                "arn:aws:cloudformation:us-east-1::type/resource/SomeVendor-Thing-Thing/00000001",
+                "00000001",
+            ),
+        ];
+        for (case, arn, in_the_names_position) in rows {
+            let read = split_public_type_arn(arn);
+            assert_eq!(
+                read.as_ref().map(|parts| parts.type_name.as_str()),
+                Some(*in_the_names_position),
+                "case {case:?}: expected {arn} read with {in_the_names_position:?} in the \
+                 name's position, got {read:?}"
+            );
+            assert!(
+                !is_type_name(in_the_names_position),
+                "case {case:?}: expected {in_the_names_position:?} to be no extension type \
+                 name"
             );
         }
     }
