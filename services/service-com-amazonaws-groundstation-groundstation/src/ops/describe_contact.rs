@@ -223,7 +223,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             visibility_start_time: None,
             visibility_end_time: None,
             tracking_overrides: contact.tracking_overrides().cloned(),
-            ephemeris: None,
+            // The ephemeris that determines this contact's antenna pointing: the one its
+            // own program track names, when the overrides it is flown with name one, and
+            // otherwise the one in force for the satellite it flies — read through the one
+            // helper every reader of a contact's pointing shares
+            // (`crate::state::ComAmazonawsGroundstationGroundstationState::pointing_ephemeris`),
+            // against the version in force, which is the version whose `trackingOverrides`
+            // and `satelliteArn` this answer reports.
+            ephemeris: guard
+                .pointing_ephemeris(contact.tracking_overrides(), contact.satellite_arn()),
             version: Some(contact.version()),
         })
     }

@@ -259,15 +259,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // in the sky the satellite rises above the receive mask, peaks and sets,
             // "based on the satellite's current active ephemeris" — and nothing this
             // service holds determines it: a ground station records no coordinates and no
-            // ephemeris here is propagated. `ephemeris` is the trajectory the antenna was
-            // pointed by, which is that same unflown geometry. All of them are therefore
-            // reported absent rather than invented, exactly as `DescribeContact` reports
-            // them.
+            // ephemeris here is propagated. They are therefore reported absent rather than
+            // invented, exactly as `DescribeContact` reports them.
             error_message: None,
             maximum_elevation: None,
             visibility_start_time: None,
             visibility_end_time: None,
-            ephemeris: None,
+            // `ephemeris` is NOT one of those: it is the ephemeris that DETERMINES the
+            // antenna pointing, which is settled by the configuration a version is flown
+            // with rather than by a flown pass, so it is read for THIS version's overrides
+            // and satellite through the one helper every reader of a contact's pointing
+            // shares
+            // (`crate::state::ComAmazonawsGroundstationGroundstationState::pointing_ephemeris`)
+            // — the version-scoped member its `trackingOverrides` and `satelliteArn` above
+            // belong with.
+            ephemeris: guard.pointing_ephemeris(
+                version.tracking_overrides.as_ref(),
+                version.satellite_arn.as_deref(),
+            ),
         })
     }
 }

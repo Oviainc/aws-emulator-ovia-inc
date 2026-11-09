@@ -49,6 +49,8 @@ mod contact_dataflows_and_pass_stages;
 mod contact_endpoint_settle_consistency;
 #[path = "all/contact_ephemeris_filter.rs"]
 mod contact_ephemeris_filter;
+#[path = "all/contact_pointing_ephemeris.rs"]
+mod contact_pointing_ephemeris;
 #[path = "all/contact_satellite_reference_integrity.rs"]
 mod contact_satellite_reference_integrity;
 #[path = "all/contact_version_description.rs"]

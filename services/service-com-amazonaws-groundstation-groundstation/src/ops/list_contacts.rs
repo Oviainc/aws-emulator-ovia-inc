@@ -412,7 +412,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags: contact.response_tags(),
                 visibility_start_time: None,
                 visibility_end_time: None,
-                ephemeris: None,
+                // The ephemeris that determines this contact's antenna pointing, read for
+                // the version in force through the one helper every reader of a contact's
+                // pointing shares
+                // (`crate::state::ComAmazonawsGroundstationGroundstationState::pointing_ephemeris`),
+                // so a stored contact reports it exactly as `DescribeContact` does — and a
+                // contact reserved over an offered window reports the ephemeris that window
+                // was offered under below.
+                ephemeris: guard
+                    .pointing_ephemeris(contact.tracking_overrides(), contact.satellite_arn()),
                 version: Some(contact.version()),
             })
             .take(reachable)

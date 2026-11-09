@@ -60,9 +60,9 @@ const POST_PASS_SECONDS: i64 = 30;
 /// identically to `DescribeContact`.
 ///
 /// Source: the output of `smithy_query(query="operation",
-/// operation="DescribeContactVersion")`, less the three version-scoped members
-/// (`satelliteArn`, `trackingOverrides`, `version`) and the five this emulator reports
-/// absent because nothing has flown a pass ([`UNFLOWN_MEMBERS`]).
+/// operation="DescribeContactVersion")`, less the four version-scoped members
+/// (`satelliteArn`, `trackingOverrides`, `ephemeris`, `version`) and the four this emulator
+/// reports absent because nothing has flown a pass ([`UNFLOWN_MEMBERS`]).
 const CONTACT_LEVEL_MEMBERS: &[&str] = &[
     "contactId",
     "missionProfileArn",
@@ -78,15 +78,21 @@ const CONTACT_LEVEL_MEMBERS: &[&str] = &[
 ];
 
 /// The output members that report what a FLOWN pass produced: the error a contact or a
-/// dataflow failed with, the geometry an antenna tracked (`maximumElevation`,
-/// `visibilityStartTime`, `visibilityEndTime`) and the ephemeris it was pointed by.
-/// Nothing in this emulator flies a pass, so a description reports none of them.
+/// dataflow failed with and the geometry an antenna tracked (`maximumElevation`,
+/// `visibilityStartTime`, `visibilityEndTime`). Nothing in this emulator flies a pass, so a
+/// description reports none of them.
+///
+/// `ephemeris` is NOT one of them: it is the ephemeris that DETERMINES the antenna pointing
+/// (`smithy_query(query="doc", shape="DescribeContactVersionResponse",
+/// member="ephemeris")`), which is settled by the configuration a version carries rather
+/// than by a flown pass — so it is version-scoped, asserted here from each version's own
+/// overrides ([`expected_ephemeris`]) and over the whole rule in
+/// `crate::contact_pointing_ephemeris`.
 const UNFLOWN_MEMBERS: &[&str] = &[
     "errorMessage",
     "maximumElevation",
     "visibilityStartTime",
     "visibilityEndTime",
-    "ephemeris",
 ];
 
 /// `TrackingOverrides` selecting the `azEl`, `oem` or `tle` member of
@@ -94,6 +100,38 @@ const UNFLOWN_MEMBERS: &[&str] = &[
 /// all three of them) for the ephemeris `uuid`.
 fn overrides(member: &str, uuid: &str) -> Value {
     json!({"programTrackSettings": {member: {"ephemerisId": uuid}}})
+}
+
+/// The `ephemeris` a version carrying the overrides `tracking` must be described with: the
+/// ephemeris its program track names, under the `EphemerisType` the member naming it
+/// requires — `azEl` -> `AZ_EL`, `oem` -> `OEM`, `tle` -> `TLE`, the three members of
+/// `ProgramTrackSettings` (`smithy_query(query="shape", shape="ProgramTrackSettings")`).
+///
+/// `Value::Null` when the version's overrides name no program track: no ephemeris this
+/// suite stores applies to a satellite, so nothing else determines the pointing of a
+/// contact here (the satellite coupling is `crate::contact_pointing_ephemeris`'s subject).
+fn expected_ephemeris(tracking: &Option<Value>) -> Value {
+    let Some(settings) = tracking
+        .as_ref()
+        .and_then(|overrides| overrides.get("programTrackSettings"))
+        .and_then(Value::as_object)
+    else {
+        return Value::Null;
+    };
+    let (member, reference) = settings
+        .iter()
+        .next()
+        .expect("a programTrackSettings names one member");
+    let ephemeris_type = match member.as_str() {
+        "azEl" => state::EPHEMERIS_TYPE_AZ_EL,
+        "oem" => state::EPHEMERIS_TYPE_OEM,
+        "tle" => state::EPHEMERIS_TYPE_TLE,
+        other => panic!("case {other}: not a ProgramTrackSettings member"),
+    };
+    json!({
+        "ephemerisId": reference.get("ephemerisId").cloned().unwrap_or(Value::Null),
+        "ephemerisType": ephemeris_type,
+    })
 }
 
 /// A mission profile with ONE dataflow edge, answering its ARN.
@@ -356,6 +394,13 @@ async fn assert_every_version_describes_its_own_configuration(
                 contact.field(member)
             );
         }
+        assert_eq!(
+            reply.body.get("ephemeris").cloned().unwrap_or(Value::Null),
+            expected_ephemeris(tracking),
+            "case {case}: expected the ephemeris this version's program track points the \
+             antenna with, got {}",
+            reply.field("ephemeris")
+        );
         for member in UNFLOWN_MEMBERS {
             assert_eq!(
                 reply.body.get(*member).unwrap_or(&Value::Null),
