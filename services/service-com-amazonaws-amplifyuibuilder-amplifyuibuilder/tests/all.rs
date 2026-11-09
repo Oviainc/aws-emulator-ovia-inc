@@ -116,5 +116,8 @@ mod token_refusal_draws_no_secret;
 #[path = "all/update_absent_id_refusal_class.rs"]
 mod update_absent_id_refusal_class;
 
+#[path = "all/widened_error_contract.rs"]
+mod widened_error_contract;
+
 #[path = "all/wrong_scope_sentence.rs"]
 mod wrong_scope_sentence;

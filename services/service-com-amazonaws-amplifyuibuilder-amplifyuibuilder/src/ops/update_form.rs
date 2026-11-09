@@ -71,6 +71,9 @@
 //!   for the input parameter.
 //! * `ResourceConflictException` (HTTP 409) — The resource specified in the request conflicts
 //!   with an existing resource.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see below):
+//!   the shape is this service's own, declared for the same id lookup by `GetForm` and
+//!   `DeleteForm`.
 
 #[allow(unused_imports)]
 use super::types::*;
