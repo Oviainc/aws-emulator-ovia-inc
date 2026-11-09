@@ -45,6 +45,8 @@ mod resource_tags;
 mod selector_validation;
 #[path = "all/service_set_tag_keys.rs"]
 mod service_set_tag_keys;
+#[path = "all/session_policy_scoping.rs"]
+mod session_policy_scoping;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_write_cancellation.rs"]
