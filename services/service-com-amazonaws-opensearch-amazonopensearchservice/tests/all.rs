@@ -63,6 +63,8 @@ mod cross_cluster_connections;
 mod cross_cluster_search;
 #[path = "all/current_generation_instance_types.rs"]
 mod current_generation_instance_types;
+#[path = "all/data_plane_iam_authorization.rs"]
+mod data_plane_iam_authorization;
 #[path = "all/data_source_attachment_authorization.rs"]
 mod data_source_attachment_authorization;
 #[path = "all/data_source_attachments.rs"]

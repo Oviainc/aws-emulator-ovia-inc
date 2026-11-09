@@ -25,20 +25,20 @@
 //! at all, so it reaches the emulator and carries what it was told; two addressings
 //! resolve:
 //!
-//! * HOST-STYLE, the addressing `DomainStatus$Endpoint` publishes: the request's host IS a
-//!   host some domain of this store publishes — its public endpoint, the dual-stack host
-//!   `DomainStatus$EndpointV2` reports beside it, or one of the VPC-access hosts
-//!   `DomainStatus$Endpoints` reports — and the whole path is the request path. This is the
-//!   addressing a client of a published endpoint uses, because that member's value is a
-//!   HOST: the client puts it in the `Host` header of the request it signs and sends, so
-//!   every host the control plane publishes is resolved here and the published value
-//!   carries nothing besides a host (see `crate::state::domain_endpoint`);
-//! * PREFIXED PATH-STYLE: the data plane is named by the reserved namespace segment
+//! * PREFIXED PATH-STYLE, the addressing `DomainStatus$Endpoint` PUBLISHES: the data plane
+//!   is named by the reserved namespace segment
 //!   (`service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`) and
 //!   [`DATA_PLANE_SEGMENT`], then the domain's name or its endpoint host, then the request
 //!   path — `/_aws/es/{domain-or-host}/{path}`. That segment begins with `_`, which no
 //!   modelled path segment of any service does, so the prefix collides with no
-//!   control-plane route.
+//!   control-plane route. This is what a client of a published endpoint uses, because the
+//!   published value IS this addressing on the endpoint this emulator answers on (see
+//!   `crate::state::published_domain_address`);
+//! * HOST-STYLE, the addressing a client that resolves AWS's own hosts uses: the request's
+//!   host IS a host some domain of this store publishes — the public host AWS names its
+//!   endpoint (`crate::state::domain_endpoint`), the dual-stack host
+//!   `DomainStatus$EndpointV2` reports beside it, or one of the VPC-access hosts
+//!   `DomainStatus$Endpoints` reports — and the whole path is the request path.
 //!
 //! Either way the claim is narrowed to a domain this service HOLDS, read from the one
 //! shared store, so one request keeps one claimant — this service's signing name is shared
@@ -758,7 +758,7 @@ fn serve_resolved(
         &resource,
         request.identity,
     ) {
-        return refused(&refusal);
+        return iam_refused(&refusal);
     }
     let segments = request.segments();
     match segments.as_slice() {
@@ -2063,6 +2063,13 @@ fn document_write(
                 }),
             )
         }
+        // The write path states BOTH the IAM decision and the CLUSTER's own (a principal
+        // fine-grained access control binds to no role) as a `security_exception`, and the
+        // refusal does not say which layer refused — so it is answered in the engine's
+        // envelope, which is right for the cluster's half. The IAM decision this surface
+        // takes is the one above ([`iam_refused`]); separating the two inside the shared
+        // write path means a refusal kind of its own on `ingest::WriteRefusal`, which the
+        // producer path reads too.
         Err(refusal) => refused(&refusal),
     }
 }
@@ -3191,6 +3198,29 @@ fn written(name: &str, existed: bool) -> RtResponse {
         201,
         &json!({ "status": "CREATED", "message": format!("'{name}' created.") }),
     )
+}
+
+/// The answer AWS's own IAM layer refuses a signed data-plane request with, BEFORE the
+/// cluster is asked anything: `403` carrying a `Message` member — the envelope every AWS
+/// service refuses an unauthorized request in, and not one of the engine's error documents,
+/// because the engine never saw the request. The sentence is the one
+/// [`ingest::iam_decision`] words: the principal that signed, the action its method asks
+/// for, and which of IAM's rules refused; every value in it comes from the request and from
+/// the stored policies.
+///
+/// The CLUSTER's own refusal of a request IAM allowed — a principal fine-grained access
+/// control binds to no role — is the engine's `security_exception` document instead
+/// ([`refused`]), because that one IS the cluster answering.
+fn iam_refused(refusal: &ingest::WriteRefusal) -> RtResponse {
+    match refusal {
+        ingest::WriteRefusal::Rejected {
+            error_type: ingest::SECURITY_EXCEPTION,
+            message,
+        } => rendered(403, &json!({ "Message": message })),
+        // Every other condition is the cluster's or the domain's own, worded as the engine
+        // words it: this decision states only the authorization one.
+        other => refused(other),
+    }
 }
 
 /// The answer a write refused by the one data-plane write path renders: the engine's own

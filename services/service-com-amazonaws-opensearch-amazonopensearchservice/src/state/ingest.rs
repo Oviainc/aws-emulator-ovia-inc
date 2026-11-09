@@ -267,7 +267,15 @@ fn provisioned_domain<'s>(
     let name = store
         .domains
         .values()
-        .find(|domain| domain.arn == address || domain.endpoint == address)
+        .find(|domain| {
+            domain.arn == address
+                // The address a producer is CONFIGURED with is the one the control plane
+                // published for the domain ([`Domain::published_endpoint`]); the host AWS
+                // names that endpoint is accepted beside it, for a configuration written
+                // against AWS's own name.
+                || domain.published_endpoint() == address
+                || domain.endpoint == address
+        })
         .map(|domain| domain.domain_name.clone())
         .ok_or_else(unreachable)?;
     let domain = store.settled_mut(&name, now).ok_or_else(unreachable)?;
@@ -342,42 +350,48 @@ pub fn iam_decision(
     }
     Err(WriteRefusal::Rejected {
         error_type: SECURITY_EXCEPTION,
-        // Worded by the one place each of IAM's refusals is worded, and WHICH of them it is
-        // follows the policy that refused: an explicit `Deny` names the side it was read
-        // from, and with neither side allowing, the sentence names the kind of policy that
-        // would have had to allow — the domain's own access policy where it carries one,
-        // and the principal's identity policies otherwise. Every value in it comes from the
-        // request and from the stored policy.
+        // Worded by the one place a data-plane refusal of this service is worded
+        // ([`not_authorized`]), and WHICH of IAM's rules refused follows the policy that
+        // refused: an explicit `Deny` names the side it was read from, and with neither side
+        // allowing, the sentence names the kind of policy that would have had to allow — the
+        // domain's own access policy where it carries one, and the principal's identity
+        // policies otherwise. Every value in it comes from the request and from the stored
+        // policy.
         message: match (identity_decision, resource_decision) {
-            (_, Decision::Denied) => super::authorization::not_authorized(
+            (_, Decision::Denied) => not_authorized(
                 principal_arn,
                 &action,
-                resource,
                 EXPLICIT_DENY_IN_A_RESOURCE_POLICY,
-            )
-            .message
-            .unwrap_or_default(),
-            (Decision::Denied, _) => super::authorization::not_authorized(
+            ),
+            (Decision::Denied, _) => not_authorized(
                 principal_arn,
                 &action,
-                resource,
                 EXPLICIT_DENY_IN_AN_IDENTITY_POLICY,
-            )
-            .message
-            .unwrap_or_default(),
-            _ if access_policy.is_some() => {
-                iam::not_authorized_by_resource_policy(principal_arn, &action, resource)
-            }
-            _ => super::authorization::not_authorized(
+            ),
+            _ if access_policy.is_some() => not_authorized(
                 principal_arn,
                 &action,
-                resource,
+                &format!("because no resource-based policy allows the {action} action"),
+            ),
+            _ => not_authorized(
+                principal_arn,
+                &action,
                 &format!("because no identity-based policy allows the {action} action"),
-            )
-            .message
-            .unwrap_or_default(),
+            ),
         },
     })
+}
+
+/// The sentence AWS refuses a DATA-PLANE request of this service with: the principal that
+/// signed, the `es:ESHttp*` action its method asks for, and which of IAM's rules refused.
+///
+/// It names no RESOURCE — the recorded refusal of such a request carries the principal, the
+/// action and the rule and nothing else — which is what separates it from this service's
+/// CONTROL-plane refusal ([`super::authorization::not_authorized`]), where the resource the
+/// request named is part of the sentence. Every value in it comes from the request and from
+/// the stored policies.
+fn not_authorized(principal_arn: &str, action: &str, reason: &str) -> String {
+    format!("User: {principal_arn} is not authorized to perform: {action} {reason}")
 }
 
 /// The clause IAM refuses a request with that a RESOURCE-based policy explicitly denies —

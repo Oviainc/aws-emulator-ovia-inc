@@ -437,6 +437,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .use_case
                 .unwrap_or_else(|| DEFAULT_USE_CASE.to_string()),
             endpoint: domain_endpoint(&name, &suffix, &region),
+            // Where a client of THIS emulator reaches the domain's data plane, which is
+            // what `DomainStatus$Endpoint` publishes: the endpoint this process answers
+            // on, read from the framework rather than from the request, so a domain
+            // CloudFormation created through an in-process call publishes the address a
+            // client can reach exactly as a directly created one does.
+            published_at: crate::state::emulator_endpoint_authority(ctx),
             // Minted below by the store, which is the one place that decides a
             // VPC-access domain needs a host id of its own.
             vpc_access_suffix: None,

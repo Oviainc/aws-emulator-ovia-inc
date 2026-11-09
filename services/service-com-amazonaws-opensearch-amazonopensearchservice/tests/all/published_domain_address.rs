@@ -4,22 +4,22 @@
 //!
 //! Three rules, each over a SET of inputs rather than one recorded call:
 //!
-//! * **every address a control-plane answer publishes for a domain's data plane is the HOST
-//!   this service publishes that address as, whoever is reading, and this emulator SERVES
-//!   that host.** `DomainStatus$Endpoint` is the "domain-specific endpoint used to submit
-//!   index, search, and data upload requests" and `Endpoints`/`EndpointV2` are the same
-//!   thing for a domain reached inside a VPC or over both address families — all of them
-//!   hosts, so what is published is a host and nothing else: a client carries the value it
-//!   was told in the `Host` header of the request it SIGNS and sends there, and a value
-//!   carrying anything besides a host (an authority with a path) makes the host it signs
-//!   differ from the host it sends, so the signature cannot verify and the request never
-//!   reaches the domain. The rows span every access mode a domain publishes an address for
-//!   and every reader that publishes one;
+//! * **every address a control-plane answer publishes for a domain's data plane is one a
+//!   client DIALS as published, and dialling it reaches THAT domain.**
+//!   `DomainStatus$Endpoint` is the "domain-specific endpoint used to submit index, search,
+//!   and data upload requests" and `Endpoints`/`EndpointV2` are the same thing for a domain
+//!   reached inside a VPC or over both address families — so a client builds its requests
+//!   on the value it was handed and sends them there, and a value nothing answers at is a
+//!   value no client can use. The public endpoint is therefore this emulator's own endpoint
+//!   with the reserved path that names this plane and the domain, since the host AWS names
+//!   that endpoint by resolves nowhere here; the hosts beside it are AWS's own names for a
+//!   domain's other addresses, which the plane serves too. The rows span every access mode
+//!   a domain publishes an address for and every reader that publishes one;
 //! * **a domain's access policy decides each principal its statements NAME, and a statement
 //!   naming an IAM role is about every session of that role** — because a resource policy is
 //!   written with the identity a client created, which for a role is the role's own ARN. An
-//!   explicit `Deny` wins over every allow, and the refusal is IAM's own sentence naming the
-//!   principal, the action, the resource and which rule refused. The rows span the spellings
+//!   explicit `Deny` wins over every allow, and the refusal is AWS's own 403 `Message`
+//!   naming the principal, the action and which rule refused. The rows span the spellings
 //!   a `Principal` element names a caller by and both effects;
 //! * **a refresh reports the shards of the indexes it ran on**, computed from each index's
 //!   own settings and the domain's node count, over a table of shard and replica counts.
@@ -126,7 +126,7 @@ async fn describe_batch_at(emulator: &Emulator, host: &str, name: &str) -> Answe
 /// A domain is still being provisioned when its create answers and publishes no address at
 /// all then, so every suite below reads the address it uses here — after waiting the
 /// provisioning span out — rather than off the create's own answer.
-async fn published_endpoint(emulator: &Emulator, domain: &str, case: &str) -> String {
+pub(crate) async fn published_endpoint(emulator: &Emulator, domain: &str, case: &str) -> String {
     let read = describe_at(emulator, LOCAL_ENDPOINT, domain).await;
     read.body["DomainStatus"]["Endpoint"]
         .as_str()
@@ -164,10 +164,16 @@ fn published_addresses(status: &Value, case: &str) -> Vec<(String, String)> {
     addresses
 }
 
-/// One data-plane request to the ADDRESS the control plane published for a domain: that
-/// address is a HOST, so it is carried in the `Host` header exactly as it was published and
-/// the request path is the client's own.
-async fn at_address(
+/// One data-plane request to the ADDRESS the control plane published for a domain, dialled
+/// exactly as a client dials it: a client builds `https://{address}{path}`, so the
+/// AUTHORITY of the published value is the host the request carries and signs, and whatever
+/// the value carries after it is the prefix of the request path.
+///
+/// One reading for both shapes a published address takes: the address a client of this
+/// emulator reaches the domain at (this emulator's own endpoint, with the reserved path that
+/// names the plane and the domain) and the host AWS names an endpoint by (an authority
+/// alone, where the prefix is empty).
+pub(crate) async fn at_address(
     emulator: &Emulator,
     address: &str,
     access_key_id: &str,
@@ -175,7 +181,19 @@ async fn at_address(
     path: &str,
     body: Option<Value>,
 ) -> Answer {
-    dispatch(emulator, address, access_key_id, method, path, body).await
+    let (authority, prefix) = match address.find('/') {
+        Some(end) => (&address[..end], &address[end..]),
+        None => (address, ""),
+    };
+    dispatch(
+        emulator,
+        authority,
+        access_key_id,
+        method,
+        &format!("{prefix}{path}"),
+        body,
+    )
+    .await
 }
 
 /// The `error.type` a refused data-plane answer carries.
@@ -186,12 +204,23 @@ fn error_type(answer: &Answer) -> String {
         .to_string()
 }
 
-/// The `error.reason` a refused data-plane answer carries — the sentence the refusal states.
-fn error_reason(answer: &Answer) -> String {
-    answer.body["error"]["reason"]
+/// The `Message` an IAM-layer refusal of a data-plane request carries — the sentence AWS
+/// refuses a signed request to a domain with, before the cluster is asked anything.
+pub(crate) fn refusal_message(answer: &Answer) -> String {
+    answer.body["Message"]
         .as_str()
         .unwrap_or_default()
         .to_string()
+}
+
+/// The endpoint THIS emulator answers on, as the framework states it for a router that is
+/// not served on a port — which is what an in-process suite's emulator is, and so the
+/// authority a published data-plane address carries here. Read from the framework rather
+/// than spelled out, so the expectation is "this emulator's own endpoint" and not a literal.
+pub(crate) fn emulator_authority() -> &'static str {
+    ::smithy_server_runtime::UNSERVED_URL_BASE
+        .split_once("://")
+        .map_or(::smithy_server_runtime::UNSERVED_URL_BASE, |(_, authority)| authority)
 }
 
 /// One domain to publish an address for: how it is reached, and which members the rule says
@@ -265,16 +294,22 @@ fn create_body(row: &AccessRow) -> Value {
     body
 }
 
-/// RULE: every address a control-plane answer publishes for a domain's data plane is the
-/// HOST this service publishes that address as — the same value whichever endpoint the
-/// reading request reached — and this emulator serves THAT domain at that host.
+/// RULE: every address a control-plane answer publishes for a domain's data plane is an
+/// address a client DIALS as published — the same value whichever endpoint the reading
+/// request reached — and dialling it reaches THAT domain.
+///
+/// The PUBLIC endpoint a client is told is this emulator's own endpoint with the reserved
+/// path that names this plane and the domain, because the host AWS names that endpoint by
+/// resolves nowhere for a client of this emulator; the VPC-access hosts beside it are the
+/// names AWS gives the addresses a domain is reached on from inside a VPC, which the plane
+/// serves too.
 ///
 /// Each row is checked on every reader that publishes such an address (the create's own
 /// answer, the single-domain read and the batch read), on every member it publishes one in,
 /// and by USING it: the banner it answers names that domain's cluster, and a document
 /// written through it reads back through it.
 #[tokio::test]
-async fn every_published_domain_address_is_a_host_this_emulator_serves_that_domain_at() {
+async fn every_published_domain_address_is_dialled_as_published_and_reaches_that_domain() {
     let emulator = Emulator::new();
     let account = ::engine::emulator_account_id();
 
@@ -309,19 +344,25 @@ async fn every_published_domain_address_is_a_host_this_emulator_serves_that_doma
             row.members
         );
 
-        // Every published address is a HOST, and the host this service mints for that
-        // member: a client puts the value in the `Host` header of the request it signs, so
-        // an authority with a path would make the host it signs differ from the one it
-        // sends. The shapes are the ones `DomainStatus`' own examples name — the `search-`
-        // host for a public endpoint and the `vpc-endpoint-` one for a VPC-access host,
-        // under the Region's `es` endpoint prefix over IPv4 and under the service's
-        // dual-stack domain for a version 2 endpoint.
+        // The PUBLIC endpoint publishes the address a client of this emulator reaches the
+        // domain at: this emulator's own endpoint, then the reserved path naming this
+        // service's data plane and the domain behind it. The hosts beside it publish the
+        // names AWS gives a domain's other addresses — the `search-` label under the
+        // service's dual-stack domain for a version 2 endpoint, and the `vpc-endpoint-`
+        // shapes `DomainStatus`' own examples name for a domain reached inside a VPC, over
+        // IPv4 under the Region's `es` endpoint prefix and over both families under that
+        // dual-stack domain.
         for (member, address) in &addresses {
+            if member == "Endpoint" {
+                assert_eq!(
+                    address,
+                    &format!("{}/_aws/es/{}", emulator_authority(), row.domain),
+                    "case {case:?}: expected {member} to publish this emulator's own endpoint \
+                     with the reserved path naming this plane and the domain"
+                );
+                continue;
+            }
             let (prefix, tail) = match member.as_str() {
-                "Endpoint" => (
-                    format!("search-{}-", row.domain),
-                    format!(".{REGION}.es.amazonaws.com"),
-                ),
                 "EndpointV2" => (
                     format!("search-{}-", row.domain),
                     format!(".aos.{REGION}.on.aws"),
@@ -434,13 +475,13 @@ async fn every_published_domain_address_is_a_host_this_emulator_serves_that_doma
 }
 
 /// The ARN of the IAM role a seeded session speaks for.
-fn role_arn(role: &str) -> String {
+pub(crate) fn role_arn(role: &str) -> String {
     format!("arn:aws:iam::{}:role/{role}", ::engine::emulator_account_id())
 }
 
 /// The ARN of the SESSION a seeded credential speaks for — the principal
 /// `sts:GetCallerIdentity` reports for it, which is the name the cluster knows the caller by.
-fn session_arn(role: &str, session: &str) -> String {
+pub(crate) fn session_arn(role: &str, session: &str) -> String {
     format!(
         "arn:aws:sts::{}:assumed-role/{role}/{session}",
         ::engine::emulator_account_id()
@@ -449,7 +490,7 @@ fn session_arn(role: &str, session: &str) -> String {
 
 /// Record the assumed-role session `access_key_id` speaks for, as `sts:AssumeRole` records
 /// one.
-fn given_session(emulator: &Emulator, role: &str, session: &str, access_key_id: &str) {
+pub(crate) fn given_session(emulator: &Emulator, role: &str, session: &str, access_key_id: &str) {
     let now = SystemTime::now();
     let arn = role_arn(role);
     let vend = sts::NewSession {
@@ -473,7 +514,7 @@ fn given_session(emulator: &Emulator, role: &str, session: &str, access_key_id: 
 
 /// Give `role` an inline policy carrying `document` — the identity-based grant IAM holds for
 /// the role a session speaks for.
-fn given_role_policy(emulator: &Emulator, role: &str, document: Value) {
+pub(crate) fn given_role_policy(emulator: &Emulator, role: &str, document: Value) {
     let store = iam::service_state(&**emulator.engine()).expect("the IAM store");
     store.lock().role_inline_policies.insert(
         iam::name_key(role),
@@ -571,10 +612,6 @@ async fn the_access_policy_decides_the_sessions_of_the_roles_it_names() {
         tokio::time::sleep(SETTLE_WAIT).await;
         published_endpoint(&emulator, domain, "CreateDomain with an access policy").await
     };
-    let domain_arn = created.body["DomainStatus"]["ARN"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
 
     // The ALLOWED role's session gets the engine's own verdicts: a create, a refresh, a read
     // and a search over what it wrote.
@@ -661,19 +698,18 @@ async fn the_access_policy_decides_the_sessions_of_the_roles_it_names() {
             "case {case:?}: expected 403, got {} with {:?}",
             answer.status, answer.body
         );
-        let reason = error_reason(&answer);
+        let message = refusal_message(&answer);
         let expected_prefix = format!(
             "User: {} is not authorized to perform: es:",
             session_arn(DENIED_ROLE, SESSION)
         );
         assert!(
-            reason.starts_with(&expected_prefix),
-            "case {case:?}: expected the refusal to name the signing session, got {reason:?}"
+            message.starts_with(&expected_prefix),
+            "case {case:?}: expected the refusal to name the signing session, got {message:?}"
         );
         assert!(
-            reason.contains(&format!(" on resource: {domain_arn}/acl-index"))
-                && reason.ends_with(" with an explicit deny in a resource-based policy"),
-            "case {case:?}: expected the resource and the explicit-deny clause, got {reason:?}"
+            message.ends_with(" with an explicit deny in a resource-based policy"),
+            "case {case:?}: expected the explicit-deny clause, got {message:?}"
         );
         assert!(
             !answer.body.to_string().contains("allowed"),
@@ -849,7 +885,6 @@ async fn each_access_policy_statement_decides_the_callers_it_names() {
 
     for row in POLICY_ROWS {
         let case = row.case;
-        let domain_arn = format!("arn:aws:es:{REGION}:{account}:domain/{}", row.domain);
         let address = published_endpoint(&emulator, row.domain, case).await;
 
         let answer = at_address(&emulator, &address, READER_KEY, "GET", "/", None).await;
@@ -866,21 +901,18 @@ async fn each_access_policy_statement_decides_the_callers_it_names() {
                 answer.body
             ),
             Some(clause) => {
+                // The IAM layer refuses before the cluster is asked anything, so the answer
+                // is AWS's own envelope — a `Message` member — and not one of the engine's
+                // error documents.
+                let message = refusal_message(&answer);
                 assert_eq!(
-                    error_type(&answer),
-                    "security_exception",
-                    "case {case:?}: expected the engine's security error type, got {:?}",
-                    answer.body
-                );
-                let reason = error_reason(&answer);
-                assert_eq!(
-                    reason,
+                    message,
                     format!(
-                        "User: {} is not authorized to perform: es:ESHttpGet on resource: \
-                         {domain_arn}/ {clause}",
+                        "User: {} is not authorized to perform: es:ESHttpGet {clause}",
                         session_arn(READER_ROLE, SESSION)
                     ),
-                    "case {case:?}: expected IAM's own sentence, got {reason:?}"
+                    "case {case:?}: expected IAM's own sentence, got {:?}",
+                    answer.body
                 );
             }
         }

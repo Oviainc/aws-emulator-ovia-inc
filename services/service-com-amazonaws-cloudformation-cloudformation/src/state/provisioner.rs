@@ -1954,6 +1954,13 @@ impl Provisioner {
                     .await
                     .map(Some)
             }
+            // `UpdateDomainConfig` "modifies the cluster configuration of the specified
+            // Amazon OpenSearch Service domain", and every property of
+            // `AWS::OpenSearchService::Domain` that is a member of it can change on a domain
+            // that exists — so a changed declaration is applied to the domain the stack
+            // created, which keeps its name, its id, its ARN and the address it is reached
+            // at, rather than replacing it ([`update_domain`]).
+            Self::OpenSearchServiceDomain => update_domain(ctx, region, resource, declared).await,
             // `PutBucketPolicy` "applies an Amazon S3 bucket policy to an Amazon S3
             // bucket", replacing the one the bucket carries, so the call that attached the
             // policy is the call that applies a changed declaration to it.

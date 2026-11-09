@@ -207,27 +207,37 @@ fn assert_rule(status: &Value, row: &Row, name: &str, case: &str) -> Vec<(String
     );
 
     if row.endpoints_keys.is_empty() {
-        // A domain reached on a public endpoint publishes that host and no map.
+        // A domain reached on a public endpoint publishes that address and no map. The
+        // address is the one a client of this emulator reaches the domain at: this
+        // emulator's own endpoint with the reserved path naming this service's data plane
+        // and the domain behind it, because the host AWS names that endpoint by resolves
+        // nowhere here.
         let endpoint = status["Endpoint"].as_str().unwrap_or_else(|| {
             panic!("case {case:?}: expected a public Endpoint, got {:?}", status["Endpoint"])
         });
-        assert!(
-            endpoint.starts_with(&format!("search-{name}-")) && endpoint.ends_with(IPV4_SUFFIX),
-            "case {case:?}: expected search-{name}-<suffix>{IPV4_SUFFIX}, got {endpoint:?}"
+        assert_eq!(
+            endpoint,
+            format!(
+                "{}/_aws/es/{name}",
+                super::published_domain_address::emulator_authority()
+            ),
+            "case {case:?}: expected this emulator's own endpoint with the reserved path \
+             naming this service's data plane and the domain"
         );
         // "If IPAddressType [is] set to dualstack, a version 2 domain endpoint is
         // provisioned. This endpoint functions like a normal endpoint, except that it
         // works with both IPv4 and IPv6 IP addresses" (`DomainStatus$EndpointV2`): so a
-        // dual-stack public domain publishes that host — the IPv4 endpoint's own label
-        // under the service's dual-stack domain — and an IPv4 one publishes none.
+        // dual-stack public domain publishes that host — the label AWS names the domain's
+        // endpoint by, under the service's dual-stack domain — and an IPv4 one publishes
+        // none.
         let dual_stack = status["EndpointV2"].as_str();
         if row.ip_address_type == Some(DUALSTACK) {
-            let label = endpoint.split('.').next().unwrap_or_default();
-            assert_eq!(
-                dual_stack,
-                Some(format!("{label}{DUALSTACK_SUFFIX}").as_str()),
-                "case {case:?}: expected the dual-stack endpoint {label}{DUALSTACK_SUFFIX} \
-                 beside {endpoint:?}, got {dual_stack:?}"
+            assert!(
+                dual_stack.is_some_and(|host| {
+                    host.starts_with(&format!("search-{name}-")) && host.ends_with(DUALSTACK_SUFFIX)
+                }),
+                "case {case:?}: expected the dual-stack host search-{name}-<suffix>\
+                 {DUALSTACK_SUFFIX}, got {dual_stack:?}"
             );
         } else {
             assert_eq!(

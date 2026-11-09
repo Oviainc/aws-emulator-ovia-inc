@@ -357,19 +357,56 @@ pub fn json_from_document(document: &::aws_smithy_types::Document) -> ::serde_js
 /// prefix, the domain name, an opaque per-domain suffix, then the Region and this
 /// service's endpoint prefix.
 ///
-/// This is a HOST, and it is published as one to every reader: `DomainStatus$Endpoint` is
-/// "the domain-specific endpoint used to submit index, search, and data upload requests",
-/// so a client carries the value it was told in the `Host` header of the request it SIGNS
-/// and sends there. A value carrying anything besides a host — an authority with a path —
-/// is a value no such client can use: the host it signs and the host it sends then differ,
-/// so the signature the emulator verifies cannot match and the request is refused before it
-/// reaches any domain. What makes this host reachable from a client on this machine is the
-/// data plane's HOST-STYLE claim ([`crate::service::domain_rest`]): a request is resolved
-/// to the domain whose published host it carries, whatever address it was dialled at. Such
-/// a client may also address the plane by the path that names the domain, which that module
-/// resolves too.
+/// This is the NAME AWS gives that endpoint, and the data plane serves it for a client
+/// that resolves AWS's own hosts — the HOST-STYLE claim of
+/// [`crate::service::domain_rest`] resolves a request to the domain whose host it carries,
+/// whatever address it was dialled at. It is NOT what the control plane publishes: a client
+/// of this emulator resolves this host nowhere, so the address it is handed is the one it
+/// can reach ([`published_domain_address`]).
 pub fn domain_endpoint(domain_name: &str, suffix: &str, region: &str) -> String {
     format!("search-{domain_name}-{suffix}.{region}.{ARN_NAMESPACE}.amazonaws.com")
+}
+
+/// The address `DomainStatus$Endpoint` PUBLISHES for a domain's data plane: the endpoint
+/// THIS emulator answers on, with the reserved path that names this service's data plane
+/// and the domain behind it (`<host>:<port>/_aws/es/<domain-name>`).
+///
+/// The member is "the domain-specific endpoint used to submit index, search, and data
+/// upload requests to the domain", so a client builds its requests on the value it is
+/// handed and sends them there. The host [`domain_endpoint`] spells is the name AWS gives
+/// that endpoint, and it resolves NOWHERE for a client of this emulator: handing it out
+/// announces an address nothing answers at, so the data plane the control plane says it
+/// provisioned cannot be reached at all. What a client can reach is the one endpoint this
+/// process serves its whole surface at, which is why the domain is named in the PATH —
+/// the addressing `service_common::data_plane_addressing` states for every data plane of
+/// this emulator and [`crate::service::domain_rest`] resolves.
+///
+/// `emulator_endpoint` is that endpoint's `host[:port]`
+/// ([`emulator_endpoint_authority`]); an empty one leaves the path alone, which no claim
+/// resolves, rather than naming a host this emulator does not serve.
+pub fn published_domain_address(emulator_endpoint: &str, domain_name: &str) -> String {
+    format!(
+        "{emulator_endpoint}/{}/{ARN_NAMESPACE}/{domain_name}",
+        ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE
+    )
+}
+
+/// The `host[:port]` of the endpoint this emulator answers on, as every URL a handler
+/// hands out names: `OperationContext::endpoint`, "the base URL a later request
+/// addresses… Callers send normally signed requests to it", without its scheme — because
+/// what a domain publishes is an address a client appends a path to, not a URL.
+///
+/// It is the data port's own published base, so it does not depend on which host the
+/// request that read it carried: a domain CloudFormation created through an in-process
+/// call publishes the same address as one a client created itself.
+pub fn emulator_endpoint_authority(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    let endpoint = ctx.endpoint();
+    let base = endpoint.as_str();
+    base.split_once("://")
+        .map_or(base, |(_scheme, authority)| authority)
+        .to_string()
 }
 
 /// The host a VPC-access domain is reached on over IPv4 — what

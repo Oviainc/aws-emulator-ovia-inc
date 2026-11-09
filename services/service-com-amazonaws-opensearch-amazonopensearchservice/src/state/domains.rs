@@ -24,12 +24,19 @@ pub struct Domain {
     pub engine_mode: String,
     /// One of `DomainUseCase`'s values; see [`DEFAULT_USE_CASE`].
     pub use_case: String,
-    /// The domain-specific endpoint index and search requests go to.
+    /// The domain-specific endpoint index and search requests go to, as AWS NAMES it.
     ///
     /// This is the PUBLIC host, which only a domain provisioned OUTSIDE a VPC is
     /// reachable on; a VPC-access domain is reached on the hosts
-    /// [`Self::vpc_access_endpoints`] publishes instead.
+    /// [`Self::vpc_access_endpoints`] publishes instead. What the control plane PUBLISHES
+    /// for this domain's data plane is [`Self::published_endpoint`] — the address a client
+    /// of this emulator can reach — and this host is served beside it, for a client that
+    /// resolves AWS's own hosts.
     pub endpoint: String,
+    /// The endpoint THIS emulator answers on, `host[:port]`, as it stood when the domain
+    /// was created ([`emulator_endpoint_authority`]) — what
+    /// [`Self::published_endpoint`] builds the address a client is handed from.
+    pub published_at: String,
     /// The opaque id the hosts of a VPC-access domain's endpoints carry, minted once
     /// for the domain when it comes to hold `VPCOptions` and `None` while it holds
     /// none — so the hosts such a domain publishes are stable across reads and no two
@@ -805,6 +812,23 @@ impl Domain {
         Some(endpoints)
     }
 
+    /// The address the control plane PUBLISHES for this domain's public data plane —
+    /// `DomainStatus$Endpoint`, "the domain-specific endpoint used to submit index, search,
+    /// and data upload requests to the domain".
+    ///
+    /// It is the address a client of this emulator can REACH the domain at
+    /// ([`published_domain_address`]), because a client builds its index and search
+    /// requests on the value it is handed: the host AWS names this endpoint
+    /// ([`Self::endpoint`]) resolves nowhere here, so publishing it would announce a data
+    /// plane nothing answers at. A record that never recorded an emulator endpoint falls
+    /// back to that host rather than to a path naming no host at all.
+    pub fn published_endpoint(&self) -> String {
+        if self.published_at.is_empty() {
+            return self.endpoint.clone();
+        }
+        published_domain_address(&self.published_at, &self.domain_name)
+    }
+
     /// The DUAL-STACK host a domain reached on a PUBLIC endpoint is also reachable on,
     /// as `DomainStatus$EndpointV2` reports it — or `None` for a domain that has no
     /// version 2 endpoint.
@@ -832,13 +856,14 @@ impl Domain {
     /// This domain as `DomainStatus` — what `CreateDomain`, `DescribeDomain` and
     /// `DeleteDomain` answer with.
     ///
-    /// Every address it publishes for the domain's data plane is the HOST this service
-    /// publishes that address as ([`domain_endpoint`] and the VPC-access hosts beside it),
-    /// whoever is reading: those members are hosts, and a client carries the one it was
-    /// told in the `Host` header of the request it signs and sends there — so a value
-    /// carrying anything besides a host is one no client can use. What makes that host
-    /// reachable from a client on this machine is the data plane's own host-style claim;
-    /// see [`domain_endpoint`].
+    /// The address it publishes for the domain's PUBLIC data plane is the one a client of
+    /// this emulator reaches that domain at ([`Self::published_endpoint`]), whoever is
+    /// reading: a client builds its requests on the value it is handed, so an address
+    /// nothing answers at is an address no client can use. `EndpointV2` and the VPC-access
+    /// hosts beside it are the names AWS gives the SAME cluster reached over both address
+    /// families or from INSIDE a VPC — neither of which a client of this emulator is
+    /// positioned to dial on AWS either — and the data plane serves those hosts too, for a
+    /// caller that resolves AWS's own names.
     pub fn to_status(&self) -> DomainStatus {
         // Where this domain is reachable decides which endpoint members it reports:
         // the map is present exactly for a VPC-access domain, and the public endpoint
@@ -866,7 +891,7 @@ impl Domain {
             // provisioned inside a VPC does not have: it is reached on the hosts
             // `Endpoints` below carries instead.
             endpoint: (publishes_address && vpc_access_endpoints.is_none())
-                .then(|| self.endpoint.clone()),
+                .then(|| self.published_endpoint()),
             // `EndpointV2` is the dual-stack PUBLIC endpoint, which a domain whose
             // `IPAddressType` is `dualstack` is provisioned beside its IPv4 one
             // ([`Self::public_endpoint_v2`]); a VPC-access domain has no public host of

@@ -1638,6 +1638,139 @@ pub(super) fn domain_created(resource_type: &str, status: &Value) -> Created {
     Created::attributes(attributes)
 }
 
+/// The properties of an `AWS::OpenSearchService::Domain` that `UpdateDomainConfig` takes, so
+/// a declaration that states one of them differently is applied to the domain the stack has
+/// rather than replacing it.
+///
+/// Every member of that call which is also a property of this type
+/// (`smithy_query(query="operation", operation="UpdateDomainConfig")`), and no other: the
+/// engine release a domain runs is NOT a member of it — Amazon OpenSearch Service moves a
+/// domain between releases through `UpgradeDomain` — and the name is the resource's identity
+/// ([`DOMAIN_NON_CREATE_PROPERTIES`]), so neither reaches this call.
+///
+/// The list is that CALL's membership, which is why it is wider than the properties named
+/// elsewhere in this file: `DOMAIN_NON_CREATE_PROPERTIES` enumerates only the properties the
+/// CREATE does not take verbatim, and every other property of the type is a member of both
+/// calls under the same name. A property this type does not publish at all compares absent
+/// on both sides below and is never sent.
+pub(super) const DOMAIN_UPDATE_PROPERTIES: &[&str] = &[
+    "AccessPolicies",
+    "AIMLOptions",
+    "AdvancedOptions",
+    "AdvancedSecurityOptions",
+    "AutoTuneOptions",
+    "AutomatedSnapshotPauseOptions",
+    "ClusterConfig",
+    "CognitoOptions",
+    "DeploymentStrategyOptions",
+    "DomainEndpointOptions",
+    "EBSOptions",
+    "EncryptionAtRestOptions",
+    "IPAddressType",
+    "IdentityCenterOptions",
+    "LogPublishingOptions",
+    "NodeToNodeEncryptionOptions",
+    "OffPeakWindowOptions",
+    "SnapshotOptions",
+    "SoftwareUpdateOptions",
+    "VPCOptions",
+];
+
+/// Whether a changed declaration may state `property` differently and still be applied to
+/// the domain the stack has: the properties `UpdateDomainConfig` carries
+/// ([`DOMAIN_UPDATE_PROPERTIES`]), plus the three that call does not take because they are
+/// not domain CONFIGURATION at all ([`DOMAIN_NON_CREATE_PROPERTIES`]) — the name, which is
+/// the resource's identity, so a revision stating another one replaces the resource and
+/// never reaches this call; `Tags`, which CloudFormation reconciles through the owning
+/// service's own tagging API ([`Provisioner::retag`]); and `SkipShardMigrationWait`, which
+/// steers how an update is PERFORMED rather than being state the domain holds.
+fn domain_applies_in_place(property: &str) -> bool {
+    DOMAIN_UPDATE_PROPERTIES.contains(&property)
+        || DOMAIN_NON_CREATE_PROPERTIES.contains(&property)
+}
+
+/// Apply a CHANGED `AWS::OpenSearchService::Domain` declaration to the domain the stack
+/// created, through that service's own `UpdateDomainConfig` — the call that "modifies the
+/// cluster configuration of the specified Amazon OpenSearch Service domain" — so a changed
+/// property re-points the domain a client is already using instead of replacing it: the
+/// domain keeps its name, its id, its ARN and the address it is reached at.
+///
+/// Only the properties that call TAKES travel ([`DOMAIN_UPDATE_PROPERTIES`]), and only the
+/// ones this deployment states differently from the last: a property neither side changed is
+/// not re-sent. Each is carried as the TYPE its member is modelled with, through the same
+/// rendering the create uses ([`DOMAIN_DOCUMENT_PROPERTIES`]), so an access policy the
+/// template declares as an object reaches that service as the document's text.
+///
+/// `Ok(None)` is a revision this call cannot make, so nothing is asked of that service and
+/// the deployment reports the change as not applied rather than as a success that dropped
+/// part of it. That is decided over EVERY property the two revisions state differently
+/// ([`changed_properties`], the reading `update_managed_policy` decides the same question
+/// by): one outside [`domain_applies_in_place`] — the engine release, which moves through
+/// `UpgradeDomain`, or a property the type publishes for no member of this call — makes the
+/// whole revision unapplyable, whatever else changed beside it; and so does a revision that
+/// STOPS declaring one of the properties this call carries, since the call takes a new value
+/// for a member and not the removal of one. The attributes come from the domain itself
+/// afterwards ([`domain_ready_attributes`]), never rebuilt here.
+pub(super) async fn update_domain(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    let changed = changed_properties(&resource.properties, declared);
+    if changed
+        .iter()
+        .any(|property| !domain_applies_in_place(property))
+    {
+        return Ok(None);
+    }
+    let mut request = Map::new();
+    for property in &changed {
+        if !DOMAIN_UPDATE_PROPERTIES.contains(&property.as_str()) {
+            // A property this call does not carry, and that nothing here has to send: the
+            // tags travel through the tagging API and the two others are not configuration.
+            continue;
+        }
+        match declared.get(property) {
+            Some(value) => {
+                request.insert(property.clone(), value.clone());
+            }
+            // The revision no longer declares a property the domain was deployed with:
+            // this call carries no removal, so the whole revision is reported as not
+            // applied rather than as one that silently kept the old value.
+            None => return Ok(None),
+        }
+    }
+    if request.is_empty() {
+        // The declaration changed nothing this call carries: either nothing at all among
+        // its members, or only what it cannot change.
+        return Ok(None);
+    }
+    render_document_members(&mut request, DOMAIN_DOCUMENT_PROPERTIES);
+    let uri = format!(
+        "{OPENSEARCH_DOMAIN_URI}/{}/config",
+        percent_encoded(&resource.physical_resource_id)
+    );
+    call_rest_json(
+        ctx,
+        OPENSEARCH_SIGNING_NAME,
+        region,
+        "POST",
+        &uri,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    Ok(Some(Created::attributes(
+        domain_ready_attributes(
+            ctx,
+            region,
+            &resource.resource_type,
+            &resource.physical_resource_id,
+        )
+        .await?,
+    )))
+}
+
 /// The published attributes of a domain Amazon OpenSearch Service now reports as settled:
 /// the whole set [`domain_created`] reads off a `DomainStatus`, which for a domain that is UP
 /// carries the addresses a client reaches it on as well as the identifiers the create
