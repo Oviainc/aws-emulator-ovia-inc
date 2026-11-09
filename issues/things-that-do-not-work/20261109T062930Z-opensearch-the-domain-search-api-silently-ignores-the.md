@@ -1,0 +1,41 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: opensearch.osq-deep-opensearch-2-highlight-wraps-matched-term-on-text-but-not-keyword-sibling opensearch.sorting-and-aggregating-a-text-field-rejected-while-its-keyword-subfield-serves-both
+Issue-Shape-Id: com.amazonaws.opensearch#AmazonOpenSearchService
+Issue-Key: opensearch.osq-deep-opensearch-2-highlight-wraps-matched-term-on-text-but-not-keyword-sibling|run#15|AssertionError|assert isinstance(highlight, dict), f"a match on 'body' returned no highlight section: {hit!r}"
+Issue-Key: opensearch.sorting-and-aggregating-a-text-field-rejected-while-its-keyword-subfield-serves-both|run#16|AssertionError|assert _hit_titles(by_keyword) == SORTED_TITLES, (
+Issue-Commit: dd6dc626874166bf5c09c57665a1e26f5c7b5618
+
+# opensearch: the domain search API silently ignores the request's `highlight` and `sort` sections — hits carry no highlight fragments and are returned in insertion order (2 causes)
+
+> _Note: this issue was identified against the code base at commit `dd6dc626874166bf5c09c57665a1e26f5c7b5618`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DomainRestDataPlane
+
+## Description
+Two net-new root causes in the domain REST data plane's search handler, each with its own failing check id. Both checks are listed in the trace ids of open issue 20261101T140814Z-opensearch-the-domain-rest-data-plane-serves-only.md, but its Cause 9 (a `match` on an analyzed text field finds nothing) now passes: both checks get past the match and fail on later assertions that none of that issue's replay keys carry, so these are divergences of the surface that now answers.
+
+Cause 1 of 2 — a search that requests highlighting gets no `highlight` section on its hits.
+AWS: given `"highlight":{"fields":{"<field>":{}}}`, the search API returns on each hit a `highlight` object keyed by every requested field that produced a fragment, each value a list of fragments in which the matched tokens are wrapped in the default `<em>`/`</em>` tags; on an analyzed `text` field exactly the matched token is wrapped and the rest of the value is returned verbatim, a requested field that holds no term matching the query contributes NO key at all (so a `.keyword` sibling is absent for an analyzed-token query, even with `require_field_match: false`), and an exact `term` match on a `keyword` field highlights the whole value as one `<em>` pair. The domain REST data plane is not in the Smithy model (Smithy: DescribeDomain `DomainStatus$Endpoint` — "Domain-specific endpoint used to submit index, search, and data upload requests to the domain"), so recorded behavior only for the emulator's response shape.
+Emulator: the search answers HTTP 200 with the correct single hit and no `highlight` key whatsoever: `{'_index': '<index>', '_id': 'h1', '_score': 1.0, '_source': {'body': '<indexed text>'}}`. The request's whole `highlight` section is dropped.
+Why: highlighting is how a client renders result snippets; it gets a 200 with no fragments, so it either shows nothing or re-implements highlighting itself, and because the omission is silent nothing signals it. The per-field semantics (analyzed field highlights the token, un-analyzed sibling yields no key) are also unobservable, so a caller cannot tell a correctly-absent fragment from an unimplemented one.
+Fix: the search handler and its response assembly in services/service-com-amazonaws-opensearch-amazonopensearchservice/src/service/domain_rest.rs — evaluate the request's `highlight` section per requested field against that field's own analysis chain (the module's `selector`/`analyze` vocabulary), honour `require_field_match`, and serialize a `highlight` object on each hit with the default `<em>` tags.
+Traces: opensearch.osq-deep-opensearch-2-highlight-wraps-matched-term-on-text-but-not-keyword-sibling
+
+Cause 2 of 2 — a search that names a `sort` key returns the hits unordered (insertion order).
+AWS: `"sort":[{"<field>":"asc"}]` on a field with doc values — a `keyword` field or a `keyword` sub-field such as `title.raw` — orders the hits by that field (lexicographic for keyword, ascending), applies `from`/`size` to that ORDER, and returns each hit's `sort` values alongside it; the ordering is what `search_after` paging is built on. Recorded behavior only for the emulator's response.
+Emulator: `POST /{index}/_search` with `{"sort":[{"title.raw":"asc"}]}` answers HTTP 200 with the documents in the order they were indexed — titles `['gamma release', 'alpha release', 'beta release']` where the ascending order of those same values is `['alpha release', 'beta release', 'gamma release']`. The `sort` section is accepted and ignored; no `sort` values are returned on the hits either.
+Why: every client that pages results, shows a "latest first" or alphabetical list, or uses `search_after` depends on the engine applying the sort. An ignored sort is worse than a refusal: the response is a 200 whose page is simply the wrong set of documents in the wrong order once `from`/`size` is involved, and nothing tells the caller.
+Fix: the search handler in that same domain_rest.rs — resolve each `sort` key against the index mapping (including `keyword` sub-fields), order the selected hits by those keys before applying `from`/`size`, and emit each hit's `sort` values.
+Traces: opensearch.sorting-and-aggregating-a-text-field-rejected-while-its-keyword-subfield-serves-both
+
+## Evidence
+Cause 1: index `{"mappings":{"dynamic":"strict","properties":{"body":{"type":"text","fields":{"keyword":{"type":"keyword"}}}}}}`, index one document whose `body` is `"<word> <token> <word>"`, then POST /<index>/_search with `{"query":{"match":{"body":"<token>"}},"highlight":{"fields":{"body":{},"body.keyword":{}}}}`. Expected the hit to carry `highlight == {"body": ["<word> <em><token></em> <word>"]}` and no `body.keyword` key. Actual: `a match on 'body' returned no highlight section: {'_index': 'sim2real-osq-hl-...', '_id': 'h1', '_score': 1.0, '_source': {'body': 'the quick brown <token> jumps over the lazy dog'}}` — HTTP 200, hit correct, `highlight` absent.
+Cause 2: index `{"mappings":{"properties":{"title":{"type":"text","fields":{"raw":{"type":"keyword"}}}}}}` with three documents whose titles are inserted in non-alphabetical order, refresh, then POST /<index>/_search with `{"sort":[{"title.raw":"asc"}]}`. Expected the hits in ascending lexicographic order of `title.raw`. Actual: HTTP 200 with `['gamma release', 'alpha release', 'beta release']` — exactly the insertion order (`sorting on the keyword sub-field must order the documents lexicographically; got [...]`).
+
+## Steps to Reproduce
+1. CreateDomain (EngineVersion OpenSearch_2.11/2.19, ClusterConfig {InstanceType t3.small.search, InstanceCount 1, DedicatedMasterEnabled false, ZoneAwarenessEnabled false}, EBSOptions gp3/10, AccessPolicies allowing es:* for this account) and wait for Processing=false with a published DomainStatus.Endpoint; address the data plane at that endpoint with SigV4 ('es').
+2. Cause 1: PUT /<index> with one shard, zero replicas and mappings `{"body":{"type":"text","fields":{"keyword":{"type":"keyword"}}}}`; PUT /<index>/_doc/h1?refresh=true with `{"body":"the quick brown <token> jumps over the lazy dog"}`; POST /<index>/_search with `{"query":{"match":{"body":"<token>"}},"highlight":{"fields":{"body":{},"body.keyword":{}}}}` -> 200 with a hit that has no `highlight` key (expected `{"body":["the quick brown <em><token></em> jumps over the lazy dog"]}` and no `body.keyword` key). Repeat with `{"highlight":{"require_field_match":false,"fields":{"body.keyword":{}}}}` and with `{"query":{"term":{"body.keyword":"<whole value>"}},"highlight":{"fields":{"body.keyword":{}}}}` — neither returns a highlight section.
+3. Cause 2: PUT /<index2> with one shard, zero replicas and mappings `{"title":{"type":"text","fields":{"raw":{"type":"keyword"}}}}`; PUT /<index2>/_doc/d1 {"title":"gamma release"}, /d2 {"title":"alpha release"}, /d3 {"title":"beta release"}; POST /<index2>/_refresh; POST /<index2>/_search with `{"sort":[{"title.raw":"asc"}]}` -> 200 with hits in insertion order instead of alphabetical, and no `sort` values on the hits.
