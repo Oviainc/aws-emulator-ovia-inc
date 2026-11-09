@@ -29,8 +29,15 @@ hex = { workspace = true }
 # `service-common` carries the workspace's ONE rendering of a constraint-violation
 # refusal — the counted envelope, the per-class requirement and the `@pattern`
 # expression quoted without its whole-value anchors — which `src/service.rs` states
-# this service's `@pattern` refusals through.
+# this service's `@pattern` refusals through. It also carries `iam_authorization`, the
+# shared evaluation of policy documents against an action on a resource, and `iam_role`,
+# which reads which IAM entity a principal ARN names.
 service-common = { path = "../common" }
+# The STS store, for the identity an access key id speaks for: the principal
+# `sts:GetCallerIdentity` answers for the credentials a request signed with.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The IAM store, for the identity-based policy documents in force on that principal.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # Amazon S3 client a `WorkflowExportConfig`'s `s3BucketName` is resolved through: a
 # definition's export destination is read before the definition is stored, and S3 is
 # called over the in-process callback into this same emulator (no network client feature

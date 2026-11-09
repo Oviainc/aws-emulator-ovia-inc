@@ -19,6 +19,8 @@ mod act_status_enum_refusal;
 mod act_status_update;
 #[path = "all/create_preconditions.rs"]
 mod create_preconditions;
+#[path = "all/identity_authorization.rs"]
+mod identity_authorization;
 #[path = "all/model_catalog.rs"]
 mod model_catalog;
 #[path = "all/not_found_resource_identifier.rs"]
