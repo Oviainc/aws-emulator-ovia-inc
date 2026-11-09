@@ -225,10 +225,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         // Every actor the container holds, however it came into being (an event written
         // for it, or content ingested into one of its sessions), in `actorId` order.
-        let mut actor_ids: Vec<&str> = match store.resolve_memory(&input.memory_id) {
-            Ok(memory) => memory.actors.keys().map(String::as_str).collect(),
+        let mut actor_ids: Vec<&str> = match store.memory_index(&input.memory_id) {
+            Some(memory) => memory.actors.keys().map(String::as_str).collect(),
             // A container the control plane holds that this plane has stored nothing in.
-            Err(_) => Vec::new(),
+            None => Vec::new(),
         };
         actor_ids.sort_unstable();
 

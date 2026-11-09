@@ -87,6 +87,8 @@ mod dashboards;
 mod datasets;
 #[path = "all/delete_insight_rules.rs"]
 mod delete_insight_rules;
+#[path = "all/describe_alarms_creation_identity.rs"]
+mod describe_alarms_creation_identity;
 #[path = "all/describe_alarms_for_metric_views.rs"]
 mod describe_alarms_for_metric_views;
 #[path = "all/disable_alarm_actions.rs"]

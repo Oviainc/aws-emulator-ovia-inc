@@ -860,6 +860,42 @@ pub fn alarm_stamp(alarm: &Value, member: &str) -> Option<f64> {
     alarm.get(member).and_then(Value::as_f64)
 }
 
+/// Whether `text` is the hyphenated `8-4-4-4-12` lowercase-hexadecimal form of a uuid.
+///
+/// The layout only: the version and variant bits belong to the one rendering of 16 opaque bytes
+/// this workspace mints a uuid with, which is asserted where that rendering lives.
+fn is_uuid(text: &str) -> bool {
+    let groups: Vec<&str> = text.split('-').collect();
+    groups.len() == 5
+        && groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+        && groups
+            .iter()
+            .all(|group| {
+                group
+                    .chars()
+                    .all(|digit| digit.is_ascii_hexdigit() && !digit.is_ascii_uppercase())
+            })
+}
+
+/// The epoch milliseconds the creation identity of an alarm names, or `None` for text that is
+/// not the `<uuid>/<epoch-millis>` form such an identity takes.
+///
+/// Every suite that asserts an alarm's reported creation identity reads it through here, so the
+/// one form that identity has is spelled out once.
+pub fn creation_identity_millis(creation_id: &str) -> Option<i64> {
+    let (uuid, millis) = creation_id.split_once('/')?;
+    if !is_uuid(uuid) {
+        return None;
+    }
+    millis.parse().ok()
+}
+
+/// The creation identity a read reports for `alarm`, or `None` when the member is absent or is
+/// not text.
+pub fn reported_creation_id(alarm: &Value) -> Option<&str> {
+    alarm.get("CreationId").and_then(Value::as_str)
+}
+
 /// One instant read out of a JSON DOCUMENT this service reports — an alarm's `StateReasonData`,
 /// the `HistoryData` that records it, or an action's notification — as epoch seconds; `None`
 /// for text that is not the form those documents write.

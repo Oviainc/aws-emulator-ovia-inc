@@ -27,8 +27,9 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::harness::{
-    alarm_stamp, build_router, described_alarm, merged, metric_alarm_request, now_secs, ok,
-    wait_for_evaluation, AlarmKind as Kind,
+    alarm_stamp, build_router, creation_identity_millis, described_alarm, merged,
+    metric_alarm_request, now_secs, ok, reported_creation_id, wait_for_evaluation,
+    AlarmKind as Kind,
 };
 
 /// One alarm configuration the rules below are asserted over.
@@ -119,42 +120,13 @@ fn promql_patch(query: &str) -> Value {
     })
 }
 
-/// Whether `text` is the hyphenated `8-4-4-4-12` lowercase-hexadecimal form of a uuid.
-///
-/// The layout only: the version and variant bits belong to the one rendering of 16 opaque bytes
-/// this workspace mints a uuid with, which is asserted where that rendering lives.
-fn is_uuid(text: &str) -> bool {
-    let groups: Vec<&str> = text.split('-').collect();
-    groups.len() == 5
-        && groups
-            .iter()
-            .map(|group| group.len())
-            .eq([8, 4, 4, 4, 12])
-        && groups
-            .iter()
-            .all(|group| group.chars().all(|digit| digit.is_ascii_hexdigit()))
-}
-
-/// The epoch milliseconds a creation identity of the form `<uuid>/<epoch-millis>` names, or
-/// `None` for text that is not that form.
-fn creation_instant_millis(creation_id: &str) -> Option<i64> {
-    let (uuid, millis) = creation_id.split_once('/')?;
-    if !is_uuid(uuid) {
-        return None;
-    }
-    millis.parse().ok()
-}
-
 /// The `CreationId` `DescribeAlarms` reports for the metric alarm `name`.
 async fn creation_id(
     router: &smithy_server_runtime::MultiServiceRouter,
     name: &str,
 ) -> Option<String> {
-    described_alarm(router, Kind::Metric, name)
-        .await?
-        .get("CreationId")
-        .and_then(Value::as_str)
-        .map(str::to_string)
+    let alarm = described_alarm(router, Kind::Metric, name).await?;
+    reported_creation_id(&alarm).map(str::to_string)
 }
 
 #[tokio::test]
@@ -175,7 +147,7 @@ async fn every_alarm_read_reports_the_creation_identity_of_the_write_that_create
 
         let reported = creation_id(&router, &name).await;
         let minted = reported.clone().unwrap_or_default();
-        let millis = creation_instant_millis(&minted);
+        let millis = creation_identity_millis(&minted);
         assert!(
             millis.is_some(),
             "case {:?}: expected a CreationId of the form <uuid>/<epoch-millis>, got {reported:?}",
@@ -239,7 +211,7 @@ async fn every_alarm_read_reports_the_creation_identity_of_the_write_that_create
         assert!(
             recreated
                 .as_deref()
-                .and_then(creation_instant_millis)
+                .and_then(creation_identity_millis)
                 .is_some(),
             "case {:?}: the re-created alarm's identity keeps the form, got {recreated:?}",
             case.label
@@ -286,10 +258,7 @@ async fn the_per_metric_reader_reports_the_same_creation_identity_as_the_general
             }),
         )
         .await;
-        let reported = for_metric["MetricAlarms"][0]
-            .get("CreationId")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let reported = reported_creation_id(&for_metric["MetricAlarms"][0]).map(str::to_string);
         assert!(
             general.is_some() && reported == general,
             "case {label:?}: the per-metric reader reports the alarm the general reader does, \

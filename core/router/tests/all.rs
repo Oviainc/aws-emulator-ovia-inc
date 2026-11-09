@@ -1208,11 +1208,6 @@ mod bedrock_catalogue_is_invocable;
 mod bedrock_logging_destination_region;
 #[path = "all/cloudformation_provisions_bedrock_guardrails.rs"]
 mod cloudformation_provisions_bedrock_guardrails;
-// Declared here, beside the sibling suites it shares its rule with: the whole deployed
-// pipeline, from an `AWS::Events::Rule`/`AWS::Lambda::Permission` template to the permitted
-// target's own work product and the un-permitted sibling's dead letter.
-#[path = "all/cloudformation_events_rule_lambda_target_permission_boundary.rs"]
-mod cloudformation_events_rule_lambda_target_permission_boundary;
 // Declared here, in this same head region, for the reason the entry above records: the two
 // services sharing the `agent-registry` signing name are two crates, so neither crate's own
 // test target can mount both and ask which of them claims a request.
