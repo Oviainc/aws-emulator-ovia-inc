@@ -2255,6 +2255,20 @@ impl FingerprintValue for Document {
     }
 }
 
+impl FingerprintValue for BTreeMap<String, String> {
+    /// A map as the OBJECT its entries denote: one member per key, so neither the order
+    /// the entries were written in nor a key written twice is part of the value — exactly
+    /// what a map stores. The canonical rendering sorts an object's members
+    /// ([`request_fingerprint`]), so the document of one map is stable between reads.
+    fn fingerprint_document(&self) -> Document {
+        Document::Object(
+            self.iter()
+                .map(|(key, value)| (key.clone(), Document::String(value.clone())))
+                .collect(),
+        )
+    }
+}
+
 impl FingerprintValue for Tag {
     fn fingerprint_document(&self) -> Document {
         fingerprint_object([("Key", Some(self.key.clone())), ("Value", Some(self.value.clone()))])
@@ -2317,9 +2331,35 @@ fn fingerprint_object<const N: usize>(members: [(&str, Option<String>); N]) -> D
 }
 
 /// `value` as the document a request fingerprint covers — the one call a handler makes
-/// per supplied member (`input.tags.as_ref().map(fingerprint_value)`).
+/// per supplied member (`input.name.as_ref().map(fingerprint_value)`).
 pub fn fingerprint_value<T: FingerprintValue>(value: &T) -> Document {
     value.fingerprint_document()
+}
+
+/// A supplied list of IDENTITIES as a request fingerprint covers it: the SET it denotes.
+///
+/// A member a handler CANONICALISES on the way into the store is fingerprinted by the
+/// value it stores, not by the spelling it was written with — the same rule that covers
+/// an identifier member by the record it names. Here the canonical value is
+/// [`distinct_values`], so two requests whose stored record is identical fingerprint
+/// alike and the second is the retry its `ClientToken` says it is.
+///
+/// `None` when the request omitted the member, so an omitted list and a supplied one
+/// still never fingerprint alike (see [`request_fingerprint`]).
+pub fn fingerprint_identity_list(values: Option<&[String]>) -> Option<Document> {
+    values.map(|values| fingerprint_value(&distinct_values(Some(values.to_vec()))))
+}
+
+/// A supplied list of TAGS as a request fingerprint covers it: the key-to-value MAP it
+/// denotes ([`tag_map`]), which is the value the store keeps.
+///
+/// The same canonicalisation rule [`fingerprint_identity_list`] states: a tag list and a
+/// reordering of it, or one repeating a key the later entry already gives its value,
+/// store the one map, so they are one request rather than a mismatch.
+///
+/// `None` when the request omitted the member.
+pub fn fingerprint_tag_set(tags: Option<&Vec<Tag>>) -> Option<Document> {
+    tags.map(|tags| fingerprint_value(&tag_map(Some(tags))))
 }
 
 /// Whether two values of one modelled shape are the SAME value, compared through the
@@ -2342,6 +2382,12 @@ pub fn same_value<T: FingerprintValue>(stored: &T, supplied: &T) -> bool {
 /// when the request omitted it. An omitted member is left out of the digest, so omitting
 /// a member and supplying one never fingerprint alike, and the rendering is canonical
 /// ([`document_json`] sorts an object's members), so two spellings of one request agree.
+///
+/// A member the operation CANONICALISES on the way into the store is passed as the value
+/// it stores rather than as the text it was written with — an identifier as the record it
+/// names, a list of identities as the set it denotes ([`fingerprint_identity_list`]), a
+/// tag list as the map it denotes ([`fingerprint_tag_set`]) — so two requests the store
+/// would keep identically are one request and the second replays the first's answer.
 ///
 /// The digest is hex SHA-256: a fixed [`REQUEST_FINGERPRINT_LEN`] bytes however large
 /// the request was, which is what lets a spent token be remembered without holding a

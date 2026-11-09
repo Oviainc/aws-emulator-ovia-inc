@@ -139,7 +139,10 @@ async fn seed(harness: &Harness, case: &str, token: &str, submit: bool) -> (Stri
 
 /// The ids of every application one catalog holds, so a refused create can be shown to
 /// have created nothing.
-async fn application_ids(harness: &Harness, case: &str, catalog: &str) -> Vec<String> {
+///
+/// Shared with `tests/all/create_canonical_request_members.rs`, which shows the same of a
+/// replayed create.
+pub(crate) async fn application_ids(harness: &Harness, case: &str, catalog: &str) -> Vec<String> {
     let listed = harness
         .ok(
             case,

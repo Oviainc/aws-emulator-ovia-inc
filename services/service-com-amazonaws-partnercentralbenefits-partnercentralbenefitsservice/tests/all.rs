@@ -47,6 +47,8 @@ mod cancel_client_token_idempotency;
 mod client_token_idempotency;
 #[path = "all/client_token_request_identity.rs"]
 mod client_token_request_identity;
+#[path = "all/create_canonical_request_members.rs"]
+mod create_canonical_request_members;
 #[path = "all/create_identity_list_sets.rs"]
 mod create_identity_list_sets;
 #[path = "all/details_document_guard.rs"]

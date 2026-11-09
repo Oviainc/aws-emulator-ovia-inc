@@ -53,6 +53,11 @@
 //! association count is a count of distinct resources whichever path stored them — see
 //! [`crate::state::distinct_values`].
 //!
+//! Those stored sets are also what the `ClientToken` fingerprint covers, as the stored tag
+//! MAP is what it covers for `Tags`: a spelling this create collapses is not a different
+//! request — see [`crate::state::fingerprint_identity_list`] and
+//! [`crate::state::fingerprint_tag_set`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -306,10 +311,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The identity of this REQUEST, which is what the `ClientToken` below is judged
-        // against: every member the request carries other than the token itself. The
-        // `BenefitIdentifier` member is covered by the BENEFIT it names, not by the
-        // spelling it was written with, so a retry naming the same benefit the other way
-        // the modelled pattern admits is the same request.
+        // against: every member the request carries other than the token itself, each as
+        // the value this create would STORE for it rather than the spelling it was written
+        // with. So the `BenefitIdentifier` is covered by the BENEFIT it names (a retry
+        // naming it the other way the modelled pattern admits is the same request), the
+        // two identity lists by the SETS they denote, and `Tags` by the MAP it denotes:
+        // two requests whose stored record would be identical are one request.
         let fingerprint = crate::state::request_fingerprint(vec![
             (
                 "Catalog",
@@ -332,12 +339,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_ref()
                     .map(crate::state::fingerprint_value),
             ),
+            // An identity list is covered by the SET it denotes, which is what the record
+            // below stores — see [`crate::state::fingerprint_identity_list`].
             (
                 "FulfillmentTypes",
-                input
-                    .fulfillment_types
-                    .as_ref()
-                    .map(crate::state::fingerprint_value),
+                crate::state::fingerprint_identity_list(input.fulfillment_types.as_deref()),
             ),
             (
                 crate::state::DETAILS_MEMBER,
@@ -346,16 +352,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_ref()
                     .map(crate::state::fingerprint_value),
             ),
+            // The tag list is covered by the MAP it denotes, which is what the record
+            // below stores — see [`crate::state::fingerprint_tag_set`].
             (
                 "Tags",
-                input.tags.as_ref().map(crate::state::fingerprint_value),
+                crate::state::fingerprint_tag_set(input.tags.as_ref()),
             ),
             (
                 "AssociatedResources",
-                input
-                    .associated_resources
-                    .as_ref()
-                    .map(crate::state::fingerprint_value),
+                crate::state::fingerprint_identity_list(input.associated_resources.as_deref()),
             ),
             (
                 "PartnerContacts",

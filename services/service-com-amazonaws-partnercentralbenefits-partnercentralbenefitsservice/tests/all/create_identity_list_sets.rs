@@ -32,7 +32,10 @@ use crate::disassociate_benefit_application_resource::{associated, body, seed, R
 
 /// The string entries of a list member of one response, in the order the service reported
 /// them; a member the record never stored is absent, which is the empty vector here.
-fn entries(body: &Value, member: &str) -> Vec<String> {
+///
+/// Shared with `tests/all/create_canonical_request_members.rs`, which reads the same stored
+/// sets back.
+pub(crate) fn entries(body: &Value, member: &str) -> Vec<String> {
     body[member]
         .as_array()
         .map(|items| {
