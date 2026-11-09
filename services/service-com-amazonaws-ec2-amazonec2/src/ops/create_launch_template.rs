@@ -262,10 +262,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `OperatorRequest$Principal` is "the service provider that manages the
         // resource", and `OperatorResponse$Managed` is true "if the resource is managed by
         // a service provider" — so a request naming a principal creates a managed
-        // template, and one naming none creates a template no provider manages, which is
-        // reported as no operator rather than an empty one. `HiddenByDefault` follows the
-        // account's managed-resource visibility settings, which nothing in this emulator
-        // sets, so it is reported absent instead of guessed.
+        // template. A request naming none creates a template no provider manages, which is
+        // still an ANSWER about it: the store derives that answer
+        // (`state::unmanaged_launch_template_operator`) for every template it keeps, so
+        // this reads the request alone. `HiddenByDefault` follows the account's
+        // managed-resource visibility settings, which nothing in this emulator sets, so it
+        // is reported absent instead of guessed.
         let operator = input
             .operator
             .as_ref()

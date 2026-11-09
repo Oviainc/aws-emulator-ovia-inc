@@ -1670,3 +1670,8 @@ mod launch_instance_type_catalog;
 // which is where every new ec2 suite inserts its lines.
 #[path = "all/network_insights_idempotency_wording.rs"]
 mod network_insights_idempotency_wording;
+// `ModifyLaunchTemplate`: the default version it moves to the version a request names — by
+// number or by one of the aliases the launch template API documents — what both readers of
+// the template then report, and the refusals that move nothing.
+#[path = "all/modify_launch_template_default_version.rs"]
+mod modify_launch_template_default_version;

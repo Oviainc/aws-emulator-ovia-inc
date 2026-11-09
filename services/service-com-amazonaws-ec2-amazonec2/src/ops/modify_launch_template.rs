@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyLaunchTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyLaunchTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyLaunchTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +136,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyLaunchTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyLaunchTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            MAX_CLIENT_TOKEN_CHARS, require_service_state, resolve_launch_template_id,
+            resolve_launch_template_version,
+        };
+
+        // Nothing here depends on the Region: a launch template carries no Region member,
+        // and the principal `CreatedBy` reports is an IAM ARN, which is global.
+        let _ = ctx;
+
+        // Documented on `ClientToken`: "Constraint: Maximum 128 ASCII characters." The model
+        // declares no `@length`, so the handler is the only place the bound can exist — the
+        // same bound every launch-template writer of this crate holds the token to.
+        if let Some(token) = input.client_token.as_deref() {
+            if token.chars().count() > MAX_CLIENT_TOKEN_CHARS || !token.is_ascii() {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "ClientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} ASCII characters"
+                )));
+            }
+        }
+
+        // An empty value names nothing, so it is read as a parameter the request did not give
+        // rather than as an id, a name or a version to look up.
+        let launch_template_id = input
+            .launch_template_id
+            .as_deref()
+            .filter(|id| !id.is_empty());
+        let launch_template_name = input
+            .launch_template_name
+            .as_deref()
+            .filter(|name| !name.is_empty());
+        let default_version = input
+            .default_version
+            .as_deref()
+            .filter(|version| !version.is_empty());
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // "You must specify either the launch template ID or the launch template name, but
+        // not both" (`$LaunchTemplateId`), resolved by the one reader every operation that
+        // names a template by either key shares — so naming both, naming neither, a malformed
+        // id and an id or name the account does not hold are all refused the same way here as
+        // there. Resolving reads only.
+        let launch_template_id =
+            resolve_launch_template_id(&store, launch_template_id, launch_template_name)?;
+
+        // "Modifies a launch template. You can specify which version of the launch template
+        // to set as the default version" — the default version is the one modification this
+        // operation makes, so a request naming none asks for nothing and is told which
+        // parameter carries a modification rather than answered with an untouched template.
+        let default_version = default_version.ok_or_else(|| {
+            Scaffolded::missing_parameter(
+                "The request must contain the parameter SetDefaultVersion",
+            )
+        })?;
+
+        let record = store.launch_templates.get(&launch_template_id).ok_or_else(|| {
+            Scaffolded::internal_error(format!(
+                "launch template '{launch_template_id}' resolved but was not stored"
+            ))
+        })?;
+        // The version a request names is resolved by the one resolver every launch-template
+        // operation that names a version shares, so a number the template does not hold is
+        // `InvalidLaunchTemplateId.VersionNotFound` and a value that is neither a number nor
+        // one of the aliases the API documents is a bad parameter value — the same verdicts
+        // `DescribeLaunchTemplateVersions` and `CreateLaunchTemplateVersion`'s `SourceVersion`
+        // give for the same values. Read-only, so it is also what a `DryRun` is answered
+        // against.
+        let version_number = resolve_launch_template_version(record, default_version)?;
+
+        // DryRun sits AFTER every parameter has been validated and every read-only check
+        // made, and BEFORE the first write: the flag asks whether the request WOULD have
+        // succeeded, so one that would have been refused is refused with that reason instead,
+        // and one that would have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The modification itself is idempotent — the stored default version is the one the
+        // request names, whatever it was before — so no `ClientToken` is retained: a repeat of
+        // the request stores the same fact and answers with the same template, which is what a
+        // token would have been kept to guarantee.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyLaunchTemplate"))
+        // The response is the STORED template, as the write leaves it, so this call and every
+        // later reader report the same one.
+        let launch_template = store
+            .set_default_launch_template_version(&launch_template_id, version_number)
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "launch template '{launch_template_id}' resolved but was not stored"
+                ))
+            })?;
+        Ok(ModifyLaunchTemplateOutput {
+            launch_template: Some(launch_template),
+        })
     }
 }

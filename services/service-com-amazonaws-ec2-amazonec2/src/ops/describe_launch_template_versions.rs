@@ -783,12 +783,16 @@ pub(crate) fn launch_template_version_view(
         // "The entity that manages the launch template" is a fact of the template, and
         // `OperatorResponse$Managed` is "if true, the resource is managed by a service
         // provider" — so a template no provider manages is reported as managed BY NOBODY
-        // rather than with the member left out, there being nothing unknown about it.
-        operator: Some(record.template.operator.clone().unwrap_or(OperatorResponse {
-            managed: Some(false),
-            principal: None,
-            hidden_by_default: None,
-        })),
+        // rather than with the member left out, there being nothing unknown about it. The
+        // store derives that answer for every template it keeps, and this is the same one
+        // reading of it for a record stored before it did.
+        operator: Some(
+            record
+                .template
+                .operator
+                .clone()
+                .unwrap_or_else(crate::state::unmanaged_launch_template_operator),
+        ),
     }
 }
 

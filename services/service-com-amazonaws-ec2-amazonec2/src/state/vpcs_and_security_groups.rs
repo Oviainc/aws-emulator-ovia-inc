@@ -1422,7 +1422,13 @@ impl ComAmazonawsEc2Amazonec2State {
             default_version_number: Some(FIRST_LAUNCH_TEMPLATE_VERSION),
             latest_version_number: Some(FIRST_LAUNCH_TEMPLATE_VERSION),
             tags: Some(spec.tags),
-            operator: spec.operator,
+            // The operator is reported for EVERY template, whether a provider manages it or
+            // not ([`unmanaged_launch_template_operator`]), so the member is derived here
+            // rather than only where a request named a principal.
+            operator: Some(
+                spec.operator
+                    .unwrap_or_else(unmanaged_launch_template_operator),
+            ),
         };
         let mut versions = BTreeMap::new();
         versions.insert(
@@ -1492,6 +1498,31 @@ impl ComAmazonawsEc2Amazonec2State {
         record.payload_bytes = record.payload_bytes.saturating_add(payload_bytes);
         self.add_stored_bytes(payload_bytes);
         Some(version_number)
+    }
+
+    /// Make the version `version_number` names the DEFAULT version of the launch template
+    /// `launch_template_id` names, and answer the template as every reader then reports it —
+    /// `None` when the account holds no such template.
+    ///
+    /// "You can specify which version of the launch template to set as the default version.
+    /// When launching an instance, the default version applies when a launch template version
+    /// is not specified" (`ModifyLaunchTemplate`). `LaunchTemplate$DefaultVersionNumber` and
+    /// the `DefaultVersion` flag [`LaunchTemplateVersionRecord`] keeps for each version are
+    /// the SAME fact seen from the template and from the version, so both move here, in one
+    /// place: exactly the version named reports the flag, and every other version the
+    /// template holds reports it false. Nothing else about the template or its versions
+    /// changes, so the bytes the record retains stay as they were counted.
+    pub fn set_default_launch_template_version(
+        &mut self,
+        launch_template_id: &str,
+        version_number: i64,
+    ) -> Option<LaunchTemplate> {
+        let record = self.launch_templates.get_mut(launch_template_id)?;
+        record.template.default_version_number = Some(version_number);
+        for version in record.versions.values_mut() {
+            version.default_version = version.version_number == version_number;
+        }
+        Some(record.template.clone())
     }
 
     /// The id of the launch template this account holds under `name`, if it holds one.
@@ -2615,12 +2646,39 @@ pub struct LaunchTemplateSpec {
     pub create_time: SystemTime,
     /// The tags the create asked for.
     pub tags: Vec<Tag>,
-    /// The service provider that manages the template, when the request named one.
+    /// The service provider that manages the template, when the request named one; a
+    /// template no provider manages is stored with the answer
+    /// [`unmanaged_launch_template_operator`] gives instead.
     pub operator: Option<OperatorResponse>,
     /// The description of the first version.
     pub version_description: Option<String>,
     /// The first version's launch parameters.
     pub data: RequestLaunchTemplateData,
+}
+
+/// The `Operator` a launch template of THIS account reports when no service provider
+/// manages it.
+///
+/// "Describes whether the resource is managed by a service provider and, if so, describes the
+/// service provider that manages it" (`OperatorResponse`), where "if `true`, the resource is
+/// managed by a service provider" (`$Managed`) and "if `managed` is `true`, then the
+/// principal is returned" (`$Principal`) — so a template the caller created for itself
+/// answers the question with `false` and names no principal: the member reports the ANSWER,
+/// and a template nobody manages still has one.
+///
+/// `HiddenByDefault` is "if `true`, the resource is hidden by default based on the managed
+/// resource visibility settings for the account", which nothing in this emulator sets, so it
+/// is reported absent rather than guessed — the one difference from [`unmanaged_operator`],
+/// which the volume and network-interface stores use for the resources THEY keep.
+///
+/// The ONE reading of that answer for a launch template, so the template's own reports and
+/// the versions' cannot differ about it.
+pub fn unmanaged_launch_template_operator() -> OperatorResponse {
+    OperatorResponse {
+        managed: Some(false),
+        principal: None,
+        hidden_by_default: None,
+    }
 }
 
 /// The caller-chosen bytes one stored launch template retains.
