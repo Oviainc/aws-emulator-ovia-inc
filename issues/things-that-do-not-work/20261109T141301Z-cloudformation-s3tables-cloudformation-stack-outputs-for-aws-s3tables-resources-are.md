@@ -1,0 +1,35 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudformation__s3tables.cfn-s3tables-table-compaction-target-file-size-below-minimum-rejected cloudformation__s3tables.deploy-s3tables-resource-types-read-back-and-removed
+Issue-Key: cloudformation__s3tables.cfn-s3tables-table-compaction-target-file-size-below-minimum-rejected|stack_outputs#11|KeyError|return {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+Issue-Key: cloudformation__s3tables.deploy-s3tables-resource-types-read-back-and-removed|stack_outputs#10|KeyError|return {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+Issue-Commit: e0dfe85212dfb0c22b04d41b86c8cbe201f3bba8
+
+# CloudFormation stack Outputs for AWS::S3Tables::* resources are returned without OutputValue, so a deployed table bucket/table identifier is unobtainable
+
+> _Note: this issue was identified against the code base at commit `e0dfe85212dfb0c22b04d41b86c8cbe201f3bba8`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DescribeStacks
+
+## Description
+Cause 1 of 1: a CloudFormation stack that declares Outputs whose Value is a Ref or an Fn::GetAtt of an AWS::S3Tables::* resource (TableBucket.TableBucketARN, Table.TableARN, Table.WarehouseLocation, Table.VersionToken, Ref of TableBucket / Namespace / Table / TableBucketPolicy / TablePolicy) reaches CREATE_COMPLETE, but at least one Output row DescribeStacks returns carries only OutputKey — the OutputValue member is absent entirely, so an SDK consumer that models OutputValue as present raises KeyError: 'OutputValue'.
+
+AWS: recorded behavior only (CloudFormation's Output shape is not in the s3tables model). For a stack in CREATE_COMPLETE, DescribeStacks returns one row per declared Output with BOTH OutputKey and OutputValue, where OutputValue is the resolved value: for AWS::S3Tables::TableBucket the table bucket ARN arn:<partition>:s3tables:<region>:<account-id>:bucket/<table-bucket-name> (partition/region/account from the stack, name from the TableBucketName property), for AWS::S3Tables::Table the table ARN .../bucket/<table-bucket-name>/table/<table-id>, for AWS::S3Tables::Namespace the Ref form <table-bucket-ARN>|<namespace>, and for the two policy resources the Ref of the parent bucket/table ARN. Those values are directly usable as the tableBucketARN / tableArn inputs of the S3 Tables API (Smithy: GetTable.tableBucketARN pattern ^(arn:aws[-a-z0-9]*:[a-z0-9]+:[-a-z0-9]*:[0-9]{12}:bucket/[a-z0-9_-]{3,63})$). Nothing about those values is per-run except the names, ids, region and account taken from the request and the stack.
+Emulator: the stack completes, but the Output rows are serialized with no OutputValue member at all; both checks die on the row access `{o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}` immediately after their `assert status == "CREATE_COMPLETE"` passed, before any S3 Tables assertion runs. OutputKey is present (the comprehension reaches the OutputValue lookup), so the row exists and only the resolved value is missing.
+Why: a client cannot retrieve the identifier of a resource the stack just provisioned, so the whole "deploy S3 Tables with CloudFormation, then drive it through its own API" path is unusable; the same Ref/GetAtt values are also consumed INSIDE the template (AWS::S3Tables::Namespace / ::Table / ::TablePolicy take TableBucketARN / TableARN by GetAtt), so unresolved attributes silently mis-provision the child resources as well. An absent member breaks SDK consumers at the type level rather than returning something a caller can inspect.
+Fix: the GetAtt/Ref attribute resolution of the AWS::S3Tables::TableBucket, ::Namespace, ::Table, ::TableBucketPolicy and ::TablePolicy resource providers in CloudFormation, plus the DescribeStacks Outputs serializer, which must never emit an Output row whose value failed to resolve.
+Traces: cloudformation__s3tables.cfn-s3tables-table-compaction-target-file-size-below-minimum-rejected, cloudformation__s3tables.deploy-s3tables-resource-types-read-back-and-removed. NOTE: the open issue 20261101T233620Z-s3tables-via-cloudformation-fn-getatt-on-aws-s3tables.md describes the same symptom under the `s3tables` service for five other checks and 20261102T051310Z-cloudformation-s3-s3tables-s3vectors-cloudformation-aws-s3tables-tablebucket-physical-resource-id-ref-15f3b6.md covers the separate PhysicalResourceId/Ref-is-the-bare-name defect; neither carries these two cloudformation__s3tables check ids, so they are filed here.
+
+## Evidence
+Replay of simparity-behavioral-aws-v1 against this checkout.
+- [error] cloudformation__s3tables.cfn-s3tables-table-compaction-target-file-size-below-minimum-rejected, line 183 `out = stack_outputs(cf, good_id)` -> line 109 `return {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}` -> KeyError: 'OutputValue'. The control stack had already satisfied `assert status == "CREATE_COMPLETE"`. Template Outputs: {"TableBucketArn": {"Value": {"Fn::GetAtt": ["TableBucket", "TableBucketARN"]}}, "TableArn": {"Value": {"Fn::GetAtt": ["Table", "TableARN"]}}}.
+- [error] cloudformation__s3tables.deploy-s3tables-resource-types-read-back-and-removed, line 243 `out = stack_outputs(cf, stack_id)` -> line 111, same comprehension -> KeyError: 'OutputValue', again after `assert status == "CREATE_COMPLETE"` passed. Template Outputs: TableBucketRef {"Ref": "TableBucket"}, TableBucketArn GetAtt TableBucket.TableBucketARN, TableBucketPolicyRef {"Ref": "TableBucketPolicy"}, NamespaceRef {"Ref": "Namespace"}, TableRef {"Ref": "Table"}, TableArn GetAtt Table.TableARN, TableWarehouseLocation GetAtt Table.WarehouseLocation, TableVersionToken GetAtt Table.VersionToken, TablePolicyRef {"Ref": "TablePolicy"}.
+Expected: every declared Output row carries an OutputValue holding the resolved value (e.g. TableBucketArn -> arn:<partition>:s3tables:<region>:<account>:bucket/<TableBucketName>, NamespaceRef -> <bucket-ARN>|<namespace>). The stack names, bucket/namespace/table names and account/region in these runs are per-run values filling that template, not part of the requirement.
+
+## Steps to Reproduce
+1. Boot the emulator from this checkout.
+2. cloudformation.create_stack with a template declaring {"TableBucket": {"Type": "AWS::S3Tables::TableBucket", "Properties": {"TableBucketName": "<name>"}}, "Namespace": {"Type": "AWS::S3Tables::Namespace", ...}, "Table": {"Type": "AWS::S3Tables::Table", ...}} and Outputs {"TableBucketArn": {"Value": {"Fn::GetAtt": ["TableBucket", "TableBucketARN"]}}, "TableArn": {"Value": {"Fn::GetAtt": ["Table", "TableARN"]}}, "TableBucketRef": {"Value": {"Ref": "TableBucket"}}}.
+3. Poll describe_stacks(StackName=<StackId>) until StackStatus == CREATE_COMPLETE.
+4. Inspect Stacks[0].Outputs: rows carry OutputKey but no OutputValue. Expect each row to carry OutputValue with the resolved ARN / Ref value, immediately usable as s3tables tableBucketARN / tableArn.
