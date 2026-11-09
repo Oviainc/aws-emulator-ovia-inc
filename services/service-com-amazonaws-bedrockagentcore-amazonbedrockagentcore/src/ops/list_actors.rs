@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListActors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListActors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the actors an AgentCore Memory container holds, from [`crate::state`] — the
+//! actors the stored events and ingested content imply. Reporting only: it writes
+//! nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListActors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The page is ordered by `actorId` ascending, an order one state always paginates the
+//! same way, and is bounded by `maxResults`, with an opaque `nextToken` resuming after
+//! it. The container's existence is the CONTROL plane's record (the shared AgentCore
+//! resource inventory), so a container that exists but has nothing stored in it is an
+//! empty page, while one the account does not hold is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +95,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The list this operation's `nextToken` belongs to, so a token minted by another
+/// paginated operation does not silently resume this one.
+const PAGE_KIND: &str = "actors";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -169,18 +173,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListActors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListActorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Request metadata is not read by this operation: every member it needs is
+        // bound into `input` by the centralized request walk.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListActorsErrorModeled::ServiceException(ServiceException {
+                message: "the shared engine does not carry this service's state".to_string(),
+            })
+        })?;
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_next_token(PAGE_KIND, token).ok_or_else(|| {
+                ListActorsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this operation issued".to_string(),
+                    reason: "CannotParse".to_string(),
+                    field_list: None,
+                })
+            })?,
+        };
+        // `@range(1..100)` is refused at the boundary; the clamp keeps this arithmetic
+        // total rather than restating that refusal.
+        let max_results = input.max_results.clamp(1, 100) as usize;
+
+        // A Memory container is created through the CONTROL plane, so whether the
+        // container this listing addresses exists is that plane's record rather than this
+        // one's: a container nothing has written into yet holds no actor, which is an
+        // empty page, not a missing resource. The message names the resource that did not
+        // resolve and the identifier exactly as the request spelled it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListActors"))
+        // The inventory is read and released before this service's own store is taken,
+        // which is the lock order every reader of it keeps.
+        let held = crate::state::holds_memory(&*self.engine, &input.memory_id).ok_or_else(|| {
+            ListActorsErrorModeled::ServiceException(ServiceException {
+                message: "the shared engine does not carry the AgentCore resource inventory"
+                    .to_string(),
+            })
+        })?;
+        if !held {
+            return Err(ListActorsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        crate::state::NotFoundResource::Memory,
+                        &input.memory_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let store = state.lock();
+        // Every actor the container holds, however it came into being (an event written
+        // for it, or content ingested into one of its sessions), in `actorId` order.
+        let mut actor_ids: Vec<&str> = match store.resolve_memory(&input.memory_id) {
+            Ok(memory) => memory.actors.keys().map(String::as_str).collect(),
+            // A container the control plane holds that this plane has stored nothing in.
+            Err(_) => Vec::new(),
+        };
+        actor_ids.sort_unstable();
+
+        // Rendered page-first: only the summaries of this page are built, however many
+        // actors the container holds.
+        let (actor_summaries, next_token) = crate::state::paginate_with(
+            &actor_ids,
+            PAGE_KIND,
+            offset,
+            max_results,
+            |actor_id| ActorSummary {
+                actor_id: (*actor_id).to_string(),
+            },
+        );
+
+        Ok(ListActorsOutput {
+            actor_summaries,
+            next_token,
+        })
     }
 }

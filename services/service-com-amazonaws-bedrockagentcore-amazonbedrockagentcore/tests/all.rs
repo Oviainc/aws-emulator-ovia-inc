@@ -25,6 +25,8 @@ mod code_interpreter_sessions;
 mod code_interpreter_tools;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/memory_actors.rs"]
+mod memory_actors;
 #[path = "all/memory_events.rs"]
 mod memory_events;
 #[path = "all/memory_ingestion.rs"]
