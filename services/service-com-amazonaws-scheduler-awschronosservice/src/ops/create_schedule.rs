@@ -231,7 +231,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // lookup runs before the store is locked: the guard is not held across an
         // await.
         if let Some(message) =
-            crate::state::execution_role_violation(ctx, &region, &input.target.role_arn).await
+            crate::state::execution_role_violation(ctx.callback(), &region, &input.target.role_arn)
+                .await
         {
             return Err(
                 CreateScheduleErrorModeled::ValidationException(ValidationException { message })
@@ -314,6 +315,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 last_modification_date: now,
             },
         );
+        // A schedule is INVOKED, not just stored: the clock that performs the
+        // occurrences its expression names is armed here, so a client that writes
+        // a schedule and then watches the target observes the invocations the
+        // schedule asked for. The store's guard is released first — arming takes
+        // the same lock.
+        drop(store);
+        crate::state::drive_invocation_clock(&self.engine, ctx.callback());
 
         Ok(CreateScheduleOutput { schedule_arn: arn })
     }

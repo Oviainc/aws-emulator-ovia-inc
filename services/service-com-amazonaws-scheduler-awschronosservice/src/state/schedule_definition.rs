@@ -31,6 +31,12 @@
 //! a `cron(...)` body and `chrono` for an `at(...)` instant — rather than by a
 //! hand-written one, and a zone name by `chrono-tz`, which carries the IANA
 //! database.
+//!
+//! The tables and the normalisation that reading needs ([`RATE_UNITS`],
+//! [`CRON_FIELDS`], [`AT_EXPRESSION_FORMAT`], [`normalised_cron`]) are declared
+//! here ONCE and used by [`super::occurrence`] as well, which computes the instants
+//! an accepted expression names: the validator and the evaluator have to read one
+//! grammar, or an expression this accepts is one the clock names no instant for.
 
 use std::time::SystemTime;
 
@@ -41,7 +47,7 @@ use ::aws_smithy_types::DateTime;
 /// minute | minutes | hour | hours | day | days" (the service's schedule-types
 /// reference). Both spellings of each unit are accepted, as the service accepts
 /// them.
-const RATE_UNITS: &[(&str, u64)] = &[
+pub(crate) const RATE_UNITS: &[(&str, u64)] = &[
     ("minute", 60),
     ("minutes", 60),
     ("hour", 3_600),
@@ -52,12 +58,12 @@ const RATE_UNITS: &[(&str, u64)] = &[
 
 /// How many whitespace-separated fields a `cron(...)` body carries: "cron(fields)
 /// […] Minutes Hours Day-of-month Month Day-of-week Year" — six.
-const CRON_FIELDS: usize = 6;
+pub(crate) const CRON_FIELDS: usize = 6;
 
 /// The indexes of the two fields a `?` ("no specific value") is a statement in —
 /// day-of-month and day-of-week — which is the same statement `*` makes in the
 /// grammar the `cron` crate reads.
-const NO_SPECIFIC_VALUE_FIELDS: [usize; 2] = [2, 4];
+pub(crate) const NO_SPECIFIC_VALUE_FIELDS: [usize; 2] = [2, 4];
 
 /// The field values the normalised seven-field expression carries for every field
 /// but the one under test, so a field is judged on its own.
@@ -74,7 +80,7 @@ const SERVICE_CRON_WILDCARDS: [char; 3] = ['L', 'W', '#'];
 /// The format an `at(...)` body states its instant in:
 /// "at(yyyy-mm-ddThh:mm:ss)" — a local date and time with no zone offset, since
 /// the zone is `ScheduleExpressionTimezone`'s to state.
-const AT_EXPRESSION_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
+pub(crate) const AT_EXPRESSION_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 
 /// A nanosecond count of one millisecond: the resolution a schedule's instants
 /// are held at.
@@ -186,7 +192,7 @@ fn names_service_wildcard(field: &str) -> bool {
 }
 
 /// The six documented fields as the seven-field expression the `cron` crate reads.
-fn normalised_cron(fields: &[&str]) -> String {
+pub(crate) fn normalised_cron(fields: &[&str]) -> String {
     let mut expression = String::from(NEUTRAL_CRON_FIELDS[0]);
     for (index, field) in fields.iter().enumerate() {
         expression.push(' ');

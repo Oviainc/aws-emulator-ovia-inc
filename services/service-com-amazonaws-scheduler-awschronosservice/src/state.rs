@@ -11,9 +11,19 @@
 //! zone that expression is read in, and the window its instants bound — live in
 //! [`schedule_definition`] and are re-exported here, so both operations that
 //! write a schedule reach them the way they reach the rest of this module.
+//!
+//! What the control plane persists is only half of this service: a schedule is
+//! also INVOKED. Which instants one runs at lives in [`occurrence`], and the clock
+//! that performs them — and the hand-over that reaches each target — in
+//! [`invocation`], which the operations that write a schedule arm.
 
+mod occurrence;
 mod schedule_definition;
 
+pub mod invocation;
+
+pub use invocation::{drive_invocation_clock, Invocations};
+pub use occurrence::Occurrences;
 pub use schedule_definition::*;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -269,6 +279,9 @@ pub struct ComAmazonawsSchedulerAwschronosserviceState {
     /// the store is first reached, keeps it STABLE across reads — a read of the
     /// default group never writes.
     pub origin: SystemTime,
+    /// The clock that invokes this account's schedules as their expressions make
+    /// them due, and what it has already performed ([`invocation`]).
+    pub invocations: Invocations,
 }
 
 impl Default for ComAmazonawsSchedulerAwschronosserviceState {
@@ -277,6 +290,7 @@ impl Default for ComAmazonawsSchedulerAwschronosserviceState {
             groups: BTreeMap::new(),
             schedules: BTreeMap::new(),
             origin: SystemTime::now(),
+            invocations: Invocations::default(),
         }
     }
 }
@@ -595,8 +609,13 @@ fn trust_policy_admits(document: &str, principal: &str) -> bool {
 /// emulator has no IAM to ask (a router with only this service mounted, say):
 /// nothing is then known about the role, and a refusal has to be grounded in
 /// what IAM answered, never assumed.
+///
+/// It takes the in-process `callback` rather than the operation's whole context,
+/// because the other caller is the invocation clock ([`invocation`]), which
+/// resolves the same role when the schedule is INVOKED and holds a callback cloned
+/// from the request that started it rather than a request of its own.
 pub async fn execution_role_violation(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     role_arn: &str,
 ) -> Option<String> {
@@ -612,8 +631,8 @@ pub async fn execution_role_violation(
     };
     let config = ::aws_sdk_iam::Config::builder()
         .behavior_version(::aws_sdk_iam::config::BehaviorVersion::latest())
-        .http_client(ctx.callback().http_client())
-        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(callback.http_client())
+        .credentials_provider(callback.aws_credentials_provider())
         .region(::aws_sdk_iam::config::Region::new(region.to_string()))
         .endpoint_url(format!("https://iam.{region}.amazonaws.com"))
         // The transport is in-process: there is nothing to retry, time out or

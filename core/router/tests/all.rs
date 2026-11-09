@@ -287,6 +287,10 @@ mod signer_revocation_status_across_services;
 // the sorted `e…` span (where the other ecs/elbv2 suites land) are both regions concurrently
 #[path = "all/ecs_awsvpc_configuration_over_an_ec2_network.rs"]
 mod ecs_awsvpc_configuration_over_an_ec2_network;
+// The ONE Amazon VPC seeding fixture the suites whose requests name a subnet literally
+// share, so no suite writes a second copy of those records.
+#[path = "all/ec2_network.rs"]
+mod ec2_network;
 // the sorted `l…` span are both regions concurrently landing suites add their line to.
 #[path = "all/log_alarm_scheduled_query.rs"]
 mod log_alarm_scheduled_query;
@@ -976,6 +980,11 @@ mod cloudformation_provisions_mq_brokers;
 mod cloudformation_refuses_mq_brokers;
 #[path = "all/cloudformation_provisions_agentcore_workload_identities.rs"]
 mod cloudformation_provisions_agentcore_workload_identities;
+// Declared here, beside the sibling suites it shares its rule with: the whole deployed
+// pipeline, from an `AWS::Events::Rule`/`AWS::Lambda::Permission` template to the permitted
+// target's own work product and the un-permitted sibling's dead letter.
+#[path = "all/cloudformation_events_rule_lambda_target_permission_boundary.rs"]
+mod cloudformation_events_rule_lambda_target_permission_boundary;
 #[path = "all/events_lambda_target_dead_letter_capture.rs"]
 mod events_lambda_target_dead_letter_capture;
 #[path = "all/events_lambda_target_resource_policy.rs"]
@@ -1195,22 +1204,18 @@ mod cloudformation_apigateway_access_control;
 // or earlier in the tail, where their own entry records why they were placed there: two
 // concurrent changes appending one entry is a redefinition that stops this target from
 // compiling, so the duplicate lines are gone and ONE declaration of each stands.
-// Declared here, in the appended tail: what an invocation PRINTS, through the metric filter on
-// its log group, the alarm over that metric, the SNS action and the queues subscribed to it.
-#[path = "all/lambda_log_metric_filter_drives_the_alarm_chain.rs"]
-mod lambda_log_metric_filter_drives_the_alarm_chain;
 #[path = "all/bedrock_catalogue_is_invocable.rs"]
 mod bedrock_catalogue_is_invocable;
 #[path = "all/bedrock_logging_destination_region.rs"]
 mod bedrock_logging_destination_region;
-// The ONE Amazon VPC seeding fixture the suites whose requests name a subnet literally
-// share, so no suite writes a second copy of those records.
-#[path = "all/ec2_network.rs"]
-mod ec2_network;
 #[path = "all/cloudformation_provisions_bedrock_guardrails.rs"]
 mod cloudformation_provisions_bedrock_guardrails;
-// Declared here, beside the sibling suites it shares its rule with: the whole deployed
-// pipeline, from an `AWS::Events::Rule`/`AWS::Lambda::Permission` template to the permitted
-// target's own work product and the un-permitted sibling's dead letter.
-#[path = "all/cloudformation_events_rule_lambda_target_permission_boundary.rs"]
-mod cloudformation_events_rule_lambda_target_permission_boundary;
+// Declared in the appended tail, which is where every new suite inserts its lines: the whole
+// deploy -> fire -> deliver -> stack-delete round trip of a stack-deployed
+// `AWS::Scheduler::Schedule`.
+#[path = "all/cloudformation_deployed_schedule_invokes_its_target.rs"]
+mod cloudformation_deployed_schedule_invokes_its_target;
+// Declared here, in the appended tail: what an invocation PRINTS, through the metric filter on
+// its log group, the alarm over that metric, the SNS action and the queues subscribed to it.
+#[path = "all/lambda_log_metric_filter_drives_the_alarm_chain.rs"]
+mod lambda_log_metric_filter_drives_the_alarm_chain;

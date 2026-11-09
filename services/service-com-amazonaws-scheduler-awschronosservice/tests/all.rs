@@ -25,6 +25,8 @@ mod schedule_definition_rules;
 mod schedule_group_listing;
 #[path = "all/schedule_group_read.rs"]
 mod schedule_group_read;
+#[path = "all/schedule_invocation.rs"]
+mod schedule_invocation;
 #[path = "all/schedule_lifecycle.rs"]
 mod schedule_lifecycle;
 #[path = "all/state_roundtrip.rs"]

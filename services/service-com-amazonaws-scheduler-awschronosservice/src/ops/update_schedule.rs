@@ -237,7 +237,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let _ = ctx;
         let mut store = state.lock();
         store.settle(now);
 
@@ -285,9 +284,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.target = input.target;
         record.flexible_time_window = input.flexible_time_window;
         record.last_modification_date = now;
+        let arn = record.arn.clone();
 
-        Ok(UpdateScheduleOutput {
-            schedule_arn: record.arn.clone(),
-        })
+        // The update may have re-expressed, re-pointed, enabled or disabled the
+        // schedule, so the clock is armed again here and reads the definition the
+        // schedule now carries. The store's guard is released first — arming takes
+        // the same lock.
+        drop(store);
+        crate::state::drive_invocation_clock(&self.engine, ctx.callback());
+
+        Ok(UpdateScheduleOutput { schedule_arn: arn })
     }
 }

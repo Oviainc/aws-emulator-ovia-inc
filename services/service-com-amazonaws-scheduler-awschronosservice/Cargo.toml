@@ -16,8 +16,11 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-# `tokio::time` drives the tests' wait past a group deletion's due instant.
-tokio = { workspace = true, features = ["time"] }
+# `time`: the invocation clock waits between its passes with it rather than
+# parking a worker thread, and it drives the tests' wait past a group deletion's
+# due instant; `rt` is the handle it spawns that one task onto
+# (`state::invocation`).
+tokio = { workspace = true, features = ["rt", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -41,12 +44,28 @@ service-common = { path = "../common" }
 cron = "0.15"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
+# The clients a schedule's occurrence reaches its target through, driven over the
+# same in-process callback (`state::invocation`): an SQS queue (`SendMessage`), an
+# SNS topic (`Publish`), a Lambda function (`Invoke`) and a Step Functions state
+# machine (`StartExecution`). Only the generated clients are needed — the
+# emulator supplies the transport, so the SDK's own HTTPS stack and runtime are
+# left out.
+aws-sdk-sqs = { version = "1", default-features = false }
+aws-sdk-sns = { version = "1", default-features = false }
+aws-sdk-lambda = { version = "1", default-features = false }
+aws-sdk-sfn = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The services a schedule's target lives in are mounted beside this one on a
+# single engine in the invocation suite, because an invocation is asserted where a
+# client sees it: on the queue the schedule's target names, and against the
+# execution role IAM holds.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true
