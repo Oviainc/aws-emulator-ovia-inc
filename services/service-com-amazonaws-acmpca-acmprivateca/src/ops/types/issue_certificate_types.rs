@@ -25,14 +25,18 @@ pub struct IssueCertificateInput {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#ApiPassthrough")]
-#[derive(Debug, Clone, Default)]
+// `PartialEq`/`Eq` here and on every shape this one reaches: the content a request asks to
+// be carried into the certificate is part of WHICH certificate it asks for, so it is
+// compared member by member when a repeat of that request is recognised
+// (`crate::state::IssuedCertificateRequest`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ApiPassthrough {
     pub extensions: Option<Extensions>,
     pub subject: Option<ASN1Subject>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#Extensions")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Extensions {
     pub certificate_policies: Option<Vec<PolicyInformation>>,
     pub extended_key_usage: Option<Vec<ExtendedKeyUsage>>,
@@ -42,34 +46,34 @@ pub struct Extensions {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#PolicyInformation")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PolicyInformation {
     pub cert_policy_id: String,
     pub policy_qualifiers: Option<Vec<PolicyQualifierInfo>>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#PolicyQualifierInfo")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PolicyQualifierInfo {
     pub policy_qualifier_id: String,
     pub qualifier: Qualifier,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#Qualifier")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Qualifier {
     pub cps_uri: String,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#ExtendedKeyUsage")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExtendedKeyUsage {
     pub extended_key_usage_type: Option<String>,
     pub extended_key_usage_object_identifier: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#CustomExtension")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CustomExtension {
     pub object_identifier: String,
     pub value: String,
@@ -77,7 +81,7 @@ pub struct CustomExtension {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.acmpca#Validity")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Validity {
     pub value: i64,
     pub r#type: String,

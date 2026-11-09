@@ -177,15 +177,13 @@ async fn only_a_root_cas_own_request_is_signed_before_it_holds_a_certificate() {
     );
 
     // The control: an ACTIVE CA signs a request that is not its own, under the template a
-    // leaf is issued with — the issuance the exception above is NOT about.
+    // leaf is issued with — the issuance the exception above is NOT about. Its validity is
+    // shorter than the root certificate's, because a leaf may not outlive its issuer
+    // (`IssueCertificateRequest$Validity`).
     let case = "an active CA signing another request";
-    let leaf = emulator
-        .ok(
-            case,
-            "IssueCertificate",
-            &issuance(&root, &subordinate_csr, Some(END_ENTITY_TEMPLATE)),
-        )
-        .await;
+    let mut leaf_request = issuance(&root, &subordinate_csr, Some(END_ENTITY_TEMPLATE));
+    leaf_request["Validity"] = json!({"Type": "DAYS", "Value": 30});
+    let leaf = emulator.ok(case, "IssueCertificate", &leaf_request).await;
     let leaf_arn = string(&leaf, "CertificateArn", case);
     assert!(
         leaf_arn.starts_with(&format!("{root}/certificate/")),

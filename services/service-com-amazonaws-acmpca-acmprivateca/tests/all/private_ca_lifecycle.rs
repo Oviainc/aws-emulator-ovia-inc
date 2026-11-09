@@ -240,13 +240,20 @@ pub(crate) fn ca_certificate_for(csr: &str) -> String {
 /// The three members `ImportCertificateAuthorityCertificate` judges a CA certificate by are
 /// the caller's to choose here, so a suite can present a certificate that diverges from the
 /// CA's own request in exactly one of them.
+///
+/// Its validity window reaches a century ahead, because a CA activated with it reports that
+/// window as its own and a certificate issued under it may not outlive it
+/// (`IssueCertificateRequest$Validity`: "The end of the validity period configured on a
+/// certificate must not exceed the limit set on its parents in the CA hierarchy."), so the
+/// window has to hold every validity the suites ask a CA for — the furthest of them being
+/// the 2050 `ABSOLUTE` sample of the validity-resolution table.
 pub(crate) fn certificate_over(
     subject: &Name,
     key: &x509_cert::spki::SubjectPublicKeyInfoOwned,
     algorithm: &x509_cert::spki::AlgorithmIdentifierOwned,
 ) -> String {
     let not_before = SystemTime::now() - Duration::from_secs(3600);
-    let not_after = not_before + Duration::from_secs(365 * 24 * 3600);
+    let not_after = not_before + Duration::from_secs(100 * 365 * 24 * 3600);
     let tbs_certificate = x509_cert::TbsCertificate {
         version: x509_cert::Version::V3,
         serial_number: x509_cert::serial_number::SerialNumber::new(&next_test_serial())
@@ -1694,8 +1701,14 @@ async fn the_per_request_stores_are_bounded() {
 
     // Idempotency tokens: beyond the bound the oldest record is evicted, so the token it
     // held no longer replays while the newest one still does.
+    //
+    // Each request is kept as it was sent, because a replay is the SAME request sent again:
+    // a token identifies retries of one call, and the call is identified by its own content
+    // (its certification request above all), so a body built afresh — with a fresh key pair
+    // in its CSR — is another call and gets a certificate of its own.
     let emulator = Emulator::new();
     let (arn, _) = active_ca(&emulator, "token-bound-root").await;
+    let mut requests: Vec<Value> = Vec::new();
     let mut minted: Vec<String> = Vec::new();
     for index in 0..=MAX_IDEMPOTENCY_TOKENS {
         let case = format!("token {index}");
@@ -1711,17 +1724,9 @@ async fn the_per_request_stores_are_bounded() {
             "CertificateArn",
             &case,
         ));
+        requests.push(body);
     }
-    let replay = |index: usize| {
-        let mut body = json!({
-            "CertificateAuthorityArn": arn,
-            "Csr": blob(&csr_pem(&format!("end-entity-{index}"))),
-            "SigningAlgorithm": "SHA256WITHRSA",
-            "Validity": {"Value": 7, "Type": "DAYS"},
-        });
-        body["IdempotencyToken"] = json!(format!("tok-{index}"));
-        body
-    };
+    let replay = |index: usize| requests[index].clone();
     let newest = MAX_IDEMPOTENCY_TOKENS;
     assert_eq!(
         string(

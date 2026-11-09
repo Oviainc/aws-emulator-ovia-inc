@@ -23,6 +23,8 @@ mod certificate_authority_key_material;
 mod certificate_authority_listing;
 #[path = "all/certificate_authority_tags.rs"]
 mod certificate_authority_tags;
+#[path = "all/certificate_issuance_rules.rs"]
+mod certificate_issuance_rules;
 #[path = "all/certificate_revocation.rs"]
 mod certificate_revocation;
 #[path = "all/constraint_refusal_messages.rs"]

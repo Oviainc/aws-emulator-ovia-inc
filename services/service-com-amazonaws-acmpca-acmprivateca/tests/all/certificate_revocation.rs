@@ -119,7 +119,19 @@ fn serial_in(certificate_arn: &str, case: &str) -> String {
 }
 
 /// Have `ca_arn` issue a certificate over `csr`, and answer the serial it allocated.
+///
+/// Every call carries an idempotency token of its own, which is how a caller asks one CA
+/// for SEVERAL certificates over one certification request: "If you change the idempotency
+/// token for each call, Amazon Web Services Private CA recognizes that you are requesting
+/// multiple certificates" (`IssueCertificateRequest$IdempotencyToken`). A byte-identical
+/// request repeated without one is the earlier certificate replayed, not a second
+/// certificate.
 async fn issued_serial(emulator: &Emulator, case: &str, ca_arn: &str, csr: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let token = format!(
+        "issuance-{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let issued = emulator
         .ok(
             case,
@@ -129,6 +141,7 @@ async fn issued_serial(emulator: &Emulator, case: &str, ca_arn: &str, csr: &str)
                 "Csr": blob(csr),
                 "SigningAlgorithm": "SHA256WITHRSA",
                 "Validity": {"Type": "DAYS", "Value": 30},
+                "IdempotencyToken": token,
             }),
         )
         .await;

@@ -14,10 +14,12 @@
 //! has issued ([`audit_reports`]).
 
 mod audit_reports;
+mod certificate_templates;
 mod imported_certificate;
 mod key_material;
 
 pub use audit_reports::*;
+pub use certificate_templates::*;
 pub use imported_certificate::*;
 pub use key_material::*;
 
@@ -39,8 +41,8 @@ use x509_cert::time::{Time, Validity as CertificateValidity};
 use x509_cert::{Certificate, TbsCertificate, Version};
 
 use crate::ops::types::{
-    ASN1Subject, CertificateAuthority, CertificateAuthorityConfiguration, CrlConfiguration,
-    Permission, RevocationConfiguration, Tag, Validity,
+    ApiPassthrough, ASN1Subject, CertificateAuthority, CertificateAuthorityConfiguration,
+    CrlConfiguration, Permission, RevocationConfiguration, Tag, Validity,
 };
 
 /// A PKCS#10 certification request, as this service reads and writes one.
@@ -103,9 +105,20 @@ pub const UPDATABLE_STATUSES: &[&str] = &[STATUS_ACTIVE, STATUS_DISABLED];
 /// allowed from, naming no request of its own. The statuses are the ones
 /// [`DELETABLE_STATUSES`] quotes from the `DeleteCertificateAuthority` docs.
 pub const DELETE_INVALID_STATE_MESSAGE: &str =
-    "A private CA can be deleted only if it is in the PENDING_CERTIFICATE, CREATING, \
-     EXPIRED, DISABLED, or FAILED state. To delete a CA in the ACTIVE state, you must \
-     first disable it.";
+    "The certificate authority is not in a valid state for deletion.";
+
+/// What Amazon Web Services Private CA answers when a CA is asked to take a certificate
+/// authority certificate in a status that cannot take one: one sentence about the CA, in
+/// the form every state refusal of this service takes ([`ISSUANCE_INVALID_STATE_MESSAGE`],
+/// [`DELETE_INVALID_STATE_MESSAGE`]) and carrying no ARN, status name or other value out of
+/// the request or the store.
+///
+/// A CA that was soft-deleted is answered the restore sentence instead
+/// ([`DELETED_INVALID_STATE_MESSAGE`]), because the action it has to be restored for is
+/// what that refusal says.
+pub const IMPORT_INVALID_STATE_MESSAGE: &str =
+    "The certificate authority is not in a valid state for importing a certificate \
+     authority certificate.";
 
 /// What Amazon Web Services Private CA answers when a deleted CA is asked to change:
 /// the service's own sentence for this refusal, naming the state the CA is in and the
@@ -172,6 +185,20 @@ pub const INVALID_ARN_MESSAGE: &str = "Not a valid arn.";
 /// What Amazon Web Services Private CA answers for a certificate body it cannot read:
 /// one sentence about the certificate, the same for the certificate and for the chain.
 pub const MALFORMED_CERTIFICATE_MESSAGE: &str = "Malformed certificate.";
+
+/// What Amazon Web Services Private CA answers for a certification request it cannot read:
+/// one sentence about the request, the counterpart of
+/// [`MALFORMED_CERTIFICATE_MESSAGE`] and, like it, naming nothing of the request's own.
+pub const MALFORMED_CSR_MESSAGE: &str = "Malformed CSR.";
+
+/// What Amazon Web Services Private CA answers when the certificate a request asks for
+/// would still be valid after the issuing CA's own certificate has expired: "The end of the
+/// validity period configured on a certificate must not exceed the limit set on its parents
+/// in the CA hierarchy." (`IssueCertificateRequest$Validity` docs.)
+///
+/// Wholly fixed text: neither the requested validity nor the CA's appears in it.
+pub const VALIDITY_EXCEEDS_CA_MESSAGE: &str =
+    "The certificate validity specified exceeds the certificate authority validity.";
 
 /// The `CertificateAuthorityType` member of a CA that signs its own certificate: "ROOT"
 /// (`CreateCertificateAuthorityRequest$CertificateAuthorityType`). A `SUBORDINATE` CA's
@@ -368,13 +395,6 @@ pub const IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(5 * 60);
 /// caller that acts immediately after the starting call still observes the transient
 /// status and the state errors that go with it (`RequestInProgressException`).
 pub const SETTLE_AFTER: Duration = Duration::from_millis(500);
-
-/// Validity window recorded for a CA certificate the caller imports, in calendar months.
-///
-/// CHOSEN, not documented: Amazon Web Services Private CA copies `NotBefore`/`NotAfter`
-/// out of the imported certificate's ASN.1, which this emulator does not decode, so the
-/// window is recorded as the import instant plus this span.
-pub const IMPORTED_CA_CERTIFICATE_VALIDITY_MONTHS: i64 = 120;
 
 /// Most private CAs this emulator holds at once.
 ///
@@ -1081,13 +1101,17 @@ pub struct CertificateAuthorityRecord {
     pub audit_reports: Vec<AuditReportRecord>,
     /// Permissions granted on this CA, one per (principal, source account) pair.
     pub permissions: Vec<PermissionRecord>,
-    /// `IssueCertificate` idempotency tokens -> the certificate ARN they minted.
+    /// `IssueCertificate` requests this CA has answered -> the certificate ARN each
+    /// minted.
     ///
-    /// The token identifies the call on its own here, so no request accompanies the
-    /// record: "if you call IssueCertificate multiple times with the same idempotency
-    /// token … Amazon Web Services Private CA recognizes that you are requesting only one
-    /// certificate and will issue only one" (`IssueCertificateRequest$IdempotencyToken`).
-    pub issue_idempotency: IdempotencyRecords<()>,
+    /// Keyed by what identifies ONE issuance request ([`IssuedCertificateRequest`]), so a
+    /// repeat of a request this CA has already answered is answered with the certificate it
+    /// minted then rather than with a second certificate for one logical request: the
+    /// operation is `@idempotent`, and "if you call IssueCertificate multiple times with
+    /// the same idempotency token … Amazon Web Services Private CA recognizes that you are
+    /// requesting only one certificate and will issue only one"
+    /// (`IssueCertificateRequest$IdempotencyToken`).
+    pub issue_idempotency: IdempotencyRecords<IssuedCertificateRequest>,
 }
 
 impl CertificateAuthorityRecord {
@@ -1302,6 +1326,21 @@ impl CertificateAuthorityRecord {
         let der = parse_pem_block(self.ca_certificate_pem.as_deref()?, PEM_LABEL_CERTIFICATE)?;
         let certificate = Certificate::from_der(&der).ok()?;
         normalized_serial(&::hex::encode(certificate.tbs_certificate.serial_number.as_bytes()))
+    }
+
+    /// When the certificate this CA was activated with stops being valid, when the CA holds
+    /// one this service can read.
+    ///
+    /// Read out of that certificate's own validity window
+    /// ([`certificate_validity_window`]) rather than off the record, so it is the instant
+    /// the certificate itself names — which is what bounds every certificate this CA
+    /// issues: "The end of the validity period configured on a certificate must not exceed
+    /// the limit set on its parents in the CA hierarchy."
+    /// (`IssueCertificateRequest$Validity` docs.)
+    pub fn own_certificate_not_after(&self) -> Option<SystemTime> {
+        let der = parse_pem_block(self.ca_certificate_pem.as_deref()?, PEM_LABEL_CERTIFICATE)?;
+        let certificate = Certificate::from_der(&der).ok()?;
+        Some(certificate_validity_window(&certificate).1)
     }
 
     /// Whether `presented` carries the very certification request this CA published
@@ -2090,6 +2129,75 @@ pub fn remove_tags(existing: &mut Vec<Tag>, tags: &[Tag]) {
     });
 }
 
+/// What identifies ONE `IssueCertificate` call, so a repeat of it is answered with the
+/// certificate the first call minted instead of a second certificate.
+///
+/// `IssueCertificate` is `@idempotent`, and the certificate a call asks for is wholly
+/// described by the request: the certification request being signed, the algorithm the CA
+/// is asked to sign with, the template that chooses the certificate's extensions, the
+/// validity window, and the `ApiPassthrough` content to be carried into it. Two calls
+/// agreeing on all of those ask the CA for the same certificate; a call differing in any of
+/// them asks for a different one and is issued its own.
+///
+/// The CA is not a field here: these records live ON the CA that answered them, so a request
+/// repeated against another CA is a request of that CA's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssuedCertificateRequest {
+    /// The `Csr` member, as the bytes the request carried.
+    pub csr: Vec<u8>,
+    /// The `SigningAlgorithm` member.
+    pub signing_algorithm: String,
+    /// The `TemplateArn` member, when the request named one.
+    pub template_arn: Option<String>,
+    /// The `Validity` member.
+    pub validity: (i64, String),
+    /// The `ValidityNotBefore` member, when the request named one.
+    pub validity_not_before: Option<(i64, String)>,
+    /// The `ApiPassthrough` member, when the request carried one.
+    pub api_passthrough: Option<ApiPassthrough>,
+}
+
+impl IssuedCertificateRequest {
+    /// The identity of a request asking for a certificate over `csr`.
+    pub fn new(
+        csr: Vec<u8>,
+        signing_algorithm: String,
+        template_arn: Option<String>,
+        validity: &Validity,
+        validity_not_before: Option<&Validity>,
+        api_passthrough: Option<ApiPassthrough>,
+    ) -> Self {
+        Self {
+            csr,
+            signing_algorithm,
+            template_arn,
+            validity: validity_key(validity),
+            validity_not_before: validity_not_before.map(validity_key),
+            api_passthrough,
+        }
+    }
+}
+
+/// A `Validity` as the pair of values it is: the period's length and the type it counts in.
+fn validity_key(validity: &Validity) -> (i64, String) {
+    (validity.value, validity.r#type.clone())
+}
+
+/// The bucket an `IssueCertificate` is remembered under: the `IdempotencyToken` it carried,
+/// and the empty string for a request that carried none.
+///
+/// A token distinguishes retries of one call from calls that each want their own
+/// certificate — "If you change the idempotency token for each call, Amazon Web Services
+/// Private CA recognizes that you are requesting multiple certificates"
+/// (`IssueCertificateRequest$IdempotencyToken`) — so it is the bucket, and the request's own
+/// identity ([`IssuedCertificateRequest`]) is what is matched inside it. `IdempotencyToken`
+/// is modelled `length 1..36`, so no token a caller can send is the empty string: the
+/// requests that named none share a bucket of their own and are told apart by their content
+/// alone.
+pub fn issuance_idempotency_key(token: Option<&String>) -> String {
+    token.cloned().unwrap_or_default()
+}
+
 /// An idempotency token's record: what it minted, WHAT IT WAS ASKED FOR, and when it
 /// stops being honoured.
 ///
@@ -2611,10 +2719,16 @@ mod oid {
 
     // Certificate and CRL extensions: RFC 5280 sections 4.2.1, 5.2 and 5.3 (`2.5.29.*`).
     pub const SUBJECT_KEY_IDENTIFIER: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.14");
+    pub const SUBJECT_ALT_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.17");
     pub const CRL_NUMBER: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.20");
     pub const CRL_REASON: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.21");
     pub const AUTHORITY_KEY_IDENTIFIER: ObjectIdentifier =
         ObjectIdentifier::new_unwrap("2.5.29.35");
+
+    // The attribute a PKCS#10 request states the extensions it asks for in: `pkcs-9-at-
+    // extensionRequest` (RFC 2985 section 5.4.2).
+    pub const EXTENSION_REQUEST: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.14");
 
     // ML-DSA names one algorithm for the key and the signature alike.
     pub const ML_DSA_44: ObjectIdentifier =
@@ -2653,6 +2767,20 @@ pub fn encode_certificate_pem(certificate: &Certificate) -> Option<String> {
 /// it is not one — what `MalformedCSRException` answers.
 pub fn parse_certification_request(der: &[u8]) -> Option<CertificationRequest> {
     CertReq::from_der(der).ok()
+}
+
+/// The validity window `certificate` carries (RFC 5280 section 4.1.2.5), as the two
+/// instants it denotes.
+///
+/// This is the window a CA activated with that certificate reports as its own
+/// `NotBefore`/`NotAfter`, and whose end bounds every certificate the CA then issues
+/// ([`VALIDITY_EXCEEDS_CA_MESSAGE`]): both are properties of the certificate, so both are
+/// read out of it rather than recorded from the instant it was taken.
+pub fn certificate_validity_window(certificate: &Certificate) -> (SystemTime, SystemTime) {
+    (
+        certificate.tbs_certificate.validity.not_before.to_system_time(),
+        certificate.tbs_certificate.validity.not_after.to_system_time(),
+    )
 }
 
 /// The certification request this CA hands out, derived once at create time.
@@ -2709,6 +2837,10 @@ pub fn derive_csr_pem(
 /// algorithm the request asked for, so the certificate verifies against the public key the
 /// CA publishes; for a CA holding no key pair it is the stand-in of the right ASN.1 shape.
 ///
+/// The extensions are the ones the `TemplateArn` the request named defines
+/// ([`certificate_template`]), so a certificate issued under a CA-certificate template is
+/// usable as an issuer and one issued under an end-entity template is not.
+///
 /// `None` when the CA's subject, the allocated serial or the validity window cannot be
 /// encoded as the certificate's DER demands.
 pub fn derive_certificate_pem(
@@ -2716,6 +2848,7 @@ pub fn derive_certificate_pem(
     serial: &str,
     request: &CertificationRequestInfo,
     signing_algorithm: &str,
+    template: &CertificateTemplate,
     not_before: SystemTime,
     not_after: SystemTime,
 ) -> Option<String> {
@@ -2733,7 +2866,7 @@ pub fn derive_certificate_pem(
         subject_public_key_info: request.public_key.clone(),
         issuer_unique_id: None,
         subject_unique_id: None,
-        extensions: None,
+        extensions: certificate_extensions(template, request),
     };
     let signature = object_signature(
         ca.key_pair.as_ref(),

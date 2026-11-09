@@ -566,6 +566,12 @@ async fn revoking_a_certificate_refreshes_the_published_crl() {
                     "Csr": blob(&csr),
                     "SigningAlgorithm": "SHA256WITHRSA",
                     "Validity": {"Type": "DAYS", "Value": 30},
+                    // Each row wants a certificate of its own over the one certification
+                    // request, which is what a token per call asks for: "If you change the
+                    // idempotency token for each call, Amazon Web Services Private CA
+                    // recognizes that you are requesting multiple certificates"
+                    // (`IssueCertificateRequest$IdempotencyToken`).
+                    "IdempotencyToken": format!("crl-{reason}"),
                 }),
             )
             .await;

@@ -291,13 +291,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 }
                 status => {
+                    // A CA waiting to be restored is answered the restore sentence; any
+                    // other status that cannot take a certificate is answered this
+                    // operation's own state sentence. Both are fixed text: the ARN and the
+                    // status are values of the request and the store, not of the refusal.
+                    let message = if status == crate::state::STATUS_DELETED {
+                        crate::state::DELETED_INVALID_STATE_MESSAGE
+                    } else {
+                        crate::state::IMPORT_INVALID_STATE_MESSAGE
+                    };
                     return Err(
                         ImportCertificateAuthorityCertificateErrorModeled::InvalidStateException(
                             InvalidStateException {
-                                message: Some(format!(
-                                    "the certificate authority {arn} is in state {status}, which \
-                                     cannot import a certificate authority certificate"
-                                )),
+                                message: Some(message.to_string()),
                             },
                         )
                         .into(),
@@ -326,11 +332,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.ca_certificate_chain_pem = chain;
             record.status = crate::state::STATUS_ACTIVE.to_string();
             record.last_state_change_at = now;
-            record.not_before = Some(now);
-            record.not_after = crate::state::add_months(
-                now,
-                crate::state::IMPORTED_CA_CERTIFICATE_VALIDITY_MONTHS,
-            );
+            // The CA's validity window is the window of the certificate it has just taken:
+            // both instants are properties of that certificate, and its NotAfter is the
+            // limit every certificate this CA goes on to issue has to fit inside.
+            let (not_before, not_after) = crate::state::certificate_validity_window(&presented);
+            record.not_before = Some(not_before);
+            record.not_after = Some(not_after);
 
             // The certificate the CA has just taken is the one it signs its CRL under, so a
             // CA whose CRLs were enabled before it held one publishes its CRL now.

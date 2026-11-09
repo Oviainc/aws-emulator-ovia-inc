@@ -314,22 +314,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> IssueCertificate<
         else {
             return Err(IssueCertificateErrorModeled::MalformedCSRException(
                 MalformedCSRException {
-                    message: Some(
-                        "Csr must be a PEM-encoded CERTIFICATE REQUEST block carrying a DER \
-                         PKCS#10 certification request"
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::MALFORMED_CSR_MESSAGE.to_string()),
                 },
             )
             .into());
         };
 
-        // @idempotent: a repeat of the same token inside the five-minute window answers
-        // with the certificate the first call issued instead of issuing a second one.
+        // @idempotent: a repeat of a request this CA has already answered — inside the
+        // five-minute window, under the same token or under none — answers with the
+        // certificate the first call issued instead of issuing a second one.
+        let identity = crate::state::IssuedCertificateRequest::new(
+            input.csr.clone(),
+            input.signing_algorithm.clone(),
+            input.template_arn.clone(),
+            &input.validity,
+            input.validity_not_before.as_ref(),
+            input.api_passthrough.clone(),
+        );
+        let idempotency_key =
+            crate::state::issuance_idempotency_key(input.idempotency_token.as_ref());
         if let Some(arn) = crate::state::replay_idempotent(
             &mut record.issue_idempotency,
-            input.idempotency_token.as_ref(),
-            &(),
+            Some(&idempotency_key),
+            &identity,
             now,
         ) {
             return Ok((arn, None));
@@ -401,21 +408,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> IssueCertificate<
                  UsageMode is SHORT_LIVED_CERTIFICATE",
             ));
         }
+        // "The end of the validity period configured on a certificate must not exceed the
+        // limit set on its parents in the CA hierarchy."
+        // (`IssueCertificateRequest$Validity` docs.) The limit a parent sets is the end of
+        // its OWN certificate's validity window, so a request that would outlive the
+        // issuing CA is refused here — before a serial is allocated, anything is signed or
+        // anything is written. A CA still waiting for its certificate holds no window to
+        // exceed, which is the root CA signing its own certificate: the one issuance that
+        // SETS such a window rather than being bounded by one.
+        if record
+            .own_certificate_not_after()
+            .is_some_and(|limit| not_after > limit)
+        {
+            return Err(IssueCertificateError::validation(
+                crate::state::VALIDITY_EXCEEDS_CA_MESSAGE,
+            ));
+        }
 
         let serial = crate::state::mint_serial(&format!("{ca_arn}|{}", record.next_serial));
         let arn = format!("{ca_arn}/certificate/{serial}");
-        // `TemplateArn` is persisted on the issued certificate but is deliberately not
-        // materialised in the certificate's DER: a template is a named set of X.509
-        // extensions (basic constraints, key usage, extended key usage, the policies a
-        // template implies), and this emulator does not hold those definitions, so
-        // synthesising extensions for one would be inventing the content a template
-        // carries. The certificate therefore carries no extensions, and the template the
-        // caller named stays readable on the resource.
+        // `TemplateArn` selects the certificate definition: the extensions the certificate
+        // carries are the ones that template defines
+        // (`crate::state::certificate_template`), and the template the caller named stays
+        // readable on the resource as well.
+        let template = crate::state::certificate_template(input.template_arn.as_deref());
         let Some(certificate_pem) = crate::state::derive_certificate_pem(
             record,
             &serial,
             &request.info,
             &input.signing_algorithm,
+            &template,
             not_before,
             not_after,
         ) else {
@@ -445,8 +467,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> IssueCertificate<
         record.next_serial += 1;
         crate::state::record_idempotent(
             &mut record.issue_idempotency,
-            input.idempotency_token,
-            (),
+            Some(idempotency_key),
+            identity,
             &arn,
             now,
         );
