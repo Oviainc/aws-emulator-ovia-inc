@@ -14,13 +14,14 @@ use serde_json::Value;
 use service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A SigV4 credential scope naming this service. It is what routes a request to ECR,
-/// and its region is what a repository ARN and URI are built for.
-const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLE/20260101/eu-west-1/ecr/aws4_request, \
-     SignedHeaders=host, Signature=abc";
+/// The access key id every call made through [`call`] presents: a key neither STS nor IAM
+/// holds a record for, which speaks for the account's own published credential. Its
+/// credential scope is what routes a request to ECR, and that scope's region is what a
+/// repository ARN and URI are built for.
+pub const ACCOUNT_ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
 
-/// The region [`SIGNED_FOR_EU_WEST_1`] signs for.
+/// The region every call made through [`call`] and [`call_as`] is signed for, which a
+/// repository ARN and URI are built for.
 pub const REGION: &str = "eu-west-1";
 
 /// The account id every generated emulator vends, spelled out here rather than imported
@@ -66,11 +67,29 @@ impl Answer {
 /// Call one operation of this service on the awsJson1_1 wire: `POST /` with
 /// `X-Amz-Target: <prefix>.<operation>` and a JSON body.
 pub async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Answer {
+    call_as(router, ACCOUNT_ACCESS_KEY_ID, operation, body).await
+}
+
+/// The same call as [`call`], presenting `access_key_id` in the SigV4 credential scope —
+/// what a suite that exercises WHO a request speaks for varies, since the access key id is
+/// where the calling principal is resolved from.
+pub async fn call_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    operation: &str,
+    body: &Value,
+) -> Answer {
     let request = ::http::Request::builder()
         .method("POST")
         .uri("/")
         .header("host", "api.ecr.eu-west-1.amazonaws.com")
-        .header("authorization", SIGNED_FOR_EU_WEST_1)
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/ecr/aws4_request, \
+                 SignedHeaders=host, Signature=abc"
+            ),
+        )
         .header("content-type", "application/x-amz-json-1.1")
         .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
         .body(Bytes::from(body.to_string()))

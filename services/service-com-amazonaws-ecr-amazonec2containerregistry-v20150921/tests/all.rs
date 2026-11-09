@@ -93,6 +93,8 @@ mod registry_replication_configuration;
 mod registry_resource_reads;
 #[path = "all/registry_scanning_configuration.rs"]
 mod registry_scanning_configuration;
+#[path = "all/repository_access_authorization.rs"]
+mod repository_access_authorization;
 #[path = "all/repository_creation_template_encryption.rs"]
 mod repository_creation_template_encryption;
 #[path = "all/repository_creation_template_updates.rs"]

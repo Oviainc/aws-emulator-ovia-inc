@@ -226,6 +226,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+
+        // A private registry's layers are private: whether any policy in force lets this
+        // caller reach this repository is decided before a part is kept
+        // (`crate::state::authorization`).
+        if let Some(denied) = crate::state::authorization::denied_on_repository(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.repository_name,
+        ) {
+            return Err(denied);
+        }
+
         // Request metadata is used for the audit record only: the upload is held in
         // this registry's state, not in the signing region.
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);

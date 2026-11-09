@@ -225,6 +225,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
 
+        // A private registry's layers are private: whether any policy in force lets this
+        // caller reach this repository is decided before a download URL is minted
+        // (`crate::state::authorization`).
+        if let Some(denied) = crate::state::authorization::denied_on_repository(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.repository_name,
+        ) {
+            return Err(denied);
+        }
+
         // "If you do not specify a registry, the default registry is assumed" — and the
         // only registry served here is this emulator's own.
         crate::state::check_registry(input.registry_id.as_ref())

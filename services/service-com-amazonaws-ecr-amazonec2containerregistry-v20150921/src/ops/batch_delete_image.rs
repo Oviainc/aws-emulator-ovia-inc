@@ -174,6 +174,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A private registry's images are private: whether any policy in force lets this
+        // caller reach this repository is decided before anything is read or written
+        // (`crate::state::authorization`).
+        if let Some(denied) = crate::state::authorization::denied_on_repository(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.repository_name,
+        ) {
+            return Err(denied);
+        }
+
         // The Region the deletes are published to EventBridge in: the one the request was
         // signed for, read before anything is removed.
         let region = crate::state::request_region(ctx.parts());

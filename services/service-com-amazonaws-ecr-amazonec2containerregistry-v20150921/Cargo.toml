@@ -35,6 +35,11 @@ flate2 = "1"
 # `json_document::minified`: the one minification of a JSON document a service reports
 # back, which the lifecycle policy document goes through.
 service-common = { path = "../common" }
+# The IAM store holds the identity-based policies of the principal a request speaks for,
+# and the STS store resolves which principal that is: `state::authorization` reads both
+# services' OWN state accessors rather than keeping a second copy of either fact.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # The AWS SDK for EventBridge, driven over the in-process callback
 # (`OperationContext::callback`): an image action on a repository — a push, a
 # delete — is published onto the account's default event bus

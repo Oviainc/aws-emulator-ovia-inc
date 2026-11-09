@@ -4207,6 +4207,11 @@ pub mod scanning;
 /// repository, in `state/image_events.rs`. Declared and re-exported here, so a handler
 /// reaches it as `crate::state::…` like every other part of this store.
 pub mod image_events;
+/// Whether a policy in force lets the calling principal reach the images and layers of the
+/// repository a request names, in `state/authorization.rs`. Declared (and not glob
+/// re-exported, so a handler names the gate it consults) here, so a handler reaches it as
+/// `crate::state::authorization::…` like every other part of this store.
+pub mod authorization;
 mod image_scan;
 mod layer_download;
 pub use layer_download::*;

@@ -195,7 +195,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        let _ = ctx;
+        // A private registry's images are private: whether any policy in force lets this
+        // caller reach this repository is decided before anything is read
+        // (`crate::state::authorization`).
+        if let Some(denied) = crate::state::authorization::denied_on_repository(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.repository_name,
+        ) {
+            return Err(denied);
+        }
 
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
