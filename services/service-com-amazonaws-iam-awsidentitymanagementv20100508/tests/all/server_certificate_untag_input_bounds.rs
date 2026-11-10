@@ -75,14 +75,12 @@ fn one_unechoed_violation(member: &str, requirement: &str) -> String {
     )
 }
 
-/// The envelope the boundary walk states for ONE broken requirement whose value it keeps —
-/// every class but a declared bound and an enumerated set, so a value outside its member's
-/// `@pattern` is stated with the value in it.
-fn one_echoed_violation(member: &str, value: &str, requirement: &str) -> String {
-    format!(
-        "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
-         constraint: {requirement}"
-    )
+/// The requirement clause a value outside its member's `@pattern` states: the expression
+/// the model declares, quoted the way this service publishes one — without the pair of
+/// anchors the model writes around a whole-value expression
+/// (`src/service/refusal_clauses.rs`, whose rule `tests/all/range_refusal_wording.rs` owns).
+fn outside_the_pattern(unanchored: &str) -> String {
+    format!("Member must satisfy regular expression pattern: {unanchored}")
 }
 
 /// The requirement clause a value over a declared `@length` maximum states.
@@ -249,12 +247,12 @@ fn key_cases() -> Vec<KeyCase> {
         rows.push(KeyCase {
             case: format!("a key carrying {key:?}, outside the published alphabet"),
             named: vec![key.to_string()],
-            // A `@pattern` is not a declared bound, so this class keeps the value the
-            // framework states it with.
-            expected: one_echoed_violation(
+            // A refusal of this service's states the member and the requirement and
+            // nothing the request carried, for a value outside a member's `@pattern` as
+            // for one outside a declared bound.
+            expected: one_unechoed_violation(
                 "tagKeys.1.member",
-                key,
-                r"Member must satisfy regular expression pattern: ^[\p{L}\p{Z}\p{N}_.:/=+\-@]+$",
+                &outside_the_pattern(r"[\p{L}\p{Z}\p{N}_.:/=+\-@]+"),
             ),
         });
     }

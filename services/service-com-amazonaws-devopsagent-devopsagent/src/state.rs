@@ -1046,16 +1046,27 @@ impl AssetFileRecord {
     }
 }
 
+/// The CONTENT of one file body as the bytes a file of that content holds: the
+/// bytes themselves, or the encoding of the text.
+///
+/// The model types a file's content as either TEXT or BYTES, but a file IS a
+/// stream of bytes whichever member it was written through, so this is the one
+/// place that correspondence lives — what the bytes of a stored file are, for
+/// anything that has to hand the file's content on as bytes.
+pub fn body_content(body: &AssetFileBody) -> &[u8] {
+    match body {
+        AssetFileBody::Bytes(bytes) => bytes.as_slice(),
+        AssetFileBody::Text(text) => text.as_bytes(),
+    }
+}
+
 /// The size of one file body, in bytes: the bytes themselves, or the encoded length
 /// of the text.
 ///
 /// Taken off the body rather than off a stored record, so the content a request
 /// carries is measured against what an asset holds before anything is persisted.
 pub fn body_bytes(body: &AssetFileBody) -> usize {
-    match body {
-        AssetFileBody::Bytes(bytes) => bytes.len(),
-        AssetFileBody::Text(text) => text.len(),
-    }
+    body_content(body).len()
 }
 
 /// What a document node IS, for a refusal that has to tell the caller what they

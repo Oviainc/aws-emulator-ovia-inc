@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAssetContent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAssetContent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAssetContent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: serves the files one revision of a stored asset holds as a zip
+//! bundle, built from [`crate::state`] and writing nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -91,10 +84,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-devopsagent-devopsagent
 // here — hence the `GetAssetContentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.devopsagent#GetAssetContent")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.devopsagent#GetAssetContent",
+    extra_errors = ["ContentSizeExceededException"]
+)]
 #[derive(Debug)]
 pub enum GetAssetContentErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    // Widened in through `extra_errors`: the SERVICE declares this as a common
+    // error. `ContentSizeExceededException` (HTTP 413) is what a bundle too large
+    // for the modelled `AssetZipBytes` blob has to answer with.
+    ContentSizeExceededException(ContentSizeExceededException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
@@ -152,18 +152,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAssetContent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAssetContentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAssetContent"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAssetContentErrorModeled::InternalServerException(InternalServerException {
+                message: "the DevOps Agent state store is unavailable".to_string(),
+            })
+        })?;
+
+        // `@readonly`: this reports the content stored for the asset and writes
+        // nothing — the bundle is assembled for the response alone.
+        let store = state.lock();
+
+        // The asset plane authorises the caller against the named Agent Space before it
+        // can know whether anything inside it exists, so an `agentSpaceId` that names
+        // no space is an authorization failure; only inside a space the caller reaches
+        // is a missing asset reported as one.
+        let space = store.agent_spaces.get(&input.agent_space_id).ok_or_else(|| {
+            GetAssetContentErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+            })
+        })?;
+        let asset = space.assets.get(&input.asset_id).ok_or_else(|| {
+            GetAssetContentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::asset_not_found_message(&input.asset_id),
+            })
+        })?;
+
+        // `assetVersion` asks for the content as of one specific revision of the
+        // asset; omitted, the latest version is returned. A revision of an asset is a
+        // snapshot of its content, so an earlier revision exports the files it was
+        // read with. A version the asset does not have — one it never reached, or one
+        // no longer retained — names no revision, so it is reported as missing rather
+        // than answered with the content of a different one.
+        let (version, files) = match input.asset_version {
+            Some(asset_version) => {
+                let files = asset.files_at(asset_version).ok_or_else(|| {
+                    GetAssetContentErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::asset_version_not_found_message(
+                                &input.asset_id,
+                                asset_version,
+                            ),
+                        },
+                    )
+                })?;
+                (asset_version, files)
+            }
+            None => (asset.version, &asset.files),
+        };
+
+        Ok(GetAssetContentOutput {
+            content: AssetZipContent {
+                zip_file: zip_bundle(files)?,
+            },
+            version,
+        })
     }
+}
+
+/// The zip bundle carrying every file of one revision of an asset: one entry per
+/// file, stored at the path the asset holds that file at and carrying its content
+/// as bytes.
+///
+/// Writing the archive format is the `zip` crate's job. The files are written in
+/// the order the asset holds them (by path), so exporting one revision twice
+/// produces the same bundle, and an asset whose content materialised no file — an
+/// import from a source URL, this emulator making no outbound connections — exports
+/// an archive with no entries rather than content nothing stored.
+///
+/// The bundle is bounded by what the modelled `AssetZipBytes` blob carries
+/// ([`crate::state::MAX_ASSET_CONTENT_BYTES`]): content that does not fit in it is
+/// refused with the service's `ContentSizeExceededException` (HTTP 413) rather than
+/// served truncated.
+fn zip_bundle(
+    files: &::std::collections::BTreeMap<String, crate::state::AssetFileRecord>,
+) -> Result<Vec<u8>, GetAssetContentError> {
+    let mut buffer = ::std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = ::zip::ZipWriter::new(&mut buffer);
+        for (path, file) in files {
+            writer
+                .start_file(path, ::zip::write::SimpleFileOptions::default())
+                .map_err(|err| bundle_failed(path, &err.to_string()))?;
+            ::std::io::Write::write_all(&mut writer, crate::state::body_content(&file.body))
+                .map_err(|err| bundle_failed(path, &err.to_string()))?;
+        }
+        writer
+            .finish()
+            .map_err(|err| bundle_failed("the bundle", &err.to_string()))?;
+    }
+    let bundle = buffer.into_inner();
+    if bundle.len() > crate::state::MAX_ASSET_CONTENT_BYTES {
+        return Err(GetAssetContentErrorModeled::ContentSizeExceededException(
+            ContentSizeExceededException {
+                message: crate::state::asset_content_size_exceeded_message(),
+            },
+        )
+        .into());
+    }
+    Ok(bundle)
+}
+
+/// The content is stored and readable but could not be packaged, which is a failure
+/// of this service rather than of the request: a 500 `InternalServerException`.
+fn bundle_failed(what: &str, err: &str) -> GetAssetContentError {
+    GetAssetContentErrorModeled::InternalServerException(InternalServerException {
+        message: format!("the asset content could not be packaged as a zip bundle: {what}: {err}"),
+    })
+    .into()
 }

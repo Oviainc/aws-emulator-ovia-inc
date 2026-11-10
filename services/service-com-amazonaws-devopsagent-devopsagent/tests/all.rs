@@ -15,6 +15,8 @@
 mod agent_space_lifecycle;
 #[path = "all/agent_space_not_found_refusal.rs"]
 mod agent_space_not_found_refusal;
+#[path = "all/asset_content_export.rs"]
+mod asset_content_export;
 #[path = "all/asset_file_updates.rs"]
 mod asset_file_updates;
 #[path = "all/asset_files.rs"]

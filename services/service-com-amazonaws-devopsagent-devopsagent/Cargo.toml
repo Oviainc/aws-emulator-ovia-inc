@@ -27,7 +27,7 @@ service-common = { path = "../common" }
 # Opaque pagination tokens: hex-encodes the list cursor a `nextToken` carries.
 hex = { workspace = true }
 # Reads the zip bundle an asset's content can arrive as, so its entries become the
-# asset's files.
+# asset's files, and writes the bundle an asset's content is exported as.
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
