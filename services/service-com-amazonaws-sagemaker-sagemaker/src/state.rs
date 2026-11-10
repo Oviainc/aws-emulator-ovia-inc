@@ -894,7 +894,16 @@ pub const DEFAULT_NONE: &str = "None";
 /// straight away still observes `Pending`, and one that waits observes `Completed` —
 /// which is what lets a waiter terminate. Real SageMaker takes anywhere from seconds to
 /// minutes depending on the validation profiles; the span is compressed, never zero.
-pub const MODEL_PACKAGE_COMPLETED_AFTER: Duration = Duration::from_millis(300);
+///
+/// It also has to OUTLAST the caller's next request, or the non-terminal status is not
+/// observable at all: a span of a few hundred milliseconds can be spent inside the single
+/// round trip a client makes between the create and its first read, so a client that
+/// describes the package it just registered would be told `Completed` and never see the
+/// registration settle. This window is three seconds for that reason, an order of
+/// magnitude more room than one request needs. The other clock-owed spans in this module
+/// are narrower, each with the resource it belongs to; widening one of those belongs with
+/// the readers and suites of that resource, not here.
+pub const MODEL_PACKAGE_COMPLETED_AFTER: Duration = Duration::from_secs(3);
 
 /// The `ModelPackageStatus` members this emulator moves a model package through (the
 /// modelled enum also carries `InProgress`, `Failed` and `Deleting`, which this slice

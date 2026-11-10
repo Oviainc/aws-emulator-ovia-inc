@@ -44,9 +44,11 @@ use crate::service_resolved_members::{
 /// The canonical account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
-/// Long enough to pass `state::MODEL_PACKAGE_COMPLETED_AFTER` (300 ms), so the
-/// registration transition the clock owes has come due.
-const PAST_COMPLETED_DUE: Duration = Duration::from_millis(600);
+/// Long enough to pass `state::MODEL_PACKAGE_COMPLETED_AFTER`, so the registration
+/// transition the clock owes has come due. Derived from that span so the wait can never
+/// drift away from the window it has to outlast.
+const PAST_COMPLETED_DUE: Duration =
+    state::MODEL_PACKAGE_COMPLETED_AFTER.saturating_add(Duration::from_millis(300));
 
 /// The group every versioned case registers its package into.
 const GROUP: &str = "updatable";

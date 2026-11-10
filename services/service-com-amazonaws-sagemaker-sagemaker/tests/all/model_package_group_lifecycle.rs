@@ -515,9 +515,9 @@ async fn repeated_describes_answer_the_same_group() {
                 &json!({ "ModelPackageGroupName": name }),
             )
             .await;
-        // Long enough for any clock-owed transition the emulator schedules (the longest is
-        // `state::ENDPOINT_IN_SERVICE_AFTER`, 300 ms) to have come due: a model group is
-        // created ready, so nothing about it may move.
+        // Long enough that a clock-owed transition, had this resource been given one,
+        // would have come due: a model package group is created ready, so nothing about it
+        // may move however long the caller waits.
         tokio::time::sleep(Duration::from_millis(600)).await;
         let second = emulator
             .ok(
