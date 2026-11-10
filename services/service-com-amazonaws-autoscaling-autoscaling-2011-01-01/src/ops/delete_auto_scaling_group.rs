@@ -201,11 +201,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let arn = group.arn.clone();
+        let region = group.region.clone();
         let instance_count = group.instances.len();
         let instance_ids: Vec<String> = group
             .instances
             .iter()
             .map(|instance| instance.instance_id.clone())
+            .collect();
+        // Where the group had placed each of them, read off its own record before the
+        // group is removed: the lifecycle event a forced delete's terminations publish
+        // reports the placement the group held, which is gone once the group is.
+        let instance_zones: Vec<Option<String>> = group
+            .instances
+            .iter()
+            .map(|instance| Some(instance.availability_zone.clone()))
             .collect();
         let desired_capacity = group.desired_capacity;
         let protection = group.deletion_protection.clone().unwrap_or_default();
@@ -266,20 +275,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that still holds instances was refused above, so there is nothing to
         // terminate on that path.)
         crate::state::ec2_instances::terminate(&*self.engine, &instance_ids);
-        state.record_activity(
+        let cause = format!(
+            "a user request deleted the AutoScalingGroup, terminating {instance_count} \
+             instance(s)."
+        );
+        let activity_id = state.record_activity(
             &name,
             &arn,
             format!("Deleting the Auto Scaling group: {name}"),
-            format!(
-                "a user request deleted the AutoScalingGroup, terminating {instance_count} \
-                 instance(s)."
-            ),
+            cause.clone(),
             crate::state::GROUP_STATE_DELETED,
             now,
             None,
         );
+        // Each instance the forced delete shut down is a termination the group took, so
+        // each is announced on the account's default event bus exactly as a scale-in's is
+        // — under the one activity that carried the whole delete out, which is the activity
+        // the service recorded for it.
+        for (instance_id, availability_zone) in instance_ids.iter().zip(instance_zones) {
+            let subnet_id = crate::state::ec2_instances::subnet_of(&*self.engine, instance_id);
+            state.queue_lifecycle_event(crate::state::PendingLifecycleEvent {
+                detail_type: crate::state::InstanceLifecycle::Terminated.detail_type(),
+                group_name: name.clone(),
+                group_arn: arn.clone(),
+                region: region.clone(),
+                instance_id: instance_id.clone(),
+                availability_zone,
+                subnet_id,
+                activity_id: activity_id.clone(),
+                description: crate::state::InstanceLifecycle::Terminated.description(instance_id),
+                cause: cause.clone(),
+                start_time: now,
+                // The delete terminated them as it ran, so there is nothing further the
+                // clock owes before the terminations are a fact.
+                due: now,
+            });
+        }
 
         crate::state::audit(ctx.parts(), "DeleteAutoScalingGroup", &name, "deleted");
+        // The terminations above are already due, so the pump publishes them on its first
+        // wake-up. The store's lock is released first: the pump takes it itself.
+        drop(state);
+        crate::state::drive_lifecycle_clock(ctx, &self.engine);
         Ok(DeleteAutoScalingGroupOutput)
     }
 }

@@ -37,7 +37,7 @@
 //! resolves. This struct holds the group's own view of it — its lifecycle state, its
 //! health and the zone it was placed in — and nothing that Amazon EC2's record owns.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -60,6 +60,15 @@ pub mod ec2_instances;
 /// account's own IAM store: a reference Amazon EC2 stores verbatim and this service, as
 /// the consumer of the template, is what resolves.
 pub mod iam_instance_profiles;
+
+/// The instance lifecycle events this service publishes onto the account's default
+/// EventBridge bus as a group launches and terminates its instances, and the clock pump
+/// that puts them on the bus as they fall due.
+pub mod lifecycle_events;
+
+pub use lifecycle_events::{
+    drive_lifecycle_clock, InstanceLifecycle, InstanceLifecycleChange, PendingLifecycleEvent,
+};
 
 /// How long a lifecycle transition this service owes takes to come due.
 ///
@@ -565,6 +574,20 @@ pub struct ComAmazonawsAutoscalingAutoscaling20110101State {
     pub next_activity_seq: u64,
     /// Source of the opaque id segment of a resource ARN.
     pub next_resource_seq: u64,
+    /// The instance lifecycle events this store has not published to EventBridge yet,
+    /// oldest first, each due at the instant the step it reports completes
+    /// ([`lifecycle_events`]). At most [`lifecycle_events::MAX_PENDING_EVENTS`] entries,
+    /// the oldest dropped first.
+    pending_lifecycle_events: VecDeque<PendingLifecycleEvent>,
+    /// Whether a clock pump ([`drive_lifecycle_clock`]) is already waiting on this store's
+    /// due instants, so at most one runs per store.
+    lifecycle_clock_pump_running: bool,
+    /// The generation of the running pump's claim, so a pump releases its OWN claim and
+    /// never a later pump's.
+    lifecycle_clock_pump_generation: u64,
+    /// The running pump's task handle, kept so the pump it replaces is aborted rather than
+    /// merely forgotten.
+    lifecycle_clock_pump: Option<::tokio::task::JoinHandle<()>>,
 }
 
 /// A shorter name for this service's state, for use inside the crate.
@@ -767,7 +790,7 @@ impl AutoScalingState {
             .then(|| SSM_PARAMETER_IMAGE_ID_MESSAGE.to_string())
     }
 
-    /// Append a scaling activity that finishes at `completes_at`.
+    /// Append a scaling activity that finishes at `completes_at`, answering its id.
     #[allow(clippy::too_many_arguments)]
     pub fn record_activity(
         &mut self,
@@ -778,7 +801,7 @@ impl AutoScalingState {
         group_state: &str,
         start_time: SystemTime,
         completes_at: Option<SystemTime>,
-    ) {
+    ) -> String {
         let finished = completes_at.is_none();
         let status_code = if finished {
             ACTIVITY_SUCCESSFUL
@@ -798,7 +821,7 @@ impl AutoScalingState {
             details: None,
             auto_scaling_group_state: Some(group_state.to_string()),
             completes_at,
-        });
+        })
     }
 
     /// Append a scaling activity that FAILED: the capacity change asked for an
@@ -812,7 +835,7 @@ impl AutoScalingState {
         description: String,
         cause: String,
         start_time: SystemTime,
-    ) {
+    ) -> String {
         self.push_activity(StoredActivity {
             activity_id: String::new(),
             auto_scaling_group_name: group_name.to_string(),
@@ -827,18 +850,19 @@ impl AutoScalingState {
             details: None,
             auto_scaling_group_state: Some(GROUP_STATE_IN_SERVICE.to_string()),
             completes_at: None,
-        });
+        })
     }
 
-    /// Store one activity under a freshly minted id, keeping the log bounded.
+    /// Store one activity under a freshly minted id, keeping the log bounded, and answer
+    /// that id.
     ///
     /// The ONE writer of [`Self::activities`], so the id every activity carries comes
     /// from one minter and the retention bound is applied in one place however the
     /// activity ended: `activity_id` on the way in is ignored.
-    fn push_activity(&mut self, activity: StoredActivity) {
+    fn push_activity(&mut self, activity: StoredActivity) -> String {
         let activity_id = self.mint_activity_id();
         self.activities.push(StoredActivity {
-            activity_id,
+            activity_id: activity_id.clone(),
             ..activity
         });
         // Keep the activity log bounded: the oldest activity is the first to go.
@@ -846,6 +870,7 @@ impl AutoScalingState {
             let excess = self.activities.len() - MAX_RETAINED_ACTIVITIES;
             self.activities.drain(..excess);
         }
+        activity_id
     }
 
     /// Materialise everything the clock has already made due at `now`: deferred
@@ -995,25 +1020,31 @@ impl AutoScalingState {
         self.terminate_group_instances(engine, group_name, &terminated_ids, due);
 
         for instance_id in launched_ids {
-            self.record_activity(
-                group_name,
-                &arn,
-                format!("Launching a new EC2 instance: {instance_id}"),
-                cause.to_string(),
-                GROUP_STATE_IN_SERVICE,
-                now,
-                Some(due),
+            self.record_instance_lifecycle_change(
+                engine,
+                &InstanceLifecycleChange {
+                    kind: InstanceLifecycle::Launched,
+                    group_name,
+                    group_arn: &arn,
+                    instance_id: &instance_id,
+                    cause,
+                    start_time: now,
+                    due,
+                },
             );
         }
         for instance_id in terminated_ids {
-            self.record_activity(
-                group_name,
-                &arn,
-                format!("Terminating EC2 instance: {instance_id}"),
-                cause.to_string(),
-                GROUP_STATE_IN_SERVICE,
-                now,
-                Some(due),
+            self.record_instance_lifecycle_change(
+                engine,
+                &InstanceLifecycleChange {
+                    kind: InstanceLifecycle::Terminated,
+                    group_name,
+                    group_arn: &arn,
+                    instance_id: &instance_id,
+                    cause,
+                    start_time: now,
+                    due,
+                },
             );
         }
         for _ in 0..unplaced {
@@ -1417,25 +1448,31 @@ impl AutoScalingState {
         self.terminate_group_instances(engine, group_name, &replaced, due);
 
         for launched_id in &launched_ids {
-            self.record_activity(
-                group_name,
-                &arn,
-                format!("Launching a new EC2 instance: {launched_id}"),
-                cause.to_string(),
-                GROUP_STATE_IN_SERVICE,
-                now,
-                Some(due),
+            self.record_instance_lifecycle_change(
+                engine,
+                &InstanceLifecycleChange {
+                    kind: InstanceLifecycle::Launched,
+                    group_name,
+                    group_arn: &arn,
+                    instance_id: launched_id,
+                    cause,
+                    start_time: now,
+                    due,
+                },
             );
         }
         for replaced_id in &replaced {
-            self.record_activity(
-                group_name,
-                &arn,
-                format!("Terminating EC2 instance: {replaced_id}"),
-                cause.to_string(),
-                GROUP_STATE_IN_SERVICE,
-                now,
-                Some(due),
+            self.record_instance_lifecycle_change(
+                engine,
+                &InstanceLifecycleChange {
+                    kind: InstanceLifecycle::Terminated,
+                    group_name,
+                    group_arn: &arn,
+                    instance_id: replaced_id,
+                    cause,
+                    start_time: now,
+                    due,
+                },
             );
         }
         for _ in 0..unplaced {

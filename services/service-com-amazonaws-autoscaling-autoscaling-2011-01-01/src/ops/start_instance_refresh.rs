@@ -296,6 +296,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &name,
             "instance refresh started",
         );
+        // The replacements this refresh owes fall due on the clock, and the lifecycle
+        // events their launches and terminations produce are published as they fall due,
+        // with no further call from anybody. The store's lock is released first: the pump
+        // takes it itself.
+        drop(state);
+        crate::state::drive_lifecycle_clock(ctx, &self.engine);
         Ok(StartInstanceRefreshOutput {
             instance_refresh_id: Some(instance_refresh_id),
         })

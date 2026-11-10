@@ -297,6 +297,21 @@ pub fn terminate<Eng: Send + Sync + 'static>(engine: &Eng, instance_ids: &[Strin
     }
 }
 
+/// The subnet the account's Amazon EC2 store placed `instance_id` in, when it placed it
+/// in one.
+///
+/// Where an instance IS is Amazon EC2's own fact — the placement [`launch`] above wrote —
+/// so a consumer that has to report it (the lifecycle event a capacity change publishes)
+/// reads it from there rather than guessing it from the group's `VPCZoneIdentifier`.
+/// `None` for an instance EC2 holds no record of, for one it placed by zone alone, and
+/// when this engine carries no Amazon EC2 store at all. EC2's store lock is taken for the
+/// one lookup and released before this returns.
+pub fn subnet_of<Eng: Send + Sync + 'static>(engine: &Eng, instance_id: &str) -> Option<String> {
+    let state = ec2::service_state(engine)?;
+    let store = state.lock();
+    store.instances.get(instance_id)?.subnet_id.clone()
+}
+
 /// The `StateReason` code of an instance terminated because a caller's capacity change
 /// scaled the group in: the client asked for the shutdown, which is the code Amazon EC2
 /// records for a termination a caller asked for.

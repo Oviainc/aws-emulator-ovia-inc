@@ -148,7 +148,7 @@ const ERROR_CASES: &[ErrorCase] = &[
     },
     ErrorCase {
         case: "a scaffolded operation, which answers the 501 channel",
-        action: "DescribeTags",
+        action: "DescribeAutoScalingInstances",
         params: &[],
         status: 501,
         code: "NotImplemented",

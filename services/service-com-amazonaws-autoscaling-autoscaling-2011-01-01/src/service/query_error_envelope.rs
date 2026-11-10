@@ -157,9 +157,25 @@ fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dy
 /// [`ErasedOperation::run`]. So the framework still owns the whole
 /// deserialize → validate → handle → serialize sequence (and every status, code and
 /// message it answers with), and this wrapper owns one element of the envelope.
-pub struct RequestIdEnvelopeOperation;
+///
+/// It is also where the AUTHORIZATION gate runs
+/// ([`crate::service::authorization::refusal`]), ahead of the operation: whether the caller
+/// may perform the action at all is a fact of the credential the request presented, not of
+/// the input the operation reads, so it is decided once here for every request this service
+/// serves. The engine it holds is what that gate reads the IAM and STS stores through — the
+/// framework hands `run` the SERVICE, whose engine is behind an engine-erased accessor.
+pub struct RequestIdEnvelopeOperation<Eng: Send + Sync + 'static> {
+    engine: std::sync::Arc<Eng>,
+}
 
-impl ErasedOperation for RequestIdEnvelopeOperation {
+impl<Eng: Send + Sync + 'static> RequestIdEnvelopeOperation<Eng> {
+    /// Build the wrapper over the shared engine.
+    pub fn new(engine: std::sync::Arc<Eng>) -> Self {
+        Self { engine }
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for RequestIdEnvelopeOperation<Eng> {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -167,6 +183,15 @@ impl ErasedOperation for RequestIdEnvelopeOperation {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
+            // The authorization gate, ahead of every operation: a caller the IAM policies
+            // in force do not permit to perform the action is refused 403 before any
+            // handler reaches the store. The refusal already carries the envelope's
+            // `<RequestId>`.
+            if let Some(response) =
+                crate::service::authorization::refusal(&*self.engine, svc, req, ctx)
+            {
+                return response;
+            }
             match modeled_operation(svc, req) {
                 Some(op) => with_request_id(op.run(svc, req, ctx).await),
                 // Unreachable through `Service::override_operation`, which claims a

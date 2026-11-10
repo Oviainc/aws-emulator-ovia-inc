@@ -265,11 +265,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &name,
                 "capacity change deferred until the cooldown has elapsed",
             );
+            // The deferred change falls due on the clock, so the pump is what applies it
+            // and publishes what it moves.
+            drop(state);
+            crate::state::drive_lifecycle_clock(ctx, &self.engine);
             return Ok(SetDesiredCapacityOutput);
         }
         state.apply_capacity(&*self.engine, &name, desired_capacity, &cause, now);
 
         crate::state::audit(ctx.parts(), "SetDesiredCapacity", &name, "capacity set");
+        // The instances this change launched or scaled in settle on the clock, and the
+        // lifecycle events that report them are published as they fall due, with no further
+        // call from anybody. The store's lock is released first: the pump takes it itself.
+        drop(state);
+        crate::state::drive_lifecycle_clock(ctx, &self.engine);
         Ok(SetDesiredCapacityOutput)
     }
 }

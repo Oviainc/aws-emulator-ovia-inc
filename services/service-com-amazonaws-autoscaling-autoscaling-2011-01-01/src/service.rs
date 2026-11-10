@@ -49,7 +49,14 @@
 //! adds it to a routing failure, a transport failure and a pre-dispatch refusal.
 //! Everything else about those paths — status, `<Type>`, `<Code>`, `<Message>` — stays
 //! with the framework.
+//!
+//! That same wrapper is where the AUTHORIZATION gate runs ([`authorization`]): whether the
+//! caller may perform the action at all is a fact of the CREDENTIAL the request presented
+//! and the IAM policies in force on the principal it speaks for, not of the input any one
+//! operation reads, so it is decided once for every request this service serves rather
+//! than per handler.
 
+pub mod authorization;
 pub mod query_error_envelope;
 
 use query_error_envelope::{AutoScalingDefinition, RequestIdEnvelopeOperation};
@@ -67,7 +74,7 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: AutoScalingDefinition<Eng>,
     /// The envelope wrapper every routable request is served through. Held in a field,
     /// built once, because `override_operation` hands back a reference to it.
-    envelope: RequestIdEnvelopeOperation,
+    envelope: RequestIdEnvelopeOperation<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -76,8 +83,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: AutoScalingDefinition::new(engine),
-            envelope: RequestIdEnvelopeOperation,
+            entry: AutoScalingDefinition::new(Arc::clone(&engine)),
+            envelope: RequestIdEnvelopeOperation::new(engine),
         }
     }
 }

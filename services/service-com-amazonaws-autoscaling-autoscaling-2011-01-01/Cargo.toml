@@ -16,7 +16,10 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `time`: the clock pump that publishes a group's instance lifecycle events as they fall
+# due waits for the earliest due instant the store holds
+# (`state::lifecycle_events::drive_lifecycle_clock`).
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -30,13 +33,27 @@ uuid = { version = "1", features = ["v4"] }
 # from EC2's own state (`state::ec2_subnets`) rather than asked of the caller. It also
 # holds the account's launch templates, which a group launches its instances from.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
-# A launch template's `IamInstanceProfile` is a reference EC2 stores verbatim and this
-# service resolves when it consumes the template, so the account's own IAM instance
-# profiles are read from IAM's own state (`state::iam_instance_profiles`).
+# The account's own IAM store holds the identity-based policies and the permissions
+# boundary in force on the principal a request speaks for, which is what the authorization
+# gate decides an account-wide read from (`service::authorization`). A launch template's
+# `IamInstanceProfile` is a reference EC2 stores verbatim and this service resolves when it
+# consumes the template, so the account's own IAM instance profiles are read from IAM's own
+# state (`state::iam_instance_profiles`).
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The account's own STS store resolves WHICH principal an access key id speaks for — the
+# same answer `sts:GetCallerIdentity` gives — so the authorization gate blames the principal
+# the caller reads back for the credential it signed with.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # `service-common` carries the ONE reading of which IAM entity a caller-supplied IAM ARN
-# names, which that instance-profile ARN is read through.
+# names, which that instance-profile ARN is read through, and the ONE in-process
+# EventBridge client an emulated service publishes an event through.
 service-common = { path = "../common" }
+# The AWS SDK for EventBridge, driven over the in-process callback
+# (`OperationContext::callback`): Amazon EC2 Auto Scaling publishes an `EC2 Instance Launch
+# Successful` / `EC2 Instance Terminate Successful` event onto the account's default event
+# bus as a group's capacity changes (`state::lifecycle_events`). Only the generated client
+# is needed — the emulator supplies the transport, so the SDK's own HTTPS stack is left out.
+aws-sdk-eventbridge = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -44,6 +61,12 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# EventBridge and Amazon SQS are mounted beside Amazon EC2 Auto Scaling on one engine in the
+# integration tests, because this service publishes an instance lifecycle event onto the
+# default event bus as a group scales and a rule on that bus delivers it to an SQS queue:
+# without them mounted there is nothing for the publication to reach.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [lints]
 workspace = true

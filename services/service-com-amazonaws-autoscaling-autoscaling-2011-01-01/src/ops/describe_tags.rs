@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags the stored Auto Scaling groups carry, as `TagDescription`s ordered by
+//! the group they are on and then by key, narrowed by the requested filters and paged by
+//! `MaxRecords`/`NextToken`. A request that matches nothing answers an empty list.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +151,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTags"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeTagsErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The requested cursor: the offset it decodes to, and the token itself, kept so a
+        // later refusal can name the token the caller actually submitted.
+        let (offset, token) = match input.next_token.clone() {
+            None => (0, String::new()),
+            Some(token) => match crate::state::decode_next_token(&token) {
+                Some(offset) => (offset, token),
+                None => {
+                    return Err(DescribeTagsErrorModeled::InvalidNextToken(InvalidNextToken {
+                        message: Some(crate::state::invalid_next_token_message(&token)),
+                    })
+                    .into())
+                }
+            },
+        };
+
+        // `MaxRecords` has a documented range; a page size outside it is refused, not
+        // quietly reshaped.
+        if let Some(max_records) = crate::state::max_records_out_of_range(input.max_records) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::max_records_violation_message(max_records),
+            ));
+        }
+
+        // Every filter is checked BEFORE a single tag is matched, and each refusal is the
+        // sentence the service states for THAT unusable criterion; none of them quotes
+        // anything from the request.
+        let filters = input.filters.unwrap_or_default();
+        // A filter entry that carries no Name says nothing about WHICH criterion it
+        // applies, so the attribute is required rather than defaulted.
+        if filters.iter().any(|filter| filter.name.is_none()) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "The filter criteria isn't valid. The Name attribute is required to specify the \
+                 type of filter being applied.",
+            ));
+        }
+        if filters
+            .iter()
+            .any(|filter| !is_valid_filter_name(filter.name.as_deref().unwrap_or_default()))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The filter criteria isn't valid. Valid filter types for the Name attribute of \
+                 filters are: {}.",
+                FILTER_NAMES.join(", ")
+            )));
+        }
+        // A filter selects by the values it carries, so one carrying none selects nothing
+        // and cannot be applied: the values are required, not ignored.
+        if filters
+            .iter()
+            .any(|filter| filter.values.as_ref().is_none_or(|values| values.is_empty()))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "The filter criteria isn't valid. The Values attribute and one or more filter \
+                 values are required.",
+            ));
+        }
+
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
+
+        // Ordered by the group the tag is on and then by key, so one page follows the
+        // previous one over a list that does not move between calls.
+        let mut matching: Vec<TagDescription> = state
+            .groups
+            .values()
+            .flat_map(|group| group.tags.iter().map(tag_description))
+            .filter(|tag| filters.iter().all(|filter| matches_filter(tag, filter)))
+            .collect();
+        matching.sort_by(|left, right| {
+            (&left.resource_id, &left.key).cmp(&(&right.resource_id, &right.key))
+        });
+        // A token the service issued always points inside the list it was issued for; one
+        // that points past the end was not issued for this list. Only a decoded token
+        // reaches a non-zero offset, so `token` is the one submitted.
+        if offset > 0 && offset >= matching.len() {
+            return Err(DescribeTagsErrorModeled::InvalidNextToken(InvalidNextToken {
+                message: Some(crate::state::invalid_next_token_message(&token)),
+            })
+            .into());
+        }
+        let (tags, next_token) = crate::state::page(&matching, offset, input.max_records);
+
+        // "If there's no match, no special message is returned": a request that selects
+        // nothing answers an empty list, not a refusal.
+        Ok(DescribeTagsOutput {
+            tags: Some(tags),
+            next_token,
+        })
+    }
+}
+
+// The filter types the model documents for THIS operation
+// (smithy_query(query="doc",shape="Filter",member="Name")): the names of Auto Scaling
+// groups, tag keys, tag values, and whether the tag propagates to instances at launch.
+// They are the tag's own members, not the group-level `tag-key` / `tag-value` / `tag:<key>`
+// set `DescribeAutoScalingGroups` documents.
+const FILTER_GROUP_NAME: &str = "auto-scaling-group";
+const FILTER_KEY: &str = "key";
+const FILTER_VALUE: &str = "value";
+const FILTER_PROPAGATE_AT_LAUNCH: &str = "propagate-at-launch";
+
+/// Those four names, in the order that documentation lists them, for the refusal that
+/// names them.
+const FILTER_NAMES: &[&str] = &[
+    FILTER_GROUP_NAME,
+    FILTER_KEY,
+    FILTER_VALUE,
+    FILTER_PROPAGATE_AT_LAUNCH,
+];
+
+/// Whether a filter names one of the filter types this operation documents.
+///
+/// A name that merely resembles one names no filter type: one the request left out
+/// altogether, one that differs in case, and one carrying surrounding space all select on
+/// nothing.
+fn is_valid_filter_name(name: &str) -> bool {
+    FILTER_NAMES.contains(&name)
+}
+
+/// Whether one tag matches one filter. A filter's values are joined with OR; the caller
+/// joins the filters themselves with AND, as the model documents ("The result includes
+/// information for a particular tag only if it matches all the filters").
+///
+/// Every filter reaching here names a documented filter type and carries at least one
+/// value: the handler refuses the others before any tag is matched. The comparison is
+/// against the tag AS REPORTED, so a filter selects exactly the tags whose reported member
+/// carries the value asked for — a tag reporting no `PropagateAtLaunch` is selected by
+/// neither Boolean.
+fn matches_filter(tag: &TagDescription, filter: &Filter) -> bool {
+    let name = filter.name.as_deref().unwrap_or_default();
+    // Borrowed, not cloned: the scan asks every filter about every tag, so the values are
+    // read where they are rather than copied per pair.
+    let values: &[String] = filter.values.as_deref().unwrap_or_default();
+    match name {
+        FILTER_GROUP_NAME => tag
+            .resource_id
+            .as_ref()
+            .is_some_and(|resource_id| values.contains(resource_id)),
+        FILTER_KEY => tag.key.as_ref().is_some_and(|key| values.contains(key)),
+        FILTER_VALUE => tag
+            .value
+            .as_ref()
+            .is_some_and(|value| values.contains(value)),
+        // "Accepts a Boolean value": only the two spellings of one select anything, so a
+        // value that is neither selects no tag — and a tag reporting no `PropagateAtLaunch`
+        // is selected by neither Boolean rather than by the values that parse as neither.
+        FILTER_PROPAGATE_AT_LAUNCH => values
+            .iter()
+            .filter_map(|value| value.parse::<bool>().ok())
+            .any(|wanted| tag.propagate_at_launch == Some(wanted)),
+        _ => false,
+    }
+}
+
+/// The `TagDescription` the service reports for a stored tag — the same five members the
+/// group's own read reports it through, so one tag is reported one way.
+fn tag_description(tag: &Tag) -> TagDescription {
+    TagDescription {
+        resource_id: tag.resource_id.clone(),
+        resource_type: tag.resource_type.clone(),
+        key: Some(tag.key.clone()),
+        value: tag.value.clone(),
+        propagate_at_launch: tag.propagate_at_launch,
     }
 }

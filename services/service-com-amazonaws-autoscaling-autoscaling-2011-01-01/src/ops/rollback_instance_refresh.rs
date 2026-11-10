@@ -192,7 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        match state.roll_back_instance_refresh(&*self.engine, &name, now) {
+        let outcome = state.roll_back_instance_refresh(&*self.engine, &name, now);
+        // The replacements a rollback owes fall due on the clock, so the store's lock is
+        // released before the pump that publishes what they move is started.
+        drop(state);
+        match outcome {
             Ok(instance_refresh_id) => {
                 crate::state::audit(
                     ctx.parts(),
@@ -200,6 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &name,
                     "instance refresh rollback started",
                 );
+                crate::state::drive_lifecycle_clock(ctx, &self.engine);
                 Ok(RollbackInstanceRefreshOutput {
                     instance_refresh_id: Some(instance_refresh_id),
                 })

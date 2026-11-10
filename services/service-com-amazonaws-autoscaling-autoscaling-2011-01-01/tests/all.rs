@@ -15,14 +15,20 @@
 mod absent_group_refusal_messages;
 #[path = "all/account_level_reads_publish_service_data.rs"]
 mod account_level_reads_publish_service_data;
+#[path = "all/account_wide_read_authorization.rs"]
+mod account_wide_read_authorization;
 #[path = "all/auto_scaling_group_lifecycle.rs"]
 mod auto_scaling_group_lifecycle;
 #[path = "all/cancel_instance_refresh.rs"]
 mod cancel_instance_refresh;
 #[path = "all/client_error_refusal_wording.rs"]
 mod client_error_refusal_wording;
+#[path = "all/describe_tags.rs"]
+mod describe_tags;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/instance_lifecycle_events.rs"]
+mod instance_lifecycle_events;
 #[path = "all/instance_refresh_lifecycle.rs"]
 mod instance_refresh_lifecycle;
 #[path = "all/instance_scale_in_protection.rs"]

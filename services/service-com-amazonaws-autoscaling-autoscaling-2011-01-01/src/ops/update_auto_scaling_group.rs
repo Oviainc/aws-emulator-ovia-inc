@@ -635,6 +635,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         crate::state::audit(ctx.parts(), "UpdateAutoScalingGroup", &name, "updated");
+        // Whatever this update's capacity change set in motion settles on the clock, and
+        // the lifecycle events that report it are published as they fall due, with no
+        // further call from anybody. The store's lock is released first: the pump takes it
+        // itself.
+        drop(state);
+        crate::state::drive_lifecycle_clock(ctx, &self.engine);
         Ok(UpdateAutoScalingGroupOutput)
     }
 }
