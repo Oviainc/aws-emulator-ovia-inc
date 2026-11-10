@@ -31,6 +31,8 @@ mod framework;
 mod framework_listing;
 #[path = "all/framework_update.rs"]
 mod framework_update;
+#[path = "all/framework_update_idempotency.rs"]
+mod framework_update_idempotency;
 #[path = "all/job_state_change_events.rs"]
 mod job_state_change_events;
 #[path = "all/legal_hold.rs"]

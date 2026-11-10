@@ -46,14 +46,17 @@ use crate::vault_and_backup_job::{call, error_code, router};
 /// the statuses the model lists for `Framework$DeploymentStatus`
 /// (`CREATE_IN_PROGRESS | UPDATE_IN_PROGRESS | DELETE_IN_PROGRESS | COMPLETED |
 /// FAILED`).
-const DEPLOYMENT_UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
+pub(crate) const DEPLOYMENT_UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
 
 /// The longest `FrameworkDescription` the model admits (`smithy_query`
 /// operation `UpdateFramework`: `FrameworkDescription`, `@length` 0..1024).
 const MAX_DESCRIPTION_LENGTH: usize = 1024;
 
 /// `PUT /audit/frameworks/{FrameworkName}` — `UpdateFramework`'s HTTP binding.
-async fn update_framework(
+///
+/// `pub(crate)` so a sibling suite in this test binary drives the same one wire
+/// path rather than growing a second copy of it.
+pub(crate) async fn update_framework(
     router: &MultiServiceRouter,
     name: &str,
     request: &Value,
@@ -81,13 +84,16 @@ fn control(name: &str) -> Value {
 
 /// The one control every row's framework is created with, so what an update
 /// does to a control list is read against a known starting point.
-fn created_controls() -> Value {
+pub(crate) fn created_controls() -> Value {
     json!([control("BACKUP_RECOVERY_POINT_ENCRYPTED")])
 }
 
 /// The framework every row's update is applied to: the same starting state,
 /// named per row so one router can hold them all.
-fn create_request(name: &str) -> Value {
+///
+/// `pub(crate)` so a sibling suite in this test binary starts its frameworks from
+/// the SAME state rather than carrying a second copy of this fixture.
+pub(crate) fn create_request(name: &str) -> Value {
     json!({
         "FrameworkName": name,
         "FrameworkDescription": "as created",
