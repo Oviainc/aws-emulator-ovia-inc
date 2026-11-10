@@ -8,8 +8,8 @@
 //! 1. a value outside the PATTERN its member's shape publishes is refused HTTP 400
 //!    `ValidationError` with AWS's one sentence for that FORM, naming the member the value
 //!    was supplied for and nothing of the value — one sentence for the entity-name character
-//!    class and one for an entity path — while the member's LENGTH is a separate requirement
-//!    and keeps the model-level walk's own clause;
+//!    class and one for an entity path — for the members IAM takes ITSELF, while the
+//!    member's LENGTH is a separate requirement and keeps the model-level walk's own clause;
 //! 2. a `Marker` the service did not issue is refused with AWS's one fixed sentence,
 //!    `Invalid Marker.`, whichever collection was being paged, under the code IAM answers a
 //!    value it cannot accept with (`ValidationError`) where the operation models no
@@ -57,12 +57,13 @@ const VALUE_REFUSAL_CODE: &str = "ValidationError";
 /// AWS's sentence for a value outside the character class published for an entity NAME,
 /// with the member it was supplied for in place of `{member}`.
 ///
-/// Source: the recorded refusal of a `userName` carrying a character outside the class. The
-/// class is the `@pattern` every name shape in the model declares — `^[\w+=,.@-]+$` on
-/// `userNameType`, `roleNameType`, `groupNameType`, `instanceProfileNameType`,
-/// `policyNameType` (`smithy_query(query="shape", shape="userNameType,roleNameType")`) — so
-/// the sentence is the same for every member targeting one of them, which is what the rows
-/// below read back on members the recording never named.
+/// Source: the recorded refusals of a `userName` and of a `roleName` carrying a character
+/// outside the class. The class is the `@pattern` every name shape in the model declares —
+/// `^[\w+=,.@-]+$` on `userNameType`, `roleNameType`, `groupNameType`,
+/// `instanceProfileNameType`, `policyNameType` (`smithy_query(query="shape",
+/// shape="userNameType,roleNameType")`) — but which members IAM takes ITSELF is per member
+/// and not per class: `instanceProfileName` is recorded refused by the model-level
+/// constraint walk instead (`tests/all/validation_error_clauses.rs`), so it is no row here.
 fn invalid_name(member: &str) -> String {
     format!(
         "The specified value for {member} is invalid. It must contain only alphanumeric \
@@ -131,12 +132,12 @@ struct NameCase {
 
 /// RULE 1a: a value outside the entity-name character class is refused 400
 /// `ValidationError` with AWS's one sentence for that class, naming the member it was
-/// supplied for — on every operation and every member whose shape publishes the class, and
-/// for every way a value can be outside it.
+/// supplied for — on every operation that carries a member IAM takes itself, and for every
+/// way a value can be outside the class.
 #[tokio::test]
 async fn a_name_outside_its_character_class_is_refused_with_awss_sentence() {
     let router = router();
-    // Rows span the member (five different name members, across a read and four creates),
+    // Rows span the member (four different name members, across a read and three creates),
     // the operation that carries it, and HOW the value is outside the class: a slash, a
     // space, a colon and an exclamation mark. The class is the regex engine's `\w` plus the
     // punctuation it names, so a letter outside ASCII is INSIDE it and is no row here.
@@ -167,13 +168,6 @@ async fn a_name_outside_its_character_class_is_refused_with_awss_sentence() {
             action: "CreateGroup",
             member: "GroupName",
             value: "group!",
-            extra: &[],
-        },
-        NameCase {
-            case: "an instance profile name carrying a space",
-            action: "CreateInstanceProfile",
-            member: "InstanceProfileName",
-            value: "has space",
             extra: &[],
         },
         NameCase {

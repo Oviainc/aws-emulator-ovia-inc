@@ -297,15 +297,17 @@ async fn every_admissible_value_of_each_set_is_accepted() {
     }
 }
 
-/// RULE: only the value is withheld — a request that names an admissible value of the
-/// wrong enum on one member and breaks a `@pattern` on another is stated as both clauses,
-/// the enum one value-free and the pattern one as the framework states it.
+/// RULE: the value is withheld from EVERY clause — a request that names an admissible value
+/// of the wrong enum on one member and breaks a `@pattern` on another is stated as both
+/// clauses, the enum one naming the set and the pattern one naming the expression AWS
+/// publishes, and neither naming what the request carried.
 #[tokio::test]
 async fn a_mixed_refusal_states_each_class_its_own_way() {
     let router = router();
     // `accessKeyIdType` is pattern ^[\w]+$ (length 16..128), so an id of that length
     // carrying a slash is the second violation — and it is a pattern IAM states no
-    // sentence of its own for, so the clause is the framework's.
+    // sentence of its own for, so the clause is the walk's, which quotes the expression
+    // without the whole-value anchors (`tests/all/validation_error_clauses.rs`).
     let malformed_key_id = "AKIA/NOT/VALID/ID";
     let (status, body) = call(
         &router,
@@ -331,8 +333,16 @@ async fn a_mixed_refusal_states_each_class_its_own_way() {
         )),
         "expected the enum clause to be stated without the value, got {message:?}"
     );
+    let pattern_clause = concat!(
+        r"Value at 'accessKeyId' failed to satisfy constraint: ",
+        r"Member must satisfy regular expression pattern: [\w]+"
+    );
     assert!(
-        message.contains(&format!("Value '{malformed_key_id}' at 'accessKeyId'")),
-        "expected the pattern clause to keep the framework's sentence, got {message:?}"
+        message.contains(pattern_clause),
+        "expected the pattern clause to be stated without the value, got {message:?}"
+    );
+    assert!(
+        !message.contains(malformed_key_id),
+        "expected no clause to echo {malformed_key_id:?}, got {message:?}"
     );
 }

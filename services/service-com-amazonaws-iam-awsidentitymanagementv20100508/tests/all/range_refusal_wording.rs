@@ -8,10 +8,12 @@
 //! 400 `ValidationError` whose message names the member and the bound it broke and
 //! nothing of the value itself (`N validation error(s) detected: Value at '<member>'
 //! failed to satisfy constraint: Member must have {value,length} {greater,less} than or
-//! equal to <bound>`), while the other classes of boundary refusal — a string outside its
-//! `@pattern`, an absent required member — keep the sentence the framework states with the
-//! rejected value in it. A value outside an enumerated set is stated value-free too, and
-//! is read back by `tests/all/enum_refusal_wording.rs`.
+//! equal to <bound>`). The other classes of boundary refusal are stated by the same walk
+//! and are value-free too: a string outside its `@pattern` names the expression AWS
+//! publishes for the member (read back below, and tabulated in
+//! `tests/all/validation_error_clauses.rs`), a value outside an enumerated set names the
+//! set (`tests/all/enum_refusal_wording.rs`), and an absent required member names the
+//! requirement alone.
 //!
 //! The members whose WHOLE form AWS states one fixed sentence for are refused by IAM
 //! itself rather than by this layer, so neither their bound nor their pattern is ever
@@ -374,27 +376,31 @@ async fn each_published_bound_itself_is_accepted() {
     }
 }
 
-/// One row of the table of classes this service does NOT reword: the call to make, the
-/// member the clause names and the value it must echo back.
+/// One row of the `@pattern` table: the call to make, the member the clause names, the
+/// value the clause must NOT echo, and the expression AWS publishes for that member.
 struct EchoedCase<'a> {
     case: &'a str,
     action: &'a str,
     params: Vec<(&'a str, &'a str)>,
     member: &'a str,
     value: &'a str,
+    published: &'a str,
 }
 
 /// RULE: a string outside a `@pattern` that is not one IAM states a sentence of its own
-/// for is another constraint class and keeps the sentence the framework states, the
-/// rejected value included — the value-free clause belongs to the classes this service
-/// states that way (a declared bound, and an enumerated set), and the fixed sentence to the
-/// forms IAM takes itself (`tests/all/member_format_refusal_wording.rs`).
+/// for is stated by the model-level walk, whose clause names the member and the expression
+/// AWS publishes for it — the model's own `@pattern` with the whole-value anchors dropped —
+/// and echoes nothing of the value, exactly as a declared bound's clause does. The table of
+/// that class, over the members and operations it covers, is
+/// `tests/all/validation_error_clauses.rs`; the fixed sentence belongs to the forms IAM
+/// takes itself (`tests/all/member_format_refusal_wording.rs`).
 #[tokio::test]
-async fn another_constraint_class_keeps_the_frameworks_own_sentence() {
+async fn another_constraint_class_states_the_walks_clause_without_the_value() {
     let router = router();
 
     // Rows: a string outside its `@pattern` on three different members, across three
-    // operations — each a pattern IAM publishes no sentence of its own for.
+    // operations — each a pattern IAM publishes no sentence of its own for, with the
+    // expression as AWS publishes it beside it.
     let cases = vec![
         EchoedCase {
             case: "an access key id outside its pattern",
@@ -408,6 +414,7 @@ async fn another_constraint_class_keeps_the_frameworks_own_sentence() {
             ],
             member: "accessKeyId",
             value: "AKIA/NOT/VALID/ID",
+            published: r"[\w]+",
         },
         EchoedCase {
             case: "an MFA device serial number outside its pattern",
@@ -417,6 +424,7 @@ async fn another_constraint_class_keeps_the_frameworks_own_sentence() {
             params: vec![("UserName", "a-user"), ("SerialNumber", "has space 123")],
             member: "serialNumber",
             value: "has space 123",
+            published: r"[\w+=/:,.@-]+",
         },
         EchoedCase {
             case: "a pagination marker outside its pattern",
@@ -426,6 +434,7 @@ async fn another_constraint_class_keeps_the_frameworks_own_sentence() {
             params: vec![("Marker", "page\u{20AC}")],
             member: "marker",
             value: "page\u{20AC}",
+            published: r"[\u0020-\u00FF]+",
         },
     ];
 
@@ -435,6 +444,7 @@ async fn another_constraint_class_keeps_the_frameworks_own_sentence() {
         params,
         member,
         value,
+        published,
     } in cases
     {
         let (status, body) = call(&router, action, &params).await;
@@ -442,25 +452,31 @@ async fn another_constraint_class_keeps_the_frameworks_own_sentence() {
             status, 400,
             "case {case:?}: expected HTTP 400, got {status}: {body}"
         );
-        // The code is the framework's own for a boundary refusal on this protocol, and
-        // these rows go nowhere near the bound rewording — so this pins the code
-        // independently of it.
+        // The code is the one IAM answers every refusal of a request's input under — so
+        // this pins it independently of the bound rewording above.
         assert_eq!(
             error_code(&body),
             "ValidationError",
             "case {case:?}: expected the query protocol's bound refusal code, got {body}"
         );
         let message = element(&body, "Message");
+        let expected = format!(
+            "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
+             Member must satisfy regular expression pattern: {published}"
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
         assert!(
-            message.contains(&format!("Value '{value}' at '{member}'")),
-            "case {case:?}: expected the framework's own sentence naming the value, got \
-             {message:?}"
+            !body.contains(value),
+            "case {case:?}: the refusal must not echo {value:?}, got {body}"
         );
     }
 }
 
 /// RULE: a request that breaks a declared bound AND another constraint is stated as both
-/// clauses — the bound value-free, the other as the framework states it.
+/// clauses, each naming its member and its requirement and neither naming a value.
 #[tokio::test]
 async fn a_mixed_refusal_states_each_class_its_own_way() {
     let router = router();
@@ -487,16 +503,24 @@ async fn a_mixed_refusal_states_each_class_its_own_way() {
         "expected the page-size clause to be stated without the number, got {message:?}"
     );
     assert!(
-        message.contains("Value 'page\u{20AC}' at 'marker'"),
-        "expected the pattern clause to keep the framework's sentence, got {message:?}"
+        message.contains(concat!(
+            r"Value at 'marker' failed to satisfy constraint: ",
+            r"Member must satisfy regular expression pattern: [\u0020-\u00FF]+"
+        )),
+        "expected the pattern clause to be stated without the value, got {message:?}"
+    );
+    assert!(
+        !message.contains("page\u{20AC}"),
+        "expected neither clause to echo the marker, got {message:?}"
     );
 }
 
-/// RULE: an ABSENT required member is a different refusal class and is not restated —
-/// it keeps the framework's own code and wording, so a client branching on either sees
-/// what it would have seen.
+/// RULE: an ABSENT required member is a refusal of the request's input like any other, so
+/// it carries the same code and the same value-free clause — its requirement alone, with
+/// the member named and nothing else (the whole table of that class, scalar and collection
+/// members alike, is `tests/all/validation_error_clauses.rs`).
 #[tokio::test]
-async fn an_absent_required_member_is_not_restated() {
+async fn an_absent_required_member_states_its_requirement_alone() {
     let router = router();
     let (status, body) = call(
         &router,
@@ -505,9 +529,16 @@ async fn an_absent_required_member_is_not_restated() {
     )
     .await;
     assert_eq!(status, 400, "expected HTTP 400, got {status}: {body}");
+    assert_eq!(
+        error_code(&body),
+        "ValidationError",
+        "expected the one input-refusal code, got {body}"
+    );
     let message = element(&body, "Message");
-    assert!(
-        message.contains("'roleName'") && message.contains("Member must not be null"),
-        "expected the framework's absent-member sentence, got {message:?}"
+    assert_eq!(
+        message,
+        "1 validation error detected: Value at 'roleName' failed to satisfy constraint: \
+         Member must not be null",
+        "expected the absent-member clause, got {message:?}"
     );
 }

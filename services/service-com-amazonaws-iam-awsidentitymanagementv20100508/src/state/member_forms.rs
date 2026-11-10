@@ -59,15 +59,39 @@ const PATTERN_REFUSALS: &[(&str, &str)] = &[
     (ENTITY_PATH_PATTERN, ENTITY_PATH_REFUSAL),
 ];
 
+/// The members a recorded refusal shows IAM does NOT take itself, whichever form their shape
+/// publishes: their values are taken by the model-level constraint walk, so a value outside
+/// the pattern is answered with that walk's clause rather than with a sentence above.
+///
+/// A published FORM is shared by many shapes — every entity-name shape in the model declares
+/// the same character class — but which members IAM validates ITSELF is not a property of the
+/// form: it is per member, and only a recorded refusal shows it. `instanceProfileName` is
+/// recorded refused with the walk's clause (`1 validation error detected: Value at
+/// 'instanceProfileName' failed to satisfy constraint: Member must satisfy regular expression
+/// pattern: …`) where `userName` and `roleName` are recorded refused with the fixed sentence,
+/// so the pattern alone cannot decide and this is what splits them.
+///
+/// SOURCE, for adding a member: AWS's own refusal of a value outside that member's pattern,
+/// showing the model-level envelope instead of a sentence. The member is named by the path a
+/// refusal names it by, so ONE entry answers for every operation carrying it
+/// (`tests/all/validation_error_clauses.rs` reads that back across the operations that take
+/// this one).
+const WALK_TAKEN_MEMBERS: &[&str] = &["instanceProfileName"];
+
 /// AWS's sentence for a value that broke the `@pattern` `pattern` on the member `path`
-/// names, or `None` when IAM states no sentence of its own for that pattern.
+/// names, or `None` when IAM states no sentence of its own for that pattern — or states one
+/// for the pattern but takes that MEMBER through the model-level walk
+/// ([`WALK_TAKEN_MEMBERS`]).
 ///
 /// The LAST path segment names the member, already spelled the way a refusal names it
 /// (lowerCamel, as `aws_smithy_schema_server::constraints::path::member` builds it).
 pub fn pattern_refusal(path: &str, pattern: &str) -> Option<String> {
+    let member = path.split('.').next_back()?;
+    if WALK_TAKEN_MEMBERS.contains(&member) {
+        return None;
+    }
     let sentence = PATTERN_REFUSALS
         .iter()
         .find_map(|(published, sentence)| (*published == pattern).then_some(*sentence))?;
-    let member = path.split('.').next_back()?;
     Some(sentence.replace("{member}", member))
 }

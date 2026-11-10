@@ -564,8 +564,9 @@ async fn a_write_naming_no_property_is_refused() {
     );
     assert_eq!(
         error_code(&body),
-        "MalformedInput",
-        "expected the missing required member to be refused as malformed, got {:?}",
+        "ValidationError",
+        "expected the missing required member to be refused under the one input-refusal \
+         code, got {:?}",
         error_code(&body)
     );
     let reported = current_properties(&router, "after the refusal").await;

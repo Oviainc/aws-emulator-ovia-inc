@@ -410,9 +410,9 @@ async fn a_supplied_policy_that_is_not_a_document_is_refused() {
     );
     assert_eq!(
         error_code(&body),
-        "MalformedInput",
+        "ValidationError",
         "case \"no member at all\": expected the boundary refusal of a missing required \
-         member, got {body}"
+         member under the one input-refusal code, got {body}"
     );
 
     // A refused request reports nothing and changes nothing: a list of documents
