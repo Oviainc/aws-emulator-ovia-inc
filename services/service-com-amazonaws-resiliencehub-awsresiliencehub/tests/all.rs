@@ -35,6 +35,8 @@ mod list_app_versions;
 mod minted_identifier_shape;
 #[path = "all/publish_app_version.rs"]
 mod publish_app_version;
+#[path = "all/published_template_label_independence.rs"]
+mod published_template_label_independence;
 #[path = "all/published_version_alias_addressing.rs"]
 mod published_version_alias_addressing;
 #[path = "all/refusal_messages.rs"]
