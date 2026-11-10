@@ -21,7 +21,7 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. THIS service uses it for two things. First, HealthLake serves three
+//!   correctly. THIS service uses it for three things. First, HealthLake serves three
 //!   surfaces that are not awsJson1_0 RPC calls and carry no `X-Amz-Target` at all —
 //!   a data store's FHIR REST data plane ([`fhir_rest`], on the path a
 //!   `DatastoreEndpoint` publishes), the data-transformation endpoint's
@@ -30,7 +30,11 @@
 //!   operation at all and the others are modelled outside the closure of the service
 //!   shape this crate serves, so the generated routing table cannot name any of them,
 //!   and this seam routes them by
-//!   HTTP method and path, which is how a REST surface is addressed. Second, every
+//!   HTTP method and path, which is how a REST surface is addressed. Second,
+//!   `UpdateProfileWithAgent` answers a `vnd.amazon.eventstream` body, which the
+//!   generated shim of a `@streaming`-output operation declines rather than
+//!   serializes, so this seam routes it to the hand-authored handler in
+//!   [`crate::ops::update_profile_with_agent`]. Third, every
 //!   other request is handed to the input-validation gate described below, which lets
 //!   the generated routing table serve it from there.
 //! - `override_refusal` — how this service words a request the framework refused
@@ -100,11 +104,15 @@ use std::sync::Arc;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::{validate, ProtocolError};
+use service_common::event_stream::EventStreamRoute;
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
     Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
 };
+
+use crate::ops::update_profile_with_agent::UpdateProfileWithAgent;
 
 /// The error code this service refuses a request that failed a modelled
 /// constraint with: `ValidationException`, the service-common client error the
@@ -363,6 +371,14 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The input-validation gate for each modelled operation, keyed by the routing key
     /// the protocol resolves for it (the operation's own `NAME`). Built once, in `new`.
     input_validation: HashMap<&'static str, Box<dyn ErasedOperation>>,
+    /// Serves `UpdateProfileWithAgent`, whose output is a `@streaming` event-stream
+    /// union. The generated `ErasedOperation` shim of such an operation declines the
+    /// request (it cannot drive `serialize_as_event_stream<P>` through an object-safe
+    /// `run`), so this copy is held behind an [`EventStreamRoute`] and routed by
+    /// [`Service::override_operation`]. It owns the shared engine, so the profile it
+    /// stamps and the conversation it records live in the same store every other
+    /// handler reads.
+    update_profile_with_agent: EventStreamRoute<UpdateProfileWithAgent<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -374,6 +390,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             fhir_rest: fhir_rest::FhirRestDataPlane::new(Arc::clone(&engine)),
             validate_source: validate_source::ValidateSource::new(),
             rest_tagging: rest_tagging::RestTagging::new(Arc::clone(&engine)),
+            update_profile_with_agent: EventStreamRoute(UpdateProfileWithAgent::new(Arc::clone(
+                &engine,
+            ))),
             entry: crate::ServiceDefinition::new(engine),
             input_validation: input_validation_gates::<Eng>(),
         }
@@ -400,13 +419,19 @@ fn input_validation_gates<Eng: Send + Sync + 'static>(
             )+
         };
     }
-    // Every operation this crate serves (one per file in `src/ops/`), because the rule
-    // is the service's and not one operation's: an operation whose input declares no
-    // constraint simply never has a violation to state, which the gate reads off that
-    // operation's own input schema. The one modelled operation with no module —
-    // `UpdateProfileWithAgent`, declined by the scaffold generator and listed in
-    // `src/ops/SKIPPED_STUBS.md` — has no input shape to validate against here and is
-    // answered by the framework's unroutable-operation path, exactly as before.
+    // Every operation this crate serves through the framework's centralized
+    // deserialize -> validate -> handle -> serialize sequence (one per file in
+    // `src/ops/`), because the rule is the service's and not one operation's: an
+    // operation whose input declares no constraint simply never has a violation to
+    // state, which the gate reads off that operation's own input schema. The one
+    // modelled operation NOT listed here — `UpdateProfileWithAgent`, whose
+    // `@streaming` event-stream output the scaffold generator declined to type
+    // (`src/ops/SKIPPED_STUBS.md`) — cannot be driven through that sequence at all, so
+    // it has no `impl Operation` for a gate to key off: it reads its own request and
+    // answers a constraint violation through the SAME
+    // [`refuse_invalid_input_of`] body this gate renders, and
+    // [`Service::override_operation`] routes it to the hand-authored handler in
+    // `src/ops/update_profile_with_agent.rs`.
     gate!(
         gates;
         create_data_transformation_profile::CreateDataTransformationProfile,
@@ -493,8 +518,32 @@ fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dy
 /// that is not a constraint violation: an unparseable body is a protocol failure, and
 /// the framework words those per protocol.
 fn refuse_invalid_input<Op: Operation>(svc: &dyn Service, req: &RtRequest) -> Option<RtResponse> {
-    let protocol = svc.definition().protocol();
-    let violations = reported_violations(model_violations::<Op>(protocol, req)?);
+    refuse_invalid_input_of::<Op::Input>(
+        svc.definition().protocol(),
+        req,
+        Op::INPUT_SCHEMA,
+        Op::NAME,
+    )
+}
+
+/// The same refusal, for an operation named by its input SHAPE rather than by an
+/// `impl Operation`.
+///
+/// `pub(crate)` because a HAND-AUTHORED operation reads its own request — an
+/// event-stream output cannot be driven through the centralized sequence, so
+/// [`crate::ops::update_profile_with_agent`] has no `impl Operation` for a gate to key
+/// off — and its constraint refusal has to be the SAME body, in the same words, as one
+/// from any other operation of this service. The gate above is the other caller.
+pub(crate) fn refuse_invalid_input_of<T>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    schema: &Schema,
+    operation: &str,
+) -> Option<RtResponse>
+where
+    T: DeserializableStruct + SerializableStruct,
+{
+    let violations = reported_violations(violations_of::<T>(protocol, req, schema)?);
     // The sentence AWS itself returns for a constraint failure, built from the member
     // path, the offending value and the violated constraint by the framework's own
     // renderer — the same text the generic 400 carried, now in the modelled member.
@@ -511,7 +560,7 @@ fn refuse_invalid_input<Op: Operation>(svc: &dyn Service, req: &RtRequest) -> Op
         // removes, so it is logged rather than passed over silently.
         .inspect_err(|error| {
             tracing::warn!(
-                operation = Op::NAME,
+                operation,
                 %error,
                 "the modelled ValidationException would not serialize; this refusal falls \
                  back to the framework's generic envelope"
@@ -520,25 +569,29 @@ fn refuse_invalid_input<Op: Operation>(svc: &dyn Service, req: &RtRequest) -> Op
         .ok()
 }
 
-/// Every rule of the model `Op`'s input breaks, or `None` when it breaks none.
+/// Every rule of the model the input shape `T` breaks, or `None` when it breaks none.
 ///
 /// Both refusal classes the framework describes structurally are collected: a required
 /// member absent (found while reading the request) and a value outside a declared
 /// constraint (found while walking the value that was read).
-fn model_violations<Op: Operation>(
+fn violations_of<T>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
-) -> Option<Vec<Violation>> {
-    let error = match protocol.deserialize_input(req, Op::INPUT_SCHEMA) {
+    schema: &Schema,
+) -> Option<Vec<Violation>>
+where
+    T: DeserializableStruct + SerializableStruct,
+{
+    let error = match protocol.deserialize_input(req, schema) {
         Err(unreadable) => unreadable,
         Ok(mut deserializer) => {
-            match <Op::Input as DeserializableStruct>::deserialize(&mut *deserializer) {
+            match <T as DeserializableStruct>::deserialize(&mut *deserializer) {
                 Err(absent_or_malformed) => ProtocolError::Serde(absent_or_malformed),
                 // The request was read: the model's own constraint traits decide. This
                 // is the same call the centralized sequence makes, so no rule is
                 // restated here.
                 Ok(input) => {
-                    let violations = validate(&input, Op::INPUT_SCHEMA);
+                    let violations = validate(&input, schema);
                     if violations.is_empty() {
                         return None;
                     }
@@ -610,7 +663,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // every request the model accepts to the generated operation, which the routing
         // table still owns; a request that names no modelled operation resolves as it
         // always did.
+        // `UpdateProfileWithAgent` answers an event-stream body, which the generated
+        // shim for a `@streaming`-output operation cannot serialize — it declines the
+        // request — so this seam routes it to the hand-authored handler, which reads
+        // its own request and refuses a constraint violation in this service's own
+        // words.
         let key = self.entry.protocol().routing_key(req).ok()?;
+        if key == crate::ops::update_profile_with_agent::UPDATE_PROFILE_WITH_AGENT {
+            return Some(&self.update_profile_with_agent);
+        }
         let gate = self.input_validation.get(key)?;
         Some(gate.as_ref())
     }
@@ -696,7 +757,9 @@ mod tests {
     const SERVICE_NAMESPACE: &str = "com.amazonaws.healthlake#";
 
     /// The operations the scaffold generator declined to emit a module for, read from
-    /// the census it writes rather than from a second hand list here.
+    /// the census it writes rather than from a second hand list here. Each is served by
+    /// a HAND-AUTHORED module instead, which reads its own request, so it has no
+    /// `impl Operation` a gate could be keyed off.
     const SKIPPED_STUBS: &str = include_str!("ops/SKIPPED_STUBS.md");
 
     #[test]
@@ -728,7 +791,7 @@ mod tests {
             if skipped.contains(operation) {
                 assert!(
                     !gates.contains_key(*operation),
-                    "operation {operation} has no module, so it cannot have a gate"
+                    "operation {operation} has no `impl Operation`, so it cannot have a gate"
                 );
                 continue;
             }

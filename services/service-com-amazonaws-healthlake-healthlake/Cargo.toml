@@ -7,6 +7,10 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+# The `vnd.amazon.eventstream` framing and the routing seam the hand-authored
+# `UpdateProfileWithAgent` needs: its output is a `@streaming` event-stream union,
+# which the generated operation shim cannot serialize.
+service-common = { path = "../common" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -47,6 +51,9 @@ tokio = { workspace = true, features = ["time"] }
 # holds. DEV-ONLY: this crate depends on no other service's crate outside its
 # tests.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# Decodes the `application/vnd.amazon.eventstream` frames the agent suite reads back,
+# so what is asserted is the wire an SDK's event-stream decoder sees.
+aws-smithy-eventstream = "0.60"
 
 [lints]
 workspace = true

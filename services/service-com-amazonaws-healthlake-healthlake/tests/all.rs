@@ -101,3 +101,5 @@ mod timestamp_cutoff_filters;
 mod update_data_transformation_profile;
 #[path = "all/update_fhir_datastore.rs"]
 mod update_fhir_datastore;
+#[path = "all/update_profile_with_agent.rs"]
+mod update_profile_with_agent;

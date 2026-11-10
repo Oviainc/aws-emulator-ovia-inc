@@ -51,9 +51,24 @@
 //! started job is observable identically through either of them. A
 //! transformation job reads and writes Amazon S3 rather than a data store, so
 //! no record reaps one.
+//!
+//! The data transformation agent conversation is the sixth, and the only one no
+//! operation mints a resource for: `UpdateProfileWithAgent` serves ONE TURN of a
+//! chat over a profile, and the turn it serves is read from — and written back to
+//! — the conversation record held in
+//! [`ComAmazonawsHealthlakeHealthlakeState::agent_conversations`], so a
+//! confirmation lands on the proposal the previous turn made. The turn that
+//! confirms a proposal writes the profile's own DRAFT, which means
+//! `GetDataTransformationProfile` and
+//! `ListDataTransformationProfileVersions` read an agent-recorded change back
+//! exactly as they read one `UpdateDataTransformationProfile` made. See
+//! [`agent_conversation`].
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
+
+mod agent_conversation;
+pub use agent_conversation::*;
 
 mod import_run;
 pub use import_run::*;
@@ -2015,6 +2030,17 @@ pub struct ComAmazonawsHealthlakeHealthlakeState {
     /// How many data transformation jobs have been started, mixed into the next
     /// `JobId` so two starts in the same clock tick still get distinct ones.
     pub transformation_jobs_started: u64,
+    /// Every live data transformation agent conversation, by `ConversationId` —
+    /// the multi-turn chat `UpdateProfileWithAgent` serves one turn of. A
+    /// `BTreeMap` so an eviction walk is in a stable order. Bounded by
+    /// [`MAX_AGENT_CONVERSATIONS`]; an entry is swept once
+    /// [`AGENT_CONVERSATION_RETENTION`] has run out
+    /// ([`Self::sweep_agent_conversations`]).
+    pub agent_conversations: BTreeMap<String, AgentConversation>,
+    /// How many conversations have been minted, mixed into the next
+    /// `ConversationId` so two first turns in the same clock tick still get
+    /// distinct ones.
+    pub agent_conversations_started: u64,
 }
 
 impl ComAmazonawsHealthlakeHealthlakeState {
@@ -2559,20 +2585,11 @@ impl ComAmazonawsHealthlakeHealthlakeState {
     /// is writing to, so a collision cannot overwrite a stored resource.
     pub fn next_fhir_resource_id(&mut self, created_at: SystemTime) -> String {
         self.fhir_resources_created += 1;
-        let mixed = mint_hex_id(
+        uuid_form(&mint_hex_id(
             FHIR_RESOURCE_MINT_DOMAIN,
             self.fhir_resources_created,
             created_at,
-        );
-        // The 8-4-4-4-12 grouping a UUID is written in.
-        format!(
-            "{}-{}-{}-{}-{}",
-            &mixed[..8],
-            &mixed[8..12],
-            &mixed[12..16],
-            &mixed[16..20],
-            &mixed[20..32]
-        )
+        ))
     }
 
     /// Record `token` as having minted `profile_id`, evicting the oldest token
@@ -2690,6 +2707,24 @@ fn mint_hex_id(domain: &str, counter: u64, created_at: SystemTime) -> String {
     hasher.update(counter.to_be_bytes());
     hasher.update(nanos.to_be_bytes());
     hex::encode(&hasher.finalize()[..16])
+}
+
+/// One [`mint_hex_id`] output written in the 8-4-4-4-12 grouping a UUID is written
+/// in: 36 characters.
+///
+/// The ONE place that grouping is applied, so every identifier this service mints in
+/// the UUID form — a FHIR resource's logical id and an agent `ConversationId` — is
+/// grouped the same way. `mint_hex_id` returns exactly 32 lowercase hex characters,
+/// so every slice below is in range for every input.
+fn uuid_form(mixed: &str) -> String {
+    format!(
+        "{}-{}-{}-{}-{}",
+        &mixed[..8],
+        &mixed[8..12],
+        &mixed[12..16],
+        &mixed[16..20],
+        &mixed[20..32]
+    )
 }
 
 /// What a request path says about a data store's FHIR endpoint: the data store

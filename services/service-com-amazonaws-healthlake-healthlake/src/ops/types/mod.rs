@@ -40,6 +40,7 @@ pub mod tag_resource_types;
 pub mod untag_resource_types;
 pub mod update_data_transformation_profile_types;
 pub mod update_fhir_datastore_types;
+pub mod update_profile_with_agent_types;
 
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_data_transformation_profile_types::*;
@@ -93,4 +94,6 @@ pub use untag_resource_types::*;
 pub use update_data_transformation_profile_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use update_fhir_datastore_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use update_profile_with_agent_types::*;
 

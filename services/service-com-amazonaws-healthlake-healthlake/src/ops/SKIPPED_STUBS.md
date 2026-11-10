@@ -19,3 +19,11 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 handler returns an error, so it never has to construct a value.
 
 // SKIPPED: UpdateProfileWithAgent — unsupported shape construct: operation 'UpdateProfileWithAgent' has a @streaming event-stream output member, which needs wire framing the generator does not emit
+
+The census above records what the GENERATOR did, so each line stays as written.
+`UpdateProfileWithAgent` has since been hand-authored in
+`ops/update_profile_with_agent.rs`: it frames its `AgentOutputMessageStream` through
+`service_common::event_stream`, reads its own request, and is routed by
+`Service::override_operation` (the generated shim for a `@streaming`-output operation
+declines the request, so it cannot serve one). It therefore has no `impl Operation`
+and no entry in `service.rs`'s input-validation gate map.
