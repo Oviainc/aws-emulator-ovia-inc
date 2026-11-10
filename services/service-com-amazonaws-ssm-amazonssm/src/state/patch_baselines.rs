@@ -74,6 +74,11 @@ pub const DEFAULT_REJECTED_PATCHES_ACTION: &str = "ALLOW_AS_DEPENDENCY";
 /// (`CreatePatchBaseline$ApprovedPatchesEnableNonSecurity`).
 pub const DEFAULT_APPROVED_PATCHES_ENABLE_NON_SECURITY: bool = false;
 
+/// Whether an approval rule that named nothing applies non-security updates available in
+/// the repository it selects from: "The default value is false"
+/// (`PatchRule$EnableNonSecurity`).
+pub const DEFAULT_PATCH_RULE_ENABLE_NON_SECURITY: bool = false;
+
 /// How many patch baselines this store holds at once, across every Region.
 ///
 /// This is the EMULATOR's own ceiling rather than a quota Systems Manager publishes: a
@@ -249,6 +254,20 @@ pub fn predefined_baseline(operating_system: &str) -> Option<&'static Predefined
         .find(|baseline| baseline.operating_system == operating_system)
 }
 
+/// The baseline Systems Manager predefines that carries `baseline_id` at `region`'s
+/// endpoint ([`predefined_baseline_id`]), or `None` when the id is none of theirs.
+///
+/// The id of a predefined baseline is derived rather than minted, so this is how a read
+/// that holds an id gets back to the baseline the id stands for.
+pub fn predefined_baseline_with_id(
+    region: &str,
+    baseline_id: &str,
+) -> Option<&'static PredefinedBaseline> {
+    PREDEFINED_BASELINES
+        .iter()
+        .find(|baseline| predefined_baseline_id(region, baseline.name) == baseline_id)
+}
+
 /// The id a predefined baseline carries at `region`'s endpoint.
 ///
 /// A predefined baseline is not created by a call, so there is no mint counter behind its
@@ -371,6 +390,39 @@ impl PatchBaselineRecord {
             // A baseline the account created is named by its own id.
             reference: self.baseline_id.clone(),
         }
+    }
+
+    /// The global filter group a read of this baseline reports: the group its write named,
+    /// or the group that filters nothing when the write named none.
+    ///
+    /// A read reports the default of every member a write left out — the way a baseline's
+    /// own compliance level, rejected-patch action and operating system are reported at
+    /// their documented defaults ([`DEFAULT_APPROVED_PATCHES_COMPLIANCE_LEVEL`] and the
+    /// constants beside it). For a "set of filters" the default is the EMPTY set rather
+    /// than nothing at all, which is what a baseline no global filter excludes a patch
+    /// from carries.
+    pub fn reported_global_filters(&self) -> PatchFilterGroup {
+        self.global_filters.clone().unwrap_or_default()
+    }
+
+    /// The approval rule group a read of this baseline reports: the group its write named,
+    /// with every member of every rule the write left out reported at its default, or the
+    /// group that selects nothing when the write named none.
+    ///
+    /// A rule's own optional members default the same way a baseline's do: "the default
+    /// value is false" (`PatchRule$EnableNonSecurity`), and a rule that names no compliance
+    /// severity level carries the unspecified one
+    /// ([`DEFAULT_APPROVED_PATCHES_COMPLIANCE_LEVEL`]), which is the level a baseline that
+    /// names none carries too.
+    pub fn reported_approval_rules(&self) -> PatchRuleGroup {
+        let mut rules = self.approval_rules.clone().unwrap_or_default();
+        for rule in &mut rules.patch_rules {
+            rule.compliance_level
+                .get_or_insert_with(|| DEFAULT_APPROVED_PATCHES_COMPLIANCE_LEVEL.to_string());
+            rule.enable_non_security
+                .get_or_insert(DEFAULT_PATCH_RULE_ENABLE_NON_SECURITY);
+        }
+        rules
     }
 
     /// The members a create SUPPLIED, rendered as one canonical string.
@@ -498,9 +550,7 @@ impl ComAmazonawsSsmAmazonssmState {
         if let Some(record) = self.patch_baseline(region, &baseline_id) {
             return Some(record.resolved());
         }
-        PREDEFINED_BASELINES
-            .iter()
-            .find(|baseline| predefined_baseline_id(region, baseline.name) == baseline_id)
+        predefined_baseline_with_id(region, &baseline_id)
             .map(|baseline| predefined_resolved(region, baseline))
     }
 

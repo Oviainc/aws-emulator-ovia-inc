@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPatchBaseline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPatchBaseline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report one patch baseline — the read half of this service's patch baseline slice. This
+//! is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPatchBaseline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every member reported comes from the record the one store in
+//! [`crate::state::patch_baselines`] holds, so what a write of the baseline persisted is
+//! what this reports and nothing is recomputed here. The `BaselineId` the request carries
+//! resolves the way every "id or ARN" member of this service does: a baseline the account
+//! created in this endpoint's Region, named by its own id or by its full ARN, or one
+//! Systems Manager predefined
+//! ([`crate::state::patch_baselines::PREDEFINED_BASELINES`]). A well formed id that names
+//! no baseline reachable here is refused with `DoesNotExistException`, and a value that
+//! could never name one — an ARN of another service, account or Region — with
+//! `InvalidResourceId`.
+//!
+//! A read: the store is only read, so a later caller sees exactly what this one saw.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +190,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPatchBaseline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPatchBaselineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPatchBaseline"))
+        // `BaselineId` is required and its length and pattern are modelled constraints the
+        // centralized walk has already refused anything outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetPatchBaselineErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the patch baseline store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+
+        // A value that could never name a baseline held at this endpoint — an ARN of
+        // another service, of another account or of another Region, or one whose resource
+        // is not a patch baseline at all — is not an id this service can look anything up
+        // by. `InvalidResourceId` carries NO message member at all, so the error code is
+        // the whole of what it reports.
+        let Some(baseline_id) = store.patch_baseline_query(&region, &input.baseline_id) else {
+            return Err(
+                GetPatchBaselineErrorModeled::InvalidResourceId(InvalidResourceId {}).into(),
+            );
+        };
+
+        // A baseline the account created here: every reported member is the one its write
+        // persisted, projected rather than recomputed.
+        if let Some(record) = store.patch_baseline(&region, &baseline_id) {
+            return Ok(GetPatchBaselineOutput {
+                // "The ID of the retrieved patch baseline": the key the record is held
+                // under, which is the id its create minted.
+                baseline_id: Some(record.baseline_id.clone()),
+                name: Some(record.name.clone()),
+                operating_system: Some(record.operating_system.clone()),
+                // The two patch selectors are sets, so a baseline whose write named
+                // neither reports the empty set of each rather than nothing at all.
+                global_filters: Some(record.reported_global_filters()),
+                approval_rules: Some(record.reported_approval_rules()),
+                approved_patches: Some(record.approved_patches.clone()),
+                approved_patches_compliance_level: Some(
+                    record.approved_patches_compliance_level.clone(),
+                ),
+                approved_patches_enable_non_security: Some(
+                    record.approved_patches_enable_non_security,
+                ),
+                rejected_patches: Some(record.rejected_patches.clone()),
+                rejected_patches_action: Some(record.rejected_patches_action.clone()),
+                // "Patch groups included in the patch baseline": a patch group is included
+                // in a baseline by registering it there, and this store holds no such
+                // registration, so a baseline it holds includes no patch group.
+                patch_groups: Some(Vec::new()),
+                created_date: Some(::aws_smithy_types::DateTime::from(record.created_date)),
+                // Equal to the created date until a write of this baseline moves it.
+                modified_date: Some(::aws_smithy_types::DateTime::from(record.modified_date)),
+                description: record.description.clone(),
+                sources: Some(record.sources.clone()),
+                available_security_updates_compliance_status: record
+                    .available_security_updates_compliance_status
+                    .clone(),
+            });
+        }
+
+        // A baseline Systems Manager predefines exists without anybody creating it — "To
+        // retrieve information about an Amazon Web Services managed patch baseline, specify
+        // the full Amazon Resource Name (ARN) of the baseline" — so an id of one is read
+        // from its definition rather than from the created-baseline map. That definition
+        // holds the baseline's identity: the name Patch Manager gives it, the operating
+        // system it applies to, and the ARN a read names it by, which is the spelling
+        // `GetDefaultPatchBaseline` reports it under. Which patches Patch Manager approves
+        // in it is Patch Manager's own and is held nowhere here, so those members are left
+        // unreported rather than reported empty, which would say the baseline approves and
+        // rejects nothing.
+        if let Some(predefined) =
+            crate::state::patch_baselines::predefined_baseline_with_id(&region, &baseline_id)
+        {
+            return Ok(GetPatchBaselineOutput {
+                baseline_id: Some(crate::state::patch_baselines::patch_baseline_arn(
+                    &region,
+                    &baseline_id,
+                )),
+                name: Some(predefined.name.to_string()),
+                operating_system: Some(predefined.operating_system.to_string()),
+                ..GetPatchBaselineOutput::default()
+            });
+        }
+
+        // A well formed id that resolves to no baseline reachable through this endpoint:
+        // there is nothing to report, worded the way every operation of this service words
+        // an absent baseline.
+        Err(
+            GetPatchBaselineErrorModeled::DoesNotExistException(DoesNotExistException {
+                message: Some(crate::state::patch_baselines::PATCH_BASELINE_NOT_FOUND.to_string()),
+            })
+            .into(),
+        )
     }
 }

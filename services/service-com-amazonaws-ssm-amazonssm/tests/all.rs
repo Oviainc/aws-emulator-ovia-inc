@@ -67,6 +67,8 @@ mod parameters_batch;
 mod parameters_by_path;
 #[path = "all/patch_baseline_approval_coverage.rs"]
 mod patch_baseline_approval_coverage;
+#[path = "all/patch_baseline_details.rs"]
+mod patch_baseline_details;
 #[path = "all/public_amazon_linux_alias_namespace.rs"]
 mod public_amazon_linux_alias_namespace;
 #[path = "all/public_image_metadata_hierarchies.rs"]
