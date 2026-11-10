@@ -956,6 +956,17 @@ pub const LATTICE_ID_SUFFIX_LEN: usize = 17;
 /// The lowercase base-36 alphabet those id patterns admit (`[0-9a-z]`).
 const BASE36_LOWER: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
+/// How many of a VPC Lattice identifier's [`LATTICE_ID_SUFFIX_LEN`] base-36 digits
+/// carry the never-reused number the account's mint drew for that resource, the rest
+/// carrying a digest of the mint's namespace. Ten digits is 36^10 resources before the
+/// low part could repeat — far past the connections the quota admits — and leaves the
+/// remaining digits to tell one mint from another. See
+/// [`IdentifierMint::next_lattice_suffix`], which is the one place the split is applied.
+const LATTICE_ID_SEQUENCE_DIGITS: u32 = 10;
+
+/// The digits above them, which carry the namespace digest.
+const LATTICE_ID_NAMESPACE_DIGITS: u32 = LATTICE_ID_SUFFIX_LEN as u32 - LATTICE_ID_SEQUENCE_DIGITS;
+
 /// One stored private connection: the record every private connection operation reads.
 #[derive(Debug, Clone)]
 pub struct PrivateConnection {
@@ -1298,6 +1309,118 @@ pub struct TargetDomainIdentity {
     pub verification_token: String,
 }
 
+/// The ONE generator every identifier and every verification token this service mints
+/// is drawn from.
+///
+/// Two values go into each minted value, and each answers one half of what the API
+/// promises its callers:
+///
+/// * a counter this mint NEVER reuses, shared by every resource type, so two resources
+///   of this account are never handed one identifier — not two agent spaces, and not an
+///   agent space and a pack — while the values handed out keep rising, which is what
+///   makes a store keyed by them walk in creation order;
+/// * a namespace drawn once per mint from entropy the system seeded
+///   ([`system_entropy`]), so what one mint hands out is not what another hands out,
+///   and a value is not the ordinal of the call that created it.
+///
+/// So every minted value is opaque, is unique within the account across resource types,
+/// and carries nothing from the request that asked for it.
+#[derive(Debug)]
+pub struct IdentifierMint {
+    /// The namespace every value this mint hands out carries, drawn once per mint.
+    namespace: u64,
+    /// How many values this mint has handed out, which is what makes the next one
+    /// unique rather than merely unlikely to repeat.
+    minted: u64,
+}
+
+impl Default for IdentifierMint {
+    /// A mint with a fresh namespace and nothing handed out yet.
+    fn default() -> Self {
+        Self {
+            namespace: system_entropy(),
+            minted: 0,
+        }
+    }
+}
+
+impl IdentifierMint {
+    /// The next number this mint has not handed out.
+    fn next_sequence(&mut self) -> u64 {
+        self.minted = self.minted.wrapping_add(1);
+        self.minted
+    }
+
+    /// A fresh identifier of this mint, with the sequence number behind it for a
+    /// resource that also names a second value derived from the same identity.
+    ///
+    /// 32 lowercase hex characters: the mint's namespace, then this resource's own
+    /// number. None of the service's identifier shapes carries a `@pattern` or a
+    /// `@length` in the model, so the FORM is this emulator's to choose; what the model
+    /// does promise — "unique identifier" — is the uniqueness above.
+    pub fn next_identifier(&mut self) -> MintedIdentifier {
+        let sequence = self.next_sequence();
+        MintedIdentifier {
+            id: format!("{:016x}{sequence:016x}", self.namespace),
+            sequence,
+        }
+    }
+
+    /// A fresh secret of this mint for the challenge `context`: 64 lowercase hex
+    /// characters, the hex-encoded SHA-256 of the context, the mint's namespace, a
+    /// number this mint never reuses and the instant it was drawn.
+    ///
+    /// Unique per call because of the number, opaque because of the namespace's seeded
+    /// bits, and carrying nothing the caller sent — which is what a proof-of-control
+    /// challenge is: a value this service handed to the owner of ONE resource, so no
+    /// two resources are ever told to publish one value. EMULATOR-GRADE: a digest, not
+    /// an unforgeable secret.
+    pub fn next_secret(&mut self, context: &str) -> String {
+        let sequence = self.next_sequence();
+        let drawn_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |since_epoch| since_epoch.as_nanos());
+        let mut digest = Sha256::new();
+        digest.update(context.as_bytes());
+        digest.update(self.namespace.to_be_bytes());
+        digest.update(sequence.to_be_bytes());
+        digest.update(drawn_at.to_be_bytes());
+        hex::encode(digest.finalize())
+    }
+
+    /// A fresh identifier of this mint in the base-36 suffix form VPC Lattice's own id
+    /// patterns declare ([`base36_id`]), for the resources this service creates THERE
+    /// rather than in its own namespace.
+    ///
+    /// That form holds fewer bits than a namespace and a sequence number together, so
+    /// the two are not shifted into it — that would keep only the namespace's low bits.
+    /// The low [`LATTICE_ID_SEQUENCE_DIGITS`] digits carry the mint's own never-reused
+    /// number, so two resources of one mint cannot be handed one id, and the digits
+    /// above them carry a digest of the WHOLE namespace, so two mints do not agree on
+    /// them.
+    pub fn next_lattice_suffix(&mut self) -> String {
+        let sequence = self.next_sequence();
+        let span = 36u128.pow(LATTICE_ID_SEQUENCE_DIGITS);
+        let digest = Sha256::digest(self.namespace.to_be_bytes());
+        let namespace = digest
+            .iter()
+            .take(8)
+            .fold(0u128, |value, byte| (value << 8) | u128::from(*byte))
+            % 36u128.pow(LATTICE_ID_NAMESPACE_DIGITS);
+        base36_id(namespace * span + (u128::from(sequence) % span))
+    }
+}
+
+/// One identifier [`IdentifierMint::next_identifier`] handed out.
+#[derive(Debug, Clone)]
+pub struct MintedIdentifier {
+    /// The identifier itself, as every response and every store key carries it.
+    pub id: String,
+    /// The mint's own number behind it, for a resource whose identity carries a second
+    /// value derived from the same draw.
+    pub sequence: u64,
+}
+
 /// Per-service state for com-amazonaws-securityagent-securityagent. A handler reaches it through [`service_state`].
 ///
 /// `Default` is hand-written rather than derived because the account does not start
@@ -1311,38 +1434,22 @@ pub struct ComAmazonawsSecurityagentSecurityagentState {
     /// taken on one page resumes at the right place on the next — including after a
     /// neighbouring record was deleted.
     pub applications: BTreeMap<String, Application>,
-    /// Monotonic counter behind every minted `applicationId`, so two
-    /// `CreateApplication` calls are two distinct records.
-    pub next_application_seq: u64,
     /// Every stored private connection, keyed by its name — which the API itself makes
     /// the identifier ("A unique name for the private connection within your
     /// account"). A `BTreeMap` for the same reason as `applications`.
     pub private_connections: BTreeMap<String, PrivateConnection>,
-    /// Monotonic counter behind the VPC Lattice ids minted per private connection, so
-    /// two creates are two distinct gateways and configurations.
-    pub next_private_connection_seq: u64,
     /// Every registered target domain, keyed by its `targetDomainId`. A `BTreeMap` for
     /// the same reason as [`Self::applications`]: one stable order for the reads that
     /// walk the whole set.
     pub target_domains: BTreeMap<String, TargetDomainRecord>,
-    /// Monotonic counter behind every minted `targetDomainId`, so two
-    /// `CreateTargetDomain` calls are two distinct records.
-    pub next_target_domain_seq: u64,
     /// Every stored agent space, keyed by its `agentSpaceId`. A `BTreeMap` for the
     /// same reason as [`Self::applications`]: one stable order for a list read to walk
     /// and to resume a cursor in.
     pub agent_spaces: BTreeMap<String, AgentSpaceRecord>,
-    /// Monotonic counter behind every minted `agentSpaceId`, so two `CreateAgentSpace`
-    /// calls are two distinct records whatever they were called with.
-    pub next_agent_space_seq: u64,
     /// Every stored security requirement pack, keyed by its `packId`. A `BTreeMap` for
     /// the same reason as [`Self::applications`]: one stable order for
     /// `ListSecurityRequirementPacks` to walk and to resume a cursor in.
     pub security_requirement_packs: BTreeMap<String, SecurityRequirementPack>,
-    /// Monotonic counter behind every minted `packId`, so two
-    /// `CreateSecurityRequirementPack` calls are two distinct records even when they
-    /// carry byte-identical input.
-    pub next_security_requirement_pack_seq: u64,
     /// Every stored security requirement, keyed by the PAIR `(packId, name)` that
     /// identifies it: a requirement lives in exactly one pack and its name is unique
     /// only within that pack, so two packs can each hold a requirement of one name and
@@ -1355,9 +1462,10 @@ pub struct ComAmazonawsSecurityagentSecurityagentState {
     /// stable order — the upload order — for a read that walks the artifacts of an
     /// agent space.
     pub artifacts: BTreeMap<String, ArtifactRecord>,
-    /// Monotonic counter behind every minted `artifactId`, so two `AddArtifact` calls
-    /// are two distinct artifacts even when they upload the same file name and bytes.
-    pub next_artifact_seq: u64,
+    /// The one generator every identifier and verification token this account's
+    /// resources are minted from — whatever their type — so no two of them are ever
+    /// handed the same value. See [`IdentifierMint`].
+    pub identifiers: IdentifierMint,
 }
 
 impl Default for ComAmazonawsSecurityagentSecurityagentState {
@@ -1372,13 +1480,9 @@ impl Default for ComAmazonawsSecurityagentSecurityagentState {
         let now = SystemTime::now();
         Self {
             applications: BTreeMap::new(),
-            next_application_seq: 0,
             private_connections: BTreeMap::new(),
-            next_private_connection_seq: 0,
             target_domains: BTreeMap::new(),
-            next_target_domain_seq: 0,
             agent_spaces: BTreeMap::new(),
-            next_agent_space_seq: 0,
             security_requirement_packs: AWS_MANAGED_PACKS
                 .iter()
                 .map(|entry| {
@@ -1388,10 +1492,9 @@ impl Default for ComAmazonawsSecurityagentSecurityagentState {
                     )
                 })
                 .collect(),
-            next_security_requirement_pack_seq: 0,
             security_requirements: BTreeMap::new(),
             artifacts: BTreeMap::new(),
-            next_artifact_seq: 0,
+            identifiers: IdentifierMint::default(),
         }
     }
 }
@@ -1409,20 +1512,18 @@ impl ComAmazonawsSecurityagentSecurityagentState {
 
     /// Mint the identity of a new application.
     ///
-    /// The id is 32 lowercase hex characters drawn from the monotonic counter, so it
-    /// is unique within the process and `ListApplications`' ordering is the creation
-    /// order. The name and the domain are derived from that same identity, so a later
-    /// read returns a real stored value rather than a placeholder, and the domain
-    /// names the region the request was signed for.
+    /// The id is a fresh identifier of the account's one mint ([`IdentifierMint`]), so
+    /// it is unique across every resource this account holds and `ListApplications`'
+    /// ordering is the creation order. The name and the domain are derived from that
+    /// same identity, so a later read returns a real stored value rather than a
+    /// placeholder, and the domain names the region the request was signed for.
     pub fn mint_application_identity(&mut self, region: &str) -> ApplicationIdentity {
-        self.next_application_seq = self.next_application_seq.wrapping_add(1);
-        let sequence = self.next_application_seq;
-        let application_id = format!("{sequence:032x}");
+        let minted = self.identifiers.next_identifier();
         ApplicationIdentity {
-            application_name: format!("application-{sequence}"),
-            domain: format!("{application_id}.securityagent.{region}.on.aws"),
-            application_id,
-            sequence,
+            application_name: format!("application-{}", minted.sequence),
+            domain: format!("{}.securityagent.{region}.on.aws", minted.id),
+            application_id: minted.id,
+            sequence: minted.sequence,
         }
     }
 
@@ -1430,21 +1531,18 @@ impl ComAmazonawsSecurityagentSecurityagentState {
     /// with: the resource gateway the service stands up in the caller's VPC, and the
     /// resource configuration it creates beside it.
     ///
-    /// Both ids are drawn from the monotonic counter — which advances once per id, so
-    /// the gateway and the configuration are two distinct resources — and rendered in
-    /// the base-36 form VPC Lattice's own id patterns declare.
+    /// Both ids are drawn from the account's one mint — once each, so the gateway and
+    /// the configuration are two distinct resources — and rendered in the base-36 form
+    /// VPC Lattice's own id patterns declare.
     pub fn mint_private_connection_identity(&mut self) -> PrivateConnectionIdentity {
-        let gateway_sequence = self.next_private_connection_seq.wrapping_add(1);
-        let configuration_sequence = self.next_private_connection_seq.wrapping_add(2);
-        self.next_private_connection_seq = configuration_sequence;
         PrivateConnectionIdentity {
             resource_gateway_id: format!(
                 "{RESOURCE_GATEWAY_ID_PREFIX}{}",
-                base36_id(u128::from(gateway_sequence))
+                self.identifiers.next_lattice_suffix()
             ),
             resource_configuration_id: format!(
                 "{RESOURCE_CONFIGURATION_ID_PREFIX}{}",
-                base36_id(u128::from(configuration_sequence))
+                self.identifiers.next_lattice_suffix()
             ),
         }
     }
@@ -1501,47 +1599,42 @@ impl ComAmazonawsSecurityagentSecurityagentState {
         }
     }
 
-    /// Mint the identity of a new target domain.
+    /// Mint the identity of a new target domain: its id and the ownership-verification
+    /// token its owner is told to publish.
     ///
-    /// The id is 32 lowercase hex characters drawn from the monotonic counter, so it is
-    /// unique within the process and the reads' ordering is the registration order. The
-    /// The token is derived from that id alone — never from request text — so it is
-    /// unique per record and carries nothing the caller sent. It is DETERMINISTIC by
-    /// design (a hash of the record's ordinal, so a test can recompute it); it is NOT
-    /// an unpredictable secret the way the real service's challenge token is.
+    /// BOTH are fresh draws of the account's one mint ([`IdentifierMint`]), never
+    /// derived from each other or from request text. So the id is unique across every
+    /// resource this account holds, and the token is this ONE domain's proof of
+    /// control: no other domain, and no other verification method, is ever told to
+    /// publish it.
     pub fn mint_target_domain_identity(&mut self) -> TargetDomainIdentity {
-        self.next_target_domain_seq = self.next_target_domain_seq.wrapping_add(1);
-        let target_domain_id = format!("{:032x}", self.next_target_domain_seq);
         TargetDomainIdentity {
-            verification_token: verification_token(&target_domain_id),
-            target_domain_id,
+            target_domain_id: self.identifiers.next_identifier().id,
+            verification_token: self.identifiers.next_secret(VERIFICATION_TOKEN_CONTEXT),
         }
     }
 
     /// Mint the `agentSpaceId` of a new agent space.
     ///
     /// Opaque to the caller — `AgentSpaceId` carries neither a `@pattern` nor a
-    /// `@length` in the model — and drawn from a monotonic counter, so it is unique
-    /// within the process and the stored order is the creation order. 32 lowercase hex
-    /// characters, the same form as a minted `applicationId`.
+    /// `@length` in the model — and a fresh draw of the account's one mint, so it is
+    /// unique across every resource this account holds and the stored order is the
+    /// creation order. The ARN this id goes into is built from it
+    /// ([`agent_space_arn`]), so the two agree and are distinct per space.
     pub fn mint_agent_space_id(&mut self) -> String {
-        self.next_agent_space_seq = self.next_agent_space_seq.wrapping_add(1);
-        format!("{:032x}", self.next_agent_space_seq)
+        self.identifiers.next_identifier().id
     }
 
     /// Mint the `packId` of a new security requirement pack.
     ///
-    /// Drawn from the store's own monotonic counter while the store is locked, so two
+    /// A fresh draw of the account's one mint, taken while the store is locked, so two
     /// calls — including two concurrent calls carrying the same `name` — get two
-    /// distinct ids and neither overwrites the other. The id is 32 lowercase hex
-    /// characters, the same opaque form as an `applicationId`: `SecurityRequirementPackId`
-    /// carries no `@pattern` or `@length` in the model, so the shape is this
-    /// emulator's to choose, and taking it from the counter makes the map's order the
-    /// creation order.
+    /// distinct ids and neither overwrites the other, and a pack id can never be an
+    /// agent space's or a target domain's id. `SecurityRequirementPackId` carries no
+    /// `@pattern` or `@length` in the model, so the form is this emulator's to choose,
+    /// and drawing it from the mint makes the map's order the creation order.
     pub fn mint_security_requirement_pack_id(&mut self) -> String {
-        self.next_security_requirement_pack_seq =
-            self.next_security_requirement_pack_seq.wrapping_add(1);
-        format!("{:032x}", self.next_security_requirement_pack_seq)
+        self.identifiers.next_identifier().id
     }
 
     /// The security requirement `name` names IN the pack `pack_id`, or `None` when that
@@ -1603,14 +1696,12 @@ impl ComAmazonawsSecurityagentSecurityagentState {
 
     /// Mint the `artifactId` of a newly uploaded artifact.
     ///
-    /// Drawn from the store's own monotonic counter while the store is locked, so two
+    /// A fresh draw of the account's one mint, taken while the store is locked, so two
     /// uploads — including two carrying the same file name and bytes — are two distinct
-    /// artifacts and neither overwrites the other. 32 lowercase hex characters, the same
-    /// opaque form as a minted `agentSpaceId`: `ArtifactId` carries no `@pattern` or
-    /// `@length` in the model, so the shape is this emulator's to choose.
+    /// artifacts and neither overwrites the other. `ArtifactId` carries no `@pattern`
+    /// or `@length` in the model, so the form is this emulator's to choose.
     pub fn mint_artifact_id(&mut self) -> String {
-        self.next_artifact_seq = self.next_artifact_seq.wrapping_add(1);
-        format!("{:032x}", self.next_artifact_seq)
+        self.identifiers.next_identifier().id
     }
 
     /// How many artifacts the agent space `agent_space_id` holds, i.e. how many count
@@ -1653,6 +1744,23 @@ impl ComAmazonawsSecurityagentSecurityagentState {
         self.artifact_in(agent_space_id, artifact_id)?;
         self.artifacts.remove(artifact_id)
     }
+}
+
+/// 64 bits of entropy this process did not choose, telling one [`IdentifierMint`] apart
+/// from another.
+///
+/// `std::collections::hash_map::RandomState::new` "is initialized with random keys"
+/// (its own documentation) — the system seeds them — and a fresh one per call carries
+/// fresh keys, so what it yields cannot be derived from a request or from an earlier
+/// draw. EMULATOR-GRADE, by design: it names a mint and opens a challenge token's
+/// digest, it is never a key, a secret or a signature, and the UNIQUENESS of a minted
+/// value comes from the mint's own never-reused counter rather than from here. The same
+/// derivation stands behind the domain verification tokens in
+/// `services/common/src/ses_identities.rs`, so no second entropy idiom is introduced.
+fn system_entropy() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    RandomState::new().build_hasher().finish()
 }
 
 /// `sequence` as the `<17 of [0-9a-z]>` suffix VPC Lattice's resource-gateway and
@@ -1749,22 +1857,6 @@ pub fn resolve_subnet(region: &str, subnet_id: &str) -> Option<SubnetRecord> {
     region_subnets(region)
         .into_iter()
         .find(|subnet| subnet.subnet_id == subnet_id)
-}
-
-/// The verification token the owner of a target domain publishes: the SHA-256 of the
-/// service-minted `targetDomainId` under a domain-separation prefix, hex-encoded.
-///
-/// Derived from the minted id rather than from the request, so it carries no caller
-/// text, is unique per record and is the same on every projection of that record.
-/// Because that id is the record's ordinal in this process, the token is a
-/// deterministic, test-reproducible value — emulator-grade, not an unpredictable
-/// secret: nothing here should be read as modelling the real challenge token's
-/// unforgeability.
-fn verification_token(target_domain_id: &str) -> String {
-    let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(
-        format!("{VERIFICATION_TOKEN_CONTEXT}{target_domain_id}").as_bytes(),
-    );
-    hex::encode(digest)
 }
 
 /// Why `name` is not a domain name this service can register as a target domain, or

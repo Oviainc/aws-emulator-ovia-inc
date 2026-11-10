@@ -837,9 +837,9 @@ async fn a_pending_target_domain_names_the_recorded_challenge() {
 async fn create_agent_space_bounds_the_association_it_will_store() {
     let router = emulator();
 
-    // Ids of the right shape that no registration minted (the id counter starts at 1,
-    // so nothing it mints begins with an `f`), so the rows differ only in COUNT: at the
-    // bound, one past it, and far past it.
+    // Ids of the right shape (32 lowercase hex) that name no registered target domain:
+    // this case registers none, so the rows differ only in COUNT — at the bound, one
+    // past it, and far past it.
     let ids = |count: usize| -> Vec<String> {
         (0..count).map(|index| format!("f{index:031x}")).collect()
     };
@@ -910,12 +910,17 @@ async fn create_agent_space_bounds_the_association_it_will_store() {
         );
 
         // Refused, so nothing was stored. A refusal answers no id, so the probe is the
-        // id SEQUENCE: this service mints consecutive ids (32 lowercase hex of a
-        // per-process counter — the accepted creates above are the ones that consumed
-        // it), so a record a refused create had stored would sit at the next one. The
-        // next three slots are asked for, and all three must be unknown.
+        // mint's own SEQUENCE: an id this service mints is the account mint's namespace
+        // followed by the resource's number, which rises by one per minted resource
+        // (the accepted creates above are the ones that consumed it), so a record a
+        // refused create had stored would sit at the next number under that same
+        // namespace. The next three slots are asked for, and all three must be unknown.
+        let namespace: String = minted
+            .first()
+            .map(|id| id.chars().take(16).collect())
+            .unwrap_or_else(|| panic!("case {case:?}: an accepted create minted no id"));
         let next: Vec<String> = (1..=3)
-            .map(|step| format!("{:032x}", minted.len() + step))
+            .map(|step| format!("{namespace}{:016x}", minted.len() + step))
             .collect();
         let (found, missing) = batch_get_agent_spaces(&router, &next, case).await;
         assert!(

@@ -24,11 +24,11 @@ tracing = { workspace = true }
 # Opaque list pagination cursors (the resume-at record key: an applicationId, a packId
 # or a private connection name) and target domain verification tokens, hex-encoded.
 hex = { workspace = true }
-# SHA-256 behind each target domain's verification token, derived from its minted id,
-# and behind the identifiers of the account's network (the default VPC and its subnets
-# a service-managed private connection's resource gateway is placed in), derived
-# exactly as every other service that places a resource in a subnet derives them — see
-# `services/common/src/network.rs`.
+# SHA-256 behind each target domain's verification token, over the account mint's own
+# never-reused draw, and behind the identifiers of the account's network (the default
+# VPC and its subnets a service-managed private connection's resource gateway is placed
+# in), derived exactly as every other service that places a resource in a subnet
+# derives them — see `services/common/src/network.rs`.
 sha2 = { workspace = true }
 
 [build-dependencies]
