@@ -139,14 +139,15 @@ async fn every_published_version_of_every_pattern_is_reported_from_state() {
                 "case {case:?}: a reported version must describe itself, got {}",
                 summary["description"]
             );
-            // The document the catalogue publishes for this pattern is reported like
-            // every other member of the record (the rule itself lives in
+            // The catalogue publishes no document per VERSION — one per application,
+            // which the workload's own view reports — so the member is left out rather
+            // than filled from another record (the rule itself lives in
             // `catalogue_published_urls.rs`).
             assert!(
-                summary["documentationUrl"]
-                    .as_str()
-                    .is_some_and(|url| !url.is_empty()),
-                "case {case:?}: a reported version must name its document, got {}",
+                summary
+                    .get("documentationUrl")
+                    .is_none_or(Value::is_null),
+                "case {case:?}: a version publishes no document of its own, got {}",
                 summary["documentationUrl"]
             );
             descriptions.insert(description);
@@ -174,7 +175,7 @@ async fn every_published_version_of_every_pattern_is_reported_from_state() {
 async fn the_version_a_pattern_reports_is_the_newest_one_the_version_read_resolves() {
     let harness = Harness::new();
     let newest = CATALOGUE_PATTERN_VERSIONS
-        .last()
+        .first()
         .copied()
         .expect("the catalogue publishes at least one version per pattern");
     for (workload, pattern) in every_pattern(&harness).await {
@@ -373,11 +374,11 @@ async fn a_version_name_outside_the_modelled_shape_is_refused_at_the_boundary() 
 async fn a_version_the_read_reports_is_a_version_an_update_can_name() {
     let harness = Harness::new();
     let oldest = CATALOGUE_PATTERN_VERSIONS
-        .first()
+        .last()
         .copied()
         .expect("the catalogue publishes at least one version per pattern");
     let newest = CATALOGUE_PATTERN_VERSIONS
-        .last()
+        .first()
         .copied()
         .expect("the catalogue publishes at least one version per pattern");
     // Each accepted update needs a deployment whose lifecycle is at rest, so every row
@@ -527,13 +528,17 @@ async fn a_version_the_read_reports_is_a_version_an_update_can_name() {
             )
             .await;
         let described = update_description(&harness, &case, &kept).await;
+        // The clause names the DEPLOYMENT PATTERN version, which is where the two
+        // version members of one catalogue entry differ: the workload version an entry
+        // is published at is its newest pattern version, so the bare version name is not
+        // enough to tell the two clauses apart.
         assert!(
-            described.contains(&format!("'{oldest}'")),
+            described.contains(&format!("deployment pattern version '{oldest}'")),
             "case {case:?}: an update naming no version must keep version {oldest:?}, got \
              {described:?}"
         );
         assert!(
-            !described.contains(&format!("'{newest}'")),
+            !described.contains(&format!("deployment pattern version '{newest}'")),
             "case {case:?}: an update naming no version must not move the deployment to \
              {newest:?}, got {described:?}"
         );

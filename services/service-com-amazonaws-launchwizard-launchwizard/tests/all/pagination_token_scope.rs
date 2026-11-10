@@ -35,7 +35,7 @@ use service_com_amazonaws_launchwizard_launchwizard::state::{
 
 use crate::deployment_lifecycle::create;
 use crate::deployment_update::{error_message, every_pattern, one_pattern_per_workload};
-use crate::harness::{catalogue, walk_pages, Harness};
+use crate::harness::{catalogue, one_page, walk_pages, Harness};
 
 /// The HTTP status a refused pagination token carries (`ValidationException`,
 /// `errorKind: client`, `httpError: 400`).
@@ -68,6 +68,10 @@ struct Paged {
 }
 
 /// One page of a paginated operation: the items it reported and the token it handed back.
+///
+/// The reply is read through the shared single-page helper, so this suite and the others
+/// that assert the token contract cannot disagree about how a page is read; what belongs
+/// to this suite is the SCOPE the request narrows by.
 async fn page(
     harness: &Harness,
     case: &str,
@@ -76,23 +80,14 @@ async fn page(
     page_size: usize,
     token: Option<&str>,
 ) -> (Vec<Value>, Option<String>) {
-    let body = harness
-        .ok(case, paged.path, request(scope, page_size, token))
-        .await;
-    let items = body[paged.items]
-        .as_array()
-        .unwrap_or_else(|| {
-            panic!(
-                "case {case:?}: {} reported no {}: {body}",
-                paged.path, paged.items
-            )
-        })
-        .clone();
-    let next = body
-        .get("nextToken")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    (items, next)
+    one_page(
+        harness,
+        case,
+        paged.path,
+        request(scope, page_size, token),
+        paged.items,
+    )
+    .await
 }
 
 /// A scope's request body with the paging members this suite drives.

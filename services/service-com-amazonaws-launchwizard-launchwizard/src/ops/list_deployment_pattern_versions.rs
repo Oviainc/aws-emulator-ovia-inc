@@ -220,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         },
                     )
                 })?;
-            // The versions this pattern publishes, oldest first, in the projection the
+            // The versions this pattern publishes, newest first, in the projection the
             // single-version read reports from — so a version a page carries reads
             // exactly as `GetDeploymentPatternVersion` reports it. Every filter has to
             // hold (AND), as narrowing a result set by two criteria means.

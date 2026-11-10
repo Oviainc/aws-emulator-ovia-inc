@@ -109,28 +109,47 @@ pub const COMPARATOR_EQUAL: &str = "Equal";
 /// See [`COMPARATOR_EQUAL`].
 pub const COMPARATOR_NOT_EQUAL: &str = "NotEqual";
 
-/// The `workloadVersionName` every seeded catalogue entry reports.
+/// The `workloadVersionName` every seeded catalogue entry reports: the catalogue's
+/// current version, which is the newest version its deployment patterns publish.
+///
+/// A Launch Wizard catalogue entry is published at ONE version: the workload version a
+/// deployment pattern is published at is the pattern version it reports, which is why
+/// `WorkloadDeploymentPatternData` carries the two members side by side with one value
+/// between them. Derived from the newest entry of [`CATALOGUE_PATTERN_VERSIONS`] rather
+/// than stated a second time beside it, so the two cannot drift apart.
+///
+/// The emulator seeds ONE version line for the WHOLE catalogue rather than one per
+/// workload — every seeded entry reports this value — so this is the catalogue's own
+/// version and not a claim about what AWS publishes for each application; see
+/// [`CATALOGUE_PATTERN_VERSIONS`] for where the value comes from.
 ///
 /// `WorkloadVersionName` / `DeploymentPatternVersionName` are len 5..30 with pattern
-/// `^(([A-Za-z0-9][a-zA-Z0-9-]*)|(\d+\.\d+\.\d+))$`; this is the dotted alternative at
-/// its shortest. The catalogue is service-owned (no API creates a workload or a
-/// pattern), so the emulator seeds ONE version per workload; a pattern's own versions
-/// are [`CATALOGUE_PATTERN_VERSIONS`].
-pub const CATALOGUE_VERSION: &str = "1.0.0";
+/// `^(([A-Za-z0-9][a-zA-Z0-9-]*)|(\d+\.\d+\.\d+))$`, which every entry of that list
+/// satisfies using the dotted alternative.
+pub const CATALOGUE_VERSION: &str = CATALOGUE_PATTERN_VERSIONS[0];
 
 /// The `DeploymentPatternVersionName`s the seeded catalogue publishes for EVERY
-/// deployment pattern, OLDEST FIRST — the last entry is the version the pattern
+/// deployment pattern, NEWEST FIRST — the first entry is the version the pattern
 /// currently deploys, which is the one `ListWorkloadDeploymentPatterns` and
 /// `GetWorkloadDeploymentPattern` report as its `deploymentPatternVersionName`.
 ///
+/// Newest first is the order a version listing pages in, so the version a caller should
+/// deploy — the one every other catalogue view reports — is on the FIRST page of
+/// `ListDeploymentPatternVersions` whatever page size it is read at, rather than behind
+/// however many older versions the pattern has accumulated.
+///
 /// The catalogue is service-owned (there is no API that creates a pattern or a version
-/// of one), so this list is the EMULATOR's own rather than a claim about which versions
-/// AWS publishes; each entry stays inside `DeploymentPatternVersionName` (see
-/// [`CATALOGUE_VERSION`]) using the dotted alternative. More than one version is seeded
-/// because a pattern's version operations (`GetDeploymentPatternVersion`,
-/// `ListDeploymentPatternVersions`) exist to tell the versions of ONE pattern apart,
-/// which a catalogue holding a single version per pattern cannot show.
-pub const CATALOGUE_PATTERN_VERSIONS: &[&str] = &["1.0.0", "1.1.0", "2.0.0"];
+/// of one), so the emulator seeds it. The FIRST entry is the deployment pattern version
+/// Launch Wizard's own catalogue publishes for its SAP deployment patterns (recorded
+/// wording, like [`WORKLOAD_NOT_FOUND_MESSAGE`]), so a client that reads a version out
+/// of this catalogue addresses the version AWS publishes rather than a substitute; the
+/// entries after it are the EMULATOR's own history behind it. Each entry stays inside
+/// `DeploymentPatternVersionName` (see [`CATALOGUE_VERSION`]) using the dotted
+/// alternative. More than one version is seeded because a pattern's version operations
+/// (`GetDeploymentPatternVersion`, `ListDeploymentPatternVersions`) exist to tell the
+/// versions of ONE pattern apart, which a catalogue holding a single version per
+/// pattern cannot show.
+pub const CATALOGUE_PATTERN_VERSIONS: &[&str] = &["1.0.27", "1.0.1", "1.0.0"];
 
 /// The message an update of a deployment that is going away is refused with.
 ///
@@ -370,13 +389,6 @@ pub struct DeploymentPattern {
     pub display_name: String,
     /// `WorkloadDeploymentPatternData$description`.
     pub description: String,
-    /// `DeploymentPatternVersionDataSummary$documentationUrl`: where the catalogue
-    /// publishes the deployment document a version of this pattern is documented by.
-    /// Seeded from the document of the workload this pattern belongs to (see
-    /// [`Workload::documentation_url`]), because the catalogue publishes one deployment
-    /// document per application rather than one per pattern. Never empty for a
-    /// catalogue entry.
-    pub documentation_url: String,
     /// One of `WORKLOAD_DEPLOYMENT_PATTERN_STATUS_VALUES`.
     pub status: String,
     /// `WorkloadDeploymentPatternData$statusMessage`: present only when the status
@@ -384,7 +396,7 @@ pub struct DeploymentPattern {
     pub status_message: Option<String>,
     /// `workloadVersionName`, see [`CATALOGUE_VERSION`].
     pub workload_version_name: String,
-    /// Every version of this pattern the catalogue publishes, OLDEST FIRST — see
+    /// Every version of this pattern the catalogue publishes, NEWEST FIRST — see
     /// [`CATALOGUE_PATTERN_VERSIONS`]. The pattern's current version is derived from
     /// this list ([`DeploymentPattern::current_version`]) rather than stored beside it,
     /// so the version a pattern reports is always one the catalogue holds.
@@ -412,7 +424,7 @@ impl DeploymentPattern {
     /// `deploymentPatternVersionName`. `None` only for a pattern with no versions at
     /// all, which the seeded catalogue never builds.
     pub fn current_version(&self) -> Option<&PatternVersion> {
-        self.versions.last()
+        self.versions.first()
     }
 
     /// The version of this pattern named `version_name`, or `None` when the catalogue
@@ -438,7 +450,7 @@ impl DeploymentPattern {
     }
 
     /// EVERY version this pattern publishes as the summaries
-    /// `ListDeploymentPatternVersions` pages, OLDEST FIRST — the order
+    /// `ListDeploymentPatternVersions` pages, NEWEST FIRST — the order
     /// [`CATALOGUE_PATTERN_VERSIONS`] publishes them in, so a page resumes in a stable
     /// order.
     ///
@@ -456,13 +468,17 @@ impl DeploymentPattern {
     ///
     /// `workloadName` and `deploymentPatternName` are read off THIS record rather than
     /// off the request, so the reported version is always stated as a version of the
-    /// pattern it was found in, and `documentationUrl` is the document the catalogue
-    /// publishes for it, read off the same record.
+    /// pattern it was found in.
+    ///
+    /// `documentationUrl` is the document published for THAT VERSION, and the catalogue
+    /// publishes one deployment document per application rather than one per pattern
+    /// version (it is what `WorkloadData$documentationUrl` reports), so the member is
+    /// left out rather than filled with the document of another resource.
     fn summary_of(&self, version: &PatternVersion) -> DeploymentPatternVersionDataSummary {
         DeploymentPatternVersionDataSummary {
             deployment_pattern_version_name: Some(version.version_name.clone()),
             description: Some(version.description.clone()),
-            documentation_url: Some(self.documentation_url.clone()),
+            documentation_url: None,
             workload_name: Some(self.workload_name.clone()),
             deployment_pattern_name: Some(self.pattern_name.clone()),
         }
@@ -508,8 +524,8 @@ impl DeploymentPattern {
     /// This pattern as the `WorkloadDeploymentPatternDataSummary`
     /// `ListWorkloadDeploymentPatterns` returns.
     ///
-    /// `accountConstraints` is left absent for the same reason as on a workload: this
-    /// emulator models no account constraints, so reporting none is the honest answer.
+    /// `accountConstraints` is reported the way a workload reports it, through
+    /// [`no_account_constraints`].
     pub fn to_summary(&self) -> WorkloadDeploymentPatternDataSummary {
         WorkloadDeploymentPatternDataSummary {
             workload_name: Some(self.workload_name.clone()),
@@ -522,7 +538,7 @@ impl DeploymentPattern {
             description: Some(self.description.clone()),
             status: Some(self.status.clone()),
             status_message: self.status_message.clone(),
-            account_constraints: None,
+            account_constraints: no_account_constraints(),
         }
     }
 
@@ -541,7 +557,7 @@ impl DeploymentPattern {
             description: Some(self.description.clone()),
             status: Some(self.status.clone()),
             status_message: self.status_message.clone(),
-            account_constraints: None,
+            account_constraints: no_account_constraints(),
             specifications: non_empty_member(
                 self.specifications
                     .iter()
@@ -582,15 +598,15 @@ pub struct Workload {
 impl Workload {
     /// This workload as the `WorkloadDataSummary` `ListWorkloads` returns.
     ///
-    /// `accountConstraints` is left absent: the model documents it as the constraints
-    /// on which kind of account may deploy the workload, and this emulator models no
-    /// account constraints, so reporting none is the honest answer.
+    /// `accountConstraints` is the empty list every catalogue view reports through
+    /// [`no_account_constraints`]: no catalogue entry constrains which account may
+    /// deploy it.
     pub fn to_summary(&self) -> WorkloadDataSummary {
         WorkloadDataSummary {
             workload_name: Some(self.workload_name.clone()),
             display_name: Some(self.display_name.clone()),
             status: Some(self.status.clone()),
-            account_constraints: None,
+            account_constraints: no_account_constraints(),
         }
     }
 
@@ -600,7 +616,8 @@ impl Workload {
     /// same catalogue entry [`Workload::to_summary`] reads, so the two reporting
     /// operations cannot disagree about one workload.
     ///
-    /// `accountConstraints` is absent for the reason [`Workload::to_summary`] gives.
+    /// `accountConstraints` is the empty list [`Workload::to_summary`] reports, for the
+    /// reason [`no_account_constraints`] gives.
     /// `documentationUrl` and `iconUrl` are the catalogue metadata the entry carries,
     /// read off it like every other member; `statusMessage` is absent because an
     /// `ACTIVE` catalogue entry has nothing to say about its status.
@@ -609,7 +626,7 @@ impl Workload {
             workload_name: Some(self.workload_name.clone()),
             display_name: Some(self.display_name.clone()),
             status: Some(self.status.clone()),
-            account_constraints: None,
+            account_constraints: no_account_constraints(),
             description: Some(self.description.clone()),
             documentation_url: Some(self.documentation_url.clone()),
             icon_url: Some(self.icon_url.clone()),
@@ -1195,12 +1212,30 @@ const NODE_COUNTS: [&str; 3] = ["2", "3", "4"];
 /// The infrastructure fields EVERY seeded deployment pattern reads.
 ///
 /// The names are the infrastructure keys the model's own `CreateDeployment` example
-/// submits (`KeyPairName`, `VpcId`, `CreateSecurityGroup`,
-/// `DisableDeploymentRollback`, `SaveDeploymentArtifacts`, `SnsTopicArn`), and each one
-/// is a valid `DeploymentSpecifications` key (len 3..256, `^[a-zA-Z0-9-:]+$`), so a
-/// caller can take a reported name straight to `CreateDeployment`.
+/// submits (`DisableDeploymentRollback`, `SaveDeploymentArtifacts`, `KeyPairName`,
+/// `VpcId`, `CreateSecurityGroup`, `SnsTopicArn`), and each one is a valid
+/// `DeploymentSpecifications` key (len 3..256, `^[a-zA-Z0-9-:]+$`), so a caller can take
+/// a reported name straight to `CreateDeployment`.
+///
+/// The ORDER is the order that example submits those keys in, because the order a
+/// pattern publishes its fields in is the order the service states what a request still
+/// has to supply (see [`published_schema_findings`]) — so the schema is listed the way
+/// Launch Wizard lists it rather than in whatever order this layer happened to compose.
+/// `SnsTopicArn` closes the layer: the example submits it after the per-workload keys,
+/// which belong to the NEXT layer ([`workload_specification_fields`]), and no pattern
+/// requires it, so its position raises no clause either way.
 fn common_specification_fields() -> Vec<SpecificationField> {
     vec![
+        spec_field(
+            "DisableDeploymentRollback",
+            "Whether the deployment keeps the resources it created when a step fails.",
+            &[REQUIRED_YES, REQUIRED_NO],
+        ),
+        spec_field(
+            "SaveDeploymentArtifacts",
+            "Whether the deployment keeps the artifacts it generated after it finishes.",
+            &[REQUIRED_YES, REQUIRED_NO],
+        ),
         spec_field(
             "KeyPairName",
             "The name of the EC2 key pair used to access the instances this deployment \
@@ -1231,16 +1266,6 @@ fn common_specification_fields() -> Vec<SpecificationField> {
             )],
         ),
         spec_field(
-            "DisableDeploymentRollback",
-            "Whether the deployment keeps the resources it created when a step fails.",
-            &[REQUIRED_YES, REQUIRED_NO],
-        ),
-        spec_field(
-            "SaveDeploymentArtifacts",
-            "Whether the deployment keeps the artifacts it generated after it finishes.",
-            &[REQUIRED_YES, REQUIRED_NO],
-        ),
-        spec_field(
             "SnsTopicArn",
             "The ARN of the Amazon SNS topic the deployment publishes its notifications \
              to.",
@@ -1253,22 +1278,23 @@ fn common_specification_fields() -> Vec<SpecificationField> {
 /// [`common_specification_fields`]: the settings that belong to the application being
 /// deployed rather than to one way of deploying it.
 ///
-/// SAP's names are the SAP-specific keys the model's own `CreateDeployment` example
-/// submits (`SapSysGroupId`, `SapVirtualIPOptIn`, `EnableEbsVolumeEncryption`,
-/// `ProxyServerAddress`, `Timezone`); the rest are the EMULATOR's own, for the reason
-/// [`sap_hana_single_fields`] gives.
+/// SAP's names, and the order they are published in, are the SAP-specific keys the
+/// model's own `CreateDeployment` example submits (`ProxyServerAddress`, `Timezone`,
+/// `EnableEbsVolumeEncryption`, `SapSysGroupId`, `SapVirtualIPOptIn`); the rest are the
+/// EMULATOR's own, for the reason [`sap_hana_single_fields`] gives.
 fn workload_specification_fields(workload: &str) -> Vec<SpecificationField> {
     match workload {
         "SAP" => vec![
             spec_field(
-                "SapSysGroupId",
-                "The group id of the SAP system's sapsys group.",
+                "ProxyServerAddress",
+                "The address of the proxy server the SAP instances reach the internet \
+                 through.",
                 &[],
             ),
             spec_field(
-                "SapVirtualIPOptIn",
-                "Whether the SAP instances are reached through a virtual IP address.",
-                &[REQUIRED_YES, REQUIRED_NO],
+                "Timezone",
+                "The time zone the SAP instances are configured with.",
+                &[],
             ),
             spec_field(
                 FIELD_ENABLE_EBS_VOLUME_ENCRYPTION,
@@ -1287,15 +1313,14 @@ fn workload_specification_fields(workload: &str) -> Vec<SpecificationField> {
                 )],
             ),
             spec_field(
-                "ProxyServerAddress",
-                "The address of the proxy server the SAP instances reach the internet \
-                 through.",
+                "SapSysGroupId",
+                "The group id of the SAP system's sapsys group.",
                 &[],
             ),
             spec_field(
-                "Timezone",
-                "The time zone the SAP instances are configured with.",
-                &[],
+                "SapVirtualIPOptIn",
+                "Whether the SAP instances are reached through a virtual IP address.",
+                &[REQUIRED_YES, REQUIRED_NO],
             ),
         ],
         "SQLServer" => vec![
@@ -1369,22 +1394,28 @@ fn two_zone_fields() -> Vec<SpecificationField> {
 }
 
 /// The fields every seeded pattern that installs an SAP HANA database reads.
+///
+/// The names are the SAP deployment specifications AWS documents for a Launch Wizard
+/// SAP database (`DatabaseSystemId`, `DatabaseInstanceNumber`,
+/// `InstallDatabaseSoftware`), which the model links from
+/// `CreateDeployment$specifications` ("SAP deployment specifications"), so a name a
+/// client discovers here is the name AWS reads it under.
 fn hana_database_fields() -> Vec<SpecificationField> {
     vec![
         spec_field(
-            "HanaSid",
+            "DatabaseSystemId",
             "The system id of the SAP HANA database the deployment installs.",
             &[],
         ),
         spec_field(
-            "HanaInstanceType",
-            "The EC2 instance type of the SAP HANA database instances.",
+            "DatabaseInstanceNumber",
+            "The instance number of the SAP HANA database.",
             &[],
         ),
         spec_field(
-            "HanaInstanceNumber",
-            "The instance number of the SAP HANA database.",
-            &[],
+            "InstallDatabaseSoftware",
+            "Whether the deployment installs the SAP HANA database software.",
+            &[REQUIRED_YES, REQUIRED_NO],
         ),
     ]
 }
@@ -1428,6 +1459,58 @@ fn sap_hana_multi_node_fields() -> Vec<SpecificationField> {
             &[],
         ),
     ]);
+    fields
+}
+
+/// The highly available SAP HANA pattern's own fields: the database every HANA pattern
+/// installs, the second instance it replicates to and the cluster that fails over
+/// between them, across TWO Availability Zones.
+///
+/// These names are the SAP deployment specifications AWS documents for a highly
+/// available Launch Wizard SAP HANA deployment — the same source
+/// [`hana_database_fields`] names — so a client that discovers this pattern can build
+/// the `CreateDeployment` AWS accepts for it. They are published in that order because
+/// the order a pattern lists its fields in is the order the service states what a
+/// request still has to supply ([`published_schema_findings`]).
+fn sap_hana_ha_fields() -> Vec<SpecificationField> {
+    let mut fields = hana_database_fields();
+    fields.extend([
+        spec_field(
+            "DatabasePrimaryHostname",
+            "The hostname of the primary SAP HANA database instance.",
+            &[],
+        ),
+        spec_field(
+            "DatabaseSecondaryHostname",
+            "The hostname of the secondary SAP HANA database instance.",
+            &[],
+        ),
+        spec_field(
+            "DatabasePrimarySiteName",
+            "The name of the SAP HANA system replication site holding the primary \
+             database instance.",
+            &[],
+        ),
+        spec_field(
+            "DatabaseSecondarySiteName",
+            "The name of the SAP HANA system replication site holding the secondary \
+             database instance.",
+            &[],
+        ),
+        spec_field(
+            "DatabaseVirtualIpAddress",
+            "The virtual IP address the cluster moves to whichever SAP HANA database \
+             instance is primary.",
+            &[],
+        ),
+        spec_field(
+            "DatabasePacemakerTag",
+            "The tag the Pacemaker cluster of the SAP HANA database instances is \
+             identified by.",
+            &[],
+        ),
+    ]);
+    fields.extend(two_zone_fields());
     fields
 }
 
@@ -1566,16 +1649,43 @@ fn self_managed_ad_fields() -> Vec<SpecificationField> {
 const SAP_HANA_SINGLE_REQUIRED: &[&str] = &[];
 /// See [`SAP_HANA_SINGLE_REQUIRED`].
 const SAP_HANA_MULTI_NODE_REQUIRED: &[&str] = &[
-    "HanaSid",
-    "HanaInstanceType",
+    "DatabaseSystemId",
+    "DatabaseInstanceNumber",
     "AvailabilityZone1",
     "PrivateSubnet1Id",
     "HanaWorkerNodeCount",
 ];
+/// The settings the highly available SAP HANA pattern insists on: every database and
+/// cluster setting it publishes, and the infrastructure and SAP settings a deployment
+/// of it cannot be created without.
+///
+/// This is the set Launch Wizard reports as missing when a `CreateDeployment` for that
+/// pattern supplies none of them (the clause list of [`published_schema_findings`]),
+/// which is what makes it the pattern's required set rather than a choice of this
+/// emulator's. See [`SAP_HANA_SINGLE_REQUIRED`] for why requirement is stated per
+/// pattern; the two Availability Zone settings stay optional here, like the other
+/// placement settings the service picks when the request leaves them out.
+const SAP_HANA_HA_REQUIRED: &[&str] = &[
+    "DisableDeploymentRollback",
+    "SaveDeploymentArtifacts",
+    FIELD_CREATE_SECURITY_GROUP,
+    "Timezone",
+    FIELD_ENABLE_EBS_VOLUME_ENCRYPTION,
+    "SapSysGroupId",
+    "DatabaseSystemId",
+    "DatabaseInstanceNumber",
+    "InstallDatabaseSoftware",
+    "DatabasePrimaryHostname",
+    "DatabaseSecondaryHostname",
+    "DatabasePrimarySiteName",
+    "DatabaseSecondarySiteName",
+    "DatabaseVirtualIpAddress",
+    "DatabasePacemakerTag",
+];
 /// See [`SAP_HANA_SINGLE_REQUIRED`].
 const SAP_NW_ON_HANA_HA_REQUIRED: &[&str] = &[
-    "HanaSid",
-    "HanaInstanceType",
+    "DatabaseSystemId",
+    "DatabaseInstanceNumber",
     "AvailabilityZone1",
     "PrivateSubnet1Id",
     "AvailabilityZone2",
@@ -1750,6 +1860,14 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
             documentation_page: "launch-wizard-sap",
             patterns: &[
                 SeededPattern {
+                    name: "SapHanaHA",
+                    display_name: "SAP HANA, highly available",
+                    description: "Deploys an SAP HANA database as a highly available pair \
+                                  across two Availability Zones.",
+                    own_fields: sap_hana_ha_fields,
+                    own_required: SAP_HANA_HA_REQUIRED,
+                },
+                SeededPattern {
                     name: "SapHanaSingle",
                     display_name: "SAP HANA on a single instance",
                     description: "Deploys an SAP HANA database on one instance.",
@@ -1828,8 +1946,7 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
         .into_iter()
         .map(|workload| {
             let workload_name = workload.name;
-            // The two URLs a catalogue entry publishes, built once per entry so the
-            // workload and every pattern of it name the SAME document.
+            // The two URLs a catalogue entry publishes, built once per entry.
             let documentation_url =
                 format!("{DOCUMENTATION_BASE}/{}.html", workload.documentation_page);
             let icon_url = format!("{ICON_BASE}/{workload_name}.png");
@@ -1844,7 +1961,6 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                             pattern_name: pattern.name.to_string(),
                             display_name: pattern.display_name.to_string(),
                             description: pattern.description.to_string(),
-                            documentation_url: documentation_url.clone(),
                             status: PATTERN_ACTIVE.to_string(),
                             status_message: None,
                             workload_version_name: CATALOGUE_VERSION.to_string(),
@@ -1870,7 +1986,7 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
         .collect()
 }
 
-/// The versions the catalogue publishes for one seeded deployment pattern, oldest
+/// The versions the catalogue publishes for one seeded deployment pattern, newest
 /// first: one per entry of [`CATALOGUE_PATTERN_VERSIONS`].
 ///
 /// A version's description is DERIVED from the pattern's own description and the
@@ -2545,6 +2661,12 @@ fn disallowed_specification_findings(
 /// The findings the pattern's PUBLISHED schema raises over the settings it does define:
 /// a field it marks `required` that the map omits, and a value outside a field's
 /// `allowedValues`.
+///
+/// A required field the map does not carry is stated as the specification that is
+/// MISSING, naming the field and nothing else: the schema is the pattern's own, so the
+/// clause a caller has to act on is which setting to add. The schema is walked in the
+/// order the pattern publishes its fields in, so the clauses arrive in the order the
+/// caller reads the schema in.
 fn published_schema_findings(
     pattern: &DeploymentPattern,
     specifications: &BTreeMap<String, String>,
@@ -2552,10 +2674,9 @@ fn published_schema_findings(
     let mut findings = Vec::new();
     for field in &pattern.specifications {
         match specifications.get(&field.name) {
-            None if field.required => findings.push(format!(
-                "'{}' is required by deployment pattern '{}'",
-                field.name, pattern.pattern_name
-            )),
+            None if field.required => {
+                findings.push(format!("Missing specification {}", field.name))
+            }
             None => {}
             Some(value) => {
                 let allowed = &field.allowed_values;
@@ -2716,6 +2837,26 @@ pub fn to_hash_map_member(map: &BTreeMap<String, String>) -> Option<HashMap<Stri
 /// (`DeploymentSpecificationsData`, `SpecificationsConditionalData`).
 pub fn non_empty_member<T>(items: Vec<T>) -> Option<Vec<T>> {
     (!items.is_empty()).then_some(items)
+}
+
+/// The `accountConstraints` every catalogue view reports: the EMPTY LIST, present on
+/// the wire.
+///
+/// The other half of the rule [`non_empty_member`] states. A list member whose shape's
+/// `@length` admits ZERO elements — `AccountConstraintsList` is
+/// `@length(min: 0, max: 10)` — can carry an empty list, so having nothing to put in it
+/// is said by serialising the empty list; only a member whose floor is at least one
+/// entry has to say it by being absent. The distinction is what a client reads: an
+/// absent member reads as "this is unknown", so a client deciding whether the calling
+/// account may deploy an entry either faults on the missing field or warns about a
+/// constraint it cannot see, where `[]` states what the catalogue knows — that no
+/// constraint applies.
+///
+/// All four views carrying the member (`WorkloadData`, `WorkloadDataSummary`,
+/// `WorkloadDeploymentPatternData`, `WorkloadDeploymentPatternDataSummary`) report it
+/// from here, so no two of them can answer the same question differently.
+pub fn no_account_constraints() -> Option<Vec<AccountConstraint>> {
+    Some(Vec::new())
 }
 
 /// What separates the parts of a [`scoped_cursor`].

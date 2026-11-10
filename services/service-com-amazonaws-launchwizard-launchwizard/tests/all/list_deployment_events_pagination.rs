@@ -30,7 +30,7 @@ use service_com_amazonaws_launchwizard_launchwizard::state::{
 
 use crate::deployment_lifecycle::create;
 use crate::deployment_update::{error_message, one_pattern_per_workload};
-use crate::harness::Harness;
+use crate::harness::{one_page, Harness};
 
 /// Long enough for every clock-owed step a CREATE schedules to come due (the three
 /// `state::TRANSITION_SPAN`s a create walks, plus slack), so the history has stopped
@@ -87,6 +87,10 @@ const ROWS: [Row; 5] = [
 
 /// One page of `ListDeploymentEvents`: the event descriptions it reported, oldest
 /// first, and the token it handed back.
+///
+/// The page itself is read through the shared single-page helper, so this suite and the
+/// others that assert the token contract cannot disagree about how a page is read; what
+/// belongs to this suite is projecting each event onto its description.
 async fn page(
     harness: &Harness,
     case: &str,
@@ -100,12 +104,15 @@ async fn page(
     if let Some(token) = token {
         request.insert("nextToken".to_string(), json!(token));
     }
-    let body = harness
-        .ok(case, "/listDeploymentEvents", Value::Object(request))
-        .await;
-    let described = body["deploymentEvents"]
-        .as_array()
-        .unwrap_or_else(|| panic!("case {case:?}: ListDeploymentEvents reported no list: {body}"))
+    let (events, next) = one_page(
+        harness,
+        case,
+        "/listDeploymentEvents",
+        Value::Object(request),
+        "deploymentEvents",
+    )
+    .await;
+    let described = events
         .iter()
         .map(|event| {
             event["description"]
@@ -114,10 +121,6 @@ async fn page(
                 .to_string()
         })
         .collect();
-    let next = body
-        .get("nextToken")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
     (described, next)
 }
 

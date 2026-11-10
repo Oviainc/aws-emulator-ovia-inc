@@ -221,7 +221,8 @@ async fn a_page_holds_at_most_max_results_and_a_token_resumes_after_it() {
             );
         }
 
-        // The first page of one item names the oldest version and carries a token; the
+        // The first page of one item names the version the pattern currently deploys —
+        // the newest one, which the catalogue publishes first — and carries a token; the
         // page that token resumes names the next one.
         let case = format!("{workload}/{pattern} first page of one");
         let first = harness
@@ -231,7 +232,7 @@ async fn a_page_holds_at_most_max_results_and_a_token_resumes_after_it() {
         assert_eq!(
             page,
             vec![CATALOGUE_PATTERN_VERSIONS[0].to_string()],
-            "case {case:?}: the first page must name the oldest published version, got {page:?}"
+            "case {case:?}: the first page must name the newest published version, got {page:?}"
         );
         let token = first["nextToken"]
             .as_str()
@@ -316,8 +317,8 @@ async fn a_page_holds_at_most_max_results_and_a_token_resumes_after_it() {
 async fn update_from_version_reports_the_versions_an_update_can_move_onto() {
     let harness = Harness::new();
     let whole = published();
-    let oldest = CATALOGUE_PATTERN_VERSIONS[0];
-    let newest = CATALOGUE_PATTERN_VERSIONS[CATALOGUE_PATTERN_VERSIONS.len() - 1];
+    let newest = CATALOGUE_PATTERN_VERSIONS[0];
+    let oldest = CATALOGUE_PATTERN_VERSIONS[CATALOGUE_PATTERN_VERSIONS.len() - 1];
 
     // One row per shape the rule generalises over: each published starting version,
     // several starting versions at once (OR-joined), a starting version the pattern does

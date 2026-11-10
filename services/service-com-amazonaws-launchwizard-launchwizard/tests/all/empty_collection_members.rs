@@ -38,24 +38,33 @@ const MAX_TAGS: usize = 200;
 const WORKLOAD: &str = "SAP";
 
 /// Every structure MEMBER name, as it travels on the wire, whose target is a map or a
-/// list the model gives a length floor of at least one entry: the members an empty
-/// collection is not a legal value for.
+/// list whose own `@length` minimum satisfies `admits`.
 ///
-/// Read off `smithy-model/` rather than written out here, so this suite cannot assert
-/// the rule for a member that no longer carries a floor, nor miss one that gained it.
-fn members_with_a_floor(model: &Value) -> BTreeSet<String> {
+/// The ONE model walk both halves of the empty-collection rule are read with: this suite
+/// asks for the members an empty collection is NOT a legal value for
+/// (`@length(min: >= 1)`), and `catalogue_aws_deployment_patterns.rs` for the ones it IS
+/// (`@length(min: 0)`), so the two cannot drift apart in how they read the model.
+/// `admits` is given the declared minimum, or `None` when the target declares no
+/// `@length` at all — which is neither half of the rule: a shape with no `@length` states
+/// nothing about zero elements, so what the service reports for such a member is its own
+/// choice rather than something the model fixes.
+///
+/// Read off `smithy-model/` rather than written out here, so neither suite can assert
+/// its half of the rule for a member that no longer carries that target, nor miss one
+/// that gained it.
+pub(crate) fn collection_members_where(
+    model: &Value,
+    admits: impl Fn(Option<u64>) -> bool,
+) -> BTreeSet<String> {
     let shapes = model["shapes"]
         .as_object()
         .expect("the model carries a shapes map");
 
-    // The collection shapes whose own `@length` forbids zero entries.
-    let floored: BTreeSet<&String> = shapes
+    let selected: BTreeSet<&String> = shapes
         .iter()
         .filter(|(_, shape)| {
             matches!(shape["type"].as_str(), Some("map") | Some("list"))
-                && shape["traits"]["smithy.api#length"]["min"]
-                    .as_u64()
-                    .is_some_and(|min| min >= 1)
+                && admits(shape["traits"]["smithy.api#length"]["min"].as_u64())
         })
         .map(|(id, _)| id)
         .collect();
@@ -70,7 +79,7 @@ fn members_with_a_floor(model: &Value) -> BTreeSet<String> {
         };
         for (name, member) in declared {
             let target = member["target"].as_str().unwrap_or_default().to_string();
-            if !floored.contains(&target) {
+            if !selected.contains(&target) {
                 continue;
             }
             // `@jsonName` renames a member on the wire; without one the member name
@@ -82,6 +91,12 @@ fn members_with_a_floor(model: &Value) -> BTreeSet<String> {
         }
     }
     members
+}
+
+/// The members an empty collection is not a legal value for: those whose target gives a
+/// length floor of at least one entry. See [`collection_members_where`].
+fn members_with_a_floor(model: &Value) -> BTreeSet<String> {
+    collection_members_where(model, |min| min.is_some_and(|min| min >= 1))
 }
 
 /// Assert no floored member anywhere in `value` carries an empty collection.

@@ -82,17 +82,24 @@ async fn a_reported_workload_carries_only_members_read_off_the_stored_entry() {
             );
         }
 
-        // And the members the emulator holds nothing for: it models no account
-        // constraints, and an entry in a steady status has nothing to say about it. An
-        // absent member is the honest answer there.
-        for member in ["statusMessage", "accountConstraints"] {
-            assert!(
-                absent(&workload, member),
-                "case {name:?}: {member} must be absent while the emulator holds no value \
-                 for it, got {}",
-                workload[member]
-            );
-        }
+        // And the members the emulator holds nothing for: an entry in a steady status
+        // has nothing to say about it, so `statusMessage` is absent. `accountConstraints`
+        // is NOT one of them: its list admits zero elements, so "no account constrains
+        // this entry" is reported as the empty list rather than by leaving the member
+        // out — the rule `tests/all/catalogue_aws_deployment_patterns.rs` tables.
+        assert!(
+            absent(&workload, "statusMessage"),
+            "case {name:?}: statusMessage must be absent while the emulator holds no value \
+             for it, got {}",
+            workload["statusMessage"]
+        );
+        assert_eq!(
+            workload["accountConstraints"],
+            json!([]),
+            "case {name:?}: accountConstraints must be the empty list for an entry no \
+             account constraint applies to, got {}",
+            workload["accountConstraints"]
+        );
     }
 }
 

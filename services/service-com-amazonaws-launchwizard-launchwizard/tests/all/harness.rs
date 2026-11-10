@@ -249,6 +249,32 @@ pub async fn catalogue(harness: &Harness) -> Vec<String> {
         .collect()
 }
 
+/// One page of a paginated operation: the items `items_member` carried, and the
+/// continuation token the page handed back (`None` when it handed none).
+///
+/// The ONE single-page read in this crate, beside [`walk_pages`] which walks every page:
+/// a suite that asserts the token contract itself — that a token comes back exactly while
+/// items remain, and that it resumes where the page ended — reads one page through here
+/// rather than copying the member lookup and the token lookup per suite.
+pub async fn one_page(
+    harness: &Harness,
+    case: &str,
+    path: &str,
+    body: Value,
+    items_member: &str,
+) -> (Vec<Value>, Option<String>) {
+    let reply = harness.ok(case, path, body).await;
+    let items = reply[items_member]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: {path} reported no {items_member}: {reply}"))
+        .clone();
+    let token = reply
+        .get("nextToken")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    (items, token)
+}
+
 /// Walk every page of a paginated operation at `page_size`, returning the items in
 /// order. Asserts the token contract: a token only when items remain, and resumption
 /// exactly where the previous page ended.

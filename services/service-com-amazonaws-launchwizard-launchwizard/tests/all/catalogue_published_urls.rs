@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end cover for the URLs the service-owned workload catalogue publishes:
-//! `WorkloadData$documentationUrl` and `WorkloadData$iconUrl` (reported by
-//! `GetWorkload`) and `DeploymentPatternVersionDataSummary$documentationUrl` (reported
-//! by `GetDeploymentPatternVersion`), driven over HTTP through the same router the
-//! production emulator serves with.
+//! `WorkloadData$documentationUrl` and `WorkloadData$iconUrl`, reported by
+//! `GetWorkload`, driven over HTTP through the same router the production emulator
+//! serves with.
 //!
 //! The rule under test is not about one entry: a reporting operation answers every
 //! member of its output shape that the catalogue entry it projects holds a value for,
 //! and a catalogue entry holds the document and the icon the service publishes for it.
 //! So each of those members is reported for EVERY entry, as an absolute URL that is the
-//! entry's own and that reading does not change.
+//! entry's own and that reading does not change — and a member the entry holds NO value
+//! for is left out rather than filled from another record, which is why a deployment
+//! pattern VERSION publishes no document of its own: the catalogue publishes one
+//! deployment document per application, not one per pattern version.
 //!
 //! Every assertion therefore runs over a TABLE: every workload the catalogue reports
 //! (not only the one entry the report cited), every deployment pattern of each, and
@@ -166,7 +168,7 @@ async fn the_listing_reports_no_url_member_its_summary_shape_does_not_declare() 
 }
 
 #[tokio::test]
-async fn every_published_version_reports_the_document_of_the_workload_it_belongs_to() {
+async fn no_published_version_reports_a_document_of_its_own() {
     let harness = Harness::new();
     assert!(
         CATALOGUE_PATTERN_VERSIONS.len() >= 2,
@@ -177,7 +179,9 @@ async fn every_published_version_reports_the_document_of_the_workload_it_belongs
     // the member being read off the stored record, so it holds for every version of
     // every pattern of every workload and not only the newest of one.
     for (workload, pattern) in every_pattern(&harness).await {
-        let expected = url_member(
+        // The document the catalogue DOES publish for the application, which the
+        // workload's own view reports.
+        let document = url_member(
             &get_workload(&harness, &workload, &workload).await,
             &workload,
             "documentationUrl",
@@ -185,18 +189,19 @@ async fn every_published_version_reports_the_document_of_the_workload_it_belongs
         for version in CATALOGUE_PATTERN_VERSIONS {
             let case = format!("{workload}/{pattern}@{version}");
             let summary = get_version(&harness, &case, &workload, &pattern, version).await;
-            let url = url_member(&summary, &case, "documentationUrl");
+            // `DeploymentPatternVersionDataSummary$documentationUrl` is the document of
+            // THAT VERSION, and the catalogue publishes none per version, so the member
+            // is absent rather than filled with the application's document.
             assert!(
-                absolute_https_url(&url),
-                "case {case:?}: documentationUrl must be an absolute https URL, got {url:?}"
+                summary.get("documentationUrl").is_none_or(Value::is_null),
+                "case {case:?}: a version publishes no document of its own, so the member must \
+                 be left out, got {}",
+                summary["documentationUrl"]
             );
-            // The catalogue publishes one deployment document per application, and both
-            // views read it off the same catalogue record, so a version cannot name a
-            // document that disagrees with its workload's.
-            assert_eq!(
-                url, expected,
-                "case {case:?}: a version must name its workload's document {expected:?}, got \
-                 {url:?}"
+            assert!(
+                !summary.to_string().contains(&document),
+                "case {case:?}: a version must not report the application's document \
+                 {document:?} as its own, got {summary}"
             );
         }
     }

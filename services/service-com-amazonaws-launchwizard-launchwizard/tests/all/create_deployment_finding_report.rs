@@ -66,6 +66,12 @@ fn disallowed_specification(key: &str) -> String {
     format!("Specification {key} is not allowed.")
 }
 
+/// The finding a specification the pattern marks required but the request omits raises:
+/// fixed text around the name of the specification that is missing.
+pub(crate) fn missing_specification(name: &str) -> String {
+    format!("Missing specification {name}.")
+}
+
 /// The finding a deployment name outside [`NAME_PATTERN`] raises: fixed text around the
 /// member's wire name and the expression it was judged against.
 fn name_mismatch() -> String {
@@ -281,9 +287,7 @@ async fn every_finding_a_create_raises_is_accumulated_into_the_one_message() {
                 findings: [
                     disallowed(2),
                     vec![name_mismatch()],
-                    vec![format!(
-                        "'{required}' is required by deployment pattern '{pattern}'."
-                    )],
+                    vec![missing_specification(&required)],
                 ]
                 .concat(),
             });
