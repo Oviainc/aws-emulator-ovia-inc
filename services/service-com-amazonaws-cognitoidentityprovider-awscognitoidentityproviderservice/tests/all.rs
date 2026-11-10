@@ -199,6 +199,8 @@ mod resource_tags;
 mod revocation_links_and_mfa_setup;
 #[path = "all/revoke_token.rs"]
 mod revoke_token;
+#[path = "all/revoked_session_refusal_sentence.rs"]
+mod revoked_session_refusal_sentence;
 #[path = "all/risk_configuration.rs"]
 mod risk_configuration;
 #[path = "all/self_service_refusal_wire.rs"]
