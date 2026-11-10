@@ -332,21 +332,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The operation's own client error (HTTP 400) for a request Athena itself refuses:
-/// "Indicates that something is wrong with the input to the request."
-fn invalid_request(message: String) -> ListTableMetadataError {
-    ListTableMetadataErrorModeled::InvalidRequestException(InvalidRequestException {
-        athena_error_code: None,
-        message: Some(message),
-    })
-    .into()
+/// "Indicates that something is wrong with the input to the request." The catalog and the
+/// `Expression` this listing refuses on are the request's own members, so the refusal
+/// carries the code for a request at fault
+/// ([`crate::state::ERROR_CODE_INVALID_INPUT`]).
+fn invalid_request(message: impl Into<String>) -> ListTableMetadataError {
+    ListTableMetadataError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }
 
 /// The operation's own client error (HTTP 400) for what the METASTORE answered: "An
 /// exception that Athena received when it called a custom metastore. Occurs if the error
 /// is not caused by user input (InvalidRequestException) or from the Athena platform."
-fn metadata_exception(message: String) -> ListTableMetadataError {
+fn metadata_exception(message: impl Into<String>) -> ListTableMetadataError {
     ListTableMetadataErrorModeled::MetadataException(MetadataException {
-        message: Some(message),
+        message: Some(message.into()),
     })
     .into()
 }

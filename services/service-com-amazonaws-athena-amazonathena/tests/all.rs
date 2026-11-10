@@ -35,6 +35,9 @@ mod query_execution_lifecycle;
 #[path = "all/query_result_outputs.rs"]
 mod query_result_outputs;
 
+#[path = "all/refusal_bodies.rs"]
+mod refusal_bodies;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

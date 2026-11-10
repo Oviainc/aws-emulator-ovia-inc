@@ -561,7 +561,7 @@ async fn an_import_needs_a_spark_enabled_workgroup_that_holds_the_name_free() {
             "a workgroup this account does not hold",
             "never-created",
             "new.ipynb",
-            state::work_group_not_found("never-created"),
+            state::WORK_GROUP_NOT_FOUND.to_string(),
         ),
         (
             "Athena's own default workgroup, which runs SQL",

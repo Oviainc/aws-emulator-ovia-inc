@@ -157,9 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Athena models no not-found error for this operation; naming a workgroup
             // that does not exist is "something wrong with the input to the request",
             // which is what `InvalidRequestException` (HTTP 400) reports.
-            return Err(invalid_request(crate::state::work_group_not_found(
-                &input.work_group,
-            )));
+            return Err(invalid_request(crate::state::WORK_GROUP_NOT_FOUND));
         };
 
         // The updates are applied to a COPY, so a configuration refused below leaves the
@@ -315,13 +313,10 @@ fn names_something(result: &ResultConfiguration) -> bool {
 
 /// The operation's own client error (HTTP 400), carrying `message`.
 ///
-/// Every refusal above is a bad request rather than an unwritten operation, and
 /// `InvalidRequestException` is the client error this operation models: "Indicates that
-/// something is wrong with the input to the request."
-fn invalid_request(message: String) -> UpdateWorkGroupError {
-    UpdateWorkGroupErrorModeled::InvalidRequestException(InvalidRequestException {
-        athena_error_code: None,
-        message: Some(message),
-    })
-    .into()
+/// something is wrong with the input to the request." Each refusal here is caused by the
+/// request itself — a workgroup that does not exist, a configuration larger than one can
+/// hold — which is the class [`crate::state::ERROR_CODE_INVALID_INPUT`] names.
+fn invalid_request(message: impl Into<String>) -> UpdateWorkGroupError {
+    UpdateWorkGroupError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }

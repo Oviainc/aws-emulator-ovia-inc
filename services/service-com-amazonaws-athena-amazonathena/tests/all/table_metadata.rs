@@ -808,7 +808,9 @@ async fn refusals_name_what_was_asked_for() {
                 "TableName": "no_such_table"
             }),
             "MetadataException",
-            "no_such_table",
+            // The metastore's own answer for a table it does not hold, which names no
+            // entity of the request.
+            service_com_amazonaws_athena_amazonathena::state::table_not_found(),
         ),
     ];
 

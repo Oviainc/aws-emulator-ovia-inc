@@ -274,30 +274,31 @@ pub fn glue_data_catalog_id() -> String {
 
 /// The refusal message for a read whose named data catalog this account does not hold.
 ///
-/// NOT recorded: what is pinned is the behaviour — HTTP 400 with the operation's own
-/// `InvalidRequestException`, naming a catalog being a problem with the input rather than
-/// one the metastore reported — and the sentence names the kind of entity and the
-/// requested name, the way this service's other per-resource misses do (`GetWorkGroup`'s
-/// "WorkGroup {name} is not found."). ONE sentence for the class, so every operation that
-/// answers it words it identically.
+/// The template is the one every Athena resource miss follows — the kind of entity, the
+/// name the request addressed, and "was not found" — which is also how an execution miss
+/// is worded ([`query_execution_not_found`]). ONE sentence for the class, so every
+/// operation that answers a catalog miss words it identically.
 pub fn data_catalog_not_found(catalog_name: &str) -> String {
-    format!("DataCatalog {catalog_name} is not found.")
+    format!("DataCatalog {catalog_name} was not found.")
 }
 
 /// The refusal message for a metadata read whose `DatabaseName` names no database the
-/// addressed data catalog holds. The miss is the METASTORE's answer, which is why it is
-/// reported as `MetadataException` rather than as a bad request, and the sentence is the
-/// Hive-metastore wording for an absent namespace, built from the requested name.
+/// addressed data catalog holds.
+///
+/// The miss is the METASTORE's answer, which is why it is reported as `MetadataException`
+/// rather than as a bad request — and the sentence is therefore the metastore's own, taken
+/// from the Data Catalog this read resolved against rather than composed here, so a
+/// database miss reads the same whether a client asked Athena or asked the catalog.
 pub fn database_not_found(database_name: &str) -> String {
-    format!("Database does not exist: {database_name}")
+    glue_state::messages::database_not_found(database_name)
 }
 
 /// The refusal message for a metadata read whose `TableName` names no table the
 /// addressed database holds. The per-kind counterpart of [`database_not_found`]: the same
-/// metastore answers it, so it is the same `MetadataException` and follows the same
-/// template, built from the requested name.
-pub fn table_not_found(table_name: &str) -> String {
-    format!("Table does not exist: {table_name}")
+/// metastore answers it, so the sentence is that metastore's own wording for a table its
+/// store does not hold, which names no entity of the request.
+pub fn table_not_found() -> &'static str {
+    glue_state::messages::TABLE_ENTITY_NOT_FOUND
 }
 
 /// The refusal message for a listing whose `Expression` is no pattern the catalog can
@@ -1338,8 +1339,13 @@ fn output_location(configuration: Option<&ResultConfiguration>) -> Option<&str> 
 /// The message a query with nowhere to write its results is refused with: the error the
 /// `ResultConfiguration$OutputLocation` sentence quoted on
 /// [`resolved_result_configuration`] calls for.
-pub const NO_OUTPUT_LOCATION: &str = "No output location provided. An output location is \
-     required either through the Workgroup result configuration setting or as an API input.";
+/// Wholly fixed text: it states the rule and the two ways of satisfying it, and
+/// interpolates nothing from the request.
+pub const NO_OUTPUT_LOCATION: &str = concat!(
+    "No output location provided. You did not provide an output location for  your query ",
+    "results. Either specify an S3 bucket location or enable Athena managed query results ",
+    "in your workgroup settings."
+);
 
 /// The message a `StartQueryExecution` that reuses a `ClientRequestToken` under changed
 /// parameters is refused with. `ClientRequestToken` documents it: "An error is returned
@@ -1391,26 +1397,47 @@ pub fn query_execution_not_found(id: &str) -> String {
 
 /// The message an operation addressing a workgroup this account holds none of answers
 /// with.
-pub fn work_group_not_found(name: &str) -> String {
-    format!("WorkGroup {name} is not found.")
-}
+///
+/// Wholly fixed text: the workgroup the request named is NOT interpolated into it, so
+/// every operation that resolves a `WorkGroup` — a read of one, an update of one, a query
+/// submitted to one, a notebook imported into one — states this one sentence.
+pub const WORK_GROUP_NOT_FOUND: &str = "WorkGroup is not found.";
+
+/// The message a create of a workgroup under a name this account already holds one under
+/// answers with. Fixed text as well, and with no closing period: the name the request
+/// carried is the caller's own and is not echoed back.
+pub const WORK_GROUP_ALREADY_CREATED: &str = "WorkGroup is already created";
 
 /// The message a query submitted to a workgroup in state [`WORK_GROUP_STATE_DISABLED`]
 /// is refused with.
 ///
 /// A workgroup's state is what decides whether queries may run in it — Athena documents
 /// that members of a disabled workgroup cannot submit queries to it — so a submission to
-/// a disabled workgroup is refused rather than queued. Worded beside
-/// [`work_group_not_found`], so the two per-workgroup refusals name the addressed
-/// workgroup the same way.
+/// a disabled workgroup is refused rather than queued. Not recorded, unlike the miss
+/// [`WORK_GROUP_NOT_FOUND`] states, so this one still names the workgroup it refused.
 pub fn work_group_disabled(name: &str) -> String {
     format!("WorkGroup {name} is disabled.")
 }
 
-/// The `ErrorCode` `BatchGetQueryExecution` reports beside
-/// [`query_execution_not_found`] for an id this account holds no execution for: the id
-/// is the caller's own input, which is what `INVALID_INPUT` names.
+/// The error code of a refusal whose cause is the request itself: a member naming a
+/// resource this account does not hold, a name already taken, a value outside a rule this
+/// service enforces. The code every Athena refusal carries unless the refusal class has
+/// one of its own ([`ERROR_CODE_QUERY_EXECUTION_NOT_FOUND`],
+/// [`ERROR_CODE_INVALID_QUERY_EXECUTION_STATE`]), and the one
+/// `BatchGetQueryExecution` reports beside [`query_execution_not_found`] on an
+/// `UnprocessedQueryExecutionId`.
 pub const ERROR_CODE_INVALID_INPUT: &str = "INVALID_INPUT";
+
+/// The error code of a refusal whose cause is that the `QueryExecutionId` names no
+/// execution this account minted: its own class, so a poller can tell a permanent miss
+/// from any other bad request and stop.
+pub const ERROR_CODE_QUERY_EXECUTION_NOT_FOUND: &str = "QUERY_EXECUTION_NOT_FOUND";
+
+/// The error code of a refusal whose cause is the STATE the addressed execution is in
+/// rather than the request: a read of results of a query that has not finished, or that
+/// did not finish successfully. Its own class, so a client can tell "poll again" from a
+/// request it must not repeat.
+pub const ERROR_CODE_INVALID_QUERY_EXECUTION_STATE: &str = "INVALID_QUERY_EXECUTION_STATE";
 
 /// The message `GetQueryResults` refuses a query that has not finished with.
 pub fn query_not_yet_finished(state: &str) -> String {

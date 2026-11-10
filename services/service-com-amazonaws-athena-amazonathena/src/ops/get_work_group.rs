@@ -147,14 +147,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.work_groups.get(&input.work_group) else {
             // Athena models no not-found error for this operation; naming a workgroup
             // that does not exist is "something wrong with the input to the request",
-            // which is what `InvalidRequestException` (HTTP 400) reports.
-            return Err(GetWorkGroupErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    athena_error_code: None,
-                    message: Some(crate::state::work_group_not_found(&input.work_group)),
-                },
-            )
-            .into());
+            // which is what `InvalidRequestException` (HTTP 400) reports, under the code
+            // for a refusal the request itself caused.
+            return Err(GetWorkGroupError::invalid_request(
+                crate::state::ERROR_CODE_INVALID_INPUT,
+                crate::state::WORK_GROUP_NOT_FOUND,
+            ));
         };
 
         Ok(GetWorkGroupOutput {

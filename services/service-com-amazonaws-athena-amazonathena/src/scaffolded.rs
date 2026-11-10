@@ -40,6 +40,16 @@
 //! place it can return an error its own model does not declare — `validation` above,
 //! for a service whose model carries no client-input error. Delete the wrapper and the
 //! handler has no way to refuse a bad request at all.
+//!
+//! ## This service's own refusals
+//!
+//! It is also where an Athena refusal is stated: [`Scaffolded::invalid_request`] renders the
+//! modelled `InvalidRequestException` (HTTP 400) with the refusal CLASS as a code, carried
+//! under the member the model declares (`AthenaErrorCode`) AND under the name the wire also
+//! gives it (`ErrorCode`). That second name is not in the on-disk model, so the body is
+//! built by [`AthenaRefusal`] rather than by the derive, which admits exactly the model's
+//! member list. A handler that refuses a request reaches for that constructor rather than
+//! the modelled error struct, so no refusal can leave the code out.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -177,6 +187,121 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `AthenaErrorCode` member of this service's own refusal body, as the model declares
+/// it on `InvalidRequestException` (`AthenaErrorCode: ErrorCode`, the first of that
+/// shape's two members).
+static ATHENA_REFUSAL_ATHENA_ERROR_CODE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.athena#InvalidRequestException$AthenaErrorCode",
+        "com.amazonaws.athena",
+        "AthenaErrorCode",
+    ),
+    ShapeType::String,
+    "AthenaErrorCode",
+    0,
+);
+
+/// The `Message` member of that same shape, its second member.
+static ATHENA_REFUSAL_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.athena#InvalidRequestException$Message",
+        "com.amazonaws.athena",
+        "Message",
+    ),
+    ShapeType::String,
+    "Message",
+    1,
+)
+.with_xml_name("Message");
+
+/// The `ErrorCode` member this service carries BESIDE `AthenaErrorCode`, holding the same
+/// value: the wire name a client reads the refusal's code under.
+///
+/// The on-disk model declares no such member — `#[smithy_macros::smithy(shape = ...)]`
+/// admits exactly the model's member list, which is why this body is built here rather
+/// than through the derive — so its shape id sits in a namespace of its own, where it can
+/// neither claim to be modelled nor collide with a member the model may declare later, and
+/// it is appended after the members the model does declare.
+static ATHENA_REFUSAL_ERROR_CODE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "aws.recorded.athena#InvalidRequestException$ErrorCode",
+        "aws.recorded.athena",
+        "ErrorCode",
+    ),
+    ShapeType::String,
+    "ErrorCode",
+    2,
+)
+.with_xml_name("ErrorCode");
+
+/// Schema for the BODY of a refusal this service states itself: the modelled
+/// `InvalidRequestException` members plus the `ErrorCode` alias above.
+pub static ATHENA_REFUSAL_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "com.amazonaws.athena#InvalidRequestException",
+        "com.amazonaws.athena",
+        "InvalidRequestException",
+    ),
+    ShapeType::Structure,
+    &[
+        &ATHENA_REFUSAL_ATHENA_ERROR_CODE,
+        &ATHENA_REFUSAL_MESSAGE,
+        &ATHENA_REFUSAL_ERROR_CODE,
+    ],
+);
+
+/// The wire error code (`__type`) of that refusal: the shape the model binds for a request
+/// this service itself refuses.
+pub const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
+
+/// Its HTTP status, the `httpError` the model carries on that shape.
+pub const INVALID_REQUEST_STATUS: u16 = 400;
+
+/// One refusal this service states itself: an `InvalidRequestException` carrying the code
+/// of the refusal CLASS and the sentence that states it.
+///
+/// It exists because the refusal body carries one member the on-disk model does not
+/// declare (see [`ATHENA_REFUSAL_ERROR_CODE`]): a client branches on the code, and reads it
+/// under either name, so both names carry it and neither can be left out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AthenaRefusal {
+    /// The refusal class, reported as both `AthenaErrorCode` and `ErrorCode`.
+    pub error_code: &'static str,
+    /// What was wrong with the request, as the service words that class of refusal.
+    pub message: String,
+}
+
+impl AthenaRefusal {
+    /// The refusal of class `error_code`, stating `message`.
+    pub fn new(error_code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            error_code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AthenaRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{INVALID_REQUEST_EXCEPTION} [{}]: {}",
+            self.error_code, self.message
+        )
+    }
+}
+
+impl std::error::Error for AthenaRefusal {}
+
+impl SerializableStruct for AthenaRefusal {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&ATHENA_REFUSAL_ATHENA_ERROR_CODE, self.error_code)?;
+        s.write_string(&ATHENA_REFUSAL_MESSAGE, self.message.as_str())?;
+        s.write_string(&ATHENA_REFUSAL_ERROR_CODE, self.error_code)?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +310,11 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// A request this service refuses itself: HTTP 400 `InvalidRequestException`, carrying
+    /// the refusal's code under both names the wire gives it. It cannot travel as
+    /// [`Modeled`](Self::Modeled) because one of those names is not a member the model
+    /// declares.
+    InvalidRequest(AthenaRefusal),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -202,6 +332,16 @@ impl<E> Scaffolded<E> {
     /// The scaffold signal for `operation`.
     pub fn not_implemented(operation: &str) -> Self {
         Self::NotImplemented(NotImplemented::new(operation))
+    }
+
+    /// Refuse the request the way this service states its own refusals: HTTP 400
+    /// `InvalidRequestException` of class `error_code`, stating `message`.
+    ///
+    /// Reach for this rather than the modelled `InvalidRequestException` wherever a
+    /// handler refuses a request itself: the code travels under both wire names only
+    /// through this channel.
+    pub fn invalid_request(error_code: &'static str, message: impl Into<String>) -> Self {
+        Self::InvalidRequest(AthenaRefusal::new(error_code, message))
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
@@ -228,6 +368,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::InvalidRequest(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +381,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::InvalidRequest(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +396,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::InvalidRequest(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +405,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::InvalidRequest(_) => &ATHENA_REFUSAL_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +418,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            // The shape the model binds for a request this service itself refuses, which
+            // is the code a client branches on.
+            Self::InvalidRequest(_) => INVALID_REQUEST_EXCEPTION,
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +433,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            Self::InvalidRequest(_) => INVALID_REQUEST_STATUS,
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,6 +445,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
+            // This service speaks awsJson1_1, and the modelled shape carries no
+            // `awsQueryError` trait, so there is no query code to honour.
+            Self::InvalidRequest(_) => None,
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }

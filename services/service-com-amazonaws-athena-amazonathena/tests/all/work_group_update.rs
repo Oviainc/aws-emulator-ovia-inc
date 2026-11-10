@@ -695,7 +695,7 @@ async fn an_update_of_a_work_group_the_registry_does_not_hold_is_refused() {
         );
         assert_eq!(
             body["Message"].as_str(),
-            Some(state::work_group_not_found(case).as_str()),
+            Some(state::WORK_GROUP_NOT_FOUND),
             "case {case:?}: expected the not-found sentence, got {body:?}"
         );
     }

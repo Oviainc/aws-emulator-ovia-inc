@@ -1022,9 +1022,8 @@ async fn a_work_group_this_account_does_not_have_is_refused() {
             );
             assert_eq!(
                 answer["Message"].as_str(),
-                work_group.map(state::work_group_not_found).as_deref(),
-                "case {case:?}: {operation} must name the workgroup it could not find, got \
-                 {answer:?}"
+                Some(state::WORK_GROUP_NOT_FOUND),
+                "case {case:?}: {operation} must state the workgroup miss, got {answer:?}"
             );
         }
     }

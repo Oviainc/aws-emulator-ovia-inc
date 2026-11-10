@@ -224,8 +224,8 @@ pub fn notebook_name_exists(work_group: &str, name: &str) -> String {
 
 /// The message an operation that needs a Spark enabled workgroup
 /// ([`is_spark_enabled`]) is refused with when the workgroup it named runs Athena SQL.
-/// Worded beside [`work_group_not_found`] and [`work_group_disabled`], so the
-/// per-workgroup refusals name the addressed workgroup the same way.
+/// Worded beside [`work_group_disabled`], the other per-workgroup refusal this emulator
+/// words itself, so both name the addressed workgroup the same way.
 pub fn work_group_not_spark_enabled(name: &str) -> String {
     format!("WorkGroup {name} is not a Spark enabled workgroup.")
 }

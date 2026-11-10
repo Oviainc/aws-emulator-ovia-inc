@@ -166,10 +166,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // query here writes one (`DataManifestLocation` is reported for none), so there
         // is no manifest to page rather than an empty one to invent.
         if input.query_result_type.as_deref() == Some(QUERY_RESULT_TYPE_DATA_MANIFEST) {
-            return Err(invalid_request(format!(
-                "Query result type {QUERY_RESULT_TYPE_DATA_MANIFEST} is not available: this \
-                 query wrote no data manifest"
-            )));
+            return Err(invalid_request(
+                crate::state::ERROR_CODE_INVALID_INPUT,
+                format!(
+                    "Query result type {QUERY_RESULT_TYPE_DATA_MANIFEST} is not available: this \
+                     query wrote no data manifest"
+                ),
+            ));
         }
         // "The maximum number of results (rows) to return in this request", bounded by
         // the modelled maximum so a request that names none still pages.
@@ -190,9 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         let Some(record) = store.query_execution(&input.query_execution_id) else {
-            return Err(invalid_request(crate::state::query_execution_not_found(
-                &input.query_execution_id,
-            )));
+            return Err(invalid_request(
+                crate::state::ERROR_CODE_QUERY_EXECUTION_NOT_FOUND,
+                crate::state::query_execution_not_found(&input.query_execution_id),
+            ));
         };
 
         let now = ::std::time::SystemTime::now();
@@ -210,11 +214,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation reports for it, and the diagnostic of a failed statement is read from
         // the execution's `StateChangeReason` and `AthenaError`.
         let Some(result) = record.readable_result_at(now) else {
-            return Err(invalid_request(if record.is_terminal_at(now) {
-                crate::state::query_did_not_succeed(state_name)
-            } else {
-                crate::state::query_not_yet_finished(state_name)
-            }));
+            // The refusal's cause is the STATE the execution is in rather than anything
+            // the request got wrong, which is the class the code reports.
+            return Err(invalid_request(
+                crate::state::ERROR_CODE_INVALID_QUERY_EXECUTION_STATE,
+                if record.is_terminal_at(now) {
+                    crate::state::query_did_not_succeed(state_name)
+                } else {
+                    crate::state::query_not_yet_finished(state_name)
+                },
+            ));
         };
 
         let position = match input.next_token.as_deref() {
@@ -224,7 +233,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     store.results_page_position(&input.query_execution_id, token)
                 else {
                     return Err(invalid_request(
-                        crate::state::INVALID_NEXT_TOKEN.to_string(),
+                        crate::state::ERROR_CODE_INVALID_INPUT,
+                        crate::state::INVALID_NEXT_TOKEN,
                     ));
                 };
                 position
@@ -297,14 +307,12 @@ fn label_row(column_info: &[ColumnInfo]) -> Row {
     }
 }
 
-/// The operation's own client error (HTTP 400), carrying `message`.
+/// The operation's own client error (HTTP 400): `InvalidRequestException` of class
+/// `error_code`, carrying `message`.
 ///
 /// `InvalidRequestException` is the client error this operation models: "Indicates that
-/// something is wrong with the input to the request."
-fn invalid_request(message: String) -> GetQueryResultsError {
-    GetQueryResultsErrorModeled::InvalidRequestException(InvalidRequestException {
-        athena_error_code: None,
-        message: Some(message),
-    })
-    .into()
+/// something is wrong with the input to the request." The code names WHICH refusal it is,
+/// and is what a client branches on.
+fn invalid_request(error_code: &'static str, message: impl Into<String>) -> GetQueryResultsError {
+    GetQueryResultsError::invalid_request(error_code, message)
 }

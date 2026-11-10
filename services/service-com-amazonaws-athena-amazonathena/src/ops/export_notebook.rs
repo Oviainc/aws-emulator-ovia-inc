@@ -152,14 +152,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.notebooks.notebook(&input.notebook_id) else {
             // Athena models no not-found error for this operation; naming a notebook that
             // does not exist is "something wrong with the input to the request", which is
-            // what `InvalidRequestException` (HTTP 400) reports.
-            return Err(ExportNotebookErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    athena_error_code: None,
-                    message: Some(crate::state::notebook_not_found(&input.notebook_id)),
-                },
-            )
-            .into());
+            // what `InvalidRequestException` (HTTP 400) reports, under the code for a
+            // refusal the request itself caused.
+            return Err(ExportNotebookError::invalid_request(
+                crate::state::ERROR_CODE_INVALID_INPUT,
+                crate::state::notebook_not_found(&input.notebook_id),
+            ));
         };
 
         // "The content of the exported notebook" is the content that was stored, handed

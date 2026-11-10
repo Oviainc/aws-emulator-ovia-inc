@@ -151,16 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.query_execution(&input.query_execution_id) else {
             // Athena models no not-found error for this operation; naming an execution
             // that does not exist is "something wrong with the input to the request",
-            // which is what `InvalidRequestException` (HTTP 400) reports.
-            return Err(GetQueryExecutionErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    athena_error_code: None,
-                    message: Some(crate::state::query_execution_not_found(
-                        &input.query_execution_id,
-                    )),
-                },
-            )
-            .into());
+            // which is what `InvalidRequestException` (HTTP 400) reports — under the code
+            // for an id that names no execution, so a poller can stop on a permanent
+            // miss rather than retrying a request it cannot fix.
+            return Err(GetQueryExecutionError::invalid_request(
+                crate::state::ERROR_CODE_QUERY_EXECUTION_NOT_FOUND,
+                crate::state::query_execution_not_found(&input.query_execution_id),
+            ));
         };
 
         Ok(GetQueryExecutionOutput {

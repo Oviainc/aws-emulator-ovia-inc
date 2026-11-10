@@ -170,26 +170,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A history belongs to a workgroup, so a workgroup this account does not have
         // has no history to report rather than an empty one.
         if !store.holds_work_group(&work_group) {
-            return Err(ListQueryExecutionsErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    athena_error_code: None,
-                    message: Some(crate::state::work_group_not_found(&work_group)),
-                },
-            )
-            .into());
+            return Err(ListQueryExecutionsError::invalid_request(
+                crate::state::ERROR_CODE_INVALID_INPUT,
+                crate::state::WORK_GROUP_NOT_FOUND,
+            ));
         }
 
         let position = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {
                 let Some(position) = store.executions_page_position(&work_group, token) else {
-                    return Err(ListQueryExecutionsErrorModeled::InvalidRequestException(
-                        InvalidRequestException {
-                            athena_error_code: None,
-                            message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
-                        },
-                    )
-                    .into());
+                    return Err(ListQueryExecutionsError::invalid_request(
+                        crate::state::ERROR_CODE_INVALID_INPUT,
+                        crate::state::INVALID_NEXT_TOKEN,
+                    ));
                 };
                 position
             }

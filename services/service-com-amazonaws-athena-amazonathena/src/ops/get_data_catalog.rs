@@ -155,16 +155,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.data_catalogs.get(&input.name) else {
             // Athena models no not-found error for this operation; naming a catalog that
             // does not exist is "something wrong with the input to the request", which
-            // is what `InvalidRequestException` (HTTP 400) reports. The sentence comes
-            // from `crate::state`, so every operation that answers a catalog miss words
-            // it identically.
-            return Err(GetDataCatalogErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    athena_error_code: None,
-                    message: Some(crate::state::data_catalog_not_found(&input.name)),
-                },
-            )
-            .into());
+            // is what `InvalidRequestException` (HTTP 400) reports, under the code for a
+            // refusal the request itself caused. The sentence comes from `crate::state`,
+            // so every operation that answers a catalog miss words it identically.
+            return Err(GetDataCatalogError::invalid_request(
+                crate::state::ERROR_CODE_INVALID_INPUT,
+                crate::state::data_catalog_not_found(&input.name),
+            ));
         };
 
         Ok(GetDataCatalogOutput {

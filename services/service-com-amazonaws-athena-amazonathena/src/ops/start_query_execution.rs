@@ -221,9 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A query cannot run in a workgroup that does not exist: its settings, its
             // results location and the history it belongs to are the workgroup's.
             if !store.holds_work_group(&work_group) {
-                return Err(invalid_request(crate::state::work_group_not_found(
-                    &work_group,
-                )));
+                return Err(invalid_request(crate::state::WORK_GROUP_NOT_FOUND));
             }
 
             let group = store.work_groups.get(&work_group).cloned();
@@ -247,9 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.result_configuration,
                 group.as_ref(),
             ) else {
-                return Err(invalid_request(
-                    crate::state::NO_OUTPUT_LOCATION.to_string(),
-                ));
+                return Err(invalid_request(crate::state::NO_OUTPUT_LOCATION));
             };
 
             // "If another StartQueryExecution request is received, the same response is
@@ -275,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         )
                     {
                         return Err(invalid_request(
-                            crate::state::IDEMPOTENT_PARAMETERS_DO_NOT_MATCH.to_string(),
+                            crate::state::IDEMPOTENT_PARAMETERS_DO_NOT_MATCH,
                         ));
                     }
                     return Ok(StartQueryExecutionOutput {
@@ -394,13 +390,12 @@ fn one_statement_only(statements: usize) -> String {
 /// The operation's own client error (HTTP 400), carrying `message`.
 ///
 /// `InvalidRequestException` is the client error this operation models: "Indicates that
-/// something is wrong with the input to the request."
-fn invalid_request(message: String) -> StartQueryExecutionError {
-    StartQueryExecutionErrorModeled::InvalidRequestException(InvalidRequestException {
-        athena_error_code: None,
-        message: Some(message),
-    })
-    .into()
+/// something is wrong with the input to the request." Every refusal here is caused by the
+/// submission itself — a workgroup that does not exist or runs no queries, nowhere to
+/// write the results, a token reused for another query — which is the class
+/// [`crate::state::ERROR_CODE_INVALID_INPUT`] names.
+fn invalid_request(message: impl Into<String>) -> StartQueryExecutionError {
+    StartQueryExecutionError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }
 
 /// The operation's own server error (HTTP 500): "Indicates a platform issue, which may

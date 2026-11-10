@@ -289,12 +289,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// Every refusal above is a bad request rather than an unwritten operation, and
 /// `InvalidRequestException` is the client error this operation models: "Indicates that
-/// something is wrong with the input to the request."
-fn invalid_request(message: String) -> CreateDataCatalogError {
-    CreateDataCatalogErrorModeled::InvalidRequestException(InvalidRequestException {
-        athena_error_code: None,
-        message: Some(message),
-    })
-    .into()
+/// something is wrong with the input to the request." Each one is caused by the request
+/// itself, which is the class [`crate::state::ERROR_CODE_INVALID_INPUT`] names.
+fn invalid_request(message: impl Into<String>) -> CreateDataCatalogError {
+    CreateDataCatalogError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }
 

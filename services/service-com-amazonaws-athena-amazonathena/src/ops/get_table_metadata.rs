@@ -236,9 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .tables
             .get(&glue_state::fold_name(&input.table_name))
         else {
-            return Err(metadata_exception(crate::state::table_not_found(
-                &input.table_name,
-            )));
+            return Err(metadata_exception(crate::state::table_not_found()));
         };
 
         Ok(GetTableMetadataOutput {
@@ -248,21 +246,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The operation's own client error (HTTP 400) for a request Athena itself refuses:
-/// "Indicates that something is wrong with the input to the request."
-fn invalid_request(message: String) -> GetTableMetadataError {
-    GetTableMetadataErrorModeled::InvalidRequestException(InvalidRequestException {
-        athena_error_code: None,
-        message: Some(message),
-    })
-    .into()
+/// "Indicates that something is wrong with the input to the request." The catalog this
+/// read addresses is the request's own member, so the refusal carries the code for a
+/// request at fault ([`crate::state::ERROR_CODE_INVALID_INPUT`]).
+fn invalid_request(message: impl Into<String>) -> GetTableMetadataError {
+    GetTableMetadataError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }
 
 /// The operation's own client error (HTTP 400) for what the METASTORE answered: "An
 /// exception that Athena received when it called a custom metastore. Occurs if the error
 /// is not caused by user input (InvalidRequestException) or from the Athena platform."
-fn metadata_exception(message: String) -> GetTableMetadataError {
+fn metadata_exception(message: impl Into<String>) -> GetTableMetadataError {
     GetTableMetadataErrorModeled::MetadataException(MetadataException {
-        message: Some(message),
+        message: Some(message.into()),
     })
     .into()
 }

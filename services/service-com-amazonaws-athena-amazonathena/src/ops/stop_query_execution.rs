@@ -142,16 +142,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if store.query_execution(&input.query_execution_id).is_none() {
             // Athena models no not-found error here either; stopping an execution that
-            // does not exist is "something wrong with the input to the request".
-            return Err(StopQueryExecutionErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    athena_error_code: None,
-                    message: Some(crate::state::query_execution_not_found(
-                        &input.query_execution_id,
-                    )),
-                },
-            )
-            .into());
+            // does not exist is "something wrong with the input to the request", under
+            // the code for an id that names no execution.
+            return Err(StopQueryExecutionError::invalid_request(
+                crate::state::ERROR_CODE_QUERY_EXECUTION_NOT_FOUND,
+                crate::state::query_execution_not_found(&input.query_execution_id),
+            ));
         }
 
         // A stop is IDEMPOTENT, as the operation's own `@idempotent` trait says: the

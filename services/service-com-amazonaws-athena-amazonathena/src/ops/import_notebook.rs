@@ -179,9 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
             _ => {
-                return Err(invalid_request(
-                    crate::state::NOTEBOOK_SOURCE_REQUIRED.to_string(),
-                ))
+                return Err(invalid_request(crate::state::NOTEBOOK_SOURCE_REQUIRED))
             }
         };
 
@@ -208,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     || minted.payload != payload
                 {
                     return Err(invalid_request(
-                        crate::state::IDEMPOTENT_PARAMETERS_DO_NOT_MATCH.to_string(),
+                        crate::state::IDEMPOTENT_PARAMETERS_DO_NOT_MATCH,
                     ));
                 }
                 return Ok(ImportNotebookOutput {
@@ -220,9 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A notebook lives in a workgroup, so one this account does not hold holds no
         // notebooks either.
         if !store.holds_work_group(&input.work_group) {
-            return Err(invalid_request(crate::state::work_group_not_found(
-                &input.work_group,
-            )));
+            return Err(invalid_request(crate::state::WORK_GROUP_NOT_FOUND));
         }
         // "Imports a single ipynb file to a Spark enabled workgroup": an Athena SQL
         // workgroup runs no notebook engine, and Athena's own default workgroup is one.
@@ -282,10 +278,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `InvalidRequestException` is the client error this operation models: "Indicates that
 /// something is wrong with the input to the request." It is also the error
 /// `ImportNotebook` documents by name for a request that names neither source or both.
-fn invalid_request(message: String) -> ImportNotebookError {
-    ImportNotebookErrorModeled::InvalidRequestException(InvalidRequestException {
-        athena_error_code: None,
-        message: Some(message),
-    })
-    .into()
+/// Every one of them is caused by the request itself, which is the class
+/// [`crate::state::ERROR_CODE_INVALID_INPUT`] names.
+fn invalid_request(message: impl Into<String>) -> ImportNotebookError {
+    ImportNotebookError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }
