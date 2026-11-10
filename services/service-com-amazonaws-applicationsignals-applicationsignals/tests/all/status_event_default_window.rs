@@ -50,12 +50,12 @@ type Events = Vec<(f64, Option<String>)>;
 
 /// The clock, in the epoch seconds `restJson1` carries a `Timestamp` as — the same scale a
 /// report names its instant on.
-fn clock() -> f64 {
+pub(crate) fn clock() -> f64 {
     DateTime::from(std::time::SystemTime::now()).as_secs_f64()
 }
 
 /// How far into its minute `at` falls, in seconds.
-fn second_of_the_minute(at: f64) -> f64 {
+pub(crate) fn second_of_the_minute(at: f64) -> f64 {
     at - (at / SECONDS_PER_MINUTE).floor() * SECONDS_PER_MINUTE
 }
 
@@ -66,7 +66,7 @@ fn second_of_the_minute(at: f64) -> f64 {
 /// Nothing is waited for once the clock is already there, and the wait is bounded by half a
 /// minute. The instant is taken after the wait, so the caller reports for the minute the
 /// following read falls in.
-fn clock_past_the_half_minute() -> f64 {
+pub(crate) fn clock_past_the_half_minute() -> f64 {
     for _ in 0..4 {
         let at = clock();
         let position = second_of_the_minute(at);

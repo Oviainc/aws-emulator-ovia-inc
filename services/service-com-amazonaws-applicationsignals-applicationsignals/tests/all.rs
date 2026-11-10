@@ -77,6 +77,8 @@ mod instrumentation_configuration_tags;
 mod instrumentation_configurations;
 #[path = "all/instrumentation_status_minute.rs"]
 mod instrumentation_status_minute;
+#[path = "all/instrumentation_status_transitions.rs"]
+mod instrumentation_status_transitions;
 #[path = "all/issued_key_boundary.rs"]
 mod issued_key_boundary;
 #[path = "all/issued_page_position.rs"]
