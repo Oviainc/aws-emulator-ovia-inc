@@ -231,6 +231,19 @@ impl AccessDeniedException {
             message: "Insufficient privileges to perform this action.".to_string(),
         }
     }
+
+    /// The same refusal, carrying the sentence the DECISION words.
+    ///
+    /// A refusal AWS states as an authorization decision names the principal that
+    /// signed, the action it asked for and the resource it asked for, each a value of
+    /// the request itself; the decision that reaches it builds the sentence
+    /// ([`crate::state::authorized_recovery_point`]) and hands it here, so the
+    /// wording lives with the rule rather than with the error channel.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for AccessDeniedException {

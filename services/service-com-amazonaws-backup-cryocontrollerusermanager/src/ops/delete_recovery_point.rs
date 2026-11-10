@@ -5,8 +5,12 @@
 //! Deletes one recovery point from the vault that holds it.
 //!
 //! The call addresses a stored recovery point by the (`BackupVaultName`,
-//! `RecoveryPointArn`) pair, so the three outcomes are:
+//! `RecoveryPointArn`) pair, so the outcomes are:
 //!
+//! * the `RecoveryPointArn` names a recovery point of ANOTHER account, which
+//!   nothing this account holds can grant access to, and the call is refused
+//!   `AccessDeniedException` (HTTP 403) before the point is resolved at all
+//!   ([`crate::state::authorized_recovery_point`]);
 //! * the pair names no recovery point the account holds — a vault it does not
 //!   hold, an ARN nothing answers to, an ARN another vault holds, one whose backup
 //!   has not finished, or one already deleted — and the call is refused
@@ -188,6 +192,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DeleteRecoveryPointErrorModeled::InvalidParameterValueException(refusal).into(),
             );
         }
+
+        // The authorization decision on the recovery point this call acts on,
+        // taken BEFORE the point is resolved: an ARN of another account is
+        // refused for lack of privileges rather than reported absent, so a
+        // delete the service refused never reads as a point that is already
+        // gone (`crate::state::authorized_recovery_point`).
+        crate::state::authorized_recovery_point(Self::NAME, &input.recovery_point_arn)?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteRecoveryPointErrorModeled::ServiceUnavailableException(

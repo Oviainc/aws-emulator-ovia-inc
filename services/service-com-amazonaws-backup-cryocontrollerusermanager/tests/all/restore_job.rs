@@ -162,8 +162,10 @@ fn start_body(recovery_point_arn: &str, resource_type: Option<&str>, target: &st
 /// nothing is stored.
 ///
 /// The rows span the ways an ARN can fail to name a stored point — fabricated,
-/// another account's, another partition's, a backup that has not finished, a
-/// point already deleted — rather than one fabricated ARN written twice.
+/// another partition's, a backup that has not finished, a point already deleted
+/// — rather than one fabricated ARN written twice. An ARN of another ACCOUNT is
+/// not one of them: the authorization decision refuses it before the point is
+/// resolved, which `recovery_point_cross_account_authorization.rs` covers.
 #[tokio::test]
 async fn a_recovery_point_arn_that_names_no_stored_point_is_one_parameter_refusal() {
     let (router, engine) = router_with_engine();
@@ -191,7 +193,6 @@ async fn a_recovery_point_arn_that_names_no_stored_point_is_one_parameter_refusa
     let unsettled = start_point(&router, "restore-source", &resource, None).await;
 
     let fabricated = format!("arn:aws:backup:{REGION}:{ACCOUNT}:recovery-point:does-not-exist");
-    let other_account = format!("arn:aws:backup:{REGION}:111122223333:recovery-point:1EB3B5E7");
     let other_partition = format!("arn:aws-cn:backup:{REGION}:{ACCOUNT}:recovery-point:1EB3B5E7");
     let cases: Vec<(&str, &str)> = vec![
         // The unsettled point comes first: the clock settles it 500 ms after
@@ -199,7 +200,6 @@ async fn a_recovery_point_arn_that_names_no_stored_point_is_one_parameter_refusa
         // the rest.
         ("a backup that has not finished", unsettled.as_str()),
         ("an ARN nothing answers to", fabricated.as_str()),
-        ("an ARN of another account", other_account.as_str()),
         ("an ARN of another partition", other_partition.as_str()),
         ("a point already deleted", gone.as_str()),
     ];

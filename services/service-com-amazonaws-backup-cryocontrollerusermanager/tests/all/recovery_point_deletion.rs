@@ -12,7 +12,9 @@
 //!   account does not hold, an ARN nothing answers to, an ARN another vault holds,
 //!   one whose backup has not finished, one already deleted — is ONE condition,
 //!   refused 400 `ResourceNotFoundException` with the same sentence, and nothing
-//!   stored changes;
+//!   stored changes (an ARN of ANOTHER ACCOUNT is not one of them: the
+//!   authorization decision refuses it before the pair is resolved, which
+//!   `recovery_point_cross_account_authorization.rs` covers);
 //! * a `RecoveryPointArn` that is not an ARN is a bad parameter value rather than
 //!   an absent resource;
 //! * while a vault is configured with a Backup Vault Lock, a recovery point whose
@@ -280,15 +282,12 @@ async fn a_pair_that_names_no_stored_recovery_point_is_one_refusal() {
     assert_eq!(status, 200, "setup: the second point should be deletable");
 
     let fabricated = format!("arn:aws:backup:{REGION}:{ACCOUNT}:recovery-point:does-not-exist");
-    let other_account = format!("arn:aws:backup:{REGION}:111122223333:recovery-point:1EB3B5E7");
     let other_partition = format!("arn:aws-cn:backup:{REGION}:{ACCOUNT}:recovery-point:1EB3B5E7");
+    // An ARN of ANOTHER ACCOUNT is deliberately not a row here: it is refused by
+    // the authorization decision before the pair is resolved at all, which
+    // `recovery_point_cross_account_authorization.rs` covers.
     let cases: Vec<(&str, &str, &str)> = vec![
         ("an ARN nothing answers to", "holder", fabricated.as_str()),
-        (
-            "an ARN of another account",
-            "holder",
-            other_account.as_str(),
-        ),
         (
             "an ARN of another partition",
             "holder",

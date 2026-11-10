@@ -341,8 +341,10 @@ async fn a_copy_that_names_no_stored_resource_is_refused_as_not_found() {
     let unfinished = string_at(&running, "RecoveryPointArn");
 
     let fabricated = format!("arn:aws:backup:{REGION}:{ACCOUNT}:recovery-point:does-not-exist");
-    let other_account = format!("arn:aws:backup:{REGION}:111122223333:recovery-point:1EB3B5E7");
     let destination = vault_arn(REGION, DESTINATION_VAULT);
+    // A source `RecoveryPointArn` of ANOTHER ACCOUNT is deliberately not a row
+    // here: the authorization decision refuses it before the source is resolved,
+    // which `recovery_point_cross_account_authorization.rs` covers.
     // (case, SourceBackupVaultName, RecoveryPointArn, DestinationBackupVaultArn,
     //  the Message the refusal carries)
     let cases: Vec<(&str, &str, &str, String, &str)> = vec![
@@ -350,13 +352,6 @@ async fn a_copy_that_names_no_stored_resource_is_refused_as_not_found() {
             "a recovery-point ARN nothing answers to",
             SOURCE_VAULT,
             fabricated.as_str(),
-            destination.clone(),
-            "Cannot find recovery point",
-        ),
-        (
-            "a recovery-point ARN of another account",
-            SOURCE_VAULT,
-            other_account.as_str(),
             destination.clone(),
             "Cannot find recovery point",
         ),

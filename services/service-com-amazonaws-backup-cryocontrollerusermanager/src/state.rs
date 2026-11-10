@@ -63,6 +63,11 @@
 //! shares — the vault READS and the vault-LOCK actions: it applies the access
 //! decision before the existence lookup, so none of them can disclose a vault the
 //! caller cannot see.
+//!
+//! [`authorized_recovery_point`] is the same shape of decision for a call AWS
+//! Backup authorizes against the RECOVERY POINT the request names by ARN — the
+//! delete, the read and the two jobs that take one as input: an ARN of another
+//! account is refused for lack of privileges before the point is resolved.
 
 pub mod schedule;
 
@@ -94,6 +99,11 @@ pub use tiering::*;
 /// calls share. Re-exported for the reason given on `events`.
 mod tagging;
 pub use tagging::*;
+
+/// The authorization decision a call that addresses a recovery point by ARN takes
+/// before resolving it. Re-exported for the reason given on `events`.
+mod authorization;
+pub use authorization::*;
 
 use crate::ops::types::{
     AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupPlanInput, BackupRule,

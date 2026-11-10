@@ -21,8 +21,8 @@
 //! * every way the pair can fail to name a stored recovery point is ONE refusal
 //!   (400 `ResourceNotFoundException`), a `RecoveryPointArn` that is not an ARN
 //!   is a bad parameter value instead, and a vault outside the caller's
-//!   visibility is refused 403 `AccessDeniedException` before existence is
-//!   considered at all.
+//!   visibility — or a `RecoveryPointArn` of another account — is refused 403
+//!   `AccessDeniedException` before existence is considered at all.
 //!
 //! Every case drives real HTTP through the router, so what is asserted is the
 //! wire behaviour a `backup` SDK client sees. The request harness is the shared
@@ -599,11 +599,12 @@ async fn a_pair_that_names_no_stored_recovery_point_is_one_refusal() {
     assert_eq!(status, 200, "setup: the second point should be deletable");
 
     let fabricated = format!("arn:aws:backup:{REGION}:{ACCOUNT}:recovery-point:does-not-exist");
-    let other_account = format!("arn:aws:backup:{REGION}:111122223333:recovery-point:1EB3B5E7");
     let other_partition = format!("arn:aws-cn:backup:{REGION}:{ACCOUNT}:recovery-point:1EB3B5E7");
+    // An ARN of ANOTHER ACCOUNT is deliberately not a row here: the
+    // authorization decision refuses it before the pair is resolved, which
+    // `recovery_point_cross_account_authorization.rs` covers.
     let cases: Vec<(&str, &str, &str)> = vec![
         ("an ARN nothing answers to", "holder", fabricated.as_str()),
-        ("an ARN of another account", "holder", other_account.as_str()),
         (
             "an ARN of another partition",
             "holder",

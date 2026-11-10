@@ -8,6 +8,11 @@
 //! stored pair. A replayed `IdempotencyToken` returns the copy job it already
 //! created rather than minting a second one.
 //!
+//! The source recovery point is authorized before it is resolved
+//! ([`crate::state::authorized_recovery_point`]): a `RecoveryPointArn` of
+//! another account is refused `AccessDeniedException` (HTTP 403) rather than
+//! reported absent, since no resolution of this account's state could reach it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -260,6 +265,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartCopyJob<Eng>
             )
             .into());
         };
+
+        // The authorization decision on the recovery point this copy reads,
+        // taken BEFORE the store is reached: an ARN of another account is
+        // refused for lack of privileges rather than reported absent, so a copy
+        // the service refused never reads as a source that is not there
+        // (`crate::state::authorized_recovery_point`).
+        crate::state::authorized_recovery_point(
+            <Self as smithy_server_runtime::Operation>::NAME,
+            &input.recovery_point_arn,
+        )?;
 
         let mut store = state.lock();
         // The one store whose KEYS a caller chooses: forget expired records and

@@ -24,6 +24,11 @@
 //!   can therefore tell a bad recovery-point reference from a bad restore-job
 //!   reference.
 //!
+//! Ahead of both stands the authorization decision on the point the request
+//! names ([`crate::state::authorized_recovery_point`]): an ARN of another
+//! account is refused `AccessDeniedException` (HTTP 403) before the store is
+//! read, since no resolution of this account's state could reach it.
+//!
 //! A started job is reported in the non-terminal status AWS answers with and
 //! the clock owes it the terminal one
 //! ([`crate::state::RESTORE_JOB_SETTLE_AFTER`]). The restore ITSELF is
@@ -199,6 +204,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
         }
+
+        // The authorization decision on the recovery point this restore reads,
+        // taken BEFORE it is resolved: an ARN of another account is refused for
+        // lack of privileges rather than reported as a value that names no
+        // stored point (`crate::state::authorized_recovery_point`).
+        crate::state::authorized_recovery_point(Self::NAME, &input.recovery_point_arn)?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartRestoreJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
