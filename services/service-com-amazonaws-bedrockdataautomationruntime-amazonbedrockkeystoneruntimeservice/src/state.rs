@@ -1124,22 +1124,37 @@ pub struct ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimes
 }
 
 impl ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeserviceState {
-    /// Mint the opaque resource id for one new invocation.
+    /// Mint the resource id for one new invocation: the id of a data automation job,
+    /// which this service names with a UUID in its canonical lower-case `8-4-4-4-12`
+    /// form — the same id the job's output lands under
+    /// ([`Invocation::output_metadata_s3_uri`]).
     ///
-    /// Built from this store's own monotonic mint count and the submission instant, and
-    /// from NOTHING the request carries: two identical payloads submitted under
-    /// different tokens therefore get different ids, and the count means an id is never
-    /// reused even after the record it named was retired. Lower-case hex and one hyphen,
-    /// so the id is inside the modelled `InvocationArn` pattern's `[a-zA-Z0-9-_]+`
-    /// resource segment; its fixed width is what [`arn_region`] bounds the ARN's region
-    /// segment against, so the whole ARN stays inside its `@length(1..128)`.
+    /// The 16 bytes it is laid out from are a digest of this store's own monotonic mint
+    /// count and the submission instant, and of NOTHING the request carries: two
+    /// identical payloads submitted under different tokens therefore get different ids,
+    /// the count means an id is never reused even after the record it named was retired,
+    /// and the digest diffuses both inputs, so consecutive ids share no field rather than
+    /// differing only in a counter. The version and variant bits and the hyphenated text
+    /// come from [`::service_common::uuid_from_random_bytes`], this tree's one rendering
+    /// of 16 opaque bytes as a UUID, so a client that parses the id out of the ARN gets a
+    /// UUID; lower-case hex and hyphens keep it inside the modelled `InvocationArn`
+    /// pattern's `[a-zA-Z0-9-_]+` resource segment, and its fixed 36-character width is
+    /// what [`arn_region`] bounds the ARN's region segment against, so the whole ARN
+    /// stays inside its `@length(1..128)`.
     pub fn mint_invocation_id(&mut self, now: SystemTime) -> String {
+        use ::sha2::Digest as _;
+
         self.minted_invocations = self.minted_invocations.wrapping_add(1);
         let since_epoch = now
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        format!("{since_epoch:016x}-{:016x}", self.minted_invocations)
+        let mut digest = ::sha2::Sha256::new();
+        digest.update(self.minted_invocations.to_be_bytes());
+        digest.update(since_epoch.to_be_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest.finalize()[..16]);
+        ::service_common::uuid_from_random_bytes(bytes)
     }
 
     /// The invocation `invocation_arn` names, for a reporting read.
@@ -1343,9 +1358,9 @@ impl ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeservice
 /// `service_common::arn::region_label` grammar — non-empty, at most 20 characters, and
 /// composed only of `[a-z0-9-]`, the form every model's `*Arn` pattern states for the
 /// field — which is what bounds the result: the fixed part of an invocation ARN
-/// (`arn:aws:bedrock:` + account + [`INVOCATION_RESOURCE_PREFIX`]) plus the 33-character
-/// id [`ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeserviceState::mint_invocation_id`]
-/// produces is 90 characters, so a region label within that grammar can never push the
+/// (`arn:aws:bedrock:` + account + [`INVOCATION_RESOURCE_PREFIX`]) plus the 36-character
+/// UUID [`ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeserviceState::mint_invocation_id`]
+/// produces is 93 characters, so a region label within that grammar can never push the
 /// ARN past 128. Anything wider names no region an endpoint has, so it is not spliced
 /// into an ARN at all and the service's own region answers instead.
 pub fn arn_region(candidate: &str) -> &str {
@@ -1358,7 +1373,7 @@ pub fn arn_region(candidate: &str) -> &str {
 /// canonical emulator account id. The resource id is never request-supplied — the only
 /// caller mints it with
 /// [`ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeserviceState::mint_invocation_id`],
-/// whose hex-and-hyphen text is inside the modelled `InvocationArn` pattern's
+/// whose canonical UUID text is inside the modelled `InvocationArn` pattern's
 /// `[a-zA-Z0-9-_]+` resource segment — and `region` is reduced to a region label by
 /// [`arn_region`] HERE, at the one place an invocation ARN is built, so the result
 /// satisfies the modelled pattern and its `@length(1..128)` whatever a caller passes.

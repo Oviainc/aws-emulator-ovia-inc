@@ -307,10 +307,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the first one's ARN. The token is retained on the record and consulted by
             // nothing.
             //
-            // The resource id is minted by the store from its own monotonic mint count
-            // and the submission instant, never derived from the request: two submissions
-            // of the identical payload, under one token or none, are two jobs with two
-            // ids.
+            // The resource id is the UUID the store mints from its own monotonic mint
+            // count and the submission instant, never derived from the request: two
+            // submissions of the identical payload, under one token or none, are two jobs
+            // with two ids.
             let invocation_id = store.mint_invocation_id(now);
             let invocation_arn = crate::state::invocation_arn(&region, &invocation_id);
 

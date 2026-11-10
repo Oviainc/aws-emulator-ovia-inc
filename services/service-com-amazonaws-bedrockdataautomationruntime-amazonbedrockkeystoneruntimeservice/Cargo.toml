@@ -42,12 +42,15 @@ image = { version = "0.25", default-features = false, features = [
     "png",
     "jpeg",
 ] }
+# Digests the store's own mint count and the submission instant into the 16 bytes behind
+# the UUID an invocation id is (`state::mint_invocation_id`); the UUID layout itself is
+# `service_common::uuid_from_random_bytes`.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
 hex = { workspace = true }
 # Percent-encoding for the ARN the build-time service binds in an `@httpLabel` path
 # segment, which the reference-resolution suite creates and releases its fixtures
