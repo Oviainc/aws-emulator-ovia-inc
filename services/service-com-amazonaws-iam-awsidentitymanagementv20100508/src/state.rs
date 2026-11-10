@@ -29,6 +29,7 @@ pub mod member_forms;
 pub mod reported_services;
 pub mod role_templates;
 pub mod simulated_decisions;
+pub mod ssh_public_keys;
 pub mod virtual_mfa_devices;
 mod managed_policy_catalog;
 pub use managed_policy_catalog::*;
@@ -41,6 +42,7 @@ pub use input_formats::*;
 pub use member_forms::*;
 pub use reported_services::*;
 pub use role_templates::*;
+pub use ssh_public_keys::*;
 pub use virtual_mfa_devices::*;
 
 /// IAM's default entity path: every entity whose request omits `Path` is created
@@ -463,6 +465,16 @@ const SERVER_CERTIFICATE_ID_PREFIX: &str = "ASCA";
 /// reserved for Amazon Web Services use."
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
+/// What IAM answers a request naming a reserved tag key with: one fixed sentence for the
+/// whole refusal class, naming the prefix the rule is about and nothing of the request.
+///
+/// Every operation that writes tags refuses the same way, so the sentence is held here
+/// rather than built at each call site: a reader matching AWS's reserved-prefix wording
+/// sees the same text whichever `Tag*` or `Create*` call it came from, and the offending
+/// key is not echoed back.
+pub const RESERVED_TAG_KEY_MESSAGE: &str =
+    "Tag keys beginning with aws: are reserved for system use.";
+
 /// How many tags ONE IAM resource may carry. AWS's "IAM and STS quotas" page gives
 /// the quota "Number of tags per IAM resource: 50" — the same bound `tagListType`
 /// puts on a single request's list (len 0..50,
@@ -649,6 +661,12 @@ pub const MARKER_SCOPE_ACCESS_KEYS: &str = "access-keys";
 /// the same reason [`MARKER_SCOPE_ACCESS_KEYS`] does: that operation pages over the
 /// same key order (the certificate id) whichever user it reports on.
 pub const MARKER_SCOPE_SIGNING_CERTIFICATES: &str = "signing-certificates";
+
+/// The marker scope of the account's SSH public keys, which `ListSSHPublicKeys` pages
+/// over. One scope covers the whole collection for the same reason
+/// [`MARKER_SCOPE_ACCESS_KEYS`] does: that operation pages over the same key order (the
+/// SSH public key id) whichever user it reports on.
+pub const MARKER_SCOPE_SSH_PUBLIC_KEYS: &str = "ssh-public-keys";
 
 /// The marker scope of the account's server certificate collection, which
 /// `ListServerCertificates` pages over. It is its OWN scope, exactly as the user and
@@ -4064,21 +4082,22 @@ pub fn default_account_properties() -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The reserved tag key among `keys`, if any — the lowest one, so the refusal names
-/// the same key however the request's tags were ordered.
-/// See [`RESERVED_TAG_KEY_PREFIX`].
-pub fn reserved_tag_key<'a, I: IntoIterator<Item = &'a str>>(keys: I) -> Option<&'a str> {
+/// Whether any of `keys` is a reserved tag key — one beginning with
+/// [`RESERVED_TAG_KEY_PREFIX`], however it is capitalised.
+///
+/// A predicate rather than a lookup, because the refusal every caller answers is the one
+/// fixed sentence [`RESERVED_TAG_KEY_MESSAGE`], which carries nothing of the request: what
+/// a caller asks is whether the request names such a key at all, never which one it was.
+pub fn has_reserved_tag_key<'a, I: IntoIterator<Item = &'a str>>(keys: I) -> bool {
     let prefix = RESERVED_TAG_KEY_PREFIX.as_bytes();
-    keys.into_iter()
-        .filter(|key| {
-            // The comparison is over BYTES and takes the head through `get`, so neither a
-            // key shorter than the prefix nor one whose first bytes are part of a
-            // multi-byte character can make it fault.
-            key.as_bytes()
-                .get(..prefix.len())
-                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-        })
-        .min()
+    keys.into_iter().any(|key| {
+        // The comparison is over BYTES and takes the head through `get`, so neither a
+        // key shorter than the prefix nor one whose first bytes are part of a
+        // multi-byte character can make it fault.
+        key.as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
 }
 
 /// The tags a record holds, as a slice: the stored list, or the EMPTY set for a record

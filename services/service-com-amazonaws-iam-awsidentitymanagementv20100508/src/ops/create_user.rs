@@ -192,6 +192,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::invalid_entity_path());
         }
 
+        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
+        // "invalid … value … for an input parameter". Checked through the one definition of
+        // that rule in `crate::state`, the same one every `Tag*` and `Create*` call in this
+        // crate uses, and checked before anything is created: "if any one of the tags is
+        // invalid … then the entire request fails".
+        if crate::state::has_reserved_tag_key(
+            input.tags.iter().flatten().map(|tag| tag.key.as_str()),
+        ) {
+            return Err(CreateUserErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::RESERVED_TAG_KEY_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
         // IAM authorizes its own API: the caller's identity-based policies are evaluated
         // before the user is created, and before the store is consulted for a name

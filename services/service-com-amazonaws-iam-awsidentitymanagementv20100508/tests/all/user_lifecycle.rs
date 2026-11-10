@@ -132,6 +132,24 @@ pub(crate) async fn call_signed_in_region(
     action: &str,
     params: &[(&str, &str)],
 ) -> (u16, String) {
+    call_signed_from(router, akid, region, None, action, params).await
+}
+
+/// [`call_signed_in_region`], with the address a proxy states it forwarded the request
+/// for.
+///
+/// That header is where the address of a forwarded request comes from, and IAM fills
+/// `aws:SourceIp` from it, so this is the one knob a suite about network-scoped grants
+/// turns. `None` sends no such header, which is the request every other suite drives —
+/// made from the local host.
+pub(crate) async fn call_signed_from(
+    router: &MultiServiceRouter,
+    akid: Option<&str>,
+    region: &str,
+    forwarded_for: Option<&str>,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in params {
         body.push('&');
@@ -156,6 +174,10 @@ pub(crate) async fn call_signed_in_region(
                  SignedHeaders=host, Signature=0"
             ),
         ),
+        None => request,
+    };
+    let request = match forwarded_for {
+        Some(address) => request.header("x-forwarded-for", address),
         None => request,
     };
     let response = router

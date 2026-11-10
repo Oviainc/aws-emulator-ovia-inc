@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSSHPublicKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSSHPublicKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSSHPublicKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +157,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSSHPublicKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSSHPublicKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The operation models `NoSuchEntityException` alone, so a store that is not
+            // there is reported as the entity not being retrievable.
+            return Err(ListSSHPublicKeysErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The page resumes strictly after the POSITION in the key order the marker names,
+        // so a token this service's encoding cannot have produced is refused rather than
+        // silently read as "start from the beginning" — the same rule
+        // `ListSigningCertificates` follows. A token that decodes but names a key deleted
+        // since the previous page is NOT an error: the position still orders the remainder.
+        let resume_after = match &input.marker {
+            Some(marker) => {
+                match crate::state::decode_marker(
+                    crate::state::MARKER_SCOPE_SSH_PUBLIC_KEYS,
+                    marker,
+                ) {
+                    Some(key) => Some(key),
+                    None => {
+                        return Err(crate::scaffolded::Scaffolded::validation_error(
+                            crate::state::INVALID_MARKER,
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
+        // `maxItemsType` is range 1..1000 and the boundary validator has already refused
+        // anything outside it, so the only choice left here is the default for an absent
+        // `MaxItems`: "if you do not include this parameter, the number of items defaults
+        // to 100". `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A read: it "returns information about the SSH public keys associated with the
+        // specified IAM user" and writes nothing.
+        let store = state.lock();
+
+        // Whose keys: the named user, or — with no `UserName` — "the UserName field is
+        // determined implicitly based on the Amazon Web Services access key used to sign
+        // the request", resolved in the one place this service resolves an absent
+        // `UserName` (`crate::state::ssh_public_key_user_key`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSSHPublicKeys"))
+        // LIMITATION, stated so the refusal is not mistaken for IAM's behaviour: real IAM
+        // also serves a nameless call made with ACCOUNT ROOT credentials. This emulator
+        // holds no root user entity, so such a call would have to report keys under a user
+        // name nothing created; it is refused instead, exactly as
+        // `ListSigningCertificates` refuses it. That path is declined, not implemented.
+        let Some(user_key) =
+            crate::state::ssh_public_key_user_key(&store, ctx, input.user_name.as_deref())
+        else {
+            return Err(crate::state::must_specify_user_name());
+        };
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any key is reported. The decision is made on the ARN of the user
+        // the keys belong to — the held user's own ARN, or, for a name the account holds no
+        // user under, the ARN that name would carry at the default path, since there is no
+        // other path to attribute it to. A refusal names that user as the request named it.
+        let named_user = input.user_name.as_deref().unwrap_or(&user_key).to_string();
+        let resource = store.users.get(&user_key).map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &named_user),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_SSH_PUBLIC_KEYS,
+            &resource,
+            &format!("user {named_user}"),
+        )?;
+
+        // The keys reported are those of an IAM user the account holds: a name the account
+        // does not hold names no user whose keys could be reported, which is the one
+        // modelled client error this operation declares.
+        let Some(user) = store.users.get(&user_key) else {
+            return Err(ListSSHPublicKeysErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!("The user with name {named_user} cannot be found.")),
+                },
+            )
+            .into());
+        };
+        // Reported in the case the user was created with, not the case the request happened
+        // to spell, since IAM names "are not distinguished by case".
+        let user_name = user.user_name.clone();
+
+        let tail = store.ssh_public_keys.range::<str, _>((
+            match &resume_after {
+                Some(key) => ::std::ops::Bound::Excluded(key.as_str()),
+                None => ::std::ops::Bound::Unbounded,
+            },
+            ::std::ops::Bound::Unbounded,
+        ));
+        let selected = tail.filter(|(_, record)| record.user_key == user_key);
+
+        let mut ssh_public_keys = Vec::new();
+        let mut is_truncated = false;
+        let mut last_key = None;
+        for (ssh_public_key_id, record) in selected {
+            if ssh_public_keys.len() == page_size {
+                // There is at least one more key of this user, so the caller needs another
+                // page to see it.
+                is_truncated = true;
+                break;
+            }
+            ssh_public_keys.push(record.report_metadata(ssh_public_key_id, &user_name));
+            last_key = Some(ssh_public_key_id.clone());
+        }
+
+        Ok(ListSSHPublicKeysOutput {
+            // "If none exists, the operation returns an empty list" — an empty list is the
+            // answer for a user holding no keys, which is what the member then carries.
+            ssh_public_keys: Some(ssh_public_keys),
+            marker: is_truncated
+                .then(|| {
+                    last_key.as_deref().map(|key| {
+                        crate::state::encode_marker(
+                            crate::state::MARKER_SCOPE_SSH_PUBLIC_KEYS,
+                            key,
+                        )
+                    })
+                })
+                .flatten(),
+            is_truncated,
+        })
     }
 }

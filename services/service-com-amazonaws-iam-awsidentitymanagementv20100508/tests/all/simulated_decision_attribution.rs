@@ -38,7 +38,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::policy_simulation::{simulate, ALLOWED, EXPLICIT_DENY, IMPLICIT_DENY};
 use crate::simulated_resource_policy::{
-    attribution, parts, IDENTITY_POLICY, RESOURCE_POLICY, RESOURCE_POLICY_ID,
+    attribution, inline_policy_id, parts, user_inline_policy_id, IDENTITY_POLICY, RESOURCE_POLICY,
+    RESOURCE_POLICY_ID,
 };
 use crate::user_lifecycle::{call, element, elements, router};
 
@@ -79,9 +80,9 @@ struct Case {
     case: &'static str,
     grant: Grant,
     /// The name the granting policy is stored under, for a grant the account holds: an
-    /// inline policy's own name, or a managed policy's friendly name. Unused by a grant
-    /// the request itself supplies, which the response identifies by the member it
-    /// arrived in.
+    /// inline policy's own name (which the response identifies together with the entity
+    /// that embeds it), or a managed policy's friendly name. Unused by a grant the request
+    /// itself supplies, which the response identifies by the member it arrived in.
     policy_name: &'static str,
     action: &'static str,
     resource: &'static str,
@@ -151,7 +152,7 @@ async fn every_grant_path_is_named_by_the_result_it_decided() {
                     &identity_document,
                 )
                 .await;
-                case.policy_name.to_string()
+                user_inline_policy_id(&user_name, case.policy_name)
             }
             Grant::UserManaged => {
                 let policy_arn =
@@ -190,7 +191,7 @@ async fn every_grant_path_is_named_by_the_result_it_decided() {
                     &[("GroupName", &group_name), ("UserName", &user_name)],
                 )
                 .await;
-                case.policy_name.to_string()
+                inline_policy_id("group", &group_name, case.policy_name)
             }
             Grant::Supplied => {
                 extra.push((
@@ -251,9 +252,109 @@ async fn every_grant_path_is_named_by_the_result_it_decided() {
     }
 }
 
-/// The name the aggregate suites' granting policy is stored under, which is what their
-/// `MatchedStatements` entries identify it by.
+/// The one policy NAME every entity below embeds its document under, so the name alone
+/// cannot tell the three embeddings apart.
+const SHARED_INLINE_NAME: &str = "read-objects";
+
+/// A trust policy `CreateRole` accepts: the account's own principal, as the other role
+/// suites in this crate create a fixture role with.
+fn trust_policy() -> String {
+    format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{}:root"}},"Action":"sts:AssumeRole"}}]}}"#,
+        crate::user_lifecycle::account_id()
+    )
+}
+
+/// RULE 1 for an INLINE policy, over every kind of entity one can be embedded in: the
+/// attribution names the embedding — the entity's type, its name and the policy's own name
+/// — so one policy name embedded in three different entities is told apart, and a decision
+/// can be attributed to the one embedding that produced it.
+///
+/// The rows differ along the entity type (and therefore along which `Put*Policy` embeds the
+/// document and which ARN the simulation addresses), the effect the document states, and
+/// the decision that effect reaches.
+#[tokio::test]
+async fn an_inline_policy_is_attributed_to_the_entity_that_embeds_it() {
+    let router = router();
+    let resource = OBJECT_ARN;
+    let action = "s3:GetObject";
+
+    // (the entity type, its name, the effect its document states, the decision that effect
+    //  reaches)
+    let rows: &[(&str, &str, &str, &str)] = &[
+        ("user", "embedder", "Allow", ALLOWED),
+        ("group", "embedders", "Allow", ALLOWED),
+        ("role", "embedding", "Allow", ALLOWED),
+        ("user", "refuser", "Deny", EXPLICIT_DENY),
+        ("role", "refusing", "Deny", EXPLICIT_DENY),
+    ];
+
+    for (entity_type, entity_name, effect, decision) in rows {
+        let case = format!("a {entity_type}'s inline policy stating {effect}");
+        // The noun the create and the put spell the entity with: `CreateUser` /
+        // `PutUserPolicy`, and so on for the other two.
+        let noun = match *entity_type {
+            "user" => "User",
+            "group" => "Group",
+            _ => "Role",
+        };
+        let name_member = format!("{noun}Name");
+        let mut params: Vec<(&str, &str)> = vec![(name_member.as_str(), entity_name)];
+        let trust = trust_policy();
+        if *entity_type == "role" {
+            params.push(("AssumeRolePolicyDocument", trust.as_str()));
+        }
+        let (status, created) = call(&router, &format!("Create{noun}"), &params).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: Create{noun} must succeed, got {status}: {created}"
+        );
+        let arn = element(&created, "Arn");
+
+        let document = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"{effect}","Action":"{action}","Resource":"{resource}"}}]}}"#
+        );
+        put_policy(
+            &router,
+            &case,
+            &format!("Put{noun}Policy"),
+            &[(name_member.as_str(), entity_name)],
+            SHARED_INLINE_NAME,
+            &document,
+        )
+        .await;
+
+        let (status, body) = simulate(&router, &arn, &[action], &[resource], &[]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status}: {body}"
+        );
+        assert_eq!(
+            element(&body, "EvalDecision"),
+            *decision,
+            "case {case:?}: expected the document to decide {decision}, got {body}"
+        );
+        let expected = vec![(
+            inline_policy_id(entity_type, entity_name, SHARED_INLINE_NAME),
+            IDENTITY_POLICY.to_string(),
+        )];
+        let (top, per_resource) = parts(&body);
+        assert_eq!(
+            attribution(top),
+            expected,
+            "case {case:?}: expected the action's result to name {expected:?}, got {body}"
+        );
+        assert_eq!(
+            attribution(per_resource),
+            expected,
+            "case {case:?}: expected the resource's result to name {expected:?}, got {body}"
+        );
+    }
+}
+
+
 const AGGREGATE_POLICY_NAME: &str = "object-reads";
+const AGGREGATE_USER: &str = "aggregated";
 
 /// One `Allow` covering two buckets and one `Deny` naming the second of them, so the
 /// three objects below reach all three decisions `PolicyEvaluationDecisionType` declares
@@ -310,12 +411,12 @@ const AGGREGATED: &[(&str, &[&str], &[&str])] = &[
 #[tokio::test]
 async fn the_actions_result_reports_the_most_restrictive_resource_decision() {
     let router = router();
-    let arn = create_user(&router, "aggregate", "aggregated").await;
+    let arn = create_user(&router, "aggregate", AGGREGATE_USER).await;
     put_policy(
         &router,
         "aggregate",
         "PutUserPolicy",
-        &[("UserName", "aggregated")],
+        &[("UserName", AGGREGATE_USER)],
         AGGREGATE_POLICY_NAME,
         AGGREGATE_POLICY,
     )
@@ -361,7 +462,7 @@ async fn the_actions_result_reports_the_most_restrictive_resource_decision() {
             Vec::new()
         } else {
             vec![(
-                AGGREGATE_POLICY_NAME.to_string(),
+                user_inline_policy_id(AGGREGATE_USER, AGGREGATE_POLICY_NAME),
                 IDENTITY_POLICY.to_string(),
             )]
         };

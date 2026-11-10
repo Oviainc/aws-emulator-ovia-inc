@@ -655,12 +655,24 @@ fn excluded(source: &crate::state::PolicySource, exclusions: &[PolicyIdentifier]
 }
 
 /// How a `MatchedStatements` entry identifies one identity-based policy in force on the
-/// simulated principal: an inline policy by its own name, a managed policy by its
-/// friendly name — the names those policies were put and created under, so a caller
-/// reading the attribution can look the policy up again.
+/// simulated principal.
+///
+/// An INLINE policy has no identity of its own — its name is unique only within the
+/// entity that embeds it, and two entities may each embed one of the same name — so it is
+/// identified by the embedding it IS: the type of the entity it is embedded in, that
+/// entity's friendly name and the policy's own name, joined by `_`. A MANAGED policy is
+/// identified by its friendly name, which the account already holds it uniquely under.
+/// Either way the identifier is built from the names the policy was put or created under,
+/// so a caller reading the attribution can look the policy up again — and a deny can be
+/// attributed to the one embedding that carries it rather than to a name shared across
+/// entities.
 fn source_policy_id(source: &crate::state::PolicySource) -> String {
     match source {
-        crate::state::PolicySource::Inline { policy_name, .. } => policy_name.clone(),
+        crate::state::PolicySource::Inline {
+            policy_name,
+            attachment_type,
+            attachment_name,
+        } => format!("{attachment_type}_{attachment_name}_{policy_name}"),
         crate::state::PolicySource::Managed { policy_arn, .. } => {
             crate::state::parse_policy_arn(policy_arn)
                 .map(|parsed| parsed.policy_name)

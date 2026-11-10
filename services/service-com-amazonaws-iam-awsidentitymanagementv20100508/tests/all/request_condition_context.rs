@@ -668,10 +668,13 @@ struct SimulatedCase {
     decision: &'static str,
     /// Whether the REAL signed call for `iam:ListUserTags` is refused.
     ///
-    /// A real call carries no value for the key at all — nothing in a signed IAM request
-    /// supplies one — so it is decided by the absent-key rule whatever the simulation was
-    /// handed: the deny applies where the absence satisfies its clause, and does not where
-    /// the absence falsifies it. A clause this evaluation cannot decide keeps the refusal.
+    /// A real call carries no value for a key nothing fills — nothing in a signed IAM
+    /// request supplies `aws:SourceVpce` — so such a clause is decided by the absent-key
+    /// rule whatever the simulation was handed: the deny applies where the absence
+    /// satisfies its clause, and does not where the absence falsifies it. A clause this
+    /// evaluation cannot decide keeps the refusal. A key IAM fills from the CONNECTION is
+    /// different: a real call carries a value for it, so its clause is decided against
+    /// that value.
     real_call_refused: bool,
     /// The context keys the result must report as missing.
     missing: &'static [&'static str],
@@ -721,7 +724,12 @@ const SIMULATED_CASES: &[SimulatedCase] = &[
         condition: r#"{"IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}"#,
         supplied: None,
         decision: ALLOWED,
-        real_call_refused: true,
+        // The SIMULATION was handed no address, so the positive clause is false and the
+        // key is reported as one the decision needed. The REAL call does carry one — IAM
+        // fills `aws:SourceIp` from the connection, and this emulator is reached from the
+        // local host — which is outside the block the deny names, so the deny does not
+        // apply to it either.
+        real_call_refused: false,
         missing: &["aws:SourceIp"],
     },
     SimulatedCase {
@@ -854,8 +862,9 @@ async fn the_simulator_reports_only_the_keys_its_decision_needed() {
             &[("UserName", &user_name)],
         )
         .await;
-        // The real call carries no value for the key either, so a deny the absence
-        // satisfies refuses it and one the absence falsifies does not.
+        // The real call is decided against the context IT carries: a deny over a key
+        // nothing fills is decided by that absence, and one over a key IAM fills from the
+        // connection is decided against the value it carries.
         if case.real_call_refused {
             assert_eq!(
                 (status, error_code(&read)),

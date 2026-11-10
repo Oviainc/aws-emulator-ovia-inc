@@ -167,6 +167,8 @@ mod mfa_device_reads;
 mod missing_entity_message_wording;
 #[path = "all/net_new_refusal_wording.rs"]
 mod net_new_refusal_wording;
+#[path = "all/network_condition_authorization.rs"]
+mod network_condition_authorization;
 #[path = "all/open_id_connect_client_id_registration.rs"]
 mod open_id_connect_client_id_registration;
 #[path = "all/open_id_connect_client_ids.rs"]
@@ -247,6 +249,8 @@ mod range_refusal_wording;
 mod refused_call_audit_parameters;
 #[path = "all/request_condition_context.rs"]
 mod request_condition_context;
+#[path = "all/reserved_tag_key_wording.rs"]
+mod reserved_tag_key_wording;
 #[path = "all/resource_tag_condition_context.rs"]
 mod resource_tag_condition_context;
 #[path = "all/role_attached_policies.rs"]
@@ -339,6 +343,8 @@ mod service_specific_credential_status;
 mod service_specific_credentials;
 #[path = "all/signing_certificates.rs"]
 mod signing_certificates;
+#[path = "all/ssh_public_keys.rs"]
+mod ssh_public_keys;
 #[path = "all/simulated_address_conditions.rs"]
 mod simulated_address_conditions;
 #[path = "all/simulated_decision_attribution.rs"]

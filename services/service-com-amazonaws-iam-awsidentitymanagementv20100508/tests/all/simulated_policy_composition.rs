@@ -30,7 +30,8 @@
 use crate::policy_simulation::{principal, simulate, ALLOWED, IMPLICIT_DENY};
 use crate::simulated_decision_attribution::allow;
 use crate::simulated_resource_policy::{
-    attribution, parts, IDENTITY_POLICY, RESOURCE_POLICY, RESOURCE_POLICY_ID,
+    attribution, parts, user_inline_policy_id, IDENTITY_POLICY, RESOURCE_POLICY,
+    RESOURCE_POLICY_ID,
 };
 use crate::user_lifecycle::{element, router};
 
@@ -192,7 +193,12 @@ async fn an_allow_is_attributed_to_the_documents_that_granted_it() {
             // identity-based policies first, then the resource-based one.
             let mut expected: Vec<(String, String)> = Vec::new();
             if holding.identity_grants {
-                expected.push((case.policy_name.to_string(), IDENTITY_POLICY.to_string()));
+                expected.push((
+                    // An inline policy of the principal this row created, so it is named
+                    // by that embedding.
+                    user_inline_policy_id(&format!("{}{row}", holding.at), case.policy_name),
+                    IDENTITY_POLICY.to_string(),
+                ));
             }
             if holding.named_by_resource_policy {
                 expected.push((

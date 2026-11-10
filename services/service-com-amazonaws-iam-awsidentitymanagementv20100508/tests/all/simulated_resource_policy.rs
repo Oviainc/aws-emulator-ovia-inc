@@ -38,6 +38,27 @@ pub(crate) const RESOURCE_POLICY: &str = "Resource Policy";
 /// `ResourcePolicy` member.
 pub(crate) const RESOURCE_POLICY_ID: &str = "ResourcePolicy";
 
+/// The `Statement$SourcePolicyId` an INLINE policy is reported under: the embedding it is
+/// — the type of the entity it is embedded in, that entity's name and the policy's own name
+/// — because an inline policy's name is unique only within the entity that embeds it, so
+/// two entities may each embed one of that name and a decision has to be attributable to
+/// the one embedding that produced it. A MANAGED policy is reported under its friendly
+/// name, which the account already holds it uniquely under.
+///
+/// Shared by every simulation suite in this crate, so the rule is written exactly once.
+pub(crate) fn inline_policy_id(
+    attachment_type: &str,
+    attachment_name: &str,
+    policy_name: &str,
+) -> String {
+    format!("{attachment_type}_{attachment_name}_{policy_name}")
+}
+
+/// [`inline_policy_id`] for the common case: a policy embedded in a USER.
+pub(crate) fn user_inline_policy_id(user_name: &str, policy_name: &str) -> String {
+    inline_policy_id("user", user_name, policy_name)
+}
+
 /// Resources the simulation is about. "You can simulate resources that don't exist in
 /// your account" (`SimulatePrincipalPolicy`), so these are never created anywhere; the
 /// three services differ so nothing under test can be keyed to one of them.
@@ -311,7 +332,16 @@ async fn a_resource_policy_is_decided_for_the_simulated_caller() {
         let expected: Vec<(String, String)> = case
             .expected_matched
             .iter()
-            .map(|(id, kind)| ((*id).to_string(), (*kind).to_string()))
+            .map(|(id, kind)| {
+                // Every identity-based entry in this table is an inline policy of the
+                // principal the row created, so it is named by that embedding.
+                let id = if *kind == IDENTITY_POLICY {
+                    user_inline_policy_id(&format!("source{row}"), id)
+                } else {
+                    (*id).to_string()
+                };
+                (id, (*kind).to_string())
+            })
             .collect();
         let (top, per_resource) = parts(&body);
         assert_eq!(

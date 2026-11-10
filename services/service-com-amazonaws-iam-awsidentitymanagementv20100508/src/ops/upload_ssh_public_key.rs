@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UploadSSHPublicKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UploadSSHPublicKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UploadSSHPublicKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +155,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UploadSSHPublicKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UploadSSHPublicKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UploadSSHPublicKey"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The operation models no `ServiceFailureException`; a store that is not
+            // there is a limit on what the account can hold rather than a bad request.
+            return Err(UploadSSHPublicKeyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // What the body carries, read as the formats it may come in rather than by
+        // matching on its text (`crate::state::read_ssh_public_key`). Read BEFORE the
+        // store is touched, since nothing about the account changes the answer.
+        let material = crate::state::read_ssh_public_key(&input.ssh_public_key_body);
+        let (subject_public_key_info, fingerprint) = match material {
+            crate::state::SshPublicKeyMaterial::Key {
+                subject_public_key_info,
+                fingerprint,
+            } => (subject_public_key_info, fingerprint),
+            // "The public key must be encoded in ssh-rsa format or PEM format": material
+            // in neither encoding is the one the operation models for an encoding it does
+            // not recognise.
+            crate::state::SshPublicKeyMaterial::UnrecognizedEncoding => {
+                return Err(
+                    UploadSSHPublicKeyErrorModeled::UnrecognizedPublicKeyEncodingException(
+                        UnrecognizedPublicKeyEncodingException {
+                            message: Some(UNRECOGNIZED_ENCODING.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // A recognised encoding carrying no usable key: "the public key is malformed
+            // or otherwise invalid" (`InvalidPublicKeyException`).
+            crate::state::SshPublicKeyMaterial::Invalid => {
+                return Err(UploadSSHPublicKeyErrorModeled::InvalidPublicKeyException(
+                    InvalidPublicKeyException {
+                        message: Some(INVALID_PUBLIC_KEY.to_string()),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let mut store = state.lock();
+
+        let user_key = crate::state::name_key(&input.user_name);
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before anything is stored. The decision is made on the ARN of the user
+        // the key is associated with — the held user's own ARN, or, for a name the account
+        // holds no user under, the ARN that name would carry at the default path, since
+        // there is no other path to attribute it to. A refusal names that user as the
+        // request named it, and stores nothing.
+        let resource = store.users.get(&user_key).map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &input.user_name),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::UPLOAD_SSH_PUBLIC_KEY,
+            &resource,
+            &format!("user {}", input.user_name),
+        )?;
+
+        // The key is associated with an IAM user the account holds;
+        // `SSHPublicKey$UserName` is reported in the case that user was created with, not
+        // the case the request happened to spell, since IAM names "are not distinguished
+        // by case".
+        let Some(user) = store.users.get(&user_key) else {
+            return Err(UploadSSHPublicKeyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name
+                    )),
+                },
+            )
+            .into());
+        };
+        let user_name = user.user_name.clone();
+
+        // "The SSH public key is already associated with the specified IAM user"
+        // (`DuplicateSSHPublicKeyException`): sameness is of the KEY, not of the text that
+        // carried it, so the question is asked of the material both bodies decode to, and
+        // of THIS user's keys alone, exactly as that sentence scopes it — an upload of a key
+        // another user holds is a fresh association of that key with this user, and leaves
+        // the other user's record untouched.
+        if store.ssh_public_key_held_by(&user_key, &subject_public_key_info) {
+            return Err(
+                UploadSSHPublicKeyErrorModeled::DuplicateSSHPublicKeyException(
+                    DuplicateSSHPublicKeyException {
+                        // Fixed text: IAM names neither the key nor the id it is held
+                        // under, and that id is minted per upload, so nothing of one run
+                        // goes into the sentence.
+                        message: Some(DUPLICATE_KEY.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A user holds a bounded number of SSH public keys, so a caller cannot grow one
+        // user's set without limit; past the quota IAM refuses the upload and stores
+        // nothing.
+        if store.ssh_public_keys_held_by(&user_key) >= crate::state::MAX_SSH_PUBLIC_KEYS_PER_USER {
+            return Err(UploadSSHPublicKeyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for SSHPublicKeysPerUser: {}",
+                        crate::state::MAX_SSH_PUBLIC_KEYS_PER_USER
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::uploaded_ssh_public_key(
+            user_key,
+            // "The SSH public key" is kept verbatim, so a later read reports the body the
+            // upload carried byte for byte.
+            input.ssh_public_key_body,
+            subject_public_key_info,
+            fingerprint,
+        );
+        let ssh_public_key_id = store.store_ssh_public_key(record.clone());
+
+        // Audit record for a state-changing call that adds material a repository
+        // authenticates against: who asked, what was stored, how it ended. Only wire
+        // metadata and the server-minted id — never the key material.
+        ::tracing::info!(
+            audit = true,
+            operation = "UploadSSHPublicKey",
+            outcome = "stored",
+            ssh_public_key_id = %ssh_public_key_id,
+            "SSH public key stored"
+        );
+
+        // The response reports the stored record, so a caller sees exactly what a later
+        // `ListSSHPublicKeys` reports.
+        Ok(UploadSSHPublicKeyOutput {
+            ssh_public_key: Some(record.report(&ssh_public_key_id, &user_name)),
+        })
     }
 }
+
+/// What IAM answers a body in neither of the encodings the upload names with. One fixed
+/// sentence for the refusal class: the material itself is what the caller has to correct,
+/// and IAM names the encodings it takes rather than quoting the body back.
+const UNRECOGNIZED_ENCODING: &str =
+    "The public key encoding format is unsupported or unrecognized.";
+
+/// What IAM answers a body in a recognised encoding that carries no usable key with —
+/// "the public key is malformed or otherwise invalid" (`InvalidPublicKeyException`).
+const INVALID_PUBLIC_KEY: &str = "The public key is malformed or otherwise invalid.";
+
+/// What IAM answers an upload of a key the named user already holds with — "the SSH public
+/// key is already associated with the specified IAM user"
+/// (`DuplicateSSHPublicKeyException`).
+const DUPLICATE_KEY: &str =
+    "The SSH public key is already associated with the specified IAM user.";

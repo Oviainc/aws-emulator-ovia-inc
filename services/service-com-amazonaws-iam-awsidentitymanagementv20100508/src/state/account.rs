@@ -416,6 +416,12 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// (rather than held on the user) so enumeration order is total and stable, which
     /// is what lets the list hand out a resumable marker.
     pub signing_certificates: BTreeMap<String, SigningCertificateRecord>,
+    /// `SSHPublicKeyId` -> the SSH public key's record, including [`name_key`] of the user
+    /// that holds it. `UploadSSHPublicKey` is what fills this map and `ListSSHPublicKeys`
+    /// pages over it. Keyed by the id (rather than held on the user) so enumeration order
+    /// is total and stable, which is what lets the list hand out a resumable marker — the
+    /// same shape [`Self::signing_certificates`] takes, for the same reason.
+    pub ssh_public_keys: BTreeMap<String, SshPublicKeyRecord>,
     /// The persisted login profiles, keyed by [`name_key`] of the user name — the
     /// same key [`Self::users`] uses, because a user has AT MOST ONE login profile
     /// ("a login profile is created when you create a password for the user",
@@ -714,6 +720,9 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// Monotonic counter feeding
     /// [`next_signing_certificate_id`](Self::next_signing_certificate_id).
     pub signing_certificate_id_seq: u64,
+    /// Monotonic counter feeding
+    /// [`next_ssh_public_key_id`](Self::next_ssh_public_key_id).
+    pub ssh_public_key_id_seq: u64,
     /// Monotonic counter feeding [`hold_password`](Self::hold_password), so every
     /// password the account holds a verifier for carries its own salt.
     pub password_salt_seq: u64,
@@ -775,6 +784,7 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             access_keys: BTreeMap::new(),
             role_sessions: BTreeMap::new(),
             signing_certificates: BTreeMap::new(),
+            ssh_public_keys: BTreeMap::new(),
             login_profiles: BTreeMap::new(),
             service_specific_credentials: BTreeMap::new(),
             policies: BTreeMap::new(),
@@ -811,6 +821,7 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             instance_profile_id_seq: 0,
             server_certificate_id_seq: 0,
             signing_certificate_id_seq: 0,
+            ssh_public_key_id_seq: 0,
             password_salt_seq: 0,
         }
     }

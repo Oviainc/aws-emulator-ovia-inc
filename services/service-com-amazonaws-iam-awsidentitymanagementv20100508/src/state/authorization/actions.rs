@@ -451,6 +451,12 @@ pub const DELETE_SIGNING_CERTIFICATE: &str = "iam:DeleteSigningCertificate";
 /// `iam:ListSigningCertificates`.
 pub const LIST_SIGNING_CERTIFICATES: &str = "iam:ListSigningCertificates";
 
+/// `iam:UploadSSHPublicKey`.
+pub const UPLOAD_SSH_PUBLIC_KEY: &str = "iam:UploadSSHPublicKey";
+
+/// `iam:ListSSHPublicKeys`.
+pub const LIST_SSH_PUBLIC_KEYS: &str = "iam:ListSSHPublicKeys";
+
 /// `iam:CreateServiceSpecificCredential`.
 pub const CREATE_SERVICE_SPECIFIC_CREDENTIAL: &str = "iam:CreateServiceSpecificCredential";
 

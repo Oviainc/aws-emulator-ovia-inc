@@ -257,6 +257,29 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             reason: no_allow("iam:ListUserTags"),
             details: true,
         },
+        Case {
+            case: "implicit deny reading one user's embedded policy",
+            policies: Vec::new(),
+            action: "GetUserPolicy",
+            params: vec![
+                ("UserName".to_string(), TARGET.to_string()),
+                ("PolicyName".to_string(), "wording".to_string()),
+            ],
+            iam_action: "iam:GetUserPolicy",
+            named_as: target.clone(),
+            reason: no_allow("iam:GetUserPolicy"),
+            details: true,
+        },
+        Case {
+            case: "implicit deny listing one user's embedded policies",
+            policies: Vec::new(),
+            action: "ListUserPolicies",
+            params: vec![("UserName".to_string(), TARGET.to_string())],
+            iam_action: "iam:ListUserPolicies",
+            named_as: target.clone(),
+            reason: no_allow("iam:ListUserPolicies"),
+            details: true,
+        },
         // The same two reads of a ROLE: a request that addresses one entity of another
         // type, so neither the entity type nor the resource form selects the wording —
         // each of these actions is one AWS words with the pointer, as the user's tag

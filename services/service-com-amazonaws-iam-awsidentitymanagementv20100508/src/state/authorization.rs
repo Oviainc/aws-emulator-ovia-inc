@@ -61,7 +61,7 @@
 //! or on what the request itself writes, rather than only on the action asked for: through
 //! a `Condition` clause over a condition key, or through a policy VARIABLE in its
 //! `Resource` element, which the shared evaluation substitutes from the request's condition
-//! context. That context is assembled here ([`request_context`]), out of the four things
+//! context. That context is assembled here ([`request_context`]), out of the five things
 //! IAM itself fills it from:
 //!
 //! * the SIGNING principal, resolved here before anything is decided — its friendly name,
@@ -74,6 +74,9 @@
 //! * the REQUEST, for a call that writes tags: the tags it writes
 //!   (`aws:RequestTag/<key>`) and the set of keys it writes (`aws:TagKeys`), which the
 //!   `Tag*`, `Untag*` and `Create*` call sites hand the gate ([`WrittenTags`]);
+//! * the CONNECTION the request arrived on — the address it was made from
+//!   (`aws:SourceIp`), which is what a network clause is decided against
+//!   ([`source_address`]);
 //! * the CLOCK, which is what a date clause is decided against (`aws:CurrentTime`, and the
 //!   same instant as epoch seconds in `aws:EpochTime`).
 //!
@@ -235,6 +238,19 @@ const REQUEST_TAG_PREFIX: &str = "aws:RequestTag/";
 /// under one of IAM's set qualifiers.
 const TAG_KEYS_KEY: &str = "aws:TagKeys";
 
+/// The condition key carrying the ADDRESS the request was made from: "`aws:SourceIp` —
+/// the requester's IP address", which is what an IP clause compares against.
+const SOURCE_IP_KEY: &str = "aws:SourceIp";
+
+/// The header a proxy in front of this emulator states the address it forwarded a request
+/// for in, whose FIRST entry is the client's own — the same reading every other service in
+/// this tree takes of a request's source address.
+const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
+
+/// The address a request carries when nothing forwarded it: this emulator serves its API
+/// over the loopback interface, so a connection that reached it came from the local host.
+const LOOPBACK_SOURCE_IP: &str = "127.0.0.1";
+
 /// The condition key carrying the instant the request is being decided at:
 /// "`aws:CurrentTime` — the date and time of the request", which is what a date clause
 /// compares against.
@@ -244,19 +260,40 @@ const CURRENT_TIME_KEY: &str = "aws:CurrentTime";
 /// in epoch or Unix time".
 const EPOCH_TIME_KEY: &str = "aws:EpochTime";
 
-/// The keys every request to this gate models about ITSELF: the tags it writes and the
-/// instant it is decided at.
+/// The keys every request to this gate models about ITSELF: the tags it writes, the
+/// address it was made from and the instant it is decided at.
 ///
 /// Published for every call, because each is answered from the call itself — a request
 /// that writes no tag carries no `aws:RequestTag/` and no `aws:TagKeys` value, which is
-/// exactly what a clause over one of them is then decided from, and the clock always has
-/// an answer.
+/// exactly what a clause over one of them is then decided from, while the connection and
+/// the clock always have an answer.
 const PUBLISHED_REQUEST_KEYS: &[&str] = &[
     REQUEST_TAG_PREFIX,
     TAG_KEYS_KEY,
+    SOURCE_IP_KEY,
     CURRENT_TIME_KEY,
     EPOCH_TIME_KEY,
 ];
+
+/// The address the request `parts` was made from, as `aws:SourceIp` carries it.
+///
+/// IAM fills that key from the CONNECTION, not from anything the request body says: the
+/// first entry of [`FORWARDED_FOR_HEADER`] when a proxy stated the client it forwarded
+/// for, and otherwise [`LOOPBACK_SOURCE_IP`], the host every connection to this emulator
+/// is made from. So a statement gated on a network either admits or refuses a real signed
+/// call, rather than leaving the clause undecided — and the value is never read off the
+/// request's own parameters.
+fn source_address(parts: &::http::request::Parts) -> String {
+    parts
+        .headers
+        .get(FORWARDED_FOR_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+        .unwrap_or(LOOPBACK_SOURCE_IP)
+        .to_string()
+}
 
 /// The condition keys a request that reaches THIS decision structurally cannot carry, so
 /// that a clause over one of them is decided from its absence rather than left undecided.
@@ -395,6 +432,7 @@ fn request_context(
     caller: Caller<'_>,
     resource: &str,
     written: WrittenTags<'_>,
+    source_ip: String,
 ) -> (Vec<(String, String)>, Vec<&'static str>) {
     let mut context = Vec::new();
     let mut published = Vec::new();
@@ -430,6 +468,9 @@ fn request_context(
         published.extend_from_slice(PUBLISHED_RESOURCE_TAG_KEYS);
     }
     context.extend(written.context());
+    // Where the call came from, read from the connection the same way every request's
+    // source address is read here ([`source_address`]).
+    context.push((SOURCE_IP_KEY.to_string(), source_ip));
     let now = super::now();
     // The instant the call is decided at, in the two spellings IAM publishes it under.
     if let Ok(stated) = now.fmt(::aws_smithy_types::date_time::Format::DateTime) {
@@ -507,7 +548,8 @@ pub fn authorize_written(
         policies,
         scope,
     } = signer;
-    let (context, published) = request_context(store, caller, resource, written);
+    let (context, published) =
+        request_context(store, caller, resource, written, source_address(ctx.parts()));
 
     let principals = [principal.clone()];
     // What the policies in force are decided against BESIDES the action and the resource:
@@ -644,6 +686,11 @@ const NAMES_AUTHORIZATION_DETAILS: &[&str] = &[
     GENERATE_CREDENTIAL_REPORT,
     GET_CREDENTIAL_REPORT,
     GET_USER,
+    // The two reads of what a USER embeds, each recorded answering its withheld call with
+    // the pointer — the same wording their role counterparts below are recorded with, which
+    // is why each is here per the SOURCE above rather than derived from the other.
+    GET_USER_POLICY,
+    LIST_USER_POLICIES,
     LIST_ACCESS_KEYS,
     LIST_OPEN_ID_CONNECT_PROVIDERS,
     LIST_ROLE_POLICIES,
@@ -806,10 +853,16 @@ pub fn delegation_permission_check(
     let mut short_of_an_ask = false;
     for (action, resource) in &asks {
         // The same question [`authorize_written`] asks, so it is asked with the same
-        // knowledge of the caller, of the ask's own target and of the clock (see
-        // [`request_context`]). A permission check writes no tags, so the ask carries
-        // none either.
-        let (ask_context, published) = request_context(store, caller, resource, WrittenTags::None);
+        // knowledge of the caller, of the ask's own target, of the connection and of the
+        // clock (see [`request_context`]). A permission check writes no tags, so the ask
+        // carries none either.
+        let (ask_context, published) = request_context(
+            store,
+            caller,
+            resource,
+            WrittenTags::None,
+            source_address(ctx.parts()),
+        );
         let request = iam::Request::new(action, resource, &principals)
             .with_context(&ask_context)
             .with_published_keys(&published);

@@ -291,15 +291,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request fails and the resource is not created" (`$Tags`), which is why this is
         // checked before anything is written.
         let supplied_tags = input.tags.unwrap_or_default();
-        if let Some(reserved) =
-            crate::state::reserved_tag_key(supplied_tags.iter().map(|tag| tag.key.as_str()))
-        {
+        if crate::state::has_reserved_tag_key(supplied_tags.iter().map(|tag| tag.key.as_str())) {
             return Err(UploadServerCertificateErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(format!(
-                        "Tag key {reserved} is reserved: keys must not begin with {}",
-                        crate::state::RESERVED_TAG_KEY_PREFIX
-                    )),
+                    message: Some(crate::state::RESERVED_TAG_KEY_MESSAGE.to_string()),
                 },
             )
             .into());
