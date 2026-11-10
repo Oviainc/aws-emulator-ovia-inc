@@ -107,6 +107,8 @@ mod forced_state_lifetime;
 mod forced_state_propagation;
 #[path = "all/forced_state_reclaim.rs"]
 mod forced_state_reclaim;
+#[path = "all/forced_transition_notification.rs"]
+mod forced_transition_notification;
 #[path = "all/get_dashboard_reader.rs"]
 mod get_dashboard_reader;
 #[path = "all/harness.rs"]
