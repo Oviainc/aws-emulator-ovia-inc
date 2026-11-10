@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRoles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRoles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRoles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the role entitlements this service holds for the tenant the request names,
+//! one page at a time. The entitlements are seeded through [`crate::state`] (the runtime
+//! API models no create operation), so an unseeded tenant has none — an empty listing,
+//! not an error.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +86,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,18 +159,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRoles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRolesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRoles"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // UNREACHABLE with the engine the router mounts: the state is keyed by type
+            // on that one shared engine. Answered rather than panicked, with the modelled
+            // error that blames the service rather than the caller.
+            return Err(internal_server_error(
+                "the account access runtime store is unavailable on this engine",
+            ));
+        };
+
+        // `maxResults` is a plain `Integer` in this model, so the framework's boundary
+        // validation passes any value and the smallest meaningful page bound is this
+        // handler's to state: a page of fewer than one role names no page at all.
+        if let Some(requested) = input.max_results {
+            if requested < 1 {
+                return Err(validation_exception(crate::state::below_minimum(
+                    "maxResults",
+                    requested,
+                    1,
+                )));
+            }
+        }
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        // The one write a listing makes, and only what the clock already owed (see
+        // `crate::state::end_expired_sessions`): nothing reported below depends on it.
+        crate::state::end_expired_sessions(&mut store, ctx.credential_store(), now);
+
+        // Exactly the entitlements held for THIS tenant, in the stored order, as the
+        // modelled shape. A tenant this service holds none for lists none.
+        let entitled: Vec<(String, AccessDetails)> = store
+            .roles(&input.tenant_id)
+            .into_iter()
+            .map(|role| {
+                (
+                    role.role_arn.clone(),
+                    AccessDetails {
+                        account_id: role.account_id.clone(),
+                        account_name: role.account_name.clone(),
+                        role_arn: role.role_arn.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        // The cursor is scoped to this tenant's role listing, so a token issued for
+        // another tenant's roles cannot be continued here.
+        let page = crate::state::page_of(
+            entitled,
+            &crate::state::roles_cursor_scope(&input.tenant_id),
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|_| {
+            validation_exception(
+                "nextToken is not a pagination token this operation issued for this tenant's \
+                 roles"
+                    .to_string(),
+            )
+        })?;
+
+        // The access record for a served listing: which tenant's entitlements were read
+        // and how many were reported, never a credential. The request-derived tenant is
+        // recorded with `?`, so it is quoted and cannot forge a line.
+        ::tracing::info!(
+            operation = Self::NAME,
+            tenant_id = ?input.tenant_id,
+            reported = page.items.len(),
+            truncated = page.next_token.is_some(),
+            "reported a tenant's role entitlements"
+        );
+
+        Ok(ListRolesOutput {
+            roles: page.items,
+            next_token: page.next_token,
+        })
     }
+}
+
+/// A request this operation will not read, as the modelled 400: the model declares its
+/// own `ValidationException`, so a rule it states but cannot express as a constraint is
+/// refused in that shape rather than through the scaffold channel.
+fn validation_exception(message: String) -> ListRolesError {
+    ListRolesErrorModeled::ValidationException(ValidationException { message }).into()
+}
+
+/// A server-side failure this operation cannot serve through: the modelled 500.
+///
+/// `detail` says which internal step failed and goes to the log, never to the caller: the
+/// response carries what this service's `InternalServerException` documents, which names
+/// no component of the emulator.
+fn internal_server_error(detail: &str) -> ListRolesError {
+    ::tracing::error!(
+        operation = "ListRoles",
+        detail = %detail,
+        "failed to serve a role listing"
+    );
+    ListRolesErrorModeled::InternalServerException(InternalServerException {
+        message: "An internal server error occurred. Retry the request.".to_string(),
+    })
+    .into()
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRoleCredentials
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRoleCredentials`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRoleCredentials::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints the temporary credentials of a role the tenant is entitled to assume, records
+//! them, and reports what it recorded. A role that is not one of that tenant's
+//! entitlements is refused with the modelled `AccessDeniedException`.
 //!
 //! ## Shape of an operation
 //!
@@ -100,6 +95,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{IssuedSession, RoleEntitlement};
+use emulator_server::aws_credentials::{AWS_SESSION, SECRET_ACCESS_KEY, SESSION_TOKEN};
+use std::time::{Duration, SystemTime};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -172,18 +171,195 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRoleCredentials` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRoleCredentialsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRoleCredentials"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // UNREACHABLE with the engine the router mounts: the state is keyed by type
+            // on that one shared engine. Answered rather than panicked, with the modelled
+            // error that blames the service rather than the caller.
+            return Err(internal_server_error(
+                "the account access runtime store is unavailable on this engine",
+            ));
+        };
+
+        // WHICH credential kind is vended is decided by the access type asked for, read
+        // against the modelled enum's own value list rather than assumed: a value the
+        // model does not declare names no member of the `CredentialsDetails` union.
+        if !ACCESS_TYPE_VALUES.contains(&input.access_type.as_str()) {
+            return Err(validation_exception(format!(
+                "1 validation error detected: Value '{}' at 'accessType' failed to satisfy \
+                 constraint: Member must satisfy enum value set: [{}]",
+                input.access_type,
+                ACCESS_TYPE_VALUES.join(", ")
+            )));
+        }
+
+        let now = SystemTime::now();
+        // Ending the spent credentials and resolving the entitlement both read the one
+        // store; the guard is released before anything is minted, so no credential is
+        // created while it is held.
+        let entitlement: RoleEntitlement = {
+            let mut store = state.lock();
+            // The one write that is owed to nobody's request (see
+            // `crate::state::end_expired_sessions`): nothing reported below depends on it.
+            crate::state::end_expired_sessions(&mut store, ctx.credential_store(), now);
+            let Some(entitlement) = store.entitlement(&input.tenant_id, &input.role_arn) else {
+                // Not an entitlement of that tenant — whether the tenant holds other
+                // roles or none at all, there is no role session to return. Recorded as
+                // the refused access attempt the real service would record; every
+                // request-derived value goes in with `?`, so it cannot forge a line.
+                ::tracing::info!(
+                    operation = Self::NAME,
+                    tenant_id = ?input.tenant_id,
+                    role_arn = ?input.role_arn,
+                    error_code = "AccessDeniedException",
+                    "refused credentials for a role the tenant is not entitled to"
+                );
+                return Err(access_denied(&input.role_arn));
+            };
+            entitlement.clone()
+        };
+
+        let duration = session_duration(input.session_duration, &entitlement)?;
+
+        // The emulator mints every id and secret: a handler never invents one. These come
+        // from the emulator's credential store, so the credentials this call hands back
+        // are ones the emulator itself accepts for signing.
+        let minted = ctx.credential_store().create(&AWS_SESSION);
+        let (Some(secret_access_key), Some(session_token)) = (
+            minted.secret(SECRET_ACCESS_KEY).map(str::to_string),
+            minted.secret(SESSION_TOKEN).map(str::to_string),
+        ) else {
+            // The session kind always mints both secrets, so this is an emulator-side
+            // fault rather than anything the caller can fix.
+            let _ = ctx.credential_store().delete(&minted.id);
+            return Err(internal_server_error(
+                "a session credential was created without its secrets",
+            ));
+        };
+
+        let access_key_id = minted.id.clone();
+        let session = IssuedSession {
+            tenant_id: input.tenant_id.clone(),
+            role_arn: input.role_arn.clone(),
+            session_name: input.session_name.clone(),
+            access_key_id: access_key_id.clone(),
+            secret_access_key,
+            session_token,
+            expires_at: crate::state::expiry_after(now, duration),
+        };
+
+        let details = {
+            let mut store = state.lock();
+            store.record_session(session);
+            // Reported FROM the record, not from the local value: what the caller is told
+            // is what this service stored, so a later read of the same session agrees
+            // with the response that minted it.
+            let Some(stored) = store.session(&input.tenant_id, &access_key_id, now) else {
+                // Nothing is left signable that no session record accounts for.
+                let _ = ctx.credential_store().delete(&access_key_id);
+                return Err(internal_server_error(
+                    "the minted credential set was not recorded",
+                ));
+            };
+            ProgrammaticAccessDetails {
+                access_key_id: stored.access_key_id.clone(),
+                secret_access_key: stored.secret_access_key.clone(),
+                session_token: stored.session_token.clone(),
+                expires_at: ::aws_smithy_types::DateTime::from(stored.expires_at),
+            }
+        };
+
+        // The access record for a credential-issuing call: which role was assumed, for
+        // which tenant, and under which access key id — never a secret or the session
+        // token. Every request-derived value is recorded with `?`, so it is quoted and
+        // its control characters escaped and cannot forge a line.
+        ::tracing::info!(
+            operation = Self::NAME,
+            tenant_id = ?input.tenant_id,
+            role_arn = ?input.role_arn,
+            session_name = ?input.session_name,
+            access_key_id = %access_key_id,
+            "issued credentials for an entitled role"
+        );
+
+        Ok(GetRoleCredentialsOutput {
+            credentials_details: Some(CredentialsDetails::programmaticAccess(details)),
+        })
     }
+}
+
+/// How long the credentials this call mints last.
+///
+/// A request that names a `sessionDuration` gets that duration, which the model says
+/// "can't exceed the maximum session duration configured for the role" — so a longer one
+/// is refused rather than quietly shortened. A request that names none gets the service
+/// default, itself never longer than the role allows. `sessionDuration` is a plain
+/// `Integer` in this model, so the framework's boundary validation passes any value and
+/// both rules are this handler's to state.
+fn session_duration(
+    requested: Option<i32>,
+    entitlement: &RoleEntitlement,
+) -> Result<Duration, GetRoleCredentialsError> {
+    let Some(seconds) = requested else {
+        return Ok(entitlement.default_session_duration());
+    };
+    if seconds < 1 {
+        return Err(validation_exception(crate::state::below_minimum(
+            "sessionDuration",
+            seconds,
+            1,
+        )));
+    }
+    let Ok(unsigned) = u64::try_from(seconds) else {
+        // Unreachable: every value this conversion rejects is negative and was refused
+        // above. Refused again rather than panicked on.
+        return Err(validation_exception(crate::state::below_minimum(
+            "sessionDuration",
+            seconds,
+            1,
+        )));
+    };
+    let asked = Duration::from_secs(unsigned);
+    if asked > entitlement.max_session_duration {
+        return Err(validation_exception(format!(
+            "The requested sessionDuration of {unsigned} seconds exceeds the maximum session \
+             duration of {} seconds configured for the role {}.",
+            entitlement.max_session_duration.as_secs(),
+            entitlement.role_arn
+        )));
+    }
+    Ok(asked)
+}
+
+/// The role is not one the tenant is entitled to assume, which the operation documents as
+/// its `AccessDeniedException`: the caller is authenticated but not authorized to assume
+/// a role it is not entitled to.
+fn access_denied(role_arn: &str) -> GetRoleCredentialsError {
+    GetRoleCredentialsErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: format!("You aren't entitled to the role {role_arn}."),
+    })
+    .into()
+}
+
+/// A request this operation will not read, as the modelled 400: the model declares its
+/// own `ValidationException`, so a rule it states but cannot express as a constraint is
+/// refused in that shape rather than through the scaffold channel.
+fn validation_exception(message: String) -> GetRoleCredentialsError {
+    GetRoleCredentialsErrorModeled::ValidationException(ValidationException { message }).into()
+}
+
+/// A server-side failure this operation cannot serve through: the modelled 500.
+///
+/// `detail` says which internal step failed and goes to the log, never to the caller: the
+/// response carries what this service's `InternalServerException` documents, which names
+/// no component of the emulator.
+fn internal_server_error(detail: &str) -> GetRoleCredentialsError {
+    ::tracing::error!(
+        operation = "GetRoleCredentials",
+        detail = %detail,
+        "failed to serve a role credential request"
+    );
+    GetRoleCredentialsErrorModeled::InternalServerException(InternalServerException {
+        message: "An internal server error occurred. Retry the request.".to_string(),
+    })
+    .into()
 }
