@@ -2188,9 +2188,10 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
 /// Every operation applies this BEFORE it resolves an identifier and before it
 /// writes anything, so an unentitled caller learns it lacks access rather than
 /// whether a recommendation exists, and a mutation it may not make changes
-/// nothing. The modelled constraints are refused earlier still, by the
-/// centralized request walk, so a malformed request is a `ValidationException`
-/// whether the caller is entitled or not.
+/// nothing. Input validation is refused earlier still, so a malformed request is
+/// a `ValidationException` whether the caller is entitled or not: the modelled
+/// constraints by the centralized request walk, and a well-formedness condition
+/// those traits cannot express by the handler that owns it, ahead of this gate.
 ///
 /// The emulator presents exactly one account (`engine::EMULATOR_ACCOUNT_ID`), so
 /// that is the account every request is made from and the only one the gate can

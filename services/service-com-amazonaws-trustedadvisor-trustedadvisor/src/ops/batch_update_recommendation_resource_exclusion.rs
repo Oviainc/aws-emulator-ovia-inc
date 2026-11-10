@@ -18,6 +18,10 @@
 //! exclusion states for one resource, which is not a well-formed request: the
 //! WHOLE request is refused with the modelled `ValidationException` (HTTP 400)
 //! and no entry is applied, rather than the last occurrence silently winning.
+//! Being an input-validation refusal, it is raised where the modelled ones are
+//! raised — ahead of [`crate::state::support_level_refusal`] — so a malformed
+//! request earns the same 400 whether the calling account's support plan
+//! includes this API or not.
 //! A refusal of one entry is reported as an entry of
 //! `batchUpdateRecommendationResourceExclusionErrors` rather than as a
 //! top-level error, so the remaining entries still apply: an ARN naming no
@@ -269,27 +273,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        // The support-level gate, ahead of everything else this handler does —
-        // ahead of applying any exclusion, so a batch this account may not make
-        // changes nothing and reports nothing about which resources exist. See
-        // [`crate::state::support_level_refusal`].
-        if let Some(denied) = crate::state::support_level_refusal(&*self.engine) {
-            return Err(
-                BatchUpdateRecommendationResourceExclusionErrorModeled::AccessDeniedException(
-                    denied,
-                )
-                .into(),
-            );
-        }
-        // Request well-formedness, ahead of every lookup and every write: a list
-        // that names one recommendation-resource ARN twice asks for two exclusion
-        // states for one resource, so the WHOLE request is refused and nothing is
-        // applied — including the entries that name no repeated ARN.
+        // Request well-formedness, ahead of the support-level gate and of every
+        // lookup and every write: a list that names one recommendation-resource
+        // ARN twice asks for two exclusion states for one resource, so the WHOLE
+        // request is refused and nothing is applied — including the entries that
+        // name no repeated ARN. This is one of this service's input-validation
+        // refusals (`crate::service::validation`), and those are answered where
+        // the modelled constraints the centralized request walk collects are
+        // answered: before the caller's entitlement is consulted, so one
+        // malformed request has one status on every support plan.
         let repeated = repeated_arns(&input.recommendation_resource_exclusions);
         if let Some(message) = repeated_arn_refusal(&repeated) {
             return Err(
                 BatchUpdateRecommendationResourceExclusionErrorModeled::ValidationException(
                     ValidationException { message },
+                )
+                .into(),
+            );
+        }
+        // The support-level gate, ahead of applying any exclusion, so a batch
+        // this account may not make changes nothing and reports nothing about
+        // which resources exist. See
+        // [`crate::state::support_level_refusal`].
+        if let Some(denied) = crate::state::support_level_refusal(&*self.engine) {
+            return Err(
+                BatchUpdateRecommendationResourceExclusionErrorModeled::AccessDeniedException(
+                    denied,
                 )
                 .into(),
             );

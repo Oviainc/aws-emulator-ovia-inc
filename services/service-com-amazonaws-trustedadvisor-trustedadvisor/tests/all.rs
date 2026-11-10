@@ -25,6 +25,8 @@ mod cost_optimizing_aggregates;
 mod cursor_scope_encoding;
 #[path = "all/localized_text.rs"]
 mod localized_text;
+#[path = "all/malformed_batch_precedes_the_gate.rs"]
+mod malformed_batch_precedes_the_gate;
 #[path = "all/organization_member_not_stored.rs"]
 mod organization_member_not_stored;
 #[path = "all/organization_member_set.rs"]

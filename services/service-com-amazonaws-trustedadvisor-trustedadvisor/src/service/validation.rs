@@ -50,7 +50,9 @@
 //! too: the handler states its own subject, member path and requirement and builds the
 //! sentence through [`clause`], [`echoed_value`] and [`refusal_sentence`], which is why
 //! those three are the crate's and not this module's alone. Nothing about the CONDITION
-//! moves here — only the sentence.
+//! moves here — only the sentence. Such a refusal is also ORDERED where the modelled ones
+//! are: ahead of the support-level gate, so a malformed request is this 400 whether the
+//! calling account's support plan includes the API or not.
 //!
 //! A `@sensitive` member reached INSIDE a collection declines the same way, so rule 3
 //! holds wherever a value is stated and not only where the violation was raised. Declining
