@@ -21,6 +21,8 @@ mod amend_benefit_application;
 mod amend_caller_supplied_members;
 #[path = "all/amend_terminal_refusal.rs"]
 mod amend_terminal_refusal;
+#[path = "all/amendment_bounds_come_from_the_model.rs"]
+mod amendment_bounds_come_from_the_model;
 #[path = "all/application_refusal_one_construction.rs"]
 mod application_refusal_one_construction;
 #[path = "all/application_status_gates.rs"]

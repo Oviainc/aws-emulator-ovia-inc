@@ -219,18 +219,6 @@ const CONTACT_UNCONSTRAINED_MEMBERS: &[&str] = &[MEMBER_PHONE];
 /// (`smithy_query(query="shape",shape="FileInput")`).
 const FILE_UNCONSTRAINED_MEMBERS: &[&str] = &[MEMBER_BUSINESS_USE_CASE];
 
-/// The longest value `Name` accepts: the modelled `BenefitApplicationName`
-/// `@length(min: 1, max: 255)`. `Amendment$NewValue` is an unconstrained `String`, so
-/// the target member's own constraint is enforced here.
-const NAME_MAX_LEN: usize = 255;
-
-/// The longest value `Description` accepts: the modelled
-/// `BenefitApplicationDescription` `@length(min: 1, max: 1000)`.
-const DESCRIPTION_MAX_LEN: usize = 1000;
-
-/// The shortest value either string member accepts, from those same `@length` traits.
-const MIN_LEN: usize = 1;
-
 /// Why one amendment cannot be applied: the input member to report, and the constraint
 /// clause it failed.
 struct AmendmentRefusal {
@@ -334,6 +322,32 @@ fn member_requirement(
         .into_iter()
         .filter(|violation| violation.path == path)
         .find_map(|violation| crate::service::constraint_requirement(&violation.kind))
+}
+
+/// The requirement `value` fails as the benefit-application string member `field`, or
+/// `None` when the model accepts it there.
+///
+/// `Name` and `Description` are members a caller supplies to the create and the update, and
+/// an amendment writes its value into that same member, so the value is judged by the same
+/// walk over the same modelled member ([`member_requirement`]): it is placed on the update's
+/// own input shape and validated there, rather than against bounds restated here. Only the
+/// member the amendment wrote is reported on, so the other members of that shape — unset
+/// here — report nothing. `None` for a `field` naming neither of the two, which only the
+/// two call sites below name.
+fn string_field_requirement(field: &str, value: &str) -> Option<String> {
+    let value = Some(value.to_string());
+    let supplied = match field {
+        FIELD_NAME => UpdateBenefitApplicationInput {
+            name: value,
+            ..Default::default()
+        },
+        FIELD_DESCRIPTION => UpdateBenefitApplicationInput {
+            description: value,
+            ..Default::default()
+        },
+        _ => return None,
+    };
+    member_requirement(&supplied, &UpdateBenefitApplicationInput::SCHEMA, field)
 }
 
 /// The slot of `contact` the element member `member` writes, or `None` when `member` names
@@ -503,20 +517,16 @@ fn apply_amendment(
 
     match *head {
         FIELD_NAME if rest.is_empty() => {
-            if let Some(clause) =
-                crate::state::length_clause(&amendment.new_value, MIN_LEN, NAME_MAX_LEN)
-            {
-                return Err(refused_value(clause));
+            if let Some(requirement) = string_field_requirement(FIELD_NAME, &amendment.new_value) {
+                return Err(refused_value(requirement));
             }
             application.name = Some(amendment.new_value.clone());
         }
         FIELD_DESCRIPTION if rest.is_empty() => {
-            if let Some(clause) = crate::state::length_clause(
-                &amendment.new_value,
-                MIN_LEN,
-                DESCRIPTION_MAX_LEN,
-            ) {
-                return Err(refused_value(clause));
+            if let Some(requirement) =
+                string_field_requirement(FIELD_DESCRIPTION, &amendment.new_value)
+            {
+                return Err(refused_value(requirement));
             }
             application.description = Some(amendment.new_value.clone());
         }
