@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopMatchmaking
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopMatchmaking`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopMatchmaking::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels the matchmaking request a ticket id names: the stored ticket stops being
+//! processed, so it moves to the modelled `CANCELLED` status and carries the instant it
+//! stopped. A ticket id no stored ticket carries is refused, and so is a ticket the
+//! service has already finished with — there is no work left on it to stop.
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +145,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopMatchmaking` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopMatchmakingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::MATCHMAKING_TICKET_STATUS_CANCELLED;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StopMatchmakingErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        // A ticket's pick-up and its request timeout are each due at an instant whether or
+        // not anybody calls, so the clock is applied before this call decides what the
+        // ticket's status is: a request that had already timed out is one this call finds
+        // finished, not one it cancels.
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // One lookup of the one stored record: the condition below is read off it and the
+        // cancellation is written to it.
+        let Some(ticket) = state.matchmaking_tickets.get_mut(&input.ticket_id) else {
+            return Err(StopMatchmakingErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::matchmaking_ticket_not_found_message(
+                        &input.ticket_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Cancels a matchmaking ticket or match backfill ticket that is currently being
+        // processed": a request the service has already stopped processing has no work left
+        // to stop, and the status it ended in is what it keeps — "matchmaking requests that
+        // fail to successfully complete (statuses FAILED, CANCELLED, TIMED_OUT) can be
+        // resubmitted as new requests with new ticket IDs", which is what a caller does
+        // rather than cancelling a finished request.
+        if !ticket.is_in_process() {
+            return Err(StopMatchmakingErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "Matchmaking ticket {} is in {} status and cannot be cancelled.",
+                        ticket.ticket_id, ticket.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "If successful, work on the ticket is stopped, and the ticket status is changed
+        // to CANCELLED" — so the ticket leaves the progression the clock drives (it is
+        // neither picked up nor timed out afterwards) and is stamped with the "time stamp
+        // indicating when the matchmaking request stopped being processed due to successful
+        // completion, timeout, or cancellation".
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopMatchmaking"))
+        // `StatusReason` is the "code to explain the current status", which the service
+        // fills for a request that did not complete on its own; a request the CALLER
+        // stopped carries none, and no match was made for it, so it reports no game session
+        // connection information either.
+        ticket.status = MATCHMAKING_TICKET_STATUS_CANCELLED.to_string();
+        ticket.searching_at = None;
+        ticket.end_time = Some(now);
+
+        // "If the operation is successful, the service sends back an empty JSON struct with
+        // the HTTP 200 response (not an empty HTTP body)."
+        Ok(StopMatchmakingOutput {})
     }
 }

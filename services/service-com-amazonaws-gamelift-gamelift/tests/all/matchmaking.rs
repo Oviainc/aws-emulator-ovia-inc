@@ -17,7 +17,7 @@ use crate::hosting_loop::{gamelift_arn, wait_for_due_transitions, GameLift};
 
 /// The ARN a rule set named `name` is assigned: `MatchmakingRuleSet$RuleSetArn`'s doc —
 /// "Format is `arn:aws:gamelift:<region>::matchmakingruleset/<ruleset name>`".
-fn rule_set_arn(name: &str) -> String {
+pub(crate) fn rule_set_arn(name: &str) -> String {
     gamelift_arn(&format!("matchmakingruleset/{name}"))
 }
 
@@ -25,13 +25,13 @@ fn rule_set_arn(name: &str) -> String {
 /// `MatchmakingConfiguration$ConfigurationArn`'s doc — "Format is
 /// `arn:aws:gamelift:<region>::matchmakingconfiguration/<matchmaking configuration
 /// name>`".
-fn configuration_arn(name: &str) -> String {
+pub(crate) fn configuration_arn(name: &str) -> String {
     gamelift_arn(&format!("matchmakingconfiguration/{name}"))
 }
 
 /// A rule set body that conforms to the FlexMatch rule language: the version it is
 /// written in, and the teams a match is built from.
-fn conformant_body() -> String {
+pub(crate) fn conformant_body() -> String {
     json!({
         "name": "solo-duel",
         "ruleLanguageVersion": "1.0",
@@ -42,7 +42,11 @@ fn conformant_body() -> String {
 
 /// Create a rule set and a matchmaking configuration on it, and return the
 /// configuration's name.
-async fn matchmaker(gamelift: &GameLift, name: &str, request_timeout_seconds: i64) -> String {
+pub(crate) async fn matchmaker(
+    gamelift: &GameLift,
+    name: &str,
+    request_timeout_seconds: i64,
+) -> String {
     gamelift
         .ok(
             "CreateMatchmakingRuleSet",

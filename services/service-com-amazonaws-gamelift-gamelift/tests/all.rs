@@ -51,6 +51,8 @@ mod locations;
 mod matchmaking;
 #[path = "all/matchmaking_backfill_mode.rs"]
 mod matchmaking_backfill_mode;
+#[path = "all/matchmaking_cancellation.rs"]
+mod matchmaking_cancellation;
 #[path = "all/matchmaking_rule_set_in_use_refusal.rs"]
 mod matchmaking_rule_set_in_use_refusal;
 #[path = "all/matchmaking_rule_set_persistence.rs"]

@@ -103,6 +103,33 @@ pub const MATCHMAKING_TICKET_STATUS_SEARCHING: &str = "SEARCHING";
 /// "`TIMED_OUT` -- The matchmaking request was not successful within the duration
 /// specified in the matchmaking configuration."
 pub const MATCHMAKING_TICKET_STATUS_TIMED_OUT: &str = "TIMED_OUT";
+/// `MatchmakingConfigurationStatus` a ticket a caller stopped ends in: "`CANCELLED` -- The
+/// matchmaking request was canceled. This may be the result of a `StopMatchmaking`
+/// operation or a proposed match that one or more players failed to accept."
+pub const MATCHMAKING_TICKET_STATUS_CANCELLED: &str = "CANCELLED";
+/// `MatchmakingConfigurationStatus` a ticket whose match was made carries: "`COMPLETED` --
+/// Players have been matched and a game session is ready to host the players."
+pub const MATCHMAKING_TICKET_STATUS_COMPLETED: &str = "COMPLETED";
+/// `MatchmakingConfigurationStatus` a ticket that did not complete carries: "`FAILED` --
+/// The matchmaking request was not completed."
+pub const MATCHMAKING_TICKET_STATUS_FAILED: &str = "FAILED";
+
+/// The statuses a matchmaking request has STOPPED being processed in, i.e. the ones from
+/// which it never moves again.
+///
+/// `MatchmakingTicket$Status`'s own docs call `COMPLETED` the status of a request whose
+/// players "have been matched and a game session is ready to host" them, and note that
+/// "matchmaking requests that fail to successfully complete (statuses `FAILED`,
+/// `CANCELLED`, `TIMED_OUT`) can be resubmitted as new requests with new ticket IDs" — a
+/// request in any of those four has finished, so the rest of the modelled statuses
+/// (`QUEUED`, `SEARCHING`, `REQUIRES_ACCEPTANCE`, `PLACING`) are the ones a request is
+/// still being worked on in.
+pub const MATCHMAKING_TICKET_TERMINAL_STATUSES: [&str; 4] = [
+    MATCHMAKING_TICKET_STATUS_COMPLETED,
+    MATCHMAKING_TICKET_STATUS_FAILED,
+    MATCHMAKING_TICKET_STATUS_CANCELLED,
+    MATCHMAKING_TICKET_STATUS_TIMED_OUT,
+];
 
 /// `GameSessionPlacementState` a new placement request carries: `GameSessionPlacement`'s
 /// own doc — "If the game session placement status is `PENDING`, the properties for game
@@ -2037,6 +2064,18 @@ impl MatchmakingConfigurationRecord {
     }
 }
 
+/// What the service answers when no matchmaking ticket is stored under the
+/// `MatchmakingIdStringModel` an operation was asked about — the one text the service's
+/// ticket lookup failure reads as, shared by every operation that names a ticket, so the
+/// same missing ticket reads the same way whichever of them was called. The modelled error
+/// CLASS it is carried in is each operation's own (`smithy_query`).
+///
+/// The ticket id the CALLER supplied is the sentence's one variable part: a ticket is
+/// "identified by a unique ticket ID", so the refusal states which id was asked for.
+pub fn matchmaking_ticket_not_found_message(ticket_id: &str) -> String {
+    format!("Matchmaking ticket not found: {ticket_id}")
+}
+
 /// A matchmaking request, as `StartMatchmaking` persisted it.
 #[derive(Debug, Clone)]
 pub struct MatchmakingTicketRecord {
@@ -2065,15 +2104,13 @@ impl MatchmakingTicketRecord {
     /// Whether this ticket is still being worked on, i.e. it has not reached a terminal
     /// status.
     ///
-    /// `MatchmakingTicket$Status`'s own docs call `QUEUED` and `SEARCHING` the statuses a
-    /// request is being processed in ("the matchmaking request has been received[; it] is
-    /// currently being processed"), and `EndTime` is set only "when the matchmaking request
-    /// stopped being processed due to successful completion, timeout, or cancellation" — so
-    /// a ticket in one of those statuses is an ACTIVE one, which is what decides both the
-    /// timeout the clock owes it and whether its matchmaker may be deleted.
+    /// `EndTime` is set only "when the matchmaking request stopped being processed due to
+    /// successful completion, timeout, or cancellation", so a ticket in none of the
+    /// terminal statuses ([`MATCHMAKING_TICKET_TERMINAL_STATUSES`]) is one the service is
+    /// still processing — which is what decides the timeout the clock owes it, whether a
+    /// caller can stop it, and whether its matchmaker may be deleted.
     pub fn is_in_process(&self) -> bool {
-        self.status == MATCHMAKING_TICKET_STATUS_QUEUED
-            || self.status == MATCHMAKING_TICKET_STATUS_SEARCHING
+        !MATCHMAKING_TICKET_TERMINAL_STATUSES.contains(&self.status.as_str())
     }
 
     /// This ticket as the modelled `MatchmakingTicket`.

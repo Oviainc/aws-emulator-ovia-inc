@@ -189,7 +189,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut tickets: Vec<MatchmakingTicket> = Vec::with_capacity(input.ticket_ids.len());
         for ticket_id in &input.ticket_ids {
             let Some(ticket) = state.matchmaking_tickets.get(ticket_id) else {
-                return Err(invalid(format!("Matchmaking ticket not found: {ticket_id}")));
+                return Err(invalid(crate::state::matchmaking_ticket_not_found_message(
+                    ticket_id,
+                )));
             };
             tickets.push(ticket.to_modelled());
         }
