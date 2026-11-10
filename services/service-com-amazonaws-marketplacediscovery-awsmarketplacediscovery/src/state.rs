@@ -196,6 +196,56 @@ pub fn fulfillment_option_display_name(option_type: &str) -> String {
         .map_or_else(|| option_type.to_string(), |(_, name)| (*name).to_string())
 }
 
+/// The fulfillment option types that deliver a product the SAME way, grouped: a machine
+/// image and the two artifacts that place one, the three container-and-cluster artifacts,
+/// the two seller-hosted ways to reach a hosted product, the two Amazon SageMaker
+/// artifacts, and a data set with the services engagement that integrates it.
+///
+/// Why the catalog groups them: `Product` carries a `FulfillmentOptionsList` — a product
+/// is fulfilled one-to-MANY — and a real AWS Marketplace product is commonly offered
+/// through several routes a buyer picks between (a container image and the Helm chart that
+/// installs it, say), which is exactly what makes `ListFulfillmentOptions` a `@paginated`
+/// operation with a `maxResults` of its own. Each group is also one DEPLOYMENT: every type
+/// in it implies the same `deployedOnAws` ([`FULFILLMENT_DEPLOYMENT_STATUS`]), so offering
+/// a product its whole group says nothing new about where it runs.
+const DELIVERY_FAMILIES: &[&[&str]] = &[
+    &[
+        "AMAZON_MACHINE_IMAGE",
+        "CLOUDFORMATION_TEMPLATE",
+        "EC2_IMAGE_BUILDER_COMPONENT",
+    ],
+    &["CONTAINER", "HELM", "EKS_ADD_ON"],
+    &["SAAS", "API"],
+    &["SAGEMAKER_ALGORITHM", "SAGEMAKER_MODEL"],
+    &["DATA_EXCHANGE", "PROFESSIONAL_SERVICES"],
+];
+
+/// Every fulfillment option type a product whose PRIMARY fulfillment is `primary` is
+/// offered through: `primary` first, then the rest of its delivery family
+/// ([`DELIVERY_FAMILIES`]).
+///
+/// A type no family names is offered on its own, so a `FulfillmentOptionType` the model
+/// gains later still seeds a product rather than being grouped by guess.
+///
+/// Public so a test can assert the relation this seeds — a product with more than one
+/// option, all of one deployment — over the catalog it produces.
+#[must_use]
+pub fn fulfilled_through(primary: &str) -> Vec<String> {
+    let mut offered: Vec<String> = vec![primary.to_string()];
+    for family in DELIVERY_FAMILIES {
+        if !family.contains(&primary) {
+            continue;
+        }
+        offered.extend(
+            family
+                .iter()
+                .filter(|value| **value != primary)
+                .map(|value| (*value).to_string()),
+        );
+    }
+    offered
+}
+
 /// The `fulfillmentOptionId` of a fulfillment option, whichever member of the
 /// `FulfillmentOption` union it is: every member of the union declares the member.
 pub fn fulfillment_option_id(option: &FulfillmentOption) -> &str {
@@ -1411,13 +1461,15 @@ pub fn search_terms(search_text: &str) -> Vec<String> {
     terms
 }
 
-/// Refuse a `filters` list the model's `SearchFilterType` enum cannot reject on its own: an
-/// unsupported filter type, a range filter carrying more than one value or a rating outside
-/// the documented 0.0–5.0 range, or a `NUMBER_OF_PRODUCTS` value that is not a count.
+/// Refuse a `filters` list the model's `SearchFilterType` enum cannot reject on its own: a
+/// filter type REPEATED across entries, an unsupported filter type, a range filter carrying
+/// more than one value or a rating outside the documented 0.0–5.0 range, or a
+/// `NUMBER_OF_PRODUCTS` value that is not a count.
 ///
 /// Checked up front rather than per listing, so the refusal is a property of the REQUEST:
 /// the same malformed filter is refused whether or not any listing reaches the predicate.
 pub fn validate_search_filters(filters: &[SearchFilter]) -> Result<(), String> {
+    reject_duplicate_filter_types(filters.iter().map(|filter| filter.filter_type.as_str()))?;
     for filter in filters {
         let values = &filter.filter_values;
         match filter.filter_type.as_str() {
@@ -1439,6 +1491,43 @@ pub fn validate_search_filters(filters: &[SearchFilter]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Refuse a `filters` list that names one `filterType` more than once, naming every type it
+/// repeats.
+///
+/// Why one entry per type is the rule: a filter entry of this service carries the values to
+/// filter that type by, and both filter shapes document those values as OR-combined —
+/// `SearchFilter$filterValues` "Term filters accept multiple values (OR logic)" and
+/// `PurchaseOptionFilter$filterValues` "OR logic combines multiple values within the same
+/// filter". So the OR of several values of ONE filter type belongs inside that entry's
+/// `filterValues`, which leaves a second entry for the same type with nothing to express —
+/// and the predicates below AND the entries, so such a list selects only what satisfies
+/// both. The rule is independent of a list's own `@length` bound (1..30 for a search,
+/// 1..10 for purchase options): two entries are well inside either.
+///
+/// The message names the offending types from the REQUEST, bracketed, and in the order the
+/// request first repeated them, so a list repeating two types names both. Taken by filter
+/// TYPE rather than by filter shape, so the one rule serves every `filters` member of this
+/// service.
+pub fn reject_duplicate_filter_types<'a>(
+    filter_types: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut repeated: Vec<&str> = Vec::new();
+    for filter_type in filter_types {
+        if seen.contains(&filter_type) {
+            if !repeated.contains(&filter_type) {
+                repeated.push(filter_type);
+            }
+        } else {
+            seen.push(filter_type);
+        }
+    }
+    if repeated.is_empty() {
+        return Ok(());
+    }
+    Err(format!("Duplicate filter types: [{}]", repeated.join(", ")))
 }
 
 /// Whether a listing satisfies every search filter (AND across filters, OR within one).
@@ -3285,8 +3374,10 @@ struct BreadthRow {
     /// with it through [`classified_under`]. A record may sit at more than one category
     /// (`CategoryList` holds up to 30), and then carries every one of their paths.
     categories: &'static [&'static str],
-    /// The `FulfillmentOptionType` its single product is fulfilled through, which also
-    /// decides the product's `deployedOnAws` ([`Product::deployed_on_aws`]).
+    /// The `FulfillmentOptionType` its single product is fulfilled through FIRST, which
+    /// also decides the product's `deployedOnAws` ([`Product::deployed_on_aws`]). The
+    /// product is offered through that type's whole delivery family
+    /// ([`fulfilled_through`]), so it carries more than one fulfillment option.
     fulfillment: &'static str,
 }
 
@@ -3515,6 +3606,13 @@ const BREADTH_REVIEWS: &[(&str, i64)] = &[
     ("4.9", 7),
 ];
 
+/// The part of a fulfillment option's id that names its TYPE: the type in lower case with
+/// its underscores as hyphens, so the options of one product carry ids that differ by the
+/// route they deliver (`…-container`, `…-helm`, `…-eks-add-on`) and sort stably.
+fn option_id_part(option_type: &str) -> String {
+    option_type.to_lowercase().replace('_', "-")
+}
+
 /// A fulfillment option of `option_type` for a breadth row's product.
 ///
 /// One arm per `FulfillmentOptionType`, each building the `FulfillmentOption` UNION MEMBER
@@ -3666,7 +3764,9 @@ pub(crate) struct CatalogRow<'a> {
     /// The taxonomy categories the listing is classified under; each one's ancestors come
     /// with it through [`classified_under`].
     pub categories: &'a [&'a str],
-    /// The `FulfillmentOptionType` its single product is fulfilled through.
+    /// The `FulfillmentOptionType` its single product is fulfilled through FIRST; the
+    /// product is offered through that type's whole delivery family
+    /// ([`fulfilled_through`]).
     pub fulfillment: &'a str,
     /// The seller it is published by, as `(sellerProfileId, displayName)`.
     pub seller: (&'a str, &'a str),
@@ -3697,7 +3797,11 @@ fn seed_rows(
         let listing_id = format!("l-{sequence:04}-{slug}");
         let product_id = format!("p-{sequence:04}-{slug}");
         let offer_id = format!("o-{sequence:04}-{slug}");
-        let option_id = format!("fo-{sequence:04}-{slug}");
+        // Every fulfillment option type this row's product is offered through — its
+        // primary one and the rest of that type's delivery family ([`fulfilled_through`]) —
+        // each with an id of its own, so `ListFulfillmentOptions` pages over several
+        // options of one product the way the modelled one-to-many relation allows.
+        let option_types = fulfilled_through(row.fulfillment);
 
         let (seller_profile_id, seller_name) = row.seller;
         let publisher = seller(seller_profile_id, seller_name);
@@ -3782,13 +3886,18 @@ fn seed_rows(
                 promotional_media: Vec::new(),
                 resources: support_resources(&support_email, support_phone, &docs),
                 seller_engagements: engagements(&contact),
-                fulfillment_options: vec![fulfillment_option_for_type(
-                    row.fulfillment,
-                    &option_id,
-                    row.name,
-                    slug,
-                    month_ago,
-                )],
+                fulfillment_options: option_types
+                    .iter()
+                    .map(|option_type| {
+                        fulfillment_option_for_type(
+                            option_type,
+                            &format!("fo-{sequence:04}-{slug}-{}", option_id_part(option_type)),
+                            row.name,
+                            slug,
+                            month_ago,
+                        )
+                    })
+                    .collect(),
             },
         );
 

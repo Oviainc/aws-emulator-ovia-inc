@@ -87,6 +87,9 @@
 //! ## Errors
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — The specified resource doesn't exist.
+//! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below):
+//!   the refusal a caller whose IAM permissions do not cover `aws-marketplace:GetOffer` on
+//!   the offer it named is answered with.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -102,10 +105,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-marketplacediscovery-aw
 // here — hence the `GetOfferError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.marketplacediscovery#GetOffer")]
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models the
+// shape as one of its common errors (`smithy_query(query="service_info")`), which every
+// operation answers an unauthorized caller with, while the OPERATION's own error list
+// names only the not-found shape.
+#[smithy_macros::operation_error(
+    "com.amazonaws.marketplacediscovery#GetOffer",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum GetOfferErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    AccessDeniedException(AccessDeniedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -159,9 +170,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let store = crate::state::service_state(&*self.engine)
             .ok_or_else(|| GetOfferError::validation("the catalog store is unavailable"))?;
+
+        // Authorization first, before the catalog is looked up: see
+        // `crate::service::authorization`.
+        let catalog = store.lock().catalog.clone();
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::record_resource(
+                ctx,
+                &catalog,
+                "offer",
+                &input.offer_id,
+            ),
+        )
+        .map_err(GetOfferErrorModeled::AccessDeniedException)?;
+
         let state = store.lock();
 
         let preferred = crate::state::resolve_requested_locale(input.locale.as_deref())

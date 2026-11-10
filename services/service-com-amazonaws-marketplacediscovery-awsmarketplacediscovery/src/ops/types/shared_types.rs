@@ -134,6 +134,12 @@ pub struct ResourceNotFoundException {
     pub message: Option<String>,
 }
 
+#[smithy_macros::smithy(shape = "com.amazonaws.marketplacediscovery#AccessDeniedException")]
+#[derive(Debug, Clone, Default)]
+pub struct AccessDeniedException {
+    pub message: Option<String>,
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.marketplacediscovery#OfferSetInformation")]
 #[derive(Debug, Clone, Default)]
 pub struct OfferSetInformation {

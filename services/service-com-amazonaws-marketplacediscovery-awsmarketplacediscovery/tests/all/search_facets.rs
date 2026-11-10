@@ -145,6 +145,23 @@ fn listings_input(query: &Value, extra: Option<Value>) -> Value {
     input
 }
 
+/// Whether `query` already filters on `filter_type`.
+///
+/// A request names a `filterType` at most once — OR-combination belongs inside one entry's
+/// `filterValues` (`SearchFilter$filterValues`), so the service refuses a repeated type —
+/// which means a query already filtering on a facet's own filter type cannot be refined by
+/// that facet's values in ONE further request.
+fn filters_on(query: &Value, filter_type: &str) -> bool {
+    query
+        .get("filters")
+        .and_then(Value::as_array)
+        .is_some_and(|filters| {
+            filters
+                .iter()
+                .any(|filter| text(filter, "filterType") == filter_type)
+        })
+}
+
 /// The queries the facet rules are asserted over: no criteria at all, text that matches
 /// many / one / nothing, a term filter, a range filter, two filters at once, text and a
 /// filter together, and a filter nothing matches.
@@ -301,6 +318,33 @@ async fn every_facet_count_is_what_filtering_a_search_on_that_value_returns() {
                     facet_count >= 1 && facet_count <= total,
                     "case {row}: expected a count in 1..={total}, got {facet_count}"
                 );
+
+                // A `filterType` may be named once per request (OR-combination belongs
+                // inside one entry's `filterValues`), so a query that already filters on
+                // this facet's own filter type is REFUSED when refined by it rather than
+                // having the two entries ANDed.
+                if filters_on(&query, filter_type) {
+                    let (status, body) = call(
+                        &router,
+                        "searchListings",
+                        &listings_input(
+                            &query,
+                            Some(json!({ "filterType": filter_type, "filterValues": [value] })),
+                        ),
+                    )
+                    .await;
+                    assert_eq!(
+                        status, 400,
+                        "case {row}: refining a query by a filter type it already names must be \
+                         refused, got {status} with {body}"
+                    );
+                    assert_eq!(
+                        text(&body, "message"),
+                        format!("Duplicate filter types: [{filter_type}]"),
+                        "case {row}: expected the duplicate-filter-type refusal, got {body}"
+                    );
+                    continue;
+                }
 
                 let filtered = ok(
                     &router,

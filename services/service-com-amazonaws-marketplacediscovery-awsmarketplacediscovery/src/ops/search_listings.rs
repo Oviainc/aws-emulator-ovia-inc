@@ -79,6 +79,12 @@
 //!   to retrieve the next page.
 //! * `totalResults` (NonNegativeCount, range 0..) **required** — The total number of listings
 //!   matching the search criteria.
+//!
+//! ## Errors
+//!
+//! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below): the
+//!   refusal a caller whose IAM permissions do not cover this action on the catalog is
+//!   answered with. The OPERATION's own error list is empty.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -94,9 +100,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-marketplacediscovery-aw
 // here — hence the `SearchListingsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.marketplacediscovery#SearchListings")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.marketplacediscovery#SearchListings",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum SearchListingsErrorModeled {
+    // Widened in through `extra_errors`: this SERVICE models the shape as one of its
+    // common errors (`smithy_query(query="service_info")`), which every operation answers
+    // an unauthorized caller with, while this OPERATION's own error list is empty.
+    AccessDeniedException(AccessDeniedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -150,7 +163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // `searchText` is checked FIRST, before any state is read: a value outside the
         // member's modelled `@pattern` is refused as a property of the REQUEST. That check
         // lives in `state` because the framework's boundary walk reads `@pattern` as a find
@@ -161,6 +173,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = crate::state::service_state(&*self.engine)
             .ok_or_else(|| SearchListingsError::validation("the catalog store is unavailable"))?;
+
+        // Authorization, before the catalog is read: see `crate::service::authorization`.
+        // This operation addresses no single record, so the action is judged against the
+        // catalog itself.
+        let catalog = store.lock().catalog.clone();
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::catalog_resource(ctx, &catalog),
+        )
+        .map_err(SearchListingsErrorModeled::AccessDeniedException)?;
+
         let state = store.lock();
 
         let locale = crate::state::resolve_requested_locale(input.locale.as_deref())

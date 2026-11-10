@@ -12,6 +12,11 @@
 //! 2. the echoed value is entity-escaped TWICE, so a caller's `&`, `<` or `>` reaches
 //!    the client as `&amp;amp;`, `&amp;lt;`, `&amp;gt;`.
 //!
+//! A constraint broken by a list ELEMENT is reported at the LIST member, echoing the whole
+//! list and nesting the element's requirement inside `Member must satisfy constraint:
+//! [ … ]` — the form `tests/all/stated_refusal_wording.rs` owns; the rows below that carry a
+//! nested list are stated in that form.
+//!
 //! The suites around them pin what the two rules must NOT disturb: the error code
 //! (`ValidationException`), the HTTP status (400), the `N validation error(s) detected:`
 //! envelope, the member path, the `@length` / `@range` / enum clauses, and the bounds at
@@ -138,6 +143,9 @@ struct PatternCase {
     path: &'static str,
     /// The expression the report must quote.
     expression: &'static str,
+    /// Whether the member is a LIST whose element broke the pattern, which is reported at
+    /// the list with the element's requirement nested.
+    nested: bool,
     /// The request body carrying `value` at `path`.
     input: fn(&str) -> Value,
 }
@@ -150,6 +158,7 @@ fn pattern_cases() -> Vec<PatternCase> {
             value: "not a valid id!",
             path: "listingId",
             expression: r"[\w\-]+",
+            nested: false,
             input: |value| json!({ "listingId": value }),
         },
         PatternCase {
@@ -158,6 +167,7 @@ fn pattern_cases() -> Vec<PatternCase> {
             value: "product id with spaces",
             path: "productId",
             expression: r"[\w\-]+",
+            nested: false,
             input: |value| json!({ "productId": value }),
         },
         PatternCase {
@@ -166,6 +176,7 @@ fn pattern_cases() -> Vec<PatternCase> {
             value: "offer/id/with/slashes",
             path: "offerId",
             expression: r"[\w\-]+",
+            nested: false,
             input: |value| json!({ "offerId": value }),
         },
         PatternCase {
@@ -174,6 +185,7 @@ fn pattern_cases() -> Vec<PatternCase> {
             value: "en,fr,de",
             path: "locale",
             expression: r"[^;,]+(\s*,\s*[^;,]+){0,1}",
+            nested: false,
             input: |value| json!({ "listingId": "listing-1", "locale": value }),
         },
         PatternCase {
@@ -182,14 +194,16 @@ fn pattern_cases() -> Vec<PatternCase> {
             value: "not a token!",
             path: "nextToken",
             expression: "[a-zA-Z0-9+/=]+",
+            nested: false,
             input: |value| json!({ "maxResults": 5, "nextToken": value }),
         },
         PatternCase {
             case: "SearchListings filter value outside ^[\\w\\-\\.]+$, nested in a list",
             operation: "searchListings",
             value: "category id!",
-            path: "filters.1.member.filterValues.1.member",
+            path: "filters.1.member.filterValues",
             expression: r"[\w\-\.]+",
+            nested: true,
             input: |value| {
                 json!({
                     "maxResults": 5,
@@ -201,8 +215,9 @@ fn pattern_cases() -> Vec<PatternCase> {
             case: "ListPurchaseOptions filter value outside ^[\\w\\-]+$, nested in a list",
             operation: "listPurchaseOptions",
             value: "product id!",
-            path: "filters.1.member.filterValues.1.member",
+            path: "filters.1.member.filterValues",
             expression: r"[\w\-]+",
+            nested: true,
             input: |value| {
                 json!({
                     "filters": [{ "filterType": "PRODUCT_ID", "filterValues": [value] }],
@@ -221,13 +236,29 @@ async fn pattern_clause_quotes_the_modeled_expression_without_its_anchors() {
         value,
         path,
         expression,
+        nested,
         input,
     } in pattern_cases()
     {
         let message = refused(&router, case, operation, &input(value)).await;
+        // A clause about a list's ELEMENT is stated at the list, echoing the whole list and
+        // nesting the element's requirement.
+        let (echoed, requirement) = if nested {
+            (
+                format!("[{value}]"),
+                format!(
+                    "Member must satisfy constraint: \
+                     [Member must satisfy regular expression pattern: {expression}]"
+                ),
+            )
+        } else {
+            (
+                value.to_string(),
+                format!("Member must satisfy regular expression pattern: {expression}"),
+            )
+        };
         let expected = one_violation(&format!(
-            "Value '{value}' at '{path}' failed to satisfy constraint: \
-             Member must satisfy regular expression pattern: {expression}"
+            "Value '{echoed}' at '{path}' failed to satisfy constraint: {requirement}"
         ));
         assert_eq!(
             message, expected,
@@ -318,10 +349,12 @@ async fn escaping_applies_to_every_clause_that_echoes_a_value() {
     .await;
     // The value also falls outside the member's `@pattern` (an ampersand is in neither
     // `\w` nor `-`), so the report carries two clauses; what this pins is that the
-    // LENGTH clause echoes the value through the same escaping step.
+    // LENGTH clause echoes the value through the same escaping step. The clause is stated
+    // at the LIST member, echoing the whole list the caller sent.
     let expected = format!(
-        "Value '{}&amp;amp;' at 'filters.1.member.filterValues.1.member' \
-         failed to satisfy constraint: Member must have length less than or equal to 128",
+        "Value '[{}&amp;amp;]' at 'filters.1.member.filterValues' \
+         failed to satisfy constraint: Member must satisfy constraint: \
+         [Member must have length less than or equal to 128]",
         "v".repeat(128)
     );
     assert!(

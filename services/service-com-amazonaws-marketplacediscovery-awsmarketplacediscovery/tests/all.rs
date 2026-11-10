@@ -19,8 +19,14 @@ mod catalog_drilldown;
 mod catalog_record_breadth;
 #[path = "all/discovery_ordering_and_refusals.rs"]
 mod discovery_ordering_and_refusals;
+#[path = "all/duplicate_filter_types.rs"]
+mod duplicate_filter_types;
+#[path = "all/fulfillment_option_families.rs"]
+mod fulfillment_option_families;
 #[path = "all/fulfillment_options.rs"]
 mod fulfillment_options;
+#[path = "all/iam_authorization.rs"]
+mod iam_authorization;
 #[path = "all/keyword_search_and_paging.rs"]
 mod keyword_search_and_paging;
 #[path = "all/purchase_option_badges_and_offer_sets.rs"]
@@ -33,6 +39,8 @@ mod refusal_wording;
 mod search_facets;
 #[path = "all/signing_name_claims.rs"]
 mod signing_name_claims;
+#[path = "all/stated_refusal_wording.rs"]
+mod stated_refusal_wording;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_message_rules.rs"]

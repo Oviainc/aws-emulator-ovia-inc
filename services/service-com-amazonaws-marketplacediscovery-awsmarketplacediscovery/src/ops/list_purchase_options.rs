@@ -71,6 +71,12 @@
 //! * `purchaseOptions` (PurchaseOptionSummaryList, len ..100) — The purchase options
 //!   available to the buyer. Each option is either an offer for a single product or an offer
 //!   set spanning multiple products.
+//!
+//! ## Errors
+//!
+//! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below): the
+//!   refusal a caller whose IAM permissions do not cover this action on the catalog is
+//!   answered with. The OPERATION's own error list is empty.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -86,9 +92,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-marketplacediscovery-aw
 // here — hence the `ListPurchaseOptionsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.marketplacediscovery#ListPurchaseOptions")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.marketplacediscovery#ListPurchaseOptions",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum ListPurchaseOptionsErrorModeled {
+    // Widened in through `extra_errors`: this SERVICE models the shape as one of its
+    // common errors (`smithy_query(query="service_info")`), which every operation answers
+    // an unauthorized caller with, while this OPERATION's own error list is empty.
+    AccessDeniedException(AccessDeniedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -142,16 +155,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListPurchaseOptionsError::validation("the catalog store is unavailable")
         })?;
+
+        // Authorization first, before the catalog is read: see
+        // `crate::service::authorization`. This operation addresses no single record, so
+        // the action is judged against the catalog itself.
+        let catalog = store.lock().catalog.clone();
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::catalog_resource(ctx, &catalog),
+        )
+        .map_err(ListPurchaseOptionsErrorModeled::AccessDeniedException)?;
+
         let state = store.lock();
 
         let locale = crate::state::resolve_requested_locale(input.locale.as_deref())
             .map_err(ListPurchaseOptionsError::validation)?;
 
         let filters = input.filters.clone().unwrap_or_default();
+        // A `filterType` repeated across entries is refused as a property of the REQUEST,
+        // before any purchase option is considered — the same rule, from the same place,
+        // that the two search operations apply to their own `filters` list.
+        crate::state::reject_duplicate_filter_types(
+            filters.iter().map(|filter| filter.filter_type.as_str()),
+        )
+        .map_err(ListPurchaseOptionsError::validation)?;
         let candidates = state.purchase_options(crate::state::now_secs(), locale);
         let mut matches: Vec<&crate::state::PurchaseOptionEntry> = Vec::new();
         for candidate in &candidates {
