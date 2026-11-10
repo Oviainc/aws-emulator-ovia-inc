@@ -609,6 +609,15 @@ async fn a_function_a_cache_behaviour_attaches_cannot_be_deleted() {
         let case = format!("{attachment:?}");
         let create = renamed(&row, &format!("delete_attached_function_{index}"));
         let created_etag = create_one(&router, &create).await;
+        // A cache behaviour runs the code the `LIVE` stage holds, so the function is
+        // published before a distribution attaches it: "Your functions must be published to
+        // the LIVE stage to associate them with a cache behavior."
+        let published = publish_function(&router, &create.name, &created_etag).await;
+        assert_eq!(
+            published.status, 200,
+            "case {case}: the seed publish must answer HTTP 200, got {} with {}",
+            published.status, published.raw
+        );
         let arn = member(
             describe_function(&router, &create.name, None).await.root(),
             "FunctionMetadata/FunctionARN",

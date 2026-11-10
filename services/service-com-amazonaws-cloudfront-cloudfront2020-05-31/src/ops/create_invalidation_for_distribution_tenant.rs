@@ -265,16 +265,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The same reference naming a DIFFERENT set of paths is not the same request
             // again, and a caller reference identifies one invalidation for its whole
             // life, so the second batch is refused rather than stored under a reference
-            // that is already taken.
+            // that is already taken — in the fixed sentence the service states that
+            // conflict in, which names nothing from the request or from the store.
             return Err(
                 CreateInvalidationForDistributionTenantErrorModeled::InvalidArgument(
-                    InvalidArgument {
-                        message: Some(format!(
-                            "The CallerReference {} was already used for invalidation {} of \
-                             this distribution tenant with different paths",
-                            batch.caller_reference, existing.id
-                        )),
-                    },
+                    crate::state::invalidation_caller_reference_reused(),
                 )
                 .into(),
             );

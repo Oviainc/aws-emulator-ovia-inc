@@ -48,7 +48,11 @@ pub enum CreateRefusal {
     InvalidLambdaFunctionAssociation(String),
     /// An argument of the submitted configuration CloudFront cannot read: a cache
     /// behaviour's function association names an event type no CloudFront function runs on
-    /// (see [`function_association_event_refusal`]).
+    /// (see [`function_association_event_refusal`]), or names a function nothing has
+    /// published to the `LIVE` stage (see
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::function_association_without_live_stage`]),
+    /// or the configuration states a member only a standard distribution has (see
+    /// [`multi_tenant_direct_only_member`]).
     InvalidArgument(String),
 }
 

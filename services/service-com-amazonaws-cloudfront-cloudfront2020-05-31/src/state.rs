@@ -539,14 +539,15 @@ pub const MAX_GEO_RESTRICTION_LOCATIONS: usize = 26 * 26;
 pub const MAX_DISTRIBUTION_TENANTS: usize = 10_000;
 
 /// `DomainResult$Status` — "Whether the domain is active or inactive" — for a domain a
-/// distribution tenant holds.
-///
-/// A domain becomes a tenant's by the call that associates it, which is state this
-/// emulator really holds; it performs no DNS resolution and issues no certificate, so
-/// there is no pending validation it could report and nothing in it moves a domain out of
-/// this value. `DomainStatus`'s other value (`inactive`) would claim a validation that
-/// nothing here runs.
+/// distribution tenant is SERVED at: viewers asking for it are routed to the tenant.
 pub const DOMAIN_STATUS_ACTIVE: &str = "active";
+
+/// `DomainResult$Status` for a domain the tenant holds but is NOT served at yet: the
+/// CloudFront managed certificate requested for it is still waiting to be validated, so
+/// CloudFront cannot serve the domain and a viewer asking for it is routed nowhere
+/// ([`StoredDistributionTenant::domain_pending_validation`]). The validation is what moves
+/// it to [`DOMAIN_STATUS_ACTIVE`].
+pub const DOMAIN_STATUS_INACTIVE: &str = "inactive";
 
 /// The `CustomizationActionType` a distribution tenant's web ACL customization carries when
 /// a web ACL of its own is associated with it: "you can specify `override` to specify a
@@ -1889,7 +1890,8 @@ pub struct StoredDistributionTenant {
     /// was created under.
     pub distribution_id: String,
     /// The domains associated with this tenant, in the order the create listed them. Each
-    /// is reported as a `DomainResult` in [`DOMAIN_STATUS_ACTIVE`].
+    /// is reported as a `DomainResult` under the status it is served at
+    /// ([`Self::to_domain_results`]).
     pub domains: Vec<String>,
     /// `DistributionTenant$ConnectionGroupId` — the connection group the tenant's viewers
     /// are routed through: the one the create named, or the account's default one.
@@ -1993,7 +1995,17 @@ impl StoredDistributionTenant {
     }
 
     /// The `DomainResult` list every projection of this tenant reports: the domains it
-    /// holds, in the order they were associated, each in [`DOMAIN_STATUS_ACTIVE`].
+    /// holds, in the order they were associated, each with the status it is SERVED under.
+    ///
+    /// `DomainResult$Status` is "whether the domain is active or inactive", which is a
+    /// property of the domain's own reachability rather than of the tenant: a domain a
+    /// viewer is routed to ([`Self::serves_domain`]) reads [`DOMAIN_STATUS_ACTIVE`], and one
+    /// that routes nowhere yet — a domain whose CloudFront managed certificate is still
+    /// waiting to be validated, so CloudFront cannot serve it — reads
+    /// [`DOMAIN_STATUS_INACTIVE`] until the validation makes it serve. The same predicate
+    /// decides the tenant's claim on the domain
+    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::domain_in_use`]), so what a tenant
+    /// reports about a domain and what the domain routes to cannot disagree.
     ///
     /// ONE mapping, so the full document and a listing's summary cannot drift apart about a
     /// tenant's domains.
@@ -2002,7 +2014,14 @@ impl StoredDistributionTenant {
             .iter()
             .map(|domain| DomainResult {
                 domain: domain.clone(),
-                status: Some(DOMAIN_STATUS_ACTIVE.to_string()),
+                status: Some(
+                    if self.serves_domain(domain) {
+                        DOMAIN_STATUS_ACTIVE
+                    } else {
+                        DOMAIN_STATUS_INACTIVE
+                    }
+                    .to_string(),
+                ),
             })
             .collect()
     }
@@ -3584,6 +3603,11 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// `DistributionConfig$CallerReference` -> distribution id, so a caller reference
     /// already associated with a distribution is detected without scanning the store.
     pub caller_references: HashMap<String, String>,
+    /// The listener each distribution's EDGE is served on, keyed by distribution id: the
+    /// address it published as its `DomainName` and the handle that keeps the port open
+    /// ([`EdgeEndpoint`]). A distribution that serves no traffic of its own — a multi-tenant
+    /// one — has no entry, and dropping an entry (the delete) closes that port.
+    pub edge_endpoints: BTreeMap<String, EdgeEndpoint>,
     /// The counter every generated id, domain name and version token is minted from, so
     /// no two mints collide and each mutation yields a FRESH `ETag`.
     pub next_token_seq: u64,
@@ -3794,3 +3818,10 @@ pub use distributions::*;
 /// [`functions`] is one; `pub use` keeps every name reachable as `crate::state::<name>`.
 mod tenant_parameters;
 pub use tenant_parameters::*;
+
+/// The ADDRESS a distribution's edge is reached at: the loopback listener the core opens for
+/// each distribution that serves traffic of its own, and the leg that hands a viewer request
+/// it accepts to this service's own data plane. A SUBMODULE for the same reason [`functions`]
+/// is one; `pub use` keeps every name reachable as `crate::state::<name>`.
+mod edge_endpoint;
+pub use edge_endpoint::*;

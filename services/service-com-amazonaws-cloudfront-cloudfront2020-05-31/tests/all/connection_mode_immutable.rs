@@ -84,9 +84,16 @@ impl TenancyConfig {
         }
     }
 
-    /// The document a client sends. `PriceClass` is always stated, because an update submits
-    /// the configuration WHOLE and a document that leaves it out is refused as incomplete.
+    /// The document a client sends.
+    ///
+    /// `PriceClass` is stated on a STANDARD distribution's document, because an update
+    /// submits the configuration WHOLE and one that leaves the member out is refused as
+    /// incomplete — and left out of a MULTI-TENANT one, where the member "only supports
+    /// standard distributions. You can't specify this field for multi-tenant
+    /// distributions", so stating it is refused.
     pub(crate) fn xml(&self) -> String {
+        let multi_tenant =
+            self.connection_mode == Some(TENANT_ONLY) || self.parameters.is_some();
         let mut out = format!(
             "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
              <CallerReference>{}</CallerReference>\
@@ -101,10 +108,14 @@ impl TenancyConfig {
             "</Origin></Items></Origins>\
              <DefaultCacheBehavior><TargetOriginId>primary</TargetOriginId>\
              <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy></DefaultCacheBehavior>\
-             <Comment>{}</Comment>\
-             <PriceClass>PriceClass_All</PriceClass>\
+             <Comment>{}</Comment>{}\
              <Enabled>true</Enabled>",
-            self.comment
+            self.comment,
+            if multi_tenant {
+                ""
+            } else {
+                "<PriceClass>PriceClass_All</PriceClass>"
+            }
         ));
         // `ParameterDefinitions` is a list whose member carries no `xmlName`
         // (`smithy_query(query="shape",shape="ParameterDefinitions")`), so each entry travels

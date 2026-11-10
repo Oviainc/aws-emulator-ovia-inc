@@ -485,6 +485,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The same rule the create path applies: a cache behaviour runs the code a
+        // CloudFront function's `LIVE` stage holds, so an update cannot leave a
+        // distribution carrying an association that names nothing published to it either.
+        if let Some(arn) = store.function_association_without_live_stage(&input.distribution_config)
+        {
+            let message = crate::state::invalid_function_association_message(arn);
+            return Err(UpdateDistributionErrorModeled::InvalidArgument(InvalidArgument {
+                message: Some(message),
+            })
+            .into());
+        }
+
         // The same rule the create path applies: an origin reaches a private bucket EITHER
         // with the credentials of an origin access control OR as an origin access identity,
         // so an update cannot leave an origin naming both either.
@@ -545,6 +557,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateDistributionErrorModeled::IllegalUpdate(
                 crate::state::illegal_update_connection_mode(),
             )
+            .into());
+        }
+
+        // Which members the submitted configuration must and must not state follows from
+        // the KIND of distribution it describes, so both rules are read here, once the mode
+        // it declares is known to be the stored one.
+        //
+        // The same rule the create path applies: the members only a standard distribution
+        // has are no members of a multi-tenant one's configuration, so an update cannot
+        // leave a multi-tenant distribution carrying one either.
+        if let Some(member) =
+            crate::state::multi_tenant_direct_only_member(&input.distribution_config)
+        {
+            return Err(UpdateDistributionErrorModeled::InvalidArgument(InvalidArgument {
+                message: Some(crate::state::multi_tenant_direct_only_message(member)),
+            })
             .into());
         }
 

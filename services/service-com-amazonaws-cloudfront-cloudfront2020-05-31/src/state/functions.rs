@@ -224,6 +224,36 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         self.key_value_stores.values().find(|store| store.arn == arn)
     }
 
+    /// The ARN of the FIRST function association of `config` that names no function
+    /// published to the `LIVE` stage, or `None` when every association it carries names
+    /// one.
+    ///
+    /// `FunctionAssociations` states the rule: "Your functions must be published to the
+    /// `LIVE` stage to associate them with a cache behavior" — a cache behaviour runs the
+    /// code the `LIVE` stage holds, so an association naming a function this account does
+    /// not hold, or one no `PublishFunction` has ever copied into `LIVE`, names no code
+    /// CloudFront could run at the edge. The question is answered against the STORED
+    /// functions, by the ARN each one carries from its own create, never taken on trust
+    /// from the request.
+    ///
+    /// Read on every path that stores a `DistributionConfig`, and for EVERY cache behaviour
+    /// of it (the default one and each ordered one, in that order), so no stored
+    /// distribution ever carries a function association that names nothing invocable — the
+    /// same rule and the same walk [`super::lambda_association_without_version`] applies to
+    /// the Lambda@Edge associations beside them. The caller reports it as the
+    /// `InvalidArgument` the recorded service answers this condition with
+    /// ([`invalid_function_association_message`]).
+    pub fn function_association_without_live_stage<'c>(
+        &self,
+        config: &'c DistributionConfig,
+    ) -> Option<&'c str> {
+        associated_function_arns(config).find(|arn| {
+            self.function_by_arn(arn)
+                .and_then(|function| function.stage(FUNCTION_STAGE_LIVE))
+                .is_none()
+        })
+    }
+
     /// The reason `config` describes no function this service can hold, or `None` when it
     /// describes one.
     ///
@@ -514,6 +544,35 @@ pub fn no_such_function_exists() -> NoSuchFunctionExists {
 /// [`super::NO_SUCH_CACHE_POLICY_MESSAGE`] and [`super::NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE`]
 /// carry it; the shape's own documentation states it in its shorter form.
 pub const NO_SUCH_FUNCTION_EXISTS_MESSAGE: &str = "The specified function does not exist.";
+
+/// The MEMBER the refusal of an unusable function association names: `FunctionAssociation`
+/// carries the function's ARN in `FunctionARN`, and the sentence the service refuses the
+/// association with names the parameter as it does there
+/// ([`invalid_function_association_message`]).
+pub const FUNCTION_ASSOCIATION_ARN_PARAMETER: &str = "FunctionAssociationArn";
+
+/// The message the refusal of an association whose `FunctionARN` names no function
+/// published to the `LIVE` stage carries, on the wire: the parameter that is unusable, and
+/// the FUNCTION that association named, with the two reasons an association is unusable at
+/// all — the account holds no such function, or the function it holds was never published.
+///
+/// The variable part is the function's own NAME, read out of the ARN the request supplied
+/// (`arn:aws:cloudfront::<account>:function/<Name>`, which `FunctionARN`'s pattern fixes),
+/// since that is what names the function a caller would publish; nothing else of the
+/// request reaches the wire.
+///
+/// The condition is served as the `InvalidArgument` (HTTP 400) every distribution-writing
+/// operation models for an argument CloudFront cannot use, which is the code the recorded
+/// service answers it with — NOT the `InvalidFunctionAssociation` the model also declares.
+pub fn invalid_function_association_message(function_arn: &str) -> String {
+    let name = function_arn
+        .rsplit_once("function/")
+        .map_or(function_arn, |(_, name)| name);
+    format!(
+        "The parameter {FUNCTION_ASSOCIATION_ARN_PARAMETER} is invalid; {name} was not found \
+         or is not published."
+    )
+}
 
 /// The message for a function configuration whose `KeyValueStoreAssociations.Quantity`
 /// disagrees with the length of its `Items`, or `None` when the two agree.

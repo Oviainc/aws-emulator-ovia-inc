@@ -240,11 +240,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a staging distribution takes part in at most ONE policy, so a create naming a
         // domain name another policy already routes traffic to is refused.
         let dns_names = crate::state::staging_distribution_dns_names(&config).to_vec();
-        if let Some(holder) = store.policy_using_staging_distribution(&dns_names) {
-            let holder_id = holder.id.clone();
+        if store
+            .policy_using_staging_distribution(&dns_names)
+            .is_some()
+        {
             return Err(
                 CreateContinuousDeploymentPolicyErrorModeled::StagingDistributionInUse(
-                    crate::state::staging_distribution_in_use(&holder_id),
+                    crate::state::staging_distribution_in_use(),
                 )
                 .into(),
             );

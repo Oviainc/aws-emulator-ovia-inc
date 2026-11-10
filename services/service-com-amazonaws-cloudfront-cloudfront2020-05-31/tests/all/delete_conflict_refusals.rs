@@ -44,7 +44,7 @@ use crate::distribution_tenant_lifecycle::{
 };
 use crate::function_delete::delete_function;
 use crate::function_lifecycle::{create_key_value_store, create_table, describe_function, member};
-use crate::function_publish::create_one;
+use crate::function_publish::{create_one, publish_function};
 use crate::origin_access_control_lifecycle::{create_control, get_control, table as control_table};
 use crate::origin_access_identity_lifecycle::{create_identity, get_identity, Config as Identity};
 use crate::realtime_log_config_lifecycle::{create_accepted, delete_config, Endpoint, Submitted};
@@ -369,6 +369,15 @@ async fn a_function_in_use_refusal_names_the_function_and_counts_the_distributio
             .expect("the create table carries at least one row");
         create.name = row.name.to_string();
         let function_etag = create_one(&router, &create).await;
+        // A cache behaviour runs the code the `LIVE` stage holds, so the function is
+        // published before any distribution attaches it: "Your functions must be published
+        // to the LIVE stage to associate them with a cache behavior."
+        let published = publish_function(&router, &create.name, &function_etag).await;
+        assert_eq!(
+            published.status, 200,
+            "case {case}: the seed publish must answer HTTP 200, got {} with {}",
+            published.status, published.raw
+        );
         let arn = member(
             describe_function(&router, &create.name, None).await.root(),
             "FunctionMetadata/FunctionARN",

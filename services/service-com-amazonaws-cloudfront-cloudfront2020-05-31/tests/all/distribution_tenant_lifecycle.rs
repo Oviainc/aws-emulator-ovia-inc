@@ -38,7 +38,7 @@ use std::time::Duration;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::VALIDATION_TOKEN_HOST_VALUES;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     CONNECTION_GROUP_ID_PREFIX, DISTRIBUTION_TENANT_ID_PREFIX, DOMAIN_STATUS_ACTIVE,
-    MAX_DOMAINS_PER_TENANT, MAX_DOMAIN_LABEL_LEN, MAX_DOMAIN_NAME_LEN,
+    DOMAIN_STATUS_INACTIVE, MAX_DOMAINS_PER_TENANT, MAX_DOMAIN_LABEL_LEN, MAX_DOMAIN_NAME_LEN,
     MAX_GEO_RESTRICTION_LOCATIONS, MAX_PARAMETERS_PER_TENANT, PROPAGATION_DELAY, STATUS_DEPLOYED,
     STATUS_IN_PROGRESS, VALIDATION_TOKEN_HOST_CLOUDFRONT,
 };
@@ -568,11 +568,22 @@ fn assert_record(
          {reported_distribution:?}"
     );
 
-    // The domains come back as submitted, in order, each active.
+    // The domains come back as submitted, in order, each under the status it is SERVED at.
+    // Every row's create asks CloudFront to validate its domains
+    // ([`managed_certificate_request`]), and a domain whose managed certificate is still
+    // waiting to be validated is served by nothing yet, so it reads `inactive` until the
+    // clock issues that certificate. The certificate's validation span and the tenant's
+    // propagation span are the same length, so the tenant's own status says which side of
+    // it this answer is on.
+    let expected_domain_status = if status == STATUS_IN_PROGRESS {
+        DOMAIN_STATUS_INACTIVE
+    } else {
+        DOMAIN_STATUS_ACTIVE
+    };
     let expected_domains: Vec<(String, String)> = create
         .domains
         .iter()
-        .map(|domain| (domain.clone(), DOMAIN_STATUS_ACTIVE.to_string()))
+        .map(|domain| (domain.clone(), expected_domain_status.to_string()))
         .collect();
     let domains = domains_of(tenant);
     assert_eq!(

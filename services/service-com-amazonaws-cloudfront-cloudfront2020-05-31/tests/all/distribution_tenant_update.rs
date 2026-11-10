@@ -40,7 +40,8 @@
 //! a client takes.
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    CUSTOMIZATION_ACTION_OVERRIDE, DOMAIN_STATUS_ACTIVE, INVALID_DOMAIN_NAME_MESSAGE,
+    CUSTOMIZATION_ACTION_OVERRIDE, DOMAIN_STATUS_ACTIVE, DOMAIN_STATUS_INACTIVE,
+    INVALID_DOMAIN_NAME_MESSAGE,
     INVALID_IF_MATCH_VERSION_MESSAGE, MAX_DOMAINS_PER_TENANT, MAX_PARAMETERS_PER_TENANT,
     STATUS_DEPLOYED, STATUS_IN_PROGRESS, VALIDATION_TOKEN_HOST_CLOUDFRONT,
 };
@@ -175,6 +176,23 @@ async fn create_tenant(
         "case {case}: expected HTTP 201 from CreateDistributionTenant, got {} with {}",
         created.status, created.raw
     );
+    // The create asked CloudFront to validate the domain, so the domain serves nothing —
+    // and reads `inactive` — until the clock issues that certificate. Every row below is
+    // about what an UPDATE changes, so the starting state is the settled one: the wait is
+    // what makes the domain status the rows compare a fixed value rather than a race with
+    // the validation span.
+    await_certificate_issuance().await;
+    let settled = read_tenant(
+        router,
+        created.root().text_at("Id").unwrap_or_default(),
+        case,
+    )
+    .await;
+    assert_eq!(
+        settled.status, 200,
+        "case {case}: expected the created tenant to be readable, got {} with {}",
+        settled.status, settled.raw
+    );
     Tenant {
         id: created
             .root()
@@ -183,7 +201,7 @@ async fn create_tenant(
             .to_string(),
         etag: created.header("etag").to_string(),
         domain,
-        facts: facts_of(created.root()),
+        facts: facts_of(settled.root()),
     }
 }
 
@@ -479,6 +497,14 @@ impl Row {
         let domains = self
             .stated_domains(tenant, slug)
             .unwrap_or_else(|| vec![tenant.domain.clone()]);
+        // `DomainResult$Status` is about what the domain SERVES: a domain this row freshly
+        // names asks CloudFront to validate it, so it serves nothing until that certificate
+        // is issued and reads `inactive`, while the domain the tenant already holds — bound
+        // under a certificate the create's own wait has had issued — reads `active`.
+        let domain_status = match self.domains {
+            Domains::Fresh(_) => DOMAIN_STATUS_INACTIVE,
+            Domains::Held | Domains::Unstated => DOMAIN_STATUS_ACTIVE,
+        };
         Facts {
             // Submitted by no member of the update, so untouched by every row.
             name: tenant.facts.name.clone(),
@@ -492,7 +518,7 @@ impl Row {
                 .unwrap_or_else(|| tenant.facts.enabled.clone()),
             domains: domains
                 .into_iter()
-                .map(|domain| (domain, DOMAIN_STATUS_ACTIVE.to_string()))
+                .map(|domain| (domain, domain_status.to_string()))
                 .collect(),
             parameters: self
                 .parameters

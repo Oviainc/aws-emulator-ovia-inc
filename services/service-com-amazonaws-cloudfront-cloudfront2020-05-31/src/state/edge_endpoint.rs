@@ -1,0 +1,456 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The ADDRESS a distribution's edge is reached at, and the listener that answers there.
+//!
+//! `Distribution$DomainName` is "the domain name that CloudFront assigns when you create a
+//! distribution", and it is the address a VIEWER is handed: a client takes that name and
+//! fetches `https://<DomainName>/<object>`. A name under a zone this emulator does not
+//! serve resolves to nothing on the machine it runs on, so a distribution that reported one
+//! would publish an address no client could reach — the one thing a published endpoint must
+//! never be. So each distribution that serves traffic of its own gets a listener of the
+//! EMULATOR's own, opened through the core (`engine.listeners().tcp_plaintext(..)`, which
+//! owns the socket and the bind interface), and reports the `host:port` that listener
+//! answers on as its domain name. A viewer dials exactly what it was told.
+//!
+//! A viewer reaches a distribution over HTTP or over HTTPS — "viewers can use HTTP or
+//! HTTPS" is what `ViewerProtocolPolicy` is about — so both are served at that one address:
+//! the connection's first byte says which the client opened with, and a TLS record is handed
+//! to the core's own TLS server before the request is read
+//! ([`::service_common::in_band_tls`], so this service never touches a key or a
+//! certificate).
+//!
+//! The listener is the ADDRESS, not the data plane: everything a viewer request is answered
+//! BY — resolving the distribution, the geographic restriction, the cache behaviour, the
+//! cache and the origin fetch — stays in [`crate::service::edge`], which serves the same
+//! request however it was addressed. So the handler here hands the request it accepts to
+//! that one data plane, through the in-process transport this emulator reaches itself over,
+//! addressed as the RESERVED data-plane path of the distribution this listener was opened
+//! for (`/_aws/cloudfront/{id}/{viewer-path}`): one serving path, reached from two
+//! addressings.
+//!
+//! A multi-tenant distribution gets none: it "has no traffic domain of its own" — its
+//! viewers reach it through a connection group — so there is no address to publish and no
+//! listener to open for it.
+//!
+//! The listener's life is the distribution's: the handle is held on the store under the
+//! distribution's id, and dropping it (the delete) closes the port and severs every
+//! connection in flight on it.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use ::bytes::Bytes;
+use ::emulator_server::{listener_caps, BrowserVerdict, ListenerConn, RemoteOrigins, TlsUpgrader};
+use ::http_body_util::{BodyExt as _, Full, Limited};
+use ::smithy_server_runtime::EmbeddedEmulator;
+use ::tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use aws_smithy_runtime_api::client::http::HttpConnector;
+use aws_smithy_runtime_api::http::Request as RtRequest;
+use aws_smithy_types::body::SdkBody;
+
+use super::SERVICE_ENDPOINT;
+
+/// How many viewer request BODIES this service reads at once, across every distribution's
+/// edge listener: the core's own HTTP in-flight cap, one permit per request, taken before a
+/// byte of a body is read and released when the answer is written.
+///
+/// What one in-flight request may buffer is capped by [`body_ceiling`], so what the bodies
+/// in flight hold at once is this count times that ceiling — the product the core's own
+/// HTTP listeners bound, rather than the connection count (or the number of distributions)
+/// times it. ONE semaphore for the whole service, because a caller chooses how many
+/// distributions exist and each one would otherwise raise the peak again. A request that
+/// finds no permit is shed, which is what the core's own HTTP listener answers such a
+/// request.
+fn in_flight() -> Arc<Semaphore> {
+    static IN_FLIGHT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(IN_FLIGHT.get_or_init(|| Arc::new(Semaphore::new(listener_caps::MAX_HTTP_INFLIGHT))))
+}
+
+/// The reserved path a viewer request is handed to the data plane under, ahead of the
+/// distribution's id: `/_aws/cloudfront/{id}/{viewer-path}`.
+///
+/// The segments are [`crate::service::edge`]'s own prefixed path-style addressing, which
+/// that module reads on whatever host a request arrives at — so the request this listener
+/// forwards resolves to exactly the distribution it was opened for, whatever the viewer
+/// path spells.
+const EDGE_PATH_PREFIX: &str = "/_aws/cloudfront";
+
+/// The headers the forwarded leg does not copy from the viewer's request.
+///
+/// `Host` is the listener's own address, which the forwarded request replaces with this
+/// service's endpoint (the data plane resolves the distribution from the reserved path
+/// instead), and the two framing headers describe a body this leg re-frames itself.
+const HEADERS_NOT_FORWARDED: [&str; 3] = ["host", "content-length", "transfer-encoding"];
+
+/// One distribution's edge listener: the address it answers on, and the handle that keeps
+/// it open.
+///
+/// Dropping it closes the port, so the record is held for exactly as long as the
+/// distribution it belongs to.
+pub struct EdgeEndpoint {
+    /// The `host:port` a viewer dials, which is what the distribution reports as its
+    /// `DomainName`.
+    authority: String,
+    /// The distribution this listener serves, published to the handler once the create that
+    /// opened the listener has minted the id. A request that arrives before then is
+    /// answered as a request for no distribution.
+    distribution: Arc<OnceLock<String>>,
+    /// The listener itself. Never read: it is held because dropping it closes the port.
+    _listener: ::emulator_server::ResourceListener,
+}
+
+impl std::fmt::Debug for EdgeEndpoint {
+    /// Everything about this record that is not a live socket: the address it answers on
+    /// and the distribution it serves. `ResourceListener` is not `Debug`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EdgeEndpoint")
+            .field("authority", &self.authority)
+            .field("distribution", &self.distribution.get())
+            .finish()
+    }
+}
+
+impl EdgeEndpoint {
+    /// The `host:port` a viewer reaches this distribution at — its `DomainName`.
+    pub fn authority(&self) -> &str {
+        &self.authority
+    }
+
+    /// Bind this listener to the distribution it was opened for, once the create that
+    /// opened it has minted the id. Called once; a second call changes nothing.
+    pub fn serves(&self, distribution_id: &str) {
+        let _ = self.distribution.set(distribution_id.to_string());
+    }
+}
+
+/// Open the listener one distribution's edge is served on, and report the address it
+/// answers at — or `None` when this engine vends no listeners, in which case the caller
+/// falls back to the name CloudFront's own zone would carry.
+///
+/// `callback` is the handle into the emulator this request is running within
+/// (`ctx.callback()`), which is how a request the listener accepts reaches the data plane:
+/// the listener is not a second emulator, it is a second ADDRESS of this one.
+pub async fn open_edge_endpoint<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    callback: EmbeddedEmulator,
+) -> Option<EdgeEndpoint> {
+    let shared = (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()?;
+    let distribution: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
+    let listeners = shared.listeners();
+    let handler = EdgeFrontDoor {
+        distribution: Arc::clone(&distribution),
+        callback,
+        // The core's own TLS server, lent to this plaintext listener so the `https://`
+        // half of the address is terminated by the core rather than here. A listener
+        // this emulator could prepare none for serves the `http://` half alone.
+        upgrader: listeners.tls_upgrader().ok(),
+    };
+    // Opened on a task of its OWN, so a runtime that cannot bind a socket at all — one
+    // built with no IO driver, which is what a host that drives this emulator in process
+    // may hand a request — leaves this create without an address of its own instead of
+    // taking the request down with it: the join answers `Err`, this answers `None`, and the
+    // caller falls back to the name CloudFront's own zone would carry.
+    let opened = ::tokio::spawn(async move { listeners.tcp_plaintext(handler).await.ok() }).await;
+    let listener = opened.ok().flatten()?;
+    Some(EdgeEndpoint {
+        authority: ::service_common::data_plane_addressing::listener_authority(&listener),
+        distribution,
+        _listener: listener,
+    })
+}
+
+/// Serves one distribution's edge domain: it hands every request it accepts to this
+/// service's own data plane, over the in-process transport, and answers with what that
+/// data plane answered.
+struct EdgeFrontDoor {
+    distribution: Arc<OnceLock<String>>,
+    callback: EmbeddedEmulator,
+    upgrader: Option<TlsUpgrader>,
+}
+
+impl ::emulator_server::NativeHandler for EdgeFrontDoor {
+    /// One call per accepted connection. The handles are cloned into the connection's own
+    /// future, which is what the core's `'static` handler contract asks for.
+    fn serve(&self, conn: ListenerConn) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let distribution = Arc::clone(&self.distribution);
+        let callback = self.callback.clone();
+        let upgrader = self.upgrader.clone();
+        Box::pin(serve_connection(distribution, callback, upgrader, conn))
+    }
+}
+
+/// Speak HTTP/1.1 on one accepted connection until the viewer closes it, answering each
+/// request from this service's own data plane.
+///
+/// The encryption is negotiated in band first ([`::service_common::in_band_tls`]), so one
+/// address serves the `http://` and the `https://` a viewer may dial. HTTP/1.1 only, as
+/// the emulator's own front door offers: every request is fully buffered, so nothing
+/// relies on HTTP/2 streaming. The header-read deadline and the body ceiling are the
+/// core's, so a viewer that dribbles a request line or sends more than one connection may
+/// carry cannot hold the connection permit the core issued for it.
+async fn serve_connection(
+    distribution: Arc<OnceLock<String>>,
+    callback: EmbeddedEmulator,
+    upgrader: Option<TlsUpgrader>,
+    conn: ListenerConn,
+) {
+    let Some(conn) = ::service_common::in_band_tls::negotiated(conn, upgrader).await else {
+        return;
+    };
+    let io = ::hyper_util::rt::TokioIo::new(conn);
+    let service = ::hyper::service::service_fn(move |request: ::http::Request<_>| {
+        let distribution = Arc::clone(&distribution);
+        let callback = callback.clone();
+        async move {
+            // A panic anywhere behind this address — in the dispatch machinery or in the
+            // handler of the operation the forwarded leg reaches — is CONTAINED here and
+            // answered as the protocol-shaped internal failure, exactly as the endpoint a
+            // control call arrives on answers the same request: one viewer cannot take the
+            // connection, the listener or the process down with it, and the next request is
+            // served normally.
+            let facts = ::emulator_server::RequestFacts::from_request(&request);
+            Ok::<_, ::std::convert::Infallible>(
+                ::emulator_server::contain_panics(facts, answer(distribution, callback, request))
+                    .await,
+            )
+        }
+    });
+    if let Err(error) = ::hyper::server::conn::http1::Builder::new()
+        .timer(::hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(request_deadline())
+        .serve_connection(io, service)
+        .await
+    {
+        // A connection the viewer dropped, or a request this emulator could not frame, ends
+        // here and takes nothing else with it: the next connection is served normally.
+        ::tracing::debug!(%error, "a connection to a distribution's edge ended before its response");
+    }
+}
+
+/// How long one viewer request may take, from its first header byte to the answer: the
+/// core's own HTTP request deadline, so this address bounds a request exactly as the core's
+/// HTTP listeners do.
+fn request_deadline() -> Duration {
+    Duration::from_secs(listener_caps::HTTP_REQUEST_DEADLINE_SECS)
+}
+
+/// How many bytes of one viewer request this address reads: the core's per-connection
+/// ceiling.
+fn body_ceiling() -> usize {
+    usize::try_from(listener_caps::MAX_BYTES_PER_CONN).unwrap_or(usize::MAX)
+}
+
+/// Answer one viewer request from the data plane of the distribution this listener was
+/// opened for.
+async fn answer(
+    distribution: Arc<OnceLock<String>>,
+    callback: EmbeddedEmulator,
+    request: ::http::Request<::hyper::body::Incoming>,
+) -> ::http::Response<Full<Bytes>> {
+    let Some(distribution) = distribution.get().cloned() else {
+        // The create that opened this listener has not named its distribution yet, so there
+        // is nothing here to serve: reported as the edge reports a request it can resolve
+        // to no distribution.
+        return generated(BAD_GATEWAY, NO_DISTRIBUTION);
+    };
+    let (parts, body) = request.into_parts();
+    if let Some(refused) = refused_before_the_edge(&parts) {
+        return refused;
+    }
+    // One permit per request IN FLIGHT, taken BEFORE a byte of the body is read: what the
+    // bodies being read hold at once is then the in-flight cap times the ceiling below,
+    // rather than the connection cap (or the number of distributions) times it.
+    let Ok(permit) = in_flight().try_acquire_owned() else {
+        return generated(SERVICE_UNAVAILABLE, SERVER_BUSY);
+    };
+    let limited = Limited::new(body, body_ceiling());
+    let served = ::tokio::time::timeout(request_deadline(), async move {
+        // Held for the whole read and dispatch, and released with it.
+        let _permit: OwnedSemaphorePermit = permit;
+        let Ok(collected) = limited.collect().await else {
+            return generated(PAYLOAD_TOO_LARGE, BODY_TOO_LARGE);
+        };
+        let Some(forwarded) = forwarded(parts, collected.to_bytes(), &distribution) else {
+            return generated(BAD_GATEWAY, NO_DISTRIBUTION);
+        };
+        match callback.http_connector().call(forwarded).await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let mut answer = ::http::Response::builder().status(status);
+                for (name, value) in response.headers().iter() {
+                    answer = answer.header(name, value);
+                }
+                let body = Bytes::from(
+                    response
+                        .into_body()
+                        .bytes()
+                        .map(<[u8]>::to_vec)
+                        .unwrap_or_default(),
+                );
+                answer
+                    .body(Full::new(body.clone()))
+                    .unwrap_or_else(|_| ::http::Response::new(Full::new(body)))
+            }
+            // The data plane is this same process, so this is no answer about a
+            // distribution; it is reported as the edge reports an answer it could not
+            // produce.
+            Err(_) => generated(BAD_GATEWAY, NO_DISTRIBUTION),
+        }
+    })
+    .await;
+    served.unwrap_or_else(|_| generated(GATEWAY_TIMEOUT, REQUEST_TIMED_OUT))
+}
+
+/// The request the data plane is handed for one viewer request: the same method, body and
+/// headers, addressed to this service's own endpoint under the reserved data-plane path of
+/// `distribution` — so the viewer path travels where this client can carry it.
+///
+/// `None` when the viewer's own request does not render as one, which addresses nothing.
+fn forwarded(
+    parts: ::http::request::Parts,
+    body: Bytes,
+    distribution: &str,
+) -> Option<RtRequest> {
+    let viewer_path = parts.uri.path();
+    let query = parts
+        .uri
+        .query()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    let uri =
+        format!("https://{SERVICE_ENDPOINT}{EDGE_PATH_PREFIX}/{distribution}{viewer_path}{query}");
+    let mut builder = ::http::Request::builder()
+        .method(parts.method.clone())
+        .uri(uri)
+        .header(::http::header::HOST, SERVICE_ENDPOINT);
+    for (name, value) in parts.headers.iter() {
+        if HEADERS_NOT_FORWARDED.contains(&name.as_str()) {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    let built = builder.body(SdkBody::from(body)).ok()?;
+    RtRequest::try_from(built).ok()
+}
+
+/// The transport-safety refusals the core applies to its OWN HTTP listeners, applied here
+/// from the core's own predicates so this address and a core listener decide them alike:
+/// the `Host` allowlist (the DNS-rebinding guard a browser needs), the WebSocket refusal,
+/// and the browser check. `None` lets the request through to the data plane.
+fn refused_before_the_edge(
+    parts: &::http::request::Parts,
+) -> Option<::http::Response<Full<Bytes>>> {
+    let header = |name: &str| parts.headers.get(name).and_then(|value| value.to_str().ok());
+
+    // HTTP/1.1 requires a `Host`, and without an authority the rebinding guard cannot be
+    // run at all, so a request carrying none is refused rather than served: this fails
+    // CLOSED, exactly as the core's own HTTP listener does.
+    let Some(host) = header("host").or_else(|| parts.uri.host()) else {
+        return Some(generated(MISDIRECTED_REQUEST, HOST_REQUIRED));
+    };
+    if !host_allowed(::service_common::data_plane_addressing::host_only(host)) {
+        return Some(generated(MISDIRECTED_REQUEST, HOST_NOT_ALLOWED));
+    }
+    if ::emulator_server::is_websocket_upgrade(
+        header("connection"),
+        header("upgrade"),
+        header(":protocol"),
+    ) {
+        return Some(generated(NOT_IMPLEMENTED, NO_WEBSOCKETS));
+    }
+    if let BrowserVerdict::Forbid(reason) = ::emulator_server::classify_browser_request(
+        header("origin"),
+        header("sec-fetch-site"),
+        // This address is the emulator's own, reached from the machine it runs on: the same
+        // default a core HTTP listener carries, which admits no remote origin.
+        &RemoteOrigins::SameOriginOnly,
+        false,
+    ) {
+        return Some(generated(FORBIDDEN, reason));
+    }
+    None
+}
+
+/// Whether a viewer request's `Host` names the interface this address was bound on, by the
+/// rule a core HTTP listener applies: a loopback `Host` on the default loopback bind (which
+/// is what guards a browser against DNS rebinding), the operator's own address when they
+/// bound a routable one, and any `Host` on a wildcard bind — there the operator exposed the
+/// port deliberately and no single address names it.
+fn host_allowed(host: &str) -> bool {
+    if ::emulator_server::is_loopback_host(host) {
+        return true;
+    }
+    let Ok(bound) = ::emulator_server::bind_address_from_env() else {
+        return false;
+    };
+    bound.is_unspecified()
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<::std::net::IpAddr>()
+            .is_ok_and(|named| named == bound)
+}
+
+/// What this address answers a request it could not hand to the data plane at all:
+/// CloudFront's own status for an answer it produced itself instead of an origin's.
+const BAD_GATEWAY: u16 = 502;
+
+/// What it answers a request whose `Host` is not the address it serves, or that names none.
+const MISDIRECTED_REQUEST: u16 = 421;
+
+/// What it answers a WebSocket upgrade, which this address does not serve.
+const NOT_IMPLEMENTED: u16 = 501;
+
+/// What it answers a request a browser made cross-site.
+const FORBIDDEN: u16 = 403;
+
+/// What it answers a request that arrived while this service was already reading as many
+/// viewer bodies as it reads at once.
+const SERVICE_UNAVAILABLE: u16 = 503;
+
+/// The body of an answer for a request shed at the in-flight cap.
+const SERVER_BUSY: &str = "This address is serving as many requests as it can. Try again.\n";
+
+/// What it answers a request that did not finish within one request deadline.
+const GATEWAY_TIMEOUT: u16 = 504;
+
+/// What it answers a request carrying more than one connection may.
+const PAYLOAD_TOO_LARGE: u16 = 413;
+
+/// The body of an answer for a request that reached no distribution.
+const NO_DISTRIBUTION: &str = "This address serves no distribution.\n";
+
+/// The body of an answer for a request larger than this address accepts.
+const BODY_TOO_LARGE: &str = "This request is larger than this address accepts.\n";
+
+/// The body of an answer for a request that outlasted one request deadline.
+const REQUEST_TIMED_OUT: &str = "This request took longer than this address allows.\n";
+
+/// The body of an answer for a request whose `Host` is not the address it serves.
+const HOST_NOT_ALLOWED: &str = "This address does not serve that host.\n";
+
+/// The body of an answer for a request that names no host at all, which no HTTP/1.1 request
+/// may.
+const HOST_REQUIRED: &str = "This address requires the host it is addressed by.\n";
+
+/// The body of an answer for a WebSocket upgrade, which no distribution's edge serves.
+const NO_WEBSOCKETS: &str = "This address does not serve WebSocket connections.\n";
+
+/// One answer of this address's own, for a viewer request the data plane never saw. Plain
+/// text, as the edge's own generated answers are.
+fn generated(status: u16, message: &str) -> ::http::Response<Full<Bytes>> {
+    let body = Bytes::from(message.to_string());
+    ::http::Response::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Full::new(body.clone()))
+        // Every argument is this function's own, so the builder cannot fail; answer a bare
+        // status rather than panicking if it ever does.
+        .unwrap_or_else(|_| {
+            let mut response = ::http::Response::new(Full::new(body));
+            *response.status_mut() = ::http::StatusCode::BAD_GATEWAY;
+            response
+        })
+}

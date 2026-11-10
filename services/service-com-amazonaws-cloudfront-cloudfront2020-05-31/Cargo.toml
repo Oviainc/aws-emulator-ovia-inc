@@ -16,9 +16,16 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
+# Speaks HTTP/1.1 on the raw connection the core hands a distribution's EDGE listener, which
+# is what makes the published `DomainName` an address a viewer dials with its own client
+# (`src/state/edge_endpoint.rs`). `hyper-util` carries the tokio IO and timer adapters for
+# it, `http-body-util` the bounded body reader and the one-shot body.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # `iam_authorization`: the ONE evaluation of the resource policy an origin states its grant
@@ -26,7 +33,10 @@ tracing = { workspace = true }
 # in-process call to another emulated service carries; `s3_bucket_name`: whether a host
 # label names a bucket; `arn`: the account an ARN belongs to;
 # `service_principal_calls`: the directory of the calls this service makes AS the CloudFront
-# service principal, which the service serving one reads.
+# service principal, which the service serving one reads; `in_band_tls` and
+# `data_plane_addressing`: the ONE reading of a data-plane connection whose encryption is
+# negotiated in band and of the `host:port` a published endpoint carries, which a
+# distribution's edge listener is announced and served through.
 service-common = { path = "../common" }
 # The CloudWatch store the EDGE publishes the per-distribution metrics of the viewer
 # requests it serves to (the `AWS/CloudFront` namespace, `service::edge_metrics`).
@@ -34,6 +44,10 @@ service-common = { path = "../common" }
 # metrics never travel over that API; this writes the very store `ListMetrics`,
 # `GetMetricStatistics` and the alarm evaluation read.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The WAFv2 web ACL a distribution's configuration puts in front of it, and the ONE
+# evaluation of its rule tree (`service::web_acl`): a viewer request the web ACL does not
+# let through is answered 403 at the edge, with no origin request made.
+service-com-amazonaws-wafv2-awswaf-20190729 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -41,6 +55,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The published-address suite DIALS the `DomainName` a distribution reports, in this
+# process, exactly as a viewer handed that name does: tokio's socket and byte-stream halves
+# carry the HTTP exchange on it.
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
 
 [lints]
 workspace = true

@@ -416,33 +416,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::store_unavailable());
         };
         let now = SystemTime::now();
-        let mut store = state.lock();
-        store.settle(now);
 
         let DistributionConfigWithTags {
             distribution_config,
             tags,
         } = input.distribution_config_with_tags;
 
-        // "The tagging specified is not valid." A tag set no resource can carry is
-        // refused before anything is claimed for the distribution, so a bad tag set
-        // creates nothing.
+        // "The tagging specified is not valid." A tag set no resource can carry is refused
+        // before anything is claimed for the distribution — before the listener below, and
+        // so before this request has cost any host resource — so a bad tag set creates
+        // nothing and opens nothing.
         let tags = crate::state::tag_set(&tags).map_err(|reason| {
             CreateDistributionWithTagsErrorModeled::InvalidTagging(crate::state::invalid_tagging(
                 reason,
             ))
         })?;
 
+        // The listener this distribution's edge is served on, opened before the store lock
+        // is taken for the reason `CreateDistribution` opens it there — and, as there, after
+        // the one bound a caller could spend host resources against. A multi-tenant
+        // distribution reports no domain name, so none is opened for one.
+        if state.lock().at_distribution_capacity() {
+            return Err(create_refusal(crate::state::too_many_distributions()));
+        }
+        let edge_endpoint = if crate::state::is_multi_tenant(&distribution_config) {
+            None
+        } else {
+            crate::state::open_edge_endpoint(&*self.engine, ctx.callback().clone()).await
+        };
+        let mut store = state.lock();
+        store.settle(now);
+
         // The create itself is the shared path `CreateDistribution` runs: this operation
         // differs only in the tag set it stores alongside the new record.
         let created = store
-            .create_distribution(distribution_config, tags, now)
+            .create_distribution(distribution_config, tags, now, edge_endpoint)
             .map_err(create_refusal)?;
 
         Ok(CreateDistributionWithTagsOutput {

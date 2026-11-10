@@ -32,13 +32,24 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
 };
 
 use crate::distribution_lifecycle::{
-    create_distribution, emulator, get_distribution, list_distributions, update_distribution,
-    Answer, Node, API_VERSION,
+    create_distribution, emulator, get_distribution, is_reachable_authority, list_distributions,
+    update_distribution, Answer, Node, API_VERSION,
 };
 
 /// The `DistributionConfig` a row submits: one origin and a default cache behaviour,
 /// plus whatever the row adds inside that behaviour and at the configuration level.
+///
+/// `PriceClass` is stated only where the configuration describes a STANDARD distribution:
+/// the member "only supports standard distributions. You can't specify this field for
+/// multi-tenant distributions", so a multi-tenant row — one whose configuration-level
+/// members declare the tenant-only connection mode or a `TenantConfig` — states none.
 fn config_xml(caller_reference: &str, behavior_extra: &str, config_extra: &str) -> String {
+    let price_class = if config_extra.contains("tenant-only") || config_extra.contains("TenantConfig")
+    {
+        ""
+    } else {
+        "<PriceClass>PriceClass_All</PriceClass>"
+    };
     format!(
         "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
          <CallerReference>{caller_reference}</CallerReference>\
@@ -49,7 +60,7 @@ fn config_xml(caller_reference: &str, behavior_extra: &str, config_extra: &str) 
          <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy>{behavior_extra}\
          </DefaultCacheBehavior>\
          <Comment>{caller_reference}</Comment>\
-         <PriceClass>PriceClass_All</PriceClass>\
+         {price_class}\
          <Enabled>true</Enabled>{config_extra}\
          </DistributionConfig>"
     )
@@ -559,11 +570,9 @@ async fn a_multi_tenant_distribution_reports_no_domain_of_its_own() {
             );
         } else {
             assert!(
-                domain.starts_with('d')
-                    && domain.ends_with(".cloudfront.net")
-                    && domain.len() > ".cloudfront.net".len() + 1,
-                "case {label}: expected an allocated d<label>.cloudfront.net domain, got \
-                 {domain:?}"
+                is_reachable_authority(&domain),
+                "case {label}: expected the address of the listener this distribution's edge \
+                 is served on, got {domain:?}"
             );
         }
 

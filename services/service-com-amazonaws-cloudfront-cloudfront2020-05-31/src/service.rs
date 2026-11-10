@@ -97,6 +97,9 @@ pub mod envelope;
 /// logging.
 pub mod management_events;
 pub mod origin_access;
+/// The WAFv2 web ACL a distribution's configuration puts in front of it, and what the edge
+/// answers a viewer request that web ACL does not let through.
+pub mod web_acl;
 
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, Refusal, Refused,

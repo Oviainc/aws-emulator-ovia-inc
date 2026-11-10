@@ -53,6 +53,7 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     INVALID_IF_MATCH_VERSION_MESSAGE, MAX_SESSION_STICKINESS_TTL,
     MAX_STAGING_DISTRIBUTION_DNS_NAMES, MAX_TRAFFIC_WEIGHT, MIN_SESSION_STICKINESS_TTL,
     NO_SUCH_CONTINUOUS_DEPLOYMENT_POLICY_MESSAGE, PRECONDITION_FAILED_MESSAGE,
+    STAGING_DISTRIBUTION_IN_USE_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -687,15 +688,18 @@ async fn an_update_claiming_another_policys_staging_distribution_is_refused() {
             "case {case}: expected StagingDistributionInUse, got {}",
             refused.raw
         );
+        // The sentence this code carries is the service's own fixed one: it states that a
+        // staging distribution of the account is already another policy's, and names
+        // neither the policy that holds it nor anything else from the request.
+        let message = refused.root().find_text("Message").unwrap_or_default();
+        assert_eq!(
+            message, STAGING_DISTRIBUTION_IN_USE_MESSAGE,
+            "case {case}: expected {STAGING_DISTRIBUTION_IN_USE_MESSAGE:?}, got {message:?}"
+        );
         assert!(
-            refused
-                .root()
-                .find_text("Message")
-                .unwrap_or_default()
-                .contains(&holder_id),
-            "case {case}: expected the refusal to name the policy that holds the staging \
-             distribution ({holder_id}), got {}",
-            refused.raw
+            !message.contains(&holder_id),
+            "case {case}: the sentence must not name the policy holding the staging \
+             distribution ({holder_id}), got {message:?}"
         );
         assert_stored(&router, &id, &subject, &etag, "claiming a held domain name").await;
 

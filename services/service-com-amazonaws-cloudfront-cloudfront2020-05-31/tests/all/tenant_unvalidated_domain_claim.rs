@@ -34,7 +34,7 @@
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::VALIDATION_TOKEN_HOST_VALUES;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    DOMAIN_STATUS_ACTIVE, MAX_DOMAINS_PER_TENANT, VALIDATION_TOKEN_HOST_CLOUDFRONT,
+    DOMAIN_STATUS_INACTIVE, MAX_DOMAINS_PER_TENANT, VALIDATION_TOKEN_HOST_CLOUDFRONT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -201,14 +201,19 @@ async fn table(router: &MultiServiceRouter) -> Vec<Row> {
 }
 
 /// The domains the tenant in `answer` reports, lowercased, with every entry's status
-/// asserted to be the one an associated domain carries.
+/// asserted to be the one a STAGED claim carries.
+///
+/// `DomainResult$Status` is "whether the domain is active or inactive", which is about what
+/// the domain SERVES: every claim in this suite is still waiting for the certificate it
+/// would be served over, so viewers asking for it reach nothing and it reads `inactive` —
+/// which is the same reading that makes the claim unenforced here.
 fn reported_domains(answer: &Answer, case: &str) -> Vec<String> {
     domains_of(answer.root())
         .into_iter()
         .map(|(domain, status)| {
             assert_eq!(
-                status, DOMAIN_STATUS_ACTIVE,
-                "case {case}: expected {domain} to be reported {DOMAIN_STATUS_ACTIVE}, got \
+                status, DOMAIN_STATUS_INACTIVE,
+                "case {case}: expected {domain} to be reported {DOMAIN_STATUS_INACTIVE}, got \
                  {status:?}"
             );
             domain.to_lowercase()

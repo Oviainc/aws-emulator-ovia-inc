@@ -1257,6 +1257,17 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .map(|tenant| &mut tenant.tags)
     }
 
+    /// Whether this store already holds as many distributions as it can
+    /// ([`MAX_DISTRIBUTIONS`]), so the next create is refused.
+    ///
+    /// Read by [`Self::create_distribution`], which is what refuses the create, and by the
+    /// handlers BEFORE they open the listener a new distribution's edge would be served on:
+    /// the bound is what keeps a caller from making this emulator hold more state than it
+    /// can, so a create it refuses must not have cost a host resource on the way.
+    pub fn at_distribution_capacity(&self) -> bool {
+        self.distributions.len() >= MAX_DISTRIBUTIONS
+    }
+
     /// Persist a new distribution carrying `config` and `tags`, and report the record
     /// that was stored — or, when the caller reference already names a distribution
     /// carrying this very configuration, report THAT record and store nothing.
@@ -1274,6 +1285,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         config: DistributionConfig,
         tags: TagSet,
         now: SystemTime,
+        edge_endpoint: Option<EdgeEndpoint>,
     ) -> Result<CreatedDistribution, CreateRefusal> {
         // "The value of Quantity and the size of Items don't match." A malformed
         // configuration is refused before any id or caller reference is claimed for it.
@@ -1309,6 +1321,16 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             return Err(CreateRefusal::InvalidLambdaFunctionAssociation(message));
         }
 
+        // A cache behaviour runs the code a CloudFront function's `LIVE` stage holds, so a
+        // configuration whose function association names a function nothing has published
+        // to that stage is refused before any distribution is created referencing code that
+        // does not exist at the edge.
+        if let Some(arn) = self.function_association_without_live_stage(&config) {
+            return Err(CreateRefusal::InvalidArgument(
+                invalid_function_association_message(arn),
+            ));
+        }
+
         // An origin reaches a private bucket EITHER with the credentials of an origin
         // access control OR as an origin access identity, never both: a configuration whose
         // origin names both says nothing about which signs it, so it is refused before any
@@ -1326,6 +1348,16 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         if self.unknown_origin_access_control(&config).is_some() {
             return Err(CreateRefusal::InvalidOriginAccessControl(
                 INVALID_ORIGIN_ACCESS_CONTROL_MESSAGE.to_string(),
+            ));
+        }
+
+        // A multi-tenant distribution serves its tenants, not its own traffic: the members
+        // the model documents as standard-distribution-only — or as a connection group's to
+        // carry — are no members of its configuration, so one that states any of them is
+        // refused before a distribution is created that CloudFront would not serve.
+        if let Some(member) = multi_tenant_direct_only_member(&config) {
+            return Err(CreateRefusal::InvalidArgument(
+                multi_tenant_direct_only_message(member),
             ));
         }
 
@@ -1390,16 +1422,23 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         // "Processing your request would cause you to exceed the maximum number of
         // distributions allowed." The store grows only here and a distribution cannot be
         // evicted (a later Get has to answer with what this create returned), so the
-        // bound is an entry count refused BEFORE anything is claimed.
-        if self.distributions.len() >= MAX_DISTRIBUTIONS {
-            return Err(CreateRefusal::TooManyDistributions(format!(
-                "This emulator holds at most {MAX_DISTRIBUTIONS} distributions; delete one \
-                 before creating another"
-            )));
+        // bound is an entry count refused BEFORE anything is claimed. The handlers read
+        // the same bound through [`Self::at_distribution_capacity`] before they open a
+        // listener for the create, so a request this refuses costs no host resource either.
+        if self.at_distribution_capacity() {
+            return Err(too_many_distributions());
         }
 
         let id = self.allocate_distribution_id();
-        let domain_name = self.allocate_domain_name();
+        // The domain name a VIEWER is handed: the address of the listener this
+        // distribution's edge is served on, so a client that dials what it was told reaches
+        // this distribution ([`EdgeEndpoint`]). A distribution with no listener of its own —
+        // a multi-tenant one, which reports no domain at all, and a create on an engine that
+        // vends no listeners — carries the name CloudFront's own zone would give it.
+        let domain_name = match &edge_endpoint {
+            Some(endpoint) => endpoint.authority().to_string(),
+            None => self.allocate_domain_name(),
+        };
         let etag = self.next_etag();
         let stored = StoredDistribution {
             arn: distribution_arn(&id),
@@ -1434,6 +1473,12 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             distribution: stored.to_distribution(&self.key_groups),
         };
         self.caller_references.insert(caller_reference, id.clone());
+        // The listener now has a distribution to serve, and its handle is held for as long
+        // as that distribution is: dropping it closes the port.
+        if let Some(endpoint) = edge_endpoint {
+            endpoint.serves(&id);
+            self.edge_endpoints.insert(id.clone(), endpoint);
+        }
         self.distributions.insert(id, stored);
         Ok(created)
     }

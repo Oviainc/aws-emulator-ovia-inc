@@ -80,6 +80,20 @@ pub(crate) fn past_propagation() -> Duration {
     PROPAGATION_DELAY + Duration::from_millis(250)
 }
 
+/// Whether `domain` is an address a client on the machine this emulator runs on can DIAL:
+/// the `host:port` of the listener a distribution's edge is served on, which is what a
+/// distribution publishes as its `DomainName`.
+///
+/// A name under CloudFront's own zone resolves to nothing here, so a distribution that
+/// reported one would publish an address no viewer could reach; what it reports instead is
+/// the authority of its own listener, and `SocketAddr` is exactly the set of values a client
+/// can dial without resolving a name (an IPv6 literal included, which carries brackets).
+///
+/// `pub(crate)` so every suite that reads a published domain name holds it to the one rule.
+pub(crate) fn is_reachable_authority(domain: &str) -> bool {
+    domain.parse::<std::net::SocketAddr>().is_ok()
+}
+
 // ---------------------------------------------------------------------------
 // XML reading
 // ---------------------------------------------------------------------------
@@ -854,8 +868,9 @@ async fn create_persists_the_configuration_every_read_then_reports() {
             .unwrap_or_default()
             .to_string();
         assert!(
-            domain.ends_with(".cloudfront.net") && domain.len() > ".cloudfront.net".len(),
-            "case {case}: expected a <label>.cloudfront.net domain name, got {domain:?}"
+            is_reachable_authority(&domain),
+            "case {case}: expected the address of the listener this distribution's edge is \
+             served on, got {domain:?}"
         );
         assert!(
             seen_domains.insert(domain.clone()),

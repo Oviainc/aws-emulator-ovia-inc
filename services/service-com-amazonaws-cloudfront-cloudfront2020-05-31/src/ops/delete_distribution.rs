@@ -221,14 +221,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Gone means gone: the record and the caller reference it held are both
-        // released, so a later create may reuse that reference and no later read
-        // reports the distribution.
+        // Gone means gone: the record, the caller reference it held and the listener its
+        // edge was served on are all released, so a later create may reuse that reference,
+        // no later read reports the distribution, and nothing answers at the domain name it
+        // published.
         if let Some(removed) = store.distributions.remove(&input.id) {
             store
                 .caller_references
                 .remove(&removed.config.caller_reference);
         }
+        store.edge_endpoints.remove(&input.id);
 
         Ok(DeleteDistributionOutput {})
     }

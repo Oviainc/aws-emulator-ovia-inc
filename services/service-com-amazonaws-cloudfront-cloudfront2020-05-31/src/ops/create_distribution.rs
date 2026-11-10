@@ -439,8 +439,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::store_unavailable());
         };
-        let _ = ctx;
         let now = SystemTime::now();
+        // The listener this distribution's edge is served on, opened BEFORE the store lock
+        // is taken (binding a socket is asynchronous). The handle is held by this function
+        // until the store takes it, so every path out of here that does not store a
+        // distribution — a refusal, or a caller-reference repeat answering the record that
+        // already exists — drops it, which closes the port. The one bound a caller could
+        // otherwise spend host resources against is read FIRST, so a create this emulator
+        // will refuse for capacity opens no socket at all. A multi-tenant distribution
+        // serves no traffic of its own and reports no domain name, so none is opened for one.
+        if state.lock().at_distribution_capacity() {
+            return Err(create_refusal(crate::state::too_many_distributions()));
+        }
+        let edge_endpoint = if crate::state::is_multi_tenant(&input.distribution_config) {
+            None
+        } else {
+            crate::state::open_edge_endpoint(&*self.engine, ctx.callback().clone()).await
+        };
         let mut store = state.lock();
         store.settle(now);
 
@@ -448,7 +463,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // starts with no tags; everything else is the shared create path, which
         // `CreateDistributionWithTags` runs too — including the caller-reference rule.
         let created = store
-            .create_distribution(input.distribution_config, crate::state::TagSet::new(), now)
+            .create_distribution(
+                input.distribution_config,
+                crate::state::TagSet::new(),
+                now,
+                edge_endpoint,
+            )
             .map_err(create_refusal)?;
 
         Ok(CreateDistributionOutput {

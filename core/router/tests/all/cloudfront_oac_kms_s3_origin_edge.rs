@@ -758,6 +758,11 @@ fn an_oac_signed_fetch_of_an_sse_kms_object_is_decided_by_the_key_policy() {
                 router: assembled,
                 runtime: tokio::runtime::Builder::new_current_thread()
                     .enable_time()
+                    // The emulator opens a core-owned listener for every distribution it
+                    // creates — a distribution's edge is served at the address it
+                    // publishes — so the runtime a create runs on needs the IO driver that
+                    // socket is bound on.
+                    .enable_io()
                     .build()
                     .expect("a current-thread runtime"),
             };

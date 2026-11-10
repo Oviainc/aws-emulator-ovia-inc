@@ -127,6 +127,8 @@ mod edge_data_plane;
 mod edge_geo_restriction;
 #[path = "all/edge_request_metrics.rs"]
 mod edge_request_metrics;
+#[path = "all/edge_web_acl.rs"]
+mod edge_web_acl;
 #[path = "all/enum_value_set_message.rs"]
 mod enum_value_set_message;
 #[path = "all/error_envelope.rs"]
@@ -237,6 +239,8 @@ mod origin_request_policy_update;
 mod path_identifier_shape;
 #[path = "all/precondition_family_wording.rs"]
 mod precondition_family_wording;
+#[path = "all/published_edge_address.rs"]
+mod published_edge_address;
 #[path = "all/public_key_delete.rs"]
 mod public_key_delete;
 #[path = "all/public_key_lifecycle.rs"]

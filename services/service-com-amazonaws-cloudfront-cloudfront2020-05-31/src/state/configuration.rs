@@ -93,12 +93,26 @@ pub(super) fn resolve_logging(logging: Option<LoggingConfig>) -> LoggingConfig {
 /// A configuration that names no certificate of its own is served on CloudFront's own
 /// certificate: "If the distribution doesn't use `Aliases` ... set
 /// `CloudFrontDefaultCertificate` to `true` and leave all other fields empty." Under that
-/// certificate the security policy is fixed — "CloudFront automatically sets the security
-/// policy to `TLSv1` regardless of the value that you set here" — and the distribution
-/// accepts HTTPS from every viewer, SNI or not ([`SSL_SUPPORT_METHOD_VIP`]). The
-/// deprecated `Certificate` and `CertificateSource` members report which certificate is in
-/// use and where it is kept, so they follow from the certificate the configuration chose.
-pub(super) fn resolve_viewer_certificate(certificate: Option<ViewerCertificate>) -> ViewerCertificate {
+/// certificate the distribution accepts HTTPS from every viewer, SNI or not
+/// ([`SSL_SUPPORT_METHOD_VIP`]). The deprecated `Certificate` and `CertificateSource`
+/// members report which certificate is in use and where it is kept, so they follow from the
+/// certificate the configuration chose.
+///
+/// `MinimumProtocolVersion` is the one member the service OVERRIDES rather than supplies,
+/// and it overrides it for exactly one kind of distribution: "If the distribution uses the
+/// CloudFront domain name such as `d111111abcdef8.cloudfront.net` (you set
+/// `CloudFrontDefaultCertificate` to `true`), CloudFront automatically sets the security
+/// policy to `TLSv1` regardless of the value that you set here." Both halves of that
+/// condition have to hold, so `serves_own_domain` carries the first: a distribution that is
+/// served on a CloudFront domain name of its own, under the default certificate, reports
+/// [`MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE`], and every other configuration — one
+/// naming a custom certificate, and a multi-tenant one, which has no CloudFront domain name
+/// at all and whose viewers reach it through a connection group — keeps the security policy
+/// it declared, which is what a later read of it answers.
+pub(super) fn resolve_viewer_certificate(
+    certificate: Option<ViewerCertificate>,
+    serves_own_domain: bool,
+) -> ViewerCertificate {
     let mut resolved = certificate.unwrap_or_default();
     let acm = resolved.acm_certificate_arn.clone();
     let iam = resolved.iam_certificate_id.clone();
@@ -112,8 +126,10 @@ pub(super) fn resolve_viewer_certificate(certificate: Option<ViewerCertificate>)
                 .ssl_support_method
                 .unwrap_or_else(|| SSL_SUPPORT_METHOD_VIP.to_string()),
         );
-        resolved.minimum_protocol_version =
-            Some(MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE.to_string());
+        if serves_own_domain {
+            resolved.minimum_protocol_version =
+                Some(MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE.to_string());
+        }
         resolved.certificate_source = Some(CERTIFICATE_SOURCE_CLOUDFRONT.to_string());
     } else if let Some(arn) = acm {
         resolved.certificate = Some(arn);
@@ -144,9 +160,9 @@ pub(super) fn quantity_disagreement(label: &str, quantity: i32, len: usize) -> O
     ))
 }
 
-/// The list wrappers one cache behaviour carries.
+/// The list wrappers and the direct-only scalars one cache behaviour carries.
 ///
-/// `DefaultCacheBehavior` and `CacheBehavior` declare the same ones, so both are
+/// `DefaultCacheBehavior` and `CacheBehavior` declare the same members, so both are
 /// checked through this one view rather than through two copies of the same walk.
 pub(super) struct BehaviorLists<'a> {
     pub(super) trusted_signers: Option<&'a TrustedSigners>,
@@ -155,6 +171,12 @@ pub(super) struct BehaviorLists<'a> {
     pub(super) lambda_function_associations: Option<&'a LambdaFunctionAssociations>,
     pub(super) function_associations: Option<&'a FunctionAssociations>,
     pub(super) forwarded_values: Option<&'a ForwardedValues>,
+    /// Whether the behaviour states `SmoothStreaming`, one of the members documented as
+    /// supported only on a standard distribution.
+    pub(super) states_smooth_streaming: bool,
+    /// Whether the behaviour states each of the three deprecated per-behaviour TTLs, which
+    /// carry the same note: `MinTTL`, `DefaultTTL` and `MaxTTL`, in that order.
+    pub(super) states_ttls: [bool; 3],
 }
 
 impl<'a> From<&'a DefaultCacheBehavior> for BehaviorLists<'a> {
@@ -166,6 +188,12 @@ impl<'a> From<&'a DefaultCacheBehavior> for BehaviorLists<'a> {
             lambda_function_associations: behavior.lambda_function_associations.as_ref(),
             function_associations: behavior.function_associations.as_ref(),
             forwarded_values: behavior.forwarded_values.as_ref(),
+            states_smooth_streaming: behavior.smooth_streaming.is_some(),
+            states_ttls: [
+                behavior.min_ttl.is_some(),
+                behavior.default_ttl.is_some(),
+                behavior.max_ttl.is_some(),
+            ],
         }
     }
 }
@@ -179,11 +207,45 @@ impl<'a> From<&'a CacheBehavior> for BehaviorLists<'a> {
             lambda_function_associations: behavior.lambda_function_associations.as_ref(),
             function_associations: behavior.function_associations.as_ref(),
             forwarded_values: behavior.forwarded_values.as_ref(),
+            states_smooth_streaming: behavior.smooth_streaming.is_some(),
+            states_ttls: [
+                behavior.min_ttl.is_some(),
+                behavior.default_ttl.is_some(),
+                behavior.max_ttl.is_some(),
+            ],
         }
     }
 }
 
 impl BehaviorLists<'_> {
+    /// The first member of this behaviour that a MULTI-TENANT distribution may not state,
+    /// or `None` when it states none of them. See
+    /// [`multi_tenant_direct_only_member`] for the rule and the member list.
+    pub(super) fn direct_only_member(&self) -> Option<&'static str> {
+        if self.forwarded_values.is_some() {
+            return Some("ForwardedValues");
+        }
+        for (stated, member) in self
+            .states_ttls
+            .iter()
+            .zip(["MinTTL", "DefaultTTL", "MaxTTL"])
+        {
+            if *stated {
+                return Some(member);
+            }
+        }
+        if self.states_smooth_streaming {
+            return Some("SmoothStreaming");
+        }
+        if self
+            .trusted_signers
+            .is_some_and(|signers| signers.quantity > 0 || items_len(&signers.items) > 0)
+        {
+            return Some("TrustedSigners");
+        }
+        None
+    }
+
     /// Record every wrapper this behaviour carries, under `label`.
     pub(super) fn collect(&self, label: &str, counts: &mut Vec<(String, i32, usize)>) {
         if let Some(signers) = self.trusted_signers {
@@ -340,6 +402,90 @@ pub fn lambda_association_without_version(config: &DistributionConfig) -> Option
         .map(|association| {
             invalid_lambda_function_association_message(&association.lambda_function_arn)
         })
+}
+
+/// The first member a MULTI-TENANT distribution's configuration may not state, or `None`
+/// when it states none of them — and `None` for a configuration that describes a STANDARD
+/// distribution, which is the kind every one of these members belongs to.
+///
+/// The model documents each of them the same way — "This field only supports standard
+/// distributions. You can't specify this field for multi-tenant distributions", or, for the
+/// ones a connection group carries instead, "To use this field for a multi-tenant
+/// distribution, use a connection group instead" — so a multi-tenant configuration that
+/// states one describes a distribution CloudFront would not serve, and it is refused with
+/// the sentence that names the member ([`multi_tenant_direct_only_message`]). The members,
+/// in the order a configuration is walked for them: `Aliases`, `PriceClass`,
+/// `IsIPV6Enabled`, `ContinuousDeploymentPolicyId`, `Staging` and `AnycastIpListId` on the
+/// configuration itself, and then, for the default cache behaviour and each ordered one in
+/// turn, the legacy cache-key group (`ForwardedValues` and the three deprecated TTLs that
+/// travel with it), `SmoothStreaming` and `TrustedSigners`
+/// ([`BehaviorLists::direct_only_member`]).
+///
+/// A member whose value says NOTHING is not a statement of it: a list wrapper carrying no
+/// entry ("specify an empty element") and an empty identifier name nothing, exactly as they
+/// name nothing in the rules that read those members
+/// ([`origin_with_both_access_mechanisms`] reads an empty `OriginAccessIdentity` that way).
+/// A scalar the configuration carries at all is one it states.
+///
+/// Checked on the way IN, on every path that stores a `DistributionConfig`, so no stored
+/// multi-tenant distribution ever carries a member only a standard one has: the condition is
+/// a property of the submitted configuration alone, which is why it lives here beside
+/// [`alias_certificate_mismatch`] rather than in one handler. It is also what makes the
+/// resolution of a multi-tenant configuration materialise none of them
+/// ([`resolve_distribution_config`]): a member the service refuses on the way in is not one
+/// it supplies a default for.
+pub fn multi_tenant_direct_only_member(config: &DistributionConfig) -> Option<&'static str> {
+    if !is_multi_tenant(config) {
+        return None;
+    }
+    let names = |value: &Option<String>| {
+        value
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    if config
+        .aliases
+        .as_ref()
+        .is_some_and(|aliases| aliases.quantity > 0 || items_len(&aliases.items) > 0)
+    {
+        return Some("Aliases");
+    }
+    if config.price_class.is_some() {
+        return Some("PriceClass");
+    }
+    if config.is_ipv6_enabled.is_some() {
+        return Some("IsIPV6Enabled");
+    }
+    if names(&config.continuous_deployment_policy_id) {
+        return Some("ContinuousDeploymentPolicyId");
+    }
+    if config.staging.is_some() {
+        return Some("Staging");
+    }
+    if names(&config.anycast_ip_list_id) {
+        return Some("AnycastIpListId");
+    }
+    behavior_views(config)
+        .iter()
+        .find_map(BehaviorLists::direct_only_member)
+}
+
+/// The sentence CloudFront refuses a multi-tenant distribution's configuration for stating
+/// `member` with, on the wire: the fixed text naming the member the configuration may not
+/// carry, which is the one variable part of it and comes from the MODEL's own name for that
+/// member ([`multi_tenant_direct_only_member`]).
+pub fn multi_tenant_direct_only_message(member: &str) -> String {
+    format!("You can't specify the {member} field for a multi-tenant distribution.")
+}
+
+/// The refusal a create is answered with at this emulator's distribution bound
+/// ([`MAX_DISTRIBUTIONS`]) — the one sentence both the store's own check and a handler's
+/// pre-check answer it with, so the two cannot word the same bound differently.
+pub fn too_many_distributions() -> CreateRefusal {
+    CreateRefusal::TooManyDistributions(format!(
+        "This emulator holds at most {MAX_DISTRIBUTIONS} distributions; delete one before \
+         creating another"
+    ))
 }
 
 /// Whether an origin of `config` names BOTH an origin access control and an origin access
@@ -1254,6 +1400,30 @@ pub fn invalid_invalidation_paths() -> crate::ops::types::InvalidArgument {
     }
 }
 
+/// The sentence CloudFront refuses a batch whose `CallerReference` already names another
+/// invalidation of the same distribution with, on the wire.
+///
+/// FIXED service text: what the refusal states is that the reference is taken for this
+/// distribution, which is a property of the error class — so neither the reference the
+/// request submitted nor the id of the invalidation that holds it belongs in it, exactly as
+/// the caller-reference conflict of every other resource kind states its own fixed sentence
+/// ([`ORIGIN_ACCESS_IDENTITY_ALREADY_EXISTS_MESSAGE`] and its neighbours).
+pub const INVALIDATION_CALLER_REFERENCE_REUSED_MESSAGE: &str =
+    "Your request contains a caller reference that was used for a previous invalidation \
+     batch for the same distribution.";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a batch submitted under a
+/// `CallerReference` that already names another invalidation of the same distribution
+/// ([`INVALIDATION_CALLER_REFERENCE_REUSED_MESSAGE`]).
+///
+/// Takes no identifier, so the refusal reads the same whichever reference collided and on
+/// whichever of the two invalidation surfaces it was submitted.
+pub fn invalidation_caller_reference_reused() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(INVALIDATION_CALLER_REFERENCE_REUSED_MESSAGE.to_string()),
+    }
+}
+
 /// `TrafficConfig$Type` selecting a share of traffic, from
 /// [`crate::ops::types::CONTINUOUS_DEPLOYMENT_POLICY_TYPE_VALUES`] — the values the model
 /// says the member accepts.
@@ -1506,16 +1676,32 @@ pub fn continuous_deployment_policy_in_use()
     }
 }
 
-/// The modelled `StagingDistributionInUse` (HTTP 409) for a create whose staging
-/// distribution another policy already routes traffic to — "A continuous deployment
-/// policy for this staging distribution already exists" — naming that policy, the one
-/// piece of detail the caller cannot work out for itself.
-pub fn staging_distribution_in_use(policy_id: &str) -> crate::ops::types::StagingDistributionInUse {
+/// The sentence `StagingDistributionInUse` carries, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this
+/// emulator therefore serves. Like [`ILLEGAL_ORIGIN_ACCESS_CONFIGURATION_MESSAGE`] it
+/// differs from the sentence the MODEL's documentation of the error shape uses for the
+/// same condition ("A continuous deployment policy for this staging distribution already
+/// exists."): that one documents the condition, this one is served. Do not "correct" this
+/// constant to the documentation sentence.
+///
+/// The WHOLE sentence is fixed: what the refusal states is that some staging distribution
+/// of this account is already another policy's, so neither the policy that holds it nor
+/// the distribution it was asked for is any part of it.
+pub const STAGING_DISTRIBUTION_IN_USE_MESSAGE: &str =
+    "One or more staging distributions are associated with another continuous deployment \
+     policy in your account.";
+
+/// The modelled `StagingDistributionInUse` (HTTP 409) for a call whose staging
+/// distribution another policy already routes traffic to.
+///
+/// Takes no identifier: the sentence is fixed service text
+/// ([`STAGING_DISTRIBUTION_IN_USE_MESSAGE`]), so every entry point into the rule refuses
+/// this condition with the one text and none of them leaks the id of the policy that holds
+/// the staging distribution.
+pub fn staging_distribution_in_use() -> crate::ops::types::StagingDistributionInUse {
     crate::ops::types::StagingDistributionInUse {
-        message: Some(format!(
-            "A continuous deployment policy for this staging distribution already exists: \
-             {policy_id}"
-        )),
+        message: Some(STAGING_DISTRIBUTION_IN_USE_MESSAGE.to_string()),
     }
 }
 
@@ -3709,7 +3895,15 @@ pub(super) fn render_token(value: u64, len: usize) -> String {
 /// real-time log configuration, an anycast ip list, a tenant or connection-mode setting)
 /// is left absent: the service applies nothing to it.
 pub fn resolve_distribution_config(mut config: DistributionConfig) -> DistributionConfig {
-    config.aliases = Some(config.aliases.unwrap_or_default());
+    // Which KIND of distribution the configuration describes decides which members the
+    // service supplies at all: a member documented as supported only on a standard
+    // distribution is no member of a multi-tenant one, which states none of them
+    // ([`multi_tenant_direct_only_member`] refuses one that does), so none of them is
+    // materialised for it either.
+    let multi_tenant = is_multi_tenant(&config);
+    if !multi_tenant {
+        config.aliases = Some(config.aliases.unwrap_or_default());
+    }
     config.default_root_object = Some(config.default_root_object.unwrap_or_default());
 
     let origins = std::mem::take(&mut config.origins.items);
@@ -3736,12 +3930,17 @@ pub fn resolve_distribution_config(mut config: DistributionConfig) -> Distributi
     config.custom_error_responses = Some(responses);
 
     config.logging = Some(resolve_logging(config.logging.take()));
-    config.price_class = Some(
-        config
-            .price_class
-            .unwrap_or_else(|| DEFAULT_PRICE_CLASS.to_string()),
-    );
-    config.viewer_certificate = Some(resolve_viewer_certificate(config.viewer_certificate.take()));
+    if !multi_tenant {
+        config.price_class = Some(
+            config
+                .price_class
+                .unwrap_or_else(|| DEFAULT_PRICE_CLASS.to_string()),
+        );
+    }
+    config.viewer_certificate = Some(resolve_viewer_certificate(
+        config.viewer_certificate.take(),
+        !multi_tenant,
+    ));
     config.restrictions = Some(config.restrictions.unwrap_or_else(|| Restrictions {
         geo_restriction: GeoRestriction {
             restriction_type: GEO_RESTRICTION_NONE.to_string(),
@@ -3755,10 +3954,12 @@ pub fn resolve_distribution_config(mut config: DistributionConfig) -> Distributi
             .http_version
             .unwrap_or_else(|| DEFAULT_HTTP_VERSION.to_string()),
     );
-    config.is_ipv6_enabled = Some(config.is_ipv6_enabled.unwrap_or(DEFAULT_IS_IPV6_ENABLED));
-    config.continuous_deployment_policy_id =
-        Some(config.continuous_deployment_policy_id.unwrap_or_default());
-    config.staging = Some(config.staging.unwrap_or(DEFAULT_STAGING));
+    if !multi_tenant {
+        config.is_ipv6_enabled = Some(config.is_ipv6_enabled.unwrap_or(DEFAULT_IS_IPV6_ENABLED));
+        config.continuous_deployment_policy_id =
+            Some(config.continuous_deployment_policy_id.unwrap_or_default());
+        config.staging = Some(config.staging.unwrap_or(DEFAULT_STAGING));
+    }
     config
 }
 

@@ -295,7 +295,7 @@ fn resolve<'s, 'r>(
     store: &'s ComAmazonawsCloudfrontCloudfront20200531State,
     addressed: &Addressed<'r>,
 ) -> Option<Resolved<'s, 'r>> {
-    if let Some(host) = addressed.host.map(bare_host) {
+    if let Some(host) = addressed.host {
         if let Some(distribution) = store
             .distributions
             .values()
@@ -329,7 +329,8 @@ fn resolve<'s, 'r>(
     }
     let (first, rest) = split_first_segment(addressed.path)?;
     // The segment is the distribution's id, or the domain name a viewer would have
-    // addressed in the host — the same name, carried where this client could carry it.
+    // addressed in the host — the same name, carried where this client can carry it, port
+    // and all ([`serves_host`] reads both forms).
     store
         .distributions
         .get(first)
@@ -337,7 +338,7 @@ fn resolve<'s, 'r>(
             store
                 .distributions
                 .values()
-                .find(|distribution| serves_host(distribution, bare_host(first)))
+                .find(|distribution| serves_host(distribution, first))
         })
         .map(|distribution| Resolved {
             distribution,
@@ -352,6 +353,14 @@ fn resolve<'s, 'r>(
 /// distribution reports no domain of its own and so is served on none: its viewers reach
 /// it through a connection group's routing endpoint.
 ///
+/// The `DomainName` is compared against the host AS ADDRESSED first, because the name a
+/// distribution publishes is the address of the listener its edge is served on
+/// (`crate::state::EdgeEndpoint`) and that address names a PORT: two distributions differ in
+/// exactly that port, so a comparison that dropped it would resolve every one of them to
+/// whichever the store lists first. A published name that carries no port — the name
+/// CloudFront's own zone would give it — matches the host without its port, which is what a
+/// client that resolves such a name sends.
+///
 /// An alias is only read when it is a name a VIEWER could be sent to: the alternate domain
 /// names are caller-supplied and unverifiable here, so one spelled like another service's
 /// endpoint, like `localhost`, or like an IP literal would take over the address every
@@ -359,6 +368,10 @@ fn resolve<'s, 'r>(
 /// assigned is never such a name, and a distribution whose alias is one is still reachable
 /// through the reserved data-plane path.
 fn serves_host(distribution: &StoredDistribution, host: &str) -> bool {
+    if same_domain(&distribution.domain_name, host) {
+        return true;
+    }
+    let host = bare_host(host);
     if same_domain(&distribution.domain_name, host) {
         return true;
     }
@@ -495,7 +508,7 @@ pub fn claims_request<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest)
 /// the path addressings are read only for a path no modelled route claims.
 pub fn claims_request_by_host<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> bool {
     let addressed = Addressed::of_request(req);
-    let Some(host) = addressed.host.map(bare_host) else {
+    let Some(host) = addressed.host else {
         return false;
     };
     crate::state::service_state(engine).is_some_and(|state| {
@@ -818,18 +831,38 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     }
     let method = req.method().to_ascii_uppercase();
     let request_bytes = req.body().bytes().map_or(0, <[u8]>::len);
-    let response = match plan {
-        Plan::Generated { status, detail } => generated(status, detail, &cf_id),
-        Plan::Hit { status, body } => served(status, body, CACHE_HIT, &cf_id),
-        Plan::Fetch(fetch) => fetch_origin(engine, ctx, *fetch, &cf_id, req).await,
+    // The WAF web ACL the distribution's configuration puts in front of it decides the
+    // request before anything the plan would do: "CloudFront responds to requests either
+    // with the requested content or with an HTTP 403 status code (Forbidden)", so a request
+    // it does not let through is answered here — before the edge cache is read and with no
+    // origin request made — while the answer is still counted into the distribution's own
+    // series, the edge having served it. Asked with THIS service's store released, since
+    // the decision locks the WAFv2 service's own ([`super::web_acl`]).
+    let response = match served_for
+        .as_ref()
+        .and_then(|served| {
+            super::web_acl::refusal(
+                engine,
+                &served.web_acl_id,
+                req,
+                &served.viewer_path,
+                &served.query,
+            )
+        }) {
+        Some(refusal) => refused_by_web_acl(refusal, &cf_id),
+        None => match plan {
+            Plan::Generated { status, detail } => generated(status, detail, &cf_id),
+            Plan::Hit { status, body } => served(status, body, CACHE_HIT, &cf_id),
+            Plan::Fetch(fetch) => fetch_origin(engine, ctx, *fetch, &cf_id, req).await,
+        },
     };
     // What the edge DID with this request is reported as the distribution's own CloudWatch
     // series, whoever produced the answer: the counters and error rates a client watches a
     // distribution with are the viewer requests it served ([`edge_metrics`]).
-    if let Some(distribution_id) = served_for {
+    if let Some(served) = served_for {
         edge_metrics::count_viewer_request(
             engine,
-            &distribution_id,
+            &served.id,
             now,
             &edge_metrics::ServedRequest {
                 method: &method,
@@ -842,6 +875,40 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     response
 }
 
+/// The answer the edge serves for a viewer request the distribution's web ACL did not let
+/// through: the status, headers and body WAF decided, under the edge's own request id and
+/// reported as an answer CloudFront produced itself rather than one an origin did.
+fn refused_by_web_acl(refusal: super::web_acl::Refusal, cf_id: &str) -> RtResponse {
+    let mut response = served(
+        refusal.status,
+        refusal.body,
+        CACHE_ERROR,
+        cf_id,
+    );
+    if let Some(content_type) = refusal.content_type {
+        let _ = response
+            .headers_mut()
+            .try_insert("content-type", content_type);
+    }
+    for (name, value) in refusal.headers {
+        let _ = response.headers_mut().try_append(name, value);
+    }
+    response
+}
+
+/// The distribution one viewer request resolved to, and everything about it the edge still
+/// needs once the store's lock is released: the id its series is counted under, the web ACL
+/// its configuration puts in front of it, and the viewer path and query a rule inspects.
+#[derive(Debug)]
+struct ServedFor {
+    id: String,
+    /// `DistributionConfig$WebACLId` as the stored configuration carries it — the empty
+    /// string for a distribution that names none.
+    web_acl_id: String,
+    viewer_path: String,
+    query: String,
+}
+
 /// Decide what the edge does with one viewer request, under the store's lock, and name the
 /// distribution the request resolved to — the one whose series it is counted into.
 fn plan_request(
@@ -849,7 +916,7 @@ fn plan_request(
     req: &RtRequest,
     cf_id: &str,
     now: SystemTime,
-) -> (Option<String>, Plan) {
+) -> (Option<ServedFor>, Plan) {
     let addressed = Addressed::of_request(req);
     let Some(resolved) = resolve(store, &addressed) else {
         // The distribution was deleted between the claim and now: an endpoint that serves
@@ -863,9 +930,19 @@ fn plan_request(
             },
         );
     };
-    let distribution_id = resolved.distribution.id.clone();
+    let served_for = ServedFor {
+        id: resolved.distribution.id.clone(),
+        web_acl_id: resolved
+            .distribution
+            .config
+            .web_acl_id
+            .clone()
+            .unwrap_or_default(),
+        viewer_path: resolved.viewer_path.to_string(),
+        query: addressed.query.to_string(),
+    };
     let plan = plan_resolved(store, &addressed, &resolved, req, cf_id, now);
-    (Some(distribution_id), plan)
+    (Some(served_for), plan)
 }
 
 /// Decide what the edge does with one viewer request it has resolved to a distribution.

@@ -311,14 +311,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // policy being updated already holds its own names, which is why the holder's id is
         // compared.
         let dns_names = crate::state::staging_distribution_dns_names(&config).to_vec();
-        if let Some(holder_id) = store
+        if store
             .policy_using_staging_distribution(&dns_names)
             .map(|holder| holder.id.clone())
-            .filter(|holder_id| *holder_id != input.id)
+            .is_some_and(|holder_id| holder_id != input.id)
         {
             return Err(
                 UpdateContinuousDeploymentPolicyErrorModeled::StagingDistributionInUse(
-                    crate::state::staging_distribution_in_use(&holder_id),
+                    crate::state::staging_distribution_in_use(),
                 )
                 .into(),
             );

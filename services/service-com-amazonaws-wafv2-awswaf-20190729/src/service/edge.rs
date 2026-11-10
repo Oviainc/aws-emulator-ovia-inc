@@ -524,6 +524,34 @@ pub fn decide<Eng: Send + Sync + 'static>(
 ) -> Option<EdgeDecision> {
     let state: ::engine::ServiceState<ComAmazonawsWafv2Awswaf20190729State> =
         crate::state::service_state(engine)?;
+    // Which web ACL is in front of the resource, read under its own shared lock and
+    // released again: the evaluation below takes the lock itself, in the four phases its
+    // own documentation describes.
+    let web_acl_arn = {
+        let store = state.lock();
+        store.web_acl_associations.get(resource_arn)?.clone()
+    };
+    decide_against(engine, &web_acl_arn, request)
+}
+
+/// Decide one request against the web ACL `web_acl_arn` names, whichever resource put it
+/// in front of itself, and record what WAF records about its own data plane.
+///
+/// The same evaluation [`decide`] performs, for a protected resource whose association
+/// with a web ACL is held by the RESOURCE rather than by `AssociateWebACL`: a CloudFront
+/// distribution names its web ACL in its own configuration — "for Amazon CloudFront, don't
+/// use `AssociateWebACL`. Instead, use your CloudFront distribution configuration" — so the
+/// resource's own service resolves the web ACL and asks about it here.
+///
+/// `None` when this store holds no web ACL under that ARN, so the resource answers the
+/// request as it would with no WAF in front of it at all.
+pub fn decide_against<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    web_acl_arn: &str,
+    request: &InspectedRequest,
+) -> Option<EdgeDecision> {
+    let state: ::engine::ServiceState<ComAmazonawsWafv2Awswaf20190729State> =
+        crate::state::service_state(engine)?;
     // PHASE 1, under a shared read: the web ACL, the entities its rules reference, and
     // the rate counts already recorded for it.
     let (entry, catalogue, counts): (
@@ -532,8 +560,7 @@ pub fn decide<Eng: Send + Sync + 'static>(
         HashMap<RateInstanceKey, Vec<RateBucket>>,
     ) = {
         let store = state.lock();
-        let web_acl_arn = store.web_acl_associations.get(resource_arn)?.clone();
-        let entry = store.web_acl_by_arn(&web_acl_arn)?.clone();
+        let entry = store.web_acl_by_arn(web_acl_arn)?.clone();
         let catalogue = Catalogue::referenced_by(
             &store,
             &entry.scope,
