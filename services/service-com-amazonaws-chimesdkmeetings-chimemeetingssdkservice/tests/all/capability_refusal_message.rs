@@ -15,6 +15,10 @@
 //! both), and every operation that judges a request-supplied set — `CreateAttendee`,
 //! `UpdateAttendeeCapabilities`, `BatchUpdateAttendeeCapabilitiesExcept` and
 //! `CreateMeetingWithAttendees`, the last of which reports the same refusal per item.
+//!
+//! The harness, the three sentences and the documented expectation [`expected_refusal`]
+//! are shared with the sibling suite that spans the whole catalog of modelled maximum
+//! resolutions, so the expected wording lives in exactly one place.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -35,33 +39,33 @@ const SIGNED_FOR_CHIME: &str = "AWS4-HMAC-SHA256 \
 /// (`smithy_query(query="shape",shape="MediaCapabilities",
 /// model_path="services/service-com-amazonaws-chimesdkmeetings-chimemeetingssdkservice/smithy-model/com-amazonaws-chimesdkmeetings-chimemeetingssdkservice.json")`
 /// -> `SendReceive | Send | Receive | None`).
-const MEDIA_CAPABILITIES: &[&str] = &["SendReceive", "Send", "Receive", "None"];
+pub(crate) const MEDIA_CAPABILITIES: &[&str] = &["SendReceive", "Send", "Receive", "None"];
 
 /// The refusal for a video capability asking to send or receive media in a meeting whose
 /// video maximum resolution is `None`.
-const VIDEO_MAX_RESOLUTION_NONE_MESSAGE: &str = "Attendee's video capability must be None \
+pub(crate) const VIDEO_MAX_RESOLUTION_NONE_MESSAGE: &str = "Attendee's video capability must be None \
      if MeetingFeatures is configured with Video:MaxResolution:None";
 
 /// The same refusal for the content axis.
-const CONTENT_MAX_RESOLUTION_NONE_MESSAGE: &str = "Attendee's content capability must be \
+pub(crate) const CONTENT_MAX_RESOLUTION_NONE_MESSAGE: &str = "Attendee's content capability must be \
      None if MeetingFeatures is configured with Content:MaxResolution:None";
 
 /// The refusal for content reception asked for without video reception.
-const CONTENT_NEEDS_VIDEO_MESSAGE: &str = "Attendee's video capability must be set to \
+pub(crate) const CONTENT_NEEDS_VIDEO_MESSAGE: &str = "Attendee's video capability must be set to \
      either SendReceive or Receive when setting content capability to SendReceive or \
      Receive.";
 
 /// One response, reduced to what a client branches on.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_code: Option<String>,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_code: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// The refusal's `Message` member.
-    fn message(&self) -> Option<String> {
+    pub(crate) fn message(&self) -> Option<String> {
         self.body
             .get("Message")
             .and_then(Value::as_str)
@@ -70,7 +74,12 @@ impl Reply {
 }
 
 /// Send one request through the router and reduce the answer to a [`Reply`].
-async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Option<&Value>) -> Reply {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Reply {
     let payload = body.map_or_else(Vec::new, |value| {
         serde_json::to_vec(value).expect("a request body serializes")
     });
@@ -111,7 +120,7 @@ async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Optio
 
 /// The emulator under test: ONE shared engine with this service mounted on it, reached the
 /// way the production router reaches it.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -120,7 +129,11 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Create a meeting with `features` (when any) and answer its minted `MeetingId`.
-async fn new_meeting(router: &MultiServiceRouter, token: &str, features: Option<Value>) -> String {
+pub(crate) async fn new_meeting(
+    router: &MultiServiceRouter,
+    token: &str,
+    features: Option<Value>,
+) -> String {
     let mut request = json!({
         "ClientRequestToken": token,
         "MediaRegion": "us-east-1",
@@ -146,7 +159,11 @@ async fn new_meeting(router: &MultiServiceRouter, token: &str, features: Option<
 
 /// Create an attendee of `meeting_id` with the meeting's default capabilities and answer
 /// its minted `AttendeeId`.
-async fn new_attendee(router: &MultiServiceRouter, meeting_id: &str, user: &str) -> String {
+pub(crate) async fn new_attendee(
+    router: &MultiServiceRouter,
+    meeting_id: &str,
+    user: &str,
+) -> String {
     let reply = call(
         router,
         "POST",
@@ -169,7 +186,7 @@ async fn new_attendee(router: &MultiServiceRouter, meeting_id: &str, user: &str)
 }
 
 /// A capability set as the wire carries it.
-fn capability_set(audio: &str, video: &str, content: &str) -> Value {
+pub(crate) fn capability_set(audio: &str, video: &str, content: &str) -> Value {
     json!({ "Audio": audio, "Video": video, "Content": content })
 }
 
@@ -190,7 +207,7 @@ fn receives(capability: &str) -> bool {
 /// lists, restated here from that documentation so the table's expectation is independent
 /// of the handler. No documented rule constrains `Audio`, so it is not a parameter: every
 /// one of its four values is admissible in every meeting.
-fn expected_refusal(
+pub(crate) fn expected_refusal(
     video: &str,
     content: &str,
     video_resolution: &str,
@@ -209,7 +226,7 @@ fn expected_refusal(
 }
 
 /// Ask `UpdateAttendeeCapabilities` to apply `capabilities` to one stored attendee.
-async fn update_capabilities(
+pub(crate) async fn update_capabilities(
     router: &MultiServiceRouter,
     meeting_id: &str,
     attendee_id: &str,
@@ -225,7 +242,7 @@ async fn update_capabilities(
 }
 
 /// Ask `CreateAttendee` to mint an attendee holding `capabilities`.
-async fn create_attendee_with(
+pub(crate) async fn create_attendee_with(
     router: &MultiServiceRouter,
     meeting_id: &str,
     user: &str,
@@ -260,7 +277,11 @@ async fn batch_update_except(
 }
 
 /// Read one attendee back.
-async fn get_attendee(router: &MultiServiceRouter, meeting_id: &str, attendee_id: &str) -> Reply {
+pub(crate) async fn get_attendee(
+    router: &MultiServiceRouter,
+    meeting_id: &str,
+    attendee_id: &str,
+) -> Reply {
     call(
         router,
         "GET",
