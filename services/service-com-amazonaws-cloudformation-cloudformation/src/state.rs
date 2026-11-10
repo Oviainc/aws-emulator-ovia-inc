@@ -1664,6 +1664,11 @@ pub struct StoredValidationFailure {
     /// `OperationEvent$ValidationStatusReason`: "additional information about the validation
     /// status" — what about the resource failed the validation.
     pub reason: String,
+    /// `OperationEvent$ValidationPath`: "the path within the resource where the validation
+    /// was applied" — the element of the submitted template the validation ran on, named by
+    /// the validation that ran ([`early_validation::resource_path`],
+    /// [`property_validation::properties_path`]).
+    pub path: String,
 }
 
 /// One stack event, appended (never overwritten) by the operation that caused it.

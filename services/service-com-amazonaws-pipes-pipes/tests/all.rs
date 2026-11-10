@@ -59,6 +59,8 @@ mod pipe_target_parameter_refusal;
 mod pipe_unassumable_role;
 #[path = "all/pipe_update.rs"]
 mod pipe_update;
+#[path = "all/service_set_tag_keys.rs"]
+mod service_set_tag_keys;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_key_rules.rs"]

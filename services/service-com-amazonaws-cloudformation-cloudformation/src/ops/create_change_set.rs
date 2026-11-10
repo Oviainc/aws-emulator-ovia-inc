@@ -1232,6 +1232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             &conflicting.resource_type,
                             &conflicting.physical_resource_id,
                         ),
+                        path: early_validation::resource_path(&conflicting.logical_id),
                     },
                     Some(operation_id.clone()),
                     input.client_token.clone(),

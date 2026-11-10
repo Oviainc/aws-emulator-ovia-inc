@@ -220,30 +220,17 @@ fn operation_event_view(stored: &StoredEvent, operation: Option<&StoredOperation
             .as_ref()
             .map(|validation| validation.reason.clone()),
         // "The path within the resource where the validation was applied": the element of
-        // the TEMPLATE the validation ran on, named as a path into that document. Every
-        // validation reported here is about one resource of the submitted template
-        // (`crate::state::early_validation`), and a template's resources live under
-        // `Resources` keyed by their logical id — so the path is that element's
-        // ([`validation_path`]), and an event that is no validation result names none.
+        // the TEMPLATE the validation ran on, named as a path into that document, which is
+        // the validation's own to say — the existence check names the resource it is about
+        // and the property validation the property document it judged, each recorded with
+        // the failure ([`crate::state::StoredValidationFailure::path`]). An event that is no
+        // validation result names none.
         validation_path: stored
             .validation
             .as_ref()
-            .map(|_| validation_path(&stored.logical_resource_id)),
+            .map(|validation| validation.path.clone()),
     }
 }
-
-/// The template path of the element a validation was applied to: the `Resources` entry the
-/// logical id names, which is where a resource is declared in every template document
-/// ("Resources: `"Logical ID": { "Type": … }`").
-///
-/// Stated as a path into the template rather than taken from the request, so an event about
-/// any resource of any submitted template names the element that resource was declared at.
-fn validation_path(logical_resource_id: &str) -> String {
-    format!("/{RESOURCES_SECTION}/{logical_resource_id}")
-}
-
-/// The template section a resource is declared in, which the path above steps through.
-const RESOURCES_SECTION: &str = "Resources";
 
 /// The instant the operation an event belongs to STARTED, which is what groups a stack's
 /// log by operation: an event of an operation the stack no longer holds a record for is

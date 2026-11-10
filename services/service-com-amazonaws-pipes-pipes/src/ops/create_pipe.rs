@@ -245,13 +245,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refuse, and it is refused with the same `BadRequestException` the tagging layer
         // answers a broken tag rule with. Sorted, so a request carrying several illegal
         // tags is always refused with the same message.
+        //
+        // The reserved `aws:` namespace is the one rule that depends on WHO named the key
+        // ([`crate::state::tag_key_origin`]): it is refused to an API caller, whose request
+        // may not write AWS's own tags, and admitted on the in-process create another
+        // emulated service makes for a resource it provisions — the path the
+        // `aws:cloudformation:*` tags a stack's resources carry arrive on, which is inside
+        // AWS rather than a client's request.
+        let origin = crate::state::tag_key_origin(ctx);
         let requested: ::std::collections::BTreeMap<&String, &String> = input
             .tags
             .iter()
             .flat_map(|tags| tags.iter())
             .collect();
         for (&key, &value) in &requested {
-            if let Some(violation) = crate::state::tag_violation(key, value) {
+            if let Some(violation) = crate::state::tag_violation_from(key, value, origin) {
                 // What request validation echoes is the member's value: every tag the
                 // request carried, in that one deterministic order.
                 let shown = crate::state::echoed_tags(

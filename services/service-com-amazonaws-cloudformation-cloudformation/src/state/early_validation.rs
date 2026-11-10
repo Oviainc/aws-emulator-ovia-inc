@@ -64,6 +64,23 @@ pub const NAME_CONFLICT_VALIDATION: &str = "NAME_CONFLICT_VALIDATION";
 /// `ValidationStatus` enum (`[FAILED, SKIPPED]`).
 pub const VALIDATION_FAILED: &str = "FAILED";
 
+/// The path a validation about ONE RESOURCE of a submitted template is applied at: the
+/// `Resources` entry its logical id names, which is where a resource is declared in every
+/// template document ("Resources: `"Logical ID": { "Type": … }`").
+///
+/// `OperationEvent$ValidationPath` is "the path within the resource where the validation was
+/// applied", so it is stated as a path into the TEMPLATE rather than taken from the request:
+/// an event about any resource of any submitted template names the element that resource was
+/// declared at. The existence check is about the resource as a whole and stops here; the
+/// property validation beside it is about the resource's own property document and steps one
+/// further ([`super::property_validation::properties_path`]).
+pub fn resource_path(logical_resource_id: &str) -> String {
+    format!("/{RESOURCES_SECTION}/{logical_resource_id}")
+}
+
+/// The template section a resource is declared in, which the path above steps through.
+const RESOURCES_SECTION: &str = "Resources";
+
 /// What that event reports about the resource: which identifier of which type is already
 /// there — CloudFormation's own sentence for a resource that cannot be created because it
 /// exists, whose variable parts are the declared type and the identifier the declaration

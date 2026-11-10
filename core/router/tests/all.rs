@@ -1246,5 +1246,10 @@ mod elbv2_host_counts_and_interfaces;
 // Declared in the appended tail, which is where every new suite inserts its lines: the whole
 // deploy -> fire -> deliver -> stack-delete round trip of a stack-deployed
 // `AWS::Scheduler::Schedule`.
+// Declared in the appended tail, which is where every new suite inserts its lines: the
+// deploy -> read-back -> delete round trip of a stack-declared `AWS::Pipes::Pipe`, and the
+// refusal of one whose declaration omits a property its type's schema requires.
+#[path = "all/cloudformation_provisions_eventbridge_pipes.rs"]
+mod cloudformation_provisions_eventbridge_pipes;
 #[path = "all/cloudformation_deployed_schedule_invokes_its_target.rs"]
 mod cloudformation_deployed_schedule_invokes_its_target;

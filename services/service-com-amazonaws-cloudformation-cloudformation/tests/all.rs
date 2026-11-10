@@ -289,6 +289,8 @@ mod refused_stack_deletion;
 mod regional_stack_namespace;
 #[path = "all/requested_rollback.rs"]
 mod requested_rollback;
+#[path = "all/required_resource_properties.rs"]
+mod required_resource_properties;
 #[path = "all/reserved_stack_tag_keys.rs"]
 mod reserved_stack_tag_keys;
 #[path = "all/resource_deletion_policies.rs"]

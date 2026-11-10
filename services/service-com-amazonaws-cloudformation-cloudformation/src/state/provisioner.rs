@@ -493,7 +493,7 @@ use super::template::{
     KINESIS_STREAM,
     KMS_ALIAS, KMS_KEY,
     MQ_BROKER, MSK_CLUSTER,
-    MSK_SERVERLESS_CLUSTER, OPENSEARCH_DOMAIN, REDSHIFT_CLUSTER,
+    MSK_SERVERLESS_CLUSTER, OPENSEARCH_DOMAIN, PIPES_PIPE, REDSHIFT_CLUSTER,
     REDSHIFT_CLUSTER_SUBNET_GROUP, ROUTE53RESOLVER_ENDPOINT,
     ROUTE53RESOLVER_FIREWALL_DOMAIN_LIST, ROUTE53RESOLVER_FIREWALL_RULE_GROUP,
     ROUTE53RESOLVER_FIREWALL_RULE_GROUP_ASSOCIATION,
@@ -753,6 +753,12 @@ pub(super) enum Provisioner {
     /// `AWS::RDS::DBSubnetGroup` is in ([`Provisioner::RdsDbSubnetGroup`]).
     RedshiftClusterSubnetGroup,
     EventsRule,
+    /// `AWS::Pipes::Pipe`: a pipe of Amazon EventBridge Pipes, which `CreatePipe` creates
+    /// under the name the template states, `UpdatePipe` changes and `DeletePipe` deletes.
+    /// That create answers the pipe `CREATING`, in which it moves no record, so the
+    /// resource's creation is held open until that service reports it resting in the state
+    /// its `DesiredState` asked for.
+    PipesPipe,
     SsmParameter,
     StepFunctionsActivity,
     SchedulerScheduleGroup,
@@ -937,6 +943,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         REDSHIFT_CLUSTER => Some(Provisioner::RedshiftCluster),
         REDSHIFT_CLUSTER_SUBNET_GROUP => Some(Provisioner::RedshiftClusterSubnetGroup),
         EVENTS_RULE => Some(Provisioner::EventsRule),
+        PIPES_PIPE => Some(Provisioner::PipesPipe),
         SSM_PARAMETER => Some(Provisioner::SsmParameter),
         STEP_FUNCTIONS_ACTIVITY => Some(Provisioner::StepFunctionsActivity),
         SCHEDULER_SCHEDULE_GROUP => Some(Provisioner::SchedulerScheduleGroup),
@@ -1222,6 +1229,10 @@ impl Provisioner {
             // `Name`, `RoleArn`, `ScheduleExpression`, `State` and `Targets` and no
             // `Tags`: the type is not taggable, so no tags are propagated to it.
             Self::EventsRule => put_rule(ctx, region, resource).await,
+            // `AWS::Pipes::Pipe` publishes `Tags` as a MAP, which is the shape
+            // `CreatePipe`'s own `Tags` member takes, so a pipe a stack creates carries the
+            // tags CloudFormation gives it beside the ones the declaration asks for.
+            Self::PipesPipe => event_pipes::create_pipe(ctx, region, resource, propagated).await,
             Self::SsmParameter => put_parameter(ctx, region, resource, propagated).await,
             Self::StepFunctionsActivity => {
                 create_activity(ctx, region, resource, propagated).await
@@ -1491,9 +1502,10 @@ impl Provisioner {
     ///
     /// A type whose owning service ADMITS the three on that in-process path — Amazon S3
     /// Vectors, whose crate refuses a reserved key to an API caller and takes one from a
-    /// provisioning call — is NOT in the set below: the three travel with the create, and
-    /// that service's own `ListTagsForResource` on the handle the stack publishes answers
-    /// with them. A type stays in the set only until its own crate reads that path too.
+    /// provisioning call, and Amazon EventBridge Pipes, whose crate reads the same signal —
+    /// is NOT in the set below: the three travel with the create, and that service's own
+    /// read of the resource's tags on the handle the stack publishes answers with them. A
+    /// type stays in the set only until its own crate reads that path too.
     fn applicable_tags(self, propagated: &[(String, String)]) -> Vec<(String, String)> {
         let refuses_reserved_keys = matches!(
             self,
@@ -1679,6 +1691,11 @@ impl Provisioner {
             Self::BedrockKnowledgeBase => {
                 knowledge_base_readiness(ctx, region, physical_resource_id).await
             }
+            // `CreatePipe` answers the pipe `CREATING` and `UpdatePipe` answers it
+            // `UPDATING` — "the state the pipe is in" — and in neither does the pipe carry
+            // the configuration the declaration asked for, so the resource is held open
+            // until EventBridge Pipes reports it resting ([`event_pipes::readiness`]).
+            Self::PipesPipe => event_pipes::readiness(ctx, region, physical_resource_id).await,
             _ => Ok(Readiness::Ready),
         }
     }
@@ -1727,6 +1744,13 @@ impl Provisioner {
             // are read off the knowledge base again when it reports it `ACTIVE`.
             Self::BedrockKnowledgeBase => {
                 knowledge_base_ready_attributes(ctx, region, physical_resource_id).await
+            }
+            // A pipe's `CurrentState`, its `StateReason` and the instant it was last
+            // modified are not the ones its create answered with once that service has
+            // brought it up, so the type's attributes are read off the pipe again when it
+            // reports it resting.
+            Self::PipesPipe => {
+                event_pipes::ready_attributes(ctx, region, physical_resource_id).await
             }
             _ => Ok(BTreeMap::new()),
         }
@@ -1951,6 +1975,11 @@ impl Provisioner {
             // created it is the document that applies a changed declaration to it
             // ([`update_schedule`]).
             Self::SchedulerSchedule => update_schedule(ctx, region, resource, declared).await,
+            // `UpdatePipe` takes a pipe's name together with the configuration it is to
+            // carry, so a changed declaration is applied to the pipe the stack created
+            // rather than replacing it — less the `Source` that call takes no member for,
+            // which a pipe cannot be repointed at ([`event_pipes::update_pipe`]).
+            Self::PipesPipe => event_pipes::update_pipe(ctx, region, resource, declared).await,
             // A schedule group publishes its `Name`, which IS the group's identity, and its
             // `Tags`, which are no part of any call that changes a group that exists and
             // reach EventBridge Scheduler through its own tagging calls ([`Self::retag`]) —
@@ -2304,6 +2333,10 @@ impl Provisioner {
             // A schedule is addressed by its name AND the group that holds it, which only
             // the resource's own record carries, so the delete takes the record.
             Self::SchedulerSchedule => delete_schedule(ctx, region, resource).await,
+            // A pipe is addressed by its name alone, which is this resource's physical id.
+            Self::PipesPipe => {
+                event_pipes::delete_pipe(ctx, region, physical_resource_id).await
+            }
             // The delete addresses the group by the PAIR that identifies it, and the pool
             // half of that pair is on the resource's own declaration.
             Self::CognitoUserPoolGroup => delete_group(ctx, region, resource).await,
@@ -2685,6 +2718,9 @@ impl Provisioner {
             // The read is addressed by the schedule's name AND its group, which only the
             // resource's own record carries.
             Self::SchedulerSchedule => describe_schedule(ctx, region, resource).await,
+            Self::PipesPipe => {
+                event_pipes::describe_pipe(ctx, region, physical_resource_id).await
+            }
             // The read is addressed by the group's name AND the pool that holds it, which
             // only the resource's own record carries.
             Self::CognitoUserPoolGroup => describe_group(ctx, region, resource).await,
@@ -2913,6 +2949,7 @@ impl Provisioner {
 // of an arm uses.
 mod tests;
 mod config_recording;
+mod event_pipes;
 mod bedrock_guardrails;
 mod bedrock_knowledge_bases;
 mod data_and_storage;

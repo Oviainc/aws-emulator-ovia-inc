@@ -1213,17 +1213,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Region publishes has no value to import, so CloudFormation refuses the
             // deployment before anything is asked of the services that own the resources —
             // the update then fails naming the export and is rolled back below.
+            let unresolved_cross_stack = stack.unresolved_cross_stack_failure();
             // "Set to true to disable pre-deployment validations in [...] stack
-            // operations", default false: with them ON, a declaration whose property value
-            // its type's contract does not admit fails the update before anything is
-            // provisioned — nothing is asked of the service that owns the resource, so no
-            // resource of this stack is changed and none reports an event of its own —
-            // while an update that disables them deploys the declaration as written and
+            // operations", default false: with them ON, a declaration whose properties its
+            // type's contract does not admit — a required property it does not carry, a
+            // value outside the set the property publishes — fails the update before
+            // anything is provisioned: nothing is asked of the service that owns the
+            // resource, so no resource of this stack is changed and none reports an event of
+            // its own. An update that disables them deploys the declaration as written and
             // the same problem surfaces as that resource's own failure
             // ([`crate::state::property_validation`]). The failure is reported as the
             // validation result it is, on an event about the resource NOTHING was done to,
             // which is the detail `DescribeEvents` carries.
-            let property_failure = (input.disable_validation != Some(true))
+            //
+            // Not asked at all of a deployment CloudFormation has already refused for a
+            // reference it could not resolve, for the reason `create_stack` records: that
+            // refusal is the one diagnostic for every property whose value it took away.
+            let property_failure = (input.disable_validation != Some(true)
+                && unresolved_cross_stack.is_none())
                 .then(|| crate::state::property_validation::failure(&stack.current_resources()))
                 .flatten();
             if let Some(failure) = &property_failure {
@@ -1235,18 +1242,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         name: crate::state::property_validation::PROPERTY_VALIDATION.to_string(),
                         status: crate::state::early_validation::VALIDATION_FAILED.to_string(),
                         reason: failure.reason.clone(),
+                        path: failure.path.clone(),
                     },
                     Some(operation_id.clone()),
                     stack.client_request_token.clone(),
                 );
             }
             let refused_deployment = withdraws_an_export_in_use
+                .or(unresolved_cross_stack)
                 .or_else(|| {
                     property_failure
                         .as_ref()
                         .map(|failure| failure.reason.clone())
-                })
-                .or_else(|| stack.unresolved_cross_stack_failure());
+                });
             (
                 stack.stack_id.clone(),
                 stack.region.clone(),

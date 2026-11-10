@@ -2823,6 +2823,14 @@ pub const ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION: &str =
 /// is the one `events DescribeRule` answers with.
 pub const EVENTS_RULE: &str = "AWS::Events::Rule";
 
+/// An Amazon EventBridge Pipes pipe's resource type (the Pipes model:
+/// `cloudFormationName: Pipes`, `arnNamespace: pipes`). This is a type
+/// `super::provisioning` creates in EventBridge Pipes itself, and "Ref returns the pipe
+/// name" — which is the physical id the naming rules already compute for the type — so the
+/// pipe a stack's output names is the one `pipes DescribePipe` answers with, and the `Arn`
+/// and `CurrentState` the type publishes are the ones that service reports for it.
+pub const PIPES_PIPE: &str = "AWS::Pipes::Pipe";
+
 /// The event bus a rule declaring none is bound to — "if you omit this, the default event
 /// bus is used" (`PutRule$EventBusName`) — and the one bus whose name a rule ARN does not
 /// carry a segment for.

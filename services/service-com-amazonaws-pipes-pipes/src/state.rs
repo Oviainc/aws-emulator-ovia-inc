@@ -192,13 +192,65 @@ pub enum TagViolation {
 ///
 /// `@length` counts CHARACTERS, not bytes (the framework's own constraint checker counts
 /// `chars()`), so a unicode key or value is measured the same way AWS measures it.
+///
+/// The key is judged as a CALLER's: every public write that takes tags is a caller's
+/// request. The one write that is not is the in-process create another emulated service
+/// makes for a resource it provisions ([`tag_violation_from`]).
 pub fn tag_violation(key: &str, value: &str) -> Option<TagViolation> {
+    tag_violation_from(key, value, TagKeyOrigin::Caller)
+}
+
+/// Who is naming the tag keys one request carries, which is what decides whether a key in
+/// the reserved `aws:` namespace may be written ([`tag_violation_from`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagKeyOrigin {
+    /// A request a CLIENT made. A key in the reserved namespace is AWS's own, so such a
+    /// request may not write one.
+    Caller,
+    /// A request another emulated service made in-process on behalf of a resource it
+    /// provisions — the path the tags AWS sets from inside itself arrive on, which no
+    /// client's request can be. A key in the reserved namespace travels on it.
+    Service,
+}
+
+/// Where the tag keys this request names came from.
+///
+/// A tag in the reserved namespace is AWS's to set: the refusal
+/// ([`RESERVED_TAG_KEY_PREFIX_MESSAGE`]) is the answer to an API CALLER, while the services
+/// that own such a tag set it from inside AWS, through no public API — the
+/// `aws:cloudformation:*` tags a stack's resources carry are exactly that. In this emulator
+/// one service reaches another ONLY through the in-process callback
+/// ([`::smithy_server_runtime::OperationContext::callback`]), so that callback is the inside
+/// path, and the signal is the [`::smithy_server_runtime::CallbackRecursionDepth`] request
+/// EXTENSION the framework's callback transport stamps on every in-process call. An
+/// extension never travels over the wire: nothing a client can send — on any socket, signed
+/// with any credential — sets it, so a client's reserved key is refused exactly as before.
+pub fn tag_key_origin(ctx: &::smithy_server_runtime::OperationContext<'_>) -> TagKeyOrigin {
+    match ctx
+        .parts()
+        .extensions
+        .get::<::smithy_server_runtime::CallbackRecursionDepth>()
+    {
+        Some(_) => TagKeyOrigin::Service,
+        None => TagKeyOrigin::Caller,
+    }
+}
+
+/// [`tag_violation`] for a write whose tag keys may be AWS's own: the reserved-namespace
+/// rule is the one rule that depends on WHO named the key ([`TagKeyOrigin`]), and every
+/// other rule is the tag's own and holds whoever wrote it.
+pub fn tag_violation_from(
+    key: &str,
+    value: &str,
+    origin: TagKeyOrigin,
+) -> Option<TagViolation> {
     if !TAG_KEY_LENGTH.contains(&key.chars().count()) {
         return Some(TagViolation::KeyLength);
     }
-    if key
-        .get(..RESERVED_TAG_KEY_PREFIX.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+    if origin == TagKeyOrigin::Caller
+        && key
+            .get(..RESERVED_TAG_KEY_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
     {
         return Some(TagViolation::ReservedKeyPrefix);
     }

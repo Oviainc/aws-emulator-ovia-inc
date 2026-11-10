@@ -23,10 +23,19 @@
 //! type and no value set at all ([`super::resource_schema`] says so in full), and the service
 //! that owns a type is reachable only by CREATING the resource — there is no read that asks
 //! it whether a declaration would be accepted. So this stage is NOT that schema check and
-//! does not stand in for it: it decides the one question a published value set makes
-//! decidable without asking anybody — a property whose contract publishes the values it
-//! admits, carrying a value that is not one of them — over the rows this emulator holds
-//! ([`CONSTRAINED_PROPERTIES`]).
+//! does not stand in for it: it decides the two questions a type's published contract makes
+//! decidable without asking anybody —
+//!
+//! * a property the contract marks REQUIRED that the declaration does not carry at all, over
+//!   the rows this emulator holds ([`REQUIRED_PROPERTIES`]), which is the
+//!   `Required property [<member>] not found` the stage reports
+//!   ([`missing_property_reason`]);
+//! * a property whose contract publishes the values it admits, carrying a value that is not
+//!   one of them, over the rows this emulator holds ([`CONSTRAINED_PROPERTIES`]).
+//!
+//! A resource is judged in that order, because a property that is not there has no value to
+//! hold to a set, and the resources in the order the deployment would have created them — so
+//! the failure reported is the one the operation would have run into first.
 //!
 //! That makes the stage deliberately PARTIAL, and fail-open: a property no row covers, a type
 //! with no row at all, and a value an expression produced that is not text are each left to
@@ -35,6 +44,12 @@
 //! a declaration it passes is still provisioned and still judged there. It becomes the real
 //! schema check when this registry holds real schemas, or when an owning service serves a
 //! would-this-be-accepted read; until then the rows are what it knows.
+//!
+//! The document a resource is judged against is the DEPLOYED one — the property document the
+//! owning service would be asked to create the resource with — so a property whose value this
+//! service could not evaluate at all counts as absent, because the create would carry it
+//! absent too ([`super::template::resolve_properties`] drops such a property rather than
+//! guessing a value for it).
 //!
 //! ## Where the value sets come from
 //!
@@ -49,6 +64,15 @@
 //! becomes, which is the authority on whether a create carrying it can succeed: a value
 //! outside it is one the owning service would refuse, so the validation refuses it first —
 //! and a value inside it is never refused here.
+//!
+//! ## Where the required properties come from
+//!
+//! [`REQUIRED_PROPERTIES`] is the same kind of catalogue for the other question: one row per
+//! resource type, carrying the properties that reference publishes with "Required: Yes" for
+//! it. Those are the members the type's owning API declares `@required` on the call that
+//! creates the resource, LESS the name, which is required of the API and not of the template
+//! — CloudFormation generates a name for a declaration that states none
+//! ([`super::template::physical_name`]), so a template may always leave it out.
 
 use ::serde_json::Value;
 
@@ -140,8 +164,93 @@ pub const CONSTRAINED_PROPERTIES: &[ConstrainedProperty] = &[
     },
 ];
 
+/// One resource type's REQUIRED properties: the ones a declaration of that type cannot be
+/// deployed without.
+#[derive(Debug, Clone, Copy)]
+pub struct RequiredProperties {
+    /// The resource type the row is about, as a template declares it.
+    pub resource_type: &'static str,
+    /// The properties its contract marks required, in the order the contract publishes them.
+    pub required: &'static [&'static str],
+}
+
+/// The types this stage knows the REQUIRED properties of.
+///
+/// Source for each row: the resource type's entry in the "AWS resource and property types
+/// reference" of the CloudFormation User Guide — every property it publishes with
+/// "Required: Yes", in the order that reference lists a type's properties (alphabetically)
+/// — which are the `@required` members of the call the owning API creates such a resource
+/// with, less the name CloudFormation itself may generate (see the module docs). That order
+/// is observable only in which property a declaration missing SEVERAL of them is reported
+/// for, and reading it off the reference is what keeps that choice the contract's rather
+/// than this catalogue's.
+pub const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
+    // `AWS::Pipes::Pipe`: `CreatePipe` declares `Source`, `Target` and `RoleArn` required
+    // beside the `Name` CloudFormation generates, so a pipe cannot be created without the
+    // source it reads, the target it delivers to and the role it acts as.
+    RequiredProperties {
+        resource_type: "AWS::Pipes::Pipe",
+        required: &["RoleArn", "Source", "Target"],
+    },
+    // `AWS::SSM::Parameter`: `PutParameter` declares `Name`, `Value` and (for a new
+    // parameter) `Type` required; the name is CloudFormation's to generate, the other two
+    // are the template's.
+    RequiredProperties {
+        resource_type: "AWS::SSM::Parameter",
+        required: &["Type", "Value"],
+    },
+    // `AWS::SNS::Subscription`: `Subscribe` declares `TopicArn` and `Protocol` required —
+    // there is no subscription without the topic it is on and the protocol it is delivered
+    // over.
+    RequiredProperties {
+        resource_type: "AWS::SNS::Subscription",
+        required: &["Protocol", "TopicArn"],
+    },
+    // `AWS::SQS::QueuePolicy` and `AWS::SNS::TopicPolicy`: each resource IS the policy the
+    // declaration states, on the queues or topics it names, so both parts are required.
+    RequiredProperties {
+        resource_type: "AWS::SQS::QueuePolicy",
+        required: &["PolicyDocument", "Queues"],
+    },
+    RequiredProperties {
+        resource_type: "AWS::SNS::TopicPolicy",
+        required: &["PolicyDocument", "Topics"],
+    },
+    // `AWS::S3::BucketPolicy`: the same case for the bucket whose policy it is
+    // (`PutBucketPolicy` takes the bucket and the document).
+    RequiredProperties {
+        resource_type: "AWS::S3::BucketPolicy",
+        required: &["Bucket", "PolicyDocument"],
+    },
+    // `AWS::Scheduler::Schedule`: `CreateSchedule` declares `FlexibleTimeWindow`,
+    // `ScheduleExpression` and `Target` required beside the name CloudFormation generates.
+    RequiredProperties {
+        resource_type: "AWS::Scheduler::Schedule",
+        required: &["FlexibleTimeWindow", "ScheduleExpression", "Target"],
+    },
+    // `AWS::EC2::SecurityGroup`: `CreateSecurityGroup` declares `GroupDescription`
+    // required ("you must provide a description"), the group's own name being
+    // CloudFormation's to generate.
+    RequiredProperties {
+        resource_type: "AWS::EC2::SecurityGroup",
+        required: &["GroupDescription"],
+    },
+    // `AWS::EC2::Subnet`: a subnet exists IN a VPC, which `CreateSubnet` declares
+    // required.
+    RequiredProperties {
+        resource_type: "AWS::EC2::Subnet",
+        required: &["VpcId"],
+    },
+    // `AWS::Logs::LogStream`: a stream exists IN a log group, which `CreateLogStream`
+    // declares required beside the stream name CloudFormation generates.
+    RequiredProperties {
+        resource_type: "AWS::Logs::LogStream",
+        required: &["LogGroupName"],
+    },
+];
+
 /// The name this service reports for the pre-deployment validation that holds a
-/// declaration's property values to what its type's contract admits.
+/// declaration's properties to what its type's contract requires and admits.
 ///
 /// `OperationEvent$ValidationName` is "the name of the validation that was performed", and a
 /// validation of this service is named for WHAT it validated, in the form the other one this
@@ -156,42 +265,105 @@ pub struct PropertyFailure {
     pub logical_id: String,
     /// That resource's declared type.
     pub resource_type: String,
-    /// Why it failed: which property, and what its type admits ([`failure_reason`]).
+    /// Why it failed: which property is missing ([`missing_property_reason`]), or which
+    /// property carries a value its type does not admit ([`failure_reason`]).
     pub reason: String,
+    /// `OperationEvent$ValidationPath`: "the path within the resource where the validation
+    /// was applied" — the element of the submitted template this validation ran on
+    /// ([`properties_path`]).
+    pub path: String,
 }
 
-/// `Some(failure)` for the first resource of `declared` carrying a property value its type's
-/// contract does not admit — the failure the operation reports instead of deploying
-/// anything; `None` when every value this stage can judge is admitted.
+/// The path a property validation is applied at: the `Properties` of the resource the
+/// template declares under `logical_id`.
+///
+/// A resource's properties are what this stage judges, and a template's resources live
+/// under `Resources` keyed by their logical id with their property document under
+/// `Properties` — so the element judged is that one, named as a path into the submitted
+/// template rather than taken from the request.
+pub fn properties_path(logical_id: &str) -> String {
+    format!(
+        "{}/{PROPERTIES_SECTION}",
+        super::early_validation::resource_path(logical_id)
+    )
+}
+
+/// The member of a template's resource declaration that carries its property document,
+/// which the path above steps through.
+const PROPERTIES_SECTION: &str = "Properties";
+
+/// `Some(failure)` for the first resource of `declared` whose property document its type's
+/// contract refuses — the failure the operation reports instead of deploying anything;
+/// `None` when every resource passes what this stage can judge.
 ///
 /// The resources are walked in the order the deployment would have created them, so the
-/// failure reported is the one the operation would have run into first. A value that is not
-/// text (an expression this service left unevaluated) is no value of a published set either
-/// way and is left to the owning service.
+/// failure reported is the one the operation would have run into first, and each resource is
+/// judged for a MISSING required property before the values it does carry: a property that
+/// is not there has no value to hold to a published set.
 pub fn failure(declared: &[StoredResource]) -> Option<PropertyFailure> {
     declared.iter().find_map(|resource| {
-        CONSTRAINED_PROPERTIES
-            .iter()
-            .filter(|constrained| constrained.resource_type == resource.resource_type)
-            .find_map(|constrained| {
-                let value = resource
-                    .properties
-                    .get(constrained.property)
-                    .and_then(Value::as_str)?;
-                if constrained.admitted.contains(&value) {
-                    return None;
-                }
-                Some(PropertyFailure {
-                    logical_id: resource.logical_id.clone(),
-                    resource_type: resource.resource_type.clone(),
-                    reason: failure_reason(
-                        &resource.logical_id,
-                        constrained.property,
-                        constrained.admitted,
-                    ),
-                })
-            })
+        missing_required_property(resource).or_else(|| inadmissible_value(resource))
     })
+}
+
+/// `Some(failure)` for a resource whose declaration does not carry a property its type's
+/// contract requires ([`REQUIRED_PROPERTIES`]) — the first such property in the order the
+/// contract publishes them; `None` for a type with no row, and for one carrying every
+/// property its row names.
+fn missing_required_property(resource: &StoredResource) -> Option<PropertyFailure> {
+    REQUIRED_PROPERTIES
+        .iter()
+        .filter(|row| row.resource_type == resource.resource_type)
+        .find_map(|row| {
+            let missing = row
+                .required
+                .iter()
+                .find(|property| resource.properties.get(*property).is_none())?;
+            Some(PropertyFailure {
+                logical_id: resource.logical_id.clone(),
+                resource_type: resource.resource_type.clone(),
+                reason: missing_property_reason(missing),
+                path: properties_path(&resource.logical_id),
+            })
+        })
+}
+
+/// `Some(failure)` for a resource carrying a property value its type's contract does not
+/// admit ([`CONSTRAINED_PROPERTIES`]); `None` when every value this stage can judge is
+/// admitted.
+///
+/// A value that is not text (an expression this service left unevaluated) is no value of a
+/// published set either way and is left to the owning service.
+fn inadmissible_value(resource: &StoredResource) -> Option<PropertyFailure> {
+    CONSTRAINED_PROPERTIES
+        .iter()
+        .filter(|constrained| constrained.resource_type == resource.resource_type)
+        .find_map(|constrained| {
+            let value = resource
+                .properties
+                .get(constrained.property)
+                .and_then(Value::as_str)?;
+            if constrained.admitted.contains(&value) {
+                return None;
+            }
+            Some(PropertyFailure {
+                logical_id: resource.logical_id.clone(),
+                resource_type: resource.resource_type.clone(),
+                reason: failure_reason(
+                    &resource.logical_id,
+                    constrained.property,
+                    constrained.admitted,
+                ),
+                path: properties_path(&resource.logical_id),
+            })
+        })
+}
+
+/// How CloudFormation reports a property its type's schema requires that the declaration
+/// does not carry: fixed text around the MEMBER that is missing, which is the one variable
+/// part and comes from the request's own template.
+pub fn missing_property_reason(property: &str) -> String {
+    format!("Required property [{property}] not found")
 }
 
 /// How this stage reports a property whose value its type does not admit: the property it is
@@ -260,7 +432,7 @@ mod tests {
                 "a tier outside the published set",
                 "AWS::SSM::Parameter",
                 "Tier",
-                ::serde_json::json!({"Type": "String", "Tier": "Platinum"}),
+                ::serde_json::json!({"Type": "String", "Value": "x", "Tier": "Platinum"}),
                 false,
             ),
             (
@@ -302,7 +474,7 @@ mod tests {
                 "a property the declaration states as an unevaluated expression",
                 "AWS::SSM::Parameter",
                 "Type",
-                ::serde_json::json!({"Type": {"Ref": "Kind"}}),
+                ::serde_json::json!({"Type": {"Ref": "Kind"}, "Value": "x"}),
                 true,
             ),
             (
@@ -333,6 +505,98 @@ mod tests {
         }
     }
 
+    /// RULE: a declaration that does not carry a property its type's contract requires fails
+    /// the validation, naming that property; one that carries every required property does
+    /// not. The rows span the catalogue — types the issue did not cite among them — and the
+    /// forms a declaration can be missing a property in (no `Properties` at all, some of
+    /// them, a property whose value is an expression).
+    #[test]
+    fn a_declaration_missing_a_required_property_fails_the_validation() {
+        // (case, type, properties, the property the stage must name — `None` for a
+        // declaration that carries every required one).
+        let rows: &[(&str, &str, Value, Option<&str>)] = &[
+            (
+                "a pipe with no target",
+                "AWS::Pipes::Pipe",
+                ::serde_json::json!({
+                    "Source": "arn:aws:sqs:us-east-1:000000000000:in",
+                    "RoleArn": "arn:aws:iam::000000000000:role/pipe",
+                }),
+                Some("Target"),
+            ),
+            (
+                "a pipe with every required property, the target an expression",
+                "AWS::Pipes::Pipe",
+                ::serde_json::json!({
+                    "Source": "arn:aws:sqs:us-east-1:000000000000:in",
+                    "Target": {"Fn::GetAtt": ["Out", "Arn"]},
+                    "RoleArn": "arn:aws:iam::000000000000:role/pipe",
+                }),
+                None,
+            ),
+            (
+                "a pipe with no properties at all reports the first required one",
+                "AWS::Pipes::Pipe",
+                Value::Null,
+                Some("RoleArn"),
+            ),
+            (
+                "a parameter with no value",
+                "AWS::SSM::Parameter",
+                ::serde_json::json!({"Type": "String"}),
+                Some("Value"),
+            ),
+            (
+                "a subscription with no protocol",
+                "AWS::SNS::Subscription",
+                ::serde_json::json!({"TopicArn": "arn:aws:sns:us-east-1:000000000000:t"}),
+                Some("Protocol"),
+            ),
+            (
+                "a queue policy with no queues",
+                "AWS::SQS::QueuePolicy",
+                ::serde_json::json!({"PolicyDocument": {"Version": "2012-10-17"}}),
+                Some("Queues"),
+            ),
+            (
+                "a schedule with no expression",
+                "AWS::Scheduler::Schedule",
+                ::serde_json::json!({
+                    "FlexibleTimeWindow": {"Mode": "OFF"},
+                    "Target": {"Arn": "arn:aws:sqs:us-east-1:000000000000:t"},
+                }),
+                Some("ScheduleExpression"),
+            ),
+            (
+                "a subnet with no VPC",
+                "AWS::EC2::Subnet",
+                ::serde_json::json!({"CidrBlock": "10.0.0.0/24"}),
+                Some("VpcId"),
+            ),
+            (
+                "a type this stage knows no required property of",
+                "AWS::SNS::Topic",
+                Value::Null,
+                None,
+            ),
+        ];
+        for (case, resource_type, properties, missing) in rows {
+            let resources = vec![declared("R", resource_type, properties.clone())];
+            let failed = failure(&resources);
+            assert_eq!(
+                failed.as_ref().map(|failure| failure.reason.clone()),
+                missing.map(missing_property_reason),
+                "case {case:?}: expected the missing property {missing:?}, got {failed:?}"
+            );
+            if let Some(failure) = failed {
+                assert_eq!(
+                    failure.path, "/Resources/R/Properties",
+                    "case {case:?}: expected the resource's own properties path, got {failure:?}"
+                );
+            }
+        }
+    }
+
     /// RULE: the failure reported is the FIRST one the deployment would have run into.
     #[test]
     fn the_first_failing_resource_is_the_one_reported() {
@@ -345,7 +609,7 @@ mod tests {
             declared(
                 "First",
                 "AWS::SSM::Parameter",
-                ::serde_json::json!({"Type": "NotAType"}),
+                ::serde_json::json!({"Type": "NotAType", "Value": "x"}),
             ),
             declared(
                 "Second",
