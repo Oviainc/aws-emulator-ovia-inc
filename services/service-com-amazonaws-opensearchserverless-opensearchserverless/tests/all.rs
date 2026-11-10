@@ -41,6 +41,8 @@ mod collection_group_collection_count;
 mod collection_group_delete;
 #[path = "all/collection_group_lifecycle.rs"]
 mod collection_group_lifecycle;
+#[path = "all/collection_group_listing.rs"]
+mod collection_group_listing;
 #[path = "all/collection_group_membership.rs"]
 mod collection_group_membership;
 #[path = "all/collection_lifecycle.rs"]

@@ -24,7 +24,8 @@ use crate::ops::types::{
     AccessPolicyDetail, AccessPolicySummary, AccountSettingsDetail, CapacityDetails, CapacityLimits,
     CollectionDetail,
     CollectionErrorDetail, CollectionGroupCapacityLimits, CollectionGroupDetail,
-    CollectionGroupErrorDetail, CollectionGroupStorageConfiguration, CollectionSummary,
+    CollectionGroupErrorDetail, CollectionGroupStorageConfiguration, CollectionGroupSummary,
+    CollectionSummary,
     CreateCollectionDetail, CreateCollectionGroupDetail, CreateVpcEndpointDetail, CurrentCapacity,
     DeleteCollectionDetail, DeleteVpcEndpointDetail, EffectiveLifecyclePolicyDetail, FipsEndpoints,
     IamFederationConfigOptions,
@@ -1086,6 +1087,28 @@ impl CollectionGroupRecord {
             number_of_collections: Some(number_of_collections),
             generation: Some(self.generation.clone()),
             storage_configuration: Some(self.storage_configuration()),
+        }
+    }
+
+    /// The `CollectionGroupSummary` body for this record — the listing's row for one
+    /// group, with the `numberOfCollections` its reader counted from the collections
+    /// beside it exactly as [`Self::detail`] does, so a listing cannot report a group
+    /// differently from a read of the same group.
+    ///
+    /// `CollectionGroupSummary` models only `id`, `arn`, `name`, `numberOfCollections`,
+    /// `createdDate`, `capacityLimits` and `generation`
+    /// (`smithy_query(query="shape", shape="CollectionGroupSummary")`), so the members
+    /// only a detail carries — `standbyReplicas`, `description`, `tags`,
+    /// `currentCapacity`, `storageConfiguration` — are not in it.
+    pub fn summary(&self, number_of_collections: i32) -> CollectionGroupSummary {
+        CollectionGroupSummary {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            number_of_collections: Some(number_of_collections),
+            created_date: Some(self.created_date),
+            capacity_limits: Some(self.capacity_limits.clone()),
+            generation: Some(self.generation.clone()),
         }
     }
 
@@ -3910,6 +3933,12 @@ pub trait Paged {
 }
 
 impl Paged for CollectionRecord {
+    fn page_cursor(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Paged for CollectionGroupRecord {
     fn page_cursor(&self) -> &str {
         &self.id
     }
