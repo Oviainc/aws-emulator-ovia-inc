@@ -291,6 +291,11 @@ pub mod audited_operation;
 /// unknown-credential failure and the signature failure, each in that service's own code,
 /// so neither is collapsed into the authorization denial `AccessDenied`.
 pub mod authentication_refusal;
+/// The ONE reading of the partial batch response an attempt that was handed a whole batch
+/// answers — which records of the batch it did not process — for every service that polls a
+/// source in batches and hands one over in a single call, so two such services cannot read
+/// the same report differently.
+pub mod batch_item_failures;
 pub mod bedrock;
 /// The ONE definition of the IAM principal this emulator's own long-term credential speaks
 /// for: the user STS reports as the caller and IAM holds among the account's users, so the

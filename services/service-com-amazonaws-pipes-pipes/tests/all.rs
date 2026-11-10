@@ -43,6 +43,8 @@ mod pipe_lifecycle_conflicts;
 mod pipe_metric_attribution;
 #[path = "all/pipe_metrics.rs"]
 mod pipe_metrics;
+#[path = "all/pipe_partial_batch_failure.rs"]
+mod pipe_partial_batch_failure;
 #[path = "all/pipe_record_envelope.rs"]
 mod pipe_record_envelope;
 #[path = "all/pipe_refusal_bodies.rs"]

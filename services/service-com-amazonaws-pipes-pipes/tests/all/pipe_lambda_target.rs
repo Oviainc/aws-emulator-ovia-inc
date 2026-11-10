@@ -49,9 +49,9 @@ const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 
 /// The runtime every function below runs, and the module and attribute its package exposes
 /// its handler as.
-const RUNTIME: &str = "python3.12";
+pub(crate) const RUNTIME: &str = "python3.12";
 /// See [`RUNTIME`].
-const HANDLER: &str = "lambda_function.lambda_handler";
+pub(crate) const HANDLER: &str = "lambda_function.lambda_handler";
 
 /// How long one invocation of the handler is given, as the function's own `Timeout`: well
 /// past what a run needs, because what is under test is the delivery and not how fast an
@@ -72,7 +72,7 @@ const QUIET: Duration = Duration::from_secs(2);
 /// The environment variable the handler reads the result queue's url from, and the two
 /// members it reports each invocation under. None of the three is read by the emulator:
 /// they are the handler's own, passed to it and asserted here.
-const RESULT_QUEUE_VARIABLE: &str = "RESULT_QUEUE";
+pub(crate) const RESULT_QUEUE_VARIABLE: &str = "RESULT_QUEUE";
 /// See [`RESULT_QUEUE_VARIABLE`].
 const SIZE_MEMBER: &str = "size";
 /// See [`RESULT_QUEUE_VARIABLE`].
@@ -85,7 +85,12 @@ const SQS_EVENT_SOURCE: &str = "aws:sqs";
 /// records are sent where a client sends them, the pipe's target is a function Lambda holds,
 /// and the SDK call the running handler makes is dispatched back into this same router — so
 /// the queue this suite reads is the queue the handler wrote.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` with the three helpers below, because the suite that asserts what a pipe does
+/// with the report its function target ANSWERS needs the same three services on one engine
+/// and the same way of putting a handler on one of them
+/// (`tests/all/pipe_partial_batch_failure.rs`).
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -102,7 +107,7 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One Lambda `restJson1` call, as its status and parsed body.
-async fn lambda(
+pub(crate) async fn lambda(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -140,7 +145,7 @@ async fn lambda(
 
 /// A .zip deployment package holding `source` as `lambda_function.py`, written in memory
 /// the way a caller uploads one.
-fn package(source: &str) -> Vec<u8> {
+pub(crate) fn package(source: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
@@ -187,14 +192,15 @@ def lambda_handler(event, context):
     )
 }
 
-/// Create the function `name` whose package runs [`handler_source`] against the result
-/// queue at `result_url`, wait until it reports `Active` — a function a pipe can invoke —
-/// and answer its ARN.
-async fn given_function(
+/// Create the function `name` whose package runs `source` with the environment variables
+/// `variables`, wait until it reports `Active` — a function a pipe can invoke — and answer
+/// its ARN.
+pub(crate) async fn given_function(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
-    result_url: &str,
+    source: &str,
+    variables: Value,
 ) -> String {
     let (status, created) = lambda(
         router,
@@ -206,9 +212,9 @@ async fn given_function(
             "Runtime": RUNTIME,
             "Handler": HANDLER,
             "Timeout": FUNCTION_TIMEOUT,
-            "Environment": { "Variables": { RESULT_QUEUE_VARIABLE: result_url } },
+            "Environment": { "Variables": variables },
             "Code": {
-                "ZipFile": base64::engine::general_purpose::STANDARD.encode(package(&handler_source())),
+                "ZipFile": base64::engine::general_purpose::STANDARD.encode(package(source)),
             },
         })),
     )
@@ -421,7 +427,14 @@ async fn a_lambda_function_target_is_invoked_once_per_polled_batch() {
         let case = row.case;
         let (source_url, source_arn) = given_queue(&router, &format!("{case}-source")).await;
         let (result_url, _) = given_queue(&router, &format!("{case}-result")).await;
-        let target_arn = given_function(&router, case, case, &result_url).await;
+        let target_arn = given_function(
+            &router,
+            case,
+            case,
+            &handler_source(),
+            json!({ RESULT_QUEUE_VARIABLE: result_url }),
+        )
+        .await;
 
         let sent = markers(case, row.records);
         send(&router, &source_url, &sent).await;

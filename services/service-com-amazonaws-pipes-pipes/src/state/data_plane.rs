@@ -67,6 +67,19 @@
 //! records are read again. Either way delivery is at-least-once, which is what the
 //! service promises for a stream source.
 //!
+//! WHICH records of a batch that is depends on what the target said about them. A target
+//! whose call answers a document of its own — a function invoked synchronously — is read as
+//! reporting the records of the batch it did NOT process
+//! ([`::service_common::batch_item_failures`]), each named by the identifier its source names
+//! it by: a queue record by its message id, a stream record by its sequence number. Exactly
+//! the records such a report leaves processed are finished with the source, so the ones it
+//! names stay there and are handed over again — a queue's when their visibility timeout
+//! lapses, a shard's because it is read on only from the first record the target did not
+//! process. A report that cannot be read as a report about the records of THAT batch, an
+//! identifier the batch does not hold among them, leaves nothing of it processed: the whole
+//! batch is handed over again. A target that answers nothing about the records — an Amazon
+//! SQS queue, a function invoked asynchronously — has taken the whole batch.
+//!
 //! A polled queue batch is a CHECKOUT, and the pipe is one consumer of that queue among
 //! others: the records a receive handed over are hidden from every other consumer for the
 //! queue's own `VisibilityTimeout`, and when that span lapses they are visible again,
@@ -529,6 +542,29 @@ async fn poll_pipe(
                         failures = 0;
                         ::tokio::time::sleep(POLL_INTERVAL).await;
                     }
+                    Batch::NotProcessed { events, detail } => {
+                        // The events reached the target and it reported it processed none of
+                        // them: the execution took them from its source and did not move
+                        // them, so it is counted the way a target that did not take the
+                        // batch is. The records are on the source already, so nothing is
+                        // held off: the pipe reads whatever that source offers while the
+                        // ones it did not consume wait their checkout out.
+                        metrics.count(super::metrics::EVENT_COUNT_METRIC, events);
+                        metrics.count(super::metrics::EXECUTION_FAILED_METRIC, 1);
+                        metrics.count(super::metrics::TARGET_STAGE_FAILED_METRIC, 1);
+                        failures = failures.saturating_add(1);
+                        if failures == 1 || failures.is_multiple_of(FAILURE_LOG_INTERVAL) {
+                            ::tracing::warn!(
+                                pipe = %pipe_name,
+                                attempt = failures,
+                                detail = %detail,
+                                "a pipe's target reported no record of the batch it was \
+                                 handed as processed; the records stay on the source and it \
+                                 hands them over again"
+                            );
+                        }
+                        ::tokio::time::sleep(retry_backoff(failures)).await;
+                    }
                     Batch::Superseded => {
                         // Nothing was handed to a stage and nothing was asked of one, so
                         // this is neither work done nor work that failed: the next pass
@@ -758,6 +794,16 @@ enum Batch {
         /// checked nothing out.
         checked_out: Option<Instant>,
     },
+    /// The batch was delivered and the TARGET reported it processed no record of it — a
+    /// `batchItemFailures` naming an identifier the batch does not hold, or every record of
+    /// it — so nothing of the batch is finished with its source and a later pass hands the
+    /// same records over again.
+    ///
+    /// Unlike [`Self::Failed`] this leaves the source unheld: the records were not withheld
+    /// by a stage this pipe could not reach, they are on the source already, invisible until
+    /// their own checkout lapses, and the pipe is free to move whatever that source offers
+    /// while it waits.
+    NotProcessed { events: usize, detail: String },
 }
 
 /// Move one batch: poll the source, drop the records the pipe's filters do not admit,
@@ -800,6 +846,10 @@ async fn move_one_batch(
         return Batch::Superseded;
     }
     let taken = polled.len();
+    // The identifier its source names each polled record by: what a target's report of the
+    // records it did not process names them by, and what the finish below leaves on the
+    // source or moves past.
+    let identifiers = polled.identifiers();
 
     // The WHOLE polled batch, as one JSON array of record envelopes.
     let batch = match polled.envelopes(run) {
@@ -819,7 +869,16 @@ async fn move_one_batch(
     // consumed, so the source moves on from it rather than offering it again.
     let batch = admitted(&run.filters, batch);
     if batch.is_empty() {
-        finish_batch(callback, clients, cursors, record, run, &polled).await;
+        finish_batch(
+            callback,
+            clients,
+            cursors,
+            record,
+            run,
+            &polled,
+            &Finished::WholeBatch,
+        )
+        .await;
         return Batch::Moved { events: taken };
     }
 
@@ -898,18 +957,47 @@ async fn move_one_batch(
 
     // How the target TAKES them is the target's own: one call per event for a target whose
     // API carries one payload per call, one call holding every event for a target whose API
-    // takes the batch ([`deliver_batch`]).
-    if let Err(detail) = deliver_batch(callback, clients, &run.target, &payloads).await {
-        return Batch::Failed {
-            stage: Stage::Target,
+    // takes the batch ([`deliver_batch`]). What it ANSWERS is which records of the batch it
+    // did not process, for a target whose call answers the caller at all.
+    let report = match deliver_batch(callback, clients, &run.target, &payloads, &identifiers).await
+    {
+        Ok(report) => report,
+        Err(detail) => {
+            return Batch::Failed {
+                stage: Stage::Target,
+                events: taken,
+                detail,
+                checked_out,
+            }
+        }
+    };
+    // A report that cannot be read as a report of the records of THIS batch — an identifier
+    // the batch does not hold among them, or every record of it — leaves nothing of it
+    // processed, so the records stay on the source in full and a later pass hands them over
+    // again.
+    if let ::service_common::batch_item_failures::BatchReport::WholeBatchFailed(detail) = &report {
+        return Batch::NotProcessed {
             events: taken,
-            detail,
-            checked_out,
+            detail: format!(
+                "the target {} reported no record of the batch as processed: {detail}",
+                run.target_arn
+            ),
         };
     }
+    let processed =
+        ::service_common::batch_item_failures::processed_records(&report, &identifiers)
+            .unwrap_or_default();
 
-    // Delivered: the batch may be finished with its source.
-    finish_batch(callback, clients, cursors, record, run, &polled).await;
+    // Delivered: the records the target processed may be finished with their source, and the
+    // ones it reported it did not stay there to be handed over again.
+    let finished = if processed.len() == identifiers.len() {
+        Finished::WholeBatch
+    } else {
+        // A SET, so finishing a batch costs its own length and never the product of the
+        // batch's length and the report's.
+        Finished::Records(processed.iter().map(String::as_str).collect())
+    };
+    finish_batch(callback, clients, cursors, record, run, &polled, &finished).await;
     Batch::Moved { events: taken }
 }
 
@@ -940,13 +1028,44 @@ fn target_payloads<'a>(
     Ok(payloads)
 }
 
-/// Finish a batch with its SOURCE, now that every event derived from it has been
-/// delivered: a queue's records are deleted, and a stream's read position moves past
-/// them.
+/// Which records of a polled batch the pipe is FINISHED with: the ones its source may move
+/// on from.
 ///
-/// Neither can fail the batch. A delete the role may not make, or that fails, only means
+/// Everything else the poll took stays where it is, so it is handed over again — a queue's
+/// records when their visibility timeout lapses, a stream's because the shard is not read on
+/// from past them.
+enum Finished<'a> {
+    /// Every record the poll took.
+    WholeBatch,
+    /// Only the records named here, by the identifier their source names a record by
+    /// ([`Polled::identifiers`]).
+    Records(BTreeSet<&'a str>),
+}
+
+impl Finished<'_> {
+    /// Whether the record `identifier` names is one of them.
+    fn holds(&self, identifier: &str) -> bool {
+        match self {
+            Self::WholeBatch => true,
+            Self::Records(finished) => finished.contains(identifier),
+        }
+    }
+}
+
+/// Finish a batch with its SOURCE, now that the events derived from it have been delivered
+/// and the target has reported which records of it it processed: a queue's records are
+/// deleted, and a stream's read position moves past them.
+///
+/// `finished` is which of the polled records that is. A target that reported records it did
+/// not process leaves exactly those on the source — a queue's reappear when their visibility
+/// timeout lapses, and a shard is read on only from the first record the target did not
+/// process, because a shard has ONE position and the records it can be read past are the run
+/// at the HEAD of the batch that were processed.
+///
+/// Nothing here can fail the batch. A delete the role may not make, or that fails, only means
 /// the record reappears and is delivered again, which is the at-least-once the service
-/// promises; a stream's position is this poller's own, so moving it on cannot fail at all.
+/// promises; and a position this poller cannot take up is one it keeps, so the same records
+/// are read again.
 async fn finish_batch(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
@@ -954,6 +1073,7 @@ async fn finish_batch(
     record: &LiveRecord<'_>,
     run: &RunningPipe,
     polled: &Polled,
+    finished: &Finished<'_>,
 ) {
     match polled {
         Polled::Messages { messages, .. } => {
@@ -969,6 +1089,12 @@ async fn finish_batch(
                 return;
             }
             for message in messages {
+                // A record the target reported it did not process is left on the queue,
+                // invisible until its visibility timeout lapses and then the queue's to hand
+                // over again.
+                if !finished.holds(message.message_id.as_deref().unwrap_or_default()) {
+                    continue;
+                }
                 let Some(handle) = message.receipt_handle.as_deref() else {
                     continue;
                 };
@@ -988,11 +1114,74 @@ async fn finish_batch(
                 }
             }
         }
-        // The shard is read from the position AFTER the delivered records from now on. A
-        // shard whose answer carried no next position is closed and drained, so it is
-        // taken off the walk rather than read from its start again.
-        Polled::Records(batch) => cursors.advance(&batch.shard, batch.next_iterator.clone()),
+        Polled::Records(batch) => {
+            let processed = match finished {
+                // The shard is read from the position AFTER the delivered records from now
+                // on. A shard whose answer carried no next position is closed and drained,
+                // so it is taken off the walk rather than read from its start again.
+                Finished::WholeBatch => {
+                    cursors.advance(&batch.shard, batch.next_iterator.clone());
+                    return;
+                }
+                Finished::Records(processed) => processed,
+            };
+            // The last record of the run at the HEAD of the batch that was processed: the
+            // first record the target did not process is where the shard must be read on
+            // from. A batch whose very first record was not processed moves the position not
+            // at all, so the whole of it is read again.
+            let batch_identifiers = stream_identifiers(&batch.records);
+            let Some(through) = checkpointed_through(&batch_identifiers, processed) else {
+                return;
+            };
+            match shard_iterator_after(callback, clients, record, run, &batch.shard, through).await
+            {
+                Ok(iterator) => cursors.advance(&batch.shard, iterator),
+                // The position this poller holds is kept, so the batch is read again in
+                // full: at-least-once, which is what a stream source promises.
+                Err(detail) => ::tracing::warn!(
+                    stream = %run.source_arn,
+                    shard = %batch.shard,
+                    detail = %detail,
+                    "a pipe could not take up the position after the records its target \
+                     processed; it reads the batch again"
+                ),
+            }
+        }
     }
+}
+
+/// The identifier its source names each of `records` by: a stream record's own sequence
+/// number, "the sequence number of the stream record" (`StreamRecord$SequenceNumber`), which
+/// is both what names its position in the shard and what a target's report names it by.
+fn stream_identifiers(records: &[::aws_sdk_dynamodbstreams::types::Record]) -> Vec<String> {
+    records
+        .iter()
+        .map(|record| {
+            record
+                .dynamodb
+                .as_ref()
+                .and_then(|change| change.sequence_number.clone())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// The identifier a shard may be read on from past, after an attempt that processed
+/// `processed` of the batch `identifiers`, or `None` when the attempt did not process the
+/// batch's own first record and so moved the shard's position not at all.
+///
+/// A shard has ONE position, so the records it can be read on from past are the run at the
+/// HEAD of the batch that were processed: the first record the attempt did not process is the
+/// one the next read must start at.
+fn checkpointed_through<'a>(
+    identifiers: &'a [String],
+    processed: &BTreeSet<&str>,
+) -> Option<&'a str> {
+    identifiers
+        .iter()
+        .map(String::as_str)
+        .take_while(|identifier| processed.contains(identifier))
+        .last()
 }
 
 /// The one question each stage asks before it makes its call: may this pipe's execution
@@ -1113,6 +1302,22 @@ impl Polled {
         match self {
             Self::Messages { checked_out, .. } => Some(*checked_out),
             Self::Records(_) => None,
+        }
+    }
+
+    /// The identifier its SOURCE names each polled record by, in the order they were
+    /// polled.
+    ///
+    /// This is what a target's report of the records it did not process names them by
+    /// ([`::service_common::batch_item_failures`]): an Amazon SQS message is named by its
+    /// message id and a stream record by its sequence number.
+    fn identifiers(&self) -> Vec<String> {
+        match self {
+            Self::Messages { messages, .. } => messages
+                .iter()
+                .map(|message| message.message_id.clone().unwrap_or_default())
+                .collect(),
+            Self::Records(batch) => stream_identifiers(&batch.records),
         }
     }
 
@@ -1566,6 +1771,43 @@ async fn shard_iterator(
     Ok(Some(iterator))
 }
 
+/// The position a shard is read on from AFTER the record `sequence_number` names, or `None`
+/// when the stream answered none.
+///
+/// This is what a partially processed batch leaves the shard at: `AFTER_SEQUENCE_NUMBER` is
+/// "start reading right after the position denoted by a specific sequence number"
+/// (`GetShardIterator$ShardIteratorType`), so the next read begins at the first record the
+/// target did not process.
+async fn shard_iterator_after(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    clients: &mut Clients,
+    record: &LiveRecord<'_>,
+    run: &RunningPipe,
+    shard: &str,
+    sequence_number: &str,
+) -> Result<Option<String>, String> {
+    if let Some(detail) = record.refusal(GET_SHARD_ITERATOR_ACTION, &run.source_arn) {
+        return Err(detail);
+    }
+    let answer = clients
+        .dynamodbstreams(callback, &run.source_region)
+        .get_shard_iterator()
+        .stream_arn(&run.source_arn)
+        .shard_id(shard)
+        .shard_iterator_type(::aws_sdk_dynamodbstreams::types::ShardIteratorType::AfterSequenceNumber)
+        .sequence_number(sequence_number)
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "the position after the record {sequence_number} of the shard {shard} could \
+                 not be taken up ({})",
+                ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+            )
+        })?;
+    Ok(answer.shard_iterator)
+}
+
 /// The shard iterator type the configured `StartingPosition` reads from. Both values
 /// `DynamoDBStreamStartPosition` admits are DynamoDB Streams' own iterator types.
 fn iterator_type(starting_position: &str) -> ::aws_sdk_dynamodbstreams::types::ShardIteratorType {
@@ -1916,11 +2158,14 @@ fn enrichment_events(returned: &[u8], arn: &str) -> Result<Vec<Value>, String> {
     })
 }
 
-/// Deliver the batch to the target.
+/// Deliver the batch to the target, and answer what the target reported about the records
+/// of the batch it was handed.
 ///
 /// Each entry of `payloads` is what the target RECEIVES for one event — the event, or the
 /// event rendered through the target's input template — beside the event its target
-/// parameters are read from, as a path reads it ([`path_view`]).
+/// parameters are read from, as a path reads it ([`path_view`]). `records` are the source
+/// records the batch was polled from, by the identifier their source names each of them by:
+/// what a report of the records the target did not process names them by.
 ///
 /// How many calls that comes to is the TARGET's own: `SendMessage` takes one message body
 /// per call and `PipeTargetSqsQueueParameters` carries no batch member, so a queue target
@@ -1928,12 +2173,20 @@ fn enrichment_events(returned: &[u8], arn: &str) -> Result<Vec<Value>, String> {
 /// payload, which is the batch itself, so a function target receives ONE call carrying
 /// every event — which is what makes the source's `BatchSize` the count of invocations a
 /// backlog comes to.
+///
+/// A target whose call ANSWERS the caller a document of its own is the one that can report:
+/// a function invoked synchronously answers what it returned, which is read as the report of
+/// the records it did not process ([`::service_common::batch_item_failures`]). Every other
+/// delivery says nothing about the records, so its batch counts as wholly processed — an
+/// Amazon SQS `SendMessage` answers nothing about the event it took, and an asynchronous
+/// invocation has only been accepted at the point it answers.
 async fn deliver_batch(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
     target: &Target,
     payloads: &[Delivery<'_>],
-) -> Result<(), String> {
+    records: &[String],
+) -> Result<::service_common::batch_item_failures::BatchReport, String> {
     match target {
         Target::Queue {
             url,
@@ -1974,7 +2227,7 @@ async fn deliver_batch(
                     )
                 })?;
             }
-            Ok(())
+            Ok(::service_common::batch_item_failures::BatchReport::WholeBatchProcessed)
         }
         Target::Function {
             arn,
@@ -2016,7 +2269,18 @@ async fn deliver_batch(
             if let Some(failure) = answer.function_error.as_deref() {
                 return Err(format!("the target {arn} answered a {failure} error"));
             }
-            Ok(())
+            if !*synchronous {
+                return Ok(
+                    ::service_common::batch_item_failures::BatchReport::WholeBatchProcessed,
+                );
+            }
+            // What the function RETURNED, read as its report of the records of the batch it
+            // did not process: a response naming none is the whole batch processed, which is
+            // what a handler that knows nothing of the report answers.
+            Ok(::service_common::batch_item_failures::read_batch_item_failures(
+                answer.payload.as_ref().map(::aws_sdk_lambda::primitives::Blob::as_ref),
+                records,
+            ))
         }
     }
 }
@@ -2673,10 +2937,44 @@ impl Clients {
 #[cfg(test)]
 mod tests {
     use super::{
-        enrichment_events, path_view, render_template, resolved_parameter, target_body,
-        MAX_TEMPLATE_BYTES, MESSAGE_GROUP_ID,
+        checkpointed_through, enrichment_events, path_view, render_template, resolved_parameter,
+        target_body, MAX_TEMPLATE_BYTES, MESSAGE_GROUP_ID,
     };
     use ::serde_json::{json, Value};
+    use ::std::collections::BTreeSet;
+
+    /// RULE: a shard has ONE position, so an attempt that processed part of the batch read
+    /// from it leaves that shard read on from the FIRST record it did not process: the
+    /// position moves through the run of processed records at the HEAD of the batch and no
+    /// further, and not at all when the batch's own first record was not processed.
+    ///
+    /// The rows differ along which records of the batch the attempt processed, which is what
+    /// the rule generalises over: all of them, none, a prefix, a suffix, and a prefix with a
+    /// gap after it.
+    #[test]
+    fn a_shard_is_read_on_from_the_first_record_the_attempt_did_not_process() {
+        let batch: Vec<String> = ["s-1", "s-2", "s-3", "s-4"]
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect();
+        // (case, the records the attempt processed, the position the shard reads on from)
+        let rows: [(&str, &[&str], Option<&str>); 6] = [
+            ("every record", &["s-1", "s-2", "s-3", "s-4"], Some("s-4")),
+            ("no record", &[], None),
+            ("the first two", &["s-1", "s-2"], Some("s-2")),
+            ("the last two", &["s-3", "s-4"], None),
+            ("the first and the third", &["s-1", "s-3"], Some("s-1")),
+            ("all but the first", &["s-2", "s-3", "s-4"], None),
+        ];
+        for (case, processed, expected) in rows {
+            let processed: BTreeSet<&str> = processed.iter().copied().collect();
+            let through = checkpointed_through(&batch, &processed);
+            assert_eq!(
+                through, expected,
+                "case {case:?}: expected the shard read on from {expected:?}, got {through:?}"
+            );
+        }
+    }
 
     /// The record envelope the template rows below are rendered against: an Amazon SQS
     /// record as the source stage builds one.
