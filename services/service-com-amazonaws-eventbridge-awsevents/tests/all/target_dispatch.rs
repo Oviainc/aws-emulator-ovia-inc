@@ -297,7 +297,7 @@ pub(crate) async fn publish_details(emulator: &Emulator, details: &[String]) -> 
 }
 
 /// Percent-encode one form value the way an AWS SDK encodes an `awsQuery` body.
-fn form_encode(value: &str) -> String {
+pub(crate) fn form_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         match byte {

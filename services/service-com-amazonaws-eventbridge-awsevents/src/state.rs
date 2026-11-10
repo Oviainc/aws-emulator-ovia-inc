@@ -3499,6 +3499,13 @@ pub fn caller_principal() -> String {
 /// is [`publication_refusal`].
 pub mod authorization;
 
+/// Whether the policies in force let the calling principal CHANGE a rule: a rule
+/// mutator is the action `events:<OperationName>` on the rule's own ARN, decided
+/// against the caller's identity-based policies with the TARGET rule's tags
+/// published as `aws:ResourceTag/<key>`
+/// ([`rule_authorization::rule_mutation_denial`]).
+pub mod rule_authorization;
+
 /// Every spelling of the identity a publication is made as that a resource
 /// policy may name it by: the role itself, the SESSION of that role the
 /// publication is made under ([`assumed_role_principal`]) and the spellings of

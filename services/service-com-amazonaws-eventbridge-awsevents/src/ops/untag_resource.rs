@@ -68,6 +68,9 @@
 //!   managed rules by using DisableRule, EnableRule, PutTargets, PutRule, TagResource, or
 //!   UntagResource.
 //! * `ResourceNotFoundException` (HTTP 400) — An entity that you specified does not exist.
+//! * `AccessDeniedException` (HTTP 400) — You do not have the necessary permissions for this
+//!   action. Widened in through `extra_errors` (see below): the refusal a caller whose
+//!   identity-based policies do not permit this action on the addressed rule answers with.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -83,9 +86,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridge-awsevents.j
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridge#UntagResource")]
+//
+// `AccessDeniedException` is widened in with `extra_errors`: this SERVICE models the
+// shape ("You do not have the necessary permissions for this action", HTTP 400) while
+// this OPERATION's own `errors` list does not name it, and it is the refusal a call the
+// caller's identity-based policies do not permit answers with (see the authorization
+// pass in the handler below).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridge#UntagResource",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ConcurrentModificationException(ConcurrentModificationException),
     InternalException(InternalException),
     ManagedRuleException(ManagedRuleException),
@@ -158,7 +171,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource = crate::state::parse_tagged_resource(&input.resource_arn, &region)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
+        // WHO this request speaks for, and the documents in force on that principal,
+        // resolved BEFORE this service's store is locked: the IAM store is never
+        // reached while this one's guard is held.
+        let caller = crate::state::authorization::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
+        // Untagging a rule is the action `events:UntagResource` on that rule, so the
+        // policies in force on the caller decide it BEFORE anything is removed —
+        // evaluated with the tags the rule carries NOW, which is what scopes a grant
+        // written against `aws:ResourceTag/<key>` to the rules carrying that tag
+        // (`crate::state::rule_authorization`).
+        if let Some(message) = crate::state::rule_authorization::tagged_rule_denial(
+            &store,
+            &caller,
+            Self::NAME,
+            &resource,
+        ) {
+            return Err(UntagResourceErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // "You cannot modify these managed rules by using DisableRule, EnableRule,
         // PutTargets, PutRule, TagResource, or UntagResource"
         // (`ManagedRuleException`).

@@ -70,6 +70,9 @@
 //!   managed rules by using DisableRule, EnableRule, PutTargets, PutRule, TagResource, or
 //!   UntagResource.
 //! * `ResourceNotFoundException` (HTTP 400) — An entity that you specified does not exist.
+//! * `AccessDeniedException` (HTTP 400) — You do not have the necessary permissions for this
+//!   action. Widened in through `extra_errors` (see below): the refusal a caller whose
+//!   identity-based policies do not permit this action on the target rule answers with.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -85,9 +88,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridge-awsevents.j
 // here — hence the `RemoveTargetsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridge#RemoveTargets")]
+//
+// `AccessDeniedException` is widened in with `extra_errors`: this SERVICE models the
+// shape ("You do not have the necessary permissions for this action", HTTP 400) while
+// this OPERATION's own `errors` list does not name it, and it is the refusal a call the
+// caller's identity-based policies do not permit answers with (see the authorization
+// pass in the handler below).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridge#RemoveTargets",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum RemoveTargetsErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ConcurrentModificationException(ConcurrentModificationException),
     InternalException(InternalException),
     ManagedRuleException(ManagedRuleException),
@@ -156,7 +169,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         let bus_name = crate::state::effective_bus_name(input.event_bus_name.as_deref());
+        // WHO this request speaks for, and the documents in force on that principal,
+        // resolved BEFORE this service's store is locked: the IAM store is never
+        // reached while this one's guard is held.
+        let caller = crate::state::authorization::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
+        // Removing targets from a rule is the action `events:RemoveTargets` on that
+        // rule, so the policies in force on the caller decide it BEFORE anything is
+        // removed — evaluated with the target rule's own tags, which is what scopes a
+        // grant written against `aws:ResourceTag/<key>` to the rules carrying that tag
+        // (`crate::state::rule_authorization`).
+        if let Some(message) = crate::state::rule_authorization::rule_mutation_denial(
+            &store,
+            &caller,
+            Self::NAME,
+            &region,
+            &bus_name,
+            &input.rule,
+        ) {
+            return Err(RemoveTargetsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // `EventBusName` names the SCOPE the rule is sought in, so the bus is
         // resolved before the rule and a bus that is gone is the missing
         // resource this call reports — `crate::state` owns that precedence, and

@@ -107,6 +107,9 @@
 //!   managed rules by using DisableRule, EnableRule, PutTargets, PutRule, TagResource, or
 //!   UntagResource.
 //! * `ResourceNotFoundException` (HTTP 400) — An entity that you specified does not exist.
+//! * `AccessDeniedException` (HTTP 400) — You do not have the necessary permissions for this
+//!   action. Widened in through `extra_errors` (see below): the refusal a caller whose
+//!   identity-based policies do not permit this action on the target rule answers with.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -122,9 +125,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridge-awsevents.j
 // here — hence the `PutRuleError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridge#PutRule")]
+//
+// `AccessDeniedException` is widened in with `extra_errors`: this SERVICE models the
+// shape ("You do not have the necessary permissions for this action", HTTP 400) while
+// this OPERATION's own `errors` list does not name it, and it is the refusal a call the
+// caller's identity-based policies do not permit answers with (see the authorization
+// pass in the handler below).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridge#PutRule",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum PutRuleErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ConcurrentModificationException(ConcurrentModificationException),
     InternalException(InternalException),
     InvalidEventPatternException(InvalidEventPatternException),
@@ -193,7 +206,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let bus_name = crate::state::effective_bus_name(input.event_bus_name.as_deref());
+        // WHO this request speaks for, and the documents in force on that principal,
+        // resolved BEFORE this service's store is locked: the IAM store is never
+        // reached while this one's guard is held.
+        let caller = crate::state::authorization::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
+
+        // Writing a rule is the action `events:PutRule` on that rule, so the policies
+        // in force on the caller decide it BEFORE anything is written — evaluated with
+        // the target rule's own tags, which is what scopes a grant written against
+        // `aws:ResourceTag/<key>` to the rules carrying that tag. A name this bus holds
+        // no rule under carries no tag yet, so a create is decided against the ARN such
+        // a rule would carry and an empty tag set
+        // (`crate::state::rule_authorization`).
+        if let Some(message) = crate::state::rule_authorization::rule_mutation_denial(
+            &store,
+            &caller,
+            Self::NAME,
+            &region,
+            &bus_name,
+            &input.name,
+        ) {
+            return Err(PutRuleErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: Some(message),
+            })
+            .into());
+        }
 
         // A rule is bound to an event bus, so a bus that does not exist is a
         // missing resource — never a bus this call brings into being. The bus is
