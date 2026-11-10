@@ -341,9 +341,10 @@ async fn starts_without_a_request_token_are_distinct_jobs() {
     }
 }
 
-/// An unknown job is a `ResourceNotFoundException`, on describe and on stop alike.
+/// An unknown job is refused as a not-found resource with the service's refusal status,
+/// on describe and on stop alike.
 #[tokio::test]
-async fn an_unknown_job_is_not_found() {
+async fn an_unknown_job_is_refused() {
     let router = router();
     for operation in [
         "DescribeEntitiesDetectionV2Job",
@@ -351,8 +352,8 @@ async fn an_unknown_job_is_not_found() {
     ] {
         let (status, answer) = call(&router, operation, &json!({"JobId": "doesnotexist"})).await;
         assert_eq!(
-            status, 404,
-            "case {operation:?}: expected 404, got {status} {answer}"
+            status, 400,
+            "case {operation:?}: expected 400, got {status} {answer}"
         );
         assert_eq!(
             answer["__type"].as_str(),

@@ -234,10 +234,10 @@ async fn describing_a_phi_job_reports_what_start_was_given() {
     }
 }
 
-/// A `JobId` that names no job of the PHI family is a `ResourceNotFoundException`, and a
-/// describe never creates the job it was asked about.
+/// A `JobId` that names no job of the PHI family is refused as a not-found resource with
+/// the service's refusal status, and a describe never creates the job it was asked about.
 #[tokio::test]
-async fn describing_a_job_the_phi_family_does_not_hold_is_not_found() {
+async fn describing_a_job_the_phi_family_does_not_hold_is_refused() {
     let router = router();
     // A job of ANOTHER family: its id is well formed and stored, but not here.
     let other_family = start_job(
@@ -264,8 +264,8 @@ async fn describing_a_job_the_phi_family_does_not_hold_is_not_found() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404, got {status} {answer}"
+            status, 400,
+            "case {case:?}: expected 400, got {status} {answer}"
         );
         assert_eq!(
             answer["__type"].as_str(),

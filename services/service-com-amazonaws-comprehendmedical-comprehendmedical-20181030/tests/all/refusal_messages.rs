@@ -371,8 +371,9 @@ async fn a_refusal_never_echoes_the_submitted_value() {
 #[tokio::test]
 async fn a_value_at_a_published_bound_is_accepted() {
     // (case, operation, body, the status expected). 501 is the scaffold's own answer for
-    // an operation nobody has implemented yet: the point of the row is that the request
-    // was NOT refused at the boundary.
+    // an operation nobody has implemented yet, and 400 the operation's OWN refusal of a
+    // well-formed job id that names no job: the point of each row is that the request was
+    // NOT refused at the boundary, which the message check below is what pins.
     let cases: Vec<(&str, &str, Value, u16)> = vec![
         (
             "the page-size minimum",
@@ -390,7 +391,7 @@ async fn a_value_at_a_published_bound_is_accepted() {
             "a job id at its length maximum",
             "DescribeEntitiesDetectionV2Job",
             json!({"JobId": "j".repeat(32)}),
-            404,
+            400,
         ),
         (
             "a filter job name at its length maximum",
@@ -424,6 +425,12 @@ async fn a_value_at_a_published_bound_is_accepted() {
         assert_eq!(
             status, expected,
             "case {case:?}: expected {expected}, got {status} {answer}"
+        );
+        let message = error_message(&answer).unwrap_or_default();
+        assert!(
+            !message.contains("failed to satisfy constraint"),
+            "case {case:?}: a value at a published bound must reach the operation rather \
+             than be refused at the boundary, got {message:?}"
         );
     }
 }
@@ -620,8 +627,9 @@ async fn stopping_a_job_in_a_terminal_status_is_refused() {
         );
     }
 
-    // A stop that names no stored job is still the not-found error, not the terminal-state
-    // refusal: the two failures are told apart by their own codes.
+    // A stop that names no stored job is the not-found refusal, not the terminal-state
+    // one: both are answered with the same status, so the two failures are told apart by
+    // their error code and their message.
     let (status, answer) = call(
         &router,
         "StopEntitiesDetectionV2Job",
@@ -629,12 +637,17 @@ async fn stopping_a_job_in_a_terminal_status_is_refused() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "case an unknown job: expected 404, got {status} {answer}"
+        status, 400,
+        "case an unknown job: expected 400, got {status} {answer}"
     );
     assert_eq!(
         answer["__type"].as_str(),
         Some("ResourceNotFoundException"),
         "case an unknown job: expected ResourceNotFoundException, got {answer}"
+    );
+    assert_ne!(
+        error_message(&answer),
+        Some(ALREADY_TERMINAL),
+        "case an unknown job: expected its own message, got {answer}"
     );
 }

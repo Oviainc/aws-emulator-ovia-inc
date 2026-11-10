@@ -4,8 +4,9 @@
 //!
 //! IMPLEMENTED. The answer is reconstructed from the stored PHI-detection job: exactly
 //! what `StartPHIDetectionJob` was given, plus the status the clock has moved the job
-//! to. An unknown (or expired) `JobId` is a `ResourceNotFoundException`; each job family
-//! keeps its own store, so a `JobId` another family minted resolves to nothing here.
+//! to. An unknown (or expired) `JobId` is refused as a `ResourceNotFoundException`; each
+//! job family keeps its own store, so a `JobId` another family minted resolves to nothing
+//! here.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +86,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-comprehendmedical-compr
 // here — hence the `DescribePHIDetectionJobError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
+//
+// The macro requires every error the model declares, `ResourceNotFoundException`
+// included. A variant answered through this `From` impl carries the status the shape's
+// `@httpError` declares (404), which is not the status this service answers that shape
+// with, so the one condition that raises it — a `JobId` naming no job — goes through
+// `crate::service::job_refusal::refuse` instead.
 #[smithy_macros::operation_error("com.amazonaws.comprehendmedical#DescribePHIDetectionJob")]
 #[derive(Debug)]
 pub enum DescribePHIDetectionJobErrorModeled {
@@ -157,25 +164,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let now = crate::state::now_epoch_secs();
         let mut state = store.lock();
-        // Both writes below are changes the CLOCK already made due at an instant fixed
-        // when the job was started — metadata expiry and the job's own status
-        // progression — so materialising them while reporting shows a later caller
-        // nothing it would not otherwise have seen.
-        state.expire_jobs(now);
-        let Some(job) = state.phi_detection_jobs.jobs.get_mut(&input.job_id) else {
-            return Err(
-                DescribePHIDetectionJobErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "No PHI detection job was found for JobId '{}'.",
-                            input.job_id
-                        )),
-                    },
-                )
-                .into(),
-            );
+        // The lookup materialises what the CLOCK already made due at instants fixed when
+        // the jobs were started — metadata expiry and this job's status progression — so
+        // reporting them shows a later caller nothing it would not otherwise have seen.
+        // An id this family holds no job for — never minted, minted by another family, or
+        // aged out with its metadata — is refused with the service's own fixed sentence,
+        // which echoes nothing of the request.
+        let job = match state.phi_detection_jobs.job_mut(&input.job_id, now) {
+            Ok(job) => job,
+            Err(absent) => return Err(crate::service::job_refusal::refuse(absent)),
         };
-        job.advance(now);
 
         Ok(DescribePHIDetectionJobOutput {
             comprehend_medical_async_job_properties: Some(job.to_properties()),

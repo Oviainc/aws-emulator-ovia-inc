@@ -48,6 +48,11 @@ use std::sync::Arc;
 /// constrained member of every operation is stated by ONE formatter.
 pub(crate) mod validation;
 
+/// How this service refuses a request that names an asynchronous job it cannot find:
+/// the modelled error shape, its one fixed sentence, and the status this service answers
+/// that refusal with. One place, so no per-id job operation words it on its own.
+pub(crate) mod job_refusal;
+
 /// The `com-amazonaws-comprehendmedical-comprehendmedical-20181030` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///

@@ -116,6 +116,24 @@ impl JobAlreadyTerminal {
     }
 }
 
+/// A request that named a job the account has no record of in the family it was sent to:
+/// an id nothing ever minted, an id another family minted, or one whose metadata has
+/// already been dropped past its `ExpirationTime`.
+///
+/// Carries the sentence the service states for it, so every family's per-id operations
+/// refuse an absent job with one wording. The whole message is FIXED text with no
+/// variable part: the identifier the caller sent is NOT echoed back, so this refusal
+/// reveals nothing about which ids the account holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobNotFound;
+
+impl JobNotFound {
+    /// What the refusal reports: the request named no job the service can find.
+    pub fn message(self) -> &'static str {
+        "Could not find specified job."
+    }
+}
+
 /// Wall-clock now, in epoch seconds — the clock every job time is measured on.
 pub fn now_epoch_secs() -> f64 {
     std::time::SystemTime::now()
@@ -342,6 +360,24 @@ impl JobFamilyStore {
             self.idempotency_tokens.insert(token, job.job_id.clone());
         }
         self.jobs.insert(job.job_id.clone(), job);
+    }
+
+    /// The job `job_id` names, with everything the clock already owes it applied —
+    /// metadata kept past its `ExpirationTime` is dropped first, then the job's own status
+    /// progression is materialised — or [`JobNotFound`] when this family holds no such
+    /// job. Both writes were due at instants fixed when the jobs were started, so applying
+    /// them while reporting shows a later caller nothing it would not otherwise have seen.
+    ///
+    /// Every per-id operation of a family (describe, stop) resolves its `JobId` through
+    /// here, so one id resolves — and one absent id is refused — the same way on each of
+    /// them. Only THIS family's metadata is swept: another family materialises what the
+    /// clock owes it on its own next call, so no caller sees a job that should have
+    /// expired.
+    pub fn job_mut(&mut self, job_id: &str, now: f64) -> Result<&mut AsyncJob, JobNotFound> {
+        self.expire(now);
+        let job = self.jobs.get_mut(job_id).ok_or(JobNotFound)?;
+        job.advance(now);
+        Ok(job)
     }
 
     /// Materialise everything the clock already owes this family at `now`: metadata kept

@@ -4,8 +4,9 @@
 //!
 //! IMPLEMENTED. A job still running is moved to `STOP_REQUESTED`, from where the clock
 //! owes its move to `STOPPED` with an `EndTime`; a job that already reached a terminal
-//! status keeps it and the stop is refused with `InvalidRequestException`. The stored job
-//! is what a later describe or list reports.
+//! status keeps it and the stop is refused with `InvalidRequestException`; a stop naming
+//! an unknown (or expired) `JobId` is refused as a `ResourceNotFoundException`. The
+//! stored job is what a later describe or list reports.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +81,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-comprehendmedical-compr
 // here — hence the `StopEntitiesDetectionV2JobError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
+//
+// The macro requires every error the model declares, `ResourceNotFoundException`
+// included. A variant answered through this `From` impl carries the status the shape's
+// `@httpError` declares (404), which is not the status this service answers that shape
+// with, so the one condition that raises it — a `JobId` naming no job — goes through
+// `crate::service::job_refusal::refuse` instead.
 #[smithy_macros::operation_error("com.amazonaws.comprehendmedical#StopEntitiesDetectionV2Job")]
 #[derive(Debug)]
 pub enum StopEntitiesDetectionV2JobErrorModeled {
@@ -154,26 +161,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let now = crate::state::now_epoch_secs();
         let mut state = store.lock();
-        state.expire_jobs(now);
-        let Some(job) = state.entities_detection_v2_jobs.jobs.get_mut(&input.job_id) else {
-            return Err(
-                StopEntitiesDetectionV2JobErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "No entities detection job was found for JobId '{}'.",
-                            input.job_id
-                        )),
-                    },
-                )
-                .into(),
-            );
+        // The lookup materialises what the CLOCK already made due at instants fixed when
+        // the jobs were started — metadata expiry and this job's status progression — so a
+        // job that finished before the stop could take effect keeps the status it reached.
+        // An id this family holds no job for — never minted, minted by another family, or
+        // aged out with its metadata — is refused with the service's own fixed sentence,
+        // which echoes nothing of the request.
+        let job = match state
+            .entities_detection_v2_jobs
+            .job_mut(&input.job_id, now)
+        {
+            Ok(job) => job,
+            Err(absent) => return Err(crate::service::job_refusal::refuse(absent)),
         };
-        // Apply what the clock owes first: a job that finished before the stop could
-        // take effect keeps the status it reached, and a stop naming a job that already
-        // finished is refused rather than answered as though it took effect. "Stops a
-        // medical entities detection job in progress" — only a job still running has a
-        // stop to request.
-        job.advance(now);
+        // A stop naming a job that already finished is refused rather than answered as
+        // though it took effect. "Stops a medical entities detection job in progress" —
+        // only a job still running has a stop to request.
         if let Err(already_terminal) = job.request_stop(now) {
             return Err(
                 StopEntitiesDetectionV2JobErrorModeled::InvalidRequestException(
