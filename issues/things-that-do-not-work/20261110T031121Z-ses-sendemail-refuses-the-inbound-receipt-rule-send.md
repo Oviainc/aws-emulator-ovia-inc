@@ -1,0 +1,58 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: ses-inbound-mail-published-by-receipt-rule-sns-action
+Issue-Step: task#9
+Issue-Severity: HIGH
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: ses-inbound-mail-published-by-receipt-rule-sns-action
+Issue-Shape-Id: com.amazonaws.ses#SimpleEmailService
+Issue-Key: ses|SendEmail|2xx->4xx|$.SendEmailResponse
+Issue-Key: ses|SendEmail|2xx->4xx|status
+Issue-Commit: bcbd6f62c7a6624265f60a60785bdde46c891127
+
+# ses SendEmail refuses the inbound-receipt-rule send with 400 instead of accepting it with 200 and a MessageId
+
+> _Note: this issue was identified against the code base at commit `bcbd6f62c7a6624265f60a60785bdde46c891127`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+SendEmail
+
+## Description
+One cause, on service token ses.
+
+Cause 1 of 1: the SES v1 (Query) SendEmail handler answers HTTP 400 — a client-error refusal — with no SendEmailResponse at all, where AWS accepts the message with HTTP 200 and a freshly minted MessageId, for a send whose every precondition the same fixture had already established successfully (fixture ses-inbound-mail-published-by-receipt-rule-sns-action, step task#9).
+
+AWS: Smithy (com.amazonaws.ses#SendEmail) — input {Source @required (Address), Destination @required (Destination), Message @required (Message), ConfigurationSetName, ReplyToAddresses, ReturnPath, SourceArn, ReturnPathArn, Tags}, output SendEmailResponse{MessageId @required (MessageId)}, success status 200. Its only modeled errors are all client errors at HTTP 400: AccountSendingPausedException (awsQueryError AccountSendingPausedException), ConfigurationSetDoesNotExistException (awsQueryError ConfigurationSetDoesNotExist), ConfigurationSetSendingPausedException, MailFromDomainNotVerifiedException and MessageRejected. The operation's own documentation states exactly which requests it refuses: the message must be sent from a verified email address or domain, must name at least one recipient across To:/Cc:/Bcc:, must not exceed 50 recipients, must carry syntactically valid recipient addresses, and must stay inside the account's 24-hour sending quota. A request that breaks none of those is ACCEPTED: "Composes an email message and immediately queues it for sending", answering the required MessageId. Recorded behavior at this step: HTTP 200 with SendEmailResponse{SendEmailResult{MessageId}} and ResponseMetadata{RequestId}; both values are per-run and shape-asserted only, so no literal id or request id from the recording is part of the requirement. Every preceding step of the fixture answered exactly as recorded — the SNS topic, the SQS queue and its subscription, the receipt rule set with its SNS action and its activation, and the sending identity — so at the instant of the send the account holds a verified sending identity for the Source, names at least one well-formed recipient, is not sending-paused and is far inside the sandbox quota of 200 messages per 24 hours. AWS's answer to that request is 200 plus a MessageId.
+
+Emulator: the step answers status 400 and the body carries no SendEmailResponse element whatsoever (replay: "status: expected 200, got 400" and "$.SendEmailResponse: missing (expected {'SendEmailResult': {'MessageId': '<shaped-not-asserted>'}, 'ResponseMetadata': {'RequestId': '<shaped-not-asserted>'}}, got None)"). Because the recorded response for an accepted send carries no error members, the replay compared only the status and the response shape, so the refusal's Error.Code and Error.Message were not captured by this step — the observable divergence is the status class (400 where 200 is due) and the completely absent SendEmailResult/MessageId.
+
+Hypothesis (neither the model nor the recording states which of the handler's gates fired, because the recording has no error body to compare against): the refusal is one of the pre-send gates in services/service-com-amazonaws-ses-simpleemailservice/src/ops/send_email.rs, and the sender-verification gate is the most likely. That handler calls state.settle_identities(now) and then gates on state.is_verified_sender(&source), returning MessageRejected whose message is built by crate::state::unverified_identities_message — fixed text "Email address is not verified. The following identities failed the check in region ", then the request's credential-scope Region upper-cased, then ": ", then the comma-separated failing identities taken from the request (here the Source). An identity recorded by VerifyEmailIdentity/VerifyDomainIdentity is stored VerificationStatus::Pending with verification_due = now + IDENTITY_VERIFICATION_SPAN (3 s), and is_verified_sender is false until that instant passes, so a fixture that verifies the sender and sends promptly is refused where AWS accepts. The other 400 arms reachable in the same handler are MessageRejected "Destination must include at least one recipient address, across the ToAddresses, CcAddresses and BccAddresses fields", MessageRejected "Destination may include at most 50 recipients ... got <n>", MessageRejected crate::state::illegal_address_message ("Illegal address: <value> is not of the form UserName@[SubDomain.]Domain.TopLevelDomain"), MessageRejected crate::state::daily_quota_exceeded_message, AccountSendingPausedException "Email sending is disabled for this account. Enable it with UpdateAccountSendingEnabled.", ConfigurationSetDoesNotExistException "Configuration set <name> does not exist." and ConfigurationSetSendingPausedException "Email sending is disabled for configuration set <name>."; crate::service::authorization::authorize_send runs before them and can also refuse. Whichever fired, it fired for a request AWS accepts, so the gate's condition — not its message — is the defect.
+
+Why: a client that stands up a receipt rule set with an SNS action, activates it and then mails an address the active rule set matches gets a client error and no message id. The SDK reports a caller-side fault for a request that was valid, so the caller 'fixes' a correct request; nothing is queued, nothing is logged in the send log (so GetSendQuota/GetSendStatistics never move either), and the entire inbound-receiving leg of the scenario — the receipt rule firing, the SNS publish and the SQS delivery — is unreachable because the message that would trigger it was never accepted.
+
+Fix: the pre-send gates of the SES v1 SendEmail handler (services/service-com-amazonaws-ses-simpleemailservice/src/ops/send_email.rs) together with the identity state they read (services/service-com-amazonaws-ses-simpleemailservice/src/state.rs: verify_identity / settle_identities / is_verified_sender, and the IDENTITY_VERIFICATION_SPAN the Pending→Success move waits on) must admit a send whose Source this account has verified, whose Destination names at least one well-formed recipient, and which is inside the account's quota, and must answer 200 with SendEmailResponse.SendEmailResult.MessageId minted and appended to the send log. Related open issues cover neighbouring symptoms and none carries this fixture step's replay key, so none closes it: 20261109T232952Z-sesv2-sendemail-refuses-the-configuration-set-send-with.md records the same 400-instead-of-200 refusal on the SESv2 surface; 20261108T003043Z-lambda-sesv2-7-net-new-causes-sesv2-enforces.md (its 'SendEmail rejects verified identities' cause) records it from the behavioral corpus; 20261027T223115Z-s3-ses-sesv2-ses-email-receiving-never-runs.md covers the receiving leg that follows this step, and 20261109T155235Z-sqs-events-published-to-an-eventbridgev2-bus-are.md already owns this same fixture's downstream sqs steps.
+
+Traces: ses-inbound-mail-published-by-receipt-rule-sns-action#task#9.
+
+## Evidence
+Replay of trace set simparity-wire-aws-v1, fixture ses-inbound-mail-published-by-receipt-rule-sns-action, step task#9 (service ses, operation SendEmail), verdict mismatch:
+  status: expected 200, got 400
+  $.SendEmailResponse: missing (expected {'SendEmailResult': {'MessageId': '<shaped-not-asserted>'}, 'ResponseMetadata': {'RequestId': '<shaped-not-asserted>'}}, got None)
+
+Expected (AWS): HTTP 200 with SendEmailResponse/SendEmailResult/MessageId present (shape-asserted, value per-run) and ResponseMetadata/RequestId. Actual (emulator): HTTP 400 with no SendEmailResponse element at all — nothing accepted, no MessageId minted, nothing added to the send log.
+
+The cluster has no stub_path and no owned_by, so no filed issue carries this step's replay key.
+
+Downstream effect observed in the same fixture, listed only as consequence (both steps are already owned by 20261109T155235Z-sqs-events-published-to-an-eventbridgev2-bus-are.md and are NOT filed here): task#10 sqs GetQueueAttributes reports ApproximateNumberOfMessages '0' instead of '1' after 36 polls, and task#11 sqs ReceiveMessage returns an empty body instead of one Message.
+
+Supporting code: every HTTP-400 arm reachable in services/service-com-amazonaws-ses-simpleemailservice/src/ops/send_email.rs is a pre-send gate — crate::service::authorization::authorize_send; MessageRejected for an empty recipient set, for more than crate::state::MAX_RECIPIENTS (50) recipients, for a recipient failing crate::state::is_email_address, for a Source failing state.is_verified_sender (message from crate::state::unverified_identities_message: fixed text 'Email address is not verified. The following identities failed the check in region ' + Region upper-cased + ': ' + the failing identities from the request) and for the 24-hour quota; AccountSendingPausedException; ConfigurationSetDoesNotExistException; ConfigurationSetSendingPausedException. services/service-com-amazonaws-ses-simpleemailservice/src/state.rs stores a newly verified identity as VerificationStatus::Pending with verification_due = now + IDENTITY_VERIFICATION_SPAN (3 s), and is_verified_sender is false for the whole span.
+
+Not part of this issue and not asserted: the MessageId format, the RequestId value, timestamps, and the emulator's host/port.
+
+## Steps to Reproduce
+1. Build and boot the emulator from this checkout, then replay wire fixture ses-inbound-mail-published-by-receipt-rule-sns-action from trace set simparity-wire-aws-v1.
+2. Let the fixture's setup run to completion: the SNS topic, the SQS queue and its subscription to the topic, the SES receipt rule set with a rule whose action is the SNS action, the activation of that rule set, and the verification of the sending identity. Every one of these steps answers as recorded.
+3. Step task#9: call ses (v1 Query API) SendEmail with Source = the verified sender, Destination.ToAddresses = [the recipient the active receipt rule set matches], and Message = {Subject:{Data}, Body:{Text:{Data}}}.
+4. Observe HTTP 400 with no SendEmailResponse/SendEmailResult/MessageId in the body, where AWS answers HTTP 200 with a MessageId.
+5. Inspect the 400's ErrorResponse/Error/Code and /Message to see which pre-send gate fired (expected to be MessageRejected with 'Email address is not verified. The following identities failed the check in region <REGION>: <Source>'); the send must be ACCEPTED instead, returning 200 and a minted MessageId.
+6. Control for the identity-verification timing hypothesis: after verifying the sender, wait longer than IDENTITY_VERIFICATION_SPAN (3 s) and re-issue the same SendEmail. If it then returns 200, the gate is admitting the send only after an emulator-chosen delay that AWS does not impose on an already-verified identity.
