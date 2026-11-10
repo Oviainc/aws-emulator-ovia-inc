@@ -10056,6 +10056,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-s3",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -10065,13 +10066,17 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "pem",
+ "rcgen",
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
+ "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-wafv2-awswaf-20190729",
  "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "x509-cert",
 ]
 
 [[package]]

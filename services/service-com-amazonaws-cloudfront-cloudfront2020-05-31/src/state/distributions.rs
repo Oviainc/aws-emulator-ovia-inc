@@ -126,15 +126,15 @@ pub const MAX_INVALIDATION_MATCHES: usize = 4096;
 /// creates it takes tags — `CreateDistributionWithTags` and
 /// `CreateStreamingDistributionWithTags` through their `…ConfigWithTags` payload, and
 /// `CreateFunction`, `CreateConnectionFunction`, `CreateKeyValueStore`,
-/// `CreateAnycastIpList`, `CreateConnectionGroup` and `CreateDistributionTenant` through
-/// their `Tags` member (`smithy_query(query="operation", operation="…")`). Every other
-/// kind of CloudFront resource — a cache policy, an origin request policy, a response
-/// headers policy, an origin access control, a public key, a real-time log configuration,
-/// a continuous deployment policy, an origin access identity — is created by an operation
-/// that takes no tags at all, so its ARN names no taggable type.
+/// `CreateAnycastIpList`, `CreateConnectionGroup`, `CreateDistributionTenant` and
+/// `CreateTrustStore` through their `Tags` member (`smithy_query(query="operation",
+/// operation="…")`). Every other kind of CloudFront resource — a cache policy, an origin
+/// request policy, a response headers policy, an origin access control, a public key, a
+/// real-time log configuration, a continuous deployment policy, an origin access identity —
+/// is created by an operation that takes no tags at all, so its ARN names no taggable type.
 ///
 /// Sorted, so the list reads as the SET it is.
-pub const TAGGABLE_RESOURCE_TYPES: [&str; 8] = [
+pub const TAGGABLE_RESOURCE_TYPES: [&str; 9] = [
     "anycast-ip-list",
     "connection-function",
     "connection-group",
@@ -143,6 +143,7 @@ pub const TAGGABLE_RESOURCE_TYPES: [&str; 8] = [
     "function",
     "key-value-store",
     "streaming-distribution",
+    "trust-store",
 ];
 
 /// The resource TYPE an ARN names — the token its resource part opens with — or `None`

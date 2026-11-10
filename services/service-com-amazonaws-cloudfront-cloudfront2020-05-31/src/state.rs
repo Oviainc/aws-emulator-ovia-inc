@@ -48,7 +48,10 @@
 //!   endpoint has propagated, and `Deployed` after ([`PROPAGATION_DELAY`]);
 //! * an Anycast static IP list CloudFront has just created is `Deploying` until its
 //!   allocated addresses have been deployed, and `Deployed` after ([`PROPAGATION_DELAY`]),
-//!   and each of its IPAM CIDR configurations is provisioned on the same deadline.
+//!   and each of its IPAM CIDR configurations is provisioned on the same deadline;
+//! * a trust store CloudFront has just created is `pending` until the CA certificates
+//!   bundle it was built from has propagated to the edge locations, and `active` after
+//!   ([`PROPAGATION_DELAY`]).
 //!
 //! Each of them is materialised by
 //! [`ComAmazonawsCloudfrontCloudfront20200531State::settle`],
@@ -126,6 +129,20 @@ pub use connection_functions::*;
 /// keeps every name reachable as `crate::state::<name>`.
 pub mod realtime_log_configs;
 pub use realtime_log_configs::*;
+
+/// The TRUST STORE slice of this store: the trust store record, the id and ARN one is
+/// addressed by, the lookups every read goes through, and the modelled errors the trust
+/// store operations answer with. A SUBMODULE for the same reason [`functions`] is one;
+/// `pub use` keeps every name reachable as `crate::state::<name>`.
+pub mod trust_stores;
+pub use trust_stores::*;
+
+/// Reading the CA CERTIFICATES BUNDLE a trust store is built from, in the one object store
+/// this emulator holds: a trust store's certificate count is a property of that object's
+/// bytes, so it is read there rather than invented here. A SUBMODULE for the same reason
+/// [`functions`] is one; `pub use` keeps every name reachable as `crate::state::<name>`.
+pub mod ca_certificates_bundle;
+pub use ca_certificates_bundle::*;
 
 /// `Distribution$Status` while a configuration is still propagating to the edge
 /// locations. The model documents the terminal value — "When the status is `Deployed`,
@@ -3715,6 +3732,12 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// same reason as `distributions`: one stable total order for a listing to page
     /// through. Everything that reads or writes it lives in [`realtime_log_configs`].
     pub realtime_log_configs: BTreeMap<String, StoredRealtimeLogConfig>,
+    /// Every trust store this emulator holds, keyed by its minted id — the identifier every
+    /// trust store operation addresses one by (its name and its ARN resolve to the same
+    /// record). A `BTreeMap` for the same reason as `distributions`: one stable total order
+    /// for `ListTrustStores`'s `Marker` to index into. Everything that reads or writes it
+    /// lives in [`trust_stores`].
+    pub trust_stores: BTreeMap<String, StoredTrustStore>,
     /// The resource policy of every resource that carries one, keyed by the ARN of the
     /// resource it is attached to — the one identifier the resource-policy surface
     /// addresses a policy by, in all three of its operations, so a policy written under an

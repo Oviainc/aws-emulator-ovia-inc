@@ -122,7 +122,11 @@ fn web_acl_id(index: usize) -> &'static str {
 
 /// `WebACLId` travels as ONE `@httpLabel` path segment, so the separators inside an ARN are
 /// percent-encoded exactly as an SDK client encodes them.
-fn encode_label(value: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite whose own identifier travels as one path label (a trust
+/// store addressed by its ARN, say) encodes it through this one helper rather than carrying a
+/// second copy of the mapping.
+pub(crate) fn encode_label(value: &str) -> String {
     value
         .chars()
         .map(|character| match character {

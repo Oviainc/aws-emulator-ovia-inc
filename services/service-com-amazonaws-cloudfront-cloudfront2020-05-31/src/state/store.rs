@@ -32,6 +32,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         for streaming_distribution in self.streaming_distributions.values_mut() {
             streaming_distribution.settle(now);
         }
+        for trust_store in self.trust_stores.values_mut() {
+            trust_store.settle(now);
+        }
         for anycast_ip_list in self.anycast_ip_lists.values_mut() {
             anycast_ip_list.settle(now);
         }
@@ -1135,6 +1138,13 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         if let Some(list) = self.anycast_ip_lists.values().find(|list| list.arn == arn) {
             return Some(&list.tags);
         }
+        if let Some(trust_store) = self
+            .trust_stores
+            .values()
+            .find(|trust_store| trust_store.arn == arn)
+        {
+            return Some(&trust_store.tags);
+        }
         self.distribution_tenants
             .values()
             .find(|tenant| tenant.arn == arn)
@@ -1248,6 +1258,15 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|list| list.arn == arn)
         {
             return Some(&mut list.tags);
+        }
+        // The trust store arm: a trust store carries the tags its create submitted, so it
+        // is one of the resource kinds a tagging call addresses by ARN.
+        if let Some(trust_store) = self
+            .trust_stores
+            .values_mut()
+            .find(|trust_store| trust_store.arn == arn)
+        {
+            return Some(&mut trust_store.tags);
         }
         // The distribution tenant arm, so a tagging call and a tag read agree about every
         // resource kind this store holds and tags.

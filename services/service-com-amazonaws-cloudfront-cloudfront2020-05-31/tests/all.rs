@@ -309,6 +309,8 @@ mod tenant_web_acl_association;
 mod tenant_web_acl_association_scope;
 #[path = "all/tenant_web_acl_disassociation_scope.rs"]
 mod tenant_web_acl_disassociation_scope;
+#[path = "all/trust_store_lifecycle.rs"]
+mod trust_store_lifecycle;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
 #[path = "all/verify_dns_configuration.rs"]

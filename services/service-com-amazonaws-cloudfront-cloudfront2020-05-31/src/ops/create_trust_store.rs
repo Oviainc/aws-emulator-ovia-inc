@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrustStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrustStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrustStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Creates a trust store": READS the CA certificates bundle the request names in the one
+//! object store this emulator holds, counts the certificates it carries, and persists the
+//! trust store built from it — its minted id, the ARN built from that id, its first version
+//! token and the tags submitted with it. The trust store starts `pending`, and the CLOCK
+//! owes it `active`.
+//!
+//! `TrustStore$NumberOfCaCertificates` is a property of the bundle's bytes, so a create that
+//! could not read a bundle is REFUSED rather than stored: an address this emulator's Amazon
+//! S3 holds nothing at is `EntityNotFound`, an address it may not read is `AccessDenied`, and
+//! a source that addresses no object or whose bytes hold no certificate is `InvalidArgument`
+//! ([`crate::state::ca_certificates_bundle`]). Where NOTHING answers the read — an emulator
+//! assembled with no object store at all — the operation answers the scaffold's 501 instead,
+//! because the caller's bundle is not what is at fault. No trust store is ever stored
+//! reporting certificates nothing counted.
+//!
+//! A trust store NAME identifies one trust store for its whole life, so a name the account
+//! already holds is refused with `EntityAlreadyExists` rather than creating a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +86,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::{CaCertificatesBundle, StoredTrustStore};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -151,18 +164,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrustStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrustStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrustStore"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        // A tag set no resource can carry (one key named twice, or more tags than a
+        // resource may hold) is refused with this operation's own tagging error — "The
+        // tagging specified is not valid" — before anything is read or minted. The rule is
+        // the service's one tagging rule, shared with every tagged resource.
+        let tags = input
+            .tags
+            .as_ref()
+            .map(crate::state::tag_set)
+            .transpose()
+            .map_err(|reason| {
+                CreateTrustStoreErrorModeled::InvalidTagging(crate::state::invalid_tagging(reason))
+            })?
+            .unwrap_or_default();
+
+        // The bundle is READ first, before the store is touched at all: the certificate
+        // count this create answers with is a property of that object's bytes, so there is
+        // nothing to persist until it is known. No store lock is held across the read.
+        let bundle =
+            crate::state::resolve_ca_certificates_bundle(ctx, &input.ca_certificates_bundle_source)
+                .await;
+        let number_of_ca_certificates = match bundle {
+            CaCertificatesBundle::Counted(counted) => counted,
+            // The object store answered that it holds nothing at the address the request
+            // named, so the entity the request pointed at was not found.
+            CaCertificatesBundle::Absent => {
+                return Err(CreateTrustStoreErrorModeled::EntityNotFound(
+                    crate::state::ca_certificates_bundle_not_found(),
+                )
+                .into())
+            }
+            // The object store answered that the bundle may not be read, which is not a
+            // statement about whether it is there.
+            CaCertificatesBundle::Denied => {
+                return Err(CreateTrustStoreErrorModeled::AccessDenied(
+                    crate::state::ca_certificates_bundle_access_denied(),
+                )
+                .into())
+            }
+            // The source addresses no object at all, the object is empty or past what this
+            // emulator reads, its bytes hold no certificate, or the store answered something
+            // no bundle can be read through: either way there is no bundle to build a trust
+            // store from, so nothing is stored and the argument is what is refused.
+            CaCertificatesBundle::Invalid => {
+                return Err(CreateTrustStoreErrorModeled::InvalidArgument(
+                    crate::state::invalid_ca_certificates_bundle(),
+                )
+                .into())
+            }
+            // NOTHING answered the read: no object store is mounted to ask, or the bytes
+            // never arrived. The caller's bundle may well be a good one, so the request is
+            // neither refused as invalid nor answered with a trust store whose certificates
+            // were never counted — this emulator simply cannot serve the operation as
+            // assembled, which is what the scaffold's 501 channel states.
+            CaCertificatesBundle::Unanswered => {
+                return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                    crate::scaffolded::NotImplemented {
+                        message: crate::state::CA_CERTIFICATES_BUNDLE_UNREAD.to_string(),
+                    },
+                ))
+            }
+        };
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // A name identifies one trust store for its whole life, so a name the account
+        // already holds cannot name a second one. Checked BEFORE anything is minted.
+        if store.holds_trust_store_named(&input.name) {
+            return Err(CreateTrustStoreErrorModeled::EntityAlreadyExists(
+                crate::state::trust_store_already_exists(),
+            )
+            .into());
+        }
+
+        // "The entity limit has been exceeded." The store grows only here and a trust store
+        // record is what every later read answers from, so the bound is an entry count
+        // refused before the insert.
+        if store.trust_stores.len() >= crate::state::MAX_TRUST_STORES {
+            return Err(CreateTrustStoreErrorModeled::EntityLimitExceeded(
+                EntityLimitExceeded {
+                    message: Some(format!(
+                        "This emulator holds at most {} trust stores; delete one before \
+                         creating another",
+                        crate::state::MAX_TRUST_STORES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.allocate_trust_store_id();
+        let etag = store.next_etag();
+        let stored = StoredTrustStore {
+            arn: crate::state::trust_store_arn(&id),
+            id,
+            name: input.name,
+            // A trust store CloudFront has just accepted is not serving viewer requests
+            // yet, so it reports the transient status until the clock owes it the terminal
+            // one.
+            status: crate::state::TRUST_STORE_STATUS_PENDING.to_string(),
+            active_due: now + crate::state::PROPAGATION_DELAY,
+            number_of_ca_certificates,
+            last_modified_time: now,
+            use_client_certificate_ocsp_endpoint: input
+                .use_client_certificate_ocsp_endpoint
+                .unwrap_or(crate::state::DEFAULT_USE_CLIENT_CERTIFICATE_OCSP_ENDPOINT),
+            bundle_source: input.ca_certificates_bundle_source,
+            etag: etag.clone(),
+            // Held as the one tag representation every tagged resource uses, so the tagging
+            // surface reads this very set rather than a second copy of it.
+            tags,
+        };
+        let trust_store = stored.to_trust_store();
+        store.trust_stores.insert(stored.id.clone(), stored);
+
+        Ok(CreateTrustStoreOutput {
+            // "The trust store" — the record just stored, never the request being served.
+            trust_store: Some(trust_store),
+            // "The version identifier for the current version of the trust store" — the
+            // token an `If-Match` against this trust store is checked against.
+            e_tag: Some(etag),
+        })
     }
 }
