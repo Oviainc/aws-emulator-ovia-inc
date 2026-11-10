@@ -38,9 +38,32 @@ whatlang = "0.18"
 # Reads and rewrites the Office Open XML package a Word document
 # TranslateDocument translates is (src/ops/translate_document.rs).
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# Amazon S3 client a batch translation job reads its input documents with, and
+# writes each translation back with (src/state/batch_translation.rs). The client
+# itself is built by `service-common`, over the in-process callback into this
+# same emulator; this declaration is for the request and stream types that plane
+# names. No network client feature is enabled: the transport is the emulator's
+# own.
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "behavior-version-latest",
+] }
+# The ONE in-process Amazon S3 client construction every emulated service that
+# reads or writes an object goes through (`service_common::s3_client`), so this
+# service configures that hop no differently from any other.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The batch translation suite mounts Amazon S3 beside this service on ONE
+# engine: a job reads the documents a test uploaded and writes the translations
+# the test reads back.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# `tokio::time::sleep` is how a test waits out the phase the clock owes a
+# submitted job before it reaches its terminal status.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

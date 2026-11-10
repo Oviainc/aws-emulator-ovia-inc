@@ -15,6 +15,13 @@
 //! translate operations share — resolving a requested terminology, substituting
 //! its terms and marking the output as synthetic — lives here too, so `Text`
 //! and a document of the same text are translated by one rule.
+//!
+//! The service's other resource is the asynchronous batch translation job
+//! `StartTextTranslationJob` submits and `DescribeTextTranslationJob` and
+//! `StopTextTranslationJob` read back. Its record, the status the clock owes
+//! it, and the data plane that reads its input documents out of object storage
+//! and writes their translations back, live in [`batch_translation`] — which
+//! translates a document with that same shared transform.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -27,6 +34,13 @@ use crate::ops::types::{
     TerminologyProperties, TextSizeLimitExceededException, TooManyTagsException,
     TranslationSettings, UnsupportedLanguagePairException,
 };
+
+/// The asynchronous batch translation jobs this service runs: the stored
+/// record, the status the clock owes it and the data plane that reads and
+/// writes the documents.
+pub mod batch_translation;
+
+use batch_translation::TranslationJob;
 
 /// The ARN namespace this service stamps into every resource ARN: `translate`
 /// (`awsService.arnNamespace`, `smithy_query query=service_info`).
@@ -376,6 +390,9 @@ pub struct ComAmazonawsTranslateAwsshinefrontendservice20170701State {
     /// so `ListTerminologies` enumerates them in one stable order and its
     /// `NextToken` can resume strictly after the name a page ended on.
     pub terminologies: BTreeMap<String, Terminology>,
+    /// Every submitted batch translation job, keyed by its `JobId`. A
+    /// [`BTreeMap`] so a listing enumerates them in one stable order.
+    pub jobs: BTreeMap<String, TranslationJob>,
 }
 
 impl ComAmazonawsTranslateAwsshinefrontendservice20170701State {
@@ -397,6 +414,17 @@ impl ComAmazonawsTranslateAwsshinefrontendservice20170701State {
     pub fn terminology_name_for_arn(&self, arn: &str) -> Option<String> {
         self.terminology_for_arn(arn)
             .map(|record| record.name.clone())
+    }
+
+    /// The stored job a submission's `ClientToken` already started, if any.
+    ///
+    /// `ClientToken` is "a unique identifier for the request", so a repeated
+    /// submission of one token names the job that submission already started
+    /// rather than starting a second one.
+    pub fn job_for_client_token(&self, client_token: &str) -> Option<&TranslationJob> {
+        self.jobs
+            .values()
+            .find(|job| job.client_token == client_token)
     }
 }
 
@@ -772,21 +800,46 @@ pub fn resolve_terminologies(
             .terminologies
             .get(name)
             .ok_or_else(|| name.clone())?;
-        let mut pairs: Vec<(String, String)> = record
-            .term_pairs(source_language_code, target_language_code)
-            .into_iter()
-            .map(|(source, target)| (source.to_string(), target.to_string()))
-            .collect();
-        // Longest source text first, so a phrase is substituted as a phrase
-        // rather than word by word.
-        pairs.sort_by(|left, right| right.0.len().cmp(&left.0.len()).then(left.0.cmp(&right.0)));
         resolved.push(ResolvedTerminology {
             name: record.name.clone(),
-            pairs,
+            pairs: resolved_pairs(record, source_language_code, target_language_code),
         });
     }
     Ok(resolved)
 }
+
+/// The `(source text, target text)` pairs one stored terminology provides for
+/// a language pair, longest source first so a longer phrase wins over a word
+/// inside it — which is what makes a phrase substituted as a phrase rather than
+/// word by word.
+pub fn resolved_pairs(
+    record: &Terminology,
+    source_language_code: &str,
+    target_language_code: &str,
+) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = record
+        .term_pairs(source_language_code, target_language_code)
+        .into_iter()
+        .map(|(source, target)| (source.to_string(), target.to_string()))
+        .collect();
+    pairs.sort_by(|left, right| right.0.len().cmp(&left.0.len()).then(left.0.cmp(&right.0)));
+    pairs
+}
+
+/// How many bytes one substitution pass may COMPARE against the stored terms.
+///
+/// At each word start the scan attempts the stored terms that can begin there,
+/// and one attempt costs at most that term's own length — so the work is the
+/// product of the text's length, how many terms begin with the byte at a
+/// position, and how long those terms are. Bounding each factor on its own
+/// leaves that product free: a terminology whose terms all share a long prefix
+/// with the request's text would make one request compare for far longer than
+/// the answer it produces. This bounds the product. A pass that reaches the
+/// bound stops exactly where it stops when the output ceiling is reached, which
+/// the calling operation refuses, rather than running on. The bound is this
+/// emulator's own, and it is far above what a terminology of the documented
+/// size costs over text of the documented size.
+pub const MAX_MATCH_COMPARISON_BYTES: usize = 64 * 1024 * 1024;
 
 /// Substitute every terminology term that occurs in `text` as a whole word, and
 /// report the pairs that matched in the order they first occur in the source
@@ -795,7 +848,10 @@ pub fn resolve_terminologies(
 /// A term matches only at a word boundary, so a terminology for `hello` does not
 /// rewrite the middle of `othello`, and a multi-word phrase matches as a phrase.
 /// The scan is a single left-to-right pass over the text against at most one
-/// terminology's terms.
+/// terminology's terms: a term can only match where its first byte does, so a
+/// position attempts the terms indexed under the byte it is at rather than the
+/// whole table, and the bytes those attempts compare are bounded by
+/// [`MAX_MATCH_COMPARISON_BYTES`].
 ///
 /// `budget` is how many characters the substituted text may still grow to.
 /// Substituting a term EMITS text rather than copying it, so without a ceiling
@@ -807,26 +863,57 @@ pub fn substitute<'t>(
     pairs: &'t [(String, String)],
     budget: usize,
 ) -> (String, Vec<(&'t str, &'t str)>, bool) {
+    // Which terms can begin at a given byte, each list in the order the caller
+    // sorted the terms in (longest source first), so the first candidate that
+    // matches here is the same one the whole table would have yielded. A term
+    // with no source text indexes under no byte, which is the term that could
+    // never match.
+    let mut by_first_byte: BTreeMap<u8, Vec<(&'t str, &'t str)>> = BTreeMap::new();
+    for (source, target) in pairs {
+        if let Some(first) = source.as_bytes().first() {
+            by_first_byte
+                .entry(*first)
+                .or_default()
+                .push((source.as_str(), target.as_str()));
+        }
+    }
+
     let mut translated = String::new();
     let mut emitted = 0usize;
+    let mut comparable = MAX_MATCH_COMPARISON_BYTES;
     let mut applied: Vec<(&'t str, &'t str)> = Vec::new();
     let mut remaining = text;
     let mut previous: Option<char> = None;
 
     while !remaining.is_empty() {
         let at_word_start = previous.is_none_or(|character| !character.is_alphanumeric());
-        let matched = if at_word_start {
-            pairs.iter().find_map(|(source, target)| {
-                let tail = remaining.strip_prefix(source.as_str())?;
-                let ends_word = tail
-                    .chars()
-                    .next()
-                    .is_none_or(|character| !character.is_alphanumeric());
-                (!source.is_empty() && ends_word).then_some((source.as_str(), target.as_str()))
-            })
-        } else {
-            None
-        };
+        let candidates = remaining
+            .as_bytes()
+            .first()
+            .filter(|_| at_word_start)
+            .and_then(|first| by_first_byte.get(first));
+        let mut matched = None;
+        for (source, target) in candidates.into_iter().flatten().copied() {
+            // One attempt costs at most the term's own length, and it is
+            // charged BEFORE the attempt is made, so the comparison work of
+            // one pass is bounded whatever the stored terms look like.
+            let cost = source.len().min(remaining.len());
+            if comparable < cost {
+                return (translated, applied, true);
+            }
+            comparable -= cost;
+            let Some(tail) = remaining.strip_prefix(source) else {
+                continue;
+            };
+            let ends_word = tail
+                .chars()
+                .next()
+                .is_none_or(|character| !character.is_alphanumeric());
+            if ends_word {
+                matched = Some((source, target));
+                break;
+            }
+        }
 
         match matched {
             Some((source, target)) => {
