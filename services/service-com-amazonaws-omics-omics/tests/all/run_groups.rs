@@ -19,6 +19,11 @@
 //!   * a replayed `requestId` answers with the group the first call created rather than
 //!     minting a second one, and changes nothing about it;
 //! * an id no group holds is the modelled 404, however the id is shaped;
+//! * `ListRunGroups` reports every persisted group in creation order, each item's members
+//!   read from the same record `GetRunGroup` reports and nothing its own shape does not
+//!   model; `maxResults` bounds a page and only a page with more behind it carries the
+//!   `nextToken` that resumes exactly there; `name` narrows the listing to the groups
+//!   carrying exactly that name; and a token this listing never issued is refused;
 //! * a run may join a group this emulator holds: the run records the group's canonical id,
 //!   `ListRuns` narrows on it, and an id no group holds is the modelled 404 there too.
 
@@ -605,5 +610,288 @@ async fn a_run_joins_a_run_group_this_emulator_holds() {
         error_code(&response),
         "ResourceNotFoundException",
         "an unheld runGroupId must be ResourceNotFoundException from ListRuns, got {response:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ListRunGroups
+// ---------------------------------------------------------------------------
+
+/// `GET /runGroup{query}`.
+async fn list_groups(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
+    call(router, "GET", &format!("/runGroup{query}"), None).await
+}
+
+/// Every member `RunGroupListItem` models, so each is asserted against the one record
+/// `GetRunGroup` reports rather than against whichever member a single row happened to
+/// carry.
+/// Source: `smithy_query(query="shape",shape="RunGroupListItem")` -> arn | id | name |
+/// maxCpus | maxRuns | maxDuration | creationTime | maxGpus.
+const LIST_ITEM_MEMBERS: &[&str] = &[
+    "arn",
+    "id",
+    "name",
+    "maxCpus",
+    "maxRuns",
+    "maxDuration",
+    "creationTime",
+    "maxGpus",
+];
+
+/// Members `RunGroupListItem` does NOT model, so a listed item carries none of them
+/// however much the group holds.
+/// Source: the same shape, which models no `tags` member.
+const NOT_ON_A_LIST_ITEM: &[&str] = &["tags"];
+
+/// The `id` of each item of a listing page, in the order the page carried them.
+fn listed_ids(page: &[Value]) -> Vec<String> {
+    page.iter()
+        .map(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("<no id>")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Walk `ListRunGroups` from the first page to the last at `page_size`, answering every
+/// id it reported in order. Polls the token the listing itself issued, so what is
+/// asserted is that the pages concatenate to the whole collection.
+async fn walk_listing(
+    router: &MultiServiceRouter,
+    case: &str,
+    query: &str,
+    page_size: usize,
+    total: usize,
+) -> Vec<String> {
+    let mut seen = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let paged = match &token {
+            Some(token) => format!("?maxResults={page_size}&startingToken={token}{query}"),
+            None => format!("?maxResults={page_size}{query}"),
+        };
+        let (status, body) = list_groups(router, &paged).await;
+        let page = items(case, status, &body);
+        assert!(
+            page.len() <= page_size,
+            "case {case:?}: a page of at most {page_size} carried {} items",
+            page.len()
+        );
+        seen.extend(listed_ids(&page));
+        pages += 1;
+        assert!(
+            pages <= total + 1,
+            "case {case:?}: paging did not terminate after {pages} pages"
+        );
+        match body.get("nextToken").and_then(Value::as_str) {
+            Some(next) => token = Some(next.to_string()),
+            None => break,
+        }
+    }
+    seen
+}
+
+#[tokio::test]
+async fn list_run_groups_reports_every_persisted_group_and_pages_over_it() {
+    let router = emulator();
+
+    // An empty registry is an empty page, not a refusal and not a token.
+    let (status, body) = list_groups(&router, "").await;
+    let page = items("an empty registry", status, &body);
+    assert!(
+        page.is_empty(),
+        "an empty registry must list no groups, got {body:?}"
+    );
+    assert!(
+        body.get("nextToken").is_none(),
+        "an empty page must carry no nextToken, got {body:?}"
+    );
+
+    // The same table the create/read-back case uses, so the listing is asserted over the
+    // whole class of groups: named and unnamed, uncapped, capped on each member at each
+    // published bound, and tagged.
+    let cases = group_cases();
+    let mut created = Vec::new();
+    for group in &cases {
+        let (status, body) = create_group(&router, &request_for(group)).await;
+        created.push(created_group_id(&group.case, status, &body));
+    }
+
+    // The rule generalises over the page size: the pages concatenate to the whole
+    // registry in creation order, whatever size is asked for, and only a page with more
+    // behind it carries a nextToken.
+    for page_size in [1usize, 2, 3, 7, cases.len(), 100] {
+        let case = format!("page size {page_size}");
+        let seen = walk_listing(&router, &case, "", page_size, cases.len()).await;
+        assert_eq!(
+            seen, created,
+            "case {case:?}: expected every run group in creation order, got {seen:?}"
+        );
+    }
+
+    // A page that exactly exhausts the registry has nothing behind it, so it carries no
+    // token to resume from.
+    let (status, body) = list_groups(&router, &format!("?maxResults={}", cases.len())).await;
+    let page = items("an exact fit", status, &body);
+    assert_eq!(
+        page.len(),
+        cases.len(),
+        "an exact fit must carry every group, got {body:?}"
+    );
+    assert!(
+        body.get("nextToken").is_none(),
+        "a page with nothing behind it must carry no nextToken, got {body:?}"
+    );
+
+    // Every member of every item comes from the ONE record the reader reports, and the
+    // item carries nothing its own shape does not model.
+    let (status, body) = list_groups(&router, "").await;
+    let page = items("the whole registry", status, &body);
+    for (group, (id, item)) in cases.iter().zip(created.iter().zip(&page)) {
+        let (status, stored) = get_group(&router, id).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected 200 from GetRunGroup, got {stored:?}",
+            group.case
+        );
+        for member in LIST_ITEM_MEMBERS {
+            assert_eq!(
+                item.get(*member),
+                stored.get(*member),
+                "case {:?}: the listed {member} must be the one GetRunGroup reports, got \
+                 {:?} against {stored:?}",
+                group.case,
+                item.get(*member)
+            );
+        }
+        assert_absent(&group.case, NOT_ON_A_LIST_ITEM, item);
+    }
+
+    // A token this operation never issued is a bad request, not a page — however it is
+    // shaped.
+    for token in ["not-a-token", "rg_", "run_6a6f", "wf_zz"] {
+        let (status, body) = list_groups(&router, &format!("?startingToken={token}")).await;
+        assert_eq!(
+            status, 400,
+            "case {token:?}: an unissued startingToken must be refused, got {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {token:?}: expected ValidationException, got {body:?}"
+        );
+    }
+
+    // And the token this listing DID issue resumes only this listing: handed to another
+    // collection's, it is refused rather than read as a resume point into it.
+    let (status, body) = list_groups(&router, "?maxResults=1").await;
+    items("the first page", status, &body);
+    let group_token = body
+        .get("nextToken")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("expected a ListRunGroups nextToken, got {body:?}"))
+        .to_string();
+    let (status, body) = list_groups(&router, &format!("?startingToken={group_token}")).await;
+    assert_eq!(
+        status, 200,
+        "a ListRunGroups token must resume ListRunGroups, got {body:?}"
+    );
+    let (status, body) = list_runs(&router, &format!("?startingToken={group_token}")).await;
+    assert_eq!(
+        status, 400,
+        "a ListRunGroups token must not resume ListRuns, got {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "expected ValidationException from ListRuns, got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_run_groups_honours_its_name_filter() {
+    let router = emulator();
+
+    // Rows differing along what the filter keys on: a name two groups share, a name one
+    // group carries, a name that is a prefix of another, a name differing only in case,
+    // and a group carrying no name at all. Every name here is query-safe, so the request
+    // asserts the filter and not a URI encoding; the whole modelled `RunGroupName`
+    // character class is exercised by the create/read-back table above.
+    let names: Vec<Option<&str>> = vec![
+        Some("alpha"),
+        Some("beta"),
+        Some("alpha"),
+        None,
+        Some("alphabet"),
+        Some("Alpha"),
+        Some("gamma.2-x"),
+    ];
+
+    let mut created: Vec<(Option<&str>, String)> = Vec::new();
+    for (n, name) in names.iter().enumerate() {
+        let case = format!("group {n} named {name:?}");
+        let mut body = Map::new();
+        body.insert("requestId".to_string(), Value::String(format!("filter-{n}")));
+        if let Some(name) = name {
+            body.insert("name".to_string(), Value::String((*name).to_string()));
+        }
+        let (status, response) = create_group(&router, &Value::Object(body)).await;
+        created.push((*name, created_group_id(&case, status, &response)));
+    }
+
+    // One row per name asked for, plus a name nothing carries: the filter answers exactly
+    // the groups whose stored name equals it, in creation order, and matches no other
+    // spelling of it.
+    let asked = [
+        "alpha",
+        "beta",
+        "alphabet",
+        "Alpha",
+        "gamma.2-x",
+        "alph",
+        "delta",
+    ];
+    for name in asked {
+        let expected: Vec<String> = created
+            .iter()
+            .filter(|(stored, _)| *stored == Some(name))
+            .map(|(_, id)| id.clone())
+            .collect();
+        let (status, body) = list_groups(&router, &format!("?name={name}")).await;
+        let page = items(name, status, &body);
+        assert_eq!(
+            listed_ids(&page),
+            expected,
+            "case {name:?}: expected exactly the groups carrying that name, got {body:?}"
+        );
+        // The filter survives paging: one group per page concatenates to the same answer.
+        let seen = walk_listing(
+            &router,
+            &format!("{name} one per page"),
+            &format!("&name={name}"),
+            1,
+            created.len(),
+        )
+        .await;
+        assert_eq!(
+            seen, expected,
+            "case {name:?}: a filtered listing must page over the same groups, got {seen:?}"
+        );
+    }
+
+    // Unfiltered, every group is still there — the filter narrowed the answer without
+    // changing what a later caller sees.
+    let (status, body) = list_groups(&router, "").await;
+    let page = items("unfiltered", status, &body);
+    assert_eq!(
+        listed_ids(&page),
+        created
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect::<Vec<String>>(),
+        "an unfiltered listing must report every group in creation order, got {body:?}"
     );
 }

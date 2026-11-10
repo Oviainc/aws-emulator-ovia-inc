@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRunGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRunGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRunGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the persisted run groups as `items`, honouring the `name` filter and the
+//! `maxResults`/`startingToken` page bounds. Reporting-only: every member of every item
+//! is read from the one stored record `CreateRunGroup` wrote and `GetRunGroup` reports,
+//! and nothing in the store is changed.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +121,42 @@ impl From<ListRunGroupsErrorModeled> for ListRunGroupsError {
     }
 }
 
+/// A page token naming the run group the NEXT page starts at. The codec and the page
+/// bound are [`crate::state::encode_page_token`] / [`crate::state::decode_page_token`]
+/// and [`crate::state::MAX_LIST_PAGE_SIZE`], shared with this crate's other listings;
+/// this wrapper only renders an unreadable token as THIS operation's 400 refusal.
+fn decode_page_token(token: &str) -> Result<u64, ListRunGroupsError> {
+    crate::state::decode_page_token(crate::state::RUN_GROUP_PAGE_TOKEN_TAG, token).ok_or_else(
+        || {
+            // This operation declares its own `ValidationException`, so the refusal
+            // carries the SERVICE's shape rather than the scaffold channel's synthetic
+            // one.
+            ListRunGroupsErrorModeled::ValidationException(ValidationException {
+                message: "startingToken is not a pagination token issued by ListRunGroups"
+                    .to_string(),
+            })
+            .into()
+        },
+    )
+}
+
+/// One stored run group as this listing's item: every member `RunGroupListItem` models,
+/// read from that record alone, so an item and `GetRunGroup` cannot disagree about the
+/// group, and a cap the create left unset is reported unset rather than as a zero the
+/// group never enforced.
+fn reported(group: &crate::state::RunGroup) -> RunGroupListItem {
+    RunGroupListItem {
+        arn: Some(group.arn.clone()),
+        id: Some(group.id.clone()),
+        name: group.name.clone(),
+        max_cpus: group.max_cpus,
+        max_runs: group.max_runs,
+        max_duration: group.max_duration,
+        max_gpus: group.max_gpus,
+        creation_time: Some(crate::state::timestamp(group.creation_time_ms)),
+    }
+}
+
 /// The `ListRunGroups` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,18 +193,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRunGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRunGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRunGroups"))
+        // Every branch below records the call through `crate::state::audit`, so one log
+        // reader sees the whole slice's traffic and not only its state changes. A listing
+        // resolves no single resource, so its records carry
+        // `crate::state::AUDIT_NO_RESOURCE`.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            ListRunGroupsErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics run group registry is unavailable".to_string(),
+            })
+        })?;
+
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_LIST_PAGE_SIZE, |requested| {
+                requested.clamp(1, crate::state::MAX_LIST_PAGE_SIZE as i32) as usize
+            });
+        let start = match input.starting_token.as_deref().map(decode_page_token) {
+            Some(Err(refusal)) => {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                    None,
+                );
+                return Err(refusal);
+            }
+            Some(Ok(start)) => start,
+            None => 0,
+        };
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        // Reserve no more than the registry can actually yield.
+        let mut items = Vec::with_capacity(page_size.min(registry.run_groups.len()));
+        let mut next_token = None;
+        // The store's key order IS creation order, so the walk is stable across calls and
+        // a token simply names the id the next page resumes at.
+        for (key, group) in registry.run_groups.range(start..) {
+            // `name` narrows the listing to the groups carrying exactly that name; a
+            // group the create left unnamed matches no requested name at all.
+            if input
+                .name
+                .as_deref()
+                .is_some_and(|name| group.name.as_deref() != Some(name))
+            {
+                continue;
+            }
+            // The first group that does not fit becomes the next page's start, and only
+            // then is a `nextToken` emitted — the last page carries none.
+            if items.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::RUN_GROUP_PAGE_TOKEN_TAG,
+                    *key,
+                ));
+                break;
+            }
+            items.push(reported(group));
+        }
+
+        crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::Reported, None);
+
+        Ok(ListRunGroupsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

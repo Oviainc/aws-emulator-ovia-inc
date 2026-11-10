@@ -7,7 +7,7 @@
 //! **versions** of that workflow (`CreateWorkflowVersion` / `GetWorkflowVersion`), the
 //! **run** started from it (`StartRun` / `GetRun` / `ListRuns` / `DeleteRun`), the
 //! **run group** that caps the compute those runs may use (`CreateRunGroup` /
-//! `GetRunGroup`), the **run cache** a run reads task outputs from (`CreateRunCache` /
+//! `GetRunGroup` / `ListRunGroups`), the **run cache** a run reads task outputs from (`CreateRunCache` /
 //! `GetRunCache`) and the **sequence store** that holds read sets
 //! (`CreateSequenceStore` / `GetSequenceStore`). Each resource is stored exactly once, keyed by the numeric id
 //! the model's `^[0-9]+$` patterns describe (a version by its name, inside its
@@ -922,10 +922,10 @@ pub fn numeric_id(id: &str) -> Option<u64> {
 /// The largest page either of this crate's listings will ever build, and the page size
 /// applied when a request omits `maxResults`.
 ///
-/// It is the maximum of the modelled `maxResults` range (1..100) that `ListRuns` and
-/// `ListWorkflows` share, stated once here. Each handler clamps to it, so the page it
-/// allocates is decided by the server, never by the request — the handlers do not rely
-/// on the centralized walk having refused a larger value.
+/// It is the maximum of the modelled `maxResults` range (1..100) that `ListRuns`,
+/// `ListWorkflows` and `ListRunGroups` share, stated once here. Each handler clamps to
+/// it, so the page it allocates is decided by the server, never by the request — the
+/// handlers do not rely on the centralized walk having refused a larger value.
 pub const MAX_LIST_PAGE_SIZE: usize = 100;
 
 /// The tag a `ListRuns` page token carries, so a token issued by another listing is
@@ -934,6 +934,9 @@ pub const RUN_PAGE_TOKEN_TAG: &str = "run_";
 
 /// The same, for `ListWorkflows`.
 pub const WORKFLOW_PAGE_TOKEN_TAG: &str = "wf_";
+
+/// The same, for `ListRunGroups`.
+pub const RUN_GROUP_PAGE_TOKEN_TAG: &str = "rg_";
 
 /// The same, for `ListWorkflowVersions`. A version is keyed by its NAME inside its
 /// workflow, so that listing's token names a name rather than a numeric id; the tag is
