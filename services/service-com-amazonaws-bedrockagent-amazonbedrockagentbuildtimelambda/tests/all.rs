@@ -57,6 +57,8 @@ mod knowledge_base_listing;
 mod managed_connector_defaults;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_reports_the_transitional_status.rs"]
+mod update_reports_the_transitional_status;
 #[path = "all/update_round_trip.rs"]
 mod update_round_trip;
 #[path = "all/vector_store_binding.rs"]

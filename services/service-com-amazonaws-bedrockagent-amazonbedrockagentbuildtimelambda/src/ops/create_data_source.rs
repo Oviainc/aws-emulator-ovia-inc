@@ -211,6 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut data_source_configuration = input.data_source_configuration;
         crate::state::complete_connector_defaults(&mut data_source_configuration);
         let connects_out = crate::state::connects_to_an_external_source(&data_source_configuration);
+        // The status this configuration settles at, by the rule every call that
+        // stores a configuration settles it by.
+        let settled = crate::state::settled_data_source_status(&data_source_configuration);
 
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
@@ -307,18 +310,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: if connects_out {
                 crate::state::DataSourceStatus::Creating
             } else {
-                crate::state::DataSourceStatus::Available
+                settled
             },
-            // That outcome is FAILED: this emulator runs no connector, so a
-            // connection to a source outside it never comes up, and reporting
-            // the data source ready to ingest from a source nothing ever read
-            // would be a readiness it does not have.
-            pending_status: connects_out.then(|| {
-                (
-                    now + crate::state::DATA_SOURCE_VALIDATION_SPAN,
-                    crate::state::DataSourceStatus::Failed,
-                )
-            }),
+            // That outcome is the status this configuration settles at, which
+            // for a source outside the emulator is FAILED: nothing here runs a
+            // connector, so a connection to such a source never comes up, and
+            // reporting the data source ready to ingest from a source nothing
+            // ever read would be a readiness it does not have.
+            pending_status: connects_out
+                .then(|| (now + crate::state::DATA_SOURCE_VALIDATION_SPAN, settled)),
             // Nothing has been deleted: a removal is owed only once a delete is
             // accepted for this data source or for the knowledge base that
             // contains it.

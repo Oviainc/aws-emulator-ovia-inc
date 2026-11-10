@@ -58,6 +58,14 @@
 //! outcome on the CLOCK alone, through
 //! [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::materialise_due_transitions`].
 //!
+//! A mutation the service ACCEPTS rather than completes inside the call puts the
+//! resource in the modelled transient status its own status enum declares for a
+//! change in flight — `UPDATING` for both a knowledge base and a data source —
+//! and leaves the settled status to the clock, by the same
+//! `pending_status` seam a create uses. What a data source's stored
+//! configuration settles at is [`settled_data_source_status`], so a create and
+//! an update of one configuration reach one status.
+//!
 //! Both `UpdateDataSource` and `UpdateKnowledgeBase` hold members their own
 //! contracts document as unchangeable once the resource exists; the one rule
 //! behind those refusals lives here, in [`immutable_member_verdict`] and
@@ -978,6 +986,11 @@ pub enum KnowledgeBaseStatus {
     Creating,
     /// The knowledge base is ready to be queried.
     Active,
+    /// `UpdateKnowledgeBase` accepted, the change not applied yet — the modelled
+    /// `KnowledgeBase$status` documents this as the status of a knowledge base
+    /// that "is being updated". It reaches [`KnowledgeBaseStatus::Active`] again
+    /// once [`KNOWLEDGE_BASE_ACTIVATION_SPAN`] has elapsed.
+    Updating,
     /// `DeleteKnowledgeBase` accepted; the knowledge base is removed from the
     /// store once [`DELETION_SPAN`] has elapsed.
     Deleting,
@@ -989,6 +1002,7 @@ impl KnowledgeBaseStatus {
         match self {
             Self::Creating => "CREATING",
             Self::Active => "ACTIVE",
+            Self::Updating => "UPDATING",
             Self::Deleting => "DELETING",
         }
     }
@@ -1586,14 +1600,16 @@ pub fn connects_to_an_external_source(configuration: &DataSourceConfiguration) -
 
 /// How long after `CreateDataSource` a data source whose connector has a source
 /// outside the service to reach leaves `CREATING` for the outcome of bringing
-/// that connection up.
+/// that connection up, and how long after `UpdateDataSource` a data source
+/// leaves `UPDATING` for the outcome of the configuration the update stored.
 ///
-/// CHOSEN, not documented: AWS publishes no duration for the creation of a data
-/// source. It is deliberately non-zero so a caller that reads the data source
-/// back immediately still observes the transient `CREATING` status the modelled
-/// `DataSourceStatus` declares, and it is the span a knowledge base's own
-/// creation takes ([`KNOWLEDGE_BASE_ACTIVATION_SPAN`]), so a client script
-/// converges just as promptly.
+/// CHOSEN, not documented: AWS publishes no duration for the creation or the
+/// update of a data source. It is deliberately non-zero so a caller that reads
+/// the data source back immediately still observes the transient `CREATING` or
+/// `UPDATING` status the modelled `DataSourceStatus` declares, and it is the
+/// span a knowledge base's own creation takes
+/// ([`KNOWLEDGE_BASE_ACTIVATION_SPAN`]), so a client script converges just as
+/// promptly.
 pub const DATA_SOURCE_VALIDATION_SPAN: Duration = KNOWLEDGE_BASE_ACTIVATION_SPAN;
 
 /// The `DataSourceStatus` values this slice of the service can hold, named as
@@ -1609,6 +1625,12 @@ pub enum DataSourceStatus {
     /// is ready for ingestion into the knowledge base", which a data source the
     /// service has no source to reach for is as soon as it is stored.
     Available,
+    /// `UpdateDataSource` accepted, the change not applied yet — a modelled
+    /// `DataSourceStatus` value the data source carries while the service
+    /// applies it. The clock owes it the outcome of the updated configuration
+    /// once [`DATA_SOURCE_VALIDATION_SPAN`] has elapsed, the same outcome the
+    /// same configuration takes at create time.
+    Updating,
     /// The connection to the source the data source's connector names did not
     /// come up, so the data source serves no ingestion.
     Failed,
@@ -1625,9 +1647,30 @@ impl DataSourceStatus {
         match self {
             Self::Creating => "CREATING",
             Self::Available => "AVAILABLE",
+            Self::Updating => "UPDATING",
             Self::Failed => "FAILED",
             Self::Deleting => "DELETING",
         }
+    }
+}
+
+/// The status a data source whose EFFECTIVE configuration is `configuration`
+/// settles at once the clock has made the outcome of that configuration due.
+///
+/// A data source the service has nothing to connect out for is ready to be
+/// ingested from, which is what the modelled `DataSource$status` documents
+/// `AVAILABLE` as. One whose connector has a source outside the service to
+/// reach settles at `FAILED`: this emulator runs no connector, so that
+/// connection never comes up, and reporting the data source ready to ingest
+/// from a source nothing ever read would be a readiness it does not have.
+///
+/// The outcome is the configuration's, not the call's, so a create and an
+/// update that store the same configuration settle at the same status.
+pub fn settled_data_source_status(configuration: &DataSourceConfiguration) -> DataSourceStatus {
+    if connects_to_an_external_source(configuration) {
+        DataSourceStatus::Failed
+    } else {
+        DataSourceStatus::Available
     }
 }
 

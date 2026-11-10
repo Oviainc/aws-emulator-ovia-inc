@@ -818,7 +818,8 @@ async fn updated_flows_round_trip_through_get_flow() {
 }
 
 /// `UpdateKnowledgeBase` writes what the request carries into the stored
-/// knowledge base, and leaves the status the clock owns alone.
+/// knowledge base; the status the clock owns reports the change being applied
+/// and settles back to `ACTIVE` on its own.
 #[tokio::test]
 async fn updated_knowledge_bases_round_trip_through_get_knowledge_base() {
     let emulator = Emulator::new();
@@ -907,14 +908,25 @@ async fn updated_knowledge_bases_round_trip_through_get_knowledge_base() {
             &fetched,
         );
 
-        // The status belongs to the creation the clock finished, not to this
-        // call: a configuration change does not send the knowledge base back
-        // through CREATING.
+        // The update is accepted rather than applied inside the call, so the
+        // knowledge base reports the change being applied until the clock has
+        // settled it — never CREATING, which belongs to the creation the clock
+        // already finished. The transition itself is asserted in
+        // `update_reports_the_transitional_status.rs`.
         let status = fetched.string(&["knowledgeBase", "status"]);
         assert_eq!(
-            status, "ACTIVE",
-            "case {case}: expected the knowledge base to stay ACTIVE across an update, \
+            status, "UPDATING",
+            "case {case}: expected the knowledge base to report the update being applied, \
              got {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let status = emulator
+            .get_knowledge_base(&knowledge_base_id)
+            .await
+            .string(&["knowledgeBase", "status"]);
+        assert_eq!(
+            status, "ACTIVE",
+            "case {case}: expected the knowledge base to settle back at ACTIVE, got {status:?}"
         );
         assert_eq!(
             fetched.string(&["knowledgeBase", "knowledgeBaseId"]),

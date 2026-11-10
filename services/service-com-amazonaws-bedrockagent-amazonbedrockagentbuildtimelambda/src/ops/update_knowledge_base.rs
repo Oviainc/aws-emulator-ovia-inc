@@ -5,7 +5,9 @@
 //! Updates a stored knowledge base: every mutable member of the record takes the value
 //! the request carries, the record's last-updated instant is stamped, and the answer is
 //! that stored record — so the following `GetKnowledgeBase` reports exactly what the
-//! update supplied.
+//! update supplied. The answer is a 202, so the change is accepted rather than already
+//! applied: the knowledge base reports the modelled transient `UPDATING` status and the
+//! clock carries it back to `ACTIVE`.
 //!
 //! `knowledgeBaseConfiguration` and `storageConfiguration` are the exceptions: this
 //! operation documents both as unchangeable once the knowledge base exists, so an update
@@ -307,9 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // must include the same values for fields that you want to keep the
         // same", so a member the request leaves out is left out of the resource
         // too. The identity members (`knowledgeBaseId`, `knowledgeBaseArn`) and
-        // `createdAt` are not the request's to set, and neither is the status:
-        // this call changes the configuration of a knowledge base that already
-        // exists, so it does not restart the creation the status reports.
+        // `createdAt` are not the request's to set.
         record.name = input.name;
         record.description = input.description;
         record.role_arn = input.role_arn;
@@ -317,6 +317,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.storage_configuration = input.storage_configuration;
         // The resource changed at this instant, so this is its last-updated one.
         record.updated_at = now;
+        // This operation answers 202, i.e. the change is ACCEPTED here and
+        // applied afterwards, so the knowledge base carries the status the
+        // modelled `KnowledgeBase$status` documents for exactly that ("UPDATING
+        // – The knowledge base is being updated") and the CLOCK owes it the
+        // return to ACTIVE one [`crate::state::KNOWLEDGE_BASE_ACTIVATION_SPAN`]
+        // later — the span applying a change to this resource takes. A caller
+        // that polls therefore observes UPDATING before ACTIVE.
+        record.status = crate::state::KnowledgeBaseStatus::Updating;
+        record.pending_status = Some((
+            now + crate::state::KNOWLEDGE_BASE_ACTIVATION_SPAN,
+            crate::state::KnowledgeBaseStatus::Active,
+        ));
 
         Ok(UpdateKnowledgeBaseOutput {
             knowledge_base: record.to_knowledge_base(),

@@ -5,7 +5,9 @@
 //! Updates a stored data source: every mutable member of the record takes the value the
 //! request carries, the record's last-updated instant is stamped, and the answer is that
 //! stored record — so the following `GetDataSource` reports exactly what the update
-//! supplied.
+//! supplied. The update is accepted rather than already applied: the data source reports
+//! the modelled transient `UPDATING` status, and the clock carries it to the outcome the
+//! configuration just stored settles at.
 //!
 //! `chunkingConfiguration` is the exception: this operation documents it as unchangeable
 //! once the connector exists, so an update that would leave a different one on the data
@@ -198,6 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // data source carrying less than the connector actually runs with.
         let mut data_source_configuration = input.data_source_configuration;
         crate::state::complete_connector_defaults(&mut data_source_configuration);
+        // The status the updated configuration settles at, by the same rule the
+        // create settles one by: the outcome belongs to the configuration, not
+        // to the call that stored it.
+        let settled = crate::state::settled_data_source_status(&data_source_configuration);
 
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
@@ -301,6 +307,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
         // The resource changed at this instant, so this is its last-updated one.
         record.updated_at = now;
+        // The change is ACCEPTED here, not applied yet: the data source carries
+        // the modelled transient UPDATING while the service applies it, and the
+        // CLOCK owes it the outcome of the configuration just stored one
+        // [`crate::state::DATA_SOURCE_VALIDATION_SPAN`] later — so a caller that
+        // polls observes UPDATING before the status it converges to.
+        record.status = crate::state::DataSourceStatus::Updating;
+        record.pending_status = Some((now + crate::state::DATA_SOURCE_VALIDATION_SPAN, settled));
 
         Ok(UpdateDataSourceOutput {
             data_source: record.to_data_source(),
