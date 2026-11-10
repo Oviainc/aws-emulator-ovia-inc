@@ -1130,6 +1130,19 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
             .find(|theme| theme.id == id)
     }
 
+    /// Whether `id` names a theme some OTHER app environment owns.
+    ///
+    /// A theme is addressed by (appId, environmentName, id) exactly as a component
+    /// and a form are, so an id that resolves outside the app environment the
+    /// request named is a request made in the wrong scope — told apart here from an
+    /// id that names no theme at all, which is simply absent. The counterparts are
+    /// [`Self::component_in_other_scope`] and [`Self::form_in_other_scope`].
+    pub fn theme_in_other_scope(&self, app_id: &str, environment_name: &str, id: &str) -> bool {
+        id_in_other_scope(&self.themes, app_id, environment_name, id, |theme| {
+            &theme.id
+        })
+    }
+
     /// The theme `id` names in one app environment, for a caller that changes it.
     pub fn theme_mut(
         &mut self,

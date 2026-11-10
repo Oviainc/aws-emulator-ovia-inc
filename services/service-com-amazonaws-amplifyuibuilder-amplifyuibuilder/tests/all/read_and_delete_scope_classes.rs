@@ -4,10 +4,12 @@
 //! one resource, end to end over HTTP.
 //!
 //! A resource of this service is addressed by the identifier triple (appId,
-//! environmentName, id) — `ComponentResource` and `FormResource` both carry it
-//! (`smithy_query(query="shape",shape="ComponentResource,FormResource")`) — and a call
-//! whose id does not resolve in the scope it addressed falls in one of TWO classes, told
-//! apart by WHERE the id resolves and not by which operation asked:
+//! environmentName, id) — `ComponentResource`, `FormResource` and `ThemeResource` all
+//! carry it
+//! (`smithy_query(query="shape",shape="ComponentResource,FormResource,ThemeResource")`) —
+//! and a call whose id does not resolve in the scope it addressed falls in one of TWO
+//! classes, told apart by WHERE the id resolves and not by which operation asked, nor by
+//! which resource kind it addressed:
 //!
 //! | the id ...                             | status | class                       | message                            |
 //! |----------------------------------------|--------|-----------------------------|------------------------------------|
@@ -26,10 +28,6 @@
 //! which half of the (appId, environmentName) pair the request gets wrong, whether the
 //! addressed scope holds resources of its own, and the FORM of an id that resolves
 //! nowhere.
-//!
-//! The theme operations are deliberately not in the table: they report an id another app
-//! environment owns as absent, and moving all three of them onto the wrong-scope
-//! classification is its own change (see the comment in `src/ops/delete_theme.rs`).
 //!
 //! Each suite in this crate carries its own request harness, so this one does too.
 
@@ -139,12 +137,13 @@ async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option
 enum Kind {
     Component,
     Form,
+    Theme,
 }
 
 impl Kind {
     /// The kinds the table runs over: the ones with BOTH a read and a delete on the
     /// triple (a codegen job has no delete).
-    const ALL: [Self; 2] = [Self::Component, Self::Form];
+    const ALL: [Self; 3] = [Self::Component, Self::Form, Self::Theme];
 
     /// The collection element of this kind's REST URIs
     /// (`/app/{appId}/environment/{environmentName}/<collection>/{id}`).
@@ -152,11 +151,13 @@ impl Kind {
         match self {
             Self::Component => "components",
             Self::Form => "forms",
+            Self::Theme => "themes",
         }
     }
 
     /// A create payload carrying only the members this kind's create data requires:
-    /// `CreateComponentData`'s six and `CreateFormData`'s seven.
+    /// `CreateComponentData`'s six, `CreateFormData`'s seven and `CreateThemeData`'s one
+    /// plus the `values` list it is modelled with.
     fn create_payload(self, name: &str) -> Value {
         match self {
             Self::Component => json!({
@@ -175,6 +176,10 @@ impl Kind {
                 "style": {},
                 "sectionalElements": {},
                 "schemaVersion": "1.0",
+            }),
+            Self::Theme => json!({
+                "name": name,
+                "values": [{"key": "tokens.colors.brand", "value": {"value": "#047d95"}}],
             }),
         }
     }

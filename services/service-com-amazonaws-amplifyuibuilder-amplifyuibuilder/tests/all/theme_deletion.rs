@@ -329,8 +329,9 @@ async fn delete_theme_leaves_every_other_theme_alone() {
 }
 
 /// A theme is addressed by (appId, environmentName, id), so an id that resolves to no
-/// theme in the addressed app environment is refused with HTTP 404 and removes nothing —
-/// including an id another app environment owns.
+/// theme in the addressed app environment removes nothing and is refused the way its class
+/// calls for: HTTP 400 for an id another app environment owns, HTTP 404 for an id that
+/// names no theme anywhere.
 #[tokio::test]
 async fn delete_theme_refuses_an_id_that_names_no_theme_in_that_app_environment() {
     let router = emulator();
@@ -341,30 +342,44 @@ async fn delete_theme_refuses_an_id_that_names_no_theme_in_that_app_environment(
         .id();
     let other_environment = create_in(&router, APP_ID, "prod", data.clone()).await.id();
 
-    // The rows differ in HOW the lookup misses.
-    let rows: Vec<(&str, &str, &str, &str)> = vec![
-        ("an id nobody created", APP_ID, ENVIRONMENT, NEVER_CREATED_ID),
-        ("an id another app owns", APP_ID, ENVIRONMENT, &elsewhere),
+    // The rows differ in HOW the lookup misses, and so in which class it falls in.
+    let rows: Vec<(&str, &str, &str, &str, u16)> = vec![
+        (
+            "an id nobody created",
+            APP_ID,
+            ENVIRONMENT,
+            NEVER_CREATED_ID,
+            404,
+        ),
+        ("an id another app owns", APP_ID, ENVIRONMENT, &elsewhere, 400),
         (
             "an id another environment of this app owns",
             APP_ID,
             ENVIRONMENT,
             &other_environment,
+            400,
         ),
-        ("this id asked for under another app", "d9999zzzz", ENVIRONMENT, &here),
+        (
+            "this id asked for under another app",
+            "d9999zzzz",
+            ENVIRONMENT,
+            &here,
+            400,
+        ),
         (
             "this id asked for under another environment",
             APP_ID,
             "prod",
             &here,
+            400,
         ),
     ];
 
-    for (case, app_id, environment, lookup) in rows {
+    for (case, app_id, environment, lookup, expected) in rows {
         let refused = delete_in(&router, app_id, environment, lookup).await;
         assert_eq!(
-            refused.status, 404,
-            "case {case:?}: expected HTTP 404 from DeleteTheme, got {} with {:?}",
+            refused.status, expected,
+            "case {case:?}: expected HTTP {expected} from DeleteTheme, got {} with {:?}",
             refused.status, refused.body
         );
         assert_eq!(

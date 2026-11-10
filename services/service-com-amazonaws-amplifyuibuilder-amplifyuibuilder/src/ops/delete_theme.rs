@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTheme
-//! Removes the stored theme the request names and answers an empty 2xx. An id that names
-//! no theme in that app environment answers the modelled `ResourceNotFoundException`
-//! (HTTP 404) — the same miss `GetTheme` reports, so a delete and a read agree on which
-//! themes exist.
+//! Removes the stored theme the request names and answers an empty 2xx. An id it cannot
+//! resolve is refused the way its class calls for: the modelled
+//! `InvalidParameterException` (HTTP 400) for an id another app environment owns, and the
+//! modelled `ResourceNotFoundException` (HTTP 404), carrying the delete path's own
+//! literal, for an id that names no theme anywhere — the two classes `GetTheme` tells
+//! apart too, so a delete and a read agree on which themes exist.
 //!
 //! ## Shape of an operation
 //!
@@ -175,24 +177,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove_theme(&input.app_id, &input.environment_name, &input.id)
             .is_none()
         {
-            // A theme is addressed by (appId, environmentName, id), so an id that
-            // resolves nowhere in the addressed app environment names no theme the
-            // caller can delete — the modelled `ResourceNotFoundException` (404).
-            // The message is the DELETE path's own fixed literal: with no error type
-            // on the wire, that literal is what tells a client a delete missed
-            // rather than a read.
-            //
-            // An id ANOTHER app environment owns is reported absent here too, which
-            // is what `GetTheme` already answers for it (`get_theme.rs`): the three
-            // theme operations agree on which themes exist. A component or a form in
-            // that position is instead refused as wrong-scope (400, via
-            // `component_in_other_scope` / `form_in_other_scope`), so the two
-            // resource kinds classify it differently. Themes are left on the
-            // reported-absent classification deliberately: it is the one `GetTheme`
-            // was written to and whose units pass, no recorded theme unit shows the
-            // 400, and moving all three theme operations onto a
-            // `theme_in_other_scope` path would change `GetTheme`'s answer — its own
-            // change, not this one's.
+            // The same two failures the component and form deletes tell apart: a
+            // theme is addressed by (appId, environmentName, id), so an id a
+            // DIFFERENT app environment owns is a wrong-scope request (the modelled
+            // `InvalidParameterException`, 400) and an id that names no theme
+            // anywhere is absent (the modelled `ResourceNotFoundException`, 404).
+            if store.theme_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
+                return Err(DeleteThemeErrorModeled::InvalidParameterException(
+                    crate::state::item_wrong_scope(),
+                )
+                .into());
+            }
+            // The refusals carry no error type, so the message is the only name the
+            // failure class has — and the delete path's not-found message is its OWN
+            // literal, not the read path's: that is what lets a client tell a failed
+            // delete from a failed read apart.
             return Err(DeleteThemeErrorModeled::ResourceNotFoundException(
                 crate::state::item_to_delete_not_found(),
             )

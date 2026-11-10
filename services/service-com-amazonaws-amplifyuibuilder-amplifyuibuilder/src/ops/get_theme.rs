@@ -2,9 +2,11 @@
 
 //! @op GetTheme
 //! Reports the theme [`crate::state`] holds for the (appId, environmentName, id) the
-//! request addresses, computed from that record; an id that names no theme in that app
-//! environment is refused with the modelled `ResourceNotFoundException`. This operation
-//! is `@readonly`: it changes nothing a later caller sees.
+//! request addresses, computed from that record. A miss falls in one of two classes, told
+//! apart by where the id resolves: an id another app environment owns is a wrong-scope
+//! request (the modelled `InvalidParameterException`), and an id that names no theme
+//! anywhere is absent (the modelled `ResourceNotFoundException`). This operation is
+//! `@readonly`: it changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -151,6 +153,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(theme) = store.theme(&input.app_id, &input.environment_name, &input.id) else {
+            // Two different failures, told apart by where the id resolves, exactly as
+            // `GetComponent` and `GetForm` tell them apart: a theme is addressed by
+            // (appId, environmentName, id), so an id a DIFFERENT app environment owns
+            // is a request made in the wrong scope — the modelled
+            // `InvalidParameterException` (400), because the parameters do not name the
+            // theme they address — while an id that names no theme anywhere is absent,
+            // the modelled `ResourceNotFoundException` (404).
+            if store.theme_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
+                return Err(GetThemeErrorModeled::InvalidParameterException(
+                    crate::state::item_wrong_scope(),
+                )
+                .into());
+            }
             return Err(GetThemeErrorModeled::ResourceNotFoundException(
                 crate::state::item_not_found(),
             )

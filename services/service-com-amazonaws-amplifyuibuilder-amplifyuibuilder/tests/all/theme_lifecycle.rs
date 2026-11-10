@@ -503,9 +503,10 @@ async fn the_client_token_makes_create_theme_idempotent() {
     }
 }
 
-/// `GetTheme` answers from the record the addressed (appId, environmentName) holds: an id
-/// that names no theme there is refused with the modelled `ResourceNotFoundException` at
-/// HTTP 404, and the refusal leaves the store alone.
+/// `GetTheme` answers from the record the addressed (appId, environmentName) holds, and
+/// tells the two miss classes apart: an id another app environment owns is a wrong-scope
+/// request (HTTP 400) and an id that names no theme anywhere is absent (HTTP 404). Either
+/// refusal leaves the store alone.
 #[tokio::test]
 async fn get_theme_refuses_an_id_that_names_no_theme_in_that_app_environment() {
     let router = emulator();
@@ -516,20 +517,26 @@ async fn get_theme_refuses_an_id_that_names_no_theme_in_that_app_environment() {
     .await
     .id();
 
-    // The rows differ in HOW the lookup misses: an id nobody created, an id of this
-    // environment asked for under another app, and the same id under another environment
-    // of this app.
-    let rows: Vec<(&str, &str, &str, &str)> = vec![
-        ("an id nobody created", APP_ID, ENVIRONMENT, NEVER_CREATED_ID),
-        ("another app", "d9999zzzz", ENVIRONMENT, &id),
-        ("another environment of this app", APP_ID, "prod", &id),
+    // The rows differ in HOW the lookup misses: an id nobody created (absent), an id of
+    // this environment asked for under another app, and the same id under another
+    // environment of this app (both wrong-scope).
+    let rows: Vec<(&str, &str, &str, &str, u16)> = vec![
+        (
+            "an id nobody created",
+            APP_ID,
+            ENVIRONMENT,
+            NEVER_CREATED_ID,
+            404,
+        ),
+        ("another app", "d9999zzzz", ENVIRONMENT, &id, 400),
+        ("another environment of this app", APP_ID, "prod", &id, 400),
     ];
 
-    for (case, app_id, environment, lookup) in rows {
+    for (case, app_id, environment, lookup, expected) in rows {
         let read = get_in(&router, app_id, environment, lookup).await;
         assert_eq!(
-            read.status, 404,
-            "case {case:?}: expected HTTP 404 from GetTheme, got {} with {:?}",
+            read.status, expected,
+            "case {case:?}: expected HTTP {expected} from GetTheme, got {} with {:?}",
             read.status, read.body
         );
         assert_eq!(

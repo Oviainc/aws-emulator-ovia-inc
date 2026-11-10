@@ -3,9 +3,9 @@
 //! Addressing one of this service's resources in the WRONG SCOPE, end to end over HTTP.
 //!
 //! Every resource of this service that is addressed by (appId, environmentName, id) —
-//! `CodegenJobResource`, `FormResource` and `ComponentResource` all carry that same
-//! identifier triple
-//! (`smithy_query(query="shape",shape="CodegenJobResource,FormResource,ComponentResource")`)
+//! `CodegenJobResource`, `FormResource`, `ComponentResource` and `ThemeResource` all carry
+//! that same identifier triple
+//! (`smithy_query(query="shape",shape="CodegenJobResource,FormResource,ComponentResource,ThemeResource")`)
 //! — tells TWO failures apart by WHERE the id resolves, and the classification is per
 //! failure class, not per resource kind:
 //!
@@ -18,10 +18,6 @@
 //! which half of the (appId, environmentName) pair the request gets wrong, and in whether
 //! the scope addressed holds resources of its own — none of which may change which class
 //! the answer falls in.
-//!
-//! The theme operations are deliberately not in the table: they report an id another app
-//! environment owns as absent, and moving all three of them onto the wrong-scope
-//! classification is its own change (see the comment in `src/ops/delete_theme.rs`).
 
 use std::sync::Arc;
 
@@ -126,12 +122,13 @@ enum Kind {
     Component,
     Form,
     CodegenJob,
+    Theme,
 }
 
 impl Kind {
     /// The kinds the table runs over, in the order their collection URIs are listed in
     /// this crate's `OPERATIONS.md`.
-    const ALL: [Self; 3] = [Self::Component, Self::Form, Self::CodegenJob];
+    const ALL: [Self; 4] = [Self::Component, Self::Form, Self::CodegenJob, Self::Theme];
 
     /// The collection element of this kind's REST URIs
     /// (`/app/{appId}/environment/{environmentName}/<collection>/{id}`).
@@ -140,13 +137,15 @@ impl Kind {
             Self::Component => "components",
             Self::Form => "forms",
             Self::CodegenJob => "codegen-jobs",
+            Self::Theme => "themes",
         }
     }
 
     /// The create payload carrying only the members this kind's create data requires:
-    /// `CreateComponentData`'s six, `CreateFormData`'s seven and
-    /// `StartCodegenJobData`'s one (`renderConfig`, a union with a single variant). A
-    /// codegen job carries no name, so `name` is ignored for it.
+    /// `CreateComponentData`'s six, `CreateFormData`'s seven,
+    /// `StartCodegenJobData`'s one (`renderConfig`, a union with a single variant) and
+    /// `CreateThemeData`'s `name` plus the `values` list it is modelled with. A codegen
+    /// job carries no name, so `name` is ignored for it.
     fn create_payload(self, name: &str) -> Value {
         match self {
             Self::Component => json!({
@@ -167,6 +166,10 @@ impl Kind {
                 "schemaVersion": "1.0",
             }),
             Self::CodegenJob => json!({"renderConfig": {"react": {}}}),
+            Self::Theme => json!({
+                "name": name,
+                "values": [{"key": "tokens.colors.brand", "value": {"value": "#047d95"}}],
+            }),
         }
     }
 }

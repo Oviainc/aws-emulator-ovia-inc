@@ -3,9 +3,11 @@
 //! @op UpdateTheme
 //! Merges the `updatedTheme` patch into the stored theme the request names and reports the
 //! record that results. Every `UpdateThemeData` member the request leaves out keeps the
-//! value it was stored with, `modifiedAt` moves to this call's instant, and an id that
-//! names no theme in that app environment answers the modelled `ResourceNotFoundException`
-//! (HTTP 404) — the same miss `GetTheme` and `DeleteTheme` report. An update is never an
+//! value it was stored with, `modifiedAt` moves to this call's instant, and an id it cannot
+//! resolve answers the refusal its class calls for — the modelled
+//! `InvalidParameterException` (HTTP 400) for an id another app environment owns and the
+//! modelled `ResourceNotFoundException` (HTTP 404) for one that names no theme anywhere,
+//! the same two `GetTheme` and `DeleteTheme` tell apart. An update is never an
 //! upsert.
 //!
 //! `clientToken` needs no replay record here: applying the same `updatedTheme` twice
@@ -198,18 +200,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // The target is resolved before anything is merged: an id that names no
-        // theme in the app environment the request addressed is absent (the
-        // widened-in `ResourceNotFoundException`, 404), and nothing is created —
-        // an update is not an upsert. A theme is addressed by
-        // (appId, environmentName, id), so an id another app environment owns is
-        // absent here too, which is how `GetTheme` and `DeleteTheme` report it; see
-        // the note in `delete_theme.rs` for why the theme operations keep that
-        // classification where a component or a form is refused as wrong-scope.
+        // The target is resolved before anything is merged, and the two ways it can
+        // fail to resolve are the two `GetTheme` and `DeleteTheme` tell apart (and
+        // the component and form operations before them): a theme is addressed by
+        // (appId, environmentName, id), so an id another app environment owns is a
+        // wrong-scope request (the modelled `InvalidParameterException`, 400) and an
+        // id that names no theme anywhere is absent (the widened-in
+        // `ResourceNotFoundException`, 404). Nothing is created either way — an
+        // update is not an upsert.
         if store
             .theme(&input.app_id, &input.environment_name, &input.id)
             .is_none()
         {
+            if store.theme_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
+                return Err(UpdateThemeErrorModeled::InvalidParameterException(
+                    crate::state::item_wrong_scope(),
+                )
+                .into());
+            }
             return Err(UpdateThemeErrorModeled::ResourceNotFoundException(
                 crate::state::item_not_found(),
             )

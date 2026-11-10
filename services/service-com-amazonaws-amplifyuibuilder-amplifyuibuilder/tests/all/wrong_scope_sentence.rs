@@ -13,9 +13,10 @@
 //! no environment and no id — so the SAME text answers every resource kind and every
 //! operation addressed by the identifier triple.
 //!
-//! The rows span what the rule generalises over: the resource KIND addressed (components
-//! and forms, the two kinds with a read, an update and a delete on the triple), the
-//! operation, and which half of the (appId, environmentName) pair the request gets wrong.
+//! The rows span what the rule generalises over: the resource KIND addressed (components,
+//! forms and themes, the three kinds with a read, an update and a delete on the triple),
+//! the operation, and which half of the (appId, environmentName) pair the request gets
+//! wrong.
 //!
 //! Each suite in this crate carries its own request harness, so this one does too.
 
@@ -111,10 +112,11 @@ async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option
 enum Kind {
     Component,
     Form,
+    Theme,
 }
 
 impl Kind {
-    const ALL: [Self; 2] = [Self::Component, Self::Form];
+    const ALL: [Self; 3] = [Self::Component, Self::Form, Self::Theme];
 
     /// The collection element of this kind's REST URIs
     /// (`/app/{appId}/environment/{environmentName}/<collection>/{id}`).
@@ -122,6 +124,7 @@ impl Kind {
         match self {
             Self::Component => "components",
             Self::Form => "forms",
+            Self::Theme => "themes",
         }
     }
 
@@ -145,14 +148,23 @@ impl Kind {
                 "sectionalElements": {},
                 "schemaVersion": "1.0",
             }),
+            Self::Theme => json!({
+                "name": name,
+                "values": [{"key": "tokens.colors.brand", "value": {"value": "#047d95"}}],
+            }),
         }
     }
 
-    /// An update payload this kind's update data accepts.
+    /// An update payload this kind's update data accepts. `UpdateThemeData$values` is
+    /// `@required` (`smithy_query(query="shape",shape="UpdateThemeData")`), so the theme
+    /// patch carries the list it is to hold.
     fn update_payload(self) -> Value {
         match self {
-            Self::Component => json!({"name": "Moved"}),
-            Self::Form => json!({"name": "Moved"}),
+            Self::Component | Self::Form => json!({"name": "Moved"}),
+            Self::Theme => json!({
+                "name": "Moved",
+                "values": [{"key": "tokens.colors.brand", "value": {"value": "#be123c"}}],
+            }),
         }
     }
 }

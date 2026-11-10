@@ -369,7 +369,8 @@ async fn a_payload_naming_another_theme_is_refused() {
     }
 }
 
-/// An id that names no theme in the addressed app environment is refused with HTTP 404,
+/// An id `UpdateTheme` cannot resolve is refused the way its class calls for — HTTP 400
+/// for an id another app environment owns, HTTP 404 for one that names no theme anywhere —
 /// and nothing is created: an update is not an upsert.
 #[tokio::test]
 async fn update_theme_refuses_an_id_that_names_no_theme_in_that_app_environment() {
@@ -377,18 +378,36 @@ async fn update_theme_refuses_an_id_that_names_no_theme_in_that_app_environment(
     let here = create(&router, stored_theme()).await.id();
     let patch = json!({"values": [{"key": "x", "value": {"value": "y"}}], "name": "Ghost"});
 
-    // The rows differ in HOW the lookup misses.
-    let rows: Vec<(&str, &str, &str, &str)> = vec![
-        ("an id nobody created", APP_ID, ENVIRONMENT, NEVER_CREATED_ID),
-        ("this id under another app", "d9999zzzz", ENVIRONMENT, &here),
-        ("this id under another environment", APP_ID, "prod", &here),
+    // The rows differ in HOW the lookup misses, and so in which class it falls in.
+    let rows: Vec<(&str, &str, &str, &str, u16)> = vec![
+        (
+            "an id nobody created",
+            APP_ID,
+            ENVIRONMENT,
+            NEVER_CREATED_ID,
+            404,
+        ),
+        (
+            "this id under another app",
+            "d9999zzzz",
+            ENVIRONMENT,
+            &here,
+            400,
+        ),
+        (
+            "this id under another environment",
+            APP_ID,
+            "prod",
+            &here,
+            400,
+        ),
     ];
 
-    for (case, app_id, environment, id) in rows {
+    for (case, app_id, environment, id, expected) in rows {
         let refused = update_in(&router, app_id, environment, id, patch.clone()).await;
         assert_eq!(
-            refused.status, 404,
-            "case {case:?}: expected HTTP 404 from UpdateTheme, got {} with {:?}",
+            refused.status, expected,
+            "case {case:?}: expected HTTP {expected} from UpdateTheme, got {} with {:?}",
             refused.status, refused.body
         );
         // Nothing was created where the update missed: the read misses the same way.
@@ -400,8 +419,9 @@ async fn update_theme_refuses_an_id_that_names_no_theme_in_that_app_environment(
         )
         .await;
         assert_eq!(
-            read.status, 404,
-            "case {case:?}: a refused update must create nothing, got {} with {:?}",
+            read.status, expected,
+            "case {case:?}: a refused update must create nothing and the read must agree, got \
+             {} with {:?}",
             read.status, read.body
         );
     }

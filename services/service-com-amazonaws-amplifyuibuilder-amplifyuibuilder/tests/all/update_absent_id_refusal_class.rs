@@ -16,10 +16,8 @@
 //! `extra_errors` to answer the absent case the way its `Get…` sibling does — the shape
 //! `GetComponent` declares for exactly this lookup.
 //!
-//! Themes are the one kind that answers the absent class for a wrong-scope id too: the
-//! three theme operations agree on which themes exist (see the note in
-//! `src/ops/delete_theme.rs`), so this suite carries that classification per KIND rather
-//! than assuming one answer for all three.
+//! The classification is the resource's, not the kind's: every kind addressed by the
+//! triple answers the same two classes, so the rows below assert ONE answer for all three.
 //!
 //! The rows span what the rule generalises over: the resource KIND updated (all three
 //! kinds with an update on the identifier triple), the FORM of the unresolvable id (uuid,
@@ -36,6 +34,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::state::{
     ITEM_NOT_FOUND_MESSAGE, WRONG_SCOPE_MESSAGE,
 };
+
 use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -168,16 +167,6 @@ impl Kind {
                 "name": name,
                 "values": [{"key": "tokens.colors.brand", "value": {"value": "#be123c"}}],
             }),
-        }
-    }
-
-    /// The status and message this kind answers for an id ANOTHER app environment owns.
-    /// Components and forms refuse it as wrong-scope; the theme operations agree instead
-    /// on which themes exist and report it absent.
-    fn wrong_scope_answer(self) -> (u16, &'static str) {
-        match self {
-            Self::Component | Self::Form => (400, WRONG_SCOPE_MESSAGE),
-            Self::Theme => (404, ITEM_NOT_FOUND_MESSAGE),
         }
     }
 }
@@ -326,11 +315,10 @@ async fn an_update_against_an_unresolvable_id_is_reported_absent() {
 }
 
 /// An update against an id that DOES resolve, under another app environment, is the other
-/// class: components and forms are refused as wrong-scope (400), themes report the absent
-/// class their own read reports. Either way it is NOT the same answer as an id that
-/// resolves nowhere for the kinds that distinguish them.
+/// class on every kind: refused as wrong-scope (400, the fixed sentence), never the 404 an
+/// id that resolves nowhere gets.
 #[tokio::test]
-async fn an_update_against_a_wrong_scope_id_answers_that_kinds_scope_class() {
+async fn an_update_against_a_wrong_scope_id_is_refused_as_wrong_scope_on_every_kind() {
     // The rows differ in which half of the scope the request gets wrong.
     let scopes = [
         ("another app, the same environment", "d9999zzzz", ENVIRONMENT),
@@ -343,7 +331,6 @@ async fn an_update_against_a_wrong_scope_id_answers_that_kinds_scope_class() {
     ];
 
     for kind in Kind::ALL {
-        let (expected_status, expected_message) = kind.wrong_scope_answer();
         for (scope, app_id, environment) in scopes {
             let router = emulator();
             let id = create(&router, kind, "Owned").await;
@@ -351,14 +338,14 @@ async fn an_update_against_a_wrong_scope_id_answers_that_kinds_scope_class() {
             let answer = update(&router, kind, app_id, environment, &id, "Moved").await;
             let case = format!("{scope} on the {kind:?} update");
             assert_eq!(
-                answer.status, expected_status,
-                "case {case:?}: expected HTTP {expected_status}, got {} with {:?}",
+                answer.status, 400,
+                "case {case:?}: expected HTTP 400, got {} with {:?}",
                 answer.status, answer.body
             );
             assert_eq!(
                 answer.message(),
-                expected_message,
-                "case {case:?}: expected the message {expected_message:?}, got {:?}",
+                WRONG_SCOPE_MESSAGE,
+                "case {case:?}: expected the message {WRONG_SCOPE_MESSAGE:?}, got {:?}",
                 answer.message()
             );
 

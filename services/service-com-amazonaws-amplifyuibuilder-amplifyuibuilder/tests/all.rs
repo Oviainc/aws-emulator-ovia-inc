@@ -107,6 +107,9 @@ mod theme_lifecycle;
 #[path = "all/theme_list.rs"]
 mod theme_list;
 
+#[path = "all/theme_scope_classes.rs"]
+mod theme_scope_classes;
+
 #[path = "all/theme_update.rs"]
 mod theme_update;
 
