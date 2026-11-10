@@ -23,6 +23,8 @@ mod flow_concurrent_start;
 mod flow_execution_cancellation;
 #[path = "all/flow_lifecycle.rs"]
 mod flow_lifecycle;
+#[path = "all/flow_principal_identity.rs"]
+mod flow_principal_identity;
 #[path = "all/flow_run_transfer.rs"]
 mod flow_run_transfer;
 #[path = "all/flow_state_fidelity.rs"]

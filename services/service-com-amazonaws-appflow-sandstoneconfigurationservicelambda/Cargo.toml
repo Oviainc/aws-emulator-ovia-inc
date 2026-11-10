@@ -26,6 +26,10 @@ tracing = { workspace = true }
 # The one object store in this emulator is the Amazon S3 service's: a flow whose source
 # and destination are Amazon S3 locations reads and writes its records there.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The session registry, so the principal a flow records as its author and its last editor
+# is the identity the credential the request was signed with was minted for (see
+# `crate::state::caller_arn`).
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # `iam_authorization`: the one reading of a resource-based policy, shared with every other
 # service that asks whether a bucket policy admits what it is about to do.
 service-common = { path = "../common" }
@@ -43,5 +47,9 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The IAM store, so a test can seed the account's record of which user holds a long-term
+# access key — the record `crate::state::caller_arn` resolves such a key's identity
+# through.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 [lints]
 workspace = true

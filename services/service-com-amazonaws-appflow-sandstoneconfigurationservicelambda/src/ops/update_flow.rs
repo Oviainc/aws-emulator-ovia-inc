@@ -174,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let caller = crate::state::caller_arn(ctx.parts());
+        let caller = crate::state::caller_arn(&*self.engine, ctx);
         // The same containers `CreateFlow` materialises on a definition it stores, so a
         // re-defined flow is shaped exactly like a created one and a read of it answers
         // with the same members.

@@ -25,12 +25,16 @@ use crate::ops::types::{
     ExecutionResult, FlowDefinition, MetadataCatalogConfig, SourceFlowConfig, Task, TriggerConfig,
 };
 
+/// WHO a write of a flow is attributed to: the principal the request's credential
+/// speaks for.
+mod caller_identity;
 /// What a flow RUN does: the transfer `StartFlow` performs between the source and the
 /// destination a flow's definition names.
 mod flow_run;
 /// The sentences this service refuses a request with.
 mod refusals;
 
+pub use caller_identity::*;
 pub use flow_run::*;
 pub use refusals::*;
 
@@ -773,13 +777,6 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
-}
-
-/// The ARN AppFlow records in `createdBy` / `lastUpdatedBy`: the caller, identified by
-/// the access key id its request was signed with.
-pub fn caller_arn(parts: &::http::request::Parts) -> String {
-    let access_key_id = ::emulator_server::extract_akid(&parts.headers);
-    ::emulator_server::emulator_arn("iam", "", &format!("user/{access_key_id}"))
 }
 
 /// A flow's ARN: `arn:aws:appflow:<region>:<account>:flow/<flowName>`.

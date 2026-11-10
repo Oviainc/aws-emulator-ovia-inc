@@ -24,9 +24,10 @@ use smithy_server_runtime::MultiServiceRouter;
 /// A SigV4 credential scope naming `appflow` in `us-east-1`: the routing signal the
 /// router reads, and the region and access key id the service builds its ARNs from.
 /// The signature is never verified here — the suite turns request authentication off.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDAPPFLOWFIXTURE/20260101/us-east-1/appflow/aws4_request, \
-     SignedHeaders=host, Signature=unverified";
+///
+/// The access key id a request carries unless a case is checking that the service tells
+/// two callers apart; such a case names its own through [`call_as`].
+pub(crate) const FIXTURE_ACCESS_KEY_ID: &str = "AKIDAPPFLOWFIXTURE";
 
 /// The account every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
 pub(crate) const ACCOUNT: &str = "000000000000";
@@ -196,10 +197,30 @@ impl Answer {
 }
 
 pub(crate) async fn call(router: &MultiServiceRouter, uri_path: &str, body: &Value) -> Answer {
+    call_as(router, FIXTURE_ACCESS_KEY_ID, uri_path, body).await
+}
+
+/// One call signed (in the routing sense) with `access_key_id`: the same request
+/// [`call`] builds, with the credential scope naming the key the caller presents.
+///
+/// It is the ONE request builder of this test target, because a service that records
+/// WHO called it can only be tested by calling as more than one principal.
+pub(crate) async fn call_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    uri_path: &str,
+    body: &Value,
+) -> Answer {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://appflow.us-east-1.amazonaws.com{uri_path}"))
-        .header("authorization", AUTHORIZATION)
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/appflow/\
+                 aws4_request, SignedHeaders=host, Signature=unverified"
+            ),
+        )
         .header("content-type", "application/json")
         .body(bytes::Bytes::from(
             serde_json::to_vec(body).expect("the request body serializes"),

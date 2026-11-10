@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
-        let caller = crate::state::caller_arn(ctx.parts());
+        let caller = crate::state::caller_arn(&*self.engine, ctx);
         let tags: ::std::collections::BTreeMap<String, String> =
             input.tags.clone().unwrap_or_default().into_iter().collect();
         let mut store = state.lock();
