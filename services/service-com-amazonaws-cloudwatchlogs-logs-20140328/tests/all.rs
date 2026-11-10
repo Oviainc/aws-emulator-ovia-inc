@@ -157,6 +157,8 @@ mod log_group_tags;
 mod log_groups_for_query;
 #[path = "all/log_objects.rs"]
 mod log_objects;
+#[path = "all/log_records.rs"]
+mod log_records;
 #[path = "all/log_stream_removal.rs"]
 mod log_stream_removal;
 #[path = "all/lookup_table_column_names.rs"]

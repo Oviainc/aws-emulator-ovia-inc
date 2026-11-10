@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLogRecord
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLogRecord`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLogRecord::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves the `@ptr` of one log event to the event this store holds and
+//! reports EVERY field of it — the fields CloudWatch Logs generates for an event and the
+//! fields its message names — as field name/field value pairs. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +71,30 @@
 //!   that can be created.
 //! * `ResourceNotFoundException` (HTTP 400) — The specified resource does not exist.
 //! * `ServiceUnavailableException` (HTTP 500) — The service cannot complete the request.
+//!
+//! ## Which record one pointer addresses
+//!
+//! "You get this from the response of a GetQueryResults operation. In that response, the
+//! value of the @ptr field for a log event is the value to use as logRecordPointer to
+//! retrieve that complete log event record": the pointer is one this service MINTED for a
+//! stored event ([`crate::state::log_record_pointer`]), so it is read back into the event it
+//! addresses ([`crate::state::insights::pointed_record`]) and the record reported is the same
+//! record a query reads that event as — every field a query's row carries for it, and the
+//! ones that row did not select, under one value each, with the full unparsed event under
+//! `@message`.
+//!
+//! A `logRecordPointer` this service did not mint carries no record to retrieve and is
+//! refused as the parameter "specified incorrectly" the operation models; a pointer it did
+//! mint whose log group, log stream or event this store no longer holds is refused as the
+//! missing resource, naming the resource that is gone.
+//!
+//! `unmask` "display[s] the log event fields with all sensitive data unmasked", which this
+//! store's events already are: it holds every event's raw message, as this service's other
+//! event reads do (`crate::ops::get_log_events`, `crate::ops::filter_log_events`), so there
+//! is nothing masked for it to reveal.
+//!
+//! Nothing here mutates the store: retrieving a record reports an event, so a request leaves
+//! every log group, stream and event exactly as a later reader finds them.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -125,6 +144,33 @@ pub struct GetLogRecord<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The refusal CloudWatch Logs answers a `logRecordPointer` it cannot READ — a pointer a
+/// client built itself, or one of this service's other opaque tokens: the service reports
+/// that it could not deserialize the token it was handed.
+///
+/// Fixed text for the class: it states the parameter fault and what about the value failed,
+/// and carries nothing of the value itself, so a pointer a client may have logged is not
+/// reflected back into a 400 body.
+const INVALID_POINTER_MESSAGE: &str = "InvalidParameter Unable to deserialize token";
+
+/// Refuse the request with the error this operation models for a parameter that is
+/// "specified incorrectly".
+fn invalid_parameter(message: &str) -> GetLogRecordError {
+    GetLogRecordErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// Refuse the request with the error this operation models for a resource that "does not
+/// exist".
+fn not_found(message: String) -> GetLogRecordError {
+    GetLogRecordErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
 impl<Eng> GetLogRecord<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -151,18 +197,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLogRecord` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLogRecordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLogRecord"))
+        // `ctx` carries only request metadata: the record is named by the pointer and by
+        // nothing about the request. `unmask` reveals nothing further, because this store
+        // holds every event's raw message (see the module docs).
+        let _ = (ctx, input.unmask);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetLogRecordError::from(GetLogRecordErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // "The pointer corresponding to the log event record you want to retrieve": a value
+        // this service minted for one stored event. Anything else addresses no record at
+        // all, whatever it spells.
+        let Some(pointer) = crate::state::log_record_pointer_parts(&input.log_record_pointer)
+        else {
+            return Err(invalid_parameter(INVALID_POINTER_MESSAGE));
+        };
+
+        let store = state.lock();
+        let record = crate::state::insights::pointed_record(&store, &pointer).map_err(|miss| {
+            not_found(crate::state::resource_not_found_message(miss.resource_kind()))
+        })?;
+
+        // "Fields are returned as field name/field value pairs", one pair per field of the
+        // record the addressed event is.
+        Ok(GetLogRecordOutput {
+            log_record: Some(record.values.into_iter().collect()),
+        })
     }
 }

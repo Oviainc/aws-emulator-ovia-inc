@@ -709,6 +709,68 @@ pub fn log_record_pointer_parts(pointer: &str) -> Option<LogRecordPointer> {
     })
 }
 
+/// What a well-formed log record pointer addresses that this store no longer holds, so a
+/// reader of one log event ([`pointed_record`]) can name the missing resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerMiss {
+    /// The log group the pointer names is not one this account holds.
+    LogGroup,
+    /// The log group is held, but not the log stream the pointer names.
+    LogStream,
+    /// Both are held, but the stream no longer carries the event the pointer addresses.
+    LogRecord,
+}
+
+impl PointerMiss {
+    /// The resource KIND the refusal states, for the sentence every operation of this service
+    /// refuses a missing resource with ([`super::resource_not_found_message`]).
+    pub fn resource_kind(self) -> &'static str {
+        match self {
+            Self::LogGroup => "log group",
+            Self::LogStream => "log stream",
+            Self::LogRecord => "log record",
+        }
+    }
+}
+
+/// The WHOLE record of the one log event a pointer addresses: "All fields are retrieved, even
+/// if the original query that produced the logRecordPointer retrieved only a subset of fields"
+/// (`GetLogRecord`).
+///
+/// It is the same record a query reads that event as ([`record_of`]), so a field a query's row
+/// reports and the same field of the whole record carry one value, and the record's `@ptr` is
+/// the pointer it was reached by. Reading it changes nothing a later caller sees.
+pub fn pointed_record(store: &State, pointer: &LogRecordPointer) -> Result<Record, PointerMiss> {
+    let group = store
+        .log_groups
+        .get(&pointer.log_group_name)
+        .ok_or(PointerMiss::LogGroup)?;
+    let stream = group
+        .streams
+        .get(&pointer.log_stream_name)
+        .ok_or(PointerMiss::LogStream)?;
+    // A stream's events are stored in their total order ([`crate::state::EventKey`]), so the
+    // one event a pointer addresses is found by one binary search — and an event the stream no
+    // longer holds is found by nothing.
+    let wanted = super::EventKey {
+        timestamp: pointer.timestamp_ms,
+        seq: pointer.seq,
+    };
+    let at = stream
+        .events
+        .binary_search_by(|event| event.key().cmp(&wanted))
+        .map_err(|_| PointerMiss::LogRecord)?;
+    let event = &stream.events[at];
+    Ok(record_of(
+        &group.name,
+        &stream.name,
+        event,
+        event.timestamp,
+        event.ingestion_seq,
+        ::engine::emulator_account_id(),
+    ))
+}
+
 /// The log groups a query reads: the ones its own source selector names when it carries one,
 /// and otherwise the ones the start resolved from the request.
 ///
