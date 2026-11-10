@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDevicePositionHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDevicePositionHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports one page of the samples
+//! `BatchUpdateDevicePosition` stored for a device under the named tracker (see
+//! [`crate::state::Tracker::position_history`]), selecting the half-open sample-time
+//! window `[StartTimeInclusive, EndTimeExclusive)`, oldest sample first, and minting a
+//! `NextToken` when samples remain past `MaxResults`. A window that does not run
+//! forwards is a `ValidationException`; an unknown tracker is a
+//! `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDevicePositionHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPORTING ONLY: this read writes nothing, so a page a client fetches leaves the
+//! stored history exactly as the next caller finds it.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +168,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDevicePositionHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDevicePositionHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDevicePositionHistory"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetDevicePositionHistoryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Amazon Location state store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // Both window bounds are optional, and the model documents what each one
+        // defaults to in terms of "the time that the request is made", so the clock
+        // is read once per request and both defaults are taken from that instant.
+        let requested_at = crate::state::now_millis();
+        let start = input
+            .start_time_inclusive
+            .as_ref()
+            .map_or_else(
+                || requested_at.saturating_sub(crate::state::DEFAULT_HISTORY_WINDOW_MILLIS),
+                crate::state::from_date_time,
+            );
+        let end = input
+            .end_time_exclusive
+            .as_ref()
+            .map_or(requested_at, crate::state::from_date_time);
+
+        // The window must run forwards: the model states the requirement on both
+        // members, and an end at or before the start selects nothing, so it is a bad
+        // request rather than an empty page.
+        if end <= start {
+            return Err(validation_failed(
+                crate::state::INVERTED_HISTORY_WINDOW.to_string(),
+                "EndTimeExclusive",
+            ));
+        }
+
+        // A cursor this service did not mint is refused rather than read as a page
+        // key, so a client cannot be silently handed the wrong page.
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_device_positions_token(token)
+                    .map_err(|why| validation_failed(why, "NextToken"))?,
+            ),
+            None => None,
+        };
+        // A page resumes at the cursor, but never outside the window the request
+        // asked for: the cursor narrows the window, it does not widen it.
+        let from = cursor.map_or(start, |resume| resume.max(start));
+        let limit = crate::state::page_size(input.max_results);
+
+        let store = state.lock();
+        let tracker = store.trackers.get(&input.tracker_name).ok_or_else(|| {
+            GetDevicePositionHistoryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::resource_not_found(
+                        crate::state::TRACKER_RESOURCE,
+                        &input.tracker_name,
+                    ),
+                },
+            )
+        })?;
+
+        // The window is already in sample-time ascending order and bounded by the
+        // tracker's own stored history, so the page below is bounded by `limit`
+        // (at most `crate::state::MAX_PAGE_SIZE`) rather than by the caller.
+        let window = tracker.position_history(&input.device_id, from, end);
+        let device_positions = window
+            .iter()
+            .take(limit)
+            .map(crate::state::StoredPosition::to_device_position)
+            .collect();
+        // One sample beyond the page: its sample time is the next page's inclusive
+        // start key. No sample beyond it means this is the last page, so the member
+        // is absent.
+        let next_token = window
+            .get(limit)
+            .map(|sample| crate::state::encode_device_positions_token(sample.sample_time));
+
+        Ok(GetDevicePositionHistoryOutput {
+            device_positions,
+            next_token,
+        })
     }
+}
+
+/// The modelled `ValidationException` this read refuses a bad request with: the
+/// sentence stated once, and the member it concerns named in `FieldList` so a client
+/// can tell which input to correct.
+fn validation_failed(why: String, member: &str) -> GetDevicePositionHistoryError {
+    GetDevicePositionHistoryErrorModeled::ValidationException(ValidationException {
+        message: why.clone(),
+        reason: "FieldValidationFailed".to_string(),
+        field_list: vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: why,
+        }],
+    })
+    .into()
 }

@@ -166,6 +166,39 @@ pub struct StoredPosition {
     pub position_properties: BTreeMap<String, String>,
 }
 
+impl StoredPosition {
+    /// The modelled `DevicePosition` this sample is reported as.
+    ///
+    /// Every position read of this service projects a stored sample the same way, so
+    /// the projection lives on the sample rather than in one operation's file:
+    /// `GetDevicePosition` reports the device's newest one and
+    /// `GetDevicePositionHistory` reports a page of them, and both must agree member
+    /// for member.
+    pub fn to_device_position(&self) -> crate::ops::types::DevicePosition {
+        crate::ops::types::DevicePosition {
+            device_id: Some(self.device_id.clone()),
+            sample_time: to_date_time(self.sample_time),
+            received_time: to_date_time(self.received_time),
+            position: self.position.to_vec(),
+            accuracy: self
+                .accuracy
+                .map(|horizontal| crate::ops::types::PositionalAccuracy { horizontal }),
+            position_properties: if self.position_properties.is_empty() {
+                // No properties were stored with the sample, so the member is
+                // absent rather than an empty map.
+                None
+            } else {
+                Some(
+                    self.position_properties
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                )
+            },
+        }
+    }
+}
+
 /// Largest `Updates` batch `BatchUpdateDevicePosition` accepts, which is the API's
 /// own maximum: the `DevicePositionUpdateList` shape is `len 1..10`. The handler
 /// enforces it itself as well as relying on the request boundary, so the amount of
@@ -321,6 +354,39 @@ impl Tracker {
     /// device has no stored position under this tracker.
     pub fn latest_position(&self, device_id: &str) -> Option<&StoredPosition> {
         self.devices.get(device_id)?.last()
+    }
+
+    /// The samples `device_id` holds whose `SampleTime` lies in the HALF-OPEN window
+    /// `[start, end)` — the start instant included, the end instant excluded — oldest
+    /// first.
+    ///
+    /// Half-open is what the model's member names state
+    /// (`StartTimeInclusive`/`EndTimeExclusive`), so a sample stamped exactly at the
+    /// end instant is outside the window while one stamped exactly at the start is
+    /// inside it. A device with no stored samples has an empty history, not a missing
+    /// one: a history read over a window is a query, and a window holding nothing is
+    /// an empty answer.
+    ///
+    /// The returned slice is a window of the device's history, which
+    /// [`Self::record_position`] keeps sorted ascending by sample time, so the order
+    /// is sample-time ascending and the two `partition_point` probes are logarithmic
+    /// in the history's length rather than linear.
+    pub fn position_history(
+        &self,
+        device_id: &str,
+        start: EpochMillis,
+        end: EpochMillis,
+    ) -> &[StoredPosition] {
+        let Some(history) = self.devices.get(device_id) else {
+            return &[];
+        };
+        let from = history.partition_point(|p| p.sample_time < start);
+        let to = history.partition_point(|p| p.sample_time < end);
+        // Both probes land at or before the history's end and `to` is at or after
+        // `from` for every window that runs forwards, so the range is in bounds;
+        // asking for it keeps the helper total (an empty window, never a panic) for
+        // one that does not.
+        history.get(from..to.max(from)).unwrap_or_default()
     }
 
     /// Associate `consumer_arn` with this tracker, reporting whether the tracker
@@ -525,6 +591,47 @@ pub const TRACKERS_CURSOR: &str = "trackers";
 
 /// The cursor tag for `ListGeofenceCollections`.
 pub const GEOFENCE_COLLECTIONS_CURSOR: &str = "geofence-collections";
+
+/// The cursor tag for `GetDevicePositionHistory`, whose page key is the INCLUSIVE
+/// sample time (epoch milliseconds) of the next page's first sample rather than a
+/// resource name: a device's history is keyed by `SampleTime`, one sample per
+/// instant.
+pub const DEVICE_POSITIONS_CURSOR: &str = "device-positions";
+
+/// A position-history cursor for the page starting at `sample_time`.
+pub fn encode_device_positions_token(sample_time: EpochMillis) -> String {
+    encode_next_token(DEVICE_POSITIONS_CURSOR, &sample_time.to_string())
+}
+
+/// The inclusive sample time a position-history cursor names, or the reason it is
+/// malformed.
+///
+/// A token this service did not mint — one from another list operation, or a
+/// client-invented string — is refused here rather than read as a page key, so a
+/// client is never silently handed the wrong page.
+pub fn decode_device_positions_token(token: &str) -> Result<EpochMillis, String> {
+    let key = decode_next_token(DEVICE_POSITIONS_CURSOR, token)?;
+    key.parse::<EpochMillis>().map_err(|_| {
+        format!("NextToken is not a valid pagination token for {DEVICE_POSITIONS_CURSOR}")
+    })
+}
+
+/// How far back a position-history read looks when the request names no
+/// `StartTimeInclusive`.
+///
+/// The model's `GetDevicePositionHistoryRequest$StartTimeInclusive` doc: "By default,
+/// the value will be 24 hours prior to the time that the request is made."
+pub const DEFAULT_HISTORY_WINDOW_MILLIS: EpochMillis = 24 * 60 * 60 * 1_000;
+
+/// The `ValidationException` sentence a position-history read whose window does not
+/// run forwards is refused with.
+///
+/// The model states the requirement on both members —
+/// `GetDevicePositionHistoryRequest$EndTimeExclusive`: "The time specified for
+/// `EndTimeExclusive` must be after the time for `StartTimeInclusive`" — so the
+/// sentence names the two members and nothing else. It carries no request value:
+/// both instants are `@sensitive`.
+pub const INVERTED_HISTORY_WINDOW: &str = "'EndTimeExclusive' must be after 'StartTimeInclusive'.";
 
 /// Largest page any list operation in this service returns, and the page size used
 /// when the caller sends no `MaxResults`: the model bounds `MaxResults` at

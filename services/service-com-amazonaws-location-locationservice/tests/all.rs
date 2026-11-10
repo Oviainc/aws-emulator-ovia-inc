@@ -15,6 +15,8 @@
 mod batch_item_error_messages;
 #[path = "all/date_time_wire_form.rs"]
 mod date_time_wire_form;
+#[path = "all/device_position_history.rs"]
+mod device_position_history;
 #[path = "all/geofence_collections.rs"]
 mod geofence_collections;
 #[path = "all/geofences.rs"]

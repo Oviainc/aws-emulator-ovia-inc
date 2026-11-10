@@ -185,27 +185,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // Every position read of this service projects a stored sample the same
+        // way, so the projection is the sample's own
+        // (`StoredPosition::to_device_position`) and this read reports the
+        // device's newest sample through it.
+        let reported = latest.to_device_position();
         Ok(GetDevicePositionOutput {
-            device_id: Some(latest.device_id.clone()),
-            sample_time: crate::state::to_date_time(latest.sample_time),
-            received_time: crate::state::to_date_time(latest.received_time),
-            position: latest.position.to_vec(),
-            accuracy: latest
-                .accuracy
-                .map(|horizontal| PositionalAccuracy { horizontal }),
-            position_properties: if latest.position_properties.is_empty() {
-                // No properties were stored with the sample, so the member is
-                // absent rather than an empty map.
-                None
-            } else {
-                Some(
-                    latest
-                        .position_properties
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect(),
-                )
-            },
+            device_id: reported.device_id,
+            sample_time: reported.sample_time,
+            received_time: reported.received_time,
+            position: reported.position,
+            accuracy: reported.accuracy,
+            position_properties: reported.position_properties,
         })
     }
 }
