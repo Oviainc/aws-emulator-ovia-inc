@@ -361,10 +361,9 @@ fn refusal_table(directory_id: &str, taken_alias: &str) -> Vec<Refusal> {
         operation: "AddTagsToResource",
         body: json!({ "ResourceId": directory_id, "Tags": too_many_tags }),
         error: "TagLimitExceededException",
-        diagnostic: Diagnostic::Fixed(format!(
-            "A resource may carry at most {TAG_QUOTA} tags; the request would leave \
-             {over_quota}"
-        )),
+        // The service's own fixed diagnostic for the class: it reports the allowance as
+        // broken and quotes neither the count nor the bound.
+        diagnostic: Diagnostic::Fixed("Tag limit exceeded.".to_string()),
     });
     rows.push(Refusal {
         case: format!("RemoveTagsFromResource with {over_quota} keys"),

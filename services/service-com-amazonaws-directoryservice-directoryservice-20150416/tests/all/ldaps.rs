@@ -422,13 +422,7 @@ async fn both_operations_need_a_directory_in_service_of_a_type_that_serves_ldaps
     // ...and one that existed until it was deleted, so the refusal follows the store
     // rather than the shape of the id.
     let doomed = directory_in_service(&router, "doomed.example.com", "deleted").await;
-    ok(
-        &router,
-        "DeleteDirectory",
-        json!({ "DirectoryId": &doomed }),
-        "deleted",
-    )
-    .await;
+    crate::harness::delete_directory_and_wait(&router, &doomed, "deleted").await;
     absent.push(doomed);
 
     for ldaps_type in LDAPS_TYPE_CATALOG {

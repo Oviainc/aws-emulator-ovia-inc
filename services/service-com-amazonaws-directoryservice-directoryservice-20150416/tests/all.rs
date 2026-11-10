@@ -47,6 +47,8 @@ mod directory_build_stages;
 mod directory_data_access;
 #[path = "all/directory_data_access_disable.rs"]
 mod directory_data_access_disable;
+#[path = "all/directory_deletion.rs"]
+mod directory_deletion;
 #[path = "all/directory_dns_addresses.rs"]
 mod directory_dns_addresses;
 #[path = "all/directory_lifecycle.rs"]
@@ -89,6 +91,8 @@ mod log_subscriptions;
 mod microsoft_ad;
 #[path = "all/pagination_token_refusal.rs"]
 mod pagination_token_refusal;
+#[path = "all/polled_lifecycles.rs"]
+mod polled_lifecycles;
 #[path = "all/refusal_classification_rules.rs"]
 mod refusal_classification_rules;
 #[path = "all/refusal_texts.rs"]
@@ -109,6 +113,8 @@ mod shared_directories;
 mod sharing_and_tagging_guards;
 #[path = "all/single_sign_on.rs"]
 mod single_sign_on;
+#[path = "all/single_sign_on_disable.rs"]
+mod single_sign_on_disable;
 #[path = "all/snapshot_deletion.rs"]
 mod snapshot_deletion;
 #[path = "all/snapshot_read_scopes.rs"]
@@ -119,6 +125,8 @@ mod snapshots;
 mod sso_access_url_prerequisite;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_limit_diagnostic.rs"]
+mod tag_limit_diagnostic;
 #[path = "all/trust_conflict_message.rs"]
 mod trust_conflict_message;
 #[path = "all/trust_outcomes.rs"]

@@ -500,13 +500,7 @@ async fn an_absent_directory_or_registration_is_refused_and_deletes_nothing() {
     // ...and one that existed until it was deleted, so the refusal follows the store
     // rather than the shape of the id.
     let doomed = directory_in_service(&router, "doomed.example.com", "absent").await;
-    ok(
-        &router,
-        "DeleteDirectory",
-        json!({ "DirectoryId": &doomed }),
-        "absent: delete",
-    )
-    .await;
+    crate::harness::delete_directory_and_wait(&router, &doomed, "absent: delete").await;
     absent_directories.push(doomed);
 
     for directory_id in &absent_directories {

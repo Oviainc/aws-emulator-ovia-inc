@@ -1108,6 +1108,11 @@ async fn a_deleted_directory_is_gone_and_its_alias_stays_reserved() {
         json!(&doomed),
         "case {case:?}: expected DeleteDirectory to report the deleted id, got {deleted}"
     );
+    // The delete answers while the directory is still being torn down — it is described in
+    // `Deleting`, then in `Deleted`, before the record goes (`crate::directory_deletion` is
+    // that rule's own suite) — so the cases below, which are about what the account no
+    // longer holds, wait that teardown out first.
+    tokio::time::sleep(crate::harness::PAST_THE_TEARDOWN).await;
 
     // Every reader of the deleted id now reports it does not exist, and a second
     // delete does too — with ONE exception, the reporting call whose `DirectoryIds` is a
@@ -1235,6 +1240,10 @@ async fn the_alias_reservation_index_is_bounded() {
             .await;
             ok(&router, "DeleteDirectory", json!({ "DirectoryId": id }), case).await;
         }
+        // A delete answers while the directory is still being torn down, and a directory
+        // the account still holds still counts against its Region quota, so each batch
+        // waits its own deletes out before the next batch creates.
+        tokio::time::sleep(crate::harness::PAST_THE_TEARDOWN).await;
     }
 
     let id = create_directory(&router, minimal_create("last.example.com"), case).await;

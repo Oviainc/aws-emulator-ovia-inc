@@ -2,9 +2,21 @@
 
 //! @op DeleteDirectory
 //!
-//! Removes a stored directory, with its tags, and answers with the deleted id. A
-//! second delete of the same id, like any other call that names it, then reports
-//! `EntityDoesNotExistException`.
+//! Starts the teardown of a stored directory and answers with its id. The directory is NOT
+//! taken away while the caller waits: the delete moves it out of the stage it was serving
+//! in and into `Deleting`, and the clock finishes the teardown — the stage settles on
+//! `Deleted` and the record then leaves the store, with the snapshots, trusts and shares
+//! that describe nothing without it. `crate::state::directory_deletion` is where that chain
+//! lives.
+//!
+//! So `DescribeDirectories` keeps describing the directory for the whole teardown, which is
+//! the progress every delete-and-wait client polls for, and only once the record is gone do
+//! calls naming the id answer as they do for an id the account no longer holds: a
+//! reporting call that takes the id as a FILTER narrows to an empty page, and every other
+//! call reports `EntityDoesNotExistException`.
+//!
+//! A repeated delete of a directory already being torn down answers the same id and moves
+//! the teardown no further: it neither restarts the chain nor pushes the removal out.
 //!
 //! The alias the directory held stays RESERVED: `CreateAlias`' own documentation says
 //! "After an alias has been created, it cannot be deleted or reused", so deleting the
@@ -146,62 +158,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(crate::state::state_unavailable)?;
 
         let mut store = state.lock();
-        store.advance_clock(::std::time::SystemTime::now());
+        let now = ::std::time::SystemTime::now();
+        store.advance_clock(now);
 
-        let removed = store.directories.remove(&input.directory_id).ok_or_else(|| {
-            DeleteDirectoryErrorModeled::EntityDoesNotExistException(crate::state::refusal(
-                crate::state::no_such_directory(&input.directory_id),
-            ))
-        })?;
+        // The delete does not take the directory away while the caller waits: it moves it
+        // into the teardown stage and the clock finishes the job (see
+        // `crate::state::directory_deletion`), so the next `DescribeDirectories` still
+        // reports the directory — in `Deleting` rather than the stage it was serving in,
+        // which is the progress a delete-and-wait client polls for. An id no directory is
+        // stored under is the modelled "specified entity could not be found".
+        let directory_id = store
+            .begin_directory_deletion(&input.directory_id, now)
+            .ok_or_else(|| {
+                DeleteDirectoryErrorModeled::EntityDoesNotExistException(crate::state::refusal(
+                    crate::state::no_such_directory(&input.directory_id),
+                ))
+            })?;
 
-        // The alias index is deliberately NOT touched: an alias "cannot be deleted or
-        // reused", so it stays reserved against the id it was created for and a later
-        // `CreateAlias` asking for it is refused.
-
-        // The id itself is remembered, and nothing else of the directory: an account that
-        // HAD this directory and deleted it is what makes a later reporting call filtered
-        // by this id an empty result rather than a refusal, while an id this account never
-        // had stays a refusal. The record is gone, so nothing about the directory can be
-        // reported from this.
-        store.remember_deleted_directory(&removed.directory_id, removed.seq);
-
-        // A snapshot is a snapshot OF this directory, so it does not outlive it: real
-        // Directory Service deletes a directory's snapshots with the directory ("all
-        // snapshots of a directory are deleted when the directory is deleted"), and
-        // keeping them would leave records naming an id no caller can resolve — and a
-        // store a create/delete cycle could grow without end.
-        store
-            .snapshots
-            .retain(|_, snapshot| snapshot.directory_id != removed.directory_id);
-
-        // A trust is the Amazon Web Services side of a relationship this directory is one
-        // party to, so it does not outlive the directory either: keeping it would leave
-        // records naming an id no caller can resolve, and a store a create/delete cycle
-        // could grow without end.
-        store
-            .trusts
-            .retain(|_, trust| trust.directory_id != removed.directory_id);
-
-        // A directory share is the consumer account's handle on THIS directory, so it
-        // does not outlive it either: keeping it would leave records naming an owner id
-        // no caller can resolve, and a store a create/delete cycle could grow without
-        // end.
-        store
-            .shared_directories
-            .retain(|_, share| share.owner_directory_id != removed.directory_id);
-
-        // The account no longer holds this directory, so the shared inventory the DATA
-        // plane reads must not keep claiming it does: the objects inside a directory that
-        // is gone are not reachable, and a later create/delete cycle must not resolve
-        // against a record this delete left behind. The record goes whole — the
-        // directory's domain name, its data-access switch and its accounts describe
-        // nothing any more.
+        // The directory stops serving its OBJECTS the moment the teardown starts: a
+        // directory being decommissioned answers no data-plane call, so the shared
+        // inventory that plane reads must not keep claiming the account holds it. The
+        // record goes whole — the directory's domain name, its data-access switch and its
+        // accounts describe nothing any more — while this service's own record stays until
+        // the clock takes it, so the control plane can still report the teardown.
         if let Some(inventory) = crate::state::ad_directory_inventory(&*self.engine) {
-            inventory.lock().forget(&removed.directory_id);
+            inventory.lock().forget(&directory_id);
         }
 
         Ok(DeleteDirectoryOutput {
-            directory_id: Some(removed.directory_id),
+            directory_id: Some(directory_id),
         })
     }
 }

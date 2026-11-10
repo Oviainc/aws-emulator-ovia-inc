@@ -674,10 +674,9 @@ async fn an_unresolvable_snapshot_filter_is_an_invalid_parameter() {
         "SnapshotId",
         "snapshot filters",
     );
-    ok(
+    crate::harness::delete_directory_and_wait(
         &router,
-        "DeleteDirectory",
-        json!({ "DirectoryId": &doomed_directory }),
+        &doomed_directory,
         "snapshot filters: the directory delete",
     )
     .await;

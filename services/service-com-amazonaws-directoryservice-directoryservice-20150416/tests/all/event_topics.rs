@@ -484,13 +484,7 @@ async fn an_absent_directory_is_refused_by_both_operations() {
     // rather than the shape of the id.
     let doomed = create_directory(&router, minimal_create("doomed.example.com"), "absent").await;
     register(&router, &doomed, "doomed-topic", "absent").await;
-    ok(
-        &router,
-        "DeleteDirectory",
-        json!({ "DirectoryId": &doomed }),
-        "absent: delete",
-    )
-    .await;
+    crate::harness::delete_directory_and_wait(&router, &doomed, "absent: delete").await;
     absent.push(doomed.clone());
 
     for directory_id in &absent {

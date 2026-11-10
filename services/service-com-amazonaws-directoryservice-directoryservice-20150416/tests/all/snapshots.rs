@@ -617,15 +617,10 @@ async fn deleting_a_directory_deletes_the_snapshots_taken_of_it() {
         create_snapshot(&router, &second, Some("kept_two"), "delete").await,
     ];
 
-    ok(
-        &router,
-        "DeleteDirectory",
-        json!({ "DirectoryId": first }),
-        "delete",
-    )
-    .await;
+    // A snapshot is a snapshot OF a directory, so it does not outlive it — which happens
+    // when the directory's teardown runs out and its record leaves the store.
+    crate::harness::delete_directory_and_wait(&router, &first, "delete").await;
 
-    // A snapshot is a snapshot OF a directory, so it does not outlive it.
     let remaining = reported_ids(&describe(&router, json!({}), "delete").await, "delete");
     assert_eq!(
         remaining,

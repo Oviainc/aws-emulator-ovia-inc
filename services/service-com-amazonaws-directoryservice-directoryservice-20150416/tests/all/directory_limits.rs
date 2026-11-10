@@ -316,13 +316,10 @@ async fn deleting_directories_frees_the_reported_allowance() {
             managed_left -= 1;
         }
         let case = format!("after deleting {id}");
-        ok(
-            &router,
-            "DeleteDirectory",
-            json!({ "DirectoryId": id }),
-            &case,
-        )
-        .await;
+        // A delete answers while the directory is still being torn down, and a directory
+        // the account still holds still counts against its allowance, so each delete is
+        // waited out before the counters are read.
+        crate::harness::delete_directory_and_wait(&router, &id, &case).await;
 
         let limits = limits(&router, &case).await;
         let counts = [

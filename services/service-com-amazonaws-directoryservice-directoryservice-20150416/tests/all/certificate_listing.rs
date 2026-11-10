@@ -403,13 +403,7 @@ async fn an_absent_directory_is_refused_and_a_foreign_token_is_not_a_page() {
     // ...and one that existed until it was deleted, so the refusal follows the store
     // rather than the shape of the id.
     let doomed = directory_in_service(&router, "doomed.example.com", "refusals").await;
-    ok(
-        &router,
-        "DeleteDirectory",
-        json!({ "DirectoryId": &doomed }),
-        "refusals: delete",
-    )
-    .await;
+    crate::harness::delete_directory_and_wait(&router, &doomed, "refusals: delete").await;
     absent.push(doomed);
 
     for directory in &absent {

@@ -592,13 +592,7 @@ async fn a_schema_extension_does_not_outlive_its_directory() {
     )
     .await;
 
-    ok(
-        &router,
-        "DeleteDirectory",
-        json!({ "DirectoryId": &first }),
-        "delete",
-    )
-    .await;
+    crate::harness::delete_directory_and_wait(&router, &first, "delete").await;
 
     // An extension is an extension OF a directory, so it does not outlive it, and the
     // other directory's extension is untouched.

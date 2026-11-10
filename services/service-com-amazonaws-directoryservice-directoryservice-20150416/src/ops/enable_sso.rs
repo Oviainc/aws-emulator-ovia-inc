@@ -211,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.user_name.is_some() || input.password.is_some() {
             return Err(
                 EnableSsoErrorModeled::AuthenticationFailedException(crate::state::refusal(
-                    AUTHENTICATION_FAILED,
+                    crate::state::AUTHENTICATION_FAILED,
                 ))
                 .into(),
             );
@@ -235,15 +235,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(EnableSsoOutput {})
     }
 }
-
-/// The diagnostic of the modelled `AuthenticationFailedException`: the sentence the
-/// error shape's own documentation states for this class
-/// (`smithy_query(query="doc",shape="AuthenticationFailedException")`), which is what
-/// Directory Service answers when it could not authenticate the account a call carried.
-/// It names nothing of the request: which member of a credential pair was wrong is
-/// exactly what an authentication failure does not disclose.
-/// [`crate::state::refusal`] appends the request id, once.
-const AUTHENTICATION_FAILED: &str = "An authentication error occurred.";
 
 /// The `ClientException` diagnostic for a directory whose access URL does not exist yet.
 ///

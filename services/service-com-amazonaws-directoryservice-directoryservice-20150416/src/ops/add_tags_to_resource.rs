@@ -146,7 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before `state.lock()` is taken, so the merge below is work proportional to a
         // constant, not to the request.
         if input.tags.len() > crate::state::MAX_TAGS {
-            return Err(tag_limit_exceeded(input.tags.len()));
+            return Err(tag_limit_exceeded());
         }
 
         // The `aws:` prefix is AWS's own tag namespace: a key in it is a system tag, and
@@ -194,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             merged.insert(tag.key, tag.value);
         }
         if merged.len() > crate::state::MAX_TAGS {
-            return Err(tag_limit_exceeded(merged.len()));
+            return Err(tag_limit_exceeded());
         }
         directory.tags = merged;
 
@@ -202,12 +202,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Refuse the request with the modelled `TagLimitExceededException`, naming the bound
-/// and the count that broke it.
-fn tag_limit_exceeded(count: usize) -> AddTagsToResourceError {
-    AddTagsToResourceErrorModeled::TagLimitExceededException(crate::state::refusal(format!(
-        "A resource may carry at most {max} tags; the request would leave {count}",
-        max = crate::state::MAX_TAGS
-    )))
+/// Refuse the request with the modelled `TagLimitExceededException`, stating this
+/// service's own fixed diagnostic for the class.
+///
+/// The sentence is [`crate::state::TAG_LIMIT_EXCEEDED`] whichever of the two bounds the
+/// call broke — the request's own tag list, or the merge of it with the tags the resource
+/// already carries — because both are the same failure of the same allowance, and the
+/// service states it without quoting a count or the bound.
+fn tag_limit_exceeded() -> AddTagsToResourceError {
+    AddTagsToResourceErrorModeled::TagLimitExceededException(crate::state::refusal(
+        crate::state::TAG_LIMIT_EXCEEDED,
+    ))
     .into()
 }

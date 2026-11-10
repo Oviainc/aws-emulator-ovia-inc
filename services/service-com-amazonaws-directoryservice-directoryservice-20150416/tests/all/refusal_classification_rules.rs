@@ -465,7 +465,9 @@ async fn a_deleted_id_filters_to_an_empty_page_while_an_unknown_one_is_refused()
     let router = service();
     let case = "the deleted filter";
 
-    // Two directories deleted and one kept, so a filter can mix them.
+    // Two directories deleted and one kept, so a filter can mix them. The deletes are
+    // waited out: a directory still being torn down is one the listing still reports, and
+    // these rows are about an id the account no longer holds at all.
     let mut deleted: Vec<String> = Vec::new();
     for index in 0..2 {
         let id = create_directory(
@@ -483,6 +485,7 @@ async fn a_deleted_id_filters_to_an_empty_page_while_an_unknown_one_is_refused()
         .await;
         deleted.push(id);
     }
+    tokio::time::sleep(crate::harness::PAST_THE_TEARDOWN).await;
     let kept = create_directory(&router, minimal_create("kept.example.com"), case).await;
 
     // Well-formed ids (`^d-[0-9a-f]{10}$`) this account never had, varied along their

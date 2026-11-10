@@ -70,6 +70,9 @@
 /// cannot word one failure two ways. Re-exported below, so every one of them is still
 /// reached as `crate::state::<name>`.
 mod diagnostics;
+/// The teardown `DeleteDirectory` starts, and the clock that finishes it. Re-exported
+/// below, so its stages are reached as `crate::state::<name>` like every other stage.
+mod directory_deletion;
 pub mod directory_network;
 pub mod directory_servers;
 pub mod directory_updates;
@@ -78,6 +81,7 @@ pub mod security_log;
 pub mod subnet_zones;
 
 pub use diagnostics::*;
+pub use directory_deletion::{STAGE_DELETED, STAGE_DELETING};
 pub use directory_updates::UpdateActivityRecord;
 
 pub use directory_network::{server_address, SubnetNetwork};
@@ -3606,7 +3610,8 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// `StartADAssessment` ran, a directory's data-access status when
     /// `EnableDirectoryDataAccess` ran, a directory setting's status when
     /// `UpdateSettings` ran, a directory's LDAPS status when `EnableLDAPS`
-    /// ran, a domain controller's status when the placement or the retirement of it ran.
+    /// ran, a domain controller's status when the placement or the retirement of it ran,
+    /// a directory's teardown when `DeleteDirectory` ran.
     pub fn advance_clock(&mut self, now: SystemTime) {
         for directory in self.directories.values_mut() {
             // The stage a create owes is a CHAIN — `Requested`, then `Creating` for the
@@ -3781,6 +3786,12 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                     || controller.status_due_at.is_some_and(|due| now < due)
             });
         }
+        // The chain a DELETE owes: the transient `Deleting` a delete records settles on the
+        // terminal `Deleted`, after which the directory's record leaves the store — a
+        // directory this service no longer holds is not one `DescribeDirectories` reports.
+        // It runs after the stage chain a create owes, so one pass can carry a directory
+        // whose delete ran long enough ago all the way out.
+        self.materialise_directory_deletions(now);
         for snapshot in self.snapshots.values_mut() {
             let Some(due) = snapshot.status_due_at else {
                 continue;
@@ -3956,13 +3967,21 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// The DNS domains this service itself serves: the fully qualified domain name of
     /// every directory it stores, folded by [`domain_key`] so a lookup agrees with DNS.
     ///
+    /// A directory whose teardown has started ([`STAGE_DELETING`], [`STAGE_DELETED`]) is
+    /// NOT one of them: its servers are being decommissioned, so nothing answers DNS at the
+    /// addresses `DirectoryDescription$DnsIpAddrs` reports for it any more, even while the
+    /// control plane still describes the directory through that teardown.
+    ///
     /// A trust's remote domain is resolved against this set
     /// ([`remote_domain_has_a_peer`]): a directory this service holds IS a peer at its own
     /// domain, so a trust pointed at one establishes, and `DeleteDirectory` taking that
-    /// directory away takes the peer with it.
+    /// directory out of service takes the peer with it.
     pub fn domains_served(&self) -> BTreeSet<String> {
         self.directories
             .values()
+            .filter(|directory| {
+                !directory_deletion::DIRECTORY_TEARDOWN_STAGES.contains(&directory.stage.as_str())
+            })
             .map(|directory| domain_key(&directory.name))
             .collect()
     }
@@ -4523,6 +4542,17 @@ pub const DIRECTORY_ALREADY_SHARED: &str =
 /// valid." FIXED text, the error class's own, for the paths that have nothing to add to
 /// it. [`refusal`] appends the request id, once.
 pub const INVALID_PARAMETER: &str = "One or more parameters are not valid.";
+
+/// The `TagLimitExceededException` message a tag write that would take a resource past
+/// [`MAX_TAGS`] is refused with.
+///
+/// FIXED text, the sentence Directory Service itself states for this class, and the same one
+/// however many tags the call carried and whichever resource it addressed: the service
+/// reports the allowance as broken, not by how much, so nothing of the request or of the
+/// stored tags is quoted into it. The error shape's own documentation states the class the
+/// same way ("The maximum allowed number of tags was exceeded"). [`refusal`] appends the
+/// request id, once.
+pub const TAG_LIMIT_EXCEEDED: &str = "Tag limit exceeded.";
 
 /// The reserved prefix of a tag key AWS itself owns, which no caller may add or remove.
 ///

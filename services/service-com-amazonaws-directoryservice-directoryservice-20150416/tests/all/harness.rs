@@ -13,13 +13,47 @@
 //! not tied to a slice of the service.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_directoryservice_directoryservice_20150416::state::TRANSITION_SPAN;
 use service_com_amazonaws_directoryservice_directoryservice_20150416::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The `X-Amz-Target` prefix: the service shape's name, `DirectoryService_20150416`.
 const TARGET_PREFIX: &str = "DirectoryService_20150416";
+
+/// Comfortably longer than the whole teardown `DeleteDirectory` owes the clock — the
+/// `Deleting` -> `Deleted` step and the span the settled record is held for — with margin
+/// for a loaded test machine, so a case that waits this long is one the directory's record
+/// has LEFT the store in.
+///
+/// DERIVED from the span the service itself publishes rather than restated, so a change to
+/// it moves every wait in the crate with it.
+pub(crate) const PAST_THE_TEARDOWN: Duration = TRANSITION_SPAN
+    .saturating_add(TRANSITION_SPAN)
+    .saturating_add(Duration::from_millis(400));
+
+/// Delete the directory `directory_id` and wait until the teardown that delete started has
+/// run out, so the record has left the store by the time the caller asserts on its absence.
+///
+/// `DeleteDirectory` answers while the directory is still being torn down — it is reported
+/// in `Deleting`, then in `Deleted`, before the record goes — so a case about what the
+/// account no longer holds waits that chain out here rather than restating it.
+pub(crate) async fn delete_directory_and_wait(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    case: &str,
+) {
+    ok(
+        router,
+        "DeleteDirectory",
+        json!({ "DirectoryId": directory_id }),
+        case,
+    )
+    .await;
+    tokio::time::sleep(PAST_THE_TEARDOWN).await;
+}
 
 /// A router with just this service mounted on a fresh engine.
 pub(crate) fn service() -> MultiServiceRouter {

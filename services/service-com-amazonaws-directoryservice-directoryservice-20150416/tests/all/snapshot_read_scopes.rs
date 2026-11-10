@@ -136,10 +136,9 @@ async fn an_id_that_selects_nothing_is_a_page_when_scoped_and_a_parameter_when_n
         "read scopes: the delete",
     )
     .await;
-    ok(
+    crate::harness::delete_directory_and_wait(
         &router,
-        "DeleteDirectory",
-        json!({ "DirectoryId": &doomed }),
+        &doomed,
         "read scopes: the directory delete",
     )
     .await;

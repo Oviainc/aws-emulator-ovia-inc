@@ -394,12 +394,11 @@ async fn log_subscriptions_are_narrowed_by_the_directory_the_request_names() {
         );
     }
 
-    // A deleted directory takes its own subscription with it: the account's subscriptions
-    // are the surviving directory's.
-    ok(
+    // A deleted directory takes its own subscription with it, once its teardown has run
+    // out: the account's subscriptions are then the surviving directory's.
+    crate::harness::delete_directory_and_wait(
         &router,
-        "DeleteDirectory",
-        json!({ "DirectoryId": &second }),
+        &second,
         "filters: delete the second directory",
     )
     .await;
@@ -433,13 +432,7 @@ async fn a_directory_this_account_does_not_hold_is_refused_by_every_operation() 
     // follows the store rather than the shape of the id.
     let doomed = create_directory(&router, minimal_create("doomed.example.com"), "absent").await;
     subscribe(&router, &doomed, "doomed-group", "absent").await;
-    ok(
-        &router,
-        "DeleteDirectory",
-        json!({ "DirectoryId": &doomed }),
-        "absent: delete",
-    )
-    .await;
+    crate::harness::delete_directory_and_wait(&router, &doomed, "absent: delete").await;
     absent.push(doomed.clone());
 
     for directory_id in &absent {

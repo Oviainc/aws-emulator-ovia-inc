@@ -499,6 +499,17 @@ pub const INVALID_NEXT_TOKEN: &str = "Invalid value passed for the NextToken par
 /// [`invalid_resource_id`], which is what builds the refusal.
 pub(super) const INVALID_RESOURCE_ID: &str = "Invalid resource ID.";
 
+/// The diagnostic of the modelled `AuthenticationFailedException`: the sentence the error
+/// shape's own documentation states for this class
+/// (`smithy_query(query="doc",shape="AuthenticationFailedException")`), which is what
+/// Directory Service answers when it could not authenticate the account a call carried.
+///
+/// FIXED text, naming nothing of the request: which member of a credential pair was wrong
+/// is exactly what an authentication failure does not disclose. Shared so the operations
+/// that take an alternate directory account's credentials (`EnableSso`, `DisableSso`) say
+/// the same thing about the same failure. [`refusal`] appends the request id, once.
+pub const AUTHENTICATION_FAILED: &str = "An authentication error occurred.";
+
 /// The ARN of the Amazon SNS topic named `topic_name` in `region`.
 ///
 /// Built through [`::engine::emulator_arn`], so the account segment is the one

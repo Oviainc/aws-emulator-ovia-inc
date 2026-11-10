@@ -295,13 +295,7 @@ async fn a_directory_id_that_names_no_directory_is_refused_and_removes_nothing()
     // rather than the shape of the id.
     let doomed = create_directory(&router, minimal_create("doomed.example.com"), "deleted").await;
     register(&router, &doomed, "doomed-topic", "deleted").await;
-    ok(
-        &router,
-        "DeleteDirectory",
-        json!({ "DirectoryId": &doomed }),
-        "deleted",
-    )
-    .await;
+    crate::harness::delete_directory_and_wait(&router, &doomed, "deleted").await;
     absent.push((doomed.clone(), "a directory that was deleted"));
 
     for (directory_id, class) in &absent {

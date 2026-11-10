@@ -611,13 +611,7 @@ async fn a_directory_that_is_absent_or_not_yet_in_service_is_refused() {
         "absent: seeding the doomed directory",
     )
     .await;
-    ok(
-        &router,
-        "DeleteDirectory",
-        json!({ "DirectoryId": &doomed }),
-        "absent: delete",
-    )
-    .await;
+    crate::harness::delete_directory_and_wait(&router, &doomed, "absent: delete").await;
     absent.push(doomed);
 
     for directory_id in &absent {

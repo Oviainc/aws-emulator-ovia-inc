@@ -1,15 +1,44 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableSso
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableSso`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableSso::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Turns single sign-on off for a stored directory, by clearing it on the directory
+//! record: `DescribeDirectories` is what reports it back, as the `SsoEnabled` member of
+//! the directory's description. The flag is the whole of the change, and there is no
+//! transient status between the two values, so the disable is in force the instant it
+//! answers.
+//!
+//! The modelled `DirectoryId` pattern is refused by the framework's boundary validator
+//! BEFORE this handler runs, so a well-formed request reaches directory resolution: an
+//! id no directory is stored under is refused with `EntityDoesNotExistException`, the
+//! shared sentence this service states for a directory a call cannot reach.
+//!
+//! One precondition stands between a resolved directory and the flag:
+//!
+//! * `UserName`/`Password` are an ALTERNATE directory account's credentials, which the
+//!   service authenticates against the directory itself before it acts on its behalf.
+//!   This emulator holds no directory account credentials at all — the administrator
+//!   password `CreateDirectory` is called with is deliberately not stored, and no
+//!   operation of this service reports or verifies one — so an alternate account can
+//!   never be authenticated and a request that supplies one is refused with the modelled
+//!   `AuthenticationFailedException`. A request that supplies neither member asks the
+//!   service to act as its own service account, which needs no authentication.
+//!
+//! Nothing else is required of the directory. Unlike `EnableSso`, which needs the access
+//! URL an alias provides, turning the switch OFF asks the directory to stop signing users
+//! in, which needs no access URL and no particular stage: the model declares no
+//! `DirectoryUnavailableException` for this operation either.
+//!
+//! A disable of a directory whose single sign-on was never turned on is therefore an
+//! IDEMPOTENT NO-OP rather than a refusal: the modelled errors declare no "already off"
+//! class, the modelled output carries no members, and the request asks for the state the
+//! directory is already in — so it is answered 200 with the same empty body, which is what
+//! makes a "turn single sign-on off" teardown safe to run unconditionally.
+//!
+//! The remaining modelled errors are never answered here: `ClientException` has no
+//! precondition left to report, and `InsufficientPermissionsException` would need a caller
+//! identity this operation evaluates none of. Their presence in the error enum is the
+//! model's, not an enforcement this handler performs.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +179,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableSso` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableSsoErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableSso"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        // Single sign-on is a property OF a directory, so the directory is resolved
+        // first: an id naming none is the modelled "specified entity could not be
+        // found", worded with this service's shared sentence for a directory a call
+        // cannot reach — the same resolution `EnableSso` makes.
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(|| {
+                DisableSsoErrorModeled::EntityDoesNotExistException(crate::state::refusal(
+                    crate::state::no_such_directory(&input.directory_id),
+                ))
+            })?;
+
+        // `UserName`/`Password` name an ALTERNATE directory account, which has to be
+        // authenticated against the directory before this service acts on its behalf,
+        // and this emulator holds no directory account credentials to authenticate one
+        // against — see this module's documentation. Neither member is stored, logged or
+        // reported back, and the refusal is the class `EnableSso` answers for the same
+        // pair.
+        if input.user_name.is_some() || input.password.is_some() {
+            return Err(
+                DisableSsoErrorModeled::AuthenticationFailedException(crate::state::refusal(
+                    crate::state::AUTHENTICATION_FAILED,
+                ))
+                .into(),
+            );
+        }
+
+        // Whether the switch was on or off, the directory is left with it off: asking for
+        // the state a resource is already in is not a failure, so a directory that never
+        // had single sign-on turned on is answered exactly as one that had.
+        directory.sso_enabled = false;
+
+        Ok(DisableSsoOutput {})
     }
 }

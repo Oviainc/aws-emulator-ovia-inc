@@ -399,10 +399,9 @@ async fn a_delete_resolving_to_no_stored_snapshot_is_refused_and_removes_nothing
     // nothing either.
     let with_its_directory =
         create_snapshot(&router, &doomed_directory, Some("doomed"), "refusals").await;
-    ok(
+    crate::harness::delete_directory_and_wait(
         &router,
-        "DeleteDirectory",
-        json!({ "DirectoryId": &doomed_directory }),
+        &doomed_directory,
         "refusals: delete the directory",
     )
     .await;

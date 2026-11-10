@@ -1250,13 +1250,9 @@ async fn a_deleted_directory_takes_its_trusts_with_it() {
     )
     .await;
 
-    ok(
-        &router,
-        "DeleteDirectory",
-        json!({ "DirectoryId": &doomed }),
-        "deletion",
-    )
-    .await;
+    // A trust does not outlive the directory it is one party to — which happens when that
+    // directory's teardown runs out and its record leaves the store.
+    crate::harness::delete_directory_and_wait(&router, &doomed, "deletion").await;
 
     let left = describe(&router, json!({}), "after the directory was deleted").await;
     assert_eq!(
