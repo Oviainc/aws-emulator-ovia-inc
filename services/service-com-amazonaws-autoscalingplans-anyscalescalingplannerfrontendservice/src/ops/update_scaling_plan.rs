@@ -174,6 +174,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The name's own modelled `@pattern` is refused before any lookup, in the
+        // constraint-violation envelope the framework serializes the constraints it
+        // enforces itself in: the constraint belongs to the shape, so it holds on every
+        // operation that carries one.
+        crate::state::check_scaling_plan_name(
+            &crate::state::scaling_plan_name_path(),
+            &input.scaling_plan_name,
+        )
+        .map_err(UpdateScalingPlanError::validation)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(internal)?;
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();

@@ -28,7 +28,7 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::describe_scaling_plans::{
-    MAX_APPLICATION_SOURCES, MAX_PLAN_NAMES,
+    APPLICATION_SOURCE_ENTRIES, MAX_APPLICATION_SOURCES, MAX_PLAN_NAMES, PLAN_NAME_ENTRIES,
 };
 
 use crate::scaling_plan_lifecycle::{
@@ -68,13 +68,13 @@ fn selector_request(member: &str, entries: Vec<Value>) -> Value {
     Value::Object(request)
 }
 
-/// The refusal a list past its documented bound has to carry, as AWS words a validation
-/// failure: the member at fault and the maximum its documentation states.
+/// The refusal a list past its documented bound has to carry: the maximum its own
+/// documentation states and what the member counts.
 ///
 /// The rendering itself is [`crate::documented_entry_count_wording::entry_count_refusal`],
 /// the one sentence this service gives that refusal for ANY bounded member.
-fn expected_refusal(wire_member: &str, bound: usize) -> String {
-    crate::documented_entry_count_wording::entry_count_refusal(wire_member, bound)
+fn expected_refusal(entries_named: &str, bound: usize) -> String {
+    crate::documented_entry_count_wording::entry_count_refusal(entries_named, bound)
 }
 
 /// The `ApplicationSource` entry forms used below: a stack ARN, a tag filter, or both
@@ -118,13 +118,13 @@ async fn every_selector_lists_documented_entry_bound_is_enforced() {
     for (member, wire_member, bound, forms) in [
         (
             "ScalingPlanNames",
-            "scalingPlanNames",
+            PLAN_NAME_ENTRIES,
             MAX_PLAN_NAMES,
             name_forms,
         ),
         (
             "ApplicationSources",
-            "applicationSources",
+            APPLICATION_SOURCE_ENTRIES,
             MAX_APPLICATION_SOURCES,
             source_forms,
         ),
@@ -165,7 +165,7 @@ async fn every_selector_lists_documented_entry_bound_is_enforced() {
 #[tokio::test]
 async fn the_source_bound_counts_entries_and_does_not_inspect_them() {
     let emulator = stocked().await;
-    let refusal = expected_refusal("applicationSources", MAX_APPLICATION_SOURCES);
+    let refusal = expected_refusal(APPLICATION_SOURCE_ENTRIES, MAX_APPLICATION_SOURCES);
 
     // An entry that identifies no application: refused on its own merits at any count,
     // but an over-long list is refused for its LENGTH first, whatever its entries say.

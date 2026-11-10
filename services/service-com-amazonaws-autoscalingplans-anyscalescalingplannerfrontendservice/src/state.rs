@@ -841,23 +841,30 @@ fn is_cloud_formation_stack_arn(arn: &str) -> bool {
 /// (up to 50)."
 pub const MAX_TAG_FILTERS: usize = 50;
 
+/// What `ApplicationSource$TagFilters` counts, as its own documentation names them ("A
+/// set of tags"), for the refusal that states its bound.
+pub const TAG_FILTER_ENTRIES: &str = "tag filters";
+
 /// Documented maximum entry count of `TagFilter$Values`: "The tag values (0 to 20)."
 pub const MAX_TAG_VALUES: usize = 20;
+
+/// What `TagFilter$Values` counts, as its own documentation names them ("The tag
+/// values"), for the refusal that states its bound.
+pub const TAG_VALUE_ENTRIES: &str = "tag values";
 
 /// The refusal for a request list member that holds more entries than its own
 /// documentation allows.
 ///
 /// A list member whose documentation states a maximum entry count is bounded by it even
 /// when the list shape carries no modelled `@length`, so nothing before the handler
-/// applies it: this is the single place the whole crate words that refusal. `member` is
-/// the member's wire path, as AWS's validation failures name it, and `max` the count its
-/// own documentation states. Separate from [`check_entry_count`] so a caller whose
-/// member path has to be BUILT renders it only once the bound is actually broken.
-pub fn entry_count_message(member: &str, max: usize) -> String {
-    format!(
-        "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
-         Member must have length less than or equal to {max}"
-    )
+/// applies it: the bound is the service's to apply and the refusal its own sentence,
+/// which states the maximum and what the member counts and interpolates nothing else
+/// from the request. This is the single place the whole crate words it. `entries` names
+/// what the member counts, as that member's own documentation names them, and `max` is
+/// the count it states. Separate from [`check_entry_count`] so a caller that reaches the
+/// bound from inside a nested walk renders it only once the bound is actually broken.
+pub fn entry_count_message(entries: &str, max: usize) -> String {
+    format!("At most {max} {entries} are allowed")
 }
 
 /// The refusal for a tag filter that names no tag, worded and pathed the way the
@@ -881,10 +888,11 @@ fn keyless_tag_filter_message(position: usize) -> String {
 }
 
 /// Refuse a request list member that holds more entries than its own documentation
-/// allows; a list within its bound is accepted.
-pub fn check_entry_count(member: &str, entries: usize, max: usize) -> Result<(), String> {
+/// allows; a list within its bound is accepted. `entries_named` is what the member
+/// counts, as [`entry_count_message`] states it.
+pub fn check_entry_count(entries_named: &str, entries: usize, max: usize) -> Result<(), String> {
     if entries > max {
-        return Err(entry_count_message(member, max));
+        return Err(entry_count_message(entries_named, max));
     }
     Ok(())
 }
@@ -906,20 +914,16 @@ pub fn check_entry_count(member: &str, entries: usize, max: usize) -> Result<(),
 /// a stack ARN and a filter naming no tag is therefore reported for that filter).
 pub fn validate_application_source(source: &ApplicationSource) -> Result<String, String> {
     if let Some(filters) = source.tag_filters.as_ref() {
-        check_entry_count("applicationSource.tagFilters", filters.len(), MAX_TAG_FILTERS)?;
-        for (index, filter) in filters.iter().enumerate() {
-            // The member path is built only for the filter that breaks the bound, so a
-            // source within it renders nothing.
-            if filter.values.as_ref().map_or(0, Vec::len) > MAX_TAG_VALUES {
-                return Err(entry_count_message(
-                    &format!("applicationSource.tagFilters[{index}].values"),
-                    MAX_TAG_VALUES,
-                ));
-            }
+        check_entry_count(TAG_FILTER_ENTRIES, filters.len(), MAX_TAG_FILTERS)?;
+        if filters
+            .iter()
+            .any(|filter| filter.values.as_ref().map_or(0, Vec::len) > MAX_TAG_VALUES)
+        {
+            return Err(entry_count_message(TAG_VALUE_ENTRIES, MAX_TAG_VALUES));
         }
         // `TagFilters` is "A set of tags", and a tag is named by its key, so an entry
         // carrying none names no tag and is reported for the member it leaves out — at
-        // the position of the first such entry, the way the bounds above name theirs.
+        // the position of the first such entry.
         if let Some(index) = filters
             .iter()
             .position(|filter| named_tag_key(filter).is_none())
@@ -934,19 +938,26 @@ pub fn validate_application_source(source: &ApplicationSource) -> Result<String,
         }
     }
     match (stack_arn.is_some(), names_tag_filters(source)) {
-        (true, true) => Err(
-            "ApplicationSource must specify either CloudFormationStackARN or TagFilters, not both"
-                .to_string(),
-        ),
-        (false, false) => Err(
-            "ApplicationSource must specify either CloudFormationStackARN or TagFilters"
-                .to_string(),
-        ),
-        _ => application_source_key(source).ok_or_else(|| {
-            "ApplicationSource must specify either CloudFormationStackARN or TagFilters".to_string()
-        }),
+        (true, true) => Err(AMBIGUOUS_APPLICATION_SOURCE.to_string()),
+        (false, false) => Err(EMPTY_APPLICATION_SOURCE.to_string()),
+        _ => application_source_key(source).ok_or_else(|| EMPTY_APPLICATION_SOURCE.to_string()),
     }
 }
+
+/// The refusal for an `ApplicationSource` that names BOTH alternatives.
+///
+/// "A CloudFormation stack or set of tags" — a source naming both identifies no one
+/// application, and the refusal says exactly that: the whole sentence is fixed text and
+/// interpolates nothing from the request. `pub` so every path that takes an application
+/// source words it once.
+pub const AMBIGUOUS_APPLICATION_SOURCE: &str = "Ambiguous application source";
+
+/// The refusal for an `ApplicationSource` that names NEITHER alternative.
+///
+/// The counterpart of [`AMBIGUOUS_APPLICATION_SOURCE`]: a source that carries neither a
+/// stack ARN nor a tag that identifies one is empty, whichever of the two members it
+/// wrote and left blank. Fixed text, interpolating nothing from the request.
+pub const EMPTY_APPLICATION_SOURCE: &str = "Empty application source";
 
 // ---------------------------------------------------------------------------
 // ScalingInstruction semantics
@@ -962,6 +973,11 @@ pub fn validate_application_source(source: &ApplicationSource) -> Result<String,
 /// Documented bound on `ScalingInstruction$TargetTrackingConfigurations`: "The target
 /// tracking configurations (up to 10)."
 pub const MAX_TARGET_TRACKING_CONFIGURATIONS: usize = 10;
+
+/// What `ScalingInstruction$TargetTrackingConfigurations` counts, as its own
+/// documentation names them ("The target tracking configurations"), for the refusal that
+/// states its bound.
+pub const TARGET_TRACKING_ENTRIES: &str = "target tracking configurations";
 
 /// The smallest `MinCapacity` a scaling instruction may ask for.
 ///
@@ -1231,6 +1247,13 @@ pub fn target_metric_identity(configuration: &TargetTrackingConfiguration) -> Op
     ))
 }
 
+/// The refusal for a write whose `ScalingInstructions` list carries no entry.
+///
+/// The list is `@required` but carries no modelled `@length`, so nothing before a
+/// handler applies the "at least one instruction" rule; the whole sentence is fixed and
+/// interpolates nothing from the request. `pub` so both write paths word it once.
+pub const EMPTY_SCALING_INSTRUCTIONS: &str = "Must provide at least 1 scaling instruction";
+
 /// Validate the `ScalingInstructions` a caller wrote.
 ///
 /// `CreateScalingPlan` and `UpdateScalingPlan` both take this list and both model
@@ -1239,9 +1262,7 @@ pub fn target_metric_identity(configuration: &TargetTrackingConfiguration) -> Op
 /// broke.
 pub fn validate_scaling_instructions(instructions: &[ScalingInstruction]) -> Result<(), String> {
     if instructions.is_empty() {
-        return Err(
-            "ScalingInstructions must specify at least one scaling instruction".to_string(),
-        );
+        return Err(EMPTY_SCALING_INSTRUCTIONS.to_string());
     }
     // "Each scaling instruction applies to one resource" (`ScalingInstruction` doc), so
     // two instructions for one scalable resource contradict each other.
@@ -1417,7 +1438,7 @@ fn validate_target_tracking_configurations(
     // crate gives this refusal, so this list past its bound reads exactly as every other
     // list past its own does.
     check_entry_count(
-        &member,
+        TARGET_TRACKING_ENTRIES,
         configurations.len(),
         MAX_TARGET_TRACKING_CONFIGURATIONS,
     )?;
@@ -1742,6 +1763,81 @@ pub fn one_of(member: &str, value: &str, allowed: &[&str]) -> Result<(), String>
     ))
 }
 
+/// `ScalingPlanName`'s modelled `@pattern`, as a constraint-violation refusal states it.
+///
+/// The model writes the pattern anchored (`^[\p{Print}&&[^|:/]]+$`,
+/// `smithy_query(query="shape",shape="ScalingPlanName")`); a refusal states the pattern
+/// BODY — the character class and its repetition — because the anchoring is how the
+/// model says "the whole value", not part of the expression a caller has to satisfy.
+pub const SCALING_PLAN_NAME_PATTERN: &str = r"[\p{Print}&&[^|:/]]+";
+
+/// The characters `ScalingPlanName`'s `@pattern` subtracts from the printable set:
+/// "Names cannot contain vertical bars, colons, or forward slashes"
+/// (`smithy_query(query="doc",shape="CreateScalingPlanRequest",member="ScalingPlanName")`).
+///
+/// They are the separators this crate derives identifiers with — the policy names and
+/// the resource-identity keys a plan name travels in — so a name carrying one of them
+/// would make two different plans render one identifier.
+pub const SCALING_PLAN_NAME_EXCLUDED: [char; 3] = ['|', ':', '/'];
+
+/// The validation path of a top-level `ScalingPlanName` member, as a refusal names it.
+pub fn scaling_plan_name_path() -> String {
+    ::aws_smithy_schema_server::constraints::path::member("ScalingPlanName")
+}
+
+/// The validation path of the `position`-th (1-based) entry of a `ScalingPlanNames`
+/// list member, as a refusal names it.
+pub fn scaling_plan_names_path(position: usize) -> String {
+    use ::aws_smithy_schema_server::constraints::path;
+
+    path::join(&[path::member("ScalingPlanNames"), path::element(position)])
+}
+
+/// Whether `value` is inside the character set `ScalingPlanName`'s `@pattern` admits.
+///
+/// The pattern's set is the printable characters with three delimiters subtracted, and
+/// it requires at least one of them. "Printable" is the class the pattern names: a
+/// character that is not a control character — so a name carrying a line break, a tab or
+/// any other control character is outside it, as is the empty name (which the member's
+/// modelled `@length` minimum of 1 refuses before a handler runs).
+fn satisfies_scaling_plan_name_pattern(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| {
+                !character.is_control() && !SCALING_PLAN_NAME_EXCLUDED.contains(&character)
+            })
+}
+
+/// Refuse a scaling-plan name outside `ScalingPlanName`'s modelled `@pattern`, naming
+/// the member at `member_path`.
+///
+/// The constraint belongs to the SHAPE, so it holds wherever the shape is carried —
+/// every operation takes a `ScalingPlanName`, and one of them takes a list of them — and
+/// `pub` is what lets each of them apply it through this one function. The sentence is
+/// rendered by the framework's own constraint renderer, so a pattern violation reads
+/// exactly like the `@length` violation on the same member that the framework itself
+/// refuses before a handler runs, and `Err` carries the whole
+/// `N validation error(s) detected: …` envelope those refusals are serialized in.
+pub fn check_scaling_plan_name(member_path: &str, value: &str) -> Result<(), String> {
+    use ::aws_smithy_schema_server::constraints::{envelope, Violation, ViolationKind};
+
+    if satisfies_scaling_plan_name_pattern(value) {
+        return Ok(());
+    }
+    let violation = Violation {
+        path: member_path.to_string(),
+        kind: ViolationKind::Pattern(SCALING_PLAN_NAME_PATTERN.to_string()),
+        // The offending value, echoed from the request: a name past the member's
+        // modelled maximum never reaches here, since the framework refuses its
+        // `@length` first.
+        value: Some(value.to_string()),
+        sensitive: false,
+    };
+    // One member outside one pattern is one violation, so the envelope always renders.
+    Err(envelope(&[violation]).unwrap_or_default())
+}
+
 /// AWS's wording for "the name and version in this request name no stored plan",
 /// built from the request's own `ScalingPlanName` and `ScalingPlanVersion`.
 ///
@@ -1788,7 +1884,7 @@ pub fn encode_cursor(kind: &str, value: &str) -> String {
 /// Decode a cursor minted by [`encode_cursor`] for the same `kind`.
 ///
 /// `None` for anything this service did not mint — the caller answers
-/// `InvalidNextTokenException`.
+/// `InvalidNextTokenException` with [`INVALID_NEXT_TOKEN`].
 ///
 /// A token is accepted only when it is the EXACT output [`encode_cursor`] would have
 /// produced for the value read back out of it, so decoding is the inverse of minting
@@ -1808,6 +1904,14 @@ pub fn decode_cursor(kind: &str, token: &str) -> Option<String> {
     }
     Some(value.to_string())
 }
+
+/// The refusal wording for a `NextToken` this service cannot decode.
+///
+/// The whole sentence is fixed text: it names the member and states that its value is
+/// not valid, and echoes nothing of the rejected token. `pub` and used by every
+/// paginated read, so the two operations that accept a `NextToken` cannot drift into two
+/// spellings of one refusal.
+pub const INVALID_NEXT_TOKEN: &str = "The NextToken value is not valid";
 
 /// The page size to use, honouring the documented 1..=50 range and the documented
 /// default of 50.

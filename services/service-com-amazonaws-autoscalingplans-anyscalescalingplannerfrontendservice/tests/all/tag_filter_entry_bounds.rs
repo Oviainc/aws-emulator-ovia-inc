@@ -27,7 +27,7 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::state::{
-    MAX_TAG_FILTERS, MAX_TAG_VALUES,
+    MAX_TAG_FILTERS, MAX_TAG_VALUES, TAG_FILTER_ENTRIES, TAG_VALUE_ENTRIES,
 };
 
 use crate::scaling_plan_lifecycle::{
@@ -46,13 +46,13 @@ type ValueForm = (&'static str, fn(usize) -> String);
 /// One labelled way of building the n-th tag filter of a source.
 type FilterForm = (&'static str, fn(usize) -> Value);
 
-/// The refusal a list past its documented bound has to carry, as AWS words a validation
-/// failure: the member at fault and the maximum its documentation states.
+/// The refusal a list past its documented bound has to carry: the maximum its own
+/// documentation states and what the member counts.
 ///
 /// The rendering itself is [`crate::documented_entry_count_wording::entry_count_refusal`],
 /// the one sentence this service gives that refusal for ANY bounded member.
-fn expected_refusal(wire_member: &str, bound: usize) -> String {
-    crate::documented_entry_count_wording::entry_count_refusal(wire_member, bound)
+fn expected_refusal(entries_named: &str, bound: usize) -> String {
+    crate::documented_entry_count_wording::entry_count_refusal(entries_named, bound)
 }
 
 /// An `ApplicationSource` whose `TagFilters` holds `count` entries, each built by `form`.
@@ -197,7 +197,7 @@ async fn assert_length_not_reported(label: &str, source: &Value, refusal: &str) 
 
 #[tokio::test]
 async fn the_tag_filter_list_bound_is_enforced_on_every_application_source_path() {
-    let refusal = expected_refusal("applicationSource.tagFilters", MAX_TAG_FILTERS);
+    let refusal = expected_refusal(TAG_FILTER_ENTRIES, MAX_TAG_FILTERS);
 
     for (form, entry) in filter_forms() {
         // Within the published bound — including exactly on it — the length rule has
@@ -220,7 +220,7 @@ async fn the_tag_filter_list_bound_is_enforced_on_every_application_source_path(
 
 #[tokio::test]
 async fn the_tag_value_list_bound_is_enforced_on_every_application_source_path() {
-    let refusal = expected_refusal("applicationSource.tagFilters[0].values", MAX_TAG_VALUES);
+    let refusal = expected_refusal(TAG_VALUE_ENTRIES, MAX_TAG_VALUES);
 
     for (form, entry) in value_forms() {
         for count in [0, 1, MAX_TAG_VALUES - 1, MAX_TAG_VALUES] {
@@ -238,8 +238,9 @@ async fn the_tag_value_list_bound_is_enforced_on_every_application_source_path()
 
 #[tokio::test]
 async fn the_value_bound_is_reported_for_the_filter_that_breaks_it() {
-    // The bound is per filter, so the refusal names the position of the filter at
-    // fault — not the first filter, and not the list as a whole.
+    // The bound is per filter, and the sentence states the bound and what is counted — so
+    // it reads the same whichever filter's value list breaks it.
+    let refusal = expected_refusal(TAG_VALUE_ENTRIES, MAX_TAG_VALUES);
     for position in [0, 1, MAX_TAG_FILTERS - 1] {
         let filters: Vec<Value> = (0..MAX_TAG_FILTERS)
             .map(|n| {
@@ -252,10 +253,6 @@ async fn the_value_bound_is_reported_for_the_filter_that_breaks_it() {
             })
             .collect();
         let source = json!({ "TagFilters": filters });
-        let refusal = expected_refusal(
-            &format!("applicationSource.tagFilters[{position}].values"),
-            MAX_TAG_VALUES,
-        );
         assert_refused_everywhere(
             &format!("the over-long filter at position {position}"),
             &source,
@@ -267,7 +264,7 @@ async fn the_value_bound_is_reported_for_the_filter_that_breaks_it() {
 
 #[tokio::test]
 async fn the_tag_filter_bounds_count_entries_and_do_not_inspect_them() {
-    let refusal = expected_refusal("applicationSource.tagFilters", MAX_TAG_FILTERS);
+    let refusal = expected_refusal(TAG_FILTER_ENTRIES, MAX_TAG_FILTERS);
 
     // An over-long filter list is refused for its LENGTH first, whatever its entries say
     // and whatever else the source gets wrong.

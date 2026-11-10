@@ -172,6 +172,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The request's own members are refused BEFORE any lookup: none of these refusals
         // depends on what this service holds, so a request AWS would not accept is refused
         // whether or not the named plan exists.
+        //
+        // The name's modelled `@pattern` is refused in the constraint-violation envelope
+        // the framework serializes the constraints it enforces itself in.
+        crate::state::check_scaling_plan_name(
+            &crate::state::scaling_plan_name_path(),
+            &input.scaling_plan_name,
+        )
+        .map_err(DescribeScalingPlanResourcesError::validation)?;
         let page_size =
             crate::state::effective_max_results(input.max_results).map_err(validation)?;
 
@@ -183,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
             Some(token) => Some(
                 crate::state::decode_cursor(CURSOR_KIND, token)
-                    .ok_or_else(|| invalid_next_token("The NextToken provided is not valid"))?,
+                    .ok_or_else(|| invalid_next_token(crate::state::INVALID_NEXT_TOKEN))?,
             ),
         };
 

@@ -150,6 +150,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The name's own modelled `@pattern` is refused before anything is read or
+        // stored, in the constraint-violation envelope the framework serializes the
+        // constraints it enforces itself in — a plan AWS stops at the API boundary must
+        // not exist here either.
+        crate::state::check_scaling_plan_name(
+            &crate::state::scaling_plan_name_path(),
+            &input.scaling_plan_name,
+        )
+        .map_err(CreateScalingPlanError::validation)?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(internal)?;
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();

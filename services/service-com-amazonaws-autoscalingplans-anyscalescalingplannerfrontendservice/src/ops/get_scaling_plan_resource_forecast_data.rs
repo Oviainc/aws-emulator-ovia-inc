@@ -206,6 +206,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The request's own members are refused BEFORE any lookup: none of these
         // refusals depends on what this service holds, so a request AWS would not
         // accept is refused here whether or not the named plan exists.
+        //
+        // The name's modelled `@pattern` is refused in the constraint-violation envelope
+        // the framework serializes the constraints it enforces itself in.
+        crate::state::check_scaling_plan_name(
+            &crate::state::scaling_plan_name_path(),
+            &input.scaling_plan_name,
+        )
+        .map_err(GetScalingPlanResourceForecastDataError::validation)?;
         crate::state::one_of(
             "ForecastDataType",
             &input.forecast_data_type,

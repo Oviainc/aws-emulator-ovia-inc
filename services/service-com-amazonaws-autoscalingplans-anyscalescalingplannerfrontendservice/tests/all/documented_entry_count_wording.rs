@@ -10,16 +10,17 @@
 //!
 //! The rule pinned here: whichever list member holds more entries than its own
 //! documentation allows, the refusal is the SAME 400 `ValidationException` sentence —
-//! AWS's validation-failure rendering naming that member's wire path and the maximum its
-//! documentation states — never a per-member rendering of the same rule.
+//! `At most <max> <entries> are allowed`, stating the maximum that member's documentation
+//! states and what the member counts, as its own documentation names them — never a
+//! per-member rendering of the same rule.
 //!
 //! The table spans EVERY list member of this service that carries a documented entry
 //! count, each on every operation that carries it, at the counts around its own published
 //! bound: well inside it, one below it, exactly on it, one past it, two past it and far
-//! past it. For a member that lives inside a list, the refusal is also shown to name the
-//! POSITION of the entry at fault, and the accepted side is read back through
-//! `DescribeScalingPlans`, so a list at its bound is shown to be stored rather than
-//! merely not refused.
+//! past it. For a member that lives inside a list, the refusal is also shown to be the
+//! same sentence whichever entry of the enclosing list breaks it, and the accepted side
+//! is read back through `DescribeScalingPlans`, so a list at its bound is shown to be
+//! stored rather than merely not refused.
 //!
 //! The harness (router, dispatch, error-body readers) is reused from
 //! [`crate::scaling_plan_lifecycle`]; nothing here builds a second one.
@@ -27,10 +28,11 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::describe_scaling_plans::{
-    MAX_APPLICATION_SOURCES, MAX_PLAN_NAMES,
+    APPLICATION_SOURCE_ENTRIES, MAX_APPLICATION_SOURCES, MAX_PLAN_NAMES, PLAN_NAME_ENTRIES,
 };
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::state::{
-    MAX_TAG_FILTERS, MAX_TAG_VALUES, MAX_TARGET_TRACKING_CONFIGURATIONS,
+    MAX_TAG_FILTERS, MAX_TAG_VALUES, MAX_TARGET_TRACKING_CONFIGURATIONS, TAG_FILTER_ENTRIES,
+    TAG_VALUE_ENTRIES, TARGET_TRACKING_ENTRIES,
 };
 
 use crate::scaling_instruction_validation::{customized_configurations, with};
@@ -49,21 +51,18 @@ const NEW_PLAN: &str = "a-new-plan";
 /// The only scaling-plan version the model documents as valid.
 const ONLY_VERSION: i64 = 1;
 
-/// The refusal a list past its documented maximum entry count has to carry, as AWS words
-/// a validation failure: the member at fault and the maximum its documentation states.
+/// The refusal a list past its documented maximum entry count has to carry: the maximum
+/// its own documentation states and what the member counts.
 ///
 /// `pub(crate)` so every suite in this target expects ONE rendering of this refusal,
 /// whichever member it is reported for.
-pub(crate) fn entry_count_refusal(wire_member: &str, bound: usize) -> String {
-    format!(
-        "1 validation error detected: Value at '{wire_member}' failed to satisfy constraint: \
-         Member must have length less than or equal to {bound}"
-    )
+pub(crate) fn entry_count_refusal(entries_named: &str, bound: usize) -> String {
+    format!("At most {bound} {entries_named} are allowed")
 }
 
 /// One request list member whose own documentation states a maximum entry count.
 struct BoundedList {
-    /// The member's wire path, as the refusal names it.
+    /// What the member counts, as the refusal names them.
     member: &'static str,
     /// The maximum entry count its documentation states.
     bound: usize,
@@ -198,27 +197,27 @@ fn instruction_requests_at(
 fn bounded_lists() -> Vec<BoundedList> {
     vec![
         BoundedList {
-            member: "scalingPlanNames",
+            member: PLAN_NAME_ENTRIES,
             bound: MAX_PLAN_NAMES,
             requests: plan_name_requests,
         },
         BoundedList {
-            member: "applicationSources",
+            member: APPLICATION_SOURCE_ENTRIES,
             bound: MAX_APPLICATION_SOURCES,
             requests: application_source_requests,
         },
         BoundedList {
-            member: "applicationSource.tagFilters",
+            member: TAG_FILTER_ENTRIES,
             bound: MAX_TAG_FILTERS,
             requests: tag_filter_requests,
         },
         BoundedList {
-            member: "applicationSource.tagFilters[0].values",
+            member: TAG_VALUE_ENTRIES,
             bound: MAX_TAG_VALUES,
             requests: tag_value_requests,
         },
         BoundedList {
-            member: "ScalingInstructions[0].TargetTrackingConfigurations",
+            member: TARGET_TRACKING_ENTRIES,
             bound: MAX_TARGET_TRACKING_CONFIGURATIONS,
             requests: instruction_requests,
         },
@@ -298,16 +297,13 @@ async fn a_list_within_its_documented_bound_is_never_refused_for_its_length() {
 }
 
 #[tokio::test]
-async fn the_entry_count_refusal_names_the_position_of_the_entry_at_fault() {
-    // The target tracking bound is per scaling instruction, so the refusal names the
-    // instruction whose list breaks it — not the first instruction, and not the list of
-    // instructions as a whole.
+async fn the_entry_count_refusal_is_one_sentence_whichever_entry_breaks_the_bound() {
+    // The target tracking bound is per scaling instruction, and the sentence states the
+    // bound and what is counted — so it reads the same whichever instruction's list
+    // breaks it, rather than being re-worded per position.
+    let refusal = entry_count_refusal(TARGET_TRACKING_ENTRIES, MAX_TARGET_TRACKING_CONFIGURATIONS);
     let instructions = 5;
     for position in [0, 1, instructions - 1] {
-        let refusal = entry_count_refusal(
-            &format!("ScalingInstructions[{position}].TargetTrackingConfigurations"),
-            MAX_TARGET_TRACKING_CONFIGURATIONS,
-        );
         let label = format!("the over-long configuration list at instruction {position}");
         assert_refused(
             &label,

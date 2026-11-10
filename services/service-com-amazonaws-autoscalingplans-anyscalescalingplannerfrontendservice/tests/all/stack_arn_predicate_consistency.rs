@@ -25,6 +25,8 @@
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::state as plan_state;
+
 use crate::scaling_plan_lifecycle::{
     error_code, error_message, simple_instructions, stack_source, Emulator,
 };
@@ -55,17 +57,12 @@ fn malformed(arn: &str) -> Expect {
 
 /// The refusal for a source that names both alternatives.
 fn both() -> Expect {
-    Expect::Refused(
-        "ApplicationSource must specify either CloudFormationStackARN or TagFilters, not both"
-            .to_string(),
-    )
+    Expect::Refused(plan_state::AMBIGUOUS_APPLICATION_SOURCE.to_string())
 }
 
 /// The refusal for a source that names neither alternative.
 fn neither() -> Expect {
-    Expect::Refused(
-        "ApplicationSource must specify either CloudFormationStackARN or TagFilters".to_string(),
-    )
+    Expect::Refused(plan_state::EMPTY_APPLICATION_SOURCE.to_string())
 }
 
 /// One tag-filter list, used by the rows that pair a stack-ARN spelling with tags.

@@ -170,8 +170,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Each selector list is documented with its own maximum entry count, and
         // neither carries a modelled `@length`, so both bounds are applied here —
         // before the request is served — rather than only the one.
-        check_entry_count("scalingPlanNames", names.len(), MAX_PLAN_NAMES)?;
-        check_entry_count("applicationSources", sources.len(), MAX_APPLICATION_SOURCES)?;
+        check_entry_count(PLAN_NAME_ENTRIES, names.len(), MAX_PLAN_NAMES)?;
+        // Every entry of the selector list is a `ScalingPlanName`, so each carries the
+        // shape's own modelled `@pattern` and is refused — in the constraint-violation
+        // envelope the framework serializes the constraints it enforces itself in — at
+        // the path that names the entry.
+        for (index, name) in names.iter().enumerate() {
+            crate::state::check_scaling_plan_name(
+                &crate::state::scaling_plan_names_path(index + 1),
+                name,
+            )
+            .map_err(DescribeScalingPlansError::validation)?;
+        }
+        check_entry_count(
+            APPLICATION_SOURCE_ENTRIES,
+            sources.len(),
+            MAX_APPLICATION_SOURCES,
+        )?;
         // "If you specify a scaling plan version, you must also specify a scaling plan name."
         if input.scaling_plan_version.is_some() && names.is_empty() {
             return Err(validation(
@@ -186,9 +201,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let after: Option<String> = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
-                crate::state::decode_cursor(CURSOR_KIND, token).ok_or_else(|| {
-                    invalid_next_token("The NextToken provided is not valid")
-                })?,
+                crate::state::decode_cursor(CURSOR_KIND, token)
+                    .ok_or_else(|| invalid_next_token(crate::state::INVALID_NEXT_TOKEN))?,
             ),
         };
 
@@ -244,9 +258,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `ScalingPlanNames` is documented as "The names of the scaling plans (up to 10)".
 pub const MAX_PLAN_NAMES: usize = 10;
 
+/// What `ScalingPlanNames` counts, as its own documentation names them ("The names of
+/// the scaling plans"), for the refusal that states its bound.
+pub const PLAN_NAME_ENTRIES: &str = "scaling plan names";
+
 /// `ApplicationSources` is documented as "The sources for the applications (up to 10)" —
 /// the same bound as its sibling selector carries, stated for its own member.
 pub const MAX_APPLICATION_SOURCES: usize = 10;
+
+/// What `ApplicationSources` counts, as its own documentation names them ("The sources
+/// for the applications"), for the refusal that states its bound.
+pub const APPLICATION_SOURCE_ENTRIES: &str = "application sources";
 
 /// Refuse a request list member that holds more entries than its documented maximum,
 /// in this operation's error channel.
@@ -255,11 +277,11 @@ pub const MAX_APPLICATION_SOURCES: usize = 10;
 /// count this service applies — this operation's two selector lists and the tag-filter
 /// counts inside an `ApplicationSource` — is refused with one sentence.
 fn check_entry_count(
-    member: &str,
+    entries_named: &str,
     entries: usize,
     max: usize,
 ) -> Result<(), DescribeScalingPlansError> {
-    crate::state::check_entry_count(member, entries, max).map_err(validation)
+    crate::state::check_entry_count(entries_named, entries, max).map_err(validation)
 }
 
 /// AWS's fixed refusal for a request that selects by application source AND by the
