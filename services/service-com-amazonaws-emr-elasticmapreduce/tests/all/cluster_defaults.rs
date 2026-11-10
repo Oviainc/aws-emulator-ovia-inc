@@ -480,9 +480,10 @@ async fn a_fleet_instance_type_reports_the_capacity_bid_and_ebs_layout_emr_suppl
     // storage table (the page the service's instance-type catalog is refreshed from) —
     // one `gp2` volume of 32 GiB for a `large`, two for an `xlarge`, four from `2xlarge`
     // up, each sized so the instance is attached 16 GiB per vCPU. The rows span the size
-    // ladder (`large` through `24xlarge`, including a `9xlarge` step), two families, a
-    // storage-optimised type that carries instance-store disks instead, and a type
-    // outside the catalog, which has no published layout to state.
+    // ladder (`large` through `24xlarge`, including a `9xlarge` step), two families, and
+    // a storage-optimised type that carries instance-store disks instead. Every row names
+    // a type the launch's release offers, which is what a launch may name at all
+    // (`tests/all/unsupported_instance_types.rs`).
     let cases = vec![
         Case {
             label: "the smallest EBS-only size, one volume",
@@ -537,11 +538,6 @@ async fn a_fleet_instance_type_reports_the_capacity_bid_and_ebs_layout_emr_suppl
         Case {
             label: "a type carrying instance-store disks of its own",
             instance_type: "i3.2xlarge",
-            volumes: &[],
-        },
-        Case {
-            label: "a type outside this service's catalog",
-            instance_type: "m1.small",
             volumes: &[],
         },
     ];

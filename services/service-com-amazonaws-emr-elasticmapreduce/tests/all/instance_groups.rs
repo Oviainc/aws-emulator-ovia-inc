@@ -378,10 +378,10 @@ async fn list_instance_groups_reports_every_group_its_cluster_was_launched_with(
         },
         Case {
             label: "uniform form, no core node instance type named",
-            instances: json!({ "InstanceCount": 2, "MasterInstanceType": "m1.small" }),
+            instances: json!({ "InstanceCount": 2, "MasterInstanceType": "m5.4xlarge" }),
             // Nothing in the request says what to provision the core nodes as, so the
             // cluster carries only the master group.
-            expected: vec![Expected::group("MASTER", "m1.small", 1)],
+            expected: vec![Expected::group("MASTER", "m5.4xlarge", 1)],
         },
         Case {
             label: "configured groups, all three roles",

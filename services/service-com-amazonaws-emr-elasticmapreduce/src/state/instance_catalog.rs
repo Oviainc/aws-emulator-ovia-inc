@@ -676,6 +676,92 @@ pub fn supported_instance_types(release: (u32, u32, u32)) -> Vec<SupportedInstan
         .collect()
 }
 
+/// Whether the release `release` — a `(major, minor, patch)` triple, as
+/// [`catalog_release`] resolves a label to — offers the instance type `instance_type`.
+///
+/// An instance type is named `<family>.<size>`, so a type a release offers is a size on
+/// the published ladder of a family that release supports: the same membership
+/// [`supported_instance_types`] projects ("the list of instance types that the release
+/// specified … supports", `ListSupportedInstanceTypesOutput$SupportedInstanceTypes`
+/// doc), decided without building that list. A value that is not a `<family>.<size>`
+/// name at all names no instance type, so no release offers it.
+pub fn release_offers_instance_type(release: (u32, u32, u32), instance_type: &str) -> bool {
+    let Some((family, size)) = instance_type.split_once('.') else {
+        return false;
+    };
+    INSTANCE_FAMILIES.iter().any(|spec| {
+        spec.family == family && spec.sizes.contains(&size) && spec.supported_by(release)
+    })
+}
+
+/// How Amazon EMR refuses an instance type the release the request names does not offer.
+///
+/// Recorded behavior for the text, whose fixed part is entirely fixed: the only variable
+/// part is the instance type, taken verbatim from the member of the request that named
+/// it, so a caller that mistyped a type or asked for one its release predates reads the
+/// value it has to change out of the sentence.
+pub fn unsupported_instance_type_message(instance_type: &str) -> String {
+    format!("Instance type '{instance_type}' is not supported.")
+}
+
+/// Every instance type a launch would provision capacity from, in request order.
+///
+/// A launch describes its capacity one of three ways, and this is all of them: the
+/// `InstanceTypeConfigs` of every instance fleet it names ("an array of
+/// `InstanceTypeConfig` objects that specify how Amazon EMR provisions Amazon EC2
+/// instances", `InstanceFleetConfig$InstanceTypeConfigs` doc) — EVERY fleet, whatever
+/// role it fills — then every instance group it names ("the Amazon EC2 instance type for
+/// all instances in the instance group", `InstanceGroupConfig$InstanceType` doc), and
+/// where it named no collection at all, the groups its uniform
+/// `MasterInstanceType`/`SlaveInstanceType` form implies
+/// ([`implied_instance_group_configs`]).
+///
+/// `instance_groups` is passed beside `instances` because the launch handler TAKES the
+/// submitted groups out of its input before anything resolves them.
+pub fn launch_instance_types(
+    instances: &JobFlowInstancesConfig,
+    instance_groups: &[InstanceGroupConfig],
+) -> Vec<String> {
+    let mut instance_types: Vec<String> = instances
+        .instance_fleets
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|fleet| fleet.instance_type_configs.as_deref().unwrap_or_default())
+        .map(|config| config.instance_type.clone())
+        .collect();
+    if !instance_groups.is_empty() {
+        instance_types.extend(
+            instance_groups
+                .iter()
+                .map(|group| group.instance_type.clone()),
+        );
+    } else if instance_types.is_empty() {
+        instance_types.extend(
+            implied_instance_group_configs(instances)
+                .into_iter()
+                .map(|group| group.instance_type),
+        );
+    }
+    instance_types
+}
+
+/// The first instance type this launch names that the release `release` does not offer,
+/// if it names one — the value [`unsupported_instance_type_message`] refuses.
+///
+/// The types are judged in the order the request states them
+/// ([`launch_instance_types`]), so a launch that gets several wrong is refused for the
+/// first.
+pub fn unsupported_launch_instance_type(
+    release: (u32, u32, u32),
+    instances: &JobFlowInstancesConfig,
+    instance_groups: &[InstanceGroupConfig],
+) -> Option<String> {
+    launch_instance_types(instances, instance_groups)
+        .into_iter()
+        .find(|instance_type| !release_offers_instance_type(release, instance_type))
+}
+
 /// `ListSupportedInstanceTypes` page size.
 ///
 /// CHOSEN, not documented: the operation is paginated on `Marker` but AWS publishes no

@@ -401,6 +401,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The RELEASE also decides which Amazon EC2 instance types the cluster can be
+        // provisioned from — "the list of instance types that the release specified …
+        // supports" (`ListSupportedInstanceTypesOutput$SupportedInstanceTypes` doc) — so
+        // every instance type the launch names is resolved against the release it names,
+        // against the same catalog `ListSupportedInstanceTypes` answers from. That is
+        // every `InstanceTypeConfigs` entry of EVERY instance fleet whatever role it
+        // fills, every instance group, and the uniform master/slave form where the launch
+        // named no collection (`crate::state::launch_instance_types`); a type the release
+        // does not offer refuses the whole launch before any cluster is stored, so no
+        // cluster is left holding capacity that can never materialise. A launch that names
+        // no release label names no release to resolve against, the same way the check
+        // above is skipped for it.
+        if let Some(release) = input
+            .release_label
+            .as_deref()
+            .and_then(crate::state::catalog_release)
+        {
+            if let Some(instance_type) = crate::state::unsupported_launch_instance_type(
+                release,
+                &input.instances,
+                &requested_group_configs,
+            ) {
+                return Err(refuse(crate::state::unsupported_instance_type_message(
+                    &instance_type,
+                )));
+            }
+        }
+
         // "A maximum of 256 steps are allowed in each job flow." (RunJobFlow doc.)
         let step_configs = input.steps.take().unwrap_or_default();
         if step_configs.len() > MAX_STEPS_PER_JOB_FLOW {

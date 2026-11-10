@@ -107,3 +107,5 @@ mod termination_protection;
 mod validation_refusal_identity;
 #[path = "all/unreadable_request_values.rs"]
 mod unreadable_request_values;
+#[path = "all/unsupported_instance_types.rs"]
+mod unsupported_instance_types;
