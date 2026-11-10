@@ -37,6 +37,10 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # The KMS store, where an `EncryptionKeyArn` is resolved to the key it names
 # (`EncryptionKeyArn` is an `@arnReference` to `AWS::KMS::Key`).
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# The AWS Backup store, which is where this account's recovery points live: a search job
+# searches the backups AWS Backup took, so `state::backup_plane` resolves a `SearchScope`
+# against that component's own records rather than against a second list of its own.
+service-com-amazonaws-backup-cryocontrollerusermanager = { workspace = true }
 # `iam_authorization`: the shared evaluation of those documents against an action on a
 # resource, so every service that enforces authorization decides alike. `iam_role` reads
 # which IAM entity a principal ARN names.

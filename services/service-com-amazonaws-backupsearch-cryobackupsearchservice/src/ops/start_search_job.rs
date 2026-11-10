@@ -8,9 +8,13 @@
 //! members it answers with are read back out of that record, so `GetSearchJob` reports
 //! the same values.
 //!
-//! A scope resolves in TWO layers, both counted from the store: the recovery points it
+//! A scope resolves in TWO layers, both counted from the stores: the recovery points it
 //! selects (`TotalRecoveryPointsToScanCount`) and the items their backup indexes hold
-//! (`TotalItemsToScanCount`, [`crate::state::scanned_items`]). The submitted `ItemFilters`
+//! (`TotalItemsToScanCount`, [`crate::state::scanned_items`]). The backups it selects
+//! from are the ones AWS Backup holds for this account, read from THAT component's store
+//! ([`crate::state::indexed_recovery_points`]) because that is where a backup exists, so
+//! a recovery point a client created through `backup:StartBackupJob` is in scope on the
+//! next call and one Backup no longer holds is in scope for nothing. The submitted `ItemFilters`
 //! select the scan's matches from that item layer
 //! ([`crate::state::item_matches_filters`]), and the record keeps them until the clock
 //! makes the scan's completion due — which is when `ListSearchJobResults` can page them
@@ -232,6 +236,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = SystemTime::now();
+        // The inventory a `SearchScope` is resolved against: the recovery points AWS
+        // Backup holds for this account, read from THAT component's store, because that
+        // is the component a backup exists in. Read before this service's store is
+        // locked, exactly as the encryption key above is resolved in KMS's store.
+        let held_by_backup = crate::state::indexed_recovery_points(&*self.engine, now);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(store_unavailable());
         };
@@ -308,20 +317,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &identifier,
         );
 
-        // What the scan has to get through, in both layers and counted from the store
+        // What the scan has to get through, in both layers and counted from the stores
         // rather than assumed: the recovery points of this account the submitted scope
         // resolves to, and the items their backup indexes hold. A recovery point exists
-        // only once the Backup data plane holds one and nothing in this service creates
-        // one, so ordinarily the scope resolves to the empty set — and then the scan has
-        // nothing to search. The progress starts at nothing scanned: the clock has not
-        // run the scan yet.
+        // because AWS Backup took a backup and built its index, so a scope resolves
+        // against what that component holds — and a scope that selects none of those
+        // backups leaves the scan nothing to search. The progress starts at nothing
+        // scanned: the clock has not run the scan yet.
         //
         // The scope says which backups the search COVERS; which of them it can get into
         // is the state of each one's backup index (`crate::state::index_searchable`), so a
         // covered recovery point whose index was in no state to be read contributes
         // neither itself nor its items to what the scan scans. It is still covered, so
         // `ListSearchJobBackups` displays it with the status saying why it was left out.
-        let points = state.recovery_points_in_scope(&input.search_scope);
+        let points = state.recovery_points_in_scope(&input.search_scope, &held_by_backup);
         let searched_points = crate::state::searched_recovery_point_count(&points);
         let scanned = crate::state::scanned_items(&points);
         // `@required` on GetSearchJob's output: a job started with no item filters

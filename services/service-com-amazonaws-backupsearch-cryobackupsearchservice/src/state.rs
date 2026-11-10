@@ -43,8 +43,11 @@
 //!
 //! ## Two layers: backups, and the items inside them
 //!
-//! A scan resolves a `SearchScope` to recovery points and then gets through the ITEMS
-//! their backup indexes hold ([`IndexedRecoveryPoint`]) — the objects of a backed-up
+//! A scan resolves a `SearchScope` to recovery points — the backups AWS Backup holds for
+//! this account, read from that component's own store ([`indexed_recovery_points`]), so a
+//! backup a client created through Backup's API is searchable on the next call — and then
+//! gets through the ITEMS their backup indexes hold ([`IndexedRecoveryPoint`]) — the
+//! objects of a backed-up
 //! bucket, the files of a backed-up volume. That inner layer is what a job's `ItemFilters`
 //! select from ([`item_matches_filters`]), what `TotalItemsToScanCount` and
 //! `ItemsScannedCount` count ([`scanned_items`]) and what `ListSearchJobResults` pages, so
@@ -70,6 +73,11 @@ use crate::ops::types::{
     ResultItem, S3ItemFilter, S3ResultItem, SearchJobBackupsResult, SearchScope,
     SearchScopeSummary, ServiceQuotaExceededException, StringCondition, TimeCondition,
 };
+
+/// Where the recovery points a `SearchScope` is resolved against come from: the AWS
+/// Backup component of this emulator, which is what holds this account's backups.
+mod backup_plane;
+pub use backup_plane::*;
 
 /// The HTTP status a successful call of this service that has NO content to report
 /// answers with.
@@ -1354,24 +1362,24 @@ pub struct ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// `ListSearchJobs` walks this backwards (see
     /// [`jobs_newest_first`](Self::jobs_newest_first)).
     pub job_order: Vec<String>,
-    /// The recovery points of this account a search job's `SearchScope` is resolved
-    /// against, each with the items its backup index holds — the backup index the Backup
-    /// data plane builds, which is what a scan actually scans, down to the item layer
-    /// ([`IndexedRecoveryPoint`]).
+    /// The ITEMS the backup indexes of this account's recovery points hold, as records
+    /// of the same shape the scope resolution works in ([`IndexedRecoveryPoint`]).
     ///
-    /// A recovery point exists for this account only once that data plane holds one, and
-    /// nothing in THIS service creates one — no operation it models takes a backup or
-    /// indexes one — so in a running emulator this stays EMPTY: every scope resolves to
-    /// nothing and every scan therefore settles to the `FAILED`/[`SCOPE_EMPTY`] outcome
-    /// the service answers for an empty scope, which is exactly what the recordings show.
-    /// The `COMPLETED` branch of [`scan_outcome`] is reached as soon as this holds a
-    /// recovery point the scope selects: a test seeds them, and a future Backup data
-    /// plane in this emulator would write them here rather than teach the scan a second
-    /// source. BOTH layers a job reports are COUNTED from here — the scope from
+    /// The recovery points THEMSELVES are not kept here: a backup exists because AWS
+    /// Backup took one, so the inventory a scope is resolved against is read from that
+    /// component's store on every start ([`indexed_recovery_points`]) rather than
+    /// copied here, which is what keeps a backup a client has just created — or just
+    /// deleted — from having to be propagated into a second list to be searchable. What
+    /// this field holds is the layer that component does NOT hold: the objects of a
+    /// backed-up bucket and the files of a backed-up volume. A record here supersedes
+    /// the projection of the same backup, so the two cannot report one backup twice
+    /// ([`recovery_points_in_scope`](Self::recovery_points_in_scope)).
+    ///
+    /// BOTH layers a job reports are COUNTED from that resolved scope — the backups from
     /// [`recovery_points_in_scope`](Self::recovery_points_in_scope) and the items from
-    /// [`scanned_items`] — rather than assumed by a handler, so every member a job reports
-    /// about its scope and its progress, and the terminal status it settles to, follows the
-    /// records this store holds.
+    /// [`scanned_items`] — rather than assumed by a handler, so every member a job
+    /// reports about its scope and its progress, and the terminal status it settles to,
+    /// follows the records the emulator holds.
     pub recovery_points: Vec<IndexedRecoveryPoint>,
     /// Every export job, keyed by its `ExportJobIdentifier`.
     pub export_jobs: HashMap<String, ExportJob>,
@@ -1525,10 +1533,16 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
         newest_first(&self.job_order, &self.search_jobs)
     }
 
-    /// The recovery points this store holds that `scope` selects — the scan's resolved
-    /// scope, and so what a search job over that scope has to get through. Each one
-    /// carries the items its backup index holds, which is the layer
-    /// [`scanned_items`] reads.
+    /// The recovery points of this account `scope` selects — the scan's resolved scope,
+    /// and so what a search job over that scope has to get through. Each one carries the
+    /// items its backup index holds, which is the layer [`scanned_items`] reads.
+    ///
+    /// The inventory selected FROM is the account's searchable backups: the ones AWS
+    /// Backup holds, which the caller hands in after reading that component's store
+    /// ([`indexed_recovery_points`]), plus the index items this store holds
+    /// ([`Self::recovery_points`]) — a record held here supersedes the projection of the
+    /// same backup, so one backup is never covered twice and the items of a backup this
+    /// store knows the contents of are the ones the scan reads.
     ///
     /// A recovery point is in scope when its resource type is one the scope names and
     /// every filter the scope carries admits it; a filter the records cannot be judged
@@ -1540,9 +1554,20 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// covered recovery point's backup index could be read at all is a separate decision
     /// ([`index_searchable`]), because a backup left out for that reason is still
     /// displayed by `ListSearchJobBackups` ([`SearchJob::backups`]).
-    pub fn recovery_points_in_scope(&self, scope: &SearchScope) -> Vec<IndexedRecoveryPoint> {
+    pub fn recovery_points_in_scope(
+        &self,
+        scope: &SearchScope,
+        held_by_backup: &[IndexedRecoveryPoint],
+    ) -> Vec<IndexedRecoveryPoint> {
+        let superseded = |point: &IndexedRecoveryPoint| {
+            point.backup.backup_resource_arn.is_some()
+                && self.recovery_points.iter().any(|held| {
+                    held.backup.backup_resource_arn == point.backup.backup_resource_arn
+                })
+        };
         self.recovery_points
             .iter()
+            .chain(held_by_backup.iter().filter(|point| !superseded(point)))
             .filter(|point| in_scope(&point.backup, scope))
             .cloned()
             .collect()
