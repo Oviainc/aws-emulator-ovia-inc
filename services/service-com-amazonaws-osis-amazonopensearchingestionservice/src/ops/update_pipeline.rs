@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = store
             .pipelines
             .get_mut(&pipeline_name)
-            .ok_or_else(|| not_found(&pipeline_name))?;
+            .ok_or_else(not_found)?;
 
         // A pipeline can only be updated from a settled status: one still moving between
         // statuses already has a change in flight, which is what this operation's
@@ -249,9 +249,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// No pipeline of this name is stored — HTTP 404 `ResourceNotFoundException`.
-fn not_found(pipeline_name: &str) -> UpdatePipelineError {
+///
+/// This update's own wording, and it is entirely fixed: a lookup-miss message is
+/// per-operation (a start, a stop and a delete each word theirs differently), and
+/// this one carries no variable part at all — it echoes neither the pipeline name
+/// the request named nor anything else the request submitted.
+fn not_found() -> UpdatePipelineError {
     UpdatePipelineErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Pipeline {pipeline_name} could not be found")),
+        message: Some("Service returned error code ResourceNotFoundException".to_string()),
     })
     .into()
 }

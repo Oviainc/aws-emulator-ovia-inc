@@ -19,6 +19,8 @@ mod error_messages;
 mod pattern_messages;
 #[path = "all/pipeline_lifecycle.rs"]
 mod pipeline_lifecycle;
+#[path = "all/pipeline_not_found_wording.rs"]
+mod pipeline_not_found_wording;
 #[path = "all/pipeline_refusal_wording.rs"]
 mod pipeline_refusal_wording;
 #[path = "all/pipeline_update.rs"]

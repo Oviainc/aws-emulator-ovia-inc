@@ -428,7 +428,7 @@ async fn an_update_is_refused_per_its_error_contract() {
             Setup::Missing,
             404,
             "ResourceNotFoundException",
-            "Pipeline ghost-pipeline could not be found".to_string(),
+            "Service returned error code ResourceNotFoundException".to_string(),
         ),
         (
             "the shortest legal name, also never created",
@@ -437,7 +437,7 @@ async fn an_update_is_refused_per_its_error_contract() {
             Setup::Missing,
             404,
             "ResourceNotFoundException",
-            "Pipeline abc could not be found".to_string(),
+            "Service returned error code ResourceNotFoundException".to_string(),
         ),
         (
             "both counts named and inverted",
