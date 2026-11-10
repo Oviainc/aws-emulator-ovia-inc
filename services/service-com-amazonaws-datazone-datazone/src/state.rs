@@ -463,6 +463,53 @@ impl Domain {
             .any(|term| term.glossary_id == glossary_id)
     }
 
+    /// The kind of object stored in this domain that is still linked to the glossary term
+    /// `term_id` and so prevents its deletion, when one is.
+    ///
+    /// What is linked to a term is whatever stored object NAMES it: another term that
+    /// relates to it ([`StoredTermRelations`], the `isA`/`classifies` relations a term
+    /// holds to other terms of the domain), an asset whose metadata attaches it
+    /// ([`AssetRevision::glossary_terms`]) and a project that attaches it
+    /// ([`Project::glossary_terms`]) — the three places a `GlossaryTermId` is stored
+    /// outside the term itself. EVERY recorded asset revision counts, for the reason
+    /// [`Self::form_type_blocker`] states: a revision is a record this store still serves,
+    /// so a term one of them attaches is still in use even when the newest revision
+    /// dropped it.
+    ///
+    /// The kinds are looked at in a fixed order, so the link reported for a term several
+    /// objects name is the same one on every call. `None` exactly when nothing in this
+    /// domain names the term, which is what lets `DeleteGlossaryTerm` remove it. Linear
+    /// scans over maps bounded by [`MAX_GLOSSARY_TERMS_PER_DOMAIN`],
+    /// [`MAX_ASSETS_PER_DOMAIN`] and [`MAX_PROJECTS_PER_DOMAIN`], the same trade
+    /// [`Self::listing_for_entity`] makes.
+    pub fn glossary_term_link(&self, term_id: &str) -> Option<TermLinkKind> {
+        let names_it = |candidate: &String| candidate == term_id;
+        let related = self.glossary_terms.values().any(|other| {
+            other.id != term_id
+                && other
+                    .term_relations
+                    .related_term_ids()
+                    .any(|related| related == term_id)
+        });
+        if related {
+            return Some(TermLinkKind::GlossaryTerm);
+        }
+        let attached_to_asset = self.assets.values().any(|asset| {
+            asset
+                .revisions
+                .values()
+                .flat_map(|revision| revision.glossary_terms.iter())
+                .any(names_it)
+        });
+        if attached_to_asset {
+            return Some(TermLinkKind::Asset);
+        }
+        self.projects
+            .values()
+            .any(|project| project.glossary_terms.iter().any(names_it))
+            .then_some(TermLinkKind::Project)
+    }
+
     /// Remember that the domain unit `unit_id` was deleted from this domain.
     ///
     /// The ids are kept oldest first and bounded by
@@ -512,6 +559,49 @@ pub const GLOSSARY_HAS_TERMS_MESSAGE: &str =
 /// read from the STORE: the `GlossaryStatus` the glossary is actually in.
 pub fn glossary_not_disabled_message(status: &str) -> String {
     format!("Glossary can't be deleted while it is in {status} state")
+}
+
+/// The kind of stored object that is linked to a glossary term and so prevents its
+/// deletion ([`Domain::glossary_term_link`]).
+///
+/// A closed set, so a refusal names a kind this service defines and never an identifier
+/// the caller sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermLinkKind {
+    /// Another glossary term of the domain relates to this one.
+    GlossaryTerm,
+    /// An asset of the domain attaches this term at one of its revisions.
+    Asset,
+    /// A project of the domain attaches this term.
+    Project,
+}
+
+impl TermLinkKind {
+    /// The linked objects as a deletion refusal names them, in the plural the wording
+    /// takes.
+    pub const fn attached_kind(self) -> &'static str {
+        match self {
+            Self::GlossaryTerm => "glossary terms",
+            Self::Asset => "assets",
+            Self::Project => "projects",
+        }
+    }
+}
+
+/// The `ConflictException` message DataZone answers a `DeleteGlossaryTerm` whose term is
+/// still linked to another stored object — "The term must not be linked to other assets
+/// or child terms" (smithy_query doc shape="DeleteGlossaryTerm").
+///
+/// Worded in the form [`GLOSSARY_HAS_TERMS_MESSAGE`] takes — the service's own wording
+/// for a delete a stored dependency prevents in this resource family — with the one
+/// variable part read from the STORE: the kind of object that is still linked
+/// ([`TermLinkKind::attached_kind`]). Neither the term nor the linked object is named, so
+/// nothing the caller sent appears in it.
+pub fn glossary_term_linked_message(link: TermLinkKind) -> String {
+    format!(
+        "Glossary term can't be deleted while having {} attached",
+        link.attached_kind()
+    )
 }
 
 /// One object of a domain's ownership hierarchy as a deletion refusal names it:
@@ -3166,6 +3256,8 @@ impl ResourceKind {
             // fixed text naming only the kind, so it echoes nothing back either.
             Self::FormType => FORM_TYPE_NOT_FOUND_MESSAGE.to_string(),
             Self::Asset => ASSET_NOT_FOUND_MESSAGE.to_string(),
+            Self::Glossary => GLOSSARY_NOT_FOUND_MESSAGE.to_string(),
+            Self::GlossaryTerm => GLOSSARY_TERM_NOT_FOUND_MESSAGE.to_string(),
             _ => format!("{} not found", self.as_str()),
         }
     }
@@ -3186,6 +3278,23 @@ pub const FORM_TYPE_NOT_FOUND_MESSAGE: &str =
 /// `CreateAssetFilter`) answers this one text, so they cannot drift.
 pub const ASSET_NOT_FOUND_MESSAGE: &str =
     "The given Asset doesn't exist. Try creating Asset before accessing it.";
+
+/// The `ResourceNotFoundException` message DataZone answers for a business glossary it
+/// cannot find — [`ResourceKind::Glossary`]'s not-found text, recorded from the service
+/// and worded the way a missing form type's and a missing asset's are
+/// ([`FORM_TYPE_NOT_FOUND_MESSAGE`]): the resource is named by its API type name, and
+/// nothing the caller sent appears in it. Every handler that addresses a glossary
+/// (`GetGlossary`, `UpdateGlossary`, `DeleteGlossary`, `CreateGlossaryTerm`) answers this
+/// one text, so they cannot drift.
+pub const GLOSSARY_NOT_FOUND_MESSAGE: &str =
+    "The given Glossary doesn't exist. Try creating Glossary before accessing it.";
+
+/// The same, for a business glossary TERM — [`ResourceKind::GlossaryTerm`]'s not-found
+/// text, in that same recorded form with the term's own API type name. Every handler that
+/// addresses a term (`GetGlossaryTerm`, `UpdateGlossaryTerm`, `DeleteGlossaryTerm`)
+/// answers it.
+pub const GLOSSARY_TERM_NOT_FOUND_MESSAGE: &str =
+    "The given GlossaryTerm doesn't exist. Try creating GlossaryTerm before accessing it.";
 
 impl std::fmt::Display for ResourceKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

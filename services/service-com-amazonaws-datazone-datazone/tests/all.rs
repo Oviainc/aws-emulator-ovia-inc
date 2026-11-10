@@ -57,6 +57,8 @@ mod form_type_revisions;
 mod glossary_deletion;
 #[path = "all/glossary_lifecycle.rs"]
 mod glossary_lifecycle;
+#[path = "all/glossary_term_deletion.rs"]
+mod glossary_term_deletion;
 #[path = "all/glossary_terms.rs"]
 mod glossary_terms;
 #[path = "all/harness.rs"]

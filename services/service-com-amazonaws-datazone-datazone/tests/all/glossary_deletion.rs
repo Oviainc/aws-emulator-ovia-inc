@@ -32,9 +32,10 @@ use service_com_amazonaws_datazone_datazone::state::{
 };
 
 /// The `ResourceNotFoundException` message the service answers for a business glossary it
-/// cannot find: a fixed sentence naming the resource KIND rather than the caller's
-/// identifier (`crate::state::ResourceKind::Glossary`).
-const GLOSSARY_NOT_FOUND: &str = "Glossary not found";
+/// cannot find: a fixed sentence naming the resource by its API TYPE name rather than the
+/// caller's identifier (`crate::state::GLOSSARY_NOT_FOUND_MESSAGE`).
+const GLOSSARY_NOT_FOUND: &str =
+    "The given Glossary doesn't exist. Try creating Glossary before accessing it.";
 
 /// The same, for a domain the service cannot find.
 const DOMAIN_NOT_FOUND: &str = "Domain not found";

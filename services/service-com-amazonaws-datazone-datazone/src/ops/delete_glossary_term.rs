@@ -1,15 +1,44 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGlossaryTerm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteGlossaryTerm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteGlossaryTerm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a stored business glossary term from its domain in [`crate::state`], so the
+//! next `GetGlossaryTerm` answers `ResourceNotFoundException`, the glossary that held it
+//! stops being blocked by it, and a second `DeleteGlossaryTerm` on the same identifier is
+//! a miss.
+//!
+//! The documented prerequisites (`smithy_query(query="doc",shape="DeleteGlossaryTerm")`)
+//! are what this handler enforces, each read from the store before anything is written,
+//! so a refused delete leaves the term readable exactly as it was:
+//!
+//! * "Caller must have delete permissions in the domain/glossary" — a DataZone
+//!   permission is held ON a domain, so an identifier this store serves no domain for is
+//!   denied before any resource is resolved, the rule every domain-scoped call here
+//!   shares.
+//! * "Glossary term must exist" — resolved by the rule `GetGlossaryTerm` reads one by: a
+//!   live domain, then that domain's own term map, each miss reported as
+//!   `ResourceNotFoundException` naming only the kind. A term is addressed by its own
+//!   `GlossaryTermId`, which names no glossary, so a term of another domain is as absent
+//!   here as one nothing created.
+//! * "The term must not be linked to other assets or child terms" / "Ensure all
+//!   associations (such as to assets or parent terms) are removed before deletion" — a
+//!   term some other stored object still NAMES is refused with the `ConflictException`
+//!   the operation models, because the request conflicts with the link that object
+//!   holds. Which stored object counts as a link is decided by
+//!   [`crate::state::Domain::glossary_term_link`], and the refusal is worded by
+//!   [`crate::state::glossary_term_linked_message`].
+//!
+//! "and be active" adds no further check: `GlossaryTermStatus` is ENABLED | DISABLED
+//! (smithy_query shape="GlossaryTermStatus") and neither member is a term on its way out
+//! — a term is in this store exactly while it exists — so the status a term reports does
+//! not gate its removal the way a glossary's DISABLED state gates `DeleteGlossary`, a
+//! prerequisite the model states for THAT operation and not for this one.
+//!
+//! The operation's output carries no members at all, so there is no in-progress state to
+//! report and nothing for the clock to settle: the removal is complete when the call
+//! returns 204. `@idempotent` describes the state a repeat reaches — the term is gone
+//! either way — not a success for a term this store no longer holds, which is the miss
+//! `GetGlossaryTerm` reports for it too.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +178,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteGlossaryTerm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteGlossaryTermErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteGlossaryTerm"))
+        let _ = ctx;
+        use crate::state::{
+            glossary_term_linked_message, not_permitted_message, now_ms, ResourceKind,
+            DOMAIN_STATUS_DELETING,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteGlossaryTermErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        // Authorization comes FIRST, as it does for every domain-scoped call: a
+        // permission is held ON a domain, so a caller holds none on an identifier this
+        // store serves no domain for, and the request is denied before any resource is
+        // resolved rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(DeleteGlossaryTermErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
+        // A domain already being deleted is gone as far as its contents go — the same
+        // liveness rule `GetGlossaryTerm` reads a term through.
+        let domain = store
+            .domains
+            .get_mut(&input.domain_identifier)
+            .filter(|domain| domain.status != DOMAIN_STATUS_DELETING)
+            .ok_or_else(|| {
+                DeleteGlossaryTermErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: ResourceKind::Domain.not_found_message(),
+                    },
+                )
+            })?;
+
+        // "Glossary term must exist": looked up by the same `GlossaryTermId`
+        // `GetGlossaryTerm` reads it by, in THIS domain's own map, so an identifier that
+        // reads a term is the identifier that deletes it and no other.
+        if !domain.glossary_terms.contains_key(&input.identifier) {
+            return Err(DeleteGlossaryTermErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: ResourceKind::GlossaryTerm.not_found_message(),
+                },
+            )
+            .into());
+        }
+
+        // "The term must not be linked to other assets or child terms." Checked BEFORE
+        // the removal, so a refused delete leaves the store exactly as it was — the term,
+        // the object linked to it and every other term of the domain stay readable.
+        if let Some(link) = domain.glossary_term_link(&input.identifier) {
+            return Err(DeleteGlossaryTermErrorModeled::ConflictException(
+                ConflictException {
+                    message: glossary_term_linked_message(link),
+                },
+            )
+            .into());
+        }
+
+        domain.glossary_terms.remove(&input.identifier);
+        Ok(DeleteGlossaryTermOutput {})
     }
 }
