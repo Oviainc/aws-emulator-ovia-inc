@@ -15,9 +15,10 @@
 //!   a caller probing permissions learns the authorization outcome and nothing about
 //!   what is stored.
 //! * On a link the caller DOES own, the modelled bounds of `ResourceTypes` are then
-//!   reported: an absent member as `MissingRequiredParameterException`, a value outside
+//!   reported: an absent property as the request front end's `BadRequestException`
+//!   (the schema of the request body is that layer's rule), a value outside
 //!   `@length(1..50)` / `@uniqueItems` as `InvalidParameterException`, and an element
-//!   outside the `ResourceType` enum as the request front end's `BadRequestException`
+//!   outside the `ResourceType` enum again as that front end's `BadRequestException`
 //!   — and a refused update changes nothing.
 //!
 //! Every case drives the real wire path (the production `MultiServiceRouter`, restJson1
@@ -436,10 +437,10 @@ async fn update_link_reports_the_modelled_bounds_on_a_link_the_caller_owns() {
     // Rows differ along which modelled rule of `ResourceTypes` the request misses:
     // its presence, each end of `@length(1..50)`, `@uniqueItems`, and the
     // `ResourceType` enum its elements target — one row per rule, plus a value the
-    // issue did not cite for the enum and the exact bound for the length. Enum
-    // MEMBERSHIP is a rule of the request body, so it is the front end's
-    // `BadRequestException`; the rest are this operation's own modelled parameter
-    // errors.
+    // issue did not cite for the enum and the exact bound for the length. A required
+    // property the body does not carry and an element outside the enum are rules of
+    // the request BODY, so both are the front end's `BadRequestException`; the list's
+    // own bounds are this operation's modelled parameter error.
     let too_many: Vec<String> = (0..=MAX_RESOURCE_TYPES)
         .map(|index| format!("{}{index}", RESOURCE_TYPES[0]))
         .collect();
@@ -448,7 +449,7 @@ async fn update_link_reports_the_modelled_bounds_on_a_link_the_caller_owns() {
             "no ResourceTypes at all",
             json!({ "Identifier": link_arn.clone() }),
             400,
-            "MissingRequiredParameterException",
+            "BadRequestException",
         ),
         (
             "an empty ResourceTypes",

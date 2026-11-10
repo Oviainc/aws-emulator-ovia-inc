@@ -44,9 +44,10 @@ pub struct UpdateLinkInput {
 /// form and every other member's constraints are exactly what the model declares.
 ///
 /// `ResourceTypes` is therefore the one member the pre-handler walk does not see, and
-/// the handler enforces its presence (`MissingRequiredParameterException`) and its
-/// modelled `@length(1..50)` / `@uniqueItems` / enum bounds
-/// (`InvalidParameterException`) itself, after the authorization decision.
+/// the handler enforces its presence (the request front end's own refusal for a body
+/// missing a required property) and its modelled `@length(1..50)` / `@uniqueItems`
+/// bounds (`InvalidParameterException`), and its elements' enum membership (again that
+/// front end's), itself, after the authorization decision.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateLinkRequest {
     pub identifier: String,

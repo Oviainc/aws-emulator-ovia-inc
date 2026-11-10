@@ -806,20 +806,72 @@ pub fn explicit_deny(operation: &str, identifier: &str) -> crate::scaffolded::Ac
     ))
 }
 
-/// How this service words a refusal for a required member the request left out.
+/// The name the model declares for the member a violation path ends at: the path's
+/// LAST segment with its first character restored to upper case.
 ///
-/// The ONE wording for an absent member, whether the centralized walk found it before
-/// a handler ran or a handler enforced it itself after taking an authorization
-/// decision first: both render the framework's clause for it, so the two cannot drift
-/// into two sentences for one refusal.
-pub fn missing_member_message(member: &str) -> String {
-    ::aws_smithy_schema_server::constraints::Violation {
-        path: ::aws_smithy_schema_server::constraints::path::member(member),
-        kind: ::aws_smithy_schema_server::constraints::ViolationKind::MissingRequiredMember,
-        value: None,
-        sensitive: false,
-    }
-    .message()
+/// Every member of this service's model is declared in Pascal case and carries no
+/// `@jsonName` (`smithy_query(query="operation",operation="…")` over this service's
+/// operations), while the framework reports a member at a dotted lowerCamel PATH
+/// (`aws_smithy_schema_server::constraints::path` lowercases each segment's first
+/// character). The declared name is therefore that last segment re-capitalised — the
+/// one segment naming the property itself rather than the objects it sits in — which
+/// is the spelling the request would have had to send. `None` for a path with no
+/// segment to name, since there is then no property to report.
+pub fn declared_property_name(path: &str) -> Option<String> {
+    let segment = path.split('.').next_back()?;
+    let mut characters = segment.chars();
+    let first = characters.next()?;
+    Some(first.to_uppercase().chain(characters).collect())
+}
+
+/// The clause the request front end states for a body that does not carry every
+/// property the operation's schema requires: the properties it left out, each named as
+/// the model declares it.
+///
+/// The sentence is the shared one every service's front door states for this schema
+/// finding, so the wording cannot drift from one crate to the next.
+pub fn missing_properties_clause(properties: &[String]) -> String {
+    ::service_common::validation_message::missing_required_properties(properties)
+}
+
+/// How this service words a refusal for a required BODY property the request left out:
+/// the front end's own envelope ([`invalid_request_body_message`]) over
+/// [`missing_properties_clause`].
+///
+/// The ONE wording for an absent property, whether the centralized walk found it as
+/// the body was read or a handler enforced it itself after taking an authorization
+/// decision first, so the two cannot drift into two sentences for one refusal.
+pub fn missing_properties_rejection(
+    properties: &[String],
+) -> crate::scaffolded::BadRequestException {
+    invalid_request_body(&[missing_properties_clause(properties)])
+}
+
+/// That same refusal for ONE property a handler itself found absent, named as the
+/// model declares it.
+pub fn missing_property_rejection(property: &str) -> crate::scaffolded::BadRequestException {
+    missing_properties_rejection(&[property.to_string()])
+}
+
+/// The front end's refusal for the absent required properties among `violations`, or
+/// `None` when none of them is one.
+///
+/// A property the body does not carry is a rule of the request BODY's SCHEMA — judged
+/// by the layer in front of the service, as the body is read — so it is reported with
+/// that layer's code and finding rather than as a parameter the service found fault
+/// with.
+pub fn missing_properties_violation_rejection(
+    violations: &[::aws_smithy_schema_server::constraints::Violation],
+) -> Option<crate::scaffolded::BadRequestException> {
+    let properties: Vec<String> = violations
+        .iter()
+        .filter(|violation| {
+            violation.kind
+                == ::aws_smithy_schema_server::constraints::ViolationKind::MissingRequiredMember
+        })
+        .filter_map(|violation| declared_property_name(&violation.path))
+        .collect();
+    (!properties.is_empty()).then(|| missing_properties_rejection(&properties))
 }
 
 /// Refuse `identifier` when it is an ARN of this service naming the resource kind

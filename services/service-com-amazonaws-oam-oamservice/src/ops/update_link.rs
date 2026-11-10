@@ -213,19 +213,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with `@length(1..50)` and `@uniqueItems` over elements targeting the
         // `ResourceType` enum, and this operation enforces all of them HERE rather than
         // in the centralized pre-handler walk, because the decision above comes first
-        // (see `super::types::UpdateLinkRequest`). An absent member is worded exactly as
-        // that walk words one, a value outside the list's own bounds as this operation's
-        // modelled parameter error, and an element outside the enum exactly as the
-        // request front end words one — judged by the MODEL's own constraints, so no
-        // update ever stores a type it does not declare.
-        let resource_types = input.resource_types.ok_or_else(|| {
-            UpdateLinkErrorModeled::MissingRequiredParameterException(
-                MissingRequiredParameterException {
-                    message: Some(crate::state::missing_member_message("ResourceTypes")),
-                    ..Default::default()
-                },
-            )
-        })?;
+        // (see `super::types::UpdateLinkRequest`). An absent property is worded exactly
+        // as the request front end words one — the rule is the body's SCHEMA — a value
+        // outside the list's own bounds as this operation's modelled parameter error,
+        // and an element outside the enum again as that front end words it — judged by
+        // the MODEL's own constraints, so no update ever stores a type it does not
+        // declare.
+        let resource_types = input
+            .resource_types
+            .ok_or_else(|| crate::state::missing_property_rejection("ResourceTypes"))?;
         if let Some(why) = crate::state::resource_types_rejection(&resource_types) {
             return Err(UpdateLinkErrorModeled::InvalidParameterException(
                 InvalidParameterException {

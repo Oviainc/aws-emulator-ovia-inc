@@ -15,8 +15,9 @@
 //!    stored sink frees the slot again.
 //! 3. A value outside a member's modelled `@pattern` is refused by the REST front end
 //!    that validates the request body — HTTP 400 `BadRequestException`, naming the
-//!    regular expression and the value — while a value outside any other modelled
-//!    bound, and an absent member, are the service's own modelled parameter errors.
+//!    regular expression and the value — as is a required property the body omits,
+//!    while a value outside any other modelled bound is the service's own modelled
+//!    parameter error.
 //!    `ListAttachedLinks` is the exception: its authorization decision is taken on the
 //!    sink the request names BEFORE the identifier is judged, so a value no resource
 //!    identifier could be earns that decision instead (rule 4).
@@ -467,10 +468,11 @@ async fn a_value_outside_a_modelled_pattern_is_refused_by_the_body_validator() {
 
     // The boundary of the rule: every OTHER refusal class keeps the code the answering
     // layer models. A value outside a `@length` or `@range`, or an element outside an
-    // enum, is `InvalidParameterException`; an absent member is
-    // `MissingRequiredParameterException`; and a violation of the `@pattern` on a
-    // member bound to the URI rather than the body (`ResourceArn`, an `@httpLabel` of
-    // the three tagging operations) keeps the `ValidationException` those model.
+    // enum, is `InvalidParameterException`; a required property the body does not carry
+    // is the SAME front end's `BadRequestException`, since the body's schema is that
+    // layer's rule too; and a violation of the `@pattern` on a member bound to the URI
+    // rather than the body (`ResourceArn`, an `@httpLabel` of the three tagging
+    // operations) keeps the `ValidationException` those model.
     let contrasts: &[(&str, &str, Value, u16, &str)] = &[
         (
             "ListAttachedLinks MaxResults one below the modelled minimum",
@@ -502,14 +504,14 @@ async fn a_value_outside_a_modelled_pattern_is_refused_by_the_body_validator() {
             "/CreateSink",
             json!({}),
             400,
-            "MissingRequiredParameterException",
+            "BadRequestException",
         ),
         (
             "DeleteSink with no Identifier at all",
             "/DeleteSink",
             json!({}),
             400,
-            "MissingRequiredParameterException",
+            "BadRequestException",
         ),
     ];
     for (case, uri, body, expected_status, expected_code) in contrasts {

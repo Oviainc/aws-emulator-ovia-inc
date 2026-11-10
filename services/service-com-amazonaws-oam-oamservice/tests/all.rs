@@ -19,6 +19,8 @@ mod list_links;
 mod list_sinks;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
+#[path = "all/missing_required_properties.rs"]
+mod missing_required_properties;
 #[path = "all/refusal_classes.rs"]
 mod refusal_classes;
 #[path = "all/resource_tags.rs"]

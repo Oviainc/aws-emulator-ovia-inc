@@ -154,9 +154,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `Name`'s presence and its `^[a-zA-Z0-9_\.\-]{1,255}$` pattern, and `Tags`'
         // 0..50 length, are modelled constraints, so the centralized walk has already
-        // refused anything outside them before this body runs — as this service's
-        // `MissingRequiredParameterException` / `InvalidParameterException`, which
-        // `crate::service` words it as.
+        // refused anything outside them before this body runs — a bound as this
+        // service's `InvalidParameterException`, and an absent required property or a
+        // value outside the pattern as the request front end's own refusal, which
+        // `crate::service` words.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateSinkErrorModeled::InternalServiceFault(InternalServiceFault {
                 message: Some("the sink store is unavailable".to_string()),

@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The sentences the AWS request front door states for a schema finding about the request
+# body (`validation_message::missing_required_properties`), shared so the wording does
+# not drift from the other services that answer that layer's refusal.
+service-common = { path = "../common" }
 # Encodes/decodes the opaque `NextToken` ListAttachedLinks hands out, and renders a
 # minted resource id as hexadecimal.
 hex = { workspace = true }

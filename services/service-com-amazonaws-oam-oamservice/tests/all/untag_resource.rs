@@ -67,7 +67,10 @@ impl Kind {
 
 /// A REST-bound request to this service signed for `region` by [`AKID`], with `body` as
 /// its payload (empty for a method that carries none).
-fn rest_request(
+///
+/// `pub(crate)` so a sibling suite judging one of the REST-bound tagging routes drives
+/// this one request builder rather than a second copy of it.
+pub(crate) fn rest_request(
     method: &str,
     path_and_query: &str,
     body: &Value,

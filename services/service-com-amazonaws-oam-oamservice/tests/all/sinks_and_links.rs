@@ -700,8 +700,9 @@ async fn create_link_refuses_a_request_it_cannot_store() {
     let unknown_sink = "22222222-3333-4444-5555-666666666666";
 
     // Each row is a request the service cannot store, with the code it is refused
-    // with: the two modelled 400s this operation declares, and the request front
-    // end's own code for an element outside the modelled `ResourceType` enum.
+    // with: the modelled 400 this operation declares for a value outside a bound, and
+    // the request front end's own code for the rules of the BODY — an element outside
+    // the modelled `ResourceType` enum, and a required property the body omits.
     let cases: &[(&str, Value, &str)] = &[
         (
             "a resource type the model does not declare",
@@ -763,7 +764,7 @@ async fn create_link_refuses_a_request_it_cannot_store() {
                 "ResourceTypes": ["AWS::CloudWatch::Metric"],
                 "SinkIdentifier": sink_arn.clone(),
             }),
-            "MissingRequiredParameterException",
+            "BadRequestException",
         ),
         (
             "no SinkIdentifier",
@@ -771,7 +772,7 @@ async fn create_link_refuses_a_request_it_cannot_store() {
                 "LabelTemplate": "$AccountName",
                 "ResourceTypes": ["AWS::CloudWatch::Metric"],
             }),
-            "MissingRequiredParameterException",
+            "BadRequestException",
         ),
     ];
 
@@ -1002,7 +1003,7 @@ async fn list_attached_links_pages_over_the_stored_links() {
             "no SinkIdentifier",
             json!({ "MaxResults": 1 }),
             400,
-            "MissingRequiredParameterException",
+            "BadRequestException",
         ),
     ];
     for (case, body, expected_status, expected_code) in refusals {

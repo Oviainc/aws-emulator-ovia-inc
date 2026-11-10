@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceType` values), `SinkIdentifier` (presence, pattern) and `Tags`
         // (0..50) are all modelled constraints, so the centralized walk has already
         // refused anything outside them before this body runs — as this service's
-        // `MissingRequiredParameterException` / `InvalidParameterException`, or, for a
+        // `InvalidParameterException`, or, for an absent required property and for a
         // value outside a modelled `@pattern` or enum, as the request front end's own
         // refusal, which `crate::service` words.
         //

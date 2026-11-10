@@ -60,7 +60,10 @@ use std::sync::Arc;
 /// attributed to one of them. Such a refusal therefore keeps the parameter wording,
 /// which is right for the two creates and is the one case where a tagging operation
 /// is worded with a code it does not declare. Narrowing it further needs an
-/// operation-aware refusal seam in the framework, which this service cannot add.
+/// operation-aware refusal seam in the framework, which this service cannot add. An
+/// ABSENT `Tags` needs no attribution at all: `Tags` is a BODY property on all three,
+/// and the front end answers one code and one finding for a body missing a required
+/// property whichever operation it was sent to.
 const TAGGING_ONLY_MEMBERS: &[&str] = &["resourceArn", "tagKeys"];
 
 /// The body validator's clause for one violation, or `None` when the violation is not
@@ -142,17 +145,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the regular expression the value had to satisfy and the value that did not.
         //
         // Everything else is the SERVICE's own wording, and OAM models its own two
-        // client-input errors for it: a member the request left out is
-        // `MissingRequiredParameterException` ("A required parameter is missing from
-        // the request") and a value outside a declared bound or uniqueness rule is
-        // `InvalidParameterException` ("A parameter is specified incorrectly"). Both
-        // are HTTP 400, which is the status this refusal already carries, so only the
-        // code and the message change. A value outside a declared `@pattern` or enum
-        // belongs to the front end above instead: both are rules of the body itself.
+        // client-input errors for it: a value outside a declared bound or uniqueness
+        // rule is `InvalidParameterException` ("A parameter is specified incorrectly").
+        // That is HTTP 400, which is the status this refusal already carries, so only
+        // the code and the message change. A value outside a declared `@pattern` or
+        // enum, and a required property the body does not carry at all, belong to the
+        // front end above instead: all three are rules of the body itself.
         //
         // The three tagging operations are the exception: `ListTagsForResource`,
         // `TagResource` and `UntagResource` model `ValidationException` and neither of
-        // the two codes above, and they are the only operations that bind
+        // the codes above, and they are the only operations that bind
         // `ResourceArn` and `TagKeys` — which are an `@httpLabel` and an `@httpQuery`,
         // so they are not part of a request BODY and the body validator above never
         // judges them. The tagging path has its own refusal for a `ResourceArn` whose
@@ -188,6 +190,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         }) {
             return None;
         }
+        // A required property the body does not carry is that same front end's
+        // refusal, and for the same reason: it is a rule of the body's SCHEMA rather
+        // than a bound the service checks. Absence is found while READING the request,
+        // before any value is judged, so this is asked before every other clause: the
+        // body never reaches the layers that would report the rest.
+        if let Some(refused) = crate::state::missing_properties_violation_rejection(violations) {
+            return Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: refused.message,
+            });
+        }
         // A value the model's own regular expression does not admit is the front end's
         // refusal, whichever member and whichever operation carried it.
         let pattern_clauses: Vec<String> = violations
@@ -203,9 +216,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // So is an element outside a modelled enum — membership of an enum is a rule of
         // the request body, not a bound the service checks — but only when that is the
         // whole of what the body got wrong: a body that also breaks a rule the SERVICE
-        // reports (a list's own length, its uniqueness, an absent member) keeps that
-        // refusal, so one input can never earn two codes depending on which clause is
-        // noticed first.
+        // reports (a list's own length, its uniqueness) keeps that refusal, so one input
+        // can never earn two codes depending on which clause is noticed first.
         if violations.iter().all(|violation| {
             matches!(violation.kind, ViolationKind::EnumValue(_))
         }) {
@@ -217,7 +229,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             }
         }
         // One absent member makes the whole request a missing-parameter refusal; the
-        // caller has to supply it before any other complaint matters.
+        // caller has to supply it before any other complaint matters. This is NOT the
+        // live path for an absent BODY property — the front end above answers every one
+        // it can name a property for — so only a violation whose path names no property
+        // at all (an empty path) is worded here.
         let code = if violations
             .iter()
             .any(|violation| violation.kind == ViolationKind::MissingRequiredMember)
