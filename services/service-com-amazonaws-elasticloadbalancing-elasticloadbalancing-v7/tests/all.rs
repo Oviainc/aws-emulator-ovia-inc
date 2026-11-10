@@ -17,6 +17,8 @@ mod described_load_balancer_policies;
 mod documented_rule_refusals;
 #[path = "all/elbv2_listener_chain_on_the_shared_endpoint.rs"]
 mod elbv2_listener_chain_on_the_shared_endpoint;
+#[path = "all/instance_health_follows_the_backend.rs"]
+mod instance_health_follows_the_backend;
 #[path = "all/instance_health_timeline.rs"]
 mod instance_health_timeline;
 #[path = "all/listeners_health_check_and_attributes.rs"]

@@ -183,33 +183,61 @@ pub const MAX_INSTANCES_PER_REQUEST: usize = MAX_INSTANCES_PER_LOAD_BALANCER;
 /// partitions. A create that would open one region past it is refused.
 pub const MAX_REGIONS: usize = 64;
 
+/// The periodic health check of one registered instance, which is what
+/// `DescribeInstanceHealth` reports the outcome of.
+mod instance_checks;
+pub use instance_checks::*;
+
+/// One instance's registration with one load balancer.
+///
+/// A registration is not only a membership: it is what the load balancer CHECKS, so it
+/// carries the instant it was made — the instant the checks it owes are counted from — and
+/// where those checks have got to ([`HealthProbe`]).
+#[derive(Debug, Clone)]
+pub struct Registration {
+    /// The instant this instance was registered.
+    pub registered_at: SystemTime,
+    /// What this registration's health checks have observed and decided.
+    pub probe: HealthProbe,
+}
+
+impl Registration {
+    /// The registration an instance registered at `at` starts with: no check has run yet.
+    pub fn starting_at(at: SystemTime) -> Self {
+        Self {
+            registered_at: at,
+            probe: HealthProbe::starting_at(at),
+        }
+    }
+}
+
 /// The registered-instance set of one load balancer: deduplicated, in registration
 /// order, with membership answered from an index rather than by scanning.
 ///
 /// The ordered `Vec` is what `DescribeLoadBalancers` and `DescribeInstanceHealth`
 /// report; the `BTreeMap` makes each membership test O(log n), so a batched request
-/// costs O(batch x log n) instead of O(batch x n), and it carries WHEN each instance was
-/// registered — the instant the health checks it owes are counted from
-/// ([`LoadBalancer::instance_health`]).
+/// costs O(batch x log n) instead of O(batch x n), and it carries each instance's
+/// [`Registration`] — when it was made and the checks it owes.
 #[derive(Debug, Clone, Default)]
 pub struct InstanceSet {
     order: Vec<String>,
-    /// Instance id -> the instant it was registered.
-    registered: BTreeMap<String, SystemTime>,
+    /// Instance id -> its registration with this load balancer.
+    registered: BTreeMap<String, Registration>,
 }
 
 impl InstanceSet {
     /// Add `instance_id`, registered at `at`, unless it is already registered. Answers
     /// whether it was added.
     ///
-    /// An instance the set already holds keeps the instant it was first registered: the
-    /// call restates a registration that already happened, so the health-check timeline
-    /// it started does not restart.
+    /// An instance the set already holds keeps the registration it already has: the
+    /// call restates a registration that already happened, so the health checks it
+    /// started do not restart.
     pub fn insert(&mut self, instance_id: &str, at: SystemTime) -> bool {
         if self.registered.contains_key(instance_id) {
             return false;
         }
-        self.registered.insert(instance_id.to_string(), at);
+        self.registered
+            .insert(instance_id.to_string(), Registration::starting_at(at));
         self.order.push(instance_id.to_string());
         true
     }
@@ -231,22 +259,43 @@ impl InstanceSet {
 
     /// The instant `instance_id` was registered, or `None` when it is not registered.
     pub fn registered_at(&self, instance_id: &str) -> Option<SystemTime> {
-        self.registered.get(instance_id).copied()
+        self.registered
+            .get(instance_id)
+            .map(|registration| registration.registered_at)
     }
 
-    /// Move an existing registration's instant to `at`, leaving the set and its order as
-    /// they are. Answers whether the instance was registered.
+    /// Move an existing registration to `at`, leaving the set, its order and the checks
+    /// that have already run as they are. Answers whether the instance was registered.
     ///
-    /// The health-check timeline of a registered instance is read off that instant, so
-    /// this is how a registration is placed at a chosen point in time.
+    /// The checks a registered instance owes are counted from its registration instant, so
+    /// this moves them with it: the next check falls due the same distance from the
+    /// registration as before. That is how a registration — and with it the checks the
+    /// clock owes it — is placed at a chosen point in time.
     pub fn restamp(&mut self, instance_id: &str, at: SystemTime) -> bool {
         match self.registered.get_mut(instance_id) {
-            Some(registered_at) => {
-                *registered_at = at;
+            Some(registration) => {
+                registration.probe.reschedule(registration.registered_at, at);
+                registration.registered_at = at;
                 true
             }
             None => false,
         }
+    }
+
+    /// The health checks `instance_id`'s registration owes, for a settle to run the ones
+    /// the clock has made due — `None` when it is not registered.
+    pub fn probe_mut(&mut self, instance_id: &str) -> Option<&mut HealthProbe> {
+        self.registered
+            .get_mut(instance_id)
+            .map(|registration| &mut registration.probe)
+    }
+
+    /// What the checks of `instance_id`'s registration have decided, or `None` when it is
+    /// not registered.
+    pub fn probe(&self, instance_id: &str) -> Option<&HealthProbe> {
+        self.registered
+            .get(instance_id)
+            .map(|registration| &registration.probe)
     }
 
     pub fn len(&self) -> usize {
@@ -314,14 +363,16 @@ pub const HEALTH_FAILED_HEALTH_CHECKS: InstanceHealth = InstanceHealth {
                   checks consecutively.",
 };
 
-/// How long one health check of a registered instance takes to fall due.
+/// How often one health check of a registered instance falls due.
 ///
-/// Nothing in this emulator serves a health-check target — no process listens on an
-/// instance's port — so a check that runs can only fail, and the transition a failing
-/// instance is owed is a transition the CLOCK makes due rather than one a probe
-/// observes. The span is this emulator's choice, not a duration AWS documents: the
-/// configured `HealthCheck$Interval` is the cadence of a real probe, and there is no real
-/// probe here.
+/// The CADENCE of a check, which the verdict a registration reaches is counted in: a load
+/// balancer's configured `HealthCheck$Interval` is the cadence of a real probe, and this
+/// emulator opens no connection, so the span is this emulator's own choice — long enough
+/// that a caller reading straight after a registration still sees the checks running, and
+/// short enough that the configured thresholds are reached without a client waiting out
+/// the real interval. What each due check OBSERVES is
+/// [`observe_instances`](instance_checks::observe_instances); the thresholds that turn a
+/// run of them into a verdict are the load balancer's own.
 pub const HEALTH_CHECK_SPAN: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// One listener of a load balancer, keyed logically by its `LoadBalancerPort`.
@@ -952,29 +1003,45 @@ impl LoadBalancer {
         self.instances.insert(instance_id, at)
     }
 
-    /// The health of `instance_id` with respect to this load balancer as of `now`.
+    /// The health of `instance_id` with respect to this load balancer: the OUTCOME of the
+    /// checks this load balancer has run against it.
     ///
     /// An instance takes traffic only while it passes this load balancer's health check,
-    /// and a registered instance that has failed `UnhealthyThreshold` consecutive checks
-    /// is `OutOfService` with the instance as the reason; one whose checks have not run
-    /// yet is `OutOfService` with Elastic Load Balancing as the reason. No emulated
-    /// instance serves a health-check target, so every check an instance owes fails: the
-    /// checks the clock has made due are counted off the registration instant, one per
-    /// [`HEALTH_CHECK_SPAN`], against the load balancer's configured
-    /// `UnhealthyThreshold`.
-    pub fn instance_health(&self, instance_id: &str, now: SystemTime) -> InstanceHealth {
-        let Some(registered_at) = self.instances.registered_at(instance_id) else {
-            return HEALTH_NOT_REGISTERED;
-        };
-        let checks = u32::try_from(self.health_check.unhealthy_threshold)
-            .unwrap_or(1)
-            .max(1);
-        match registered_at.checked_add(HEALTH_CHECK_SPAN.saturating_mul(checks)) {
-            Some(failed_at) if now < failed_at => HEALTH_REGISTRATION_IN_PROGRESS,
-            Some(_) => HEALTH_FAILED_HEALTH_CHECKS,
-            // An instant so far out that the owed checks cannot be dated: nothing has
-            // run yet, so the registration is still in progress.
-            None => HEALTH_REGISTRATION_IN_PROGRESS,
+    /// so what is reported is the verdict its checks have reached
+    /// ([`HealthProbe::reported_health`]) — in service once `HealthyThreshold` consecutive
+    /// checks were answered, out of service with the instance as the cause once
+    /// `UnhealthyThreshold` consecutive checks were not, and the registration's own checks
+    /// still running until one of those thresholds is reached. An instance that is not
+    /// registered takes no traffic for a reason of Elastic Load Balancing's own, and no
+    /// check of it is run at all.
+    ///
+    /// A read reports what the checks that have already fallen due decided, which is what
+    /// [`LoadBalancer::settle_instance_health`] runs.
+    pub fn instance_health(&self, instance_id: &str) -> InstanceHealth {
+        match self.instances.probe(instance_id) {
+            Some(probe) => probe.reported_health(),
+            None => HEALTH_NOT_REGISTERED,
+        }
+    }
+
+    /// Run every health check of this load balancer's registrations that the clock has
+    /// made due at `now`, folding what each one observed ([`observe_instances`]) into the
+    /// verdict it moves.
+    ///
+    /// Materialises only what the clock already owed: the checks were due at `now`
+    /// whether or not anybody called, and `observed` says what each of them saw, so the
+    /// verdict a caller reads does not depend on who read it. An id `observed` carries no
+    /// entry for is one no check was run for.
+    pub fn settle_instance_health(
+        &mut self,
+        observed: &BTreeMap<String, Option<InstanceObservation>>,
+        now: SystemTime,
+    ) {
+        let thresholds = HealthThresholds::of(&self.health_check);
+        for (instance_id, observation) in observed {
+            if let Some(probe) = self.instances.probe_mut(instance_id) {
+                probe.settle(*observation, thresholds, now);
+            }
         }
     }
 

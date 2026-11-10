@@ -13,10 +13,14 @@
 //!   "Instance is not currently registered with the LoadBalancer.";
 //! * a registered instance whose owed health checks have not fallen due yet is
 //!   `OutOfService` / `ELB` / "Instance registration is still in progress.";
-//! * once `UnhealthyThreshold` consecutive checks are due — no emulated instance serves a
-//!   health-check target, so each one fails — it is `OutOfService` / `Instance` /
+//! * once `UnhealthyThreshold` consecutive checks are due — the instances these rows
+//!   register are ids the account's EC2 inventory holds no instance for, so nothing stands
+//!   behind the registration and each check fails — it is `OutOfService` / `Instance` /
 //!   "Instance has failed at least the UnhealthyThreshold number of health checks
 //!   consecutively."
+//!
+//! What ONE check observes, and the verdict a run of answered checks reaches, is the
+//! sibling suite `instance_health_follows_the_backend`.
 //!
 //! Asserted over a TABLE whose rows differ in the configured `UnhealthyThreshold`
 //! (including both modelled bounds), in how many instances are registered, and in whether

@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceHealth
-//! IMPLEMENTED: derives one `InstanceState` per described instance from the stored
-//! registration — its id, the instant it was registered and the load balancer's
-//! health-check configuration. This is the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports, for each described instance, the OUTCOME of this load balancer's
+//! own health checks of it. This is the ONLY file to touch for this operation.
 //!
 //! The three health members move together as one state, so they are projected together
-//! by [`crate::state::LoadBalancer::instance_health`], which states the rule; this
-//! handler decides only WHICH instances are described.
+//! by [`crate::state::LoadBalancer::instance_health`]; what one check observes and the
+//! thresholds that turn a run of checks into a verdict are
+//! [`crate::state::instance_checks`]. This handler decides only WHICH instances are
+//! described, runs the checks the clock has made due for them, and projects the verdict.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +114,18 @@ pub struct DescribeInstanceHealth<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The refusal a request naming a load balancer this region holds none of earns, stated
+/// over the name the request carried — the modelled `AccessPointNotFoundException`, which
+/// this handler resolves the record more than once for.
+fn load_balancer_not_found(load_balancer_name: &str) -> DescribeInstanceHealthError {
+    DescribeInstanceHealthErrorModeled::AccessPointNotFoundException(AccessPointNotFoundException {
+        message: Some(format!(
+            "There is no ACTIVE Load Balancer named '{load_balancer_name}'"
+        )),
+    })
+    .into()
+}
+
 impl<Eng> DescribeInstanceHealth<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -177,37 +190,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::region_from_request(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let guard = state.lock();
-        let Some(record) = guard
-            .load_balancers_in(&region)
-            .and_then(|records| records.get(&input.load_balancer_name))
-        else {
-            return Err(
-                DescribeInstanceHealthErrorModeled::AccessPointNotFoundException(
-                    AccessPointNotFoundException {
-                        message: Some(format!(
-                            "There is no ACTIVE Load Balancer named '{}'",
-                            input.load_balancer_name
-                        )),
-                    },
-                )
-                .into(),
-            );
-        };
 
-        // "If no instances are specified, the call describes the state of all instances
-        // that are currently registered with the load balancer. If instances are
-        // specified, their state is returned even if they are no longer registered."
-        let described: Vec<String> = if requested.is_empty() {
-            record.instances.iter().cloned().collect()
-        } else {
-            requested
+        // Three steps, so this service's guard is never held while EC2's store is read:
+        // which instances the answer is about, then one check of each of them against the
+        // inventory that stands behind a registration, then the verdicts those checks
+        // moved.
+        let (described, to_check) = {
+            let guard = state.lock();
+            let Some(record) = guard
+                .load_balancers_in(&region)
+                .and_then(|records| records.get(&input.load_balancer_name))
+            else {
+                return Err(load_balancer_not_found(&input.load_balancer_name));
+            };
+            // "If no instances are specified, the call describes the state of all
+            // instances that are currently registered with the load balancer. If
+            // instances are specified, their state is returned even if they are no longer
+            // registered."
+            let described: Vec<String> = if requested.is_empty() {
+                record.instances.iter().cloned().collect()
+            } else {
+                requested
+            };
+            // An instance that is not registered with this load balancer is checked by
+            // nothing, so only the registered ones are asked about.
+            let to_check: ::std::collections::BTreeSet<String> = described
+                .iter()
+                .filter(|instance_id| record.has_instance(instance_id))
+                .cloned()
+                .collect();
+            (described, to_check)
         };
+        let observed = crate::state::observe_instances(&*self.engine, &to_check);
+
+        let mut guard = state.lock();
+        let Some(record) = guard
+            .load_balancers_in_mut(&region)
+            .and_then(|records| records.get_mut(&input.load_balancer_name))
+        else {
+            return Err(load_balancer_not_found(&input.load_balancer_name));
+        };
+        // The checks the clock had already made due at `now`: they were owed at that
+        // instant whether or not anybody called, and each one's observation is what moves
+        // the verdict this answer reports.
+        record.settle_instance_health(&observed, now);
 
         let instance_states = described
             .into_iter()
             .map(|instance_id| {
-                let health = record.instance_health(&instance_id, now);
+                let health = record.instance_health(&instance_id);
                 InstanceState {
                     instance_id: Some(instance_id),
                     state: Some(health.state.to_string()),

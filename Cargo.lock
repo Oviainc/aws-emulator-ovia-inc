@@ -12202,6 +12202,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10",
  "service-common",
  "sha2 0.10.9",

@@ -29,6 +29,10 @@ sha2 = { workspace = true }
 # `src/service/api_version.rs`). Reaching its operations needs its routing table, which
 # only its crate carries.
 service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { path = "../service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10" }
+# The EC2 store, which OWNS instances: a health check of a registered instance observes
+# whether EC2 reports that instance running, so the inventory a check reads is EC2's own
+# (`src/state/instance_checks.rs`).
+service-com-amazonaws-ec2-amazonec2 = { path = "../service-com-amazonaws-ec2-amazonec2" }
 # `query_error_envelope`: the `<RequestId>` element an awsQuery `<ErrorResponse>` carries
 # beside its `<Error>`, which no model declares and the framework's error renderers do not
 # write. Shared with the ELBv2 crate, which this front door serves on the endpoint the two
