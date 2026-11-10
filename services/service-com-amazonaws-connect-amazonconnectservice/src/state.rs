@@ -23,6 +23,14 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+/// The attached-files configuration of an instance's attachment scopes: one concern of
+/// its own, so its own file, re-exported so a handler reaches it through
+/// `crate::state` like everything else here.
+mod attached_files;
+pub use attached_files::{
+    requested_extensions, AttachedFilesConfigurationRecord, DEFAULT_MAXIMUM_SIZE_LIMIT_IN_BYTES,
+};
+
 /// The chat half of the instance: what `StartChatContact` records here and what it
 /// hands the Connect Participant Service. Its own file because it is one concern of
 /// its own, and it is re-exported so a handler reaches it through `crate::state` like
@@ -909,6 +917,15 @@ pub struct InstanceRecord {
     /// [`Self::storage_config_for_resource_type`]) and that enum is finite, so this
     /// map cannot grow past it.
     pub storage_configs: BTreeMap<String, StorageConfigRecord>,
+    /// This instance's attached-files configurations, keyed by `AttachmentScope` —
+    /// the records `UpdateAttachedFilesConfiguration` writes and
+    /// `DescribeAttachedFilesConfiguration` projects. A scope nobody has updated holds
+    /// no record and reports its defaults (see
+    /// [`Self::attached_files_configuration`]).
+    ///
+    /// Bounded without a quota of its own: one record per `AttachmentScope`, and that
+    /// enum is finite.
+    pub attached_files_configurations: BTreeMap<String, AttachedFilesConfigurationRecord>,
 }
 
 impl InstanceRecord {
@@ -948,6 +965,7 @@ impl InstanceRecord {
             hours_of_operations: BTreeMap::new(),
             chat_contacts: BTreeMap::new(),
             storage_configs: BTreeMap::new(),
+            attached_files_configurations: BTreeMap::new(),
         }
     }
 

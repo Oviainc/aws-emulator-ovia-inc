@@ -154,6 +154,18 @@ fn calls_resolving_an_instance(instance_id: &str) -> Vec<Call> {
             ),
             None,
         ),
+        call(
+            "UpdateAttachedFilesConfiguration",
+            "POST",
+            format!("/attached-files-configurations/{instance_id}/CHAT"),
+            Some(json!({ "MaximumSizeLimitInBytes": 1024 })),
+        ),
+        call(
+            "DescribeAttachedFilesConfiguration",
+            "GET",
+            format!("/attached-files-configurations/{instance_id}/CHAT"),
+            None,
+        ),
     ]
 }
 
@@ -201,7 +213,7 @@ async fn assert_every_call_reports_the_instance_missing(
 /// The table spans the identifier's form and length: the UUID shape Connect mints, both
 /// ends of the modelled `InstanceId` length bound (1..100), a mixed-case identifier, one
 /// that is a prefix of a UUID, and one carrying the characters an identifier may hold —
-/// crossed with all fourteen instance-resolving operations.
+/// crossed with every instance-resolving operation.
 #[tokio::test]
 async fn an_unknown_instance_id_is_refused_in_awss_sentence() {
     let connect = Connect::new();
