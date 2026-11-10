@@ -832,11 +832,71 @@ pub fn max_allocated_storage(engine: &str) -> i32 {
 /// Whether `engine` supports IAM database authentication
 /// (`SupportsIAMDatabaseAuthentication`): the MySQL, MariaDB and PostgreSQL engines do;
 /// the Oracle, SQL Server and Db2 engines do not.
+///
+/// The GRAPH engine of the Amazon Neptune control plane this door serves does too, and at
+/// the cluster level: its own
+/// `CreateDBClusterMessage$EnableIAMDatabaseAuthentication` "enables Amazon Identity and
+/// Access Management (IAM) authentication for the entire DB cluster (this cannot be set at
+/// an instance level)"
+/// (`smithy_query(query="doc",shape="CreateDBClusterMessage",member="EnableIAMDatabaseAuthentication",model_path="services/service-com-amazonaws-neptune-amazonrdsv19/smithy-model/com-amazonaws-neptune-amazonrdsv19.json")`),
+/// so every option of it is offered with that auth mode. The DOCUMENT engine's control
+/// plane models no such member on either create
+/// (`com.amazonaws.docdb#CreateDBClusterMessage`,
+/// `com.amazonaws.docdb#CreateDBInstanceMessage`), so an option of it reports none: the
+/// capability is read per engine from the control plane that owns it rather than defaulted
+/// for this one front door.
 fn supports_iam_database_authentication(engine: &str) -> bool {
     matches!(
         engine,
-        "mysql" | "mariadb" | "postgres" | "aurora-mysql" | "aurora-postgresql"
+        "mysql" | "mariadb" | "postgres" | "aurora-mysql" | "aurora-postgresql" | "neptune"
     )
+}
+
+/// Whether a DB instance of `engine` can be ordered as a MULTI-AZ deployment
+/// (`MultiAZCapable`, "whether a DB instance is Multi-AZ capable").
+///
+/// A Multi-AZ deployment is a standby DB INSTANCE the service keeps in another zone of the
+/// region for an instance that owns its own storage. For a cluster engine the zones are
+/// not the instance's at all: `CreateDBInstanceMessage$MultiAZ` states it — "This setting
+/// doesn't apply to Amazon Aurora because the DB instance Availability Zones (AZs) are
+/// managed by the DB cluster" — and the two sibling control planes served by this one door
+/// document their instance members the same way ("Not applicable … managed by the DB
+/// cluster" on the Amazon Neptune and Amazon DocumentDB `CreateDBInstance` members). An
+/// option of a cluster engine therefore reports no instance-level Multi-AZ capability; the
+/// zones its members are placed in come from the CLUSTER's own `AvailabilityZones`.
+fn multi_az_capable(engine: &str) -> bool {
+    !is_cluster_engine(engine)
+}
+
+/// Whether an option of `engine` reports Enhanced Monitoring
+/// (`SupportsEnhancedMonitoring`, "Enhanced Monitoring at intervals from 1 to 60
+/// seconds").
+///
+/// Enhanced Monitoring is the OS-metric stream Amazon RDS collects from a DB instance's
+/// host under a monitoring role, which this control plane's own engines publish. An engine
+/// of ANOTHER control plane served by this one door
+/// ([`serves_another_control_plane`]) publishes its own capability set and neither of them
+/// offers it: the document engine's control plane models no monitoring member to enable it
+/// with at all (`com.amazonaws.docdb#CreateDBInstanceMessage` carries neither
+/// `MonitoringInterval` nor `MonitoringRoleArn`), and the graph engine's own front-door
+/// option report publishes the member unsupported for every class. So it is read per
+/// engine rather than claimed for every option.
+fn supports_enhanced_monitoring(engine: &str) -> bool {
+    !serves_another_control_plane(engine)
+}
+
+/// Whether `engine` offers Performance Insights at all, before the CLASS is consulted.
+///
+/// The graph engine does not: its own control plane documents both the option member and
+/// the create flag that would enable it as "(Not supported by Neptune)"
+/// (`smithy_query(query="shape",shape="OrderableDBInstanceOption",model_path="services/service-com-amazonaws-neptune-amazonrdsv19/smithy-model/com-amazonaws-neptune-amazonrdsv19.json")`
+/// on `SupportsPerformanceInsights`, and the same note on that model's
+/// `CreateDBInstanceMessage$EnablePerformanceInsights`), so no option of it claims the
+/// capability whatever class it runs on. The document engine's control plane DOES model
+/// `EnablePerformanceInsights`, so its options report the capability its classes carry —
+/// the question is the engine's, not this front door's.
+fn engine_offers_performance_insights(engine: &str) -> bool {
+    engine != crate::state::NEPTUNE_ENGINE
 }
 
 /// The Database Activity Streams modes an option reports, exactly as
@@ -937,9 +997,12 @@ fn to_wire(
         db_instance_class: Some(class.name.clone()),
         license_model: Some(license_model.to_string()),
         availability_zones: Some(availability_zones(region)),
-        // A Multi-AZ deployment puts the standby in another zone of the same region, so
-        // every option offered in several zones is Multi-AZ capable.
-        multi_az_capable: Some(true),
+        // Multi-AZ, a read replica and Enhanced Monitoring are INSTANCE-level
+        // capabilities, so each is the engine's own rather than this front door's default:
+        // a cluster engine's deployment and replication belong to its cluster, and the
+        // read-replica answer is read from the engine catalogue so this report and
+        // `DescribeDBEngineVersions` cannot disagree about the version.
+        multi_az_capable: Some(multi_az_capable(engine)),
         read_replica_capable: Some(version.profile.supports_read_replica),
         vpc: Some(true),
         supports_storage_encryption: Some(true),
@@ -972,8 +1035,12 @@ fn to_wire(
         supports_storage_autoscaling: Some(storage.size_range.is_some()),
         min_storage_size: storage_size.map(|(min, _)| min),
         max_storage_size: storage_size.map(|(_, max)| max),
-        supports_enhanced_monitoring: Some(true),
-        supports_performance_insights: Some(class.supports_performance_insights),
+        supports_enhanced_monitoring: Some(supports_enhanced_monitoring(engine)),
+        // Performance Insights is the ENGINE's first and the class's second: an engine
+        // that does not offer it claims it on no class.
+        supports_performance_insights: Some(
+            engine_offers_performance_insights(engine) && class.supports_performance_insights,
+        ),
         supports_iam_database_authentication: Some(supports_iam_database_authentication(engine)),
         // The engine modes and the global-database capability are the VERSION's, read
         // from the engine catalogue, so this report and `DescribeDBEngineVersions` cannot

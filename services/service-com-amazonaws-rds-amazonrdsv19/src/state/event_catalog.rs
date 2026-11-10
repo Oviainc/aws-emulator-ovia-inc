@@ -5,14 +5,20 @@ use super::*;
 /// The event source types and their categories, as `DescribeEventCategories` reports
 /// them.
 ///
-/// The source types are the valid values documented on
-/// `DescribeEventCategoriesMessage$SourceType` ("`db-instance` | `db-cluster` |
-/// `db-parameter-group` | `db-security-group` | `db-snapshot` | `db-cluster-snapshot` |
-/// `db-proxy`"), in that order; the categories of each are the ones published in "Amazon
-/// RDS event categories and event messages" (Amazon RDS User Guide), in the order that
-/// table lists them (alphabetical): the wire order of `EventCategories` is not documented
-/// anywhere in the model or the API reference, so the ONE order this catalog can state a
-/// source for is the published table's.
+/// The ORDER of this catalog is the order the report publishes, entry for entry and
+/// category for category: neither the model nor the API reference states a sort rule for
+/// either list, so the sequence is the front door's own published one and the handler emits
+/// it unchanged — a client that indexes this report positionally, or renders it as the
+/// ordered list it is, reads the source type the service names at that position. The
+/// source-type sequence below, and the category sequence of the entries the front door's
+/// own report is evidenced for (`db-snapshot`, `db-cluster`, `db-proxy`), are that
+/// published sequence; the remaining entries carry their categories in the order the
+/// published event table lists them. It is NOT the order
+/// `DescribeEventCategoriesMessage$SourceType`'s prose happens to name the types in, and
+/// not an alphabetical sort of either list.
+///
+/// The SETS are the ones published in "Amazon RDS event categories and event messages"
+/// (Amazon RDS User Guide), one entry per source type this front door publishes a map for.
 ///
 /// `db-instance` carries the two categories that table lists beyond the ones a DB
 /// instance shares with the other source types — `backtrack` (an Aurora MySQL backtrack
@@ -22,16 +28,21 @@ use super::*;
 ///
 /// A source type the model's `SourceType` enum
 /// (`smithy_query(query="shape",shape="SourceType")`) carries but this member's prose does
-/// not list is published too, at the position the enum declares it in, when this emulator
-/// can cite the categories that source type publishes: `custom-engine-version` is one —
-/// the published custom-engine-version event table carries a single `failure` event — and
-/// a client that subscribes to a source type has to be able to read its categories from
+/// not list is published too, at the position the published report names it in, when this
+/// emulator can cite the categories that source type publishes: `custom-engine-version` is
+/// one — the published custom-engine-version event table carries a single `failure` event —
+/// and a client that subscribes to a source type has to be able to read its categories from
 /// this one map. The three remaining enum values — `blue-green-deployment`,
 /// `db-shard-group` and `zero-etl` — have no published category table this emulator can
 /// cite, so it publishes no map for them rather than an invented one, and a request naming
 /// one is refused with the code a value this parameter does not accept gets, naming the
 /// set it is not in.
 pub const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
+    (
+        "db-snapshot",
+        &["notification", "creation", "deletion", "restoration"],
+    ),
+    ("db-parameter-group", &["configuration change"]),
     (
         "db-instance",
         &[
@@ -53,37 +64,32 @@ pub const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
             "security patching",
         ],
     ),
+    ("db-security-group", &["configuration change", "failure"]),
+    ("db-cluster-snapshot", &["backup", "notification"]),
     (
         "db-cluster",
         &[
-            "configuration change",
-            "creation",
-            "deletion",
             "failover",
-            "failure",
-            "global-failover",
-            "maintenance",
-            // A cluster also publishes the events of the two things only a CLUSTER does:
-            // it is migrated onto the service (`migration`), and it runs serverless
-            // capacity (`serverless`). Both are rows of the published DB cluster event
-            // table and both are categories a cluster subscription may name.
+            // The two categories only a CLUSTER publishes: it is migrated onto the
+            // service (`migration`), and it runs serverless capacity (`serverless`).
+            // Both are rows of the published DB cluster event table and both are
+            // categories a cluster subscription may name.
             "migration",
+            "failure",
             "notification",
             "serverless",
+            "creation",
+            "deletion",
+            "maintenance",
+            "configuration change",
+            "global-failover",
         ],
     ),
-    ("db-parameter-group", &["configuration change"]),
-    ("db-security-group", &["configuration change", "failure"]),
-    (
-        "db-snapshot",
-        &["creation", "deletion", "notification", "restoration"],
-    ),
-    ("db-cluster-snapshot", &["backup", "notification"]),
     // The published custom-engine-version event table has one row, a failed CEV creation.
     ("custom-engine-version", &["failure"]),
     (
         "db-proxy",
-        &["configuration change", "creation", "deletion", "failure"],
+        &["creation", "configuration change", "deletion", "failure"],
     ),
 ];
 

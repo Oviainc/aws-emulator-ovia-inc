@@ -166,12 +166,15 @@ async fn every_published_family_of_the_graph_engine_reports_its_own_release_line
                  {}, got {scalars}",
                 family.global_databases
             );
-            // A cluster member of this engine is a read replica of its cluster, and its
-            // storage is the cluster's, so no option of it orders a dedicated log volume.
+            // A reader of one of this engine's clusters is another member of that cluster,
+            // not an RDS read replica: its control plane models no
+            // `CreateDBInstanceReadReplica` at all, so no version of it claims one — the
+            // same answer every Aurora version gives (`db_engine_versions.rs`).
             assert_eq!(
                 text(&scalars, "SupportsReadReplica"),
-                "true",
-                "case {case:?}: a cluster member serves a read replica, got {scalars}"
+                "false",
+                "case {case:?}: a cluster member is a reader of its cluster rather than \
+                 an RDS read replica, got {scalars}"
             );
             // Every release of this engine is a four-part release number.
             let parts: Vec<&str> = version.split('.').collect();

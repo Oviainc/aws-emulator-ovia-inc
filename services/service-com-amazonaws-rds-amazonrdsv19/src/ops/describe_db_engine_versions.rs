@@ -779,7 +779,8 @@ const NEPTUNE: VersionProfile = NEPTUNE_BEFORE_SERVERLESS
 /// "Using Amazon Neptune Serverless" (Amazon Neptune User Guide) states the 1.2.0.1 minimum
 /// engine version, so the releases before it report no serverless capacity at all rather
 /// than claiming a range their clusters cannot be configured in.
-const NEPTUNE_BEFORE_SERVERLESS: VersionProfile = DOCDB;
+const NEPTUNE_BEFORE_SERVERLESS: VersionProfile =
+    NEPTUNE_WITHOUT_GLOBAL_DATABASE.global_databases();
 
 /// An Amazon Neptune version from BEFORE that engine's global database: the same cluster
 /// member capabilities without `SupportsGlobalDatabases`.
@@ -789,9 +790,19 @@ const NEPTUNE_BEFORE_SERVERLESS: VersionProfile = DOCDB;
 /// so the earlier family reports the capability as absent rather than claiming one its
 /// clusters cannot join — which is exactly the per-version difference a
 /// [`VersionProfile`] carries.
-const NEPTUNE_WITHOUT_GLOBAL_DATABASE: VersionProfile = VersionProfile::provisioned()
-    .read_replica()
-    .certificate_rotation_without_restart();
+///
+/// `SupportsReadReplica` is NOT one of those capabilities. The member answers whether the
+/// version supports an RDS READ REPLICA — a DB instance of its own, created by
+/// `CreateDBInstanceReadReplica` and replicating from another instance — and the graph
+/// engine's control plane models no such operation at all
+/// (`smithy_query(query="list_operations",model_path="services/service-com-amazonaws-neptune-amazonrdsv19/smithy-model/com-amazonaws-neptune-amazonrdsv19.json")`
+/// lists its 70 operations, which carry no read-replica create; the one promotion it
+/// publishes is `PromoteReadReplicaDBCluster`, at the CLUSTER level). A reader of one of
+/// its clusters is another member of that cluster, which is the same reason every Aurora
+/// profile above claims no read replica either — and an orderable DB instance option of
+/// this engine reports the same fact as its `ReadReplicaCapable`.
+const NEPTUNE_WITHOUT_GLOBAL_DATABASE: VersionProfile =
+    VersionProfile::provisioned().certificate_rotation_without_restart();
 
 /// The lower Serverless v2 bound of an Aurora version that does NOT scale to zero: half
 /// an Aurora Capacity Unit, the smallest capacity a cluster of such a version can be

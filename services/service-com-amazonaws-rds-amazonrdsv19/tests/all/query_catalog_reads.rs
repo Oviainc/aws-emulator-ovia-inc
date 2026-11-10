@@ -318,14 +318,16 @@ async fn describe_event_categories_reports_the_published_source_types() {
 async fn the_published_event_categories_are_the_documented_ones() {
     let router = emulator();
 
-    // (source type, every event category AWS publishes for it, in the order the
-    // published "Amazon RDS event categories and event messages" table lists them).
+    // (source type, every event category AWS publishes for it, in the order the front
+    // door's own report publishes them — the published "Amazon RDS event categories and
+    // event messages" table's order for the entries no report of the service is evidenced
+    // for).
     //
     // This table states the catalog INDEPENDENTLY of `state::EVENT_CATEGORIES`, which is
     // what the sibling test above compares the answer against: a row here is what the
-    // published table says, so a change to the catalog that drops or invents a category
-    // fails here rather than agreeing with itself. Every published source type is a row,
-    // including the ones no issue cited (`db-cluster`, `db-parameter-group`,
+    // published report says, so a change to the catalog that drops, invents or re-sorts a
+    // category fails here rather than agreeing with itself. Every published source type is
+    // a row, including the ones no issue cited (`db-cluster`, `db-parameter-group`,
     // `db-security-group`, `db-proxy`, `custom-engine-version`).
     let rows: Vec<(&str, Vec<&str>)> = vec![
         (
@@ -352,25 +354,25 @@ async fn the_published_event_categories_are_the_documented_ones() {
         (
             "db-cluster",
             vec![
-                "configuration change",
-                "creation",
-                "deletion",
                 "failover",
-                "failure",
-                "global-failover",
-                "maintenance",
                 // The two categories only a CLUSTER publishes: its migration onto the
                 // service, and its serverless capacity.
                 "migration",
+                "failure",
                 "notification",
                 "serverless",
+                "creation",
+                "deletion",
+                "maintenance",
+                "configuration change",
+                "global-failover",
             ],
         ),
         ("db-parameter-group", vec!["configuration change"]),
         ("db-security-group", vec!["configuration change", "failure"]),
         (
             "db-snapshot",
-            vec!["creation", "deletion", "notification", "restoration"],
+            vec!["notification", "creation", "deletion", "restoration"],
         ),
         ("db-cluster-snapshot", vec!["backup", "notification"]),
         // A source type the model's `SourceType` enum declares and this operation's own
@@ -378,7 +380,7 @@ async fn the_published_event_categories_are_the_documented_ones() {
         ("custom-engine-version", vec!["failure"]),
         (
             "db-proxy",
-            vec!["configuration change", "creation", "deletion", "failure"],
+            vec!["creation", "configuration change", "deletion", "failure"],
         ),
     ];
 

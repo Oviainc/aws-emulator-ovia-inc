@@ -135,6 +135,8 @@ mod db_subnet_group_subnet_existence;
 mod delete_custom_db_engine_version;
 #[path = "all/docdb_query_surface.rs"]
 mod docdb_query_surface;
+#[path = "all/engine_capability_reports.rs"]
+mod engine_capability_reports;
 #[path = "all/engine_default_catalog_head.rs"]
 mod engine_default_catalog_head;
 #[path = "all/engine_default_cluster_parameters.rs"]
