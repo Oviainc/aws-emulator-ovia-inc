@@ -379,6 +379,19 @@ fn published_condition_keys(caller: &Caller, addressed: &AddressedKeys) -> Vec<&
     published
 }
 
+/// The sentence AWS refuses an unauthorized request with: who was refused, which action on
+/// which resource, and the reason the refusal rests on.
+///
+/// ONE statement of that wording for this crate, so the data-plane's policy decision
+/// ([`denial_addressing`]) and every other refusal naming an action the caller may not
+/// perform cannot word it differently.
+pub fn not_authorized(caller_arn: &str, action: &str, resource: &str, reason: &str) -> String {
+    format!(
+        "User: {caller_arn} is not authorized to perform: {action} on resource: {resource} \
+         {reason}"
+    )
+}
+
 /// The `AccessDeniedException` message a request that addresses no partition of its own
 /// earns when the policies in force do not permit it, or `None` when they do. See
 /// [`denial_addressing`], which this is the table-wide case of.
@@ -404,12 +417,7 @@ pub fn denial_addressing(
     now: SystemTime,
     addressed: &AddressedKeys,
 ) -> Option<String> {
-    let refusal = |reason: &str| {
-        Some(format!(
-            "User: {} is not authorized to perform: {action} on resource: {} {reason}",
-            caller.arn, table.arn
-        ))
-    };
+    let refusal = |reason: &str| Some(not_authorized(&caller.arn, action, &table.arn, reason));
     // "PutResourcePolicy is an asynchronous operation" and "the policy application is
     // eventually consistent" (the `PutResourcePolicy` doc): a policy whose application is
     // not due yet states nothing about this request.

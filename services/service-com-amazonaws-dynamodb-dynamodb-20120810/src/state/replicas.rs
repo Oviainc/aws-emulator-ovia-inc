@@ -867,6 +867,11 @@ impl Table {
                     .or(self.on_demand_throughput.max_read_request_units),
                 max_write_request_units: self.on_demand_throughput.max_write_request_units,
             },
+            // The settings the group's capacities are scaled by travel with the replica:
+            // the write capacity of a global table is the group's, and the new replica's
+            // read capacity follows the table it is a replica of until a replica auto
+            // scaling update states its own.
+            auto_scaling: self.auto_scaling.clone(),
             region,
         }
     }

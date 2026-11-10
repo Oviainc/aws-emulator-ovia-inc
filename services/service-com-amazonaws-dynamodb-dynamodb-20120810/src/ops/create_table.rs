@@ -570,6 +570,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             encryption,
             on_demand_throughput: crate::state::OnDemandCeilings::default()
                 .apply(input.on_demand_throughput.as_ref()),
+            // Nothing scales a new table's capacities: `CreateTable` carries no auto
+            // scaling member, so `UpdateTableReplicaAutoScaling` is the only way to
+            // configure one.
+            auto_scaling: crate::state::TableAutoScaling::default(),
         };
         let description = table.describe(now);
         store.insert_table(table);

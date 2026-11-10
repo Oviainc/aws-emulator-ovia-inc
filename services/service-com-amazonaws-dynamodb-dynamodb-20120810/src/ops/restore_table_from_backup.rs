@@ -422,6 +422,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An on-demand ceiling is named through `OnDemandThroughputOverride`, which
             // this slice does not store yet, so the restored table starts with none.
             on_demand_throughput: crate::state::OnDemandCeilings::default(),
+            // Auto scaling is one of the settings a caller configures again on the
+            // restored table, so nothing scales its capacities to begin with.
+            auto_scaling: crate::state::TableAutoScaling::default(),
         };
         // The figures `ItemCount`/`TableSizeBytes` report are metered when a table is
         // created, and this one was created holding the restored items.

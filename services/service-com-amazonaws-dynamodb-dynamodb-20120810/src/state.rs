@@ -2730,6 +2730,11 @@ pub struct Table {
     /// The on-demand capacity ceilings in force for this table, as `OnDemandThroughput`
     /// sets and reports them ([`OnDemandCeilings`]).
     pub on_demand_throughput: OnDemandCeilings,
+    /// The auto scaling settings in force for this REPLICA's capacities, as
+    /// `UpdateTableReplicaAutoScaling` wrote them and
+    /// `DescribeTableReplicaAutoScaling` reports them ([`TableAutoScaling`]). Empty for a
+    /// table whose capacities nothing scales.
+    pub auto_scaling: TableAutoScaling,
 }
 
 /// Where a restored table came from, as `RestoreSummary` reports it: the backup it was
@@ -4918,6 +4923,12 @@ pub use encryption::*;
 /// between them. Re-exported below, so every caller still names them `crate::state::…`.
 mod replicas;
 pub use replicas::*;
+
+/// The auto scaling settings each replica's capacities are scaled by, in its own file: the
+/// capacity windows and target-tracking policies the replica auto scaling surface writes
+/// and reports. Re-exported below, so every caller still names them `crate::state::…`.
+mod auto_scaling;
+pub use auto_scaling::*;
 
 /// What the LEGACY (2017.11.29) global-table operations answer, in one file so the five
 /// of them cannot word the same two refusals differently. Re-exported below, so every

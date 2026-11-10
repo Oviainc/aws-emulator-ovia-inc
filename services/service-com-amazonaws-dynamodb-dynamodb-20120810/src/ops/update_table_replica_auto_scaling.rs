@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTableReplicaAutoScaling
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTableReplicaAutoScaling`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTableReplicaAutoScaling::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates auto scaling settings on your global tables at once: the capacity windows and
+//! target-tracking policies each replica of the addressed table's replication group is
+//! scaled by ([`crate::state::TableAutoScaling`]), reported back as
+//! `DescribeTableReplicaAutoScaling` reports them.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTableReplicaAutoScaling` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTableReplicaAutoScalingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTableReplicaAutoScaling"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
+        // A replica's capacities are scaled through this service's own service-linked role.
+        // A request that names a role of its own asks for that role to be PASSED to the
+        // scaling service, which the calling principal must be authorized to do, so the
+        // authorization failure that pass earns is what the request is answered with
+        // ([`crate::state::unpassable_auto_scaling_role`]). The principal is resolved
+        // before the store is locked, as every reader of the caller is.
+        if let Some(role_arn) = crate::state::unpassable_auto_scaling_role(&input) {
+            let caller = crate::state::request_caller(&*self.engine, ctx);
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::auto_scaling_role_pass_denied(&caller.arn, &role_arn),
+            ));
+        }
+
+        let mut store = state.lock();
+        // Whatever the clock already owes the group is materialised before the update is
+        // applied, so a replica whose create has fallen due is one this request can scale
+        // and a table whose delete has is one it cannot.
+        store.apply_due_transitions(now);
+        store
+            .apply_replica_auto_scaling(&region, &name, &input)
+            .map_err(lift)?;
+        let description = store
+            .described_replica_auto_scaling(&region, &name, now)
+            .map_err(lift)?;
+        drop(store);
+
+        // The audit record for a state-changing call: who asked, what was scaled and that
+        // it succeeded. Never a credential — only the access key id the caller presented.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            table_name = %name,
+            replica_updates = input.replica_updates.as_ref().map_or(0, Vec::len),
+            global_secondary_index_updates = input
+                .global_secondary_index_updates
+                .as_ref()
+                .map_or(0, Vec::len),
+            "auto scaling settings updated"
+        );
+
+        Ok(UpdateTableReplicaAutoScalingOutput {
+            table_auto_scaling_description: Some(description),
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> UpdateTableReplicaAutoScalingError {
+    UpdateTableReplicaAutoScalingErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel: a table or index this
+/// operation cannot find is the `ResourceNotFoundException` it models — "the operation
+/// tried to access a nonexistent table or index" — and an update it cannot apply for a
+/// reason that is in the REQUEST is a request-shape refusal.
+fn lift(error: crate::state::RequestError) -> UpdateTableReplicaAutoScalingError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            UpdateTableReplicaAutoScalingErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }
