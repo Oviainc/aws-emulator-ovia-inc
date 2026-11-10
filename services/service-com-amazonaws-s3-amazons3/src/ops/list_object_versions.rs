@@ -355,6 +355,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let prefix = input.prefix.clone().unwrap_or_default();
         let delimiter = input.delimiter.clone().unwrap_or_default();
+        // "Specifies the owner of the object" (`ObjectVersion$Owner`) and "the account that
+        // created the delete marker" (`DeleteMarkerEntry$Owner`) — this operation models the
+        // member on BOTH containers and makes it opt-in on neither, so every entry of every
+        // page carries it. This emulator serves one account, whose canonical user id the
+        // store names once (`state::canonical_user_id`), the same id every other owner this
+        // service reports carries. The id is read ONCE here rather than per entry, because
+        // every entry of a listing carries the same owner. No `DisplayName`: that is an
+        // account's friendly name, which nothing here records.
+        let owner = Owner {
+            id: Some(crate::state::canonical_user_id()),
+            display_name: None,
+        };
 
         let mut versions: Vec<ObjectVersion> = Vec::new();
         let mut delete_markers: Vec<DeleteMarkerEntry> = Vec::new();
@@ -473,8 +485,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             last_modified: Some(::aws_smithy_types::DateTime::from(
                                 held.last_modified(),
                             )),
-                            // `Owner` needs an object owner this emulator does not record.
-                            owner: None,
+                            owner: Some(owner.clone()),
                         });
                         continue;
                     };
@@ -490,8 +501,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         last_modified: Some(::aws_smithy_types::DateTime::from(
                             object.last_modified,
                         )),
-                        // `Owner` needs an object owner this emulator does not record and
-                        // `RestoreStatus` an archive tier it does not model.
+                        owner: Some(owner.clone()),
+                        // `RestoreStatus` needs an archive tier this store does not model.
                         //
                         // "The algorithm that was used to create a checksum of the object"
                         // and "the checksum type that is used to calculate the object's

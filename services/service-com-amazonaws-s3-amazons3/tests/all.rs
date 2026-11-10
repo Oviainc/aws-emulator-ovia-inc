@@ -351,6 +351,8 @@ mod state_roundtrip;
 mod stored_payload_checksums;
 #[path = "all/version_id_classification.rs"]
 mod version_id_classification;
+#[path = "all/version_listing_echoed_members.rs"]
+mod version_listing_echoed_members;
 #[path = "all/write_checksum_header_count.rs"]
 mod write_checksum_header_count;
 #[path = "all/write_response_identity.rs"]

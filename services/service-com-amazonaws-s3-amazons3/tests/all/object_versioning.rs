@@ -107,7 +107,9 @@ pub(crate) struct VersionListing {
     /// The elements directly under the result: `Name`, `IsTruncated`, `MaxKeys`, the
     /// markers and the echoed request parameters.
     top: BTreeMap<String, String>,
-    /// One map per `Version` entry, keyed by element name, in response order.
+    /// One map per `Version` or `DeleteMarker` entry, keyed by element name — a member of
+    /// the nested `Owner` structure under the container-qualified name `Owner.ID` — in
+    /// response order.
     versions: Vec<BTreeMap<String, String>>,
     /// Every `CommonPrefixes/Prefix`, in response order.
     common_prefixes: Vec<String>,
@@ -116,8 +118,29 @@ pub(crate) struct VersionListing {
 impl VersionListing {
     /// A top-level element's text, or the empty string when the response carries none —
     /// which is what "absent" looks like to a client reading a bound member.
-    fn field(&self, name: &str) -> String {
+    ///
+    /// `pub(crate)`, like [`VersionListing::carries`]: the suite that pins the echoed
+    /// elements and the owner of every entry reads them through these.
+    pub(crate) fn field(&self, name: &str) -> String {
         self.top.get(name).cloned().unwrap_or_default()
+    }
+
+    /// Whether the result document carries this top-level element AT ALL — which is what
+    /// [`VersionListing::field`] cannot tell apart from an element carrying the empty
+    /// string, and exactly the distinction an echoed marker turns on.
+    pub(crate) fn carries(&self, name: &str) -> bool {
+        self.top.contains_key(name)
+    }
+
+    /// Every listed entry, in response order — a `Version` or a `DeleteMarker`, whichever
+    /// container carried it.
+    pub(crate) fn listed(&self) -> &[BTreeMap<String, String>] {
+        &self.versions
+    }
+
+    /// Every `CommonPrefixes/Prefix` the page rolled up, in response order.
+    pub(crate) fn rolled_up(&self) -> &[String] {
+        &self.common_prefixes
     }
 
     /// One entry's element, or the empty string when it carries none.
@@ -149,6 +172,11 @@ impl VersionListing {
     }
 }
 
+/// The pseudo-element [`version_listing_of`] records an entry's CONTAINER under: `Version`
+/// or `DeleteMarker`. No element of the result document is named this, so it collides with
+/// nothing a response carries.
+pub(crate) const CONTAINER: &str = "@container";
+
 /// Read a version listing with an XML reader, rather than by slicing the body — the same
 /// accumulate-per-element walk [`super::object_storage::listing_of`] does for
 /// `ListObjectsV2`, over this operation's `Version` and `DeleteMarker` containers.
@@ -160,6 +188,7 @@ pub(crate) fn version_listing_of(answer: &Answer) -> VersionListing {
     let mut element = String::new();
     let mut current = String::new();
     let mut entry: Option<BTreeMap<String, String>> = None;
+    let mut nested: Option<String> = None;
     let mut common_prefix: Option<String> = None;
     loop {
         match reader
@@ -170,10 +199,43 @@ pub(crate) fn version_listing_of(answer: &Answer) -> VersionListing {
                 element = String::from_utf8_lossy(start.name().as_ref()).into_owned();
                 current.clear();
                 match element.as_str() {
-                    "Version" | "DeleteMarker" => entry = Some(BTreeMap::new()),
+                    // The container an entry arrived in is recorded under a name no element
+                    // of the document carries, so a reader can tell a version from a delete
+                    // marker without re-reading the body.
+                    "Version" | "DeleteMarker" => {
+                        entry = Some(BTreeMap::from([(
+                            CONTAINER.to_string(),
+                            element.clone(),
+                        )]))
+                    }
+                    "Owner" => nested = Some(element.clone()),
                     "CommonPrefixes" => common_prefix = Some(String::new()),
                     _ => {}
                 }
+            }
+            // A self-closing element carries the empty string and is PRESENT: an echoed
+            // marker the request named nothing for is written one way or the other
+            // (`<KeyMarker></KeyMarker>` or `<KeyMarker/>`), and a client reading the
+            // document sees the same element either way.
+            Event::Empty(empty) => {
+                let name = String::from_utf8_lossy(empty.name().as_ref()).into_owned();
+                let field = match &nested {
+                    Some(container) => format!("{container}.{name}"),
+                    None => name.clone(),
+                };
+                match (entry.as_mut(), common_prefix.as_mut()) {
+                    (Some(entry), _) => {
+                        entry.insert(field, String::new());
+                    }
+                    // An empty element inside `CommonPrefixes` is that rolled-up prefix, not
+                    // the listing's own echoed `Prefix` — the same split the `End` arm makes.
+                    (None, Some(prefix)) if name == "Prefix" => prefix.clear(),
+                    _ => {
+                        listing.top.insert(field, String::new());
+                    }
+                }
+                element.clear();
+                current.clear();
             }
             Event::Text(text) => {
                 let decoded = text
@@ -195,21 +257,28 @@ pub(crate) fn version_listing_of(answer: &Answer) -> VersionListing {
                             listing.versions.push(done);
                         }
                     }
+                    "Owner" => nested = None,
                     "CommonPrefixes" => {
                         if let Some(done) = common_prefix.take() {
                             listing.common_prefixes.push(done);
                         }
                     }
-                    // Every other element's text belongs to whichever container is open.
+                    // Every other element's text belongs to whichever container is open,
+                    // under the container-qualified name when it is a member of the `Owner`
+                    // structure.
                     name if name == element => {
                         let value = std::mem::take(&mut current);
+                        let field = match &nested {
+                            Some(container) => format!("{container}.{name}"),
+                            None => name.to_string(),
+                        };
                         match (entry.as_mut(), common_prefix.as_mut()) {
                             (Some(entry), _) => {
-                                entry.insert(name.to_string(), value);
+                                entry.insert(field, value);
                             }
                             (None, Some(prefix)) if name == "Prefix" => *prefix = value,
                             _ => {
-                                listing.top.insert(name.to_string(), value);
+                                listing.top.insert(field, value);
                             }
                         }
                     }
