@@ -19353,8 +19353,10 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "pdf-writer",
  "serde_json",
  "sha2 0.10.9",
+ "textwrap",
  "tokio",
  "tracing",
 ]

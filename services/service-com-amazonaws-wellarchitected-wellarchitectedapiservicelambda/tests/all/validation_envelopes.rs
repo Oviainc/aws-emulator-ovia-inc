@@ -578,16 +578,18 @@ async fn an_undecodable_next_token_cannot_be_parsed() {
 async fn a_scaffolded_operation_still_answers_501_for_a_valid_request() {
     let client = Client::new();
     for (case, method, path, body) in [
-        // `GetLensReviewReport` — the report of one lens review of a workload — is still a
-        // scaffold with its own issue. The rows this one replaced name operations since
-        // implemented: `ListProfileNotifications` (`super::profile_notifications`),
-        // `ListNotifications` (`super::lens_notifications`) and `GetProfileTemplate`
-        // (`super::profile_template`). The request is well formed — a 32-hex `WorkloadId`
-        // and a published `LensAlias` — so nothing refuses it before the handler runs.
+        // `GetConsolidatedReport` — the consolidated report over the account's workloads —
+        // is still a scaffold with its own issue. The rows this one replaced name
+        // operations since implemented: `GetLensReviewReport`
+        // (`super::lens_review_report`), `ListProfileNotifications`
+        // (`super::profile_notifications`), `ListNotifications`
+        // (`super::lens_notifications`) and `GetProfileTemplate`
+        // (`super::profile_template`). The request is well formed — `Format` is a
+        // published `ReportFormat` member — so nothing refuses it before the handler runs.
         (
-            "GetLensReviewReport",
+            "GetConsolidatedReport",
             "GET",
-            format!("/workloads/{}/lensReviews/wellarchitected/report", "0".repeat(32)),
+            "/consolidatedReport?Format=JSON".to_string(),
             None,
         ),
     ] {

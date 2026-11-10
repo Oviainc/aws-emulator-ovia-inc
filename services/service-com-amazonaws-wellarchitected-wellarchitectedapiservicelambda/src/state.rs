@@ -125,6 +125,9 @@ pub mod regions;
 pub mod account_regions;
 pub mod trusted_advisor_checks;
 mod framework_lens;
+/// The document ONE lens review is REPORTED as (`GetLensReviewReport`), derived from the
+/// stored review exactly as the review's own projection is.
+mod lens_review_report;
 mod store;
 mod refusals;
 mod shares;
@@ -137,6 +140,7 @@ pub use agents::*;
 pub use shares::*;
 pub use refusals::*;
 pub use framework_lens::*;
+pub use lens_review_report::*;
 
 pub use regions::{AWS_REGIONS, DEFAULT_REGION};
 

@@ -25,6 +25,12 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex codec for the minted ids and the opaque paging NextToken.
 hex = { workspace = true }
+# Writes the PDF document a lens review is reported as (`GetLensReviewReport`), so the
+# report a caller decodes is produced by a PDF writer rather than hand-assembled bytes.
+pdf-writer = "0.13"
+# Wraps the stored notes that document prints to the page's text column. Only the crate's
+# own first-fit wrapping is needed, so every optional feature is left off.
+textwrap = { version = "0.16", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

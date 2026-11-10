@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLensReviewReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLensReviewReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLensReviewReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE lens review of ONE workload AS A DOCUMENT: the lens the review is of, and
+//! the Base64-encoded PDF report of that review, derived from the reviewed workload's
+//! stored state by the one place that builds it ([`crate::state::lens_review_report`]).
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +152,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLensReviewReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLensReviewReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLensReviewReport"))
+        let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(|| {
+            GetLensReviewReportErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        let store = state.lock();
+        let live = store.workloads.get(&input.workload_id).ok_or_else(|| {
+            GetLensReviewReportErrorModeled::ResourceNotFoundException(
+                crate::state::workload_not_found(&input.workload_id),
+            )
+        })?;
+
+        // "A milestone records the state of a workload at a particular point in time"
+        // (`CreateMilestone` doc): a request that names one reports the review the RECORDED
+        // workload carried, not the live one — the same resolution the review's own read
+        // makes (`crate::ops::get_lens_review`).
+        let workload = match input.milestone_number {
+            None => live,
+            Some(number) => {
+                &store
+                    .milestone(&input.workload_id, number)
+                    .ok_or_else(|| {
+                        GetLensReviewReportErrorModeled::ResourceNotFoundException(
+                            crate::state::milestone_not_found(&input.workload_id, number),
+                        )
+                    })?
+                    .workload
+            }
+        };
+
+        // A lens review exists only while that lens is associated with the workload, so a
+        // lens the workload does not carry names no review of it to report — a value of
+        // `LensAlias` this service refuses rather than a resource it could not find
+        // (`crate::service::lens_content_validation`).
+        if !workload.reviews_lens(&input.lens_alias) {
+            return Err(GetLensReviewReportErrorModeled::ValidationException(
+                crate::service::lens_content_validation::no_lens_review(
+                    &input.workload_id,
+                    &input.lens_alias,
+                ),
+            )
+            .into());
+        }
+
+        Ok(GetLensReviewReportOutput {
+            workload_id: Some(workload.workload_id.clone()),
+            // Echoed only when the request scoped the read to a milestone: a report of the
+            // live review is a report of no milestone.
+            milestone_number: input.milestone_number,
+            lens_review_report: Some(crate::state::lens_review_report(
+                workload,
+                &input.lens_alias,
+                // The lens as the catalog describes it for the version this review is
+                // against, resolved exactly as the review's own read resolves it.
+                &store.reviewed_lens_at(
+                    &input.lens_alias,
+                    workload.lens_review_version(&input.lens_alias),
+                ),
+                // The content of the lenses this workload reviews, which the risk roll-ups
+                // in the document are counted over: what a lens asks is that lens's own
+                // content, for the version each of its reviews is against.
+                &store.reviewed_lens_content(&workload.reviewed_lens_versions()),
+                input.milestone_number,
+            )),
+        })
     }
 }
