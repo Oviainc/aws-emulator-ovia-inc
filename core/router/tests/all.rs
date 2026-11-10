@@ -608,6 +608,9 @@ mod sfn_integration_error_names;
 mod sfn_parallel_branch_cancellation;
 #[path = "all/cloudformation_sfn_fifo_queue_stack.rs"]
 mod cloudformation_sfn_fifo_queue_stack;
+// Declared beside the other Step Functions suites, for the reason the lines above give.
+#[path = "all/sfn_management_events.rs"]
+mod sfn_management_events;
 // Declared HERE, in the sorted list at its own name, rather than at the head or the tail
 // of this file: both of those are where every concurrently landing suite puts its line, so
 // a declaration there conflicts with all of them, while these neighbouring lines are

@@ -40,6 +40,13 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
+//! ## Every served call is a management event
+//!
+//! The routing table this service answers with is its AUDITED one ([`management_events`]),
+//! so every call it serves is recorded in the account's event history where CloudTrail's
+//! `LookupEvents` reads it. The recording is a property of SERVING a call rather than of
+//! any one operation, so no handler of this service carries one.
+//!
 //! ## Naming the request a response answers
 //!
 //! Every response AWS sends names the request it answered, in the response header this
@@ -83,6 +90,14 @@ pub(crate) mod authorization;
 /// the lookups both of those questions are decided from.
 pub(crate) mod request_caller;
 
+/// This front door's AUDIT leg: every call it serves is recorded as a management event of
+/// `states.amazonaws.com` in the account's event history, where CloudTrail's
+/// `LookupEvents` reads it.
+///
+/// Public: its `eventSource` and its per-operation reporting-vs-mutating catalog are
+/// checked by this crate's tests.
+pub mod management_events;
+
 /// Where that identity-based decision is TAKEN: in front of every modelled operation,
 /// through [`identity_authorization::IamAuthorized`].
 ///
@@ -114,8 +129,13 @@ pub mod wire;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The generated entry, with its three framework-level error renderers wrapped so a
-    /// response no operation produced still names the request it answers.
-    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
+    /// response no operation produced still names the request it answers — and routing
+    /// through this service's AUDITED table (see [`management_events`]), so every call it
+    /// serves is recorded as a management event. Identity, the protocol and the operations
+    /// are the generated entry's untouched.
+    entry: RequestIdEnvelopeDefinition<
+        ::service_common::audited_operation::AuditedDefinition<crate::ServiceDefinition<Eng>>,
+    >,
     /// This service's wire protocol, built ONCE here because
     /// `override_protocol` hands out a borrow of it rather than a new one per
     /// request.
@@ -133,9 +153,18 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(
-                Arc::clone(&engine),
-            )),
+            entry: RequestIdEnvelopeDefinition::header_only(
+                ::service_common::audited_operation::AuditedDefinition::new(
+                    crate::ServiceDefinition::new(Arc::clone(&engine)),
+                    // Every operation of this service, each wrapped in the shared
+                    // management-event recorder and built from this same shared engine
+                    // (see [`management_events`]), so each call this service serves is
+                    // recorded as a management event of `states.amazonaws.com` — the one
+                    // table the identity gate below resolves every admitted request
+                    // through, so no request reaches a path that records nothing.
+                    management_events::audited_table(&engine),
+                ),
+            ),
             protocol: wire::SwfJsonProtocol::new(),
             authorized: identity_authorization::IamAuthorized::new(engine),
         }

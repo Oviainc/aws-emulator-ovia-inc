@@ -129,6 +129,8 @@ mod lambda_task_control_flow;
 mod lambda_task_function_metrics;
 #[path = "all/list_state_machine_aliases_pages.rs"]
 mod list_state_machine_aliases_pages;
+#[path = "all/management_event_recording.rs"]
+mod management_event_recording;
 #[path = "all/map_item_batcher.rs"]
 mod map_item_batcher;
 #[path = "all/map_item_reader.rs"]
