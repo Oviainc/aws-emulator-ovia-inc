@@ -521,6 +521,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(refusal);
         }
 
+        // A specification states the launch template by id or by name; the group reports
+        // BOTH, because this service resolves the template against the account's own Amazon
+        // EC2 launch templates when the group is created. Resolved here, before this
+        // service's store is locked, for the same reason the two reads above are.
+        let mut launch_template = input.launch_template;
+        let mut mixed_instances_policy = input.mixed_instances_policy;
+        crate::state::ec2_instances::complete_launch_template_specifications(
+            &*self.engine,
+            launch_template.as_mut(),
+            mixed_instances_policy.as_mut(),
+        );
+
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);
@@ -583,8 +595,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // and the instances it launches, live.
             region: region.clone(),
             launch_configuration_name: input.launch_configuration_name,
-            launch_template: input.launch_template,
-            mixed_instances_policy: input.mixed_instances_policy,
+            launch_template,
+            mixed_instances_policy,
             min_size: input.min_size,
             max_size: input.max_size,
             // The group starts empty: `apply_capacity` below launches what the

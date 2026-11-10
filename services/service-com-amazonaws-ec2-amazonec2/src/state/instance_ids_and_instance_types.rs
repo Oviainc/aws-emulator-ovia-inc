@@ -106,6 +106,55 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 }
 
+/// The refusal a tagging call answers for a resource id that names no resource this account
+/// holds.
+///
+/// `CreateTags` and `DeleteTags` act on an id without being told its kind, and the kind is
+/// what decides the refusal: a WELL-FORMED id of a kind EC2 publishes names a resource that
+/// does not exist, which is that kind's own `Invalid<Kind>.NotFound` — the same refusal every
+/// operation of that resource answers for the id, so a client that deleted a subnet and then
+/// tagged it reads `InvalidSubnetID.NotFound` whichever call it made. A value that is not an
+/// id of any such kind is no id at all, which is `InvalidID` ("The specified ID for the
+/// resource you are trying to tag is not valid"): the refusal these calls answer for a
+/// malformed value, and the one this falls back to.
+///
+/// The kinds are the ones this store holds a taggable resource of
+/// ([`ComAmazonawsEc2Amazonec2State::resource_tags_mut`]) whose own not-found refusal this
+/// crate words, keyed by the printed prefix of their ids.
+pub fn untaggable_resource_id<E>(resource_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    // An instance id is read through its own form check, which refuses the placeholder and
+    // the long forms EC2 never mints ([`instance_id_is_well_formed`]).
+    if instance_id_is_well_formed(resource_id) {
+        return crate::scaffolded::Scaffolded::invalid_instance_id_not_found(resource_id);
+    }
+    /// The not-found refusal of one taggable kind, as the catalogue below holds it.
+    type NotFound<E> = fn(&str) -> crate::scaffolded::Scaffolded<E>;
+    let kinds: [(&str, NotFound<E>); 12] = [
+        ("vpc", invalid_vpc_id_not_found),
+        ("subnet", invalid_subnet_id_not_found),
+        ("sg", invalid_group_not_found),
+        ("eni", invalid_network_interface_id_not_found),
+        ("vol", invalid_volume_id_not_found),
+        ("snap", invalid_snapshot_id_not_found),
+        ("igw", invalid_internet_gateway_id_not_found),
+        ("rtb", invalid_route_table_id_not_found),
+        ("acl", invalid_network_acl_id_not_found),
+        ("dopt", invalid_dhcp_option_id_not_found),
+        // The launch-template wording that NAMES the id the request sent: a tagging call
+        // names one resource per id, so the refusal states which template is absent rather
+        // than that at least one of several is ([`invalid_launch_template_id_not_found`]
+        // carries that other sentence, which names none of them).
+        ("lt", specified_launch_template_id_not_found),
+        ("ami", invalid_ami_id_not_found),
+    ];
+    for (prefix, not_found) in kinds {
+        if prefixed_id_is_well_formed(prefix, resource_id) {
+            return not_found(resource_id);
+        }
+    }
+    crate::scaffolded::Scaffolded::invalid_id(resource_id)
+}
+
 /// Refuse a tag key longer than EC2 documents ([`MAX_TAG_KEY_CHARS`]).
 ///
 /// Split out of [`validate_tag_size`] so a caller that carries a KEY and no value — the

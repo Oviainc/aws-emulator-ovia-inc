@@ -39,6 +39,11 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{
 /// about, so a row says what the declaration IS rather than what it is called.
 const GATE: &str = "Gate";
 
+/// The launch template the Auto Scaling group of the update-policy row launches from: that
+/// service refuses a group naming no launch source, so the group's declaration names a
+/// resource of the same stack.
+const GATE_LAUNCH: &str = "GateLaunch";
+
 /// How many reads a row that signals a SETTLED create gives the create to settle in: a stack
 /// is owed its terminal status by the clock and by the services that own its resources, and a
 /// read is what asks them.
@@ -64,7 +69,8 @@ enum Declared {
     WaitCondition,
 }
 
-/// The template a row deploys: one resource under [`GATE`], declared the row's way.
+/// The template a row deploys: the resource under [`GATE`], declared the row's way, beside
+/// whatever that declaration needs to exist.
 ///
 /// The types are the ones AWS documents each attribute on — `CreationPolicy` applies to
 /// `AWS::EC2::Instance`, `AWS::AutoScaling::AutoScalingGroup` and
@@ -72,6 +78,7 @@ enum Declared {
 /// group — so no row leans on an attribute the type does not take. `marker` goes into the
 /// declaration so an update can change the template without changing the wait.
 fn template(declared: Declared, marker: &str) -> String {
+    let mut resources = ::serde_json::Map::new();
     let gate = match declared {
         Declared::NothingWaiting => json!({
             "Type": "AWS::SNS::Topic",
@@ -89,22 +96,53 @@ fn template(declared: Declared, marker: &str) -> String {
             },
             "CreationPolicy": {"ResourceSignal": {"Count": 1, "Timeout": "PT5M"}}
         }),
-        Declared::UpdatePolicy => json!({
-            "Type": "AWS::AutoScaling::AutoScalingGroup",
-            "Properties": {"MinSize": "1", "MaxSize": "1", "AvailabilityZones": [marker]},
-            "UpdatePolicy": {
-                "AutoScalingRollingUpdate": {
-                    "MinInstancesInService": "0",
-                    "WaitOnResourceSignals": true
+        Declared::UpdatePolicy => {
+            // The stack CREATES this group in Amazon EC2 Auto Scaling, which refuses a group
+            // that names no launch source ("Valid requests must contain either
+            // LaunchTemplate, LaunchConfigurationName, InstanceId or MixedInstancesPolicy
+            // parameter"), so the template declares the launch template the group launches
+            // from — a resource of the same stack, so the group names the id Amazon EC2
+            // assigned it.
+            resources.insert(
+                GATE_LAUNCH.to_string(),
+                json!({
+                    "Type": "AWS::EC2::LaunchTemplate",
+                    "Properties": {"LaunchTemplateData": {
+                        "ImageId": "ami-0123456789abcdef0",
+                        "InstanceType": "t3.micro"
+                    }}
+                }),
+            );
+            json!({
+                "Type": "AWS::AutoScaling::AutoScalingGroup",
+                "Properties": {
+                    "MinSize": "1",
+                    "MaxSize": "1",
+                    "AvailabilityZones": ["us-east-1a"],
+                    "LaunchTemplate": {
+                        "LaunchTemplateId": {"Ref": GATE_LAUNCH},
+                        "Version": {"Fn::GetAtt": [GATE_LAUNCH, "LatestVersionNumber"]}
+                    },
+                    // The row's own marker goes in a property `UpdateAutoScalingGroup` can
+                    // change on a group that exists, for the reason the instance row's goes
+                    // in a tag: the group really exists in that service.
+                    "PlacementGroup": marker
+                },
+                "UpdatePolicy": {
+                    "AutoScalingRollingUpdate": {
+                        "MinInstancesInService": "0",
+                        "WaitOnResourceSignals": true
+                    }
                 }
-            }
-        }),
+            })
+        }
         Declared::WaitCondition => json!({
             "Type": "AWS::CloudFormation::WaitCondition",
             "Properties": {"Count": 1, "Timeout": marker}
         }),
     };
-    json!({"Resources": {GATE: gate}}).to_string()
+    resources.insert(GATE.to_string(), gate);
+    json!({"Resources": resources}).to_string()
 }
 
 /// One `SignalResource` call, as an SDK sends it.

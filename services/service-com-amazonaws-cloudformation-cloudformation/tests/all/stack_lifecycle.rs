@@ -25,7 +25,7 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 pub(crate) use crate::harness::{
-    call, call_in, create_stack, enroll_as_a_marketplace_seller, get_template,
+    call, call_in, create_stack, ec2_tag_value, enroll_as_a_marketplace_seller, get_template,
     is_service_assigned_id, list_imports_ok, member, router, router_with_engine, store,
     wait_for_the_transition, xml_blocks, xml_text, xml_texts, xml_unescape, REGION,
     SERVICE_ID_HEX_DIGITS,
@@ -240,6 +240,47 @@ pub(crate) async fn ec2(
         )
         .body(bytes::Bytes::from(body))
         .expect("a well-formed EC2 request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8_lossy(response.body()).to_string();
+    (status, body)
+}
+
+/// One awsQuery call to Amazon EC2 Auto Scaling over the same router, answered with the HTTP
+/// status and the XML body.
+///
+/// The ONE Auto Scaling caller of this crate's suites: the group an
+/// `AWS::AutoScaling::AutoScalingGroup` declares is CREATED in that service, so a case that
+/// reads one back — its zones, its ARN, its tags — goes through that service's own wire here,
+/// signed for `autoscaling` in the Region the stack was created in, under its own API version
+/// (`version: 2011-01-01`).
+pub(crate) async fn autoscaling(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
+    let mut body = format!("Action={action}&Version=2011-01-01");
+    for (name, value) in params {
+        body.push('&');
+        body.push_str(&form_encode(name));
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("autoscaling.{REGION}.amazonaws.com"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIDEXAMPLE/20260101/{REGION}/autoscaling/aws4_request, \
+                 SignedHeaders=host, Signature=0123456789abcdef"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("a well-formed Auto Scaling request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     let body = String::from_utf8_lossy(response.body()).to_string();

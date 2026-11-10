@@ -29,6 +29,8 @@ mod instance_refresh_lifecycle;
 mod launch_configurations_are_unavailable;
 #[path = "all/launch_template_instance_profiles.rs"]
 mod launch_template_instance_profiles;
+#[path = "all/launch_template_specifications.rs"]
+mod launch_template_specifications;
 #[path = "all/legacy_target_group_detach.rs"]
 mod legacy_target_group_detach;
 #[path = "all/metric_collection_catalog.rs"]

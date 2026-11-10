@@ -3246,17 +3246,96 @@ pub(crate) async fn create_ec2_vpc(
     .await?;
     // The attributes the type publishes that EC2 itself decides: the id it assigned (which
     // this type's `VpcId` return value is) and the block it canonicalised the declared one
-    // into. The ones that are another EC2 resource's id (`DefaultSecurityGroup`,
-    // `DefaultNetworkAcl`) are not reported by this call, so none is invented here.
+    // into. The two that are ANOTHER EC2 resource's id — the default security group and the
+    // default network ACL "for this VPC", which that service creates with the VPC — are not
+    // reported by this call, so each is read back from the service that holds it
+    // ([`ec2_vpc_default_member`]) rather than invented or left absent.
     let mut attributes = BTreeMap::new();
     attributes.insert("VpcId".to_string(), vpc_id.clone());
     if let Some(cidr_block) = reported.get("CidrBlock").and_then(Value::as_str) {
         attributes.insert("CidrBlock".to_string(), cidr_block.to_string());
     }
+    for (attribute, read) in [
+        ("DefaultSecurityGroup", DEFAULT_SECURITY_GROUP_OF_VPC),
+        ("DefaultNetworkAcl", DEFAULT_NETWORK_ACL_OF_VPC),
+    ] {
+        if let Some(id) = ec2_vpc_default_member(ctx, region, &vpc_id, read).await? {
+            attributes.insert(attribute.to_string(), id);
+        }
+    }
     Ok(Created {
         physical_resource_id: Some(vpc_id),
         attributes,
     })
+}
+
+/// One Amazon EC2 read that answers a resource the service created WITH a VPC: the describe
+/// to make, the filter that narrows it to the one the VPC has, and the element its id is
+/// reported under.
+///
+/// A VPC's published `DefaultSecurityGroup` and `DefaultNetworkAcl` return values are the ids
+/// of resources `CreateVpc` does not report — "when you create a VPC, it comes with a default
+/// security group" and a default network ACL — so each is read from EC2 by the attribute that
+/// makes it the VPC's default one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Ec2VpcDefaultMember {
+    /// The describe that reports the resource.
+    action: &'static str,
+    /// The filter name and value that select the VPC's DEFAULT one, beside the `vpc-id`
+    /// filter every such read carries.
+    default_filter: (&'static str, &'static str),
+    /// The element of the answer that carries the resource's id, as an `ec2Query` answer
+    /// spells it (lower camel case).
+    id_element: &'static str,
+}
+
+/// The default security group of a VPC: "the ID of the default security group for this VPC".
+/// The group is the one named `default` among the groups of that VPC, which is the group EC2
+/// creates with the VPC and the only one of that name it can hold
+/// (`DescribeSecurityGroups`'s `group-name` filter).
+pub(crate) const DEFAULT_SECURITY_GROUP_OF_VPC: Ec2VpcDefaultMember = Ec2VpcDefaultMember {
+    action: "DescribeSecurityGroups",
+    default_filter: ("group-name", "default"),
+    id_element: "groupId",
+};
+
+/// The default network ACL of a VPC: "the ID of the default network ACL for this VPC", which
+/// `DescribeNetworkAcls` reports under its own `default` filter.
+pub(crate) const DEFAULT_NETWORK_ACL_OF_VPC: Ec2VpcDefaultMember = Ec2VpcDefaultMember {
+    action: "DescribeNetworkAcls",
+    default_filter: ("default", "true"),
+    id_element: "networkAclId",
+};
+
+/// The id of the resource `read` names for the VPC `vpc_id`, as Amazon EC2 reports it, or
+/// `None` where that service reports none.
+///
+/// A filtered describe answers an empty set rather than a refusal for a VPC that has no such
+/// resource, so an absent one leaves the attribute off rather than failing the create: the
+/// attribute carries only what EC2 really holds.
+pub(crate) async fn ec2_vpc_default_member(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    vpc_id: &str,
+    read: Ec2VpcDefaultMember,
+) -> Result<Option<String>, Refusal> {
+    let (filter_name, filter_value) = read.default_filter;
+    let parameters = vec![
+        ("Filter.1.Name".to_string(), "vpc-id".to_string()),
+        ("Filter.1.Value.1".to_string(), vpc_id.to_string()),
+        ("Filter.2.Name".to_string(), filter_name.to_string()),
+        ("Filter.2.Value.1".to_string(), filter_value.to_string()),
+    ];
+    let answered = call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        read.action,
+        &parameters,
+    )
+    .await?;
+    Ok(xml_element(&answered, read.id_element).filter(|id| !id.is_empty()))
 }
 
 /// Create the subnet an `AWS::EC2::Subnet` declares, in Amazon EC2.

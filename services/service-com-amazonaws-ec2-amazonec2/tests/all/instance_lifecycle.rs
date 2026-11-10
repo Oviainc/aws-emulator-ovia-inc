@@ -1237,7 +1237,12 @@ async fn an_unknown_resource_id_is_refused_by_every_operation() {
         "a refused batch must not have terminated the known instance, got {stored:?}"
     );
 
-    for resource_id in ["vol-0123456789abcdef0", "not-an-id"] {
+    // An id of a KIND EC2 publishes names a resource that does not exist, which is that
+    // kind's own not-found refusal; a value that is no resource id at all is `InvalidID`.
+    for (resource_id, expected) in [
+        ("vol-0123456789abcdef0", "InvalidVolume.NotFound"),
+        ("not-an-id", "InvalidID"),
+    ] {
         let answer = ec2
             .call(
                 "CreateTags",
@@ -1250,8 +1255,8 @@ async fn an_unknown_resource_id_is_refused_by_every_operation() {
             .await;
         assert_eq!(
             answer.error_code(),
-            "InvalidID",
-            "case {resource_id}: expected InvalidID, got {}",
+            expected,
+            "case {resource_id}: expected {expected}, got {}",
             answer.body
         );
     }
@@ -1987,8 +1992,8 @@ async fn create_tags_also_tags_a_stored_vpc() {
         "the VPC must report the tag CreateTags wrote, got {tags:?}"
     );
 
-    // A `vpc-` id nothing holds is still refused, as an id of a resource this crate
-    // cannot resolve.
+    // A `vpc-` id nothing holds names a VPC that does not exist, which is the refusal every
+    // operation of that resource answers for the id.
     let unknown = ec2
         .call(
             "CreateTags",
@@ -2001,8 +2006,8 @@ async fn create_tags_also_tags_a_stored_vpc() {
         .await;
     assert_eq!(
         unknown.error_code(),
-        "InvalidID",
-        "an unknown VPC id must be refused, got {}",
+        "InvalidVpcID.NotFound",
+        "an unknown VPC id must be refused as a VPC that does not exist, got {}",
         unknown.body
     );
 }

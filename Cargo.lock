@@ -10017,6 +10017,7 @@ dependencies = [
  "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-apigatewayv2-apigatewayv2",
  "service-com-amazonaws-applicationautoscaling-anyscalefrontendservice",
+ "service-com-amazonaws-autoscaling-autoscaling-2011-01-01",
  "service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",

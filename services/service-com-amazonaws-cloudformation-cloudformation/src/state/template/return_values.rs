@@ -996,6 +996,22 @@ pub(super) fn return_values(
             let id = ec2_network_identity("vol", "VolumeId", name, &mut attributes);
             (id, attributes)
         }
+        // A LAUNCH TEMPLATE, whose identity Amazon EC2 assigns the same way: "Ref returns the
+        // launch template ID" (the `lt-` + 17 hexadecimal form), and whose published
+        // `Fn::GetAtt` attributes are that same id and the two VERSION numbers of the
+        // template — the latest and the default, both 1 for the one version
+        // `CreateLaunchTemplate` creates ([`FIRST_LAUNCH_TEMPLATE_VERSION`]). The create
+        // re-points all three at what EC2 answered.
+        EC2_LAUNCH_TEMPLATE => {
+            let id = ec2_network_identity("lt", "LaunchTemplateId", name, &mut attributes);
+            for attribute in ["DefaultVersionNumber", "LatestVersionNumber"] {
+                attributes.insert(
+                    attribute.to_string(),
+                    FIRST_LAUNCH_TEMPLATE_VERSION.to_string(),
+                );
+            }
+            (id, attributes)
+        }
         // An INSTANCE, whose identity Amazon EC2 assigns the same way again — "Ref returns the
         // ID of the instance", the `i-` + 17 hexadecimal form — and whose published
         // `Fn::GetAtt` attributes are NONE of them that id: they are the zone the instance was
@@ -1654,6 +1670,13 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         EC2_VPN_GATEWAY => &["VPNGatewayId"],
         EC2_NETWORK_ACL | EC2_NETWORK_INTERFACE | EC2_VPC_ENDPOINT => &["Id"],
         EC2_VOLUME => &["VolumeId"],
+        // Source: `AWS::EC2::LaunchTemplate`'s own "Return values" section — the id EC2
+        // assigned the template, and the default and latest version numbers of it.
+        EC2_LAUNCH_TEMPLATE => &[
+            "DefaultVersionNumber",
+            "LatestVersionNumber",
+            "LaunchTemplateId",
+        ],
         // Source: `AWS::EC2::Instance`'s own "Return values" section — the zone the instance
         // was placed in, its private DNS name and IPv4 address, and its public ones. "Ref
         // returns the ID of the instance", which is the resource's physical id rather than one
@@ -1950,6 +1973,12 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // `vol-` id, and "Ref returns the volume ID", so the identifier in force is the one
         // that service answered.
         || resource_type == EC2_VOLUME
+        // A LAUNCH TEMPLATE is one more: `CreateLaunchTemplate` takes the template's NAME and
+        // no identifier — Amazon EC2 assigns the `lt-` id — and "Ref returns the launch
+        // template ID", so the identifier in force is the one that service answered the
+        // create with, while the NAME a declaration states is what the template is created
+        // under.
+        || resource_type == EC2_LAUNCH_TEMPLATE
         // An INSTANCE is a fifth: `RunInstances` takes no identifier either — the declaration
         // states the AMI, the instance type and where the instance goes — Amazon EC2 assigns
         // the `i-` id, and "Ref returns the ID of the instance", so the identifier in force is
@@ -3477,6 +3506,31 @@ pub const EC2_EIP: &str = "AWS::EC2::EIP";
 /// [`identity_is_service_assigned`] names the type because the identifier in force is the
 /// one that service answered its create with.
 pub const EC2_VOLUME: &str = "AWS::EC2::Volume";
+
+/// `AWS::EC2::LaunchTemplate`: a launch template of Amazon EC2. Its identity is read the
+/// same way the VPC-network types' are: `CreateLaunchTemplate` takes the template's NAME and
+/// assigns the `lt-…` identifier itself, and that type's "Return values" publishes "Ref
+/// returns the launch template ID" beside the `LaunchTemplateId`, `LatestVersionNumber` and
+/// `DefaultVersionNumber` attributes — so a declaration of one carries an identifier of that
+/// form rather than the name, and [`identity_is_service_assigned`] names the type because
+/// the identifier in force is the one EC2 answered the create with.
+pub const EC2_LAUNCH_TEMPLATE: &str = "AWS::EC2::LaunchTemplate";
+
+/// The version a launch template's FIRST version carries, which is the one
+/// `CreateLaunchTemplate` creates: version numbering starts at 1 and "you can't specify,
+/// change, or replace the numbering of launch template versions"
+/// (`CreateLaunchTemplateVersion`). It is the stand-in both version attributes carry before
+/// the create — the deployment re-points them at the numbers EC2 answered
+/// ([`super::provisioning::repoint_references`]).
+pub const FIRST_LAUNCH_TEMPLATE_VERSION: &str = "1";
+
+/// `AWS::AutoScaling::AutoScalingGroup`: an Auto Scaling group of Amazon EC2 Auto Scaling.
+/// "Ref returns the name of the Auto Scaling group", which is the name the declaration states
+/// or the one CloudFormation generated for it — the physical id the naming rules already
+/// compute — so the type carries no arm in [`return_values`] and is not in
+/// [`identity_is_service_assigned`]: the group is CREATED under that name
+/// ([`super::provisioner`]).
+pub const AUTOSCALING_GROUP: &str = "AWS::AutoScaling::AutoScalingGroup";
 
 /// `AWS::EC2::Instance`: an Amazon EC2 instance. Its identity is read the same way again —
 /// `RunInstances` takes no name, Amazon EC2 assigns the `i-…` identifier and "Ref returns the

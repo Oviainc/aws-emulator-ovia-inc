@@ -167,8 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            deduplicate_ids, instance_id_is_well_formed, is_cross_service_request,
-            require_service_state, tag_bytes, validate_tag_size, MAX_RESOURCE_IDS,
+            deduplicate_ids, is_cross_service_request,
+            require_service_state, tag_bytes, untaggable_resource_id, validate_tag_size,
+            MAX_RESOURCE_IDS,
             MAX_STORED_BYTES, MAX_TAGS_PER_RESOURCE, RESERVED_TAG_PREFIX,
         };
 
@@ -258,12 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut added_bytes: usize = 0;
         for resource_id in &resource_ids {
             let Some(tags) = store.resource_tags_mut(resource_id) else {
-                return Err(if instance_id_is_well_formed(resource_id) {
-                    Scaffolded::invalid_instance_id_not_found(resource_id)
-                } else {
-                    // An id naming no resource this account holds names nothing to tag.
-                    Scaffolded::invalid_id(resource_id)
-                });
+                // The id names no resource this account holds: the refusal is the one the
+                // KIND the id names answers for a resource that does not exist.
+                return Err(untaggable_resource_id(resource_id));
             };
             // What the resource would hold once the write lands, asked of a COPY of its
             // tags so the check itself writes nothing. Both sides of the delta are counted

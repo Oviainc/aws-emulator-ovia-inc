@@ -176,14 +176,8 @@ async fn output(router: &MultiServiceRouter, stack: &str, key: &str) -> String {
 }
 
 /// The tag value a described EC2 resource carries under `key`, read off the `tagSet` the
-/// answer reports.
-fn tag_value(body: &str, key: &str) -> Option<String> {
-    xml_texts(body, "key")
-        .into_iter()
-        .zip(xml_texts(body, "value"))
-        .find(|(held, _)| held == key)
-        .map(|(_, value)| value)
-}
+/// answer reports — the ONE reading of an EC2 tag set in this crate's suites.
+use crate::harness::ec2_tag_value as tag_value;
 
 /// The read that reports one gateway, as the status and the body EC2 answered.
 async fn describe_gateway(

@@ -363,6 +363,8 @@ mod stack_event_timeline;
 mod stack_exports;
 #[path = "all/stack_failure_reason.rs"]
 mod stack_failure_reason;
+#[path = "all/stack_fleet_resources.rs"]
+mod stack_fleet_resources;
 #[path = "all/stack_identifier_refusals.rs"]
 mod stack_identifier_refusals;
 #[path = "all/stack_input_contracts.rs"]

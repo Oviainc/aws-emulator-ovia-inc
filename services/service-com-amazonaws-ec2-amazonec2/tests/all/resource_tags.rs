@@ -409,7 +409,7 @@ async fn delete_tags_untags_every_resource_the_request_names() {
 #[tokio::test]
 async fn delete_tags_refuses_an_unresolvable_id_or_an_unactionable_key() {
     // `(case, the parameters beyond the resource id, the id to name, the status, the code)`
-    let rows: [(&str, Params, Option<&str>, u16, &str); 8] = [
+    let rows: [(&str, Params, Option<&str>, u16, &str); 11] = [
         (
             "a well-formed instance id nothing was launched for",
             tag_fields(&[("env", None)]),
@@ -418,6 +418,9 @@ async fn delete_tags_refuses_an_unresolvable_id_or_an_unactionable_key() {
             "InvalidInstanceID.NotFound",
         ),
         (
+            // An Elastic IP allocation is a taggable resource whose own not-found refusal
+            // this crate does not word for a tagging call, so an `eipalloc-` id nothing holds
+            // is still refused as an id the tagging calls cannot resolve.
             "an allocation id this account does not hold",
             tag_fields(&[("env", None)]),
             Some("eipalloc-00000000000000999"),
@@ -425,9 +428,35 @@ async fn delete_tags_refuses_an_unresolvable_id_or_an_unactionable_key() {
             "InvalidID",
         ),
         (
+            // A well-formed id of a kind EC2 publishes names a resource that does not exist,
+            // which is that kind's own not-found refusal — the same one every other
+            // operation of the resource answers for the id.
             "a VPC id this account does not hold",
             tag_fields(&[("env", None)]),
             Some("vpc-00000000000000999"),
+            400,
+            "InvalidVpcID.NotFound",
+        ),
+        (
+            "a subnet id this account does not hold",
+            tag_fields(&[("env", None)]),
+            Some("subnet-00000000000000999"),
+            400,
+            "InvalidSubnetID.NotFound",
+        ),
+        (
+            "a security group id this account does not hold",
+            tag_fields(&[("env", None)]),
+            Some("sg-00000000000000999"),
+            400,
+            "InvalidGroup.NotFound",
+        ),
+        (
+            // Not a well-formed id of any kind: `InvalidID` is what the tagging calls answer
+            // for a value that is no resource id at all.
+            "a subnet id that is not well formed",
+            tag_fields(&[("env", None)]),
+            Some("subnet-zzz"),
             400,
             "InvalidID",
         ),
@@ -546,6 +575,97 @@ async fn one_unresolvable_id_leaves_every_other_resource_tagged() {
         assert_eq!(
             reported, all,
             "case {case:?}: the {kind} must keep every tag, got {reported:?}"
+        );
+    }
+}
+
+/// Rule 3 for `CreateTags`, over the resource KINDS a tagging call resolves: a resource this
+/// account created and then DELETED is tagged with that kind's own not-found refusal — the
+/// same one every other operation of the resource answers for its id — while a value that is
+/// no resource id of any kind is refused as the id it is not.
+#[tokio::test]
+async fn create_tags_refuses_a_deleted_resource_with_the_kinds_own_not_found() {
+    // `(case, the kind to create and delete, the delete that takes it away, the member that
+    // names it there, the error code the tagging call must answer)`
+    let rows: [(&str, &str, &str, &str, &str); 3] = [
+        (
+            "a subnet the account deleted",
+            "subnet",
+            "DeleteSubnet",
+            "SubnetId",
+            "InvalidSubnetID.NotFound",
+        ),
+        (
+            "a security group the account deleted",
+            "security-group",
+            "DeleteSecurityGroup",
+            "GroupId",
+            "InvalidGroup.NotFound",
+        ),
+        (
+            "a VPC the account deleted",
+            "vpc",
+            "DeleteVpc",
+            "VpcId",
+            "InvalidVpcID.NotFound",
+        ),
+    ];
+
+    for (case, kind, delete, id_member, expected_code) in rows {
+        let router = emulator();
+        let resource_id = create_resource(&router, case, kind).await;
+        // The resource is tagged while it exists, so the refusal below is about the resource
+        // being gone and not about the request.
+        tag_resource(&router, case, kind, &resource_id).await;
+        let (status, body) = call(
+            &router,
+            REGION,
+            delete,
+            &[p(id_member, resource_id.clone())],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: {delete} must succeed, got {status}: {body}"
+        );
+
+        let mut params = vec![p("ResourceId.1", resource_id.clone())];
+        params.extend(tag_fields(&[("env", Some("prod"))]));
+        let (status, body) = call(&router, REGION, "CreateTags", &params).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: tagging a resource that is gone must be refused, got {status}: \
+             {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            expected_code,
+            "case {case:?}: expected the error code {expected_code} for {resource_id}, got \
+             {body}"
+        );
+    }
+
+    // A value that is no resource id of any kind EC2 publishes is refused as such, whatever
+    // kind's prefix it starts with. A well-formed id of a kind nothing was ever created for
+    // is the other side of the same rule: it names a resource that does not exist.
+    for (resource_id, expected_code) in [
+        ("not-an-id", "InvalidID"),
+        ("subnet-zzzz", "InvalidID"),
+        ("sg-", "InvalidID"),
+        ("vpc-012345", "InvalidID"),
+        ("i-00000000000000999", "InvalidInstanceID.NotFound"),
+        ("vol-00000000000000999", "InvalidVolume.NotFound"),
+        ("eni-00000000000000999", "InvalidNetworkInterfaceID.NotFound"),
+        ("lt-00000000000000999", "InvalidLaunchTemplateId.NotFound"),
+    ] {
+        let router = emulator();
+        let mut params = vec![p("ResourceId.1", resource_id)];
+        params.extend(tag_fields(&[("env", Some("prod"))]));
+        let (status, body) = call(&router, REGION, "CreateTags", &params).await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, expected_code.to_string()),
+            "case {resource_id:?}: expected {expected_code}, got {status}: {body}"
         );
     }
 }

@@ -415,6 +415,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(refusal);
         }
 
+        // A specification states the launch template by id or by name, and the group reports
+        // BOTH: a replaced launch source is resolved against the account's own Amazon EC2
+        // launch templates exactly as the create resolves the one it is given, before this
+        // service's store is locked.
+        let mut input = input;
+        crate::state::ec2_instances::complete_launch_template_specifications(
+            &*self.engine,
+            input.launch_template.as_mut(),
+            input.mixed_instances_policy.as_mut(),
+        );
+        let input = input;
+
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);

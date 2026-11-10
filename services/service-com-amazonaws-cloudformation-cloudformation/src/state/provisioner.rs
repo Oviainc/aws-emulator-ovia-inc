@@ -481,7 +481,9 @@ use super::template::{
     CODEBUILD_PROJECT,
     CODEBUILD_REPORT_GROUP, CODECOMMIT_REPOSITORY, CODEDEPLOY_APPLICATION,
     CODEDEPLOY_DEPLOYMENT_CONFIG, CODEDEPLOY_DEPLOYMENT_GROUP,
-    COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_SECURITY_GROUP, EC2_SUBNET,
+    AUTOSCALING_GROUP,
+    COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_LAUNCH_TEMPLATE, EC2_SECURITY_GROUP,
+    EC2_SUBNET,
     EC2_VOLUME, EC2_VPC,
     ECR_PUBLIC_REPOSITORY, ECR_REPOSITORY, ECS_CLUSTER, EKS_ACCESS_ENTRY, EKS_CLUSTER,
     EKS_POD_IDENTITY_ASSOCIATION,
@@ -637,6 +639,16 @@ pub(super) enum Provisioner {
     /// same way. `CreateVolume` answers the volume `creating`, so its creation is held open
     /// until that service reports it `available`.
     Ec2Volume,
+    /// `AWS::EC2::LaunchTemplate`: a launch template of Amazon EC2, whose `lt-…` identifier
+    /// that service assigns and whose version numbers it keeps —
+    /// `CreateLaunchTemplate` creates it under the name the stack decided and
+    /// `DeleteLaunchTemplate` deletes it by the id EC2 answered.
+    Ec2LaunchTemplate,
+    /// `AWS::AutoScaling::AutoScalingGroup`: a group of Amazon EC2 Auto Scaling, which
+    /// `CreateAutoScalingGroup` creates under the name the stack decided — the name this
+    /// type's `Ref` returns — and `DeleteAutoScalingGroup` deletes by that name, together
+    /// with the instances the group launched.
+    AutoScalingGroup,
     OpenSearchServerlessCollection,
     OpenSearchServerlessSecurityPolicy,
     /// `AWS::OpenSearchService::Domain`: a domain of Amazon OpenSearch Service, which is a
@@ -891,6 +903,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         EC2_SUBNET => Some(Provisioner::Ec2Subnet),
         EC2_SECURITY_GROUP => Some(Provisioner::Ec2SecurityGroup),
         EC2_VOLUME => Some(Provisioner::Ec2Volume),
+        EC2_LAUNCH_TEMPLATE => Some(Provisioner::Ec2LaunchTemplate),
+        AUTOSCALING_GROUP => Some(Provisioner::AutoScalingGroup),
         AOSS_COLLECTION => Some(Provisioner::OpenSearchServerlessCollection),
         AOSS_SECURITY_POLICY => Some(Provisioner::OpenSearchServerlessSecurityPolicy),
         OPENSEARCH_DOMAIN => Some(Provisioner::OpenSearchServiceDomain),
@@ -1063,6 +1077,12 @@ impl Provisioner {
                 create_ec2_security_group(ctx, region, resource, propagated).await
             }
             Self::Ec2Volume => create_ec2_volume(ctx, region, resource, propagated).await,
+            Self::Ec2LaunchTemplate => {
+                create_ec2_launch_template(ctx, region, resource, propagated).await
+            }
+            Self::AutoScalingGroup => {
+                create_auto_scaling_group(ctx, region, resource, propagated).await
+            }
             Self::S3Bucket => create_bucket(ctx, region, resource, propagated).await,
             // `AWS::S3::BucketPolicy` publishes `Bucket` and `PolicyDocument` and no
             // `Tags`: a bucket's policy is no taggable resource, so no tags are
@@ -2047,6 +2067,13 @@ impl Provisioner {
             // bucket", replacing the one the bucket carries, so the call that attached the
             // policy is the call that applies a changed declaration to it.
             Self::S3BucketPolicy => set_bucket_policy(ctx, region, declared).await.map(Some),
+            // Amazon EC2 Auto Scaling's own `UpdateAutoScalingGroup` is the call that
+            // "updates the configuration for the specified Auto Scaling group", so a changed
+            // declaration reaches the group through it — under the name the group was created
+            // with, which is this resource's physical id.
+            Self::AutoScalingGroup => {
+                update_auto_scaling_group(ctx, region, resource, declared).await
+            }
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -2173,6 +2200,12 @@ impl Provisioner {
                 delete_ec2_security_group(ctx, region, physical_resource_id).await
             }
             Self::Ec2Volume => delete_ec2_volume(ctx, region, physical_resource_id).await,
+            Self::Ec2LaunchTemplate => {
+                delete_ec2_launch_template(ctx, region, physical_resource_id).await
+            }
+            Self::AutoScalingGroup => {
+                delete_auto_scaling_group(ctx, region, physical_resource_id).await
+            }
             Self::OpenSearchServerlessSecurityPolicy => {
                 delete_security_policy(ctx, region, resource).await
             }
@@ -2581,6 +2614,12 @@ impl Provisioner {
                 describe_ec2_security_group(ctx, region, physical_resource_id).await
             }
             Self::Ec2Volume => describe_ec2_volume(ctx, region, physical_resource_id).await,
+            Self::Ec2LaunchTemplate => {
+                describe_ec2_launch_template(ctx, region, physical_resource_id).await
+            }
+            Self::AutoScalingGroup => {
+                describe_auto_scaling_group(ctx, region, physical_resource_id).await
+            }
             Self::S3Bucket => describe_bucket(ctx, region, physical_resource_id).await,
             // A policy resource's configuration is the document the named bucket carries
             // now, read back from Amazon S3.
@@ -2956,7 +2995,9 @@ mod data_and_storage;
 mod iam_identities;
 mod application_services;
 mod platform_services;
+mod compute_fleet;
 mod network_and_delivery;
+use compute_fleet::*;
 pub(crate) use network_and_delivery::*;
 use platform_services::*;
 pub(crate) use application_services::*;

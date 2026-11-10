@@ -176,6 +176,11 @@ service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda = { workspa
 # (`state::provisioner`): a suite that deploys one must have its owning service mounted
 # beside CloudFormation, or the create is refused and the stack fails.
 service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { workspace = true }
+# Amazon EC2 Auto Scaling, for the `AWS::AutoScaling::AutoScalingGroup` a stack really
+# creates there (`state::provisioner::compute_fleet`): a suite that deploys one must have its
+# owning service mounted beside CloudFormation, or the create is refused and the stack fails —
+# and the group's zones and ARN are read back through that service's own wire.
+service-com-amazonaws-autoscaling-autoscaling-2011-01-01 = { workspace = true }
 
 [lints]
 workspace = true

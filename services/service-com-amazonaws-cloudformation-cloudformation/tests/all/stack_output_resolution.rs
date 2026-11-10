@@ -60,6 +60,14 @@ enum Expect {
     /// the rule is the FORM. `prefix` carries the ARN's head where the value is an ARN built
     /// on such an identifier, exactly as [`Expect::Generated`]'s does.
     ServiceAssigned { prefix: String },
+    /// A value of this FORM, for one the OWNING service builds out of an identifier it
+    /// minted that is not a plain `<prefix>-<hex>` id: an Auto Scaling group's ARN carries
+    /// the group's own resource id between its `autoScalingGroup` and
+    /// `autoScalingGroupName/<name>` segments, and no request fixes that id.
+    Form {
+        described: &'static str,
+        check: fn(&str) -> bool,
+    },
     /// The output is not reported at all, because its `Condition` evaluates false.
     Absent,
 }
@@ -363,6 +371,9 @@ Resources:
       MinSize: "2"
       MaxSize: "4"
       DesiredCapacity: "2"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref Lt
+        Version: !GetAtt Lt.LatestVersionNumber
       VPCZoneIdentifier:
         - !Ref SubnetA
         - !Ref SubnetB
@@ -377,6 +388,8 @@ Outputs:
     Value: !GetAtt Asg.DesiredCapacity
   LaunchTemplateName:
     Value: !Ref Lt
+  LaunchTemplateVersion:
+    Value: !GetAtt Lt.LatestVersionNumber
   VpcId:
     Value: !Ref Vpc
   VpcCidrBlock:
@@ -399,13 +412,32 @@ Outputs:
             expected: vec![
                 // The template NAMES the group, so that is its physical id.
                 value("AsgName", "probe-asg"),
-                value(
+                // The group's ARN is the one Amazon EC2 Auto Scaling built for the group it
+                // created, which carries the resource id THAT service minted beside the
+                // group's name — not a path these naming rules could compute.
+                (
                     "AsgArn",
-                    format!("arn:aws:autoscaling:{REGION}:{ACCOUNT_ID}:auto-scaling-group/probe-asg"),
+                    Expect::Form {
+                        described: "the ARN Amazon EC2 Auto Scaling built for the group: \
+                                    arn:aws:autoscaling:<region>:<account>:autoScalingGroup:\
+                                    <group id>:autoScalingGroupName/probe-asg",
+                        check: is_auto_scaling_group_arn,
+                    },
                 ),
                 // An attribute that is the property the template declared for it.
                 value("AsgDesired", "2"),
-                value("LaunchTemplateName", "probe-lt"),
+                // "Ref returns the launch template ID", the `lt-` identifier Amazon EC2
+                // assigned the template the stack created there — never the name the
+                // template declared for it.
+                (
+                    "LaunchTemplateName",
+                    Expect::ServiceAssigned {
+                        prefix: "lt".to_string(),
+                    },
+                ),
+                // The version EC2 reported for the one version `CreateLaunchTemplate`
+                // creates.
+                value("LaunchTemplateVersion", "1"),
                 // The VPC the template does not name reports the `vpc-` identifier its
                 // type's `Ref` returns, and the subnet's `VpcId` attribute is that same id.
                 (
@@ -444,6 +476,19 @@ Outputs:
             ],
         },
     ]
+}
+
+/// Whether `value` is the ARN Amazon EC2 Auto Scaling builds for the group named
+/// `probe-asg`: `arn:aws:autoscaling:<region>:<account>:autoScalingGroup:<group id>:
+/// autoScalingGroupName/<name>`, the form that service's own `AutoScalingGroupARN` carries.
+/// The group id between the two segments is one that service minted, so the rule is the FORM
+/// of the ARN and the name at the end of it.
+fn is_auto_scaling_group_arn(value: &str) -> bool {
+    let head = format!("arn:aws:autoscaling:{REGION}:{ACCOUNT_ID}:autoScalingGroup:");
+    value.strip_prefix(&head).is_some_and(|rest| {
+        rest.split_once(":autoScalingGroupName/")
+            .is_some_and(|(group_id, name)| !group_id.is_empty() && name == "probe-asg")
+    })
 }
 
 /// Whether `value` is a generated physical id of `logical_id` in `stack_name`, behind
@@ -533,6 +578,15 @@ async fn every_declared_output_of_a_deployed_stack_carries_its_resolved_value() 
                         is_service_assigned_id(actual, prefix),
                         "case {:?}: output {key:?} must carry {prefix}-<17 hexadecimal \
                          characters>, got {:?}",
+                        case.case,
+                        output.value
+                    );
+                }
+                Expect::Form { described, check } => {
+                    let actual = output.value.as_deref().unwrap_or_default();
+                    assert!(
+                        output.value.is_some() && check(actual),
+                        "case {:?}: output {key:?} must carry {described}, got {:?}",
                         case.case,
                         output.value
                     );

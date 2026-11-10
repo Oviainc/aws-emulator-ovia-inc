@@ -432,6 +432,82 @@ fn launch_parameters(
     }
 }
 
+/// Complete every launch-template specification a group carries with the half the request did
+/// not state: the `LaunchTemplateName` of a template named by id, and the
+/// `LaunchTemplateId` of one named by name.
+///
+/// "Conditional: You must specify either a `LaunchTemplateId` or a `LaunchTemplateName`"
+/// (`LaunchTemplateSpecification`), so a caller states ONE of them — and Amazon EC2 Auto
+/// Scaling resolves the template when the group is created, which is why every read of a
+/// group reports both: a client that created the group by id reads the template's name off
+/// the group, and one that created it by name reads the id. The pair comes from the account's
+/// own launch-template store, the same place a launch reads the template's parameters from
+/// ([`template_data`]), so the name a group reports is the name EC2 holds that template
+/// under.
+///
+/// A specification naming a template the account does not hold is left exactly as the request
+/// stated it: there is no name or id to report for a template nothing holds, and none is
+/// invented. EC2's store lock is taken for the one pass that completes them and released
+/// before this returns, so no caller holds it.
+pub fn complete_launch_template_specifications<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    launch_template: Option<&mut LaunchTemplateSpecification>,
+    mixed_instances_policy: Option<&mut MixedInstancesPolicy>,
+) {
+    let Some(state) = ec2::service_state(engine) else {
+        return;
+    };
+    let store = state.lock();
+    // Every specification a group carries: its own, the one its mixed instances policy
+    // names, and the one each of that policy's overrides may name instead — the same set the
+    // IAM instance profile of a group is resolved over
+    // ([`super::iam_instance_profiles::specifications`]).
+    let mut specifications: Vec<&mut LaunchTemplateSpecification> = Vec::new();
+    if let Some(specification) = launch_template {
+        specifications.push(specification);
+    }
+    if let Some(template) = mixed_instances_policy.and_then(|policy| policy.launch_template.as_mut())
+    {
+        if let Some(specification) = template.launch_template_specification.as_mut() {
+            specifications.push(specification);
+        }
+        for entry in template.overrides.iter_mut().flatten() {
+            if let Some(specification) = entry.launch_template_specification.as_mut() {
+                specifications.push(specification);
+            }
+        }
+    }
+    for specification in specifications {
+        complete_specification(&store, specification);
+    }
+}
+
+/// Fill in the half of ONE specification the request did not state, from Amazon EC2's own
+/// launch-template store.
+fn complete_specification(
+    store: &ec2::ComAmazonawsEc2Amazonec2State,
+    specification: &mut LaunchTemplateSpecification,
+) {
+    match (
+        specification.launch_template_id.clone(),
+        specification.launch_template_name.clone(),
+    ) {
+        (Some(launch_template_id), None) => {
+            if let Some(record) = store.launch_templates.get(&launch_template_id) {
+                specification.launch_template_name =
+                    Some(record.launch_template_name().to_string());
+            }
+        }
+        (None, Some(launch_template_name)) => {
+            specification.launch_template_id =
+                store.launch_template_id_for_name(&launch_template_name);
+        }
+        // Both stated, or neither: there is nothing to resolve. A specification stating both
+        // is refused by the owning service's own rules, not completed here.
+        _ => {}
+    }
+}
+
 /// The launch-template version `specification` names, read from the account's own Amazon
 /// EC2 store — the launch data itself, for a caller that needs more of it than a launch
 /// does.

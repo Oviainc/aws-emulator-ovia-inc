@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            deduplicate_ids, instance_id_is_well_formed, require_service_state, validate_tag_size,
+            deduplicate_ids, require_service_state, untaggable_resource_id, validate_tag_size,
             MAX_RESOURCE_IDS, MAX_TAGS_PER_DELETE_REQUEST, RESERVED_TAG_PREFIX,
         };
 
@@ -256,11 +256,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this account holds no resource for leaves the tags of the others alone.
         for resource_id in &resource_ids {
             if store.resource_tags_mut(resource_id).is_none() {
-                return Err(if instance_id_is_well_formed(resource_id) {
-                    Scaffolded::invalid_instance_id_not_found(resource_id)
-                } else {
-                    Scaffolded::invalid_id(resource_id)
-                });
+                // The id names no resource this account holds: the refusal is the one the
+                // KIND the id names answers for a resource that does not exist.
+                return Err(untaggable_resource_id(resource_id));
             }
         }
 

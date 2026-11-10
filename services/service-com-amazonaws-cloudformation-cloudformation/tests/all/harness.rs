@@ -182,6 +182,14 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             Arc::clone(&engine),
         ),
     );
+    // Amazon EC2 Auto Scaling, for the `AWS::AutoScaling::AutoScalingGroup` a stack really
+    // creates there, so a suite that deploys a fleet reads the group — its zones, its ARN and
+    // the launch template it launches from — back through that service's own wire.
+    router.register_service(
+        service_com_amazonaws_autoscaling_autoscaling_2011_01_01::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     (router, engine)
 }
 
@@ -310,6 +318,21 @@ pub fn xml_texts(xml: &str, tag: &str) -> Vec<String> {
 /// The first `<tag>` text, or `None` when the response carries none.
 pub fn xml_text(xml: &str, tag: &str) -> Option<String> {
     xml_texts(xml, tag).into_iter().next()
+}
+
+/// The tag value a described Amazon EC2 resource carries under `key`, read off the `tagSet`
+/// the answer reports.
+///
+/// The ONE reading of an EC2 tag set in this crate's suites: an `ec2Query` answer reports a
+/// tag as a `<key>`/`<value>` pair inside its `tagSet`, so the two members are read as
+/// PARALLEL lists and zipped — sound exactly because the answering service reports both on
+/// every entry. `None` where the resource carries no tag under that key.
+pub fn ec2_tag_value(body: &str, key: &str) -> Option<String> {
+    xml_texts(body, "key")
+        .into_iter()
+        .zip(xml_texts(body, "value"))
+        .find(|(held, _)| held == key)
+        .map(|(_, value)| value)
 }
 
 /// `CreateStack` with a template body and whatever else the case needs.
