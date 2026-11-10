@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetSessionOutput {
-            session: session.clone(),
+            session: session.session.clone(),
         })
     }
 }

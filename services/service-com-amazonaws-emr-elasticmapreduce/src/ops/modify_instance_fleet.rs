@@ -15,7 +15,11 @@
 //! carries no fleet for, and a NEGATIVE target capacity — which names no number of
 //! Amazon EC2 units, and whose refusal
 //! ([`crate::state::instance_fleet_capacity_violation`]) names the value the request sent
-//! and the fleet it sent it for.
+//! and the fleet it sent it for. A target capacity at the other end is refused too: one
+//! that would need more instances than Amazon EMR provisions for one instance fleet
+//! ([`crate::state::instance_fleet_instance_ceiling_violation`]) is answered with Amazon
+//! EMR's own fixed sentence for the ceiling, and leaves the fleet's capacities exactly as
+//! they were.
 //!
 //! ## Shape of an operation
 //!
@@ -254,6 +258,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ModifyInstanceFleetErrorModeled::InvalidRequestException(refusal).into(),
                 );
             }
+        }
+
+        // Bounded ABOVE as well: Amazon EMR provisions at most so many instances for one
+        // instance fleet ([`crate::state::MAX_INSTANCES_PER_FLEET`]), so a resize whose
+        // capacities would need more than that is refused with Amazon EMR's own fixed
+        // sentence for the ceiling. The capacities judged are the ones the fleet would
+        // HOLD — a member the configuration omits asks for no change, so the stored one
+        // stands — and the instances they could need follow from the weights the fleet's
+        // instance type configurations give a unit, which a submitted configuration
+        // replaces.
+        let merged_configs = fleet.merged_instance_type_configs(&input.instance_fleet);
+        if let Some(refusal) = crate::state::instance_fleet_instance_ceiling_violation(
+            input
+                .instance_fleet
+                .target_on_demand_capacity
+                .or(fleet.config.target_on_demand_capacity)
+                .map_or(0, i64::from),
+            input
+                .instance_fleet
+                .target_spot_capacity
+                .or(fleet.config.target_spot_capacity)
+                .map_or(0, i64::from),
+            &merged_configs,
+        ) {
+            return Err(ModifyInstanceFleetErrorModeled::InvalidRequestException(refusal).into());
         }
 
         // "The call either succeeds or fails atomically" (this operation's doc): every

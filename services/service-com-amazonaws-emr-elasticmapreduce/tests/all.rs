@@ -23,6 +23,8 @@ mod cluster_defaults;
 mod cluster_id_refusal_code;
 #[path = "all/cluster_placement.rs"]
 mod cluster_placement;
+#[path = "all/cluster_sessions.rs"]
+mod cluster_sessions;
 #[path = "all/cluster_step_execution.rs"]
 mod cluster_step_execution;
 #[path = "all/created_window.rs"]
@@ -35,6 +37,8 @@ mod enum_refusal_identity;
 mod glue_metastore_steps;
 #[path = "all/input_refusals.rs"]
 mod input_refusals;
+#[path = "all/instance_fleet_capacity_ceiling.rs"]
+mod instance_fleet_capacity_ceiling;
 #[path = "all/instance_fleet_target_capacities.rs"]
 mod instance_fleet_target_capacities;
 #[path = "all/instance_fleets.rs"]
@@ -63,6 +67,8 @@ mod modify_instance_groups;
 mod multi_primary_termination_protection;
 #[path = "all/notebook_execution_progression.rs"]
 mod notebook_execution_progression;
+#[path = "all/notebook_execution_run.rs"]
+mod notebook_execution_run;
 #[path = "all/notebook_executions.rs"]
 mod notebook_executions;
 #[path = "all/persistent_app_ui.rs"]

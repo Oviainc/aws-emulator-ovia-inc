@@ -359,6 +359,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // Amazon EMR provisions at most so many instances for ONE instance fleet
+        // ([`crate::state::MAX_INSTANCES_PER_FLEET`]), so a launch asking a fleet for
+        // target capacities that would need more than that is refused with Amazon EMR's
+        // own fixed sentence for the ceiling — the same rule `AddInstanceFleet` and
+        // `ModifyInstanceFleet` hold a fleet's capacities to — and no cluster is launched.
+        for config in input.instances.instance_fleets.iter().flatten() {
+            if crate::state::instance_fleet_instance_ceiling_violation(
+                config.target_on_demand_capacity.map_or(0, i64::from),
+                config.target_spot_capacity.map_or(0, i64::from),
+                config.instance_type_configs.as_deref().unwrap_or(&[]),
+            )
+            .is_some()
+            {
+                return Err(refuse(
+                    crate::state::INSTANCE_FLEET_CEILING_MESSAGE.to_string(),
+                ));
+            }
+        }
+
         // One cluster carries a bounded number of instance groups, the same way it
         // carries a bounded number of fleets. The configs are TAKEN rather than cloned —
         // they are moved into the records below, and nothing downstream reads

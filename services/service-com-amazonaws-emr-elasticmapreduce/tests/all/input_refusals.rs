@@ -164,18 +164,6 @@ fn admitted_then_refused(
     }
 }
 
-/// A request the model admits, of an operation that is still a scaffold stub: it
-/// reaches the handler and is answered 501 there, which is the OTHER half of "a
-/// refusal of constrained input happens before the handler".
-fn admitted_by_a_stub(case: &'static str, operation: &'static str, body: Value) -> Case {
-    Case {
-        case,
-        operation,
-        body,
-        expected: Expectation::Admitted(501),
-    }
-}
-
 fn cases() -> Vec<Case> {
     let over_long_cluster_id = "j".repeat(CLUSTER_ID_MAX_LENGTH + 1);
     let longest_cluster_id = "j".repeat(CLUSTER_ID_MAX_LENGTH);
@@ -230,22 +218,28 @@ fn cases() -> Vec<Case> {
             json!({ "ClusterStates": CLUSTER_STATES }),
         ),
         admitted("no filter at all", "ListClusters", json!({})),
-        admitted_by_a_stub(
+        // `ListSessions` is implemented, so a request the boundary admits reaches the
+        // handler and is refused there for naming no cluster — the cluster-id sentence,
+        // not the validator's member-path envelope.
+        admitted_then_refused(
             "every declared SessionState at once",
             "ListSessions",
+            "is not valid.",
             json!({ "ClusterId": "j-ABCDEFGHIJKLM", "SessionStates": SESSION_STATES }),
         ),
-        admitted_by_a_stub(
+        admitted_then_refused(
             "MaxResults at the range minimum",
             "ListSessions",
+            "is not valid.",
             json!({
                 "ClusterId": "j-ABCDEFGHIJKLM",
                 "MaxResults": MAX_RESULTS_RANGE.0,
             }),
         ),
-        admitted_by_a_stub(
+        admitted_then_refused(
             "MaxResults at the range maximum",
             "ListSessions",
+            "is not valid.",
             json!({
                 "ClusterId": "j-ABCDEFGHIJKLM",
                 "MaxResults": MAX_RESULTS_RANGE.1,

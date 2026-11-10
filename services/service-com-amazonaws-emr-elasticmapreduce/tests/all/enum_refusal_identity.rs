@@ -566,10 +566,12 @@ async fn a_declared_enum_value_reaches_the_handler_at_every_depth() {
             501,
         ),
         (
+            // `ListSessions` is implemented: the declared values reach the handler, which
+            // then refuses the CLUSTER this suite names and holds none of.
             "declared SessionStates",
             "ListSessions",
             json!({ "ClusterId": cluster, "SessionStates": ["IDLE", "BUSY"] }),
-            501,
+            400,
         ),
     ];
     for (label, operation, body, expected) in rows {

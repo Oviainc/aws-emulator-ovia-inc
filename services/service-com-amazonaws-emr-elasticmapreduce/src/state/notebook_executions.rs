@@ -4,10 +4,16 @@
 //!
 //! `StartNotebookExecution` records a [`NotebookExecutionRecord`] here and the clock walks
 //! it through the statuses `NotebookExecution$Status` names
-//! ([`NOTEBOOK_EXECUTION_PROGRESSION`], [`NOTEBOOK_EXECUTION_STOP_PROGRESSION`]);
+//! ([`NOTEBOOK_EXECUTION_PROGRESSION`] and the end its own run answered,
+//! [`NotebookOutcome`]; [`NOTEBOOK_EXECUTION_STOP_PROGRESSION`] once a caller has asked it
+//! to stop);
 //! `DescribeNotebookExecution` reports that record and `ListNotebookExecutions` a
 //! PROJECTION of it ([`NotebookExecutionRecord::to_summary`]). Its names are re-exported by
 //! the state root, so every caller keeps reaching them through `crate::state`.
+//!
+//! What the notebook itself CAME TO is the notebook runner's concern
+//! ([`super::notebook_run`]): this module owns the statuses and their spans, and the end of
+//! the walk is whatever that run answered ([`NotebookOutcome`]).
 
 use super::*;
 
@@ -32,32 +38,125 @@ pub const LIST_NOTEBOOK_EXECUTIONS_PAGE_SIZE: usize = 50;
 pub const NOTEBOOK_EXECUTION_DEFAULT_FROM: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// The statuses a notebook execution passes through, in order, from the moment the cluster
-/// has received the request until the execution has ended.
+/// has received the request until its notebook's own run is under way.
 ///
 /// Straight off `NotebookExecution$Status`: "`START_PENDING` indicates that the cluster has
 /// received the execution request but execution has not begun", "`STARTING` indicates that
-/// the execution is starting on the cluster", "`RUNNING` indicates that the execution is
-/// being processed by the cluster", "`FAILING` indicates that the execution is failing and
-/// will not finish successfully" and "`FAILED` indicates that the execution failed". Each
-/// move is owed [`NOTEBOOK_PHASE_SPAN`] after the one before it.
+/// the execution is starting on the cluster" and "`RUNNING` indicates that the execution is
+/// being processed by the cluster". Each move is owed [`notebook_phase_span`] after the one
+/// before it.
 ///
-/// It ends in the FAILURE statuses because this service runs no notebook: it records the
-/// execution faithfully — its engine, its notebook location, its parameters — and walks the
-/// phases the cluster would take it through, but no cell of the notebook is executed, so
-/// the execution reaches no result. `FINISHED` ("the execution has completed without
-/// error") would be a success for work nothing performed, which is why
-/// [`NOTEBOOK_NOT_EXECUTED_REASON`] stands in `LastStateChangeReason` instead and says so.
+/// What follows `RUNNING` is not fixed here: it is the end the execution's OWN run answered
+/// ([`NotebookOutcome::end_progression`]) — the finishing statuses for a notebook whose code
+/// cells all ran, the failing ones for a notebook that raised and for one nothing ran.
 pub const NOTEBOOK_EXECUTION_PROGRESSION: &[&str] = &[
     notebook_execution_status::START_PENDING,
     notebook_execution_status::STARTING,
     notebook_execution_status::RUNNING,
+];
+
+/// How long an execution stays `RUNNING` — "the execution is being processed by the
+/// cluster" (`NotebookExecution$Status` doc) — before the end its run answered comes due.
+///
+/// CHOSEN, not documented, and deliberately the LONGEST phase of the walk: that is the phase
+/// a real execution spends its time in, and it is where a client acts on one — polling it,
+/// and stopping it while it is still going. A span as short as the phases around it would
+/// leave an execution terminal before a client that polls every few seconds had read it
+/// once, so a stop could never reach a running execution. Stored as a due instant — nothing
+/// sleeps.
+pub const NOTEBOOK_RUN_SPAN: Duration = Duration::from_secs(20);
+
+/// How long the move OFF `status` takes: leaving `RUNNING` costs [`NOTEBOOK_RUN_SPAN`],
+/// every other move one [`NOTEBOOK_PHASE_SPAN`].
+///
+/// The one reading of a notebook execution's spans, so the walk and the stop progression
+/// cannot come to time themselves differently.
+pub fn notebook_phase_span(status: &str) -> Duration {
+    if status == notebook_execution_status::RUNNING {
+        return NOTEBOOK_RUN_SPAN;
+    }
+    NOTEBOOK_PHASE_SPAN
+}
+
+/// The statuses an execution whose notebook ran without raising ends through: "`FINISHING`
+/// indicates that execution processing is in the final stages" and "`FINISHED` indicates
+/// that the execution has completed without error" (`NotebookExecution$Status` doc).
+pub const NOTEBOOK_EXECUTION_FINISH_PROGRESSION: &[&str] = &[
+    notebook_execution_status::FINISHING,
+    notebook_execution_status::FINISHED,
+];
+
+/// The statuses an execution that FAILED ends through: "`FAILING` indicates that the
+/// execution is failing and will not finish successfully" and "`FAILED` indicates that the
+/// execution failed" (`NotebookExecution$Status` doc).
+///
+/// Two kinds of execution end here, and `LastStateChangeReason` is what tells them apart
+/// ([`NotebookOutcome::failure_reason`]): one whose notebook RAN and raised, which carries
+/// the engine's own exception, and one nothing ran at all, which carries
+/// [`NOTEBOOK_NOT_EXECUTED_REASON`].
+pub const NOTEBOOK_EXECUTION_FAILURE_PROGRESSION: &[&str] = &[
     notebook_execution_status::FAILING,
     notebook_execution_status::FAILED,
 ];
 
-/// `NotebookExecution$LastStateChangeReason` for an execution this service recorded and
-/// walked the phases of without running its notebook — the reason that tells a caller the
-/// failure is this emulator's own and not the notebook's.
+/// What a notebook execution's own run came to, which decides the end of its status walk.
+///
+/// The run itself is [`super::run_notebook`]: it fetches the notebook the execution names
+/// out of Amazon S3 and executes its code cells in the contained interpreter this emulator
+/// runs caller-supplied code in. Nothing here reports an outcome for work nothing performed:
+/// an execution whose notebook could not be fetched, read or run is [`Self::NotRun`] and
+/// says so in its reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotebookOutcome {
+    /// No notebook was run: the execution names no Amazon S3 notebook, Amazon S3 holds no
+    /// such object, the object is no readable notebook, or its kernel is not a kind this
+    /// emulator can run.
+    NotRun,
+    /// Every code cell of the notebook ran without raising, and this is how many there
+    /// were.
+    Finished {
+        /// How many code cells ran.
+        cells: usize,
+    },
+    /// The run ended in a failure, with the reason the engine gave for it.
+    Failed {
+        /// `NotebookExecution$LastStateChangeReason` for the failure, as the run reported
+        /// it.
+        reason: String,
+    },
+}
+
+impl NotebookOutcome {
+    /// The statuses an execution that reached `RUNNING` ends through, for this outcome.
+    pub fn end_progression(&self) -> &'static [&'static str] {
+        match self {
+            Self::Finished { .. } => NOTEBOOK_EXECUTION_FINISH_PROGRESSION,
+            Self::NotRun | Self::Failed { .. } => NOTEBOOK_EXECUTION_FAILURE_PROGRESSION,
+        }
+    }
+
+    /// `NotebookExecution$LastStateChangeReason` for the failing statuses of this outcome:
+    /// the engine's own reason for a run that failed, and the sentence that says no notebook
+    /// was run for an execution nothing ran.
+    pub fn failure_reason(&self) -> Option<String> {
+        match self {
+            Self::Finished { .. } => None,
+            Self::NotRun => Some(NOTEBOOK_NOT_EXECUTED_REASON.to_string()),
+            Self::Failed { reason } => Some(reason.clone()),
+        }
+    }
+}
+
+/// `NotebookExecution$LastStateChangeReason` for an execution whose notebook this service
+/// did not run — the reason that tells a caller the failure is this emulator's own and not
+/// the notebook's.
+///
+/// An execution reaches it when there is no notebook to run: the request names no Amazon S3
+/// notebook (a notebook under an editor is kept in storage this emulator does not hold),
+/// Amazon S3 hands over no such object, or the object is no notebook whose cells this
+/// emulator can run. `FINISHED` ("the execution has completed without error") would be a
+/// success for work nothing performed, which is why this stands in `LastStateChangeReason`
+/// instead and says so.
 pub const NOTEBOOK_NOT_EXECUTED_REASON: &str =
     "This emulator records notebook executions but runs no notebook, so the execution \
      ended without running.";
@@ -73,18 +172,32 @@ pub const NOTEBOOK_EXECUTION_STOP_PROGRESSION: &[&str] = &[
     notebook_execution_status::STOPPED,
 ];
 
-/// The status that follows `status` in the progression it belongs to, or `None` for one
-/// that ends its progression and for one no progression names.
+/// The status that follows `status` for an execution whose own run came to `outcome`, or
+/// `None` for one that ends its progression and for one no progression names.
 ///
-/// The ONE reading of what a notebook execution's clock owes it next, so the start
-/// progression and the stop progression cannot drift apart from the statuses above.
-pub fn next_notebook_execution_status(status: &str) -> Option<&'static str> {
+/// The ONE reading of what a notebook execution's clock owes it next, so the walk to
+/// `RUNNING`, the end the run answered and the stop progression cannot drift apart from the
+/// statuses above.
+pub fn next_notebook_execution_status(
+    status: &str,
+    outcome: &NotebookOutcome,
+) -> Option<&'static str> {
     for progression in [
         NOTEBOOK_EXECUTION_PROGRESSION,
+        outcome.end_progression(),
         NOTEBOOK_EXECUTION_STOP_PROGRESSION,
     ] {
         if let Some(position) = progression.iter().position(|step| *step == status) {
-            return progression.get(position + 1).copied();
+            return progression
+                .get(position + 1)
+                .copied()
+                // The walk to `RUNNING` ends where the END the run answered begins: a
+                // notebook that ran finishes, one that failed or that nothing ran fails.
+                .or_else(|| {
+                    (progression == NOTEBOOK_EXECUTION_PROGRESSION)
+                        .then(|| outcome.end_progression().first().copied())
+                        .flatten()
+                });
         }
     }
     None
@@ -113,18 +226,22 @@ pub struct PendingNotebookExecutionStatus {
 pub struct NotebookExecutionRecord {
     pub execution: NotebookExecution,
     pub pending_status: Option<PendingNotebookExecutionStatus>,
+    /// What this execution's own run of the notebook came to, which is the END of its
+    /// status walk ([`NotebookOutcome`]).
+    pub outcome: NotebookOutcome,
 }
 
 impl NotebookExecutionRecord {
     /// The execution `StartNotebookExecution` records for `input`, under the id and ARN
-    /// EMR minted for it.
+    /// EMR minted for it, with `outcome` as what running its notebook came to.
     pub fn from_request(
         id: String,
         arn: String,
         input: StartNotebookExecutionInput,
+        outcome: NotebookOutcome,
         now: SystemTime,
     ) -> Self {
-        Self {
+        let mut record = Self {
             execution: NotebookExecution {
                 notebook_execution_id: Some(id),
                 editor_id: input.editor_id,
@@ -165,15 +282,17 @@ impl NotebookExecutionRecord {
             // that, up to the terminal one. A progression that names nothing after
             // `START_PENDING` owes NOTHING — the execution then simply stays where it is,
             // rather than being defaulted into a status nothing took it to.
-            pending_status: next_notebook_execution_status(
-                notebook_execution_status::START_PENDING,
-            )
-            .map(|next| PendingNotebookExecutionStatus {
-                due: now + NOTEBOOK_PHASE_SPAN,
-                status: next.to_string(),
-                reason: Self::phase_reason(next),
-            }),
-        }
+            pending_status: None,
+            outcome,
+        };
+        record.pending_status =
+            next_notebook_execution_status(notebook_execution_status::START_PENDING, &record.outcome)
+                .map(|next| PendingNotebookExecutionStatus {
+                    due: now + notebook_phase_span(notebook_execution_status::START_PENDING),
+                    status: next.to_string(),
+                    reason: record.phase_reason(next),
+                });
+        record
     }
 
     /// Materialise every status the clock already made due, and nothing else.
@@ -199,28 +318,28 @@ impl NotebookExecutionRecord {
                 return;
             }
             // Whatever the phase that just landed owes next, one span later.
-            if let Some(next) = next_notebook_execution_status(&pending.status) {
+            if let Some(next) = next_notebook_execution_status(&pending.status, &self.outcome) {
+                let reason = self.phase_reason(next);
                 self.pending_status = Some(PendingNotebookExecutionStatus {
-                    due: pending.due + NOTEBOOK_PHASE_SPAN,
+                    due: pending.due + notebook_phase_span(&pending.status),
                     status: next.to_string(),
-                    reason: Self::phase_reason(next),
+                    reason,
                 });
             }
         }
     }
 
     /// The reason a move to `status` records, for a move that has one to give: the stop
-    /// progression says the caller asked for the stop, the two failure phases say the
-    /// notebook was never run ([`NOTEBOOK_NOT_EXECUTED_REASON`]), and the phases on the way
-    /// have nothing to report.
-    fn phase_reason(status: &str) -> Option<String> {
+    /// progression says the caller asked for the stop, the failing phases carry the reason
+    /// this execution's own run gave ([`NotebookOutcome::failure_reason`]) — the notebook's
+    /// exception, or the sentence that says no notebook was run — and the phases on the way,
+    /// like the finishing ones, have nothing to report.
+    fn phase_reason(&self, status: &str) -> Option<String> {
         if NOTEBOOK_EXECUTION_STOP_PROGRESSION.contains(&status) {
             return Some(NOTEBOOK_STOPPED_REASON.to_string());
         }
-        if status == notebook_execution_status::FAILING
-            || status == notebook_execution_status::FAILED
-        {
-            return Some(NOTEBOOK_NOT_EXECUTED_REASON.to_string());
+        if NOTEBOOK_EXECUTION_FAILURE_PROGRESSION.contains(&status) {
+            return self.outcome.failure_reason();
         }
         None
     }
@@ -244,14 +363,15 @@ impl NotebookExecutionRecord {
         }
         self.execution.status = Some(notebook_execution_status::STOP_PENDING.to_string());
         self.execution.last_state_change_reason = Some(NOTEBOOK_STOPPED_REASON.to_string());
-        self.pending_status =
-            next_notebook_execution_status(notebook_execution_status::STOP_PENDING).map(|next| {
-                PendingNotebookExecutionStatus {
-                    due: now + NOTEBOOK_PHASE_SPAN,
-                    status: next.to_string(),
-                    reason: Some(NOTEBOOK_STOPPED_REASON.to_string()),
-                }
-            });
+        self.pending_status = next_notebook_execution_status(
+            notebook_execution_status::STOP_PENDING,
+            &self.outcome,
+        )
+        .map(|next| PendingNotebookExecutionStatus {
+            due: now + notebook_phase_span(notebook_execution_status::STOP_PENDING),
+            status: next.to_string(),
+            reason: Some(NOTEBOOK_STOPPED_REASON.to_string()),
+        });
         true
     }
 

@@ -16,6 +16,14 @@
 //! because the request reaches it by two paths — the handler, and the order-restoring
 //! layer in [`crate::service`] for a value the modelled `@range(min: 0)` makes the generic
 //! request validator reach first — so the two cannot word one refusal differently.
+//!
+//! Capacities are bounded ABOVE as well, by the instances one fleet is provisioned at most
+//! ([`MAX_INSTANCES_PER_FLEET`]): a request that would take a fleet past that ceiling is
+//! refused with Amazon EMR's own fixed sentence for it
+//! ([`instance_fleet_instance_ceiling_violation`]) and leaves the fleet exactly as it was.
+//! That rule holds wherever a fleet's target capacities are SET — the launch that creates
+//! the fleet, the addition of one to a running cluster, and the modification of one — so
+//! each of those reaches it here.
 
 use super::*;
 
@@ -83,6 +91,93 @@ pub fn instance_fleet_capacity_violation(
         .flatten()
         .find(|capacity| *capacity < 0)
         .map(|capacity| invalid_instance_fleet_capacity(capacity, instance_fleet_id))
+}
+
+/// The greatest number of Amazon EC2 instances Amazon EMR provisions for ONE instance
+/// fleet, which the target capacities a fleet is asked to hold are judged against
+/// ([`instance_fleet_instance_ceiling_violation`]).
+///
+/// CHOSEN, not modelled: the model puts no `@range` maximum on the target-capacity members,
+/// so the ceiling itself is not published in it — what IS the contract is that a request
+/// past the ceiling is refused with Amazon EMR's own sentence for it
+/// ([`INSTANCE_FLEET_CEILING_MESSAGE`]) rather than accepted. The value is this emulator's
+/// own, in the units the refusal speaks of (instances), and it is deliberately far above any
+/// fleet a client would really ask for and far below the values a sizing calculation
+/// produces when it goes wrong, which is the class the refusal exists for.
+pub const MAX_INSTANCES_PER_FLEET: i64 = 65_536;
+
+/// How Amazon EMR refuses target capacities that would take an instance fleet past the
+/// number of instances it provisions for one fleet ([`MAX_INSTANCES_PER_FLEET`]).
+///
+/// Recorded behavior for the text, and it is ENTIRELY fixed: the sentence carries no value
+/// from the request — not the capacity, not the fleet, not the ceiling — so nothing of the
+/// request or of this emulator's own bound is interpolated into it.
+pub const INSTANCE_FLEET_CEILING_MESSAGE: &str =
+    "The maximum number of possible instances to be provisioned per instance fleet has \
+     been exceeded. Revise the configuration and resubmit.";
+
+/// The refusal an operation that sets a fleet's target capacities answers one past the
+/// ceiling with: [`INSTANCE_FLEET_CEILING_MESSAGE`] under the client error the operation
+/// models.
+///
+/// No `ErrorCode`, for the same reason the unusable-capacity refusal carries none
+/// ([`invalid_instance_fleet_capacity`]): Amazon EMR publishes no discriminator for this
+/// class.
+pub fn instance_fleet_ceiling_refusal() -> InvalidRequestException {
+    InvalidRequestException {
+        error_code: None,
+        message: Some(INSTANCE_FLEET_CEILING_MESSAGE.to_string()),
+    }
+}
+
+/// The most Amazon EC2 instances a fleet holding `target_on_demand_capacity` On-Demand
+/// units and `target_spot_capacity` Spot units could need, given the instance type
+/// configurations `configs` it provisions them from.
+///
+/// A target capacity is a number of UNITS, and `WeightedCapacity` is "the number of units
+/// that a provisioned instance of this type provides toward fulfilling the target
+/// capacities" (`InstanceTypeConfig$WeightedCapacity` doc, Smithy model), so the instances
+/// a target needs depends on which type fulfills it: the SMALLEST weight a fleet's
+/// configurations offer is the one that needs the most instances, which is the count the
+/// ceiling has to be taken against. A configuration that states no weight, and a fleet that
+/// states no configurations, provisions one unit per instance.
+pub fn implied_fleet_instance_count(
+    target_on_demand_capacity: i64,
+    target_spot_capacity: i64,
+    configs: &[InstanceTypeConfig],
+) -> i64 {
+    let smallest_weight = configs
+        .iter()
+        .map(|config| i64::from(config.weighted_capacity.unwrap_or(1)))
+        .filter(|weight| *weight > 0)
+        .min()
+        .unwrap_or(1);
+    let units = target_on_demand_capacity.saturating_add(target_spot_capacity);
+    // Rounded UP: a target the weights do not divide evenly is fulfilled by one more
+    // instance, which is an instance the fleet has to hold.
+    units.saturating_add(smallest_weight - 1) / smallest_weight
+}
+
+/// Why the target capacities a fleet would hold cannot be accepted, if they cannot: the
+/// instances they could need ([`implied_fleet_instance_count`]) are more than Amazon EMR
+/// provisions for one instance fleet ([`MAX_INSTANCES_PER_FLEET`]).
+///
+/// Judged on the capacities the fleet would HOLD rather than on the ones the request
+/// carried, so a modification that names one of the two leaves the other where it is and is
+/// judged against the pair, and so is a launch or an addition that names only one of them.
+/// A refused call writes nothing: "the call either succeeds or fails atomically"
+/// (`ModifyInstanceFleet` doc, Smithy model).
+pub fn instance_fleet_instance_ceiling_violation(
+    target_on_demand_capacity: i64,
+    target_spot_capacity: i64,
+    configs: &[InstanceTypeConfig],
+) -> Option<InvalidRequestException> {
+    let instances = implied_fleet_instance_count(
+        target_on_demand_capacity,
+        target_spot_capacity,
+        configs,
+    );
+    (instances > MAX_INSTANCES_PER_FLEET).then(instance_fleet_ceiling_refusal)
 }
 
 /// How many instance type configurations one instance fleet holds at once.
@@ -167,18 +262,35 @@ impl InstanceFleetRecord {
         if let Some(context) = modification.context.as_ref() {
             self.config.context = Some(context.clone());
         }
-        if let Some(submitted) = modification.instance_type_configs.as_deref() {
-            let mut held = self.config.instance_type_configs.clone().unwrap_or_default();
-            for config in submitted {
-                match held
-                    .iter_mut()
-                    .find(|holding| holding.instance_type == config.instance_type)
-                {
-                    Some(holding) => *holding = config.clone(),
-                    None => held.push(config.clone()),
-                }
-            }
-            self.config.instance_type_configs = Some(held);
+        if modification.instance_type_configs.is_some() {
+            let merged = self.merged_instance_type_configs(modification);
+            self.config.instance_type_configs = Some(merged);
         }
+    }
+
+    /// The instance type configurations this fleet would hold once `modification` had been
+    /// applied to it.
+    ///
+    /// The merge [`Self::apply_modification`] performs, read WITHOUT performing it, so the
+    /// refusals a modification is judged by see the configurations the fleet would end up
+    /// with rather than the ones it holds now — and the merge itself is stated once.
+    pub fn merged_instance_type_configs(
+        &self,
+        modification: &InstanceFleetModifyConfig,
+    ) -> Vec<InstanceTypeConfig> {
+        let mut held = self.config.instance_type_configs.clone().unwrap_or_default();
+        let Some(submitted) = modification.instance_type_configs.as_deref() else {
+            return held;
+        };
+        for config in submitted {
+            match held
+                .iter_mut()
+                .find(|holding| holding.instance_type == config.instance_type)
+            {
+                Some(holding) => *holding = config.clone(),
+                None => held.push(config.clone()),
+            }
+        }
+        held
     }
 }

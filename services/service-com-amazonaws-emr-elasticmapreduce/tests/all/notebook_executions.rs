@@ -33,7 +33,7 @@
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_emr_elasticmapreduce::state::NOTEBOOK_PHASE_SPAN;
+use service_com_amazonaws_emr_elasticmapreduce::state::{NOTEBOOK_PHASE_SPAN, NOTEBOOK_RUN_SPAN};
 
 use crate::job_flow_lifecycle::{
     assert_minted_id, assert_refused, at, epoch_secs, kept_alive_request, Emr,
@@ -41,10 +41,12 @@ use crate::job_flow_lifecycle::{
 use crate::refusal_messages::message;
 
 /// Longer than the whole status progression a notebook execution walks (one
-/// [`NOTEBOOK_PHASE_SPAN`] per phase), so an execution that was `START_PENDING` or
-/// `STOP_PENDING` has reached the status it ends in by the time we look.
+/// [`NOTEBOOK_PHASE_SPAN`] per phase, plus the longer [`NOTEBOOK_RUN_SPAN`] the execution
+/// spends `RUNNING`), so an execution that was `START_PENDING` or `STOP_PENDING` has
+/// reached the status it ends in by the time we look.
 const PAST_TRANSITION: Duration = NOTEBOOK_PHASE_SPAN
     .saturating_mul(5)
+    .saturating_add(NOTEBOOK_RUN_SPAN)
     .saturating_add(Duration::from_millis(400));
 
 /// `ListNotebookExecutions` page size, documented on the operation: "Returns a maximum

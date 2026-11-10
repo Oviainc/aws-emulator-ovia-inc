@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a Spark Connect session on a cluster of the shared engine and answers the id,
+//! ARN, account and state of the session it recorded ([`crate::state::SessionRecord`]), so
+//! a later `GetSession` and `ListSessions` report exactly that session.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it refuses, all with the `InvalidRequestException` it models: a cluster id this
+//! account holds no cluster under, a cluster launched WITHOUT the session surface
+//! ([`crate::state::sessions_not_enabled`] — the same refusal `ListSessions` answers, since
+//! sessions are enabled by the launch and nothing can switch them on later), a cluster that
+//! is not in the RUNNING or WAITING state (`StartSession` doc,
+//! [`crate::state::accepts_sessions_in_state`]) and a cluster already holding as many
+//! sessions as one carries. A repeat of a request that succeeded, carrying the same
+//! `ClientRequestToken`, answers the session the first one created and starts no second
+//! one.
 //!
 //! ## Shape of an operation
 //!
@@ -133,6 +137,19 @@ impl From<StartSessionErrorModeled> for StartSessionError {
     }
 }
 
+/// The answer `StartSession` gives for the session `session`: every member of its output
+/// read off the RECORDED session, so the call reports what a later `GetSession` reports
+/// rather than what the request asked for.
+fn session_answer(session: &Session) -> StartSessionOutput {
+    StartSessionOutput {
+        id: session.id.clone(),
+        cluster_id: Some(session.cluster_id.clone()),
+        arn: Some(session.arn.clone()),
+        account_id: session.account_id.clone(),
+        state: Some(session.state.clone()),
+    }
+}
+
 /// The `StartSession` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -169,18 +186,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSession"))
+        use crate::state::MAX_SESSIONS_PER_CLUSTER;
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        // The SHAPE of the cluster id is settled BEFORE any cluster is resolved: a value
+        // carrying characters no cluster id is drawn from names no cluster the service
+        // could hold, so it is refused as a bad REQUEST — naming the member the caller has
+        // to fix — rather than looked up, exactly as `GetSession` settles it.
+        if !crate::state::is_cluster_id_shaped(&input.cluster_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_cluster_id_message(&input.cluster_id),
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR cluster store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+        // Minted BEFORE the cluster is borrowed, so the write path below holds the ONE
+        // mutable borrow `cluster_mut` hands back and no invariant has to be re-derived by
+        // looking the cluster up a second time.
+        let session_id = store.mint_session_id();
+        let arn = crate::state::session_arn(&region, &input.cluster_id, &session_id);
+
+        // Starting a session changes the cluster's state, so every transition the clock
+        // already made due is materialised before this one is recorded; `cluster_mut` does
+        // that for the cluster and the sessions it already carries.
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(StartSessionErrorModeled::InvalidRequestException(
+                crate::state::unknown_cluster(&input.cluster_id),
+            )
+            .into());
+        };
+
+        // "The cluster must be in the RUNNING or WAITING state and have sessions enabled."
+        // (`StartSession` doc, Smithy model.) Sessions being enabled is a property of the
+        // LAUNCH, so it is judged first: a cluster that carries no session surface at all
+        // cannot be made to carry one, whatever state it is in.
+        if !cluster.sessions_enabled() {
+            return Err(StartSessionErrorModeled::InvalidRequestException(
+                crate::state::sessions_not_enabled(&input.cluster_id),
+            )
+            .into());
+        }
+        if !crate::state::accepts_sessions_in_state(&cluster.status.state) {
+            let refusal = crate::state::cluster_not_running_for_session_message(
+                &input.cluster_id,
+                &cluster.status.state,
+            );
+            return Err(StartSessionErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(refusal),
+                },
+            )
+            .into());
+        }
+
+        // "If you retry a request that completed successfully using the same client request
+        // token, the service returns the original response without performing the operation
+        // again." (`StartSessionInput$ClientRequestToken` doc.) The answer is read off the
+        // session the first request created, so a retry starts no second session and
+        // reports the state that one has reached.
+        if let Some(held) = cluster.session_for_token(input.client_request_token.as_deref()) {
+            return Ok(session_answer(&held.session));
+        }
+
+        if cluster.sessions.len() >= MAX_SESSIONS_PER_CLUSTER {
+            return Err(StartSessionErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(format!(
+                        "Cluster '{}' already carries {MAX_SESSIONS_PER_CLUSTER} sessions, \
+                         which is the maximum.",
+                        input.cluster_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let answer = session_answer(&cluster.start_session(session_id, arn, input, now).session);
+        drop(store);
+
+        Ok(answer)
     }
 }

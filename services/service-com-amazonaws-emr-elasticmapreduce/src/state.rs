@@ -69,6 +69,12 @@ pub use studio_network::*;
 mod notebook_executions;
 pub use notebook_executions::*;
 
+/// RUNNING a notebook execution's notebook — fetching it out of Amazon S3 and executing
+/// its code cells — split out of the lifecycle above as its own concern and re-exported
+/// the same way.
+mod notebook_run;
+pub use notebook_run::*;
+
 /// The sentences every MODIFICATION refusal of this service is worded by, split out and
 /// re-exported the same way.
 mod modification_refusals;
@@ -85,6 +91,17 @@ pub use instance_fleet_modification::*;
 /// and re-exported the same way.
 mod launch_defaults;
 pub use launch_defaults::*;
+
+/// The Spark Connect session surface of a cluster — which clusters carry sessions, what
+/// `StartSession` records and the states the clock walks one through — split out and
+/// re-exported the same way.
+mod sessions;
+pub use sessions::*;
+
+/// The SPARK release family of the release catalog — the labels an Amazon EMR Spark
+/// release carries and what one bundles — split out and re-exported the same way.
+mod spark_releases;
+pub use spark_releases::*;
 
 /// `com.amazonaws.emr#ClusterState`, as the wire carries it.
 pub mod cluster_state {
@@ -1560,6 +1577,10 @@ pub struct ComAmazonawsEmrElasticmapreduceState {
     /// name is its identity. Keying the map by it is what makes the name unique and
     /// what gives every listing a deterministic, name-ordered sequence.
     pub security_configurations: BTreeMap<String, SecurityConfigurationRecord>,
+    /// The sequence every session id of this account is minted from
+    /// ([`ComAmazonawsEmrElasticmapreduceState::mint_session_id`]); the sessions
+    /// themselves hang off the cluster they were started on.
+    pub next_session_seq: u64,
 }
 
 /// The account's default configuration is in place before any caller puts one, so the
@@ -1584,6 +1605,7 @@ impl Default for ComAmazonawsEmrElasticmapreduceState {
             persistent_app_uis: BTreeMap::new(),
             next_persistent_app_ui_seq: 0,
             security_configurations: BTreeMap::new(),
+            next_session_seq: 0,
         }
     }
 }
@@ -1756,7 +1778,7 @@ impl ComAmazonawsEmrElasticmapreduceState {
                 return Ok(TagSetMut::List(&mut cluster.tags));
             }
             return match cluster.session_mut(resource_id) {
-                Some(session) => Ok(TagSetMut::Optional(&mut session.tags)),
+                Some(session) => Ok(TagSetMut::Optional(&mut session.session.tags)),
                 None => Err(TagTargetRefusal::NotValid(unknown_session_message(
                     resource_id,
                 ))),
@@ -2533,8 +2555,13 @@ pub fn release_version(label: &str) -> Option<(u32, u32, u32)> {
 ///
 /// A label has to be spelled exactly as [`release_label`] renders it — so a padded or
 /// differently cased variant names no release — AND name a patch release published on
-/// one of the lines in [`RELEASE_LINES`].
+/// one of the lines in [`RELEASE_LINES`]. The Spark release family carries its own prefix
+/// and its own lines ([`spark_release`]), and a label of it resolves here too: it is one
+/// catalog.
 pub fn catalog_release(label: &str) -> Option<(u32, u32, u32)> {
+    if let Some(release) = spark_release(label) {
+        return Some(release);
+    }
     let (major, minor, patch) = release_version(label)?;
     if label != release_label(major, minor, patch) {
         return None;
@@ -2592,6 +2619,9 @@ pub struct ReleaseLabelRecord {
 /// The catalog's entry for `label`, or `None` when it names no release this emulator
 /// offers.
 pub fn release_label_record(label: &str) -> Option<ReleaseLabelRecord> {
+    if let Some(record) = spark_release_label_record(label) {
+        return Some(record);
+    }
     let (major, minor, patch) = catalog_release(label)?;
     Some(ReleaseLabelRecord {
         label: release_label(major, minor, patch),
@@ -2853,13 +2883,13 @@ pub struct ClusterRecord {
     /// ([`master_dns_name`]) and reported once the clock has brought that node up
     /// ([`ClusterRecord::master_public_dns_name`]).
     pub master_dns_name: String,
-    /// The Spark Connect sessions this cluster carries.
+    /// The Spark Connect sessions this cluster carries, in the order `StartSession`
+    /// started them ([`SessionRecord`], [`ClusterRecord::start_session`]).
     ///
-    /// `StartSession` is what appends one; it is still a scaffold stub (its own
-    /// issue), so until it lands this is what tells `GetSession` that a session id
-    /// names nothing on this cluster. Held as the wire shape for the same reason the
-    /// studios are.
-    pub sessions: Vec<Session>,
+    /// `GetSession` reports one of these records and `ListSessions` pages over them;
+    /// each carries the state the clock still owes it beside the wire shape, the way a
+    /// notebook execution does.
+    pub sessions: Vec<SessionRecord>,
 }
 
 impl ClusterRecord {
@@ -2872,6 +2902,9 @@ impl ClusterRecord {
     /// cluster that is ready runs and then completes, and one the caller terminated
     /// reaches `TERMINATED`.
     pub fn advance_to(&mut self, now: SystemTime) {
+        for session in &mut self.sessions {
+            session.advance_to(now);
+        }
         for fleet in &mut self.fleets {
             fleet.advance_to(now);
         }
@@ -3119,20 +3152,6 @@ impl ClusterRecord {
         self.groups
             .iter_mut()
             .find(|group| group.id == instance_group_id)
-    }
-
-    /// The session `session_id` of this cluster, if it has one.
-    pub fn session(&self, session_id: &str) -> Option<&Session> {
-        self.sessions
-            .iter()
-            .find(|session| session.id == session_id)
-    }
-
-    /// The session `session_id` of this cluster, for an operation that changes it.
-    pub fn session_mut(&mut self, session_id: &str) -> Option<&mut Session> {
-        self.sessions
-            .iter_mut()
-            .find(|session| session.id == session_id)
     }
 
     /// The wire `ClusterStatus` for this record.
@@ -4669,14 +4688,15 @@ pub const LIST_RELEASE_LABELS_MAX_RESULTS: i32 = 100;
 /// however the catalog spells a name. A label the catalog does not offer bundles
 /// nothing.
 pub fn release_bundles_application(label: &str, filter: &str) -> bool {
-    let Some((major, minor, _)) = catalog_release(label) else {
+    let Some(record) = release_label_record(label) else {
         return false;
     };
     let (name, version) = match filter.split_once('@') {
         Some((name, version)) => (name, Some(version)),
         None => (filter, None),
     };
-    release_line_applications(major, minor)
+    record
+        .applications
         .iter()
         .any(|application| {
             application

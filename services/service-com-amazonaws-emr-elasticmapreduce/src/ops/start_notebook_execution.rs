@@ -189,46 +189,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        {
+            let mut store = state.lock();
+
+            // Every transition the clock already made due is materialised before the store
+            // is read, so the cluster resolved below is in the state it is owed and the
+            // count taken against the bound counts no execution twice.
+            store.advance_all(now);
+
+            // "Specifies the execution engine (cluster) to run the notebook and perform the
+            // notebook execution" / "The unique identifier of the execution engine. For an
+            // Amazon EMR cluster, this is the cluster ID." (`ExecutionEngineConfig` and
+            // `ExecutionEngineConfig$Id` docs.) The engine is resolved against this
+            // service's own clusters, so an engine naming no usable cluster is refused
+            // rather than recorded as an execution nothing could ever run — as a
+            // request-validation refusal, which is the envelope Amazon EMR answers this
+            // class in, worded by `crate::state::engine_not_available_message`: it states
+            // the cluster resolution produced, which is none on this path, and so echoes no
+            // id from the request.
+            if !store.clusters.contains_key(&input.execution_engine.id) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::engine_not_available_message(),
+                ));
+            }
+
+            if store.notebook_executions.len() >= MAX_NOTEBOOK_EXECUTIONS {
+                return Err(StartNotebookExecutionErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        error_code: None,
+                        message: Some(format!(
+                            "This account already holds {MAX_NOTEBOOK_EXECUTIONS} notebook \
+                             executions, which is the maximum."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The notebook itself: fetched out of Amazon S3 and RUN, with NO store guard held.
+        // Three things bound what a request can make this process do here, and the module
+        // that performs it states each of them where it enforces them
+        // ([`crate::state::run_notebook`]):
+        //
+        // * WHAT is fetched: an object of THIS emulator's own Amazon S3 store, addressed by
+        //   the `NotebookS3Location` bucket and key alone. Nothing of the request becomes a
+        //   host, a scheme, a URL or a filesystem path, and the read travels over the
+        //   emulator's own in-process callback transport
+        //   ([`::service_common::s3_client`]), which opens no socket and resolves no name —
+        //   so there is no destination a caller can steer it to. `EditorId` and
+        //   `RelativePath` name a notebook in storage this emulator does not hold, so they
+        //   fetch NOTHING: such an execution is reported as one nothing ran.
+        // * WHAT runs: the notebook's own code cells, in the contained interpreter this
+        //   emulator already holds for caller-supplied code — host-reaching surface compiled
+        //   out, native modules narrowed to an allow-list, no filesystem, socket, process or
+        //   host library reachable from a cell, and no host environment variable or
+        //   credential: the only environment a cell sees is this execution's own
+        //   `EnvironmentVariables`, which is why that map is the only other thing passed in.
+        // * WHAT it may cost: the object is capped before and after it is read, the cells are
+        //   counted, the runs this process performs at once are a bounded pool, the run has a
+        //   thread and a stack of its own rather than the async executor's, and this call
+        //   waits no longer than the run's own wall clock and the grace on top of it.
+        //
+        // What it ANSWERS is the end of the execution's status walk, so it is settled before
+        // the execution is recorded and every later read of that execution reports the same
+        // outcome.
+        let outcome = crate::state::run_notebook(
+            ctx,
+            &region,
+            input.notebook_s3_location.as_ref(),
+            input.environment_variables.as_ref(),
+        )
+        .await;
+
         let mut store = state.lock();
-
-        // Every transition the clock already made due is materialised before the store
-        // is read, so the cluster resolved below is in the state it is owed and the
-        // count taken against the bound counts no execution twice.
-        store.advance_all(now);
-
-        // "Specifies the execution engine (cluster) to run the notebook and perform the
-        // notebook execution" / "The unique identifier of the execution engine. For an
-        // Amazon EMR cluster, this is the cluster ID." (`ExecutionEngineConfig` and
-        // `ExecutionEngineConfig$Id` docs.) The engine is resolved against this
-        // service's own clusters, so an engine naming no usable cluster is refused
-        // rather than recorded as an execution nothing could ever run — as a
-        // request-validation refusal, which is the envelope Amazon EMR answers this
-        // class in, worded by `crate::state::engine_not_available_message`: it states the
-        // cluster resolution produced, which is none on this path, and so echoes no id
-        // from the request.
-        if !store.clusters.contains_key(&input.execution_engine.id) {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::engine_not_available_message(),
-            ));
-        }
-
-        if store.notebook_executions.len() >= MAX_NOTEBOOK_EXECUTIONS {
-            return Err(StartNotebookExecutionErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    error_code: None,
-                    message: Some(format!(
-                        "This account already holds {MAX_NOTEBOOK_EXECUTIONS} notebook \
-                         executions, which is the maximum."
-                    )),
-                },
-            )
-            .into());
-        }
-
         let id = store.mint_notebook_execution_id();
         let arn = crate::state::notebook_execution_arn(&region, &id);
-        let record = NotebookExecutionRecord::from_request(id.clone(), arn, input, now);
+        let record = NotebookExecutionRecord::from_request(id.clone(), arn, input, outcome, now);
         store.notebook_executions.insert(id.clone(), record);
+        drop(store);
 
         Ok(StartNotebookExecutionOutput {
             notebook_execution_id: Some(id),

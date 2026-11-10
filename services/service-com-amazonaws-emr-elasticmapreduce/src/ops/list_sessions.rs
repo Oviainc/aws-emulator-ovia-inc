@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSessions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSessions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the Spark Connect sessions a cluster of the shared engine carries — "newer
+//! sessions are returned first" (this operation's doc) — filtered by the states the request
+//! names and paged on `NextToken`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSessions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It refuses what `StartSession` refuses about the CLUSTER, with the same
+//! `InvalidRequestException`: a cluster id this account holds no cluster under, and a
+//! cluster launched without the session surface ([`crate::state::sessions_not_enabled`]) —
+//! which is a refusal rather than an empty `Sessions` list, because such a cluster carries
+//! no sessions to list and never can. A `NextToken` this listing did not mint is refused
+//! too ([`crate::state::malformed_next_token`]).
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +149,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSessions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSessionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSessions"))
+        use crate::state::{LIST_PAGE_SIZE, MAX_LIST_SESSIONS_RESULTS};
+
+        // Reporting only: the writes below are the session states the clock already made
+        // due, each owed at this instant whether or not anybody listed the sessions.
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        if !crate::state::is_cluster_id_shaped(&input.cluster_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_cluster_id_message(&input.cluster_id),
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSessionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR cluster store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(ListSessionsErrorModeled::InvalidRequestException(
+                crate::state::unknown_cluster(&input.cluster_id),
+            )
+            .into());
+        };
+
+        // The same gate `StartSession` holds a cluster to: a cluster launched without the
+        // session surface is REFUSED rather than reported as a cluster with no sessions.
+        if !cluster.sessions_enabled() {
+            return Err(ListSessionsErrorModeled::InvalidRequestException(
+                crate::state::sessions_not_enabled(&input.cluster_id),
+            )
+            .into());
+        }
+
+        // "Newer sessions are returned first." (This operation's doc, Smithy model.) The
+        // sessions are held in the order they were started, so that is this list reversed.
+        // "An optional filter that limits the results to sessions in the specified states"
+        // (`ListSessionsInput$SessionStates` doc): a request naming none filters nothing,
+        // and one naming states keeps the sessions in them.
+        let matched: Vec<&crate::state::SessionRecord> = cluster
+            .sessions
+            .iter()
+            .rev()
+            .filter(|record| {
+                input.session_states.as_deref().is_none_or(|states| {
+                    // A filter that names no state keeps every session: it narrows nothing,
+                    // the way an absent filter does.
+                    states.is_empty() || states.contains(&record.session.state)
+                })
+            })
+            .collect();
+
+        // The token is the id of the first session the previous page did not report, the
+        // way every other listing of this service continues.
+        let start = match input.next_token.as_ref() {
+            Some(token) => match matched
+                .iter()
+                .position(|record| record.session.id == *token)
+            {
+                Some(at) => at,
+                None => {
+                    return Err(ListSessionsErrorModeled::InvalidRequestException(
+                        crate::state::malformed_next_token(token),
+                    )
+                    .into())
+                }
+            },
+            None => 0,
+        };
+        // "The maximum number of sessions to return in each page of results"
+        // (`ListSessionsInput$MaxResults` doc), held to the band the model declares on
+        // `MaxResultsNumber` (range 1..100) so a page is never empty-but-continuing; a
+        // request that names no size takes the page size this service's listings publish
+        // ([`crate::state::LIST_PAGE_SIZE`]).
+        let page = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(LIST_PAGE_SIZE)
+            .clamp(1, MAX_LIST_SESSIONS_RESULTS);
+        let end = matched.len().min(start.saturating_add(page));
+        let sessions: Vec<Session> = matched[start..end]
+            .iter()
+            .map(|record| record.session.clone())
+            .collect();
+        // "This field is absent when there are no more results."
+        // (`ListSessionsOutput$NextToken` doc.)
+        let next_token = matched.get(end).map(|record| record.session.id.clone());
+
+        Ok(ListSessionsOutput {
+            sessions: Some(sessions),
+            next_token,
+        })
     }
 }

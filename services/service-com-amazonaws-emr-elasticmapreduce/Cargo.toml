@@ -16,7 +16,10 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `sync` and `time` on top of the workspace features: a notebook execution's own run
+# happens on a thread of its own and reports back over a oneshot channel, waited for no
+# longer than the run's bounds allow (`state::notebook_run`).
+tokio = { workspace = true, features = ["sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -46,6 +49,21 @@ sqlparser = { version = "0.59", features = ["visitor"] }
 # (`bash -c '…'`), which is lexed with the POSIX shell's own word rules rather than split
 # by hand.
 shell-words = "1"
+# A notebook execution's notebook is an object in Amazon S3 ("the Amazon S3 location that
+# the notebook execution input is stored in"), and `StartNotebookExecution` FOLLOWS that
+# reference: the object is read with a `GetObject` driven over the in-process callback
+# (`state::notebook_run`), so the cells that run are the ones `PutObject` wrote. Only the
+# generated client is needed — the emulator supplies the transport.
+aws-sdk-s3 = { version = "1", default-features = false }
+# The notebook a headless execution names has to RUN for the execution to reach the status
+# its own cells answered, and its cells are caller-supplied Python. They are run in the
+# CONTAINED interpreter this workspace already holds for exactly that
+# (`state::execution::python` of the crate below): one interpreter per run, built with its
+# host-reaching surface compiled out, its native modules narrowed to an allow-list, and the
+# deadline, step, memory, recursion and output bounds enforced in host code the cells cannot
+# reach. No second execution substrate is introduced here — this crate adds no engine
+# dependency of its own and runs the cells through that one (`state::notebook_run`).
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -53,6 +71,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# A notebook execution's notebook is an object in Amazon S3, so the suite that asserts a
+# notebook RUNS writes it through Amazon S3's own `CreateBucket`/`PutObject`, with that
+# service mounted beside Amazon EMR on ONE engine: the cells that run are the ones a client
+# put in the bucket.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true
