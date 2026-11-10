@@ -731,6 +731,16 @@ pub struct ParameterVersionRecord {
     pub key_id: Option<String>,
     pub policies: Option<String>,
     pub last_modified_date: SystemTime,
+    /// The ARN of the principal whose credential signed the write that created this
+    /// version — "Amazon Resource Name (ARN) of the Amazon Web Services user who last
+    /// changed the parameter" (`ParameterMetadata$LastModifiedUser`), as the write
+    /// resolved it ([`identity_authorization::caller_arn`]), so a client reading its own
+    /// identity recognises the writer of a parameter it wrote.
+    ///
+    /// `None` for a version no principal of this account wrote: a parameter AWS itself
+    /// publishes ([`public_parameters`]) belongs to no account, so no account's user is
+    /// reported as having changed it.
+    pub last_modified_user: Option<String>,
     /// The labels that point at THIS version. `LabelParameterVersion` is what writes
     /// them ([`ParameterRecord::attach_label`]) and `UnlabelParameterVersion` what
     /// erases them, so the set holds exactly what was attached and never released — a
@@ -776,10 +786,10 @@ impl ParameterVersionRecord {
             // a key carries one.
             key_id: self.key_id.clone(),
             last_modified_date: Some(::aws_smithy_types::DateTime::from(self.last_modified_date)),
-            // As in [`Self::to_parameter_history`]: a request carries a SigV4 credential
-            // scope, not a caller identity, so nothing recorded which user wrote this
-            // version and no user is reported rather than one being invented.
-            last_modified_user: None,
+            // As in [`Self::to_parameter_history`]: the principal the write that created
+            // this version was signed for, recorded by that write and reported unchanged,
+            // so two reads of one version report one writer.
+            last_modified_user: self.last_modified_user.clone(),
             description: self.description.clone(),
             allowed_pattern: self.allowed_pattern.clone(),
             version: self.version,
@@ -805,10 +815,10 @@ impl ParameterVersionRecord {
             key_id: self.key_id.clone(),
             last_modified_date: Some(::aws_smithy_types::DateTime::from(self.last_modified_date)),
             // "Amazon Resource Name (ARN) of the Amazon Web Services user who last
-            // changed the parameter": a request carries a SigV4 credential scope, not a
-            // caller identity, so nothing recorded which user wrote this version and no
-            // user is reported for it rather than one being invented.
-            last_modified_user: None,
+            // changed the parameter": the principal the write that created THIS version
+            // was signed for, so an entry names the writer of the version it reports
+            // rather than the writer of the newest one.
+            last_modified_user: self.last_modified_user.clone(),
             description: self.description.clone(),
             value: Some(self.value.clone()),
             allowed_pattern: self.allowed_pattern.clone(),

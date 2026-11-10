@@ -551,6 +551,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        // Who is writing this version. Resolved from the credential the request was
+        // signed with, through the same reading `sts:GetCallerIdentity` answers from, so
+        // the writer a metadata read reports back is the identity the caller holds — a
+        // role session names that session, a user's own key names that user. Taken
+        // before the store guard, so no guard of this service is held while another
+        // service's store is read.
+        let writer = crate::state::identity_authorization::caller_arn(&*self.engine, ctx);
         let overwrite = input.overwrite.unwrap_or(false);
         // Tags belong to the parameter, and `AddTagsToResource` is how an existing one
         // is tagged: "To add tags to an existing Systems Manager parameter, use the
@@ -829,6 +836,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             key_id,
             policies: input.policies,
             last_modified_date: now,
+            // "ARN of the Amazon Web Services user who last changed the parameter": this
+            // put is that change, so the version records the principal it was signed for.
+            last_modified_user: Some(writer),
             // Only `LabelParameterVersion` attaches a label, so a version is created
             // carrying none.
             labels: ::std::collections::BTreeSet::new(),

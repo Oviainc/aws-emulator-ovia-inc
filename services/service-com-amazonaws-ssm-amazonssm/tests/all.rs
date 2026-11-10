@@ -53,6 +53,8 @@ mod parameter_deletion_visibility;
 mod parameter_history;
 #[path = "all/parameter_labels.rs"]
 mod parameter_labels;
+#[path = "all/parameter_last_modified_user.rs"]
+mod parameter_last_modified_user;
 #[path = "all/parameter_metadata.rs"]
 mod parameter_metadata;
 #[path = "all/parameter_not_found_payload.rs"]

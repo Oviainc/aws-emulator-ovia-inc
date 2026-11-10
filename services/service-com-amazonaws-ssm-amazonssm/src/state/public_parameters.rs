@@ -159,6 +159,9 @@ fn published_record(
             key_id: None,
             policies: None,
             last_modified_date: published_at,
+            // AWS publishes this parameter and no account can write it, so no user of
+            // this account last changed it and none is reported as having done so.
+            last_modified_user: None,
             labels: Default::default(),
         }],
     }
