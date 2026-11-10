@@ -170,6 +170,146 @@ pub async fn create_database_with_input(router: &MultiServiceRouter, input: &Val
     );
 }
 
+/// The principal the Data Catalog recorded as a table's creator (`Table$CreatedBy`, "the
+/// person or entity who created the table"), read back through Glue's own `GetTable`.
+///
+/// A suite about what the CREATOR of a table holds asks the catalog who that is rather
+/// than spelling an identity of its own, so the assertion follows the emulator's identity
+/// contract instead of pinning a literal ARN.
+pub async fn table_created_by(router: &MultiServiceRouter, database: &str, name: &str) -> String {
+    let (status, body) = glue(
+        router,
+        "GetTable",
+        &json!({ "DatabaseName": database, "Name": name }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case get table {database}.{name}: expected 200, got {status} {body:?}"
+    );
+    body.get("Table")
+        .and_then(|table| table.get("CreatedBy"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("case get table {database}.{name}: expected a CreatedBy, got {body:?}")
+        })
+        .to_string()
+}
+
+/// The `PrincipalResourcePermissions` entries a `ListPermissions` body answers, asserting
+/// 200 and that the member is present (a listing that matches nothing answers an EMPTY
+/// list, not an absent member).
+pub async fn list_permissions(
+    router: &MultiServiceRouter,
+    case: &str,
+    body: &Value,
+) -> Vec<Value> {
+    let (status, payload) = lake_formation(router, "ListPermissions", body).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected ListPermissions to answer 200, got {status} {payload:?}"
+    );
+    payload
+        .get("PrincipalResourcePermissions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: ListPermissions must carry a PrincipalResourcePermissions \
+                 list, got {payload:?}"
+            )
+        })
+}
+
+/// One listed entry as the permission suites compare it: the principal, the resource, the
+/// permissions and the permissions held with the grant option.
+pub type Entry = (String, String, Vec<String>, Vec<String>);
+
+/// The string list `member` of one entry, sorted, empty when the member carries none.
+fn strings(entry: &Value, member: &str) -> Vec<String> {
+    let mut values: Vec<String> = entry
+        .get(member)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| value.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    values.sort();
+    values
+}
+
+/// The entries a listing carries, sorted so a comparison does not depend on the order the
+/// service enumerated them in.
+pub fn permission_entries(listed: &[Value]) -> Vec<Entry> {
+    let mut entries: Vec<Entry> = listed
+        .iter()
+        .map(|entry| {
+            (
+                entry
+                    .get("Principal")
+                    .and_then(|principal| principal.get("DataLakePrincipalIdentifier"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                entry
+                    .get("Resource")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_string(),
+                strings(entry, "Permissions"),
+                strings(entry, "PermissionsWithGrantOption"),
+            )
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// Revoke what creating a table in a database that hands its tables the IAM-access-control
+/// default granted on it: the creator's Super (`ALL` and every individual table
+/// permission, at both of the scopes a table's permissions are held at) and the
+/// `IAM_ALLOWED_PRINCIPALS` `ALL` the database handed it
+/// (the `creator_table_grants.rs` and `table_default_grants.rs` suites cover those grants
+/// themselves).
+///
+/// A suite about the EXPLICIT grant store calls this after seeding a table, exactly as it
+/// calls [`revoke_default_database_grant`] for a database, so its listings read back only
+/// the records its own grants wrote.
+pub async fn revoke_table_default_grants(
+    router: &MultiServiceRouter,
+    database: &str,
+    table: &str,
+) {
+    let on_table = json!({ "Table": { "DatabaseName": database, "Name": table } });
+    let creator = table_created_by(router, database, table).await;
+    // What the creator holds, named once for the whole crate by the suite that asserts it;
+    // naming it in both lists takes the grant option with it.
+    let creator_permissions = json!(crate::creator_table_grants::CREATOR_PERMISSIONS);
+    let revokes = [
+        json!({
+            "Principal": { "DataLakePrincipalIdentifier": creator },
+            "Resource": on_table,
+            "Permissions": creator_permissions,
+            "PermissionsWithGrantOption": creator_permissions,
+        }),
+        json!({
+            "Principal": { "DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS" },
+            "Resource": on_table,
+            "Permissions": ["ALL"],
+        }),
+    ];
+    for body in revokes {
+        let (status, payload) = lake_formation(router, "RevokePermissions", &body).await;
+        assert_eq!(
+            status, 200,
+            "case revoke {body:?} on {database}.{table}: expected 200, got {status} {payload:?}"
+        );
+    }
+}
+
 /// Revoke a database's creation-time default grant: `ALL` to `IAM_ALLOWED_PRINCIPALS`, the
 /// account's "use only IAM access control" setting, which every database is created
 /// carrying.

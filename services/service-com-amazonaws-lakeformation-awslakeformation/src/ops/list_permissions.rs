@@ -6,7 +6,10 @@
 //! the explicit records in
 //! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s `permission_grants`,
 //! plus the default grant each Data Catalog database was created carrying
-//! ([`crate::state::default_database_grants`]) until a revoke takes it away. The listing
+//! ([`crate::state::default_database_grants`]) and the grants each Data Catalog table was
+//! created carrying — its creator's and its database's table-level defaults
+//! ([`crate::state::created_table_grants`]) — each until a
+//! revoke takes it away. The listing
 //! is narrowed by the `Principal`, `Resource`, `ResourceType` and `CatalogId` filters and
 //! bounded by `MaxResults`, resuming from the grant key an opaque `NextToken` names.
 //! Reporting only — it writes nothing.
@@ -269,6 +272,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &settings,
         );
 
+        // The grants the addressed TABLES were created carrying: the principal that
+        // created a table holds Super on it, and the principals its database's table-level
+        // defaults name hold what that setting grants. Read from the Data Catalog here for
+        // the same reason, and with the same lock discipline, as the database defaults
+        // above — and not read at all for a listing narrowed to a resource type no table
+        // grant carries, which selects none of them (`crate::state::resource_types` maps
+        // both a table and a table-with-columns resource to `TABLE`).
+        let table_grants = if resource_type.is_none_or(|wanted| wanted == "TABLE") {
+            crate::state::created_table_grants(&*self.engine, &catalog_id, resource_filter.as_ref())
+        } else {
+            Vec::new()
+        };
+
         // "If both Principal and Resource parameters are provided, the response returns
         // effective permissions rather than the explicitly granted permissions." — this
         // operation's own documentation. Effective means what the principal holds through
@@ -304,9 +320,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // first, so an entry that carries both reports what was granted ahead of what the
         // database was created holding.
         //
-        // What this holds is bounded by the two stores it reads, neither of which a
+        // What this holds is bounded by the three stores it reads, none of which a
         // request can grow past its ceiling: `crate::state::MAX_PERMISSION_GRANTS` explicit
-        // records and the Data Catalog's own per-catalog database ceiling.
+        // records, the Data Catalog's own per-catalog database ceiling for the database
+        // defaults, and `crate::state::MAX_IMPLICIT_TABLE_GRANTS` for the table grants —
+        // the last of which bounds the PRODUCT of the tables addressed and the default
+        // permission entries each carries.
         let mut reported: std::collections::BTreeMap<String, crate::state::PermissionGrant> =
             std::collections::BTreeMap::new();
         for grant in store.permission_grants.values().filter(|g| selects(g)) {
@@ -315,6 +334,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (key, grant) in &default_grants {
             // A default a revoke took away is gone from both views: nothing was recorded
             // for it, so this memory of the revoke is what answers for it.
+            if store.revoked_default_grants.contains(key) || !selects(grant) {
+                continue;
+            }
+            crate::state::merge_reported_grant(&mut reported, grant, effective_for);
+        }
+        for (key, grant) in &table_grants {
+            // Revocable exactly like a database's default, and remembered the same way.
             if store.revoked_default_grants.contains(key) || !selects(grant) {
                 continue;
             }

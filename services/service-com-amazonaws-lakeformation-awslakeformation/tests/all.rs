@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/creator_table_grants.rs"]
+mod creator_table_grants;
 #[path = "all/data_cells_filters.rs"]
 mod data_cells_filters;
 #[path = "all/data_lake_settings.rs"]
@@ -33,3 +35,5 @@ mod revoke_default_grant;
 mod state_roundtrip;
 #[path = "all/table_column_scope.rs"]
 mod table_column_scope;
+#[path = "all/table_default_grants.rs"]
+mod table_default_grants;

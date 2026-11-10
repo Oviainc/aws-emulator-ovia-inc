@@ -9,11 +9,11 @@
 //! default, over the wire through the router that claims `lakeformation`, with its own
 //! dispatch harness the way every suite under `tests/all/` carries one.
 //!
-//! The tables span what the rule generalises over: the kind of resource (only a DATABASE
-//! is created carrying it — a table's default comes from its database's
-//! `CreateTableDefaultPermissions` in the Data Catalog, which this service's store does
-//! not hold), the principal, the permissions named, and whether the request is
-//! condition-scoped.
+//! The tables span what the rule generalises over: the kind of resource (a DATABASE is
+//! created carrying it from the account's data lake settings, and a TABLE from its
+//! database's own `CreateTableDefaultPermissions` in the Data Catalog — see the
+//! `table_default_grants.rs` suite), the principal, the permissions named, and whether the
+//! request is condition-scoped.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -117,10 +117,12 @@ async fn the_default_database_grant_is_revocable_exactly_once() {
 }
 
 #[tokio::test]
-async fn the_default_grant_covers_only_a_database_and_only_all_to_iam_allowed_principals() {
+async fn the_default_grant_covers_a_database_and_its_tables_and_only_all_to_iam_allowed_principals() {
     // Rows differ along every part of the default's identity: the kind of resource that is
     // created carrying it, the principal that holds it, the permissions it carries, and
-    // the condition it does not carry. Only the first row names the default itself.
+    // the condition it does not carry. The first two rows name a resource that carries it:
+    // the database, from the account's data lake settings, and its table, from the
+    // database's own `CreateTableDefaultPermissions`.
     let cases: Vec<DefaultGrantCase> = vec![
         (
             "a database, the principal and the permission of the default",
@@ -132,13 +134,13 @@ async fn the_default_grant_covers_only_a_database_and_only_all_to_iam_allowed_pr
             200,
         ),
         (
-            "a table, whose default comes from its database in the Data Catalog",
+            "a table, which carries what its database hands the tables created in it",
             json!({ "Table": { "DatabaseName": "sales", "Name": "orders" } }),
             IAM_ALLOWED_PRINCIPALS,
             vec!["ALL"],
             vec![],
             None,
-            400,
+            200,
         ),
         (
             "every table in a database",

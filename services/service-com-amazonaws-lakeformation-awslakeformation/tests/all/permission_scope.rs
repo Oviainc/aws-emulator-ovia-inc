@@ -24,7 +24,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // extractor.
 use crate::glue_catalog::{
     account_catalog as account, create_database, create_table, emulator, error_code,
-    lake_formation, revoke_default_database_grant,
+    lake_formation, revoke_default_database_grant, revoke_table_default_grants,
 };
 
 /// One row of the scope table: the case name, the resource granted on, the permissions
@@ -160,8 +160,10 @@ async fn a_grant_on_an_entity_the_catalog_does_not_hold_is_refused() {
     create_database(&router, "sales").await;
     create_table(&router, "sales", "orders").await;
     // The assertions below count the records the grants wrote, so the database's
-    // creation-time default grant is revoked first.
+    // creation-time default grant and the grants creating the table made (see
+    // `creator_table_grants.rs`) are revoked first.
     revoke_default_database_grant(&router, "sales").await;
+    revoke_table_default_grants(&router, "sales", "orders").await;
 
     // The third field is the entity kind the refusal must name: whichever of the two the
     // catalog could not resolve, the database first.
@@ -498,8 +500,10 @@ async fn a_column_scoped_grant_may_only_name_a_column_scoped_permission() {
     create_database(&router, "sales").await;
     create_table(&router, "sales", "orders").await;
     // One assertion below is that a refused grant persisted nothing, so the database's
-    // creation-time default grant is revoked first.
+    // creation-time default grant and the grants creating the table made (see
+    // `creator_table_grants.rs`) are revoked first.
     revoke_default_database_grant(&router, "sales").await;
+    revoke_table_default_grants(&router, "sales", "orders").await;
 
     let columns = json!({
         "TableWithColumns": {
@@ -719,6 +723,9 @@ async fn a_revoke_naming_the_table_reaches_both_scopes() {
         let router = emulator();
         create_database(&router, "sales").await;
         create_table(&router, "sales", "orders").await;
+        // The row counts the records its own grant wrote, so what creating the table
+        // granted is revoked first (see the `creator_table_grants.rs` suite).
+        revoke_table_default_grants(&router, "sales", "orders").await;
         let (status, body) = grant(&router, principal, &on_table, &["SELECT", "DESCRIBE"]).await;
         assert_eq!(
             status, 200,

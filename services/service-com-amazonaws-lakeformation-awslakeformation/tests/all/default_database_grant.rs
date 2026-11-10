@@ -27,7 +27,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // emulator, the Glue catalog writers and the `restJson1` wire path.
 use crate::glue_catalog::{
     account_catalog, create_database, create_database_with_input, create_table, emulator,
-    lake_formation as call,
+    lake_formation as call, revoke_table_default_grants,
 };
 
 /// The group the default grant names, spelled as Lake Formation spells it on the wire.
@@ -412,6 +412,11 @@ async fn the_default_grant_is_selected_by_exactly_the_filters_that_name_it() {
     let router = emulator();
     create_database(&router, "sales").await;
     create_table(&router, "sales", "orders").await;
+    // This suite is about the DATABASE-level default alone, so the grants creating the
+    // table made (see the `creator_table_grants.rs` suite) are revoked first and every
+    // count below
+    // is the default's own.
+    revoke_table_default_grants(&router, "sales", "orders").await;
 
     let cases: Vec<(&str, Value, usize)> = vec![
         ("no filter at all", json!({}), 1),

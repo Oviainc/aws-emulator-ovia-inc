@@ -399,6 +399,11 @@ fn a_permission_is_recorded_only_on_a_resource_the_data_catalog_holds() {
             // column-scoped permission beside a table one is held as two entries — the
             // table's own and the column-level one — and a table-filtered listing reports
             // both, which is what `ListPermissions$Resource` documents.
+            //
+            // This listing names a principal AND a resource, so it reports what that
+            // principal EFFECTIVELY holds: beside what the grant wrote, the table carries
+            // the default its database hands the tables created in it (`ALL` to the
+            // IAM-allowed group), which an IAM role holds through that group.
             let table =
                 json!({ "Table": { "DatabaseName": PRESENT_DATABASE, "Name": PRESENT_TABLE } });
             let (status, body) = lakeformation(
@@ -428,8 +433,18 @@ fn a_permission_is_recorded_only_on_a_resource_the_data_catalog_holds() {
                     Some((kind, permissions))
                 })
                 .collect();
-            assert!(
-                held.contains(&("Table".to_string(), vec!["DESCRIBE".to_string()])),
+            // The table's own entry carries what the grant wrote (`DESCRIBE`) beside the
+            // default its database hands the tables created in it (`ALL`), which this IAM
+            // role holds through the IAM-allowed group the default names.
+            let mut on_table: Vec<String> = held
+                .iter()
+                .filter(|(kind, _)| kind == "Table")
+                .flat_map(|(_, permissions)| permissions.clone())
+                .collect();
+            on_table.sort();
+            assert_eq!(
+                on_table,
+                vec!["ALL".to_string(), "DESCRIBE".to_string()],
                 "the table permission must be held on the table itself, got {body}"
             );
             assert!(

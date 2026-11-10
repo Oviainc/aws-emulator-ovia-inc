@@ -23,7 +23,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // emulator, the seeded catalog, the `restJson1` wire path and the error-code extractor.
 use crate::glue_catalog::{
     account_catalog, create_database, emulator, error_code, lake_formation as call,
-    revoke_default_database_grant,
+    revoke_default_database_grant, revoke_table_default_grants,
 };
 
 /// One row of the repeated-grant table: the case name, the permissions each successive
@@ -60,8 +60,19 @@ type PartialRevokeCase = (
 
 /// The Data Catalog this suite's rows grant on: the `sales` database with its `orders`
 /// and `returns` tables, seeded through the shared harness.
+///
+/// This suite counts the records its own grants wrote, so the grants creating the two
+/// tables made — their creator's and the database's table-level default — are revoked
+/// first, the same reason its rows revoke the database's creation-time default. Those
+/// grants are covered by the `creator_table_grants.rs` and `table_default_grants.rs`
+/// suites.
 async fn emulator_with_catalog() -> MultiServiceRouter {
-    crate::glue_catalog::emulator_with_catalog(&[("sales", &["orders", "returns"])]).await
+    let router =
+        crate::glue_catalog::emulator_with_catalog(&[("sales", &["orders", "returns"])]).await;
+    for table in ["orders", "returns"] {
+        revoke_table_default_grants(&router, "sales", table).await;
+    }
+    router
 }
 
 /// `GrantPermissions`, asserting it was accepted.

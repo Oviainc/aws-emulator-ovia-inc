@@ -23,6 +23,15 @@ use crate::ops::types::{
 /// buckets. See [`missing_grant_entity`].
 use ::service_com_amazonaws_glue_awsglue::state as glue_state;
 
+/// What a Data Catalog TABLE is created carrying — the grants its creation makes, beside
+/// the setting-driven [`default_database_grants`] — and how one of them is taken away.
+/// Re-exported, so a handler reaches both under `crate::state::` like every other part of
+/// this store.
+mod creator_table_grants;
+mod implicit_table_grants;
+pub use creator_table_grants::*;
+pub use implicit_table_grants::*;
+
 /// One registered data-lake location: the resource ARN Lake Formation manages, the IAM
 /// role it uses to reach it, and the registration flags the caller set.
 ///
@@ -670,10 +679,10 @@ pub fn create_database_default_principals(settings: &DataLakeSettings) -> Vec<St
 /// Why it stops at databases: the default a resource is created with comes from the
 /// account's data lake settings for a DATABASE
 /// (`DataLakeSettings$CreateDatabaseDefaultPermissions`), but for a TABLE it comes from
-/// the parent database's own `CreateTableDefaultPermissions` in the Data Catalog — which
-/// is another service's state and not readable from here — so a table holds nothing until
-/// something grants it. The database default is this service's own setting, so it is the
-/// one this store can answer for.
+/// the parent database's own `CreateTableDefaultPermissions` in the Data Catalog. The
+/// database default is this service's own setting, so it is the one this store can answer
+/// for. What a table was CREATED carrying — its creator's Super and the table-level
+/// defaults its database hands it — is rendered by [`created_table_grants`].
 ///
 /// It is rendered per request rather than written when the database is created, because
 /// this store never sees a database being created. The two calls that can change what it
@@ -750,10 +759,7 @@ pub fn default_database_grants<Eng: Send + Sync + 'static>(
                 return Vec::new();
             };
             (
-                match database.catalog_id.as_deref() {
-                    Some(id) if !id.is_empty() => id.to_string(),
-                    _ => catalog_id.to_string(),
-                },
+                resource_catalog(database.catalog_id.as_deref(), catalog_id),
                 Some(database.name.clone()),
             )
         }
@@ -818,6 +824,21 @@ pub fn default_database_grants<Eng: Send + Sync + 'static>(
         }
     }
     grants
+}
+
+/// The Data Catalog a resource member belongs to: the one it names, else the one the
+/// request addresses ("The identifier for the Data Catalog. By default, the account ID.",
+/// and "By default, it is the account ID of the caller" on the catalog id INSIDE a
+/// resource — `TableResource$CatalogId`).
+///
+/// The one definition of that rule, so the sites that apply it — a listing's rendering of
+/// what a resource was created carrying, and [`missing_grant_entity`]'s resolution of the
+/// entity a grant names — cannot drift on the empty-string case.
+pub fn resource_catalog(named: Option<&str>, default_catalog: &str) -> String {
+    match named.filter(|id| !id.is_empty()) {
+        Some(id) => id.to_string(),
+        None => default_catalog.to_string(),
+    }
 }
 
 /// The `arn:<partition>:iam::<account>:<type>/…` resource types that name an IAM
@@ -1669,10 +1690,7 @@ pub fn missing_grant_entity<Eng: Send + Sync + 'static>(
     default_catalog: &str,
 ) -> Option<String> {
     let in_catalog = |named: Option<&String>| -> String {
-        match named.map(String::as_str).filter(|id| !id.is_empty()) {
-            Some(id) => id.to_string(),
-            None => default_catalog.to_string(),
-        }
+        resource_catalog(named.map(String::as_str), default_catalog)
     };
 
     // The Data Catalog entity a database, table or table-with-columns resource names.

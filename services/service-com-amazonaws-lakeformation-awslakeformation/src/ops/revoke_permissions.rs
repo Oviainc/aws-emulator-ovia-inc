@@ -22,7 +22,11 @@
 //! remembered in `revoked_default_grants`, so the default is revocable exactly once while
 //! an explicit grant on the same resource is trimmed as usual. See
 //! [`crate::state::default_database_grant`] for what the default covers and why it stops
-//! at databases.
+//! at databases. The grants a TABLE was created carrying — its creator's Super and the
+//! table-level defaults its database hands it ([`crate::state::created_table_grants`]) —
+//! are not records
+//! either, and are taken away the same way — with what one of them still holds recorded,
+//! so a revoke of part of it leaves the rest in place.
 //!
 //! ## Shape of an operation
 //!
@@ -237,6 +241,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|expression| !expression.is_empty());
         let key = crate::state::grant_key(&catalog_id, principal, &resource, condition.as_deref());
 
+        // The grants the addressed TABLE was created carrying, which are not records
+        // either: its creator holds Super on it and its database's table-level defaults are
+        // held by the principals they name, at the scopes a table's permissions are held at
+        // (see [`crate::state::created_table_grants`]). Only this principal's are of
+        // interest
+        // here, and such a grant carries no condition, so a condition-scoped request
+        // addresses a different grant. Read BEFORE this service's store is locked: the
+        // helper takes Glue's lock itself.
+        let table_grants: Vec<(String, crate::state::PermissionGrant)> = match &condition {
+            Some(_) => Vec::new(),
+            None => {
+                crate::state::created_table_grants(&*self.engine, &catalog_id, Some(&resource))
+                    .into_iter()
+                    .filter(|(_, grant)| grant.principal == principal)
+                    .collect()
+            }
+        };
+
         // A revoke takes away what the matching GRANT wrote, so it is split the same way:
         // a table's column-scoped permissions were recorded against that table's
         // `TableWithColumns` key, and naming the TABLE has to reach them (see
@@ -296,9 +318,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             // The default grant carries no grant option, so only a record can hold one.
-            let held_with_grant_option: Vec<String> = held
+            let mut held_with_grant_option: Vec<String> = held
                 .map(|grant| grant.permissions_with_grant_option.clone())
                 .unwrap_or_default();
+            // A table holds what its creation granted on top of whatever was granted
+            // explicitly, at this scope, unless a revoke already took it away.
+            if !store.revoked_default_grants.contains(scoped_key) {
+                if let Some(implicit) =
+                    crate::state::implicit_grant_for(&table_grants, scoped_key)
+                {
+                    held_permissions.extend(implicit.permissions.iter().cloned());
+                    held_with_grant_option
+                        .extend(implicit.permissions_with_grant_option.iter().cloned());
+                }
+            }
             missing.extend(crate::state::missing_permissions(
                 &held_permissions,
                 permissions,
@@ -341,6 +374,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.revoked_default_grants.insert(key.clone());
         }
 
+        // A grant a table was created carrying is taken away the same way — remembered as
+        // gone, keyed exactly as the listing renders it — and whatever it still holds
+        // becomes a record, so a revoke of one permission leaves the others in place.
+        let revokes_implicit =
+            crate::state::revoke_implicit_grants(&mut store, &table_grants, &scoped)
+                .map_err(invalid)?;
+
         // Counted per record, symmetrically with the grant path's
         // `records_inserted` / `records_updated`: a revoke can trim one scope and empty
         // another, and a revoke of a default grant trims no record at all.
@@ -376,6 +416,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             records_removed = removed,
             records_reduced = reduced,
             default_grant_revoked = revokes_default,
+            implicit_grant_revoked = revokes_implicit,
             "Lake Formation permissions revoked"
         );
 
