@@ -26,7 +26,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::directory_lifecycle::PAST_ONE_SPAN;
+use crate::directory_lifecycle::{PAST_ONE_SPAN, PAST_ONE_SPAN_ONLY};
 use crate::harness::{call, ok, service, string};
 use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 
@@ -340,7 +340,9 @@ async fn a_torn_down_trust_settles_on_deleted_before_it_leaves_the_service() {
             json!(state),
             "case {case:?}: expected {state}, got {reported}"
         );
-        tokio::time::sleep(PAST_ONE_SPAN).await;
+        // One span at a time, so the state the teardown settles on is read BEFORE the
+        // next transition it owes takes the relationship out of the service.
+        tokio::time::sleep(PAST_ONE_SPAN_ONLY).await;
     }
 
     // One span past `Deleted` the relationship is gone from this service: resolving it by

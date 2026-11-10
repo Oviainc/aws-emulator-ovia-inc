@@ -177,6 +177,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
+        // A tag write changes a directory that is already there, so it needs one that has
+        // finished being built: THE one guard both tag writes read the stage through, so
+        // neither removes a tag from a directory the other could not add one to.
+        if let Some(defect) = crate::state::tag_stage_defect(&directory.stage) {
+            return Err(RemoveTagsFromResourceErrorModeled::ClientException(
+                crate::state::refusal(defect),
+            )
+            .into());
+        }
+
         for key in &input.tag_keys {
             directory.tags.remove(key);
         }

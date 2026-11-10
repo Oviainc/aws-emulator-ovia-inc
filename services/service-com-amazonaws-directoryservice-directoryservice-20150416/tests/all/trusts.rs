@@ -29,7 +29,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::conditional_forwarders::{domain_of_length, REMOTE_DOMAIN_NAME_MAX_LEN};
-use crate::directory_lifecycle::{create_directory, minimal_create, PAST_ONE_SPAN};
+use crate::directory_lifecycle::{
+    create_directory, minimal_create, PAST_ONE_SPAN, PAST_ONE_SPAN_ONLY,
+};
 use crate::harness::{call, ok, refused, service, string};
 use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 
@@ -989,8 +991,9 @@ async fn deleting_a_trust_tears_it_down_and_takes_the_asked_for_forwarder() {
     // Once the teardown has fallen due, the relationship carries the settled `Deleted`
     // state of the modelled enum — still reported, so a caller polling the teardown sees
     // how it ended — and one span later it is gone from this service altogether: in no
-    // listing, and resolving it by id reports that it does not exist.
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    // listing, and resolving it by id reports that it does not exist. One span at a time,
+    // so the settled state is read before the transition that takes it away.
+    tokio::time::sleep(PAST_ONE_SPAN_ONLY).await;
     let torn_down = describe(&router, json!({}), "after the teardowns fell due").await;
     for (case, trust_id, _) in &deleted {
         let reported = torn_down

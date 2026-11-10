@@ -26,9 +26,12 @@
 //! and gives each controller an address out of its own subnet's CIDR block — the addresses
 //! `DescribeDirectories` reports as `DnsIpAddrs`.
 //!
-//! The directory is persisted in the modelled `Requested` stage with the move to
-//! `Active` owed by the clock one [`crate::state::TRANSITION_SPAN`] later, so a caller
-//! that describes it immediately still sees the transient stage.
+//! The directory is persisted in the modelled `Requested` stage, and the stage the create
+//! owes is the CHAIN a build goes through: `Creating` once
+//! [`crate::state::TRANSITION_SPAN`] has elapsed, and `Active` only once the directory's
+//! servers are up, one [`crate::state::DIRECTORY_BUILD_SPAN`] later — so a caller that
+//! polls the create observes the stage its domain controllers are coming up in, and every
+//! operation that needs the directory in service is refused until then.
 //!
 //! ## Shape of an operation
 //!
@@ -209,6 +212,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::MICROSOFT_AD_EDITIONS.join(", ")
                 )));
             }
+        }
+
+        // The create makes the directory's administrator account, so the password it is
+        // called with has to meet the directory's own password policy — which is more
+        // than the modelled `Password` pattern expresses. Checked before anything is
+        // resolved or stored, so a refused password creates no directory.
+        if let Some(defect) = crate::state::administrator_password_defect(&input.password) {
+            return Err(invalid_parameter(defect.to_string()));
         }
 
         // A directory's servers are placed in two subnets in two different Availability
@@ -394,8 +405,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // requested VPC settings, each still `Creating` until the transition this create
         // owes falls due. `DescribeDomainControllers` reports them, and
         // `DesiredNumberOfDomainControllers` above is how many there are.
+        // They are the servers the directory is MADE OF, so they are in service when the
+        // directory itself is: the stage chain reaches `Active` at the same instant they
+        // do, never before.
         let desired = usize::try_from(crate::state::MICROSOFT_AD_DOMAIN_CONTROLLERS).unwrap_or(0);
-        store.place_domain_controllers(&directory_id, desired, now);
+        store.place_domain_controllers(
+            &directory_id,
+            desired,
+            now,
+            crate::state::directory_active_at(now),
+        );
 
         // Read the id back out of the store, so the response cannot name a directory
         // the insert did not persist.

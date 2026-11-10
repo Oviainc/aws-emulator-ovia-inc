@@ -19,11 +19,10 @@
 //! record; and the account quota at its published bound and one past it.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::directory_lifecycle::PAST_ONE_SPAN;
 use crate::harness::{call, ok, refused, service, string};
 
 /// A password satisfying the modelled `Password` pattern, so the `CreateDirectory`
@@ -47,10 +46,6 @@ const REPORT_TYPE_CUSTOMER: &str = "CUSTOMER";
 /// The account quota `StartADAssessment`'s documentation states: "Your Amazon Web
 /// Services account has a limit of 100 CUSTOMER directory assessments."
 const ASSESSMENT_QUOTA: usize = 100;
-
-/// Comfortably longer than one clock-owed transition span, with margin for a loaded
-/// test machine.
-const PAST_ONE_SPAN: Duration = Duration::from_millis(900);
 
 /// The modelled `AssessmentId` pattern, `^da-[0-9a-f]{18}$`, as an assertion.
 fn assert_assessment_id(id: &str, case: &str) {

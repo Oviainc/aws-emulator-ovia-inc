@@ -117,6 +117,42 @@ pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
 /// The stage a directory is in between `CreateDirectory` and [`TRANSITION_SPAN`].
 pub const STAGE_REQUESTED: &str = "Requested";
 
+/// The stage a directory is in while its servers are being built: the `Creating` value of
+/// the modelled `DirectoryStage` enum
+/// (`smithy_query(query="shape",shape="DirectoryStage")`).
+///
+/// A create does NOT hand back a directory that is in service: the request is accepted
+/// ([`STAGE_REQUESTED`]) and the directory then sits in THIS stage for as long as the
+/// servers it is made of take to come up, reaching [`STAGE_ACTIVE`] only once they are.
+/// So the stage a create owes is a CHAIN rather than one step, and every stage-gated
+/// operation of a fresh directory is refused from this stage, which is the one a caller
+/// polling a create actually observes (`advance_clock` materialises both steps).
+pub const STAGE_CREATING: &str = "Creating";
+
+/// How long a created directory is reported [`STAGE_CREATING`] before it reaches
+/// [`STAGE_ACTIVE`].
+///
+/// Its own span rather than [`TRANSITION_SPAN`]: this is the window the directory's
+/// servers come up in — Directory Service documents the build of a Managed Microsoft AD
+/// directory as taking 20 to 45 minutes — and it is the stage a caller that polls a create
+/// spends that whole build in, so it has to be observable by a client that polls at human
+/// intervals rather than within one request. Compressed to the few seconds the project's
+/// emulator contract allows a clock-owed transition, and the same for every directory
+/// type: all of them answer their create before their servers exist.
+pub const DIRECTORY_BUILD_SPAN: Duration = Duration::from_secs(3);
+
+/// The instant a directory whose create ran at `now` reaches [`STAGE_ACTIVE`]: the end of
+/// the chain that create owes, [`TRANSITION_SPAN`] in [`STAGE_REQUESTED`] followed by
+/// [`DIRECTORY_BUILD_SPAN`] in [`STAGE_CREATING`].
+///
+/// What it is for: the servers a create PLACES are in service when the directory they
+/// belong to is, so a create reads the instant its own directory settles on from here
+/// rather than restating the chain.
+#[must_use]
+pub fn directory_active_at(now: SystemTime) -> SystemTime {
+    now + TRANSITION_SPAN + DIRECTORY_BUILD_SPAN
+}
+
 /// The `IpRouteStatusMsg` an address block carries between `AddIpRoutes` and
 /// [`TRANSITION_SPAN`]: the first value of the modelled `IpRouteStatusMsg` enum.
 ///
@@ -3403,15 +3439,26 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// in one subnet never share one — and those addresses are what the directory serves
     /// DNS at ([`Directory::dns_ip_addrs`]). Each one is placed in
     /// [`DOMAIN_CONTROLLER_STATUS_CREATING`] with the move to
-    /// [`DOMAIN_CONTROLLER_STATUS_ACTIVE`] owed by the clock one [`TRANSITION_SPAN`]
-    /// later, so a caller that describes them immediately still sees the transient
-    /// status.
+    /// [`DOMAIN_CONTROLLER_STATUS_ACTIVE`] owed by the clock at `ready_at`, so a caller
+    /// that describes them immediately still sees the transient status.
+    ///
+    /// `ready_at` is the instant the controllers are in service, which the caller owns
+    /// because it differs by what placed them: the controllers a CREATE places are the
+    /// servers the directory is made of, so they are ready when the directory itself is
+    /// ([`directory_active_at`]), while a resize of a directory already in service adds a
+    /// controller on its own [`TRANSITION_SPAN`].
     ///
     /// The directory is never left holding more than
     /// [`MAX_DOMAIN_CONTROLLERS_PER_DIRECTORY`] — the count is clamped against what the
     /// directory already holds — and nothing is placed for an id that names no stored
     /// directory: there is nothing to place controllers in.
-    pub fn place_domain_controllers(&mut self, directory_id: &str, count: usize, now: SystemTime) {
+    pub fn place_domain_controllers(
+        &mut self,
+        directory_id: &str,
+        count: usize,
+        now: SystemTime,
+        ready_at: SystemTime,
+    ) {
         let Some(directory) = self.directories.get(directory_id) else {
             return;
         };
@@ -3449,7 +3496,7 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                 subnet_id,
                 dns_ip_addr,
                 status: DOMAIN_CONTROLLER_STATUS_CREATING.to_string(),
-                status_due_at: Some(now + TRANSITION_SPAN),
+                status_due_at: Some(ready_at),
                 launch_time: now,
                 status_last_updated: now,
                 seq,
@@ -3536,11 +3583,29 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// ran, a domain controller's status when the placement or the retirement of it ran.
     pub fn advance_clock(&mut self, now: SystemTime) {
         for directory in self.directories.values_mut() {
-            if let Some(due) = directory.stage_due_at {
-                if now >= due {
-                    directory.stage = STAGE_ACTIVE.to_string();
-                    directory.stage_last_updated = due;
-                    directory.stage_due_at = None;
+            // The stage a create owes is a CHAIN — `Requested`, then `Creating` for the
+            // build window, then `Active` — so every step the clock has already made due
+            // is materialised here, however long ago the create ran. Each step stores the
+            // next step's due instant, so the chain is driven by the create's own clock
+            // and not by this call, and ONLY the two stages of that chain are advanced: a
+            // directory in any other stage keeps it, so no future transient stage of the
+            // modelled enum can be taken for the end of this one.
+            while let Some(due) = directory.stage_due_at {
+                if now < due {
+                    break;
+                }
+                match directory.stage.as_str() {
+                    STAGE_REQUESTED => {
+                        directory.stage = STAGE_CREATING.to_string();
+                        directory.stage_last_updated = due;
+                        directory.stage_due_at = Some(due + DIRECTORY_BUILD_SPAN);
+                    }
+                    STAGE_CREATING => {
+                        directory.stage = STAGE_ACTIVE.to_string();
+                        directory.stage_last_updated = due;
+                        directory.stage_due_at = None;
+                    }
+                    _ => break,
                 }
             }
             // The status transition an `AddRegion` owes: the replication it starts answers

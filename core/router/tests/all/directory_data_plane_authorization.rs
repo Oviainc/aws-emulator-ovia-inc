@@ -29,6 +29,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_directoryservice_directoryservice_20150416::state::{
+    DIRECTORY_BUILD_SPAN, TRANSITION_SPAN,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request here is signed for.
@@ -52,10 +55,14 @@ const IAM_AUTH: &str = "IAM_AUTH";
 /// suite ever mints, varied along their digits.
 const UNCREATED_DIRECTORIES: [&str; 3] = ["d-0000000000", "d-ffffffffff", "d-5e9207cba4"];
 
-/// Past one of the control plane's transition spans: a create answers before the directory
-/// is in service and the data-access toggle answers before the feature has moved, and the
-/// clock — not a later call — settles both.
-pub(super) const PAST_ONE_SPAN: Duration = Duration::from_millis(700);
+/// Past the control plane's clock-owed spans: a create answers before the directory is in
+/// service — it is `Requested`, then `Creating` while its servers come up — and the
+/// data-access toggle answers before the feature has moved, and the clock, not a later
+/// call, settles all of them. Derived from the spans the control plane publishes, so a
+/// change to either moves this wait with it.
+pub(super) const PAST_ONE_SPAN: Duration = TRANSITION_SPAN
+    .saturating_add(DIRECTORY_BUILD_SPAN)
+    .saturating_add(Duration::from_millis(400));
 
 type DirectoryService =
     service_com_amazonaws_directoryservice_directoryservice_20150416::EmulatedService<

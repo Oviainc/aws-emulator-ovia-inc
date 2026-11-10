@@ -176,11 +176,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Deactivating LDAP secure calls changes the directory's own security
         // configuration, so it needs a directory that is in service, exactly as
-        // activating it does. The diagnostic is this service's shared one for a directory
-        // a call cannot reach: the requested id and nothing about the stage it is in.
+        // activating it does — and is refused with the same sentence the LDAPS family
+        // states: the requested id and what the directory is not available FOR.
         if directory.stage != crate::state::STAGE_ACTIVE {
             return Err(DisableLDAPSErrorModeled::DirectoryUnavailableException(
-                crate::state::refusal(crate::state::directory_unavailable(&input.directory_id)),
+                crate::state::refusal(crate::state::ldaps_directory_unavailable(
+                    &input.directory_id,
+                )),
             )
             .into());
         }

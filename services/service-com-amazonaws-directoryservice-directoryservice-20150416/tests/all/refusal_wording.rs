@@ -12,12 +12,14 @@
 //! recorded call:
 //!
 //! * a call that needs a directory IN SERVICE and finds one that is not is refused with
-//!   `DirectoryUnavailableException` whose diagnostic is this service's shared sentence
-//!   for a directory a call cannot reach — the quoted id the request asked for, then "does
-//!   not exist.", then the request-id suffix — so the refusal reads exactly like the one
-//!   the same id gets when it resolves to no directory at all, and discloses nothing about
-//!   where in its build the directory is. Once the transition the create owed has fallen
-//!   due, the same call is no longer refused that way, so the branch follows stored state.
+//!   `DirectoryUnavailableException` whose diagnostic is the sentence Directory Service
+//!   states that failure in — the operation it could not perform, the unquoted id the
+//!   request asked for and the fact that the directory is unavailable, then the request-id
+//!   suffix — which is a DIFFERENT sentence from the one the same id gets when it resolves
+//!   to no directory at all, so a client can tell a directory that is not there from one
+//!   that is not ready, while neither sentence discloses where in its build the directory
+//!   is. Once the stage chain the create owed has run out, the same call is no longer
+//!   refused that way, so the branch follows stored state.
 //! * a value outside an enumerated type's value set is refused with the boundary's
 //!   `ValidationException`, whose remediation hint lists that enum's admissible WIRE
 //!   VALUES in the order this service lists them — descending — and not in the order the
@@ -127,9 +129,18 @@ fn unavailable_rows(certificate: &str) -> Vec<UnavailableCase> {
     ]
 }
 
-/// The sentence this service states for a directory a call cannot reach, with the request
-/// id the answer itself reported appended — the shape every refusal of this service's
-/// lookup family carries.
+/// The sentence this service states for a directory that is stored but not in service,
+/// with the request id the answer itself reported appended — the shape every refusal of
+/// this service's unavailable family carries.
+fn unavailable_directory(directory_id: &str, request_id: &str) -> String {
+    format!(
+        "Operation could not be performed because directory {directory_id} is unavailable. : \
+         RequestId: {request_id}"
+    )
+}
+
+/// The sentence this service states for an id that resolves to NO directory, with the same
+/// suffix — the lookup family's wording, which the unavailable one above is not.
 fn unreachable_directory(directory_id: &str, request_id: &str) -> String {
     format!("Directory: '{directory_id}' does not exist. : RequestId: {request_id}")
 }
@@ -143,7 +154,7 @@ fn request_id(parsed: &Value, case: &str) -> String {
 }
 
 #[tokio::test]
-async fn a_directory_that_is_not_in_service_is_refused_with_the_shared_lookup_sentence() {
+async fn a_directory_that_is_not_in_service_is_refused_with_the_unavailable_sentence() {
     // `RegisterCertificate` reads its `CertificateData` before it resolves the directory,
     // so that row carries a real certificate (the sibling suite's builder).
     let (certificate, _) = certificate_pem(Some("unavailable.example.com"), (2032, 7, 7));
@@ -178,13 +189,13 @@ async fn a_directory_that_is_not_in_service_is_refused_with_the_shared_lookup_se
         let reported = request_id(&parsed, &case);
         assert_eq!(
             message(&parsed, &case),
-            unreachable_directory(&directory_id, &reported),
-            "case {case:?}: expected the shared unreachable-directory sentence, got {parsed}"
+            unavailable_directory(&directory_id, &reported),
+            "case {case:?}: expected the unavailable-directory sentence, got {parsed}"
         );
 
-        // The same call against an id that resolves to NO directory is refused with the
-        // same sentence: which of the two it was is not disclosed, so the stage cannot be
-        // read out of the diagnostic.
+        // The same call against an id that resolves to NO directory is refused in the
+        // LOOKUP family's sentence instead: the two failures are worded differently, so a
+        // client can tell them apart — and neither says where in its build a directory is.
         let absent_case = format!("{} on an id naming no directory", row.case);
         let (absent_status, absent) =
             call(&router, row.operation, (row.body)(ABSENT_DIRECTORY_ID)).await;
@@ -196,7 +207,7 @@ async fn a_directory_that_is_not_in_service_is_refused_with_the_shared_lookup_se
         assert_eq!(
             message(&absent, &absent_case),
             unreachable_directory(ABSENT_DIRECTORY_ID, &absent_reported),
-            "case {absent_case:?}: expected the same sentence for an absent id, got {absent}"
+            "case {absent_case:?}: expected the lookup sentence for an absent id, got {absent}"
         );
 
         // The refusal was about the directory being out of service, so once the

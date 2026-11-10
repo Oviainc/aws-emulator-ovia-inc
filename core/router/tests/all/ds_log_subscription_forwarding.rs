@@ -23,6 +23,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_directoryservice_directoryservice_20150416::state::{
+    DIRECTORY_BUILD_SPAN, TRANSITION_SPAN,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every request here is signed for.
@@ -42,7 +45,9 @@ const LOGS_TARGET_PREFIX: &str = "Logs_20140328";
 /// Past the span a directory's create-owed transitions take to fall due, so the directory
 /// is in service with its domain controllers up — the state a security log is forwarded
 /// from.
-const PAST_ONE_SPAN: Duration = Duration::from_millis(900);
+const PAST_ONE_SPAN: Duration = TRANSITION_SPAN
+    .saturating_add(DIRECTORY_BUILD_SPAN)
+    .saturating_add(Duration::from_millis(400));
 
 /// The log group the account creates for its directory's security logs.
 const LOG_GROUP: &str = "/aws/directoryservice/sim2real";

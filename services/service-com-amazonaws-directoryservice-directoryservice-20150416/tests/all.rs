@@ -39,6 +39,8 @@ mod conditional_forwarder_deletion;
 mod conditional_forwarder_update;
 #[path = "all/conditional_forwarders.rs"]
 mod conditional_forwarders;
+#[path = "all/directory_build_stages.rs"]
+mod directory_build_stages;
 #[path = "all/directory_data_access.rs"]
 mod directory_data_access;
 #[path = "all/directory_data_access_disable.rs"]

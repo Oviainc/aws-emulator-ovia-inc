@@ -236,9 +236,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // directory already runs changes none of them.
         let current = directory.domain_controllers.len();
         match desired.cmp(&current) {
-            ::std::cmp::Ordering::Greater => {
-                store.place_domain_controllers(&input.directory_id, desired - current, now)
-            }
+            ::std::cmp::Ordering::Greater => store.place_domain_controllers(
+                &input.directory_id,
+                desired - current,
+                now,
+                // A controller added to a directory that is already in service comes up
+                // on its own span: the directory it joins is not being built.
+                now + crate::state::TRANSITION_SPAN,
+            ),
             ::std::cmp::Ordering::Less => {
                 store.retire_domain_controllers(&input.directory_id, current - desired, now)
             }

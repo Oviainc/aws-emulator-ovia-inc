@@ -25,9 +25,11 @@
 //! modelled `InvalidParameterException` ([`crate::state::subnet_pair_defect`]) before
 //! anything is persisted.
 //!
-//! The connector is persisted in the modelled `Requested` stage with the move to `Active`
-//! owed by the clock one [`crate::state::TRANSITION_SPAN`] later, so a caller that
-//! describes it immediately still sees the transient stage.
+//! The connector is persisted in the modelled `Requested` stage, and the stage this create
+//! owes is the same CHAIN every directory build goes through: `Creating` once
+//! [`crate::state::TRANSITION_SPAN`] has elapsed, and `Active` one
+//! [`crate::state::DIRECTORY_BUILD_SPAN`] later, so a caller that polls the create sees
+//! the stage the build happens in.
 //!
 //! ## Shape of an operation
 //!

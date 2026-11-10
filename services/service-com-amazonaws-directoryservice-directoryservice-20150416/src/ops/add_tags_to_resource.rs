@@ -173,6 +173,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
+        // A tag write changes a directory that is already there, so it needs one that has
+        // finished being built: a directory still coming up does not serve it, and
+        // Directory Service reports that as a call its subject's STATE does not support,
+        // naming the stage the directory is actually in. Decided before the merge below,
+        // so a refused call stores nothing.
+        if let Some(defect) = crate::state::tag_stage_defect(&directory.stage) {
+            return Err(
+                AddTagsToResourceErrorModeled::ClientException(crate::state::refusal(defect))
+                    .into(),
+            );
+        }
+
         // The merged map is sized BEFORE anything is written, so a merge that would
         // take the stored map past the limit leaves the stored tags exactly as they
         // were. Both operands are already bounded by `MAX_TAGS`, the request's list by

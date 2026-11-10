@@ -247,10 +247,15 @@ async fn the_certificate_refusals_state_their_error_classes_own_sentences() {
             "The certificate has already been registered into the system.".to_string(),
         ),
         (
+            // The invalid-certificate refusal names the registration it could not perform
+            // and the directory the request named it for.
             "data that is not a certificate",
             "RegisterCertificate",
             json!({ "DirectoryId": &directory_id, "CertificateData": "not a certificate" }),
-            "The certificate PEM that was provided has incorrect encoding.".to_string(),
+            format!(
+                "Certificate is not valid. Could not register the certificate with the \
+                 directory {directory_id}"
+            ),
         ),
         (
             // The not-found refusal is the one of this family that names both ids the

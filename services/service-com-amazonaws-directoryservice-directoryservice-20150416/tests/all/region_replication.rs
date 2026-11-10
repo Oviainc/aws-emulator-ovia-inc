@@ -258,8 +258,8 @@ async fn active_directory(emulator: &Emulator, name: &str, edition: Option<&str>
         .as_str()
         .unwrap_or_else(|| panic!("case {name:?}: expected a DirectoryId, got {answer}"))
         .to_string();
-    // The stage transition the create owes falls due on its own.
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    // The stage chain the create owes falls due on its own.
+    tokio::time::sleep(crate::directory_lifecycle::PAST_ONE_SPAN).await;
     id
 }
 
@@ -793,7 +793,7 @@ async fn a_replication_is_recorded_and_the_refusals_follow_from_the_store() {
     )
     .await;
     let simple = simple["DirectoryId"].as_str().unwrap_or_default().to_string();
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    tokio::time::sleep(crate::directory_lifecycle::PAST_ONE_SPAN).await;
     rows.push((
         "a Simple AD directory".to_string(),
         add_region(&simple, OTHER_REGION),

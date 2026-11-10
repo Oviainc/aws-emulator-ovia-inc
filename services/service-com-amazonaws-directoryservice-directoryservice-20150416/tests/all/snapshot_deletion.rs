@@ -28,6 +28,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::directory_lifecycle::PAST_ONE_SPAN;
 use crate::harness::{call, call_raw, ok, refused, service, string};
 
 /// A password satisfying the modelled `Password` pattern, so the create requests these
@@ -44,10 +45,6 @@ const STATUS_COMPLETED: &str = "Completed";
 /// Directory Service's default quota "Manual snapshots: 5" per directory, the bound
 /// `GetSnapshotLimits` reports as `SnapshotLimits$ManualSnapshotsLimit`.
 const MANUAL_SNAPSHOT_QUOTA: usize = 5;
-
-/// Comfortably longer than one clock-owed transition span, with margin for a loaded
-/// test machine.
-const PAST_ONE_SPAN: std::time::Duration = std::time::Duration::from_millis(900);
 
 /// Well-formed `SnapshotId`s (`^s-[0-9a-f]{10}$`) that are never created: the all-zero
 /// and all-f ends of the pattern's value space, plus two mixed spellings in between.

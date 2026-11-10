@@ -163,12 +163,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The certificate is decoded BEFORE the store is reached, so nothing
         // caller-sized is parsed under the lock and a PEM this emulator cannot read is
-        // refused the same way whether or not the id names a stored directory. The
-        // modelled `InvalidCertificateException` is exactly this failure: "The
-        // certificate PEM that was provided has incorrect encoding."
+        // refused the same way whether or not the id names a stored directory — and
+        // before the directory's stage is looked at, so data that is not a certificate is
+        // reported as such whatever state the directory is in. The modelled
+        // `InvalidCertificateException` is exactly this failure, stated as Directory
+        // Service words it: the registration it could not perform, for the directory the
+        // request named.
         let parsed = crate::state::parse_certificate(&input.certificate_data).ok_or_else(|| {
             RegisterCertificateErrorModeled::InvalidCertificateException(crate::state::refusal(
-                crate::state::CERTIFICATE_ENCODING_INVALID,
+                crate::state::certificate_not_valid(&input.directory_id),
             ))
         })?;
 

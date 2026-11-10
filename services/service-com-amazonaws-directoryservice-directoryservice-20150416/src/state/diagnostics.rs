@@ -50,16 +50,34 @@ pub fn invalid_directory_ids(directory_ids: &[String]) -> String {
 }
 
 /// The `DirectoryUnavailableException` message for a directory that is stored but is not
-/// in service yet. Shared so every operation that needs a directory in service says the
-/// same thing about the same failure.
+/// in service. Shared so every operation that needs a directory in service — and whose
+/// family states no sentence of its own — says the same thing about the same failure.
 ///
-/// Directory Service states this refusal with the SAME sentence it states for an id that
-/// resolves to no directory at all ([`no_such_directory`]): the quoted id the request
-/// asked for, then "does not exist." It reports nothing about where in its build the
-/// directory is, so the diagnostic discloses no internal provisioning state and a caller
-/// cannot read one out of the message. [`refusal`] appends the request id, once.
+/// Directory Service words this one as the operation it could not perform, the directory
+/// the request named (UNQUOTED) and the fact that refused it: that the directory is
+/// unavailable. It reports nothing about WHERE in its build the directory is, so the
+/// diagnostic discloses no internal provisioning state and a caller cannot read one out of
+/// the message. It is NOT [`no_such_directory`], the sentence for an id that resolves to no
+/// directory at all: a caller that branches on the message must be able to tell a directory
+/// that is not there from one that is not ready. [`refusal`] appends the request id, once.
+///
+/// Some families state their own sentence for the same failure, and those say it rather
+/// than this one: [`ldaps_directory_unavailable`] for the LDAPS settings, and
+/// [`stage_defect`] for a call whose refusal names the stage it needs.
 pub fn directory_unavailable(directory_id: &str) -> String {
-    no_such_directory(directory_id)
+    format!("Operation could not be performed because directory {directory_id} is unavailable.")
+}
+
+/// The `DirectoryUnavailableException` message the LDAPS settings of a directory that is
+/// not in service are refused with.
+///
+/// Directory Service words this one in terms of what the directory is not available FOR —
+/// the quoted id the request named, then that it is not available for an LDAPS operation —
+/// so `EnableLDAPS` and `DisableLDAPS` state it rather than the family-neutral
+/// [`directory_unavailable`], and both state it the same way. [`refusal`] appends the
+/// request id, once.
+pub fn ldaps_directory_unavailable(directory_id: &str) -> String {
+    format!("Directory: '{directory_id}' is not available for LDAPS operation.")
 }
 
 /// The stages a mutation of a directory's conditional forwarders is served in.
@@ -112,6 +130,44 @@ pub fn stage_defect(action: &str, directory_id: &str, required: &[&str]) -> Stri
     )
 }
 
+/// The stages a tag write of a directory is served in.
+///
+/// `AddTagsToResource` and `RemoveTagsFromResource` change a directory that is already
+/// there, so Directory Service admits them once the directory has finished being built:
+/// [`STAGE_ACTIVE`], and [`STAGE_IMPAIRED`] with it — a degraded directory still carries
+/// its own tags.
+pub const TAG_SERVING_STAGES: [&str; 2] = [STAGE_ACTIVE, STAGE_IMPAIRED];
+
+/// Why the directory in `stage` cannot serve a tag write, or `None` when it can.
+///
+/// THE one guard the tag writes read the directory's stage through, so `AddTagsToResource`
+/// and `RemoveTagsFromResource` refuse a directory that is still being built the same way:
+/// Directory Service reports such a call as one its subject's state does not support
+/// ([`unsupported_in_stage`]), under the modelled `ClientException` both operations
+/// declare, rather than as the directory being unreachable ([`directory_unavailable`]) or
+/// as a parameter of the call being wrong.
+pub fn tag_stage_defect(stage: &str) -> Option<String> {
+    if TAG_SERVING_STAGES.contains(&stage) {
+        return None;
+    }
+    Some(unsupported_in_stage(stage))
+}
+
+/// The sentence Directory Service states a call its subject's STATE does not support in:
+/// that the operation is not supported for a directory in this state, then the status the
+/// directory is actually in.
+///
+/// The fixed text is the rule, and the one variable part is read from the STORE — the
+/// stage the directory is in when the call arrives — so a caller polling a create is told
+/// which state refused it and can wait for the one that serves it. [`refusal`] appends the
+/// request id, once.
+pub fn unsupported_in_stage(stage: &str) -> String {
+    format!(
+        "The operation is not supported for directories in this state. Directory Status: \
+         {stage}"
+    )
+}
+
 /// The stages an alias assignment is served in: [`STAGE_ACTIVE`] alone.
 ///
 /// `CreateAlias` creates "an alias for a directory and assigns the alias to the
@@ -144,6 +200,37 @@ pub fn alias_stage_defect(directory_id: &str, stage: &str) -> Option<String> {
 
 /// The action `CreateAlias` states in that refusal, as its own name says it.
 pub(super) const ALIAS_ACTION_CREATE: &str = "create alias";
+
+/// The stages a password reset is served in: [`STAGE_ACTIVE`] alone.
+///
+/// A password is set in the directory's own domain, so `ResetUserPassword` needs a
+/// directory whose domain is serving: it is refused for as long as the directory is still
+/// being built.
+pub const PASSWORD_RESET_SERVING_STAGES: [&str; 1] = [STAGE_ACTIVE];
+
+/// Why the directory in `stage` cannot serve a password reset, or `None` when it can.
+///
+/// Directory Service states this refusal in the stage-gate family's wording
+/// ([`stage_defect`]) rather than the family-neutral [`directory_unavailable`] one: the
+/// action it could not perform, the directory the request named and the stage that action
+/// needs — so a caller is told to wait for the stage the reset is served in. The error
+/// class is still the modelled `DirectoryUnavailableException`: the request is well formed
+/// and the directory is simply not ready.
+pub fn password_reset_stage_defect(directory_id: &str, stage: &str) -> Option<String> {
+    if PASSWORD_RESET_SERVING_STAGES.contains(&stage) {
+        return None;
+    }
+    Some(stage_defect(
+        PASSWORD_RESET_ACTION,
+        directory_id,
+        &PASSWORD_RESET_SERVING_STAGES,
+    ))
+}
+
+/// The action `ResetUserPassword` states in that refusal, as the operation's own
+/// documentation says it ("Resets the password for any user in your Managed Microsoft AD
+/// or Simple AD directory").
+pub(super) const PASSWORD_RESET_ACTION: &str = "reset user password";
 
 /// The `UnsupportedOperationException` message for a multi-Region call on a directory that
 /// does not replicate across Regions.
@@ -482,6 +569,56 @@ pub const PASSWORD_COMPLEXITY_REFUSED: &str =
     "Could not reset user password, because the password does not meet the complexity \
      requirements.";
 
+/// The word a directory's administrator password may not contain, whatever its case.
+///
+/// Part of the policy Directory Service states for the password a create makes the
+/// directory's administrator account with ([`INVALID_ADMIN_PASSWORD`]) — the name of that
+/// account, which a password may not give away. Not expressible in the modelled `Password`
+/// pattern, so it is the half of the policy only the create can enforce.
+const ADMIN_WORD: &str = "admin";
+
+/// Why `password` cannot be the password of the administrator account a create makes, or
+/// `None` when it can.
+///
+/// ONE rule for every create that makes a directory's administrator account
+/// (`CreateDirectory`, `CreateMicrosoftAD`), so neither can accept a password the other
+/// refuses: the policy the `Password` member's own documentation states — between
+/// [`MIN_PASSWORD_CHARS`] and [`MAX_PASSWORD_CHARS`] characters, drawn from at least
+/// [`PASSWORD_CHARACTER_CLASSES`] of Active Directory's four character classes
+/// ([`password_policy_defect`]) — AND the clause that documentation does not express and
+/// the modelled pattern therefore cannot refuse: the password may not contain the word
+/// [`ADMIN_WORD`], the name of the account it is the password of, in any case.
+///
+/// The diagnostic is [`INVALID_ADMIN_PASSWORD`], the sentence Directory Service states the
+/// WHOLE policy in, so a caller is told the rule it broke whichever half refused it, and
+/// the `@sensitive` password appears nowhere in it.
+pub fn administrator_password_defect(password: &str) -> Option<&'static str> {
+    if password_policy_defect(password).is_some() {
+        return Some(INVALID_ADMIN_PASSWORD);
+    }
+    // Case-insensitively, since the clause is about the WORD rather than its spelling. The
+    // length half of the policy ran first, so the lower-casing below is allocated only for
+    // a password already bounded by [`MAX_PASSWORD_CHARS`] characters.
+    if password.to_lowercase().contains(ADMIN_WORD) {
+        return Some(INVALID_ADMIN_PASSWORD);
+    }
+    None
+}
+
+/// The sentence Directory Service refuses a create whose `Password` cannot be the
+/// directory administrator's with.
+///
+/// FIXED text: it states the policy in full and quotes neither the password (it is
+/// `@sensitive`) nor which half of the policy the password broke, so every caller that
+/// breaks it reads the same sentence. It is NOT [`PASSWORD_COMPLEXITY_REFUSED`], the
+/// sentence a RESET of an existing account's password is refused with: the two refusals are
+/// worded differently, so neither may be built from the other. [`refusal`] appends the
+/// request id, once.
+pub const INVALID_ADMIN_PASSWORD: &str =
+    "Invalid password. The password must be between 8 and 64 characters, not contain the \
+     word \"admin\", and must have at least one character from three of these four \
+     categories: lowercase, uppercase, numeric, and special characters.";
+
 /// The sentence the modelled `DirectoryAlreadyInRegionException` states this refusal
 /// with: "The Region you specified is the same Region where the Managed Microsoft AD
 /// directory was created. Specify a different Region and try again."
@@ -594,10 +731,19 @@ pub const CERTIFICATE_LIMIT_REACHED: &str =
     "The certificate could not be added because the certificate limit has been reached.";
 
 /// The `InvalidCertificateException` message for `CertificateData` this service cannot
-/// read as a certificate: that error shape's own sentence, FIXED text with no interpolated
-/// value — the data itself is the caller's and is not echoed.
-pub const CERTIFICATE_ENCODING_INVALID: &str =
-    "The certificate PEM that was provided has incorrect encoding.";
+/// read as a certificate.
+///
+/// Directory Service words this one as the fact — the certificate is not valid — followed
+/// by the registration it could not perform and the directory the request named it for, so
+/// the message is built from the request and nothing else: the certificate data itself is
+/// the caller's and is not echoed, and the sentence carries no closing full stop.
+/// [`refusal`] appends the request id, once.
+pub fn certificate_not_valid(directory_id: &str) -> String {
+    format!(
+        "Certificate is not valid. Could not register the certificate with the directory \
+         {directory_id}"
+    )
+}
 
 /// The `EntityDoesNotExistException` message for an id that names no schema extension of
 /// the directory the request asked about.

@@ -20,6 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_directoryservice_directoryservice_20150416::state::{
+    DIRECTORY_BUILD_SPAN, TRANSITION_SPAN,
+};
 use service_com_amazonaws_directoryservice_directoryservice_20150416::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -31,11 +34,15 @@ const TARGET_PREFIX: &str = "DirectoryService_20150416";
 /// operation reports it back — and exists only so the create requests are well formed.
 pub(crate) const PASSWORD: &str = "Passw0rd!2345";
 
-/// The stage a directory is in between the create and the transition that create owes:
-/// the first value of the modelled `DirectoryStage` enum.
+/// The stage a directory is in between the create and the first transition that create
+/// owes: the first value of the modelled `DirectoryStage` enum.
 pub(crate) const STAGE_REQUESTED: &str = "Requested";
 
-/// The stage a created directory reaches once that transition falls due.
+/// The stage a created directory is in while its servers come up, between the two
+/// transitions its create owes: the `Creating` value of the same modelled enum.
+pub(crate) const STAGE_CREATING: &str = "Creating";
+
+/// The stage a created directory reaches once that chain has run out.
 pub(crate) const STAGE_ACTIVE: &str = "Active";
 
 /// The network types `CreateDirectoryRequest$NetworkType`'s documentation says a Simple
@@ -59,9 +66,23 @@ pub(crate) const CONNECTED_QUOTA: usize = 10;
 /// AWS's tagging limit of 50 tags per resource.
 pub(crate) const TAG_QUOTA: usize = 50;
 
-/// Comfortably longer than one clock-owed transition span, with margin for a loaded
-/// test machine.
-pub(crate) const PAST_ONE_SPAN: Duration = Duration::from_millis(900);
+/// Comfortably longer than the clock-owed transitions a create owes before the directory
+/// is in service — the whole `Requested` -> `Creating` -> `Active` chain — with margin for
+/// a loaded test machine. The waits in this suite and its siblings are all "until the
+/// thing the last call started has happened", so one bound serves them all, and it is
+/// DERIVED from the spans the service itself publishes rather than restated, so a change
+/// to either span moves every wait in the crate with it.
+pub(crate) const PAST_ONE_SPAN: Duration = TRANSITION_SPAN
+    .saturating_add(DIRECTORY_BUILD_SPAN)
+    .saturating_add(SLACK);
+
+/// Comfortably longer than ONE clock-owed transition span and comfortably SHORTER than
+/// two, for a case that has to observe the state a record settles on BEFORE the next
+/// transition the same call owes takes that record out of the service.
+pub(crate) const PAST_ONE_SPAN_ONLY: Duration = TRANSITION_SPAN.saturating_add(SLACK);
+
+/// The margin a wait carries over the spans it waits out, for a loaded test machine.
+const SLACK: Duration = Duration::from_millis(400);
 
 /// The Region the calls below are signed for, and the one a minted ARN therefore
 /// carries. `tests/all/event_topics.rs` and
@@ -662,6 +683,10 @@ async fn tags_are_merged_into_the_stored_map_and_reported_from_it() {
         )
         .await;
 
+        // A tag write is served by a directory that has finished being built, so the
+        // stage chain the create owes is waited out before the merge below.
+        tokio::time::sleep(PAST_ONE_SPAN).await;
+
         let empty = ok(
             &router,
             "AddTagsToResource",
@@ -773,6 +798,9 @@ async fn describe_directories_pages_over_the_stored_records() {
 
     // A token this service did not issue is refused rather than served as a first
     // page — including a token another paginated operation issued.
+    // The tags that listing pages over are added once the directory has finished being
+    // built, which is the only stage a tag write is served in.
+    tokio::time::sleep(PAST_ONE_SPAN).await;
     let tags_token = {
         let id = &created[0];
         ok(
@@ -894,6 +922,8 @@ async fn list_tags_for_resource_pages_over_the_stored_tags() {
     let case = "tag paging";
     let id = create_directory(&router, minimal_create("tags.example.com"), case).await;
     let keys = ["alpha", "beta", "gamma", "delta"];
+    // A tag write is served once the directory has finished being built.
+    tokio::time::sleep(PAST_ONE_SPAN).await;
     ok(
         &router,
         "AddTagsToResource",
@@ -1048,6 +1078,9 @@ async fn a_deleted_directory_is_gone_and_its_alias_stays_reserved() {
     let case = "delete";
     let doomed = create_directory(&router, minimal_create("doomed.example.com"), case).await;
     let survivor = create_directory(&router, minimal_create("keeper.example.com"), case).await;
+    // A tag write and an alias are both served only by a directory that has reached its
+    // serving stage, so the chain both creates owe is waited out first.
+    tokio::time::sleep(PAST_ONE_SPAN).await;
     ok(
         &router,
         "AddTagsToResource",
@@ -1055,8 +1088,6 @@ async fn a_deleted_directory_is_gone_and_its_alias_stays_reserved() {
         case,
     )
     .await;
-    // An alias is assigned only to a directory that has reached its serving stage.
-    tokio::time::sleep(PAST_ONE_SPAN).await;
     ok(
         &router,
         "CreateAlias",
@@ -1252,6 +1283,8 @@ async fn the_directory_and_tag_quotas_are_enforced() {
         .collect();
     let stored = describe_all(&router, "tag quota").await;
     let id = string(&stored[0], "DirectoryId", "tag quota");
+    // A tag write is served once the directory has finished being built.
+    tokio::time::sleep(PAST_ONE_SPAN).await;
     ok(
         &router,
         "AddTagsToResource",

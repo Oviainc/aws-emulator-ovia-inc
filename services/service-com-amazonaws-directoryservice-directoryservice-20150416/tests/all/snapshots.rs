@@ -19,11 +19,13 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_directoryservice_directoryservice_20150416::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+// The one wait the crate's suites share, derived from the spans the service publishes.
+use crate::directory_lifecycle::PAST_ONE_SPAN;
 
 /// The `X-Amz-Target` prefix: the service shape's name, `DirectoryService_20150416`.
 const TARGET_PREFIX: &str = "DirectoryService_20150416";
@@ -48,10 +50,6 @@ const MANUAL_SNAPSHOT_QUOTA: usize = 5;
 /// The maximum length of the modelled `SnapshotName`, from its `@length` trait
 /// (`min: 0, max: 128`).
 const SNAPSHOT_NAME_MAX: usize = 128;
-
-/// Comfortably longer than one clock-owed transition span, with margin for a loaded
-/// test machine.
-const PAST_ONE_SPAN: Duration = Duration::from_millis(900);
 
 /// A well-formed `DirectoryId` (`^d-[0-9a-f]{10}$`) that is never created.
 const ABSENT_DIRECTORY_ID: &str = "d-1dca5812e8";

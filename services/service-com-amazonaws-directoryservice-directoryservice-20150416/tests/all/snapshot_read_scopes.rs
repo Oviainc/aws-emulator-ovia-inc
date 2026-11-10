@@ -27,20 +27,16 @@
 //! is gone, and re-delete it — over a table of snapshots differing in name, directory and
 //! creation order.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+// The one wait the crate's suites share, derived from the spans the service publishes.
+use crate::directory_lifecycle::PAST_ONE_SPAN;
 use crate::harness::{call, ok, refused, service, string};
 
 /// A password satisfying the modelled `Password` pattern, so the creates these cases need
 /// are well formed. It is never asserted on.
 const PASSWORD: &str = "Passw0rd!2345";
-
-/// Comfortably longer than one clock-owed transition span, with margin for a loaded test
-/// machine.
-const PAST_ONE_SPAN: Duration = Duration::from_millis(900);
 
 /// The `Completed` value of the modelled `SnapshotStatus` enum
 /// (`smithy_query(query="shape", shape="SnapshotStatus")`).

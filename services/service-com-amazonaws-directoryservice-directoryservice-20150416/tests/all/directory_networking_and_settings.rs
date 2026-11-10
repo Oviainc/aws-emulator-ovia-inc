@@ -820,6 +820,9 @@ async fn removing_tag_keys_leaves_the_stored_map_without_them() {
 
     for (case, remove, expected) in cases {
         let id = create_directory(&router, minimal_create("corp.example.com"), case).await;
+        // Both tag writes are served once the directory has finished being built, so the
+        // stage chain the create owes is waited out first.
+        tokio::time::sleep(PAST_ONE_SPAN).await;
         ok(
             &router,
             "AddTagsToResource",

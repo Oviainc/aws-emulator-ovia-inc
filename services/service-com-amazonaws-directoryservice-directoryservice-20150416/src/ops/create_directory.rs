@@ -7,9 +7,13 @@
 //! [`crate::state`] and answers with the minted id. The administrator `Password` is
 //! `@sensitive` and no operation reports it back, so it is not stored.
 //!
-//! The directory is persisted in the modelled `Requested` stage with the move to
-//! `Active` owed by the clock one [`crate::state::TRANSITION_SPAN`] later, so a caller
-//! that describes it immediately still sees the transient stage.
+//! The directory is persisted in the modelled `Requested` stage, and the stage this create
+//! owes is the CHAIN a build goes through: `Creating` once
+//! [`crate::state::TRANSITION_SPAN`] has elapsed, and `Active` only once the directory's
+//! servers are up, one [`crate::state::DIRECTORY_BUILD_SPAN`] later — so a caller that
+//! polls the create sees the stage the build happens in rather than a directory that is
+//! instantly in service. The administrator `Password` is checked against the directory's
+//! own password policy first ([`crate::state::administrator_password_defect`]).
 //!
 //! ## Shape of an operation
 //!
@@ -187,6 +191,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::SIMPLE_AD_NETWORK_TYPES.join(", ")
                 )));
             }
+        }
+
+        // The create makes the directory's administrator account, so the password it is
+        // called with has to meet the directory's own password policy — which is more than
+        // the modelled `Password` pattern expresses. Checked before anything is resolved or
+        // stored, so a refused password creates no directory.
+        if let Some(defect) = crate::state::administrator_password_defect(&input.password) {
+            return Err(invalid_parameter(defect.to_string()));
         }
 
         // A directory's servers are placed in two subnets in two different Availability

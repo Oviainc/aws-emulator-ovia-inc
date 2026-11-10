@@ -213,15 +213,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A password is set in the directory's own domain, so the reset needs a directory
-        // that is in service: one still being built by the transition its create owes is
-        // unavailable. The diagnostic is this service's shared one for a directory a call
-        // cannot reach.
-        if directory.stage != crate::state::STAGE_ACTIVE {
+        // that is in service: one still being built by the stage chain its create owes is
+        // unavailable. The diagnostic is the stage-gate family's: the action it could not
+        // perform, the directory the request named and the stage that action needs.
+        if let Some(defect) =
+            crate::state::password_reset_stage_defect(&input.directory_id, &directory.stage)
+        {
             return Err(
                 ResetUserPasswordErrorModeled::DirectoryUnavailableException(
-                    crate::state::refusal(crate::state::directory_unavailable(
-                        &input.directory_id,
-                    )),
+                    crate::state::refusal(defect),
                 )
                 .into(),
             );
