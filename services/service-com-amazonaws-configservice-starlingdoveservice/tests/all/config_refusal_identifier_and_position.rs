@@ -16,8 +16,8 @@
 //! 3. the service-linked recorder surface words a refusal for the DIMENSION the request
 //!    selected the recorder by: the service-principal legs name the service principal, and
 //!    never the recorder name the caller never sent;//! 4. `PutResourceConfig` refuses a `ResourceType` the CloudFormation registry holds no
-//!    registration for with the class that registry lookup answers with —
-//!    `InsufficientPermissionsException`, client 400 — and records nothing.
+//!    registration for as the input-validation failure of the value it was sent —
+//!    `ValidationException`, client 400 — and records nothing.
 //!
 //! Every case drives the emulator the way a client does — an `awsJson1_1` `POST /`
 //! through the same `MultiServiceRouter` the production router builds — reusing the
@@ -478,7 +478,8 @@ async fn an_unregistered_resource_type_is_refused_by_the_registry_lookups_own_cl
     // Rows differ along WHY the CloudFormation registry holds no registration for the
     // type: organizations nothing registered a type under, a name that is no registry type
     // name at all, a module name, and a registered type misspelled or spelled in another
-    // case. The class is the one the registry lookup answers with, whichever it is.
+    // case. The class is the input-validation one, because what failed is the value the
+    // request carried at that member.
     let cases: [(&str, &str); 6] = [
         ("an organization nothing registered", "Sim2Real::PrecisionTest::Resource"),
         ("another unregistered organization", "Acme::Network::Switch"),
@@ -504,7 +505,7 @@ async fn an_unregistered_resource_type_is_refused_by_the_registry_lookups_own_cl
             (status, code.as_str(), message.as_str()),
             (
                 400,
-                "InsufficientPermissionsException",
+                "ValidationException",
                 expected.as_str()
             ),
             "case {case:?}: expected the registration precondition for {resource_type:?}, got \

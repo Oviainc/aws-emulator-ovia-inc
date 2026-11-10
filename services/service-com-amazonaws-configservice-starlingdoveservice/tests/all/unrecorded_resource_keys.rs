@@ -221,7 +221,7 @@ async fn a_write_the_registration_precondition_refused_is_reported_by_no_read() 
         );
         assert_eq!(
             (status, code.as_str(), message.as_str()),
-            (400, "InsufficientPermissionsException", expected.as_str()),
+            (400, "ValidationException", expected.as_str()),
             "case {case:?}: expected the registration precondition for {resource_type:?}, got \
              {status} with {code} and {message:?}"
         );

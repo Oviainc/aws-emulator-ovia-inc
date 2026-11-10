@@ -2818,6 +2818,20 @@ pub use delivery_authorization::*;
 pub mod change_notification;
 pub use change_notification::*;
 
+// Whether the TARGET a remediation configuration names EXISTS — the Systems Manager
+// automation document its `TargetId` names, asked of Systems Manager itself — lives in
+// `state/remediation_target.rs`, re-exported here like the modules above so a handler
+// reaches its names as `crate::state::<name>`.
+pub mod remediation_target;
+pub use remediation_target::*;
+
+// Which resource type NAMES a discovered-resource listing can be asked about — the types
+// this model enumerates and the CloudFormation registry type names a custom resource is
+// recorded under — lives in `state/resource_type.rs`, re-exported here like the modules
+// above.
+pub mod resource_type;
+pub use resource_type::*;
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -4820,19 +4834,22 @@ pub fn max_configuration_recorders_message() -> String {
 /// Config rule that holds no remediation configuration — none at all, or none for the
 /// `resource_type` the request named.
 ///
-/// The message is BUILT FROM THE REQUEST — it quotes the `ConfigRuleName` the caller
+/// The message is BUILT FROM THE REQUEST — it carries the `ConfigRuleName` the caller
 /// sent, and the `ResourceType` when the caller named one, so the two refusals are
 /// told apart — for the case the modelled error documents ("You specified an Config
-/// rule without a remediation configuration").
+/// rule without a remediation configuration"). The rule's name is interpolated UNQUOTED
+/// and the sentence carries no trailing stop, which is how Config words it (the sibling
+/// refusal of a rule holding no remediation configuration,
+/// `ops::put_remediation_exceptions`, carries its name the same way).
 pub fn no_such_remediation_configuration_message(
     name: &str,
     resource_type: Option<&str>,
 ) -> String {
     match resource_type {
-        None => format!("No RemediationConfiguration for rule '{name}' exists."),
+        None => format!("No RemediationConfiguration for rule {name} exists"),
         Some(resource_type) => format!(
-            "No RemediationConfiguration for rule '{name}' and resource type \
-             '{resource_type}' exists."
+            "No RemediationConfiguration for rule {name} and resource type {resource_type} \
+             exists"
         ),
     }
 }

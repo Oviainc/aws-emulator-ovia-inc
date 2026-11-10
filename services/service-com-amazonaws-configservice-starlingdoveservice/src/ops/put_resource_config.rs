@@ -8,9 +8,12 @@
 //! in behind it, so the states it went through are what its history holds. The resource
 //! type has to be one the CloudFormation registry holds a registration for
 //! ([`is_registered_resource_type`]); anything else is refused and nothing is recorded.
-//! Config reads that registry with the configuration recorder's OWN role, so the
-//! refusal is the one that lookup answers with — `InsufficientPermissionsException`,
-//! client/400 — rather than a validation of the member the caller sent.
+//! That is a fact about the `ResourceType` the caller SENT — the registry holds no type
+//! of that name — so it is refused as the input-validation failure the model words for
+//! exactly that (`ValidationException`: "the input value fails the validation"), client
+//! 400, and not as a permission failure of the role Config reads the registry with:
+//! `InsufficientPermissionsException` is what the model reserves for the IAM failures its
+//! own documentation enumerates, which no caller fixes by registering a type.
 //!
 //! ## Shape of an operation
 //!
@@ -153,8 +156,8 @@ pub(crate) fn is_registered_resource_type(resource_type: &str) -> bool {
 }
 
 /// How Config words the registration precondition for a `ResourceType` the
-/// CloudFormation registry holds no type for — the refusal of the registry lookup Config
-/// makes with the recorder's own role, which is `InsufficientPermissionsException`.
+/// CloudFormation registry holds no type for — the input-validation refusal of the member
+/// the caller sent, which is `ValidationException`.
 ///
 /// BUILT FROM THE REQUEST: the fixed sentence pair carries the `ResourceType` the caller
 /// sent, verbatim, as its one variable part.
@@ -304,24 +307,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // This API records the configuration state of a resource type the
             // CloudFormation registry holds a registration for, so a `ResourceType` it
-            // holds none for names nothing Config can record. The lookup that establishes
-            // this is one Config makes against the CloudFormation registry with the
-            // configuration recorder's own role, so the refusal belongs to that lookup —
-            // the modelled permission class, client 400 — and not to the validation of the
-            // members this request carried. Judged AFTER the recorder, because a recorder
-            // that is not recording is the precondition Config reports for a request that
-            // fails both.
+            // holds none for names nothing Config can record. What failed is the value the
+            // request carried at that member, so the refusal is this operation's own
+            // input-validation class — never the permission class, which a caller would
+            // fix by changing a role rather than by registering the type. Judged AFTER the
+            // recorder, because a recorder that is not recording is the precondition
+            // Config reports for a request that fails both.
             if !is_registered_resource_type(&input.resource_type) {
-                return Err(
-                    PutResourceConfigErrorModeled::InsufficientPermissionsException(
-                        InsufficientPermissionsException {
-                            message: Some(unregistered_resource_type_message(
-                                &input.resource_type,
-                            )),
-                        },
-                    )
-                    .into(),
-                );
+                return Err(refuse(unregistered_resource_type_message(
+                    &input.resource_type,
+                )));
             }
 
             let key = (input.resource_type.clone(), input.resource_id.clone());

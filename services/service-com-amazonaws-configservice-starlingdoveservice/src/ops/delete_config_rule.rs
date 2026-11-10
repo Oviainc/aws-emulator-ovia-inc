@@ -194,15 +194,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Config cannot delete this rule. Delete the remediation action associated
         // with the rule before deleting the rule" (`ResourceInUseException`). The rule
         // therefore outlives the delete, and its remediation configuration is never
-        // orphaned by one.
+        // orphaned by one. The sentence is Config's own, BUILT FROM THE REQUEST: fixed
+        // text carrying the rule's name, unquoted, as its one variable part.
         if store.remediation_configurations.contains_key(&name) {
             return Err(DeleteConfigRuleErrorModeled::ResourceInUseException(
                 ResourceInUseException {
                     message: Some(format!(
-                        "A remediation action is associated with the Config rule '{name}' and \
-                         Config cannot delete this rule. Delete the remediation action \
-                         associated with the rule before deleting the rule and try your request \
-                         again later."
+                        "The rule {name} currently has a RemediationConfiguration. Please \
+                         delete the RemediationConfiguration and try again."
                     )),
                 },
             )

@@ -9,10 +9,12 @@
 //! Two failure classes, deliberately answered through different channels:
 //!
 //! * a configuration that is not a usable remediation AS ASKED FOR — a parameter that
-//!   selects neither or both of its two value kinds, or an AUTOMATIC remediation with no
-//!   value for the role it runs as — refuses the WHOLE request with the modelled
-//!   `InvalidParameterValueException`, because nothing about the account's state could
-//!   have made that item succeed and a caller has to resend it either way;
+//!   selects neither or both of its two value kinds, an AUTOMATIC remediation with no
+//!   value for the role it runs as, or a target Systems Manager holds no automation
+//!   document for ("The target (SSM document) must exist") — refuses the WHOLE request
+//!   with the modelled `InvalidParameterValueException`, because nothing about the
+//!   account's state could have made that item succeed and a caller has to resend it
+//!   either way;
 //! * a configuration that is well formed but names a Config rule this account does not
 //!   hold is a FAILED ITEM of the batch, reported in `FailedBatches` with its reason
 //!   and persisted nowhere, because it depends on state the caller can fix for that one
@@ -231,6 +233,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx);
+
+        // "The target (SSM document) must exist and have permissions to use the target."
+        // The document is Systems Manager's resource, so whether it exists is asked of
+        // Systems Manager's own document registry — before anything is written, because a
+        // configuration whose target does not exist is one no remediation could ever run
+        // and the whole request is refused for it, the way the two checks above are.
+        for requested in &input.remediation_configurations {
+            if !crate::state::targets_an_ssm_document(&requested.target_type) {
+                continue;
+            }
+            let found = crate::state::remediation_target(
+                ctx.callback(),
+                &region,
+                requested.target_id.trim(),
+            )
+            .await;
+            if found == crate::state::RemediationTarget::NotFound {
+                return Err(
+                    PutRemediationConfigurationsErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(
+                                crate::state::remediation_target_not_found_message(
+                                    requested.config_rule_name.trim(),
+                                ),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         let mut store = state.lock();
 
         // Each configuration is written on its own, so one failed item does not cost

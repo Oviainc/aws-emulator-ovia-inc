@@ -177,6 +177,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
 
+        // This listing reports the resources aggregated UNDER one resource type name, so
+        // the name is what it is asked about: a type this service's model enumerates, or a
+        // CloudFormation registry type name, which is what a custom resource's
+        // configuration state is recorded under. A value that is neither names no resource
+        // type at all and is refused with Config's own sentence for one it does not
+        // support; a type name nothing was recorded under is answered, and the answer is
+        // an empty list.
+        if let Some(refusal) = crate::state::unsupported_resource_type_refusal(&input.resource_type)
+        {
+            return Err(
+                ListAggregateDiscoveredResourcesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(refusal.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // A limit outside the allowable range is what `InvalidLimitException` reports.
         // The modelled range refuses one before this handler runs; the check stands so
         // the condition answers this operation's own modelled error either way.

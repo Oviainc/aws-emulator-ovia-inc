@@ -199,6 +199,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries rather than a request that narrows by nothing.
         let requested_name = input.resource_name.as_deref();
 
+        // This listing reports the resources discovered UNDER one resource type name, so
+        // the name is what it is asked about: a type this service's model enumerates, or a
+        // CloudFormation registry type name, which is what a custom resource's
+        // configuration state is recorded under. A value that is neither names no resource
+        // type at all and is refused with Config's own sentence for one it does not
+        // support; a registry type name the inventory holds nothing under is answered, and
+        // the answer is an empty list.
+        if let Some(refusal) = crate::state::unsupported_resource_type_refusal(&input.resource_type)
+        {
+            return Err(ListDiscoveredResourcesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(refusal.to_string()),
+                },
+            )
+            .into());
+        }
+
         // "You can specify either resource IDs or a resource name, but not both, in the
         // same request."
         if !requested_ids.is_empty() && requested_name.is_some() {

@@ -601,7 +601,7 @@ async fn put_resource_config_records_only_a_registered_resource_type() {
             (status, code.as_str(), message.as_str()),
             (
                 400,
-                "InsufficientPermissionsException",
+                "ValidationException",
                 format!(
                     "Cannot find registered Resource Type with name {resource_type}. Please \
                      register the Resource Type with Cloudformation and try again."

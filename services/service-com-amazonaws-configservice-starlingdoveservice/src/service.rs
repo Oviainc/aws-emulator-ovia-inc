@@ -63,7 +63,9 @@
 //! 5. a value outside the modelled `ResourceType` value set is refused with Config's
 //!    own fixed sentence about a resource type it does not support
 //!    ([`UNSUPPORTED_RESOURCE_TYPE_MESSAGE`]) instead of a clause enumerating that
-//!    set, wherever a member targeting that shape carries it ([`resource_type_values`]).
+//!    set, wherever a member targeting that shape carries it ([`resource_type_values`])
+//!    — except on a discovered-resource LISTING, whose member admits a CloudFormation
+//!    registry type name as well and so judges the name in its own handler.
 //!
 //! The status (400) and the error code ([`VALIDATION_EXCEPTION`]) are the framework's
 //! own choice for a constraint failure and are unchanged; only the sentence differs.
@@ -432,37 +434,36 @@ fn constraint_clauses(violation: &Violation) -> Option<Vec<String>> {
 
 /// How Config refuses a value that is no resource type it supports.
 ///
-/// Config records the resource types its published catalogue covers and that catalogue
-/// GROWS, so the service does not read its current value set back to the caller: the
-/// sentence is FIXED and request-independent — it quotes neither the value sent nor the
-/// types Config supports — and tells the caller to verify the type it named. Recorded on
-/// the resource-type association path and stated for the shape rather than for one
-/// operation, so it holds wherever a member targeting `ResourceType` carries a value
-/// outside it.
-const UNSUPPORTED_RESOURCE_TYPE_MESSAGE: &str =
-    "The resource type you specified is not supported by AWS Config. Verify the resource \
-     type, and try again.";
+/// The sentence itself lives in [`crate::state::UNSUPPORTED_RESOURCE_TYPE_MESSAGE`], which
+/// is where the handlers that judge a resource type NAME themselves read it from (a
+/// discovered-resource listing admits a CloudFormation registry type name the modelled
+/// enum does not list, so its member carries no enum constraint at this boundary); this
+/// seam states the same sentence for the members whose value set the boundary still
+/// checks, so the two cannot drift.
+const UNSUPPORTED_RESOURCE_TYPE_MESSAGE: &str = crate::state::UNSUPPORTED_RESOURCE_TYPE_MESSAGE;
 
-/// The members of this model that carry ONE resource type, as the model declares them:
-/// where the `ResourceType` value set can be read at runtime.
+/// The members of this model that carry ONE resource type AND are checked against its
+/// value set at this boundary, as the model declares them: where the `ResourceType` value
+/// set can be read at runtime.
 ///
-/// Several of them, from unrelated operations, because this is how the set is reached at
+/// Several of them, from unrelated shapes, because this is how the set is reached at
 /// all: a member targeting an enumerated shape carries that shape's value set as the
 /// constraint the validating walk checks against, so the set is available through the
 /// members that target it and not through the shape on its own. Listing more than one
 /// means a member renamed or retargeted upstream cannot silently take the rule with it
 /// — the others still name the set, and the unit test holds all of them to the same one.
+///
+/// The two discovered-resource LISTINGS are not here, and neither is `ResourceKey`: those
+/// members admit a resource type name the modelled set does not carry, so each carries no
+/// enum constraint to read a set off and the name is judged by the handler that was sent
+/// it (`crate::state::unsupported_resource_type_refusal`).
 static RESOURCE_TYPE_MEMBERS: &[(&::aws_smithy_schema::Schema, &str)] = &[
     (
         crate::ops::types::GET_RESOURCE_CONFIG_HISTORY_INPUT_SCHEMA,
         "resourceType",
     ),
     (
-        crate::ops::types::LIST_DISCOVERED_RESOURCES_INPUT_SCHEMA,
-        "resourceType",
-    ),
-    (
-        crate::ops::types::LIST_AGGREGATE_DISCOVERED_RESOURCES_INPUT_SCHEMA,
+        &crate::ops::types::AggregateResourceIdentifier::SCHEMA,
         "ResourceType",
     ),
 ];

@@ -9,10 +9,11 @@
 //!
 //! The rules pinned here, each over a TABLE of inputs rather than one recorded case:
 //!
-//! 1. a value outside the modelled `ResourceType` value set is refused with Config's
-//!    own fixed sentence about a resource type it does not support — which enumerates
-//!    neither the value sent nor the types Config supports — wherever a member
-//!    targeting that shape carries it;
+//! 1. a value that NAMES no resource type — neither one the modelled `ResourceType`
+//!    value set carries nor a CloudFormation registry type name — is refused with
+//!    Config's own fixed sentence about a resource type it does not support, which
+//!    enumerates neither the value sent nor the types Config supports, wherever a member
+//!    carrying a resource type sits;
 //! 2. a `ServicePrincipal` Config can resolve no service-linked configuration recorder
 //!    from is `ValidationException` worded about the service principal, while a
 //!    principal whose recorder Config COULD resolve and this account does not hold is
@@ -85,15 +86,11 @@ async fn refusal(case: &str, emulator: &Emulator, operation: &str, body: &Value,
 
 #[tokio::test]
 async fn a_resource_type_config_does_not_support_is_refused_with_its_own_sentence() {
-    // Rows differ along the OPERATION and the position the resource type sits at — one
-    // the input carries directly and an element of a resource-type list — and along the
-    // value sent: a type-shaped name of nothing, a name that is no resource type at
-    // all, and a supported type mis-cased.
-    let unsupported = [
-        "AWS::NotAReal::ResourceType",
-        "not-a-resource-type",
-        "aws::s3::bucket",
-    ];
+    // Rows differ along the value sent: a name that is no resource type at all, one
+    // carrying an empty segment, and one whose segments are shorter than a registry type
+    // name's. None of them NAMES a resource type, in the modelled set or in the
+    // CloudFormation registry's form, so every member that carries one refuses them.
+    let unsupported = ["not-a-resource-type", "AWS::::Account", "A::B::C"];
 
     for value in unsupported {
         let rows: [(&str, &str, Value); 5] = [
@@ -142,6 +139,37 @@ async fn a_resource_type_config_does_not_support_is_refused_with_its_own_sentenc
                 !message.contains(value) && !message.contains(S3_BUCKET),
                 "case {case:?}: the refusal enumerates neither the value nor the supported \
                  types, got {message:?}"
+            );
+        }
+    }
+
+    // A type-shaped name of nothing is a CloudFormation registry TYPE NAME, which is
+    // what a custom resource is recorded under: the members that RECORD resource types
+    // still refuse it (Config records only the types it supports), while a member that
+    // only ASKS about a type name takes it — covered end to end in
+    // `registry_resource_type_reads`.
+    for value in ["AWS::NotAReal::ResourceType", "aws::s3::bucket"] {
+        for (position, operation, body) in [
+            (
+                "a resource-type list",
+                "AssociateResourceTypes",
+                json!({
+                    "ConfigurationRecorderArn": state::recorder_arn("us-east-1", "default", "cr-1"),
+                    "ResourceTypes": [value],
+                }),
+            ),
+            (
+                "a single resource-type member",
+                "GetResourceConfigHistory",
+                json!({ "resourceType": value, "resourceId": "r-1" }),
+            ),
+        ] {
+            let case = format!("{position} carrying {value:?}");
+            let emulator = Emulator::new();
+            let message = refusal(&case, &emulator, operation, &body, "ValidationException").await;
+            assert_eq!(
+                message, UNSUPPORTED_RESOURCE_TYPE,
+                "case {case:?}: expected {UNSUPPORTED_RESOURCE_TYPE:?}, got {message:?}"
             );
         }
     }

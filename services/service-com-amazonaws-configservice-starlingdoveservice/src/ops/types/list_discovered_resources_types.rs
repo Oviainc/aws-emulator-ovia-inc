@@ -11,7 +11,15 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-configservice-starlingdoveservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.configservice#ListDiscoveredResourcesRequest")]
+// `skip_validation = ["resourceType"]`: the same member, the same reason as
+// `ListAggregateDiscoveredResourcesInput` — a discovered-resource listing is asked about a
+// resource type NAME, which a CloudFormation registry type name is even though the
+// modelled `ResourceType` enum does not list it, so the name is judged by the handler
+// (`crate::state::unsupported_resource_type_refusal`) rather than by the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.configservice#ListDiscoveredResourcesRequest",
+    skip_validation = ["resourceType"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListDiscoveredResourcesInput {
     pub resource_type: String,

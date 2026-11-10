@@ -193,3 +193,5 @@ mod delivery_channel_bucket_policy;
 mod delivery_channel_recorder_role;
 #[path = "all/validation_clause_quotes_the_submitted_value.rs"]
 mod validation_clause_quotes_the_submitted_value;
+#[path = "all/registry_resource_types_and_remediation_targets.rs"]
+mod registry_resource_types_and_remediation_targets;
