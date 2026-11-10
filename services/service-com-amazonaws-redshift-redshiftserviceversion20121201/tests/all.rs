@@ -85,6 +85,8 @@ mod hsm_client_certificates;
 mod hsm_configurations;
 #[path = "all/identity_center_auth_token.rs"]
 mod identity_center_auth_token;
+#[path = "all/maintenance_track_refusal_wording.rs"]
+mod maintenance_track_refusal_wording;
 #[path = "all/maintenance_tracks.rs"]
 mod maintenance_tracks;
 #[path = "all/modify_cluster_parameter_group.rs"]

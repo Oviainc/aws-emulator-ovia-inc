@@ -558,17 +558,60 @@ pub fn published_maintenance_tracks() -> Vec<MaintenanceTrack> {
         .collect()
 }
 
+/// Which sentence an `InvalidClusterTrackFault` is worded with.
+///
+/// The same split as [`ClusterNotFoundWording`]: the fault's status (400) and
+/// awsQuery code (`InvalidClusterTrack`) are what the model fixes, while the
+/// fixed text around the requested name is an attribute of the OPERATION —
+/// recorded refusals show the operations that would put a cluster ON the track
+/// terminating the sentence, and the catalog read leaving it unterminated.
+/// Naming each wording here keeps the choice at the handler that makes it, so no
+/// operation can quietly inherit another one's sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidClusterTrackWording {
+    /// `Invalid cluster track: <MaintenanceTrackName>.` — what the operations
+    /// that would place a cluster on the track they name answer
+    /// (`CreateCluster`, `ModifyCluster`, `RestoreFromClusterSnapshot`): the
+    /// fixed prefix, the requested name, and a terminating period.
+    TrackThenPeriod,
+    /// `Invalid cluster track: <MaintenanceTrackName>` — what the catalog read
+    /// `DescribeClusterTracks` answers: the same prefix and name, with no
+    /// sentence terminator.
+    TrackUnterminated,
+}
+
+/// The `InvalidClusterTrackFault` message `wording` words, naming the
+/// `MaintenanceTrackName` the request supplied.
+pub fn invalid_cluster_track_message(
+    wording: InvalidClusterTrackWording,
+    maintenance_track_name: &str,
+) -> String {
+    match wording {
+        InvalidClusterTrackWording::TrackThenPeriod => {
+            format!("Invalid cluster track: {maintenance_track_name}.")
+        }
+        InvalidClusterTrackWording::TrackUnterminated => {
+            format!("Invalid cluster track: {maintenance_track_name}")
+        }
+    }
+}
+
 /// Refuse a `MaintenanceTrackName` the catalog does not publish, with the
-/// message the modelled `InvalidClusterTrackFault` carries.
+/// message the modelled `InvalidClusterTrackFault` carries for the operation
+/// that `wording` belongs to.
 ///
 /// One rule for every operation that names a maintenance track, so a name
 /// `DescribeClusterTracks` does not report cannot be accepted by a create, a
-/// modify or a restore.
-pub fn check_maintenance_track(name: &str) -> Result<(), String> {
+/// modify or a restore; only the sentence it is refused with is per-operation
+/// ([`InvalidClusterTrackWording`]).
+pub fn check_maintenance_track(
+    wording: InvalidClusterTrackWording,
+    name: &str,
+) -> Result<(), String> {
     if PUBLISHED_MAINTENANCE_TRACKS.contains(&name) {
         return Ok(());
     }
-    Err(format!("Invalid cluster track: {name}"))
+    Err(invalid_cluster_track_message(wording, name))
 }
 
 /// The most days a cluster's maintenance may be deferred for — the

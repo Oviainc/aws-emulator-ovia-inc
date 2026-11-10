@@ -226,7 +226,7 @@ async fn a_create_is_refused_before_anything_is_provisioned() {
             overrides: vec![("MaintenanceTrackName", "nosuch")],
             status: 400,
             code: "InvalidClusterTrack",
-            message: "Invalid cluster track: nosuch".to_string(),
+            message: "Invalid cluster track: nosuch.".to_string(),
         },
     ];
 

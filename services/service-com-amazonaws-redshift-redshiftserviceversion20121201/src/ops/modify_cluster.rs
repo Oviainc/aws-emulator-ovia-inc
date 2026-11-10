@@ -555,9 +555,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyCluster<Eng
         // A maintenance track the service does not publish names no track at
         // all, so it is refused with the modelled `InvalidClusterTrackFault`
         // rather than stored on the cluster: the track set a cluster can be on
-        // is exactly the one `DescribeClusterTracks` reports.
+        // is exactly the one `DescribeClusterTracks` reports. The sentence it is
+        // refused with is this operation's, from the per-operation catalog
+        // [`st::InvalidClusterTrackWording`].
         if let Some(track) = input.maintenance_track_name.as_deref() {
-            if let Err(message) = st::check_maintenance_track(track) {
+            if let Err(message) = st::check_maintenance_track(
+                st::InvalidClusterTrackWording::TrackThenPeriod,
+                track,
+            ) {
                 return Err(ModifyClusterErrorModeled::InvalidClusterTrackFault(
                     InvalidClusterTrackFault {
                         message: Some(message),

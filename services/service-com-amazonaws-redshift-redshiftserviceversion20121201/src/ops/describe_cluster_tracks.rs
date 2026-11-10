@@ -173,7 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // track name is not valid" — FOR this operation, so a name the catalog
         // does not publish is refused rather than served as an empty page. The
         // name is resolved against the store's own catalog, by the one rule every
-        // operation naming a maintenance track shares.
+        // operation naming a maintenance track shares; this READ words the
+        // refusal with its own unterminated sentence, from the per-operation
+        // catalog [`st::InvalidClusterTrackWording`].
         let matched: Vec<&MaintenanceTrack> = match input.maintenance_track_name.as_deref() {
             None => store.maintenance_tracks.iter().collect(),
             Some(requested) => match store.maintenance_track(requested) {
@@ -181,7 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(DescribeClusterTracksErrorModeled::InvalidClusterTrackFault(
                         InvalidClusterTrackFault {
-                            message: st::check_maintenance_track(requested).err(),
+                            message: st::check_maintenance_track(
+                                st::InvalidClusterTrackWording::TrackUnterminated,
+                                requested,
+                            )
+                            .err(),
                         },
                     )
                     .into());
