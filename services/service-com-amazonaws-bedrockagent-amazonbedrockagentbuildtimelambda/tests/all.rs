@@ -23,6 +23,8 @@ mod delete_removes_the_resource;
 mod flow_alias_deployment;
 #[path = "all/flow_definition_validation.rs"]
 mod flow_definition_validation;
+#[path = "all/flow_draft_updates.rs"]
+mod flow_draft_updates;
 #[path = "all/flow_lifecycle.rs"]
 mod flow_lifecycle;
 #[path = "all/flow_preparation.rs"]

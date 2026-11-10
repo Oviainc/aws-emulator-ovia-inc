@@ -143,6 +143,8 @@ mod engine_default_cluster_parameters;
 mod engine_default_parameters;
 #[path = "all/engine_role_grants.rs"]
 mod engine_role_grants;
+#[path = "all/engine_row_lock_statement_bound.rs"]
+mod engine_row_lock_statement_bound;
 #[path = "all/engine_server_surface.rs"]
 mod engine_server_surface;
 #[path = "all/engine_statement_classes.rs"]
