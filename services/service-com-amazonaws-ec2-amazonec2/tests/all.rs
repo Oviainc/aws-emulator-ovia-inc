@@ -28,7 +28,6 @@ mod run_instances_from_launch_template;
 mod instance_sql_ha_registrations;
 // Where `DryRun` is answered relative to an operation's own checks, for the operations whose
 // recorded contract puts the flag before the resource the request names is looked up.
-// Declared beside `prefix_lists` for the reason the note above gives.
 #[path = "all/dry_run_before_resource_lookup.rs"]
 mod dry_run_before_resource_lookup;
 // Setting the reverse DNS (PTR) record of an Elastic IP address: what the modify writes and
@@ -40,7 +39,6 @@ mod address_attribute_modify;
 // public half the store keeps and `DescribeKeyPairs` reports, the fingerprint each type is
 // fingerprinted with, what each call refuses, and what the published filters select.
 // Declared beside `prefix_lists` for the reason the note above gives: the sorted
-// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/key_pairs.rs"]
 mod key_pairs;
 // The ONE snapshot resource the EBS direct APIs and EC2 both describe: a snapshot
@@ -189,7 +187,6 @@ mod describe_nat_gateways;
 // class with, with only the variable parts it interpolates from the request and the store —
 // no restatement of the rule the value missed, no identifier out of the account's own state,
 // and the holder set of a `VolumeInUse` rendered as the set it is. Declared beside
-// `prefix_lists` for the reason the note above gives.
 #[path = "all/refusal_fixed_text.rs"]
 mod refusal_fixed_text;
 // What `GetManagedPrefixListEntries` reports: the entry set of the one prefix list a request
@@ -294,7 +291,6 @@ mod disassociate_subnet_cidr_block;
 // The sentence this service refuses a request with, per refusal CLASS: the resource named in
 // that class's own words, the request's value interpolated in that class's own quoting and
 // position, and nothing repeated back by a class whose sentence interpolates nothing.
-// Declared beside `prefix_lists` for the reason the note above gives.
 #[path = "all/per_resource_refusal_wording.rs"]
 mod per_resource_refusal_wording;
 // What `ModifyTransitGateway` applies to a stored transit gateway, what it leaves alone,
@@ -343,7 +339,6 @@ mod fpga_image_id_form;
 mod security_group_rule_quota_buckets;
 // What `AcceptReservedInstancesExchangeQuote` exchanges: which Convertible Reserved Instances
 // it retires, the purchases of the target offerings it mints in their place, and what it
-// refuses. Declared beside `prefix_lists` for the reason the note above gives: the sorted
 #[path = "all/reserved_instances_exchanges.rs"]
 mod reserved_instances_exchanges;
 // What `ModifyCapacityReservationFleet` changes about a stored Capacity Reservation Fleet,
@@ -1737,3 +1732,9 @@ mod describe_fleets;
 // is resolved, and what `DescribeTransitGatewayPeeringAttachments` then reads back.
 #[path = "all/create_transit_gateway_peering_attachment.rs"]
 mod create_transit_gateway_peering_attachment;
+// What `CancelSpotInstanceRequests` writes: the `cancelled` state and the Spot request status
+// code for the way each named request ended, the instances it leaves running, the state it
+// reports for a request that had already left `open` and `active`, and what it refuses
+// without cancelling anything. Declared beside `prefix_lists` for the reason the note above
+#[path = "all/spot_instance_request_cancellation.rs"]
+mod spot_instance_request_cancellation;

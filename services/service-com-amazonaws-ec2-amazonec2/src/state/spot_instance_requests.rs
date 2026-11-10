@@ -658,6 +658,67 @@ impl ComAmazonawsEc2Amazonec2State {
         }
     }
 
+    /// Cancel the one Spot Instance request `request_id` names and answer the state it is in
+    /// afterwards, as of the instant `at` — `None` when this store holds no such request.
+    ///
+    /// The ONE writer of a Spot Instance request's cancellation, so a request cancelled on
+    /// its own and one cancelled with the fleet that placed it
+    /// ([`Self::cancel_spot_fleet_request`]) cannot end two different ways:
+    ///
+    /// * "`cancelled` - The request was canceled" (`SpotInstanceState`) is the state a request
+    ///   in [`SPOT_REQUEST_STATE_OPEN`] or [`SPOT_REQUEST_STATE_ACTIVE`] enters; a request
+    ///   that has already left both — one whose validity ran out, one already cancelled — has
+    ///   nothing left to cancel and keeps the state it is in, which is what this answers;
+    /// * the Spot request status code records HOW it ended:
+    ///   [`SPOT_STATUS_CANCELED_BEFORE_FULFILLMENT`] when nothing had been launched for it,
+    ///   [`SPOT_STATUS_INSTANCE_TERMINATED_BY_USER`] when the instance it launched is being
+    ///   terminated with it, and [`SPOT_STATUS_REQUEST_CANCELED_AND_INSTANCE_RUNNING`] when
+    ///   that instance is left running;
+    /// * a cancelled request owes no fulfillment, which is what stops the next clock pass
+    ///   launching an instance for it.
+    ///
+    /// `instance_terminated` says whether the CALLER is terminating the instance the request
+    /// launched, which is the status code's third case; terminating it is the caller's own
+    /// step ([`Self::begin_instance_termination`]), because "canceling a Spot Instance
+    /// request does not terminate running Spot Instances associated with the request"
+    /// (`CancelSpotInstanceRequests`) while a Spot Fleet cancellation may.
+    pub fn cancel_spot_instance_request(
+        &mut self,
+        request_id: &str,
+        instance_terminated: bool,
+        at: SystemTime,
+    ) -> Option<String> {
+        let record = self.spot_instance_requests.get_mut(request_id)?;
+        let state = record.view.state.as_deref().unwrap_or_default();
+        if state != SPOT_REQUEST_STATE_OPEN && state != SPOT_REQUEST_STATE_ACTIVE {
+            return Some(state.to_string());
+        }
+        let (code, message) = match (record.view.instance_id.is_some(), instance_terminated) {
+            // Nothing was launched for this request, so it is cancelled before it was ever
+            // fulfilled.
+            (false, _) => (
+                SPOT_STATUS_CANCELED_BEFORE_FULFILLMENT,
+                SPOT_STATUS_MESSAGE_CANCELED_BEFORE_FULFILLMENT,
+            ),
+            (true, true) => (
+                SPOT_STATUS_INSTANCE_TERMINATED_BY_USER,
+                SPOT_STATUS_MESSAGE_INSTANCE_TERMINATED_BY_USER,
+            ),
+            (true, false) => (
+                SPOT_STATUS_REQUEST_CANCELED_AND_INSTANCE_RUNNING,
+                SPOT_STATUS_MESSAGE_REQUEST_CANCELED_AND_INSTANCE_RUNNING,
+            ),
+        };
+        record.view.state = Some(SPOT_REQUEST_STATE_CANCELLED.to_string());
+        record.view.status = Some(SpotInstanceStatus {
+            code: Some(code.to_string()),
+            message: Some(message.to_string()),
+            update_time: Some(system_time_to_date_time(at)),
+        });
+        record.fulfillment = None;
+        Some(SPOT_REQUEST_STATE_CANCELLED.to_string())
+    }
+
     /// The product description a Spot request for `image_id` carries: which operating
     /// system the Spot Instance runs, read off the AMI the launch names when this account
     /// can see it.

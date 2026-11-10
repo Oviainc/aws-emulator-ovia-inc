@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelSpotInstanceRequests
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelSpotInstanceRequests`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelSpotInstanceRequests::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels the Spot Instance requests a call names: each request that is still `open` or
+//! `active` enters `cancelled` carrying the Spot request status code for the way it ended, the
+//! instances it launched are left running, and the call reports the state every named request
+//! is in afterwards. The ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +131,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelSpotInstanceRequests` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelSpotInstanceRequestsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelSpotInstanceRequests"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            MAX_RESOURCE_IDS, deduplicate_ids, invalid_spot_instance_request_id_not_found,
+            require_service_state, require_well_formed_spot_instance_request_id,
+        };
+
+        // `ctx` carries request metadata only; a Spot Instance request is cancelled by its id
+        // and the store holds the account's requests, so this operation reads none of it. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // The ids a call may name are capped before any of them is looked at, the way every
+        // id-taking operation of this service caps them: the model bounds the list at nothing,
+        // and the work the call does is proportional to its length.
+        if input.spot_instance_request_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "SpotInstanceRequestIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                input.spot_instance_request_ids.len()
+            )));
+        }
+        // Naming one request twice asks for one cancellation, so the ids are deduplicated
+        // before anything is reported about them — otherwise one request would be reported
+        // twice, the second time from a state the caller never saw. A request that names the
+        // member nowhere is refused at the boundary by the model's own `@required`, so every
+        // call that reaches here names at least one id.
+        let request_ids = deduplicate_ids(&input.spot_instance_request_ids);
+        // Something that is not a Spot Instance request id at all is refused before any
+        // lookup, the way this service answers every malformed resource id.
+        for request_id in &request_ids {
+            require_well_formed_spot_instance_request_id(request_id)?;
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The moves the CLOCK already owed — the fulfillment that launches a request's
+        // instance, and the expiry its `ValidUntil` makes due — are applied before any state
+        // is read, so each request is cancelled from the state it is actually in: a request
+        // whose fulfillment fell due is cancelled from `active` with its instance left
+        // running, and one whose window closed is seen as `closed` rather than cancelled.
+        store.materialize_due_transitions();
+
+        // A well-formed id no request of the account has refuses the WHOLE call — this
+        // operation models no per-request error channel, so there is nowhere to report one
+        // id's failure — and it is answered before anything is cancelled, so a batch carrying
+        // an unknown id cancels nothing.
+        if let Some(unknown) = request_ids
+            .iter()
+            .find(|request_id| !store.spot_instance_requests.contains_key(request_id.as_str()))
+        {
+            return Err(invalid_spot_instance_request_id_not_found(unknown));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every read-only check
+        // made, and before anything is changed: the flag asks whether the request WOULD have
+        // succeeded, so one that would have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "Canceling a Spot Instance request does not terminate running Spot Instances
+        // associated with the request": the cancellation writes the request, never the
+        // instance it launched, so nothing here terminates an instance and the status code the
+        // one cancellation writer records is the one for an instance left running.
+        let at = ::std::time::SystemTime::now();
+        let cancelled: Vec<CancelledSpotInstanceRequest> = request_ids
+            .iter()
+            .map(|request_id| CancelledSpotInstanceRequest {
+                spot_instance_request_id: Some(request_id.clone()),
+                // "The state of the Spot Instance request"
+                // (`CancelledSpotInstanceRequest$State`), read back OUT of the store: a
+                // request that was `open` or `active` is now `cancelled`, and one that had
+                // already left both keeps the state a describe reports for it.
+                state: store.cancel_spot_instance_request(request_id, false, at),
+            })
+            .collect();
+
+        Ok(CancelSpotInstanceRequestsOutput {
+            cancelled_spot_instance_requests: Some(cancelled),
+        })
     }
 }

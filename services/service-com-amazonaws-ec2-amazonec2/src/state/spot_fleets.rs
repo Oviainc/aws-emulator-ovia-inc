@@ -867,42 +867,15 @@ impl ComAmazonawsEc2Amazonec2State {
 
         let at = SystemTime::now();
         for placement in &placements {
-            let Some(request) = self
-                .spot_instance_requests
-                .get_mut(&placement.spot_instance_request_id)
-            else {
-                continue;
-            };
-            // A request that has already left `open` or `active` — one whose validity ran
-            // out, or one already cancelled — has nothing left to cancel.
-            let state = request.view.state.as_deref().unwrap_or_default();
-            if state != SPOT_REQUEST_STATE_OPEN && state != SPOT_REQUEST_STATE_ACTIVE {
-                continue;
-            }
-            let (code, message) = match (request.view.instance_id.is_some(), terminate_instances) {
-                // Nothing was launched for this request, so it is cancelled before it was
-                // ever fulfilled.
-                (false, _) => (
-                    SPOT_STATUS_CANCELED_BEFORE_FULFILLMENT,
-                    SPOT_STATUS_MESSAGE_CANCELED_BEFORE_FULFILLMENT,
-                ),
-                (true, true) => (
-                    SPOT_STATUS_INSTANCE_TERMINATED_BY_USER,
-                    SPOT_STATUS_MESSAGE_INSTANCE_TERMINATED_BY_USER,
-                ),
-                (true, false) => (
-                    SPOT_STATUS_REQUEST_CANCELED_AND_INSTANCE_RUNNING,
-                    SPOT_STATUS_MESSAGE_REQUEST_CANCELED_AND_INSTANCE_RUNNING,
-                ),
-            };
-            request.view.state = Some(SPOT_REQUEST_STATE_CANCELLED.to_string());
-            request.view.status = Some(SpotInstanceStatus {
-                code: Some(code.to_string()),
-                message: Some(message.to_string()),
-                update_time: Some(system_time_to_date_time(at)),
-            });
-            // The fleet places no new instance for a request it has cancelled.
-            request.fulfillment = None;
+            // Each request the fleet placed is cancelled through the ONE writer of a Spot
+            // Instance request's cancellation, so a request cancelled with its fleet and one
+            // cancelled on its own end the same way — and the fleet places no new instance
+            // for a request it has cancelled.
+            self.cancel_spot_instance_request(
+                &placement.spot_instance_request_id,
+                terminate_instances,
+                at,
+            );
         }
         if terminate_instances {
             // "Terminating an instance is permanent and irreversible": the instances the fleet
