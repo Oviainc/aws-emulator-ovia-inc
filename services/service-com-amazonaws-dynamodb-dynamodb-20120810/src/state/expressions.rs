@@ -2905,10 +2905,16 @@ pub fn expression_conflict(legacy: &str, expression: &str) -> RequestError {
 ///
 /// The rule is about the two generations of parameters, not about one pair of them: "This
 /// is a legacy parameter. Use <the expression member> instead" is said of each legacy
-/// member, so a request that mixes ANY of them with ANY expression member states its
-/// intent two ways at once and is refused — naming both whole sets, as AWS does, so a
-/// caller sees every member it has to drop rather than one pair at a time. Each side is
-/// listed in the order the model declares its members.
+/// member, so a request that states one thing twice is refused naming both whole sets, as
+/// AWS does, so a caller sees every member it has to drop rather than one pair at a time.
+///
+/// Each side is listed in the order the CALLING OPERATION's input shape declares its
+/// members, which is the order a recorded refusal states them in: a `Scan`'s expression
+/// members are stated `ProjectionExpression, FilterExpression`, the order
+/// `smithy_query(query="operation", operation="Scan")` declares. So each handler lists
+/// its own members in its own declared order and this renderer keeps that order; neither
+/// side is sorted here, and the request's own order never reaches it, because what is
+/// walked is the handler's list.
 pub fn expression_conflict_between(legacy: &[&str], expression: &[&str]) -> RequestError {
     RequestError::Validation(format!(
         "Can not use both expression and non-expression parameters in the same request: \
@@ -2918,30 +2924,77 @@ pub fn expression_conflict_between(legacy: &[&str], expression: &[&str]) -> Requ
     ))
 }
 
-/// Hold a request's two generations of parameters apart: a request that carries at least
-/// one non-expression member AND at least one expression member is refused before either
-/// is read.
+/// One non-expression member of a request, as a caller states it: its name, whether the
+/// request carried it, and the expression member(s) that state the SAME thing — the ones
+/// its own documentation says to use instead ("This is a legacy parameter. Use `<member>`
+/// instead").
+///
+/// Most legacy members name exactly one replacement. `ConditionalOperator` names every
+/// expression member its operation declares, because it has no counterpart of its own: it
+/// says how the entries of a legacy MAP are combined, and the expression generation states
+/// that inside the expression itself, so a request carrying it and any expression member
+/// states its intent in both generations at once. That is wider than the one member its
+/// own doc points at (`FilterExpression` for a read, `ConditionExpression` for a write)
+/// because it is what the service is OBSERVED to refuse: a `Scan` carrying
+/// `ConditionalOperator` beside a `ProjectionExpression` alone — no filter of either
+/// generation — is answered with this sentence naming those two members, which the
+/// narrower reading would serve. `tests/all/legacy_conditional_operator_refusals.rs`
+/// pins that case.
+pub type LegacyParameter<'m> = (&'m str, bool, &'m [&'m str]);
+
+/// Hold a request's two generations of parameters apart: a request that states ONE thing
+/// through a legacy member AND through an expression member that states the same thing is
+/// refused before either is read.
+///
+/// What COLLIDES is a PAIR — the legacy member and its replacement, the two ways of
+/// saying one thing — not the two generations at large: a request may carry a member of
+/// each generation when they say DIFFERENT things, and that is served. It is the pair and
+/// not the generations because that is what the service is OBSERVED to do: a `Query`
+/// carrying the legacy `KeyConditions` map beside a `ProjectionExpression` — a key
+/// condition and a projection, two different asks — is SERVED, and so is the symmetric
+/// `Scan` carrying `AttributesToGet` beside a `FilterExpression`, while every request
+/// that states ONE of those things twice is refused. The "Use `<member>` instead"
+/// sentence names which members are the two ways of saying one thing; the served calls
+/// are what says the rest of a request's members are not held against each other.
+/// `tests/all/legacy_conditional_operator_refusals.rs` and
+/// `tests/all/request_validation_refusals.rs` pin both sides of that line.
+///
+/// Once any pair does collide, the refusal NAMES THE WHOLE OF EACH SIDE
+/// ([`expression_conflict_between`]), so a caller sees every member of both generations
+/// its request carried rather than the one pair that was noticed.
 ///
 /// Each entry pairs a member's name with whether the request carried it, so the caller
-/// states the members its own operation declares — the legacy ones and the expression
-/// ones — and this states the rule once for all of them.
+/// states the members its own operation declares — the legacy ones with their
+/// replacements, and the expression ones — IN THE ORDER THAT OPERATION'S INPUT SHAPE
+/// DECLARES THEM ([`expression_conflict_between`]), and this states the rule once for all
+/// of them.
 pub fn check_expression_parameter_mix(
-    legacy: &[(&str, bool)],
+    legacy: &[LegacyParameter<'_>],
     expression: &[(&str, bool)],
 ) -> Result<(), RequestError> {
-    fn carried<'m>(members: &[(&'m str, bool)]) -> Vec<&'m str> {
-        members
-            .iter()
-            .filter(|(_, sent)| *sent)
-            .map(|(member, _)| *member)
-            .collect()
-    }
-    let legacy = carried(legacy);
-    let expression = carried(expression);
-    if legacy.is_empty() || expression.is_empty() {
+    let carried_legacy: Vec<&str> = legacy
+        .iter()
+        .filter(|(_, sent, _)| *sent)
+        .map(|(member, _, _)| *member)
+        .collect();
+    let carried_expression: Vec<&str> = expression
+        .iter()
+        .filter(|(_, sent)| *sent)
+        .map(|(member, _)| *member)
+        .collect();
+    let states_one_thing_twice = legacy.iter().any(|(_, sent, replacements)| {
+        *sent
+            && replacements
+                .iter()
+                .any(|replacement| carried_expression.contains(replacement))
+    });
+    if !states_one_thing_twice {
         return Ok(());
     }
-    Err(expression_conflict_between(&legacy, &expression))
+    Err(expression_conflict_between(
+        &carried_legacy,
+        &carried_expression,
+    ))
 }
 
 /// How a `ConditionalOperator` sent with no map for it to combine is refused.
@@ -2954,6 +3007,85 @@ pub fn check_expression_parameter_mix(
 /// operation would have carried.
 pub const CONDITIONAL_OPERATOR_WITHOUT_MAP_MESSAGE: &str =
     "ConditionalOperator cannot be used without Filter or Expected";
+
+/// How a `ConditionalOperator` sent with a map holding exactly ONE entry is refused.
+///
+/// A map with one entry states one condition, and one condition is combined with
+/// nothing — "AND - If all of the conditions evaluate to true ... OR - If at least one
+/// of the conditions evaluate to true" (`ConditionalOperator`) — so the member has no
+/// work to do and the request is refused with its own sentence, DISTINCT from the one a
+/// request that sent no map at all earns: a caller can tell "you forgot the map" from
+/// "your map needs a second entry". Fixed text, named for both kinds of map the member
+/// can combine, like the sentence above.
+pub const CONDITIONAL_OPERATOR_NEEDS_TWO_ELEMENTS_MESSAGE: &str =
+    "ConditionalOperator can only be used when Filter or Expected has two or more elements";
+
+/// The legacy map a conditional WRITE states its condition through, which is what its
+/// refusals name.
+pub const EXPECTED_MEMBER: &str = "Expected";
+
+/// The legacy condition members a WRITE states its intent through, whose refusals carry
+/// the `<N> validation error(s) detected: ` envelope — the members a READ narrows its
+/// result with do not, which is the same split [`envelopes_expression_refusals`] states
+/// for the two generations' expression members.
+const ENVELOPED_LEGACY_MEMBERS: [&str; 1] = [EXPECTED_MEMBER];
+
+/// Whether a `ConditionalOperator` request fits the map it was sent to combine: the
+/// member combines the ENTRIES of that map, so it needs two or more of them, and the
+/// sentence a request that does not provide them earns is selected on the count the
+/// request carried — none, or exactly one.
+///
+/// `companion_member` is the map the calling surface would have combined (`ScanFilter`,
+/// `QueryFilter`, `Expected`), which decides only whether the sentence is stated inside
+/// the validation envelope ([`ENVELOPED_LEGACY_MEMBERS`]); the sentence itself names
+/// both kinds of map, as AWS states it, and carries nothing of the request.
+pub fn check_conditional_operator_companion(
+    companion_member: &str,
+    conditional_operator: Option<&str>,
+    elements: usize,
+) -> Result<(), RequestError> {
+    if conditional_operator.is_none() {
+        return Ok(());
+    }
+    let clause = match elements {
+        0 => CONDITIONAL_OPERATOR_WITHOUT_MAP_MESSAGE,
+        1 => CONDITIONAL_OPERATOR_NEEDS_TWO_ELEMENTS_MESSAGE,
+        _ => return Ok(()),
+    };
+    Err(expression_refusal(
+        ENVELOPED_LEGACY_MEMBERS.contains(&companion_member),
+        clause.to_string(),
+    ))
+}
+
+/// Hold every VALUE one legacy condition map compares against to the documented value
+/// rules, exactly as a value a write stores or an expression binds is held to them.
+///
+/// The rules belong to the value's TYPE and to this service's own ceilings on the work
+/// one value can ask for ([`check_attribute_value`] — the documented nesting depth, the
+/// item ceiling, the members a collection may carry, the numeric domain and the set
+/// rules), so they hold wherever a request carries a value: an `Expected` entry's
+/// `Value` or `AttributeValueList`, and a `ScanFilter`/`QueryFilter` entry's
+/// `AttributeValueList`, are values a request carries like any other.
+///
+/// `member` is the map they arrived in, which decides only whether the clause is stated
+/// inside the validation envelope ([`ENVELOPED_LEGACY_MEMBERS`]).
+pub fn check_legacy_condition_values<'v>(
+    member: &str,
+    values: impl Iterator<Item = (&'v str, &'v AttributeValue)>,
+) -> Result<(), RequestError> {
+    let enveloped = ENVELOPED_LEGACY_MEMBERS.contains(&member);
+    for (name, value) in values {
+        check_attribute_value(name, value).map_err(|error| {
+            if enveloped {
+                error
+            } else {
+                without_envelope(error)
+            }
+        })?;
+    }
+    Ok(())
+}
 
 /// Whether the condition a conditional write states is satisfied by the stored item.
 ///
@@ -2980,13 +3112,30 @@ pub fn write_condition_satisfied(
             }
             ParsedCondition::parse("ConditionExpression", expression, substitutions)?.evaluate(item)
         }
-        (None, Some(expected)) => expected_satisfied(expected, conditional_operator, item),
+        (None, Some(expected)) => {
+            // The member combines the entries of `Expected`, so the map it was sent with
+            // has to hold two or more of them.
+            check_conditional_operator_companion(
+                EXPECTED_MEMBER,
+                conditional_operator,
+                expected.len(),
+            )?;
+            // Every value the map compares against is held to the documented value rules,
+            // before the stored item is read against any of them.
+            check_legacy_condition_values(
+                EXPECTED_MEMBER,
+                expected.iter().flat_map(|(name, condition)| {
+                    condition
+                        .value
+                        .iter()
+                        .chain(condition.attribute_value_list.iter().flatten())
+                        .map(move |value| (name.as_str(), value))
+                }),
+            )?;
+            expected_satisfied(expected, conditional_operator, item)
+        }
         (None, None) => {
-            if conditional_operator.is_some() {
-                return Err(RequestError::Validation(
-                    CONDITIONAL_OPERATOR_WITHOUT_MAP_MESSAGE.to_string(),
-                ));
-            }
+            check_conditional_operator_companion(EXPECTED_MEMBER, conditional_operator, 0)?;
             Ok(true)
         }
     }

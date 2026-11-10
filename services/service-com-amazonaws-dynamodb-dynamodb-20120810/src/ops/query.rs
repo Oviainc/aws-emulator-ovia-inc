@@ -368,7 +368,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A request states its intent through the expression members or through the
         // legacy ones they replaced, never through both: the whole of each side is
-        // named, and the check runs before either side is read.
+        // named, and the check runs before either side is read. Each side is listed in
+        // the order THIS operation's input shape declares its members
+        // (`smithy_query(query="operation", operation="Query")`), which is the order the
+        // sentence states them in ([`crate::state::expression_conflict_between`]).
         crate::state::check_expression_parameter_mix(
             &[
                 (
@@ -377,6 +380,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .attributes_to_get
                         .as_ref()
                         .is_some_and(|names| !names.is_empty()),
+                    &[PROJECTION_EXPRESSION],
                 ),
                 (
                     "KeyConditions",
@@ -384,6 +388,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .key_conditions
                         .as_ref()
                         .is_some_and(|map| !map.is_empty()),
+                    &["KeyConditionExpression"],
                 ),
                 (
                     "QueryFilter",
@@ -391,23 +396,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .query_filter
                         .as_ref()
                         .is_some_and(|map| !map.is_empty()),
+                    &["FilterExpression"],
                 ),
                 (
                     "ConditionalOperator",
                     input.conditional_operator.is_some(),
+                    // The member has no expression counterpart of its own, so it states
+                    // its intent twice beside ANY expression member — wider than the
+                    // `FilterExpression` its doc points at, because a request carrying it
+                    // beside a projection expression ALONE is observed to be refused with
+                    // this sentence ([`crate::state::LegacyParameter`]).
+                    &[
+                        PROJECTION_EXPRESSION,
+                        "FilterExpression",
+                        "KeyConditionExpression",
+                    ],
                 ),
             ],
             &[
                 (
-                    "KeyConditionExpression",
-                    input.key_condition_expression.is_some(),
-                ),
-                ("FilterExpression", input.filter_expression.is_some()),
-                (
                     PROJECTION_EXPRESSION,
                     input.projection_expression.is_some(),
                 ),
+                ("FilterExpression", input.filter_expression.is_some()),
+                (
+                    "KeyConditionExpression",
+                    input.key_condition_expression.is_some(),
+                ),
             ],
+        )
+        .map_err(lift)?;
+        // `ConditionalOperator` combines the ENTRIES of the legacy filter map beside it,
+        // so whether this request carries a map with entries to combine is settled with
+        // the other facts about which members were sent — before the key condition is
+        // read, because a request that states how to combine nothing is refused whatever
+        // it asks of the key. The filter reader states the same rule again when it
+        // resolves the map ([`crate::state::ReadFilter::resolve`]) and reaches the same
+        // verdict; neither call is dead, the one here only fixes WHEN it is reached.
+        crate::state::check_conditional_operator_companion(
+            "QueryFilter",
+            input.conditional_operator.as_deref(),
+            input.query_filter.as_ref().map_or(0, std::collections::HashMap::len),
         )
         .map_err(lift)?;
         // What each reported item carries is a fact of the REQUEST: the projection it
@@ -1138,7 +1167,8 @@ fn key_comparisons(input: &QueryInput) -> Result<Vec<Comparison>, crate::state::
     match (input.key_condition_expression.as_deref(), legacy) {
         // Both members at once is the two generations stated at once, which
         // [`crate::state::check_expression_parameter_mix`] has already refused over the
-        // whole of each side; the arm stays total rather than unreachable.
+        // whole of each side — it names this pair among the request's members; the arm
+        // stays total rather than unreachable.
         (Some(_), Some(_)) => Err(crate::state::expression_conflict(
             "KeyConditions",
             "KeyConditionExpression",

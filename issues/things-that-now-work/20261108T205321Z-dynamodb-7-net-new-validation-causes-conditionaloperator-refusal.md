@@ -98,3 +98,25 @@ Cause 7 — dynamodb.zero-with-out-of-range-exponent-rejected: put_item(Item={'v
 7. Cause 6: ddb.scan(TableName=t, AttributesToGet=['a'], ScanFilter={'a': <EQ>}, ConditionalOperator='AND', FilterExpression='a = :v', ProjectionExpression='b', ExpressionAttributeValues={':v': {'S': 'x'}}) and read the two brace lists in Error.Message.
 8. Cause 7: ddb.put_item(TableName=t, Item={'pk': {'S': 'exp-at-max'}, 'v': {'N': '1E9223372036854775807'}}) and compare Error.Message with the 1E9223372036854775808 case.
 Then replay the dynamodb checks named in trace_ids.
+
+## Resolution note
+
+All seven causes were implemented (see the fix's commit). Two residual divergences are
+recorded here rather than lost, because no evidence available in this repository, the
+Smithy model or the AWS documentation determines either one:
+
+* Cause 6 — a `Query` carrying ALL of `KeyConditions`, `QueryFilter`,
+  `ConditionalOperator`, `ProjectionExpression`, `FilterExpression` and
+  `KeyConditionExpression` is refused with the right status, code, sentence and both
+  membership sets, but the ORDER of the names inside the braces for that one request
+  shape is still not AWS's. Every order of its three expression members, and both
+  orders of each key-member variant, were tried against the recorded check and none
+  matched; the `Scan` class this issue documents (`{AttributesToGet, ScanFilter,
+  ConditionalOperator}` / `{ProjectionExpression, FilterExpression}`) now matches
+  exactly, and the emulator states each side in the order the operation's input shape
+  declares its members.
+* Cause 3 — `ExecuteStatement` now reports a truncated `INSERT` as `Unexpected term`,
+  and the recorded check gets past that class onto a LATER malformed statement whose
+  text this emulator reads as an expression followed by a token
+  (`Unexpected token after expression`). Which statement class that label sends, and
+  what AWS answers for it, is not stated anywhere in this issue.

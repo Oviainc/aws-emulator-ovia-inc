@@ -374,16 +374,17 @@ const MAX_NUMBER_TEXT_DIGITS: usize =
     MAX_SIGNIFICANT_DIGITS + (MAX_POINT - MIN_POINT) as usize;
 
 /// The most CHARACTERS one `N` value's EXPONENT text may carry, sign included: the
-/// widest decimal spelling of the `i32` the exponent is read into.
+/// widest decimal spelling of the 64-bit integer the exponent is read into
+/// (`-9223372036854775808`).
 ///
-/// An exponent is read with `parse::<i32>`, which accepts any run of leading zeros, so a
+/// An exponent is read with `parse::<i64>`, which accepts any run of leading zeros, so a
 /// bound on the exponent's VALUE (the documented range, enforced below as an over- or
-/// underflow) bounds no amount of exponent TEXT. An exponent spelled wider than an `i32`
-/// denotes no number this service can convert — the same fault as an exponent that is
-/// not digits at all — and bounding the text keeps what one value retains bounded, which
-/// is what the byte budgets measured against a number's accounted size
+/// underflow) bounds no amount of exponent TEXT. A text wider than that integer's widest
+/// spelling carries no exponent that integer can hold — the same fault as an exponent
+/// that is not digits at all — and bounding the text keeps what one value retains
+/// bounded, which is what the byte budgets measured against a number's accounted size
 /// ([`attribute_value_size`], which sizes a number from its significant digits) rely on.
-const MAX_EXPONENT_TEXT_CHARS: usize = 11;
+const MAX_EXPONENT_TEXT_CHARS: usize = 20;
 
 /// How often the figures a description reports as `ItemCount` and
 /// `TableSizeBytes`/`IndexSizeBytes` are recomputed from what is stored.
@@ -4223,7 +4224,10 @@ fn clipped(text: &str) -> String {
 //   * a set's members are distinct ("the values within a set must be unique" and "No
 //     two elements can be equal" — the `AttributeValue$SS`/`NS`/`BS` docs and the
 //     Developer Guide's set rules), compared the way the type compares: `NS` members
-//     numerically, so `1` and `1.0` are one member.
+//     numerically, so `1` and `1.0` are one member;
+//   * a `NULL` states the value `true` ("An attribute of type Null. For example:
+//     `"NULL": true`" — `AttributeValue$NULL`), which is the only value that member
+//     takes.
 
 /// Which set type a value is, for the refusals whose wording differs between them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4358,7 +4362,8 @@ pub(crate) fn canonical_number_text(text: &str) -> Result<String, RequestError> 
 /// `L` or an `M` at any depth: a number is refused unless it is one the documented
 /// precision and exponent range can hold ([`canonical_number_text`]), and a set is
 /// refused if it is empty ([`check_set_not_empty`]) or lists one value twice
-/// ([`duplicate_set_member`]). Set distinctness is checked AFTER canonicalization, so
+/// ([`duplicate_set_member`]), and a `NULL` is refused unless it states the one value
+/// that member takes ([`check_null_is_true`]). Set distinctness is checked AFTER canonicalization, so
 /// two spellings of one number are the duplicate member DynamoDB refuses rather than
 /// two members of the stored set. The walk is ITERATIVE, over an explicit stack, for
 /// the reason [`attribute_value_size`]'s is: how deeply a value nests is the caller's
@@ -4394,13 +4399,29 @@ pub(crate) fn canonicalize_attribute_value(
             }
             AttributeValue::L(members) => pending.extend(members.iter_mut()),
             AttributeValue::M(entries) => pending.extend(entries.values_mut()),
-            AttributeValue::S(_)
-            | AttributeValue::B(_)
-            | AttributeValue::Bool(_)
-            | AttributeValue::Null(_) => {}
+            AttributeValue::Null(stated) => check_null_is_true(*stated)?,
+            AttributeValue::S(_) | AttributeValue::B(_) | AttributeValue::Bool(_) => {}
         }
     }
     Ok(())
+}
+
+/// Refuse a `NULL` attribute value whose boolean is anything but `true`.
+///
+/// The member is the attribute's own TYPE rather than a value of it: "An attribute of
+/// type Null. For example: `\"NULL\": true`" (`AttributeValue$NULL`), so `true` is the
+/// only value that states the type and a `false` states no value at all. The clause is
+/// fixed and echoes nothing of the request, inside the same validation envelope every
+/// other value clause is stated in.
+fn check_null_is_true(stated: bool) -> Result<(), RequestError> {
+    if stated {
+        return Ok(());
+    }
+    Err(refused(
+        "One or more parameter values were invalid: Null attribute value types must have the \
+         value of true"
+            .to_string(),
+    ))
 }
 
 /// Whether a set lists one value twice: a set holds each of its values once, so a

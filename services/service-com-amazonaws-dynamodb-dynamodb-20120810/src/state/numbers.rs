@@ -27,18 +27,19 @@ impl NumberKey {
         let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
             Some(at) => {
                 let text = &unsigned[at + 1..];
-                // An exponent spelled wider than the integer it is read into denotes a
-                // magnitude far outside the documented range whatever the mantissa
-                // shifts it by — so the TEXT is no number this service can convert,
-                // which is the same fault `parse` reports for an exponent that is not
-                // digits at all. Bounded before it is parsed, because `parse::<i32>`
-                // reads through any number of leading zeros.
+                // The exponent is read as a 64-BIT integer and only then held to the
+                // documented range below, so the two defects stay apart: a text whose
+                // exponent is a number states a magnitude, which over- or underflows
+                // that range, and only a text whose exponent is NO 64-bit integer — not
+                // digits at all, or wider than that integer can hold — is a text this
+                // service cannot convert to a number. Bounded before it is parsed,
+                // because `parse` reads through any number of leading zeros.
                 if text.len() > MAX_EXPONENT_TEXT_CHARS {
                     return Err(NumberFault::NotNumeric);
                 }
                 (
                     &unsigned[..at],
-                    text.parse::<i32>().map_err(|_| NumberFault::NotNumeric)?,
+                    text.parse::<i64>().map_err(|_| NumberFault::NotNumeric)?,
                 )
             }
             None => (unsigned, 0),
@@ -69,18 +70,20 @@ impl NumberKey {
         // sits after the integral digits, shifted by the exponent. Both terms come
         // from the request, so every step is checked: an exponent that leaves the
         // documented range is refused as an over- or underflow, whichever direction
-        // it left it in.
-        let shifted = i32::try_from(integral.len())
+        // it left it in. The arithmetic is done in the width the exponent was READ in,
+        // so a magnitude stated with an exponent at that integer's own limit is still
+        // reported as the over- or underflow it is.
+        let shifted = i64::try_from(integral.len())
             .ok()
             .and_then(|len| len.checked_add(exponent));
-        let mut point = match shifted {
+        let mut point: i64 = match shifted {
             Some(point) => point,
             None if exponent > 0 => return Err(NumberFault::Overflow),
             None => return Err(NumberFault::Underflow),
         };
         let leading_zeros = digits.iter().take_while(|digit| **digit == 0).count();
         digits.drain(..leading_zeros);
-        point = match i32::try_from(leading_zeros)
+        point = match i64::try_from(leading_zeros)
             .ok()
             .and_then(|zeros| point.checked_sub(zeros))
         {
@@ -95,10 +98,10 @@ impl NumberKey {
             // the EXPONENT the text spelled is still held to the documented range: a
             // zero written with an exponent outside that range is a number this service
             // does not store, whatever its mantissa normalises to.
-            if exponent > MAX_EXPONENT {
+            if exponent > i64::from(MAX_EXPONENT) {
                 return Err(NumberFault::Overflow);
             }
-            if exponent < MIN_EXPONENT {
+            if exponent < i64::from(MIN_EXPONENT) {
                 return Err(NumberFault::Underflow);
             }
             return Ok(Self {
@@ -110,15 +113,17 @@ impl NumberKey {
         if digits.len() > MAX_SIGNIFICANT_DIGITS {
             return Err(NumberFault::Precision);
         }
-        if point > MAX_POINT {
+        if point > i64::from(MAX_POINT) {
             return Err(NumberFault::Overflow);
         }
-        if point < MIN_POINT {
+        if point < i64::from(MIN_POINT) {
             return Err(NumberFault::Underflow);
         }
         Ok(Self {
             negative,
-            point,
+            // Inside the documented range, which the two bounds above just held it to,
+            // so the narrowing cannot lose a value.
+            point: i32::try_from(point).map_err(|_| NumberFault::Overflow)?,
             digits,
         })
     }

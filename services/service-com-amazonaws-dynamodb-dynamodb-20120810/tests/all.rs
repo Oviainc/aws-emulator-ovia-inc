@@ -13,6 +13,8 @@
 mod account_capacity_limits;
 #[path = "all/arn_addressed_tag_refusals.rs"]
 mod arn_addressed_tag_refusals;
+#[path = "all/attribute_value_admission_rules.rs"]
+mod attribute_value_admission_rules;
 #[path = "all/authentication_refusal_wording.rs"]
 mod authentication_refusal_wording;
 #[path = "all/batch_and_transact_items.rs"]
@@ -95,6 +97,8 @@ mod kinesis_destination_stream_resolution;
 mod kinesis_streaming_destinations;
 #[path = "all/kms_key_state_refusals.rs"]
 mod kms_key_state_refusals;
+#[path = "all/legacy_conditional_operator_refusals.rs"]
+mod legacy_conditional_operator_refusals;
 #[path = "all/list_exports.rs"]
 mod list_exports;
 #[path = "all/list_imports.rs"]
@@ -115,6 +119,8 @@ mod parallel_scan_segment_refusals;
 mod partiql_refusal_wording;
 #[path = "all/partiql_statement_boundaries.rs"]
 mod partiql_statement_boundaries;
+#[path = "all/partiql_statement_defect_classes.rs"]
+mod partiql_statement_defect_classes;
 #[path = "all/partiql_statements.rs"]
 mod partiql_statements;
 #[path = "all/partiql_transaction_responses.rs"]

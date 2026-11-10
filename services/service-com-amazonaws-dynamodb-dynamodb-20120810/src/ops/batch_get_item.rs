@@ -262,6 +262,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut addressed: Vec<(&String, &KeysAndAttributes)> =
             input.request_items.iter().collect();
         addressed.sort_by(|left, right| left.0.cmp(right.0));
+        // A request states its intent through the expression members or through the
+        // legacy ones they replaced, never through both — a rule about the REQUEST, so
+        // the two sides are collected over EVERY table's entry: a batch that projects one
+        // table the legacy way and another the expression way states its intent two ways
+        // at once, exactly as one entry carrying both members does.
+        crate::state::check_expression_parameter_mix(
+            &[(
+                "AttributesToGet",
+                addressed.iter().any(|(_, keys)| {
+                    keys.attributes_to_get
+                        .as_ref()
+                        .is_some_and(|names| !names.is_empty())
+                }),
+                PROJECTION_EXPRESSION_SET,
+            )],
+            &[(
+                PROJECTION_EXPRESSION,
+                addressed
+                    .iter()
+                    .any(|(_, keys)| keys.projection_expression.is_some()),
+            )],
+        )
+        .map_err(lift)?;
         // What each table's entry REPORTS of the items it addresses, settled before the
         // store is reached: a projection the service would refuse is refused whatever
         // the tables hold. Read by the one reader every read of this service reads it
@@ -462,3 +485,7 @@ fn lift(error: crate::state::RequestError) -> BatchGetItemError {
 
 /// The input member a projection travels in, which is what its refusals name.
 const PROJECTION_EXPRESSION: &str = "ProjectionExpression";
+
+/// The same member as the expression generation's whole answer to `AttributesToGet`:
+/// what the legacy member's documentation says to use instead of it.
+const PROJECTION_EXPRESSION_SET: &[&str] = &[PROJECTION_EXPRESSION];

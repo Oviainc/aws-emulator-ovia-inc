@@ -75,6 +75,21 @@ impl<'a> ReadFilter<'a> {
                 // combining them is one the model declares, are all facts of the
                 // request: settled once here rather than per item, so the work the
                 // filter does per row is bounded by this service's own constants.
+                crate::state::check_conditional_operator_companion(
+                    legacy_member,
+                    conditional_operator,
+                    conditions.len(),
+                )?;
+                // Every value the filter compares against is held to the documented
+                // value rules, before anything is read against them.
+                crate::state::check_legacy_condition_values(
+                    legacy_member,
+                    conditions.iter().flat_map(|(name, condition)| {
+                        crate::state::legacy_operands(condition)
+                            .iter()
+                            .map(move |value| (name.as_str(), value))
+                    }),
+                )?;
                 check_legacy_conditions(conditions, conditional_operator)?;
                 Ok(Self::Legacy {
                     conditions,
@@ -82,14 +97,14 @@ impl<'a> ReadFilter<'a> {
                 })
             }
             (None, None) => {
-                if conditional_operator.is_some() {
-                    // The member combines the entries of the legacy filter map, so a
-                    // request that sends it with no map states how to combine nothing:
-                    // the one sentence every surface carrying the member states.
-                    return Err(RequestError::Validation(
-                        crate::state::CONDITIONAL_OPERATOR_WITHOUT_MAP_MESSAGE.to_string(),
-                    ));
-                }
+                // The member combines the entries of the legacy filter map, so a
+                // request that sends it with no map states how to combine nothing:
+                // the one sentence every surface carrying the member states.
+                crate::state::check_conditional_operator_companion(
+                    legacy_member,
+                    conditional_operator,
+                    0,
+                )?;
                 Ok(Self::Unfiltered)
             }
         }

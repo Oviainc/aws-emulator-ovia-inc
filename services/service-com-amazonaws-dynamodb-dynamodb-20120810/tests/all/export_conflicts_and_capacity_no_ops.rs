@@ -394,10 +394,11 @@ async fn a_conditional_operator_with_no_map_to_combine_states_one_sentence() {
 
     let key = json!({"Part": {"S": "one"}});
     // Rows differ in the operation, and so in WHICH legacy map the member would have
-    // combined; the sentence states the rule, so it is the same for all of them. Both
-    // values the enum declares are sent, because the rule is about the member being
-    // there at all.
-    let calls: [(&str, Value); 5] = [
+    // combined; the sentence states the rule, so it is the same for all of them — and the
+    // form it is stated in follows the surface: a read states it bare, a write states it
+    // inside the validation envelope. Both values the enum declares are sent, because the
+    // rule is about the member being there at all.
+    let calls: [(&str, Value, &str); 5] = [
         (
             "Query",
             json!({
@@ -407,18 +408,22 @@ async fn a_conditional_operator_with_no_map_to_combine_states_one_sentence() {
                     "Part": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "one"}]},
                 },
             }),
+            "",
         ),
         (
             "Scan",
             json!({"TableName": "Combined", "ConditionalOperator": "OR"}),
+            "",
         ),
         (
             "PutItem",
             json!({"TableName": "Combined", "Item": key, "ConditionalOperator": "AND"}),
+            "1 validation error detected: ",
         ),
         (
             "DeleteItem",
             json!({"TableName": "Combined", "Key": key, "ConditionalOperator": "OR"}),
+            "1 validation error detected: ",
         ),
         (
             "UpdateItem",
@@ -428,17 +433,20 @@ async fn a_conditional_operator_with_no_map_to_combine_states_one_sentence() {
                 "AttributeUpdates": {"Label": {"Action": "PUT", "Value": {"S": "x"}}},
                 "ConditionalOperator": "AND",
             }),
+            "1 validation error detected: ",
         ),
     ];
 
-    for (operation, body) in calls {
+    for (operation, body, envelope) in calls {
         let (status, answered) = call(&router, operation, body).await;
         assert_eq!(
             (status, error_code(&answered).as_str(), message(&answered)),
             (
                 400,
                 "ValidationException",
-                "ConditionalOperator cannot be used without Filter or Expected".to_string()
+                format!(
+                    "{envelope}ConditionalOperator cannot be used without Filter or Expected"
+                )
             ),
             "case {operation:?}: expected the one sentence the rule states, got {status} with \
              {answered}"

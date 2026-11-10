@@ -267,10 +267,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A statement of a transaction is refused as the SLOT it was sent in: the
             // statement's own defect, behind the position the request stated it at, so a
             // caller carrying several statements can tell which of them is wrong.
-            parsed.push(
-                crate::state::parse_statement(&entry.statement, &parameters)
-                    .map_err(|error| lift(in_slot(slot, error)))?,
-            );
+            let statement = crate::state::parse_statement(&entry.statement, &parameters)
+                .map_err(|error| lift(in_slot(slot, error)))?;
+            // A read addressed at an INDEX is admitted by no transaction: the statement
+            // is well formed and names the index's own key, and it is the index that a
+            // transaction cannot read — so the refusal is the top-level validation of
+            // this request, behind the slot that carried the statement, and nothing of
+            // the transaction is attempted or cancelled.
+            if matches!(
+                &statement,
+                crate::state::PartiqlStatement::Select(select) if select.index.is_some()
+            ) {
+                return Err(lift(in_slot(
+                    slot,
+                    crate::state::RequestError::Validation(
+                        INDEX_READ_IN_TRANSACTION_MESSAGE.to_string(),
+                    ),
+                )));
+            }
+            parsed.push(statement);
         }
 
         // "The entire transaction must consist of either read statements or write
@@ -382,12 +397,22 @@ const MIXED_TRANSACTION_MESSAGE: &str =
 /// How a `SELECT` that does not address ONE item of the table is refused.
 ///
 /// A transactional read reports the item its statement names, so the `WHERE` clause must
-/// pin every key attribute by equality — and a secondary index is not keyed by the
-/// table's primary key, so no clause over one addresses an item of the table. The
-/// sentence is the one this surface states that rule with, named for the operation that
-/// enforces it exactly as `BatchExecuteStatement` names itself in its own.
+/// pin every key attribute by equality. The sentence is the one this surface states that
+/// rule with, named for the operation that enforces it exactly as `BatchExecuteStatement`
+/// names itself in its own.
 const SINGLE_ITEM_READ_MESSAGE: &str = "Select statements within ExecuteTransaction must specify \
                                         the primary key in the where clause.";
+
+/// How a `SELECT` addressed at an INDEX is refused.
+///
+/// A transaction reads items of a TABLE, and an index holds a projection of them keyed by
+/// its own schema, so an index is a source no statement of a transaction can read — which
+/// is a different fact from a `WHERE` clause that pins no key ([`SINGLE_ITEM_READ_MESSAGE`]):
+/// such a statement DOES pin the index's key. The sentence is fixed and names neither the
+/// index nor the table; the slot it is stated behind ([`in_slot`]) is what locates the
+/// statement in the request.
+const INDEX_READ_IN_TRANSACTION_MESSAGE: &str =
+    "Reads on indices are not supported within transactions.";
 
 /// One statement's refusal, reported against the slot the request sent that statement
 /// in.
@@ -495,11 +520,6 @@ fn read_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         // not use leaves nothing this statement could decrypt — and a transaction is
         // served whole or not at all ([`crate::state::check_table_key_accessible`]).
         crate::state::check_table_key_accessible(engine, table).map_err(lift)?;
-        if select.index.is_some() {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                SINGLE_ITEM_READ_MESSAGE,
-            ));
-        }
         if select.order_by.is_some() {
             return Err(crate::scaffolded::Scaffolded::validation(ORDER_BY_MESSAGE));
         }

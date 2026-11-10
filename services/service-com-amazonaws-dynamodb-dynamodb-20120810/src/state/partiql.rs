@@ -1578,8 +1578,13 @@ impl StatementParser<'_> {
     fn insert(&mut self) -> Result<InsertStatement, RequestError> {
         self.expect_clause_word("into")?;
         let table = self.write_target(&["value", "values"], single_table_in_data_manipulation)?;
-        if !self.accept_word("value") {
-            self.expect_clause_word("values")?;
+        if !self.accept_word("value") && !self.accept_word("values") {
+            // What follows an `INSERT`'s target is the VALUE it inserts, so the position
+            // admits a TERM: text that states none — the statement stopping there, or a
+            // token the grammar has no place for — is refused as that term rather than as
+            // text stating no manipulation of data, which is what an `UPDATE` with
+            // neither action earns ([`ParseDefect::NotDataManipulation`]).
+            return Err(unexpected_token(self.peek()));
         }
         let value = self.value()?;
         let AttributeValue::M(item) = value else {
@@ -2789,7 +2794,8 @@ pub fn unprojected_filter_refusal(index: &str, attributes: &[String]) -> Request
 /// `ALL` index, and the projected ones for any other index.
 ///
 /// Returns `None` when every attribute is reported.
-pub fn projected_attributes(table: &Table, index: Option<&str>) -> Option<BTreeSet<String>> {    let index = index?;
+pub fn projected_attributes(table: &Table, index: Option<&str>) -> Option<BTreeSet<String>> {
+    let index = index?;
     let (key_schema, projection) = index_shape(table, index)?;
     let projection_type = projection.projection_type.as_deref().unwrap_or("ALL");
     if projection_type == "ALL" {

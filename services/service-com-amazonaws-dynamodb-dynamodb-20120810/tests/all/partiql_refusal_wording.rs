@@ -767,25 +767,34 @@ async fn a_transaction_states_the_slot_a_statement_was_sent_in() {
 async fn a_transaction_read_that_addresses_no_one_item_states_that_rule() {
     let router = seeded().await;
 
+    let no_one_item = "Select statements within ExecuteTransaction must specify the primary key in \
+                       the where clause.";
     // The ways a read statement can fail to address ONE item of the table: no clause at
-    // all, part of the key, a key pinned by something other than an equality, and a
-    // source that is an index (which is not keyed by the table's primary key).
+    // all, part of the key, and a key pinned by something other than an equality. A
+    // source that is an INDEX is a different defect — the statement does pin the index's
+    // key, and a transaction reads no index at all — so it earns its own sentence, behind
+    // the slot the request sent it in.
     let rows = [
-        ("no WHERE clause at all", "SELECT * FROM keyed"),
-        ("only the partition key", "SELECT * FROM keyed WHERE pk = 'a'"),
+        ("no WHERE clause at all", "SELECT * FROM keyed", no_one_item),
+        (
+            "only the partition key",
+            "SELECT * FROM keyed WHERE pk = 'a'",
+            no_one_item,
+        ),
         (
             "the sort key pinned by an inequality",
             "SELECT * FROM keyed WHERE pk = 'a' AND sk > 0",
+            no_one_item,
         ),
         (
             "a source that is an index",
             "SELECT * FROM \"keyed\".\"by-owner\" WHERE owner = 'x'",
+            "Validation failed in TransactStatements[0]: Reads on indices are not supported \
+             within transactions.",
         ),
     ];
-    let expected = "Select statements within ExecuteTransaction must specify the primary key in \
-                    the where clause.";
 
-    for (case, statement) in rows {
+    for (case, statement, expected) in rows {
         let (status, answered) = call(
             &router,
             "ExecuteTransaction",
@@ -807,6 +816,11 @@ async fn a_transaction_read_that_addresses_no_one_item_states_that_rule() {
             message(&answered),
             expected,
             "case {case}: expected the message {expected:?}, got {answered}"
+        );
+        assert_eq!(
+            answered.get("CancellationReasons"),
+            None,
+            "case {case}: a top-level validation carries no cancellation, got {answered}"
         );
     }
 }

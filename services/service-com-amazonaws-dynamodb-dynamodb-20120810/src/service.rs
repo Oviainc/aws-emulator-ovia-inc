@@ -183,35 +183,86 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
     })
 }
 
-/// The input member DynamoDB's own request code validates rather than leaving to the
-/// generic request walk, named by the path that walk reports it under.
+/// The input members DynamoDB's own request code validates rather than leaving to the
+/// generic request walk, each named by the path that walk reports it under and paired
+/// with the value set that check states.
 ///
-/// Its refusal is worded differently from every other enumerated member's: the clause
-/// states the requirement ALONE — neither the rejected value nor the member path — which
-/// is what a check by the service's own code looks like next to the generic validator's
-/// `Value '<v>' at '<path>' failed to satisfy constraint: …`.
+/// Their refusals are worded differently from every other enumerated member's: the
+/// clause states the requirement ALONE — neither the rejected value nor the member path
+/// — which is what a check by the service's own code looks like next to the generic
+/// validator's `Value '<v>' at '<path>' failed to satisfy constraint: …`.
 ///
-/// This is ONE member, not a class, and it is here because the service's refusal of it
-/// is observed to take that shape while the refusals of the service's other enumerated
+/// These are NAMED MEMBERS, not a class, because the service's refusals of them are
+/// observed to take that shape while the refusals of the service's other enumerated
 /// members (`ReturnConsumedCapacity`, `Select`, `StreamViewType`, `ProjectionType`, …)
 /// are observed to take the generic one. Nothing about the model distinguishes them, so
 /// there is nothing to derive the difference from: a member later found to be checked
 /// the same way needs its own entry, and
-/// `tests/all/refusal_contracts_and_expression_pre_images.rs` pins both shapes side by
-/// side so the difference is visible rather than silent.
-const SERVICE_CHECKED_ENUM_MEMBER: &str = "returnValues";
-
-/// The value set that refusal states for it.
+/// `tests/all/refusal_contracts_and_expression_pre_images.rs` and
+/// `tests/all/legacy_conditional_operator_refusals.rs` pin both shapes side by side so
+/// the difference is visible rather than silent.
 ///
-/// It is the SERVICE's own set rather than the model's `ReturnValue` enum
-/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ReturnValue")` gives
-/// `NONE ALL_OLD UPDATED_OLD ALL_NEW UPDATED_NEW`): the order differs and `UPDATED_NEW`
-/// is spelled `UPDATE_NEW`. Both differences are the service's and are reproduced rather
-/// than normalised, because a client matching the message has to read the same text from
-/// the emulator and from DynamoDB; deriving the set from the model would state a
-/// different sentence from the one the service sends.
-const SERVICE_CHECKED_ENUM_SET: [&str; 5] =
-    ["ALL_OLD", "UPDATED_OLD", "ALL_NEW", "UPDATE_NEW", "NONE"];
+/// The value set each entry states is the SERVICE's own rather than the model's:
+///
+/// * `returnValues` states `ReturnValue`
+///   (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ReturnValue")` gives
+///   `NONE ALL_OLD UPDATED_OLD ALL_NEW UPDATED_NEW`) in a different order and spells
+///   `UPDATED_NEW` as `UPDATE_NEW`;
+/// * `conditionalOperator` states `[ALL, OR]` where the model's `ConditionalOperator`
+///   (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ConditionalOperator")`
+///   gives `AND OR`) declares `AND` for the value `ALL` stands in for.
+///
+/// Every difference is the service's and is reproduced rather than normalised, because a
+/// client matching the message has to read the same text from the emulator and from
+/// DynamoDB; deriving a set from the model would state a different sentence from the one
+/// the service sends.
+const SERVICE_CHECKED_ENUMS: &[(&str, &[&str])] = &[
+    (
+        "returnValues",
+        &["ALL_OLD", "UPDATED_OLD", "ALL_NEW", "UPDATE_NEW", "NONE"],
+    ),
+    ("conditionalOperator", &["ALL", "OR"]),
+];
+
+/// The set the service's own check states for `path`, or `None` for a member the generic
+/// request walk words.
+fn service_checked_enum_set(path: &str) -> Option<&'static [&'static str]> {
+    SERVICE_CHECKED_ENUMS
+        .iter()
+        .find(|(member, _)| *member == path)
+        .map(|(_, stated)| *stated)
+}
+
+/// Whether every violation this refusal reports is about a member the service checks
+/// itself ([`SERVICE_CHECKED_ENUMS`]) being outside its set — the refusals whose
+/// envelope follows the operation that was served.
+fn all_service_checked_enums(violations: &[Violation]) -> bool {
+    !violations.is_empty()
+        && violations.iter().all(|violation| {
+            matches!(violation.kind, ViolationKind::EnumValue(_))
+                && service_checked_enum_set(&violation.path).is_some()
+        })
+}
+
+/// The operations that state a clause about a member they check themselves BARE, outside
+/// the `<N> validation error(s) detected: ` envelope every other refusal of this service
+/// carries.
+///
+/// It is the same split this service states everywhere else about the two generations of
+/// condition members (`crate::state`'s enveloped-members rule): a refusal about the
+/// members a WRITE states its intent through carries the envelope, and one about the
+/// members a READ narrows its result with does not. The two readers below are the
+/// operations that carry such a member — `ConditionalOperator`, beside the filter map it
+/// combines — so their refusal of it is the sentence alone.
+///
+/// Sorted, which [`states_service_checked_clause_bare`] relies on for `binary_search`
+/// and `bare_clause_operations_are_sorted` pins.
+const BARE_CLAUSE_OPERATIONS: &[&str] = &["Query", "Scan"];
+
+/// Whether `operation` states such a clause bare.
+fn states_service_checked_clause_bare(operation: &str) -> bool {
+    BARE_CLAUSE_OPERATIONS.binary_search(&operation).is_ok()
+}
 
 /// The enum value sets this service STATES in an order of its own, each written in the
 /// order it states them.
@@ -334,6 +385,10 @@ tokio::task_local! {
     /// set by [`OperationScopedClauseForm::run`] around that operation's whole run and
     /// read back by [`EmulatedService::override_refusal`].
     static SERVED_CLAUSE_FORM: ClauseForm;
+
+    /// Whether that operation states a clause about a member the service checks itself
+    /// BARE ([`BARE_CLAUSE_OPERATIONS`]), set and read back the same way.
+    static SERVED_BARE_CLAUSE: bool;
 }
 
 /// The form the operation this task is serving states its clauses in.
@@ -345,6 +400,13 @@ fn served_clause_form() -> ClauseForm {
     SERVED_CLAUSE_FORM
         .try_with(|form| *form)
         .unwrap_or(ClauseForm::PathAndValue)
+}
+
+/// Whether the operation this task is serving states such a clause bare. Absent
+/// altogether is a refusal raised outside an operation's run, which carries the
+/// envelope every other refusal of this service carries.
+fn served_states_clause_bare() -> bool {
+    SERVED_BARE_CLAUSE.try_with(|bare| *bare).unwrap_or(false)
 }
 
 /// Serves a request as the operation the generated routing table names, with that
@@ -378,7 +440,13 @@ impl ErasedOperation for OperationScopedClauseForm {
                 return svc.definition().routing_error_response(req);
             };
             let answered = SERVED_CLAUSE_FORM
-                .scope(clause_form(operation), op.run(svc, req, ctx))
+                .scope(
+                    clause_form(operation),
+                    SERVED_BARE_CLAUSE.scope(
+                        states_service_checked_clause_bare(operation),
+                        op.run(svc, req, ctx),
+                    ),
+                )
                 .await;
             // This is the ONE place every response an operation of this service produces
             // passes through, so no operation can answer without naming the request it
@@ -408,8 +476,8 @@ impl ErasedOperation for OperationScopedClauseForm {
 ///   was refused. That is exactly the framework's own rendering, so the framework
 ///   renders it (`Violation::message`) rather than this service restating the
 ///   sentence; the one thing this service decides is the ORDER the admissible set
-///   is stated in ([`stated_enum_order`]). [`SERVICE_CHECKED_ENUM_MEMBER`] is the
-///   one member that is not reported that way, because the service checks it itself;
+///   is stated in ([`stated_enum_order`]). [`SERVICE_CHECKED_ENUMS`] names the
+///   members that are not reported that way, because the service checks them itself;
 /// * an absent member states the `null` it was, which is a fact of the request's
 ///   shape — the framework's rendering again, over the member path the validating
 ///   walk reports it under (`Value null at 'streamArn' …`), which is the path the
@@ -436,12 +504,12 @@ impl ErasedOperation for OperationScopedClauseForm {
 /// collections of the batched and transactional operations.
 fn violation_clause(violation: &Violation, form: ClauseForm) -> Option<String> {
     match &violation.kind {
-        // The one member the service checks itself: the requirement with nothing
-        // echoed, over the set that check states.
-        ViolationKind::EnumValue(_) if violation.path == SERVICE_CHECKED_ENUM_MEMBER => {
+        // A member the service checks itself: the requirement with nothing echoed, over
+        // the set that check states.
+        ViolationKind::EnumValue(_) if service_checked_enum_set(&violation.path).is_some() => {
             Some(format!(
                 "Failed to satisfy constraint: {}",
-                crate::state::enum_value_requirement(&SERVICE_CHECKED_ENUM_SET)
+                crate::state::enum_value_requirement(service_checked_enum_set(&violation.path)?)
             ))
         }
         ViolationKind::MissingRequiredMember | ViolationKind::EnumValue(_) => Some(
@@ -508,6 +576,16 @@ fn validation_envelope(violations: &[Violation]) -> Option<String> {
         .into_iter()
         .map(|violation| violation_clause(violation, form))
         .collect::<Option<Vec<_>>>()?;
+    // A refusal about nothing but the members this service checks itself is stated bare
+    // by the operations that state such a clause bare ([`BARE_CLAUSE_OPERATIONS`]), and
+    // inside the envelope by every other operation. Anything else — a bound the
+    // validating walk found, or several members at once — is stated inside the envelope
+    // whichever operation was served.
+    if let [clause] = clauses.as_slice() {
+        if all_service_checked_enums(violations) && served_states_clause_bare() {
+            return Some(clause.clone());
+        }
+    }
     crate::state::validation_message(clauses)
 }
 
@@ -745,8 +823,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clause_form, stated_enum_order, ClauseForm, ITEM_REQUEST_FORM_OPERATIONS,
-        PUBLISHED_ENUM_ORDERS,
+        clause_form, stated_enum_order, states_service_checked_clause_bare, ClauseForm,
+        BARE_CLAUSE_OPERATIONS, ITEM_REQUEST_FORM_OPERATIONS, PUBLISHED_ENUM_ORDERS,
     };
 
     /// The admissible sets as the walk hands them over.
@@ -807,6 +885,30 @@ mod tests {
                 sorted.len(),
                 before,
                 "case {published:?}: expected each value stated once, got {sorted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_clause_operations_are_sorted() {
+        let mut sorted = BARE_CLAUSE_OPERATIONS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            BARE_CLAUSE_OPERATIONS,
+            sorted.as_slice(),
+            "case the bare-clause list: expected it sorted for `binary_search`, got \
+             {BARE_CLAUSE_OPERATIONS:?}"
+        );
+        for operation in BARE_CLAUSE_OPERATIONS {
+            assert!(
+                states_service_checked_clause_bare(operation),
+                "case {operation:?}: expected the bare form, got the envelope"
+            );
+        }
+        for operation in ["PutItem", "UpdateItem", "DeleteItem", "GetItem", "CreateTable"] {
+            assert!(
+                !states_service_checked_clause_bare(operation),
+                "case {operation:?}: expected the envelope, got the bare form"
             );
         }
     }

@@ -339,14 +339,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .attribute_updates
                         .as_ref()
                         .is_some_and(|map| !map.is_empty()),
+                    &["UpdateExpression"],
                 ),
                 (
                     "Expected",
                     input.expected.as_ref().is_some_and(|map| !map.is_empty()),
+                    &["ConditionExpression"],
                 ),
                 (
                     "ConditionalOperator",
                     input.conditional_operator.is_some(),
+                    // The member has no expression counterpart of its own, so it states
+                    // its intent twice beside ANY expression member.
+                    &["UpdateExpression", "ConditionExpression"],
                 ),
             ],
             &[

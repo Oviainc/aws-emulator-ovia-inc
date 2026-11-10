@@ -1111,24 +1111,24 @@ async fn a_request_states_its_intent_one_way() {
     let router = emulator();
     table(&router, "Generations").await;
 
-    // Each row: the operation, the request, the non-expression members it carries and
-    // the expression members it carries. Every pair of generations is refused, naming
-    // both sides.
+    // Each row: the operation, the request, the non-expression member it carries and the
+    // expression member that REPLACED that member. A request that states one thing both
+    // ways is refused, naming both whole sides.
     let rows: Vec<(&str, Value, &str, &str)> = vec![
         (
             "Scan",
             json!({"TableName": "Generations", "AttributesToGet": ["a"],
-                   "FilterExpression": "attribute_exists(a)"}),
+                   "ProjectionExpression": "a"}),
             "AttributesToGet",
-            "FilterExpression",
+            "ProjectionExpression",
         ),
         (
             "Scan",
             json!({"TableName": "Generations",
                    "ScanFilter": {"a": {"ComparisonOperator": "NOT_NULL"}},
-                   "ProjectionExpression": "a"}),
+                   "FilterExpression": "attribute_exists(a)"}),
             "ScanFilter",
-            "ProjectionExpression",
+            "FilterExpression",
         ),
         (
             "Query",
@@ -1184,6 +1184,30 @@ async fn a_request_states_its_intent_one_way() {
                  Non-expression parameters: {{{legacy}}} Expression parameters: {{{expression}}}"
             ),
             "case {case:?}: expected both sides to be named, got {stated:?}"
+        );
+    }
+
+    // A legacy member beside an expression member that states something ELSE is two
+    // different asks, not one stated twice, and is served: the legacy projection with a
+    // filter expression, and the legacy filter with a projection expression.
+    for (case, request) in [
+        (
+            "the legacy projection beside a filter expression",
+            json!({"TableName": "Generations", "AttributesToGet": ["a"],
+                   "FilterExpression": "attribute_exists(a)"}),
+        ),
+        (
+            "the legacy filter beside a projection expression",
+            json!({"TableName": "Generations",
+                   "ScanFilter": {"a": {"ComparisonOperator": "NOT_NULL"}},
+                   "ProjectionExpression": "a"}),
+        ),
+    ] {
+        let (status, answered) = call(&router, "Scan", request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: two members that state different things are served, got {status} \
+             with {answered}"
         );
     }
 }

@@ -230,6 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .attributes_to_get
                     .as_ref()
                     .is_some_and(|names| !names.is_empty()),
+                &["ProjectionExpression"],
             )],
             &[(
                 "ProjectionExpression",

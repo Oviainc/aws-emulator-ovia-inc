@@ -948,7 +948,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
             ),
             message: "Can not use both expression and non-expression parameters in the same \
                       request: Non-expression parameters: {AttributesToGet} Expression \
-                      parameters: {KeyConditionExpression, ProjectionExpression}"
+                      parameters: {ProjectionExpression, KeyConditionExpression}"
                 .to_string(),
         },
     ]
