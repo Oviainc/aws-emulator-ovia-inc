@@ -1084,7 +1084,14 @@ async fn deleting_an_access_entry_removes_it_and_lets_it_be_created_again() {
 async fn deleting_one_entry_takes_its_policies_and_leaves_the_others() {
     let router = emulator();
     let cluster = "delete-entry-scope";
-    let created = create(&router, &minimal_request(cluster)).await;
+    // The entries this asserts over are the two created below, so the cluster is
+    // created without the creator's own bootstrap access entry
+    // (`accessConfig.bootstrapClusterCreatorAdminPermissions`, covered by
+    // `cluster_creator_access_entry.rs`).
+    let mut request = minimal_request(cluster);
+    request["accessConfig"] =
+        serde_json::json!({ "bootstrapClusterCreatorAdminPermissions": false });
+    let created = create(&router, &request).await;
     assert_eq!(
         created.status, 200,
         "setup: creating {cluster:?} must succeed, got {created:?}"

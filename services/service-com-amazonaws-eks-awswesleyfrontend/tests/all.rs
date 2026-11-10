@@ -69,6 +69,8 @@ mod child_create_resolves_the_cluster_first;
 mod child_resource_deletion;
 #[path = "all/cluster_config_update.rs"]
 mod cluster_config_update;
+#[path = "all/cluster_creator_access_entry.rs"]
+mod cluster_creator_access_entry;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
 #[path = "all/cluster_payload_members.rs"]

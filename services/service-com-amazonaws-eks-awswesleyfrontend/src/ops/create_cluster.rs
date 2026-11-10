@@ -19,6 +19,13 @@
 //! [`crate::state::CLUSTER_ACTIVATION_DELAY`] later; the due instant is stored on the
 //! record and materialised by whichever read first runs after it.
 //!
+//! When `accessConfig.bootstrapClusterCreatorAdminPermissions` holds — which it does
+//! by default — it also materialises the cluster creator's own access entry
+//! ([`crate::state::cluster_creator_access_entry`]): the calling IAM principal, with
+//! the one cluster-scoped `cluster-admin` association, written into the cluster's
+//! access-entry map so `ListAccessEntries`, `DescribeAccessEntry` and
+//! `ListAssociatedAccessPolicies` all read it.
+//!
 //! It also provisions the cluster's OWN security group in EC2
 //! ([`crate::state::mint_cluster_security_group`]) — one group in the VPC the request's
 //! subnets belong to, tagged as that cluster's, which appears while the cluster is still
@@ -449,11 +456,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this call's own answer to report
         // ([`state::ClusterRecord::to_created_cluster`]) and is not part of the
         // `accessConfig` a later read of the cluster returns.
-        let bootstrap_cluster_creator_admin_permissions = Some(
-            requested_access
-                .bootstrap_cluster_creator_admin_permissions
-                .unwrap_or(true),
-        );
+        let bootstrap_creator_admin = requested_access
+            .bootstrap_cluster_creator_admin_permissions
+            .unwrap_or(true);
+        let bootstrap_cluster_creator_admin_permissions = Some(bootstrap_creator_admin);
+        // The flag "specifies whether or not the cluster creator IAM principal WAS
+        // SET AS A CLUSTER ADMIN ACCESS ENTRY during cluster creation time", so when
+        // it holds this create materialises that entry — the calling IAM principal,
+        // `STANDARD`, with the one cluster-scoped `cluster-admin` association
+        // ([`state::cluster_creator_access_entry`]) — in the cluster's own
+        // access-entry map, which is what every reader of the slice reads. A create
+        // that turns the flag off materialises none, and so starts the cluster with
+        // no access entries at all.
+        let bootstrap_access_entry = bootstrap_creator_admin
+            .then(|| {
+                state::cluster_creator_access_entry(
+                    &region,
+                    &input.name,
+                    &state::request_caller_principal_arn(&*self.engine, ctx, now),
+                    now,
+                )
+            })
+            .flatten();
         let access_config = AccessConfigResponse {
             bootstrap_cluster_creator_admin_permissions: None,
             authentication_mode: Some(
@@ -584,11 +608,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.kube_controller_manager_config.as_ref(),
                 None,
             )),
-            // A new cluster has no access entries yet: every entry a caller can read
-            // is one `CreateAccessEntry` wrote. (The creator's own admin access comes
-            // from `accessConfig.bootstrapClusterCreatorAdminPermissions` above, which
-            // is reported on the cluster rather than as an `AccessEntry` record.)
-            access_entries: ::std::collections::BTreeMap::new(),
+            // A new cluster holds the entries this create materialised and no
+            // others: the cluster creator's own
+            // ([`state::cluster_creator_access_entry`], written when
+            // `accessConfig.bootstrapClusterCreatorAdminPermissions` holds), and
+            // then one per `CreateAccessEntry` a caller makes.
+            access_entries: bootstrap_access_entry
+                .map(|entry| (entry.principal_arn.clone(), entry))
+                .into_iter()
+                .collect(),
             // A brand new cluster has run no asynchronous update yet; the
             // operations that start one (`AssociateEncryptionConfig` and friends)
             // write into this map.

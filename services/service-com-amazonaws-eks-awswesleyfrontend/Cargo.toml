@@ -40,6 +40,12 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 # cluster's own log group, which is CloudWatch Logs' resource to create and write
 # (`src/state/control_plane_logs.rs`).
 aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
+# The session registry in the same shared engine, which is where
+# `sts:GetCallerIdentity` answers from: `CreateCluster` files the cluster creator's
+# bootstrap access entry under the IAM principal the request's own credential speaks
+# for, so that principal is resolved through STS's OWN resolution rather than
+# guessed (`src/state/cluster_creator_access.rs`).
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # `iam_trust_policy`: the one reading of an IAM trust policy — including the
 # decode of the URL-encoded form IAM reports a document in — shared with every
 # other service that resolves a caller-supplied role.

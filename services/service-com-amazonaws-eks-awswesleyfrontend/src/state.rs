@@ -58,7 +58,11 @@
 //! [`ClusterRecord::access_entries`] is where `CreateAccessEntry` writes and
 //! `DescribeAccessEntry`, `ListAccessEntries`, `AssociateAccessPolicy` and
 //! `ListAssociatedAccessPolicies` read — and deleting the cluster takes its access
-//! entries with it, without a second map to keep in step.
+//! entries with it, without a second map to keep in step. `CreateCluster` writes
+//! into that same map: a create whose
+//! `accessConfig.bootstrapClusterCreatorAdminPermissions` holds materialises the
+//! cluster creator's own entry ([`cluster_creator_access_entry`]), so there is no
+//! second place the creator's administrative access is recorded.
 //!
 //! It also holds the EKS Pod Identity association slice:
 //! `CreatePodIdentityAssociation` writes a [`PodIdentityAssociationRecord`] here
@@ -4461,6 +4465,7 @@ macro_rules! callback_client {
 mod tests;
 mod addon_catalog;
 mod certificate_authority;
+mod cluster_creator_access;
 mod cluster_record;
 mod control_plane_logs;
 mod derived_identifiers;
@@ -4471,6 +4476,7 @@ mod peers;
 mod store;
 pub use addon_catalog::*;
 pub use certificate_authority::*;
+pub use cluster_creator_access::*;
 pub use cluster_record::*;
 pub use control_plane_logs::*;
 pub use derived_identifiers::*;
