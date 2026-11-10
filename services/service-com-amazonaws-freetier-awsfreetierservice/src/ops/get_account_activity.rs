@@ -191,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // outside the enum names no language the catalog could be read in.
         let language_code = input.language_code.as_deref();
         if let Some(message) = crate::state::language_code_refusal(language_code) {
-            return Err(validation(message));
+            return Err(refusal(message));
         }
 
         let store = state.lock();
@@ -235,6 +235,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn validation(message: impl AsRef<str>) -> GetAccountActivityError {
     GetAccountActivityErrorModeled::ValidationException(ValidationException {
         message: crate::state::stated_validation(message.as_ref()),
+    })
+    .into()
+}
+
+/// Refuse the request with this operation's own modelled `ValidationException`
+/// (HTTP 400), stating `message` VERBATIM.
+///
+/// The counterpart of [`validation`] for a refusal of a value outside an
+/// enumerated type, which is worded by the module that words the boundary walk's
+/// own refusal of it (`crate::service::validation`) and carries no second
+/// envelope — exactly as its sibling reader states the same refusal.
+fn refusal(message: impl Into<String>) -> GetAccountActivityError {
+    GetAccountActivityErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
     })
     .into()
 }

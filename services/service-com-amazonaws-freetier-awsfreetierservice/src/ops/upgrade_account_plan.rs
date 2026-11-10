@@ -187,13 +187,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `accountPlanType` is an enum member, so the framework refuses a value
         // outside it before `handle` runs; checking here as well keeps the
         // refusal a 400 `ValidationException` whatever the boundary does with a
-        // value the enum does not declare.
+        // value the enum does not declare, and states the very clause that
+        // boundary refusal carries so the two layers cannot word one violation
+        // differently.
         let target = input.account_plan_type.as_str();
-        if !ACCOUNT_PLAN_TYPE_VALUES.contains(&target) {
-            return Err(validation(format!(
-                "accountPlanType: {target} is not an account plan type; expected one of {}",
-                ACCOUNT_PLAN_TYPE_VALUES.join(", ")
-            )));
+        if let Some(message) = crate::state::enum_value_refusal(
+            ACCOUNT_PLAN_TYPE_MEMBER,
+            target,
+            ACCOUNT_PLAN_TYPE_VALUES,
+        ) {
+            return Err(stated_verbatim(&message));
         }
 
         let account_id = crate::state::caller_account_id();
@@ -244,6 +247,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The member this operation's enum refusal names, as its input spells it.
+const ACCOUNT_PLAN_TYPE_MEMBER: &str = "accountPlanType";
+
 /// Refuse the request with this operation's own modelled `ValidationException`
 /// (HTTP 400), stating `message` in the envelope this service's validation
 /// front door states a refusal in ([`crate::state::stated_validation`]).
@@ -259,7 +265,10 @@ fn validation(message: impl AsRef<str>) -> UpgradeAccountPlanError {
 ///
 /// The counterpart of [`validation`] for a refusal this service states in fixed
 /// words of its own rather than inside that envelope — see
-/// [`crate::state::PAYMENT_INSTRUMENT_VET_FAILURE`].
+/// [`crate::state::PAYMENT_INSTRUMENT_VET_FAILURE`] — and for one stated in the
+/// per-member validation envelope the boundary walk uses, which this service's
+/// recordings show carrying no second envelope
+/// ([`crate::state::enum_value_refusal`]).
 fn stated_verbatim(message: &str) -> UpgradeAccountPlanError {
     UpgradeAccountPlanErrorModeled::ValidationException(ValidationException {
         message: message.to_string(),

@@ -175,19 +175,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every status named in the filter must be one the model declares; a
         // value outside the enum selects nothing, so it is refused rather than
-        // served as an empty page.
+        // served as an empty page. The framework's walk refuses such a list
+        // before `handle` runs, and this states the very clause that refusal
+        // carries — at the list member, quoting the whole list — so the two
+        // layers cannot word one violation differently.
         let wanted: &[String] = input
             .filter_activity_statuses
             .as_deref()
             .unwrap_or_default();
-        for status in wanted {
-            if !ACTIVITY_STATUS_VALUES.contains(&status.as_str()) {
-                return Err(validation(format!(
-                    "filterActivityStatuses: {status} is not an activity status; expected one \
-                     of {}",
-                    ACTIVITY_STATUS_VALUES.join(", ")
-                )));
-            }
+        if let Some(message) = crate::state::enum_element_refusal(
+            FILTER_ACTIVITY_STATUSES_MEMBER,
+            wanted,
+            ACTIVITY_STATUS_VALUES,
+        ) {
+            return Err(refusal(message));
         }
 
         // `languageCode` selects the language of the translated titles this
@@ -197,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // another.
         let language_code = input.language_code.as_deref();
         if let Some(message) = crate::state::language_code_refusal(language_code) {
-            return Err(validation(message));
+            return Err(refusal(message));
         }
 
         let page_size = crate::state::page_size(input.max_results);
@@ -254,24 +255,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `GetFreeTierUsage` is not accepted here.
 const PAGE_KIND: &str = "activities";
 
-/// Refuse the request with this operation's own modelled `ValidationException`
-/// (HTTP 400), stating `message` in the envelope this service's validation
-/// front door states a refusal in ([`crate::state::stated_validation`]).
-fn validation(message: impl AsRef<str>) -> ListAccountActivitiesError {
-    ListAccountActivitiesErrorModeled::ValidationException(ValidationException {
-        message: crate::state::stated_validation(message.as_ref()),
-    })
-    .into()
-}
+/// The member this operation's status-filter refusal names, as its input spells
+/// it.
+const FILTER_ACTIVITY_STATUSES_MEMBER: &str = "filterActivityStatuses";
 
 /// Refuse the request with this operation's own modelled `ValidationException`
 /// (HTTP 400), stating `message` VERBATIM.
 ///
-/// This operation's refusals of an input BOUND — a page size above the ceiling
-/// it serves, a `nextToken` it never issued — carry their sentence alone, not
-/// wrapped in the envelope [`validation`] states a condition in: the envelope is
-/// a property of the layer that words the refusal, and these two are worded
-/// where the bound lives (`crate::state`) rather than by the filter-shape layer.
+/// Every refusal this operation words itself carries its sentence alone, not
+/// wrapped in the envelope `crate::state::stated_validation` states a condition
+/// in: an input BOUND (a page size above the ceiling it serves, a `nextToken` it
+/// never issued) is worded where the bound lives (`crate::state`), and a value
+/// outside an enumerated type is worded by the module that words the boundary
+/// walk's own refusal of it (`crate::service::validation`), which this service's
+/// recordings show carrying no second envelope.
 fn refusal(message: impl Into<String>) -> ListAccountActivitiesError {
     ListAccountActivitiesErrorModeled::ValidationException(ValidationException {
         message: message.into(),

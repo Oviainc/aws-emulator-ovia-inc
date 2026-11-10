@@ -418,7 +418,7 @@ fn check_dimension(
     if !DIMENSION_VALUES.contains(&key) {
         return Err(validation(format!(
             "filter.Dimensions.Key: {key} is not a dimension; expected one of {}",
-            DIMENSION_VALUES.join(", ")
+            crate::state::listed_enum_value_set(DIMENSION_VALUES)
         )));
     }
 
@@ -435,7 +435,7 @@ fn check_dimension(
     if !MATCH_OPTION_VALUES.contains(&option) {
         return Err(validation(format!(
             "filter.Dimensions.MatchOptions: {option} is not a match option; expected one of {}",
-            MATCH_OPTION_VALUES.join(", ")
+            crate::state::listed_enum_value_set(MATCH_OPTION_VALUES)
         )));
     }
 

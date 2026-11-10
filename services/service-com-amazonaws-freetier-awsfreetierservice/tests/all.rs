@@ -21,6 +21,8 @@ mod activity_plane_refusals;
 mod date_time_wire_form;
 #[path = "all/dimension_decode.rs"]
 mod dimension_decode;
+#[path = "all/enum_value_set_wording.rs"]
+mod enum_value_set_wording;
 #[path = "all/free_tier.rs"]
 mod free_tier;
 #[path = "all/identity_authorization.rs"]

@@ -35,7 +35,13 @@
 //!    the member itself or nested inside one about the list that holds it;
 //! 7. a bound the SERVICE enforces for itself — one the model does not declare, so the
 //!    constraint walk never sees it — is stated in the same envelope and the same
-//!    requirement sentence, and quotes NO value ([`above_ceiling`]).
+//!    requirement sentence, and quotes NO value ([`above_ceiling`]);
+//! 8. a MODELLED constraint a handler re-checks for itself, so its refusal stays this
+//!    operation's 400 whatever the boundary does with the value, is stated through the
+//!    very clause writer the walk's own refusal goes through
+//!    ([`outside_enum`], [`outside_element_enum`]) — so no second rendering of a value
+//!    set, of a member path or of a requirement exists in this crate to drift from the
+//!    one above.
 //!
 //! Rules 1-3 and 5 are `services/common`'s already
 //! (`service_common::validation_message::aws_validation_refusal`), which cannot be
@@ -57,7 +63,7 @@ use ::aws_smithy_schema_server::constraints::{
     path, ElementConstraintsTrait, EnumTrait, LengthTrait, PatternTrait, RangeTrait, Violation,
     ViolationKind,
 };
-use ::service_common::validation::{list_of_element, unanchored};
+use ::service_common::validation::{list_of_element, quoted_echo, unanchored};
 use ::service_common::validation_message::{list_item_count, map_entry_count};
 use ::smithy_server_runtime::Refused;
 
@@ -256,6 +262,64 @@ pub(crate) fn above_ceiling(path: &str, ceiling: i32) -> String {
     });
     let clause = format!("Value at '{path}' {CLAUSE_MARKER}{requirement}");
     envelope(std::slice::from_ref(&clause)).unwrap_or(clause)
+}
+
+/// The whole `message` of this service's refusal of a value outside the enumerated type
+/// the member at `member` targets, as rule 8 states it: the clause this module writes for
+/// exactly that violation, which is the one the boundary walk's refusal carries.
+///
+/// `value` is the value as the caller sent it and `declared` the values the model
+/// declares for the enum, handed over in the order the model declares them in — rule 6
+/// restates the set in the order this SERVICE lists it, here as everywhere else, because
+/// that order is a property of the enum and not of the layer that found the violation.
+pub(crate) fn outside_enum(member: &str, value: &str, declared: &[&str]) -> String {
+    let violation = enum_violation(member.to_string(), value, declared);
+    one_clause(&violation, &HashMap::new())
+}
+
+/// The same refusal for an ELEMENT of a list whose element shape targets the enum, which
+/// rule 4 states at the LIST member: `member` is that list member, `position` the
+/// element's 1-based position (the spelling the walk's own paths use), and `rendered` the
+/// whole list as the caller sent it (`service_common::validation::rendered_list`, the
+/// rendering a clause restored from the walk quotes).
+pub(crate) fn outside_element_enum(
+    member: &str,
+    position: usize,
+    value: &str,
+    declared: &[&str],
+    rendered: &str,
+) -> String {
+    let element = path::join(&[member.to_string(), path::element(position)]);
+    let lists = HashMap::from([(member.to_string(), rendered.to_string())]);
+    let violation = enum_violation(element, value, declared);
+    one_clause(&violation, &lists)
+}
+
+/// One violation of an enumerated type's value set, recorded the way the constraint walk
+/// records one so the clause writer cannot tell the two apart.
+///
+/// The value is quoted under the SAME ceiling as a clause restored from that walk
+/// (`service_common::validation::quoted_echo`), so neither refusal path of this service
+/// states a message sized by the request. The membership check itself is made against the
+/// value the caller sent, never against this rendering.
+fn enum_violation(path: String, value: &str, declared: &[&str]) -> Violation {
+    Violation {
+        path,
+        kind: ViolationKind::EnumValue(
+            declared.iter().map(|value| (*value).to_string()).collect(),
+        ),
+        value: Some(quoted_echo(value).into_owned()),
+        sensitive: false,
+    }
+}
+
+/// The whole `message` of a refusal over the single violation `violation`, through
+/// [`message`] so its envelope, its clause and its requirement are the ones every other
+/// refusal of this service carries. A violation class [`message`] has no wording for
+/// keeps the framework's own sentence rather than losing the clause — the same fallback
+/// [`above_ceiling`] makes.
+fn one_clause(violation: &Violation, lists: &HashMap<String, String>) -> String {
+    message(std::slice::from_ref(violation), lists).unwrap_or_else(|| violation.message())
 }
 
 /// Every constraint the ELEMENT shape of the list member at `list_path` declares, as the

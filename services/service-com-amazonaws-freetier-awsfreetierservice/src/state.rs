@@ -797,6 +797,81 @@ fn published_enum_value_set(values: &[String]) -> Option<&'static [&'static str]
     })
 }
 
+/// The values `declared` as a SENTENCE lists an enumerated type's value set:
+/// comma-separated, in the order this service states that set in
+/// ([`stated_enum_value_set`]).
+///
+/// For the refusals this service words in its own sentences rather than in the
+/// AWS validation clause ([`enum_value_refusal`]): the order a value set is
+/// listed in is a property of the enum, so it is resolved in the one place
+/// wherever a set is named, and a set this service publishes no order for is
+/// listed as the model declares it.
+pub fn listed_enum_value_set(declared: &[&str]) -> String {
+    let presented: Vec<String> = declared.iter().map(|value| (*value).to_string()).collect();
+    stated_enum_value_set(&presented).join(", ")
+}
+
+/// Whether `value`, submitted at the member `member`, is one of the values
+/// `declared` — the value set the model declares for the enumerated type that
+/// member targets — and the message refusing it when it is not.
+///
+/// The one membership check this service's handlers make for themselves. A
+/// modelled enum is already enforced by the framework's constraint walk in FRONT
+/// of every handler, and a handler re-checks it so its refusal stays that
+/// operation's own 400 `ValidationException` whatever the boundary does with a
+/// value the enum does not declare — which only holds if the two layers state
+/// one refusal, so the message is the clause the walk's own refusal carries
+/// ([`crate::service::validation`]'s rule 8), value set, member path, requirement
+/// and envelope alike. `declared` is handed over as the MODEL declares it and the
+/// set is restated in the order this service lists it ([`stated_enum_value_set`]).
+///
+/// `None` means the value is one the enum admits. `Some(message)` is the whole
+/// `message` of the refusal, which the handler raises VERBATIM inside its own
+/// modelled `ValidationException`.
+pub fn enum_value_refusal(member: &str, value: &str, declared: &[&str]) -> Option<String> {
+    if declared.contains(&value) {
+        return None;
+    }
+    Some(crate::service::validation::outside_enum(
+        member, value, declared,
+    ))
+}
+
+/// The sibling of [`enum_value_refusal`] for a LIST member whose ELEMENTS target
+/// an enumerated type: `None` when every element `submitted` holds is one
+/// `declared` admits, and otherwise the whole `message` refusing the list.
+///
+/// The clause such a refusal states is the one AWS states at the LIST member —
+/// the whole list as the caller sent it, with the element's requirements nested —
+/// so it is written by the same module and reports the FIRST element outside the
+/// set, exactly as the walk reporting the same list would. The list is quoted
+/// under the same ceiling as a clause restored from that walk
+/// (`service_common::validation::quoted_echo`), so no message is sized by the
+/// request.
+pub fn enum_element_refusal(
+    member: &str,
+    submitted: &[String],
+    declared: &[&str],
+) -> Option<String> {
+    let (index, value) = submitted
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !declared.contains(&value.as_str()))?;
+    let elements: Vec<&str> = submitted.iter().map(String::as_str).collect();
+    let rendered = ::service_common::validation::rendered_list(&elements);
+    Some(crate::service::validation::outside_element_enum(
+        member,
+        index + 1,
+        value,
+        declared,
+        &::service_common::validation::quoted_echo(&rendered),
+    ))
+}
+
+/// The member a `languageCode` refusal names, as both activity readers' inputs
+/// spell it.
+const LANGUAGE_CODE_MEMBER: &str = "languageCode";
+
 /// Whether a request's `languageCode` names a language an activity reader can
 /// answer in, and the message refusing it when it does not.
 ///
@@ -809,17 +884,11 @@ fn published_enum_value_set(values: &[String]) -> Option<&'static [&'static str]
 /// [`DEFAULT_LANGUAGE_CODE`] answers it.
 ///
 /// `None` means the code is one a reader can answer. `Some(message)` is the
-/// refusal's message, which each reader raises inside its OWN modelled
-/// `ValidationException`, so the two readers refuse in one wording.
+/// refusal's message, stated through [`enum_value_refusal`] so both readers
+/// refuse in the one wording this service refuses any value outside an
+/// enumerated type in.
 pub fn language_code_refusal(language_code: Option<&str>) -> Option<String> {
-    let code = language_code?;
-    if LANGUAGE_CODE_VALUES.contains(&code) {
-        return None;
-    }
-    Some(format!(
-        "languageCode: {code} is not a language code; expected one of {}",
-        LANGUAGE_CODE_VALUES.join(", ")
-    ))
+    enum_value_refusal(LANGUAGE_CODE_MEMBER, language_code?, LANGUAGE_CODE_VALUES)
 }
 
 /// Whether `activity_id` satisfies the modelled `ActivityId` constraints:
