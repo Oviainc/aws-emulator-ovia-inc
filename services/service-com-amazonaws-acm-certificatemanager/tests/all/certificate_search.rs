@@ -84,7 +84,8 @@ struct Stored {
 /// The `RequestCertificate` bodies the filter tables run against.
 ///
 /// The rows differ along everything the leaf filters select on: the status the clock
-/// owes them (private authority -> `ISSUED`, public -> `FAILED`), the key algorithm,
+/// owes them (private authority -> `ISSUED`, a name the public DNS delegates to
+/// nobody -> `FAILED`), the key algorithm,
 /// the validation method, the export option, the manager, the name form (plain,
 /// wildcard, deep label) and the number of subject alternative names.
 fn fixture_requests() -> Vec<(&'static str, Value)> {
@@ -123,8 +124,8 @@ fn fixture_requests() -> Vec<(&'static str, Value)> {
         (
             "failed-rsa4096",
             json!({
-                "DomainName": "gamma.service.example.org",
-                "SubjectAlternativeNames": ["api.gamma.service.example.org", "edge.example.org"],
+                "DomainName": "gamma.service.example.test",
+                "SubjectAlternativeNames": ["api.gamma.service.example.test", "edge.example.test"],
                 "KeyAlgorithm": "RSA_4096",
                 "ValidationMethod": "HTTP",
             }),
@@ -448,7 +449,7 @@ async fn each_leaf_filter_selects_on_the_stored_record() {
         ),
         (
             "SubjectAlternativeName DnsName EQUALS a SAN",
-            json!({ "Filter": { "X509AttributeFilter": { "SubjectAlternativeName": { "DnsName": { "Value": "edge.example.org", "ComparisonOperator": "EQUALS" } } } } }),
+            json!({ "Filter": { "X509AttributeFilter": { "SubjectAlternativeName": { "DnsName": { "Value": "edge.example.test", "ComparisonOperator": "EQUALS" } } } } }),
             vec!["failed-rsa4096"],
         ),
         (

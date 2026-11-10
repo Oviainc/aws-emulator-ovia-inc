@@ -80,8 +80,8 @@
 //!
 //! A requested certificate's record carries the outcome the clock owes it and the
 //! instant it falls due ([`PendingValidation`]) — issuance for a request that needs no
-//! proof of domain control, the up-front refusal of a name nobody can be delegated
-//! ([`domain_control_is_unprovable`]), and otherwise the timeout at the end of the
+//! proof of domain control, the up-front refusal of a name the public DNS delegates to
+//! nobody ([`domain_is_not_in_public_dns`]), and otherwise the timeout at the end of the
 //! documented [`VALIDATION_WINDOW`], which is what a request waiting for evidence from
 //! outside is owed. Beside it — for a certificate ACM validates by EMAIL — sits the
 //! instant the initial validation mail it owes falls due
@@ -178,9 +178,9 @@ pub const DOMAIN_STATUS_FAILED: &str = "FAILED";
 /// requested, UNLESS it fails for any of the reasons given in the troubleshooting
 /// topic Certificate request fails" (`CertificateDetail$Status` doc). The reason ACM
 /// models for a request it cannot process without information it has to obtain
-/// elsewhere is `ADDITIONAL_VERIFICATION_REQUIRED`, and it is what the recorded AWS
-/// responses for a name whose control can never be delegated to the requester carry
-/// ([`domain_control_is_unprovable`]). `FailureReason` "exists only when the
+/// elsewhere is `ADDITIONAL_VERIFICATION_REQUIRED`, which is what a request naming a
+/// domain the public DNS delegates to nobody carries
+/// ([`domain_is_not_in_public_dns`]). `FailureReason` "exists only when the
 /// certificate status is FAILED" (`CertificateDetail$FailureReason` doc), so it is set
 /// only beside [`STATUS_FAILED`].
 pub const FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED: &str =
@@ -247,47 +247,50 @@ pub const VALIDATION_EMAIL_DISPATCH_DELAY: Duration = Duration::from_secs(4);
 /// owed transitions are.
 pub const VALIDATION_WINDOW: Duration = Duration::from_secs(72 * 60 * 60);
 
-/// Domain names reserved by the IANA Special-Use Domain Names registry as whole
-/// top-level labels: `.example`, `.invalid`, `.localhost` and `.test` are "reserved
-/// for ... testing and documentation" and are never delegated (RFC 2606 §2, RFC 6761
-/// §6), and `.local` (RFC 6762 §3) and `.onion` (RFC 7686) likewise name no domain in
-/// the public DNS.
+/// The top-level labels the IANA Special-Use Domain Names registry reserves, so that
+/// the public DNS delegates them to NOBODY: `.example`, `.invalid`, `.localhost` and
+/// `.test` are "reserved for ... testing and documentation" and are never delegated
+/// (RFC 2606 §2, RFC 6761 §6), and `.local` (RFC 6762 §3) and `.onion` (RFC 7686)
+/// likewise name no domain in the public DNS.
 ///
-/// Nobody can be delegated control of a name under one of them, so no certificate
-/// authority can ever validate one — see [`domain_control_is_unprovable`].
-pub const RESERVED_DOMAIN_SUFFIXES: &[&str] = &[
+/// A name whose top-level label is one of these is no public domain at all, which is
+/// what makes a request for it one ACM cannot carry through — see
+/// [`domain_is_not_in_public_dns`]. Only WHOLE top-level labels belong here: a
+/// registrable name under a delegated label (`.com`, `.net`, `.org`) is a public domain
+/// whoever holds it, including the names RFC 2606 §3 reserves for documentation, so
+/// such a request is one ACM waits for evidence on rather than refuses.
+pub const RESERVED_TOP_LEVEL_LABELS: &[&str] = &[
     "example", "invalid", "localhost", "test", "local", "onion",
 ];
 
-/// The second-level names RFC 2606 §3 reserves for documentation —
-/// "example.com, example.net, example.org" — which, like
-/// [`RESERVED_DOMAIN_SUFFIXES`], no requester can be delegated control of.
-pub const RESERVED_DOMAIN_NAMES: &[&str] = &["example.com", "example.net", "example.org"];
-
-/// Whether control of `domain_name` can never be proven, because the name sits under a
-/// reserved domain nobody can be delegated ([`RESERVED_DOMAIN_SUFFIXES`],
-/// [`RESERVED_DOMAIN_NAMES`]).
+/// Whether `domain_name` names no domain in the public DNS, because its top-level
+/// label is one the registry delegates to nobody ([`RESERVED_TOP_LEVEL_LABELS`]).
 ///
 /// A certificate request for such a name is one ACM cannot carry through at all, so it
 /// is refused up front rather than left waiting for evidence that cannot arrive — "a
 /// certificate enters status PENDING_VALIDATION upon being requested, unless it fails
 /// for any of the reasons given in the troubleshooting topic Certificate request fails"
-/// (`CertificateDetail$Status` doc). Every other name is one whose owner could publish
-/// the evidence, so its request waits the documented [`VALIDATION_WINDOW`] out.
+/// (`CertificateDetail$Status` doc).
+///
+/// Every name the public DNS DOES delegate is one whose holder could publish the
+/// evidence, whether or not this emulator ever observes it published, so its request
+/// enters `PENDING_VALIDATION` and waits the documented [`VALIDATION_WINDOW`] out:
+/// "ACM makes repeated attempts to validate a certificate for 72 hours and then times
+/// out" (`CertificateDetail$Status` doc). A challenge nobody has published yet is that
+/// wait, not a request failure — the reasons a request FAILS are the modelled
+/// `FailureReason` values, none of which is an unpublished challenge.
 ///
 /// Matched on DOT BOUNDARIES and case-insensitively, as a DNS suffix is, and through
 /// the name ACM actually proves control of ([`validation_target`]), so a wildcard is
 /// judged by the domain it covers.
-pub fn domain_control_is_unprovable(domain_name: &str) -> bool {
+pub fn domain_is_not_in_public_dns(domain_name: &str) -> bool {
     let name = validation_target(domain_name).to_ascii_lowercase();
-    let under = |reserved: &str| {
-        name == reserved
+    RESERVED_TOP_LEVEL_LABELS.iter().any(|label| {
+        name == *label
             || name
-                .strip_suffix(reserved)
+                .strip_suffix(label)
                 .is_some_and(|higher| higher.ends_with('.'))
-    };
-    RESERVED_DOMAIN_SUFFIXES.iter().any(|tld| under(tld))
-        || RESERVED_DOMAIN_NAMES.iter().any(|second| under(second))
+    })
 }
 
 /// How long after the domain-validation email was last sent ACM will send it again.
@@ -836,10 +839,12 @@ pub enum ValidationOutcome {
     /// nothing left to prove and the request completes.
     Issued,
     /// The request fails with [`FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED`]
-    /// before ACM waits on anything: the request names a domain whose control can
-    /// never be proven ([`domain_control_is_unprovable`]), which is one of the reasons
-    /// a request fails "upon being requested" rather than entering
-    /// `PENDING_VALIDATION` (`CertificateDetail$Status` doc).
+    /// before ACM waits on anything: the request names a domain the public DNS
+    /// delegates to nobody ([`domain_is_not_in_public_dns`]), which is one of the
+    /// reasons a request fails "upon being requested" rather than entering
+    /// `PENDING_VALIDATION` (`CertificateDetail$Status` doc). A name the public DNS
+    /// DOES delegate never reaches this outcome, however long its challenge goes
+    /// unpublished: that wait is [`Self::TimedOut`].
     Failed,
     /// The request times out unvalidated: "If you are requesting a public certificate,
     /// each domain name that you specify must be validated to verify that you own or

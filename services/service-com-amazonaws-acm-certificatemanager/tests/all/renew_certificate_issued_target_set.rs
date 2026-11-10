@@ -100,12 +100,12 @@ async fn certificates_outside_the_issued_set(
         "revoking an exported certificate must succeed, got {status} {response}"
     );
 
-    // A name nobody can be delegated control of, which ACM refuses up front, and an
+    // A name the public DNS delegates to nobody, which ACM refuses up front, and an
     // ordinary name whose evidence nobody published, which times out: both reach a
     // terminal status without ever being issued.
     let failed = request_certificate(
         router,
-        &json!({ "DomainName": "failed.renew-target.example.com", "ValidationMethod": "EMAIL" }),
+        &json!({ "DomainName": "failed.renew-target.invalid", "ValidationMethod": "EMAIL" }),
     )
     .await;
     let timed_out = request_certificate(

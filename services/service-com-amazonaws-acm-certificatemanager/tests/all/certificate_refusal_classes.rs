@@ -388,7 +388,7 @@ async fn options_update_refusals_carry_the_sentence_of_the_rule_they_break() {
         ),
         (
             "a request that failed, asked to migrate validation",
-            json!({ "DomainName": "failed.example.org", "ValidationMethod": "EMAIL" }),
+            json!({ "DomainName": "failed.invalid", "ValidationMethod": "EMAIL" }),
             true,
             "FAILED",
             json!({ "ValidationMethod": "HTTP" }),

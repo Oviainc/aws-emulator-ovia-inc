@@ -487,21 +487,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// * "If you are requesting a private certificate, domain validation is not required"
 ///   (`RequestCertificate` doc), so a request naming a private certificate authority
 ///   has nothing left to prove and is ISSUED.
-/// * A request naming a domain whose control can never be proven — a name under a
-///   reserved domain nobody can be delegated
-///   ([`crate::state::domain_control_is_unprovable`]) — is one of the requests that
+/// * A request naming a domain the public DNS delegates to nobody — a name whose
+///   top-level label is a reserved special-use one
+///   ([`crate::state::domain_is_not_in_public_dns`]) — is one of the requests that
 ///   fail "upon being requested" instead of entering `PENDING_VALIDATION`
 ///   (`CertificateDetail$Status` doc), with the reason ACM models for a request it
 ///   cannot process without information it has to obtain elsewhere.
-/// * Every other public request is one whose owner COULD publish the evidence: "each
-///   domain name that you specify must be validated to verify that you own or control
-///   the domain" (`RequestCertificate` doc), which happens out of band. ACM waits for
-///   it — "ACM makes repeated attempts to validate a certificate for 72 hours and then
-///   times out" (`CertificateDetail$Status` doc) — so the request stays
-///   `PENDING_VALIDATION` with its evidence live for the whole documented window, and
-///   the only outcome the clock owes it is that timeout. This emulator observes no
-///   published evidence, so nothing shortens the wait; it does not pre-empt it either,
-///   which is what keeps every operation that acts on a pending validation
+/// * Every other public request names domains the public DNS delegates, so their
+///   holder COULD publish the evidence: "each domain name that you specify must be
+///   validated to verify that you own or control the domain" (`RequestCertificate`
+///   doc), which happens out of band. ACM waits for it — "ACM makes repeated attempts
+///   to validate a certificate for 72 hours and then times out"
+///   (`CertificateDetail$Status` doc) — so the request stays `PENDING_VALIDATION` with
+///   its evidence live for the whole documented window, and the only outcome the clock
+///   owes it is that timeout. This emulator observes no published evidence, so nothing
+///   shortens the wait; a challenge it has not seen published is not a request failure
+///   either, which is what keeps every operation that acts on a pending validation
 ///   (`ResendValidationEmail`, the published CNAME) reachable.
 fn validation_outcome(
     input: &RequestCertificateInput,
@@ -511,7 +512,7 @@ fn validation_outcome(
         crate::state::ValidationOutcome::Issued
     } else if names
         .iter()
-        .any(|name| crate::state::domain_control_is_unprovable(name))
+        .any(|name| crate::state::domain_is_not_in_public_dns(name))
     {
         crate::state::ValidationOutcome::Failed
     } else {

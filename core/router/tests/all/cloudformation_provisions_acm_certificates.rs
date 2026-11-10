@@ -361,7 +361,7 @@ const ROWS: &[Row] = &[
         identity_outputs: &["CertificateRef"],
     },
     Row {
-        case: "a public certificate for a domain nobody can be delegated, which ACM fails",
+        case: "a public certificate for a name the public DNS delegates to nobody, which ACM fails",
         region: "us-east-1",
         template: || {
             json!({
@@ -369,9 +369,10 @@ const ROWS: &[Row] = &[
                     "Certificate": {
                         "Type": "AWS::CertificateManager::Certificate",
                         "Properties": {
-                            // Reserved by IANA for documentation, so no requester can ever
+                            // A special-use top-level label (RFC 6761), which the public
+                            // DNS delegates to nobody, so there is no holder who could ever
                             // publish the evidence ACM asks for.
-                            "DomainName": "www.example.com",
+                            "DomainName": "www.acme-widgets.invalid",
                             "ValidationMethod": "DNS"
                         }
                     }
@@ -380,8 +381,8 @@ const ROWS: &[Row] = &[
             .to_string()
         },
         owed: Owed::Failed,
-        expected_domain: "www.example.com",
-        expected_names: &["www.example.com"],
+        expected_domain: "www.acme-widgets.invalid",
+        expected_names: &["www.acme-widgets.invalid"],
         expected_tags: &[],
         identity_outputs: &[],
     },

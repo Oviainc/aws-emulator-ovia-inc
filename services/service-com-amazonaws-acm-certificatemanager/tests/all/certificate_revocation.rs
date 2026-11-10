@@ -322,7 +322,7 @@ async fn revoking_a_certificate_that_was_never_exported_is_refused() {
         ),
         (
             "a failed public request, export not opted in",
-            json!({ "DomainName": "failed.example.com", "ValidationMethod": "EMAIL" }),
+            json!({ "DomainName": "failed.invalid", "ValidationMethod": "EMAIL" }),
             true,
             "FAILED",
             "KEY_COMPROMISE",

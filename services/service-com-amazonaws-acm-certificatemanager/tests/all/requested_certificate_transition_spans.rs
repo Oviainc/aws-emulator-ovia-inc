@@ -21,8 +21,8 @@
 //! defaulted), the number and form of the covered names (one name, several, a wildcard),
 //! whether the request chose the mail suffix itself, and — the axis the spans differ
 //! along — whether the name is one whose control could ever be proven, since a request
-//! for a name nobody can be delegated is the one whose owed OUTCOME closes the window
-//! instead of the owed mail.
+//! for a name the public DNS delegates to nobody is the one whose owed OUTCOME closes
+//! the window instead of the owed mail.
 //!
 //! Every call goes through `MultiServiceRouter::dispatch` on the shared harness in
 //! [`crate::certificate_lifecycle`], and each claim is read back through
@@ -141,18 +141,18 @@ async fn a_client_that_pauses_still_sees_the_pre_dispatch_state() {
     let cases: &[PendingCase<'_>] = &[
         (
             "a name whose control can never be proven",
-            json!({ "DomainName": "paused.example.com", "ValidationMethod": "EMAIL" }),
-            &[("paused.example.com", true)],
+            json!({ "DomainName": "paused.invalid", "ValidationMethod": "EMAIL" }),
+            &[("paused.invalid", true)],
         ),
         (
             // No method named: ACM validates a public certificate by email unless the
             // request asks for DNS or HTTP validation.
             "the same with no validation method named",
             json!({
-                "DomainName": "paused.example.net",
-                "SubjectAlternativeNames": ["mail.paused.example.net"],
+                "DomainName": "paused.localhost",
+                "SubjectAlternativeNames": ["mail.paused.localhost"],
             }),
-            &[("paused.example.net", true), ("mail.paused.example.net", true)],
+            &[("paused.localhost", true), ("mail.paused.localhost", true)],
         ),
         (
             "one email-validated name whose control could be proven",

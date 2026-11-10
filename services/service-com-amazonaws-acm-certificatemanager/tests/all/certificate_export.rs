@@ -85,8 +85,8 @@ async fn export_classifies_the_certificate_the_request_names() {
 
     // A requested certificate per export option: absent, DISABLED and ENABLED. The
     // private-CA requests have nothing to prove, so the clock carries them to ISSUED;
-    // the public one names a domain nobody can be delegated, so the clock carries it to
-    // a terminal status that is not ISSUED.
+    // the public one names a domain the public DNS delegates to nobody, so the clock
+    // carries it to a terminal status that is not ISSUED.
     let default_option = request_certificate(
         &router,
         &json!({
@@ -107,7 +107,7 @@ async fn export_classifies_the_certificate_the_request_names() {
     let unissued_enabled = request_certificate(
         &router,
         &json!({
-            "DomainName": "unissued.export.example.com",
+            "DomainName": "unissued.export.invalid",
             "ValidationMethod": "DNS",
             "Options": { "Export": "ENABLED" },
         }),
@@ -319,7 +319,8 @@ async fn an_export_enabled_certificate_that_is_not_issued_names_no_issued_certif
 
     // Three export-enabled requests, differing in what the clock owes each: a domain
     // whose control COULD be published, so the request waits its validation window out;
-    // a domain nobody can be delegated, so the request fails; and a private-CA request
+    // a domain the public DNS delegates to nobody, so the request fails; and a
+    // private-CA request
     // ("if you are requesting a private certificate, domain validation is not
     // required"), which is the ISSUED row the rule stops at.
     let waiting = request_certificate(
@@ -334,7 +335,7 @@ async fn an_export_enabled_certificate_that_is_not_issued_names_no_issued_certif
     let unprovable = request_certificate(
         &router,
         &json!({
-            "DomainName": "*.unprovable.export.example.org",
+            "DomainName": "*.unprovable.export.invalid",
             "ValidationMethod": "HTTP",
             "Options": { "Export": "ENABLED" },
         }),

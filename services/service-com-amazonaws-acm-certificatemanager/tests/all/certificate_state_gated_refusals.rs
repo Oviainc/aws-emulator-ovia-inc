@@ -135,9 +135,10 @@ async fn a_reimport_onto_a_certificate_acm_issued_names_no_imported_certificate(
             "ISSUED",
         ),
         (
-            // A name nobody can be delegated control of, which ACM refuses up front.
+            // A name whose top-level label the public DNS delegates to nobody, which
+            // ACM refuses up front.
             "a request that failed",
-            json!({ "DomainName": "failed.reimport.example.com", "ValidationMethod": "EMAIL" }),
+            json!({ "DomainName": "failed.reimport.invalid", "ValidationMethod": "EMAIL" }),
             "failed",
             "FAILED",
         ),
@@ -351,10 +352,11 @@ async fn resending_validation_mail_is_gated_on_the_certificates_state() {
         &private_request("issued.mail.probe-domain.com"),
     )
     .await;
-    // A request for a name nobody can be delegated: FAILED, with its domain unproven.
+    // A request for a name the public DNS delegates to nobody: FAILED, with its domain
+    // unproven.
     let failed = request_certificate(
         &router,
-        &json!({ "DomainName": "failed.mail.example.com", "ValidationMethod": "EMAIL" }),
+        &json!({ "DomainName": "failed.mail.invalid", "ValidationMethod": "EMAIL" }),
     )
     .await;
     make_validation_due_now(&engine);
@@ -395,8 +397,8 @@ async fn resending_validation_mail_is_gated_on_the_certificates_state() {
         (
             "a failed request, asked for its own name",
             &failed,
-            "failed.mail.example.com",
-            "failed.mail.example.com",
+            "failed.mail.invalid",
+            "failed.mail.invalid",
             "InvalidStateException",
         ),
     ];

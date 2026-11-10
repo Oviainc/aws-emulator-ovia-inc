@@ -87,6 +87,8 @@ mod certificate_not_found_message;
 mod certificate_options_not_issued_class;
 #[path = "all/certificate_options_update.rs"]
 mod certificate_options_update;
+#[path = "all/certificate_pending_validation_window.rs"]
+mod certificate_pending_validation_window;
 #[path = "all/certificate_refusal_classes.rs"]
 mod certificate_refusal_classes;
 #[path = "all/certificate_retrieval.rs"]

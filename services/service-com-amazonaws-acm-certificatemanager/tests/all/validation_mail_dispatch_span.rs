@@ -158,12 +158,13 @@ async fn a_client_calling_again_still_sees_the_unmailed_certificate() {
             ],
         ),
         (
-            // A name under a reserved domain nobody can be delegated (RFC 2606) is one
-            // ACM refuses up front — but not yet: the request is accepted, so the gate
-            // the resend draws here is the in-progress one, exactly as above.
+            // A name whose top-level label the public DNS delegates to nobody (RFC
+            // 6761) is one ACM refuses up front — but not yet: the request is accepted,
+            // so the gate the resend draws here is the in-progress one, exactly as
+            // above.
             "a name whose control can never be proven",
-            json!({ "DomainName": "reserved.example.com", "ValidationMethod": "EMAIL" }),
-            &[("reserved.example.com", true)],
+            json!({ "DomainName": "reserved.invalid", "ValidationMethod": "EMAIL" }),
+            &[("reserved.invalid", true)],
         ),
         (
             "a name validated by DNS, which reports no mailbox list at all",
@@ -250,21 +251,21 @@ async fn a_request_that_needs_no_proof_of_control_is_never_mailed() {
          would have, got {VALIDATION_SETTLE_DELAY:?} and {VALIDATION_EMAIL_DISPATCH_DELAY:?}"
     );
 
-    // Rows span both requests whose outcome needs no proof of control: a name nobody
-    // can be delegated (which ACM refuses up front, with the method named and
-    // defaulted) and a private certificate, for which "domain validation is not
+    // Rows span both requests whose outcome needs no proof of control: a name the
+    // public DNS delegates to nobody (which ACM refuses up front, with the method named
+    // and defaulted) and a private certificate, for which "domain validation is not
     // required" (`RequestCertificate` doc).
     let cases: &[SettledCase<'_>] = &[
         (
             "a name whose control can never be proven",
-            json!({ "DomainName": "unprovable.example.com", "ValidationMethod": "EMAIL" }),
+            json!({ "DomainName": "unprovable.invalid", "ValidationMethod": "EMAIL" }),
             "FAILED",
         ),
         (
             "the same with no validation method named",
             json!({
-                "DomainName": "unprovable.example.net",
-                "SubjectAlternativeNames": ["mail.unprovable.example.net"],
+                "DomainName": "unprovable.localhost",
+                "SubjectAlternativeNames": ["mail.unprovable.localhost"],
             }),
             "FAILED",
         ),

@@ -14,8 +14,8 @@
 //!    `CertificateDetail$Status` doc), so everything a pending validation exists for
 //!    stays reachable — the approval mail `ResendValidationEmail` resends, the CNAME
 //!    `DescribeCertificate` publishes. A name whose control can never be proven,
-//!    because it sits under a reserved domain nobody can be delegated (RFC 2606,
-//!    RFC 6761), is the exception ACM refuses up front.
+//!    because its top-level label is one the public DNS delegates to nobody (RFC 2606
+//!    §2, RFC 6761), is the exception ACM refuses up front.
 //! 2. An operation that needs an ISSUED certificate and is handed one in any other
 //!    status reports a PROCESSING STATE, `InvalidStateException` (HTTP 400) — a refusal
 //!    the same request stops drawing once the certificate is issued.
@@ -412,8 +412,8 @@ async fn every_dns_challenge_target_sits_under_its_own_validation_label() {
     let (router, _engine) = router_with_engine();
 
     // Rows differ along the name being validated: a plain one, a deep one, a wildcard
-    // (validated through the domain it covers), a reserved name, and several names in
-    // one certificate.
+    // (validated through the domain it covers), a name the public DNS delegates to
+    // nobody, and several names in one certificate.
     let rows: &[(&str, Value)] = &[
         (
             "one plain name",
@@ -432,8 +432,9 @@ async fn every_dns_challenge_target_sits_under_its_own_validation_label() {
             }),
         ),
         (
-            "a reserved name, which ACM refuses up front but still publishes evidence for",
-            json!({ "DomainName": "challenge.example.com", "ValidationMethod": "DNS" }),
+            "a name the public DNS delegates to nobody, which ACM refuses up front but \
+             still publishes evidence for",
+            json!({ "DomainName": "challenge.invalid", "ValidationMethod": "DNS" }),
         ),
         (
             "three names in one certificate",

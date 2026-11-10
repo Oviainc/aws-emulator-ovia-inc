@@ -6,7 +6,7 @@
 //! RULE under test: `PENDING_VALIDATION` is the status a request WAITS in, and what it
 //! waits for is fixed by the request. The clock owes a terminal status — `ISSUED` when
 //! the request needs no proof of domain ownership, `FAILED` with its `FailureReason`
-//! when it names a domain whose control can never be proven, and
+//! when it names a domain the public DNS delegates to nobody, and
 //! `VALIDATION_TIMED_OUT` at the end of the documented 72-hour validation window
 //! otherwise — and every reader reports that outcome once it has fallen due, so a
 //! client polling for a terminal status terminates.
@@ -57,7 +57,7 @@ type OutcomeCase<'a> = (&'a str, Value, &'a str, &'a str, Duration);
 ///
 /// Reads the very instant the emulator stored, so the test asserts the service's own
 /// bookkeeping rather than a guess about it.
-fn pending_due_in(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> Option<Duration> {
+pub(crate) fn pending_due_in(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> Option<Duration> {
     let store = engine.state::<ComAmazonawsAcmCertificatemanagerState>();
     let store = store.lock();
     let pending = store
@@ -91,7 +91,7 @@ pub(crate) fn make_validation_due_now(engine: &Arc<engine::InMemoryEngine>) {
 }
 
 /// The `DomainValidationOptions` of a described certificate.
-fn validations(case: &str, detail: &Value) -> Vec<Value> {
+pub(crate) fn validations(case: &str, detail: &Value) -> Vec<Value> {
     detail["DomainValidationOptions"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case}: no DomainValidationOptions in {detail}"))
@@ -224,7 +224,7 @@ fn assert_terminal(case: &str, detail: &Value, expected: &str, method: &str) {
 }
 
 /// Every certificate ARN `ListCertificates` reports for a status filter.
-async fn arns_in_statuses(router: &MultiServiceRouter, statuses: &[&str]) -> Vec<String> {
+pub(crate) async fn arns_in_statuses(router: &MultiServiceRouter, statuses: &[&str]) -> Vec<String> {
     let body = json!({ "CertificateStatuses": statuses, "MaxItems": 100 });
     let (status, response) = call(router, "ListCertificates", &body).await;
     assert_eq!(
@@ -246,9 +246,9 @@ async fn arns_in_statuses(router: &MultiServiceRouter, statuses: &[&str]) -> Vec
 
 /// RULE: a requested certificate is `PENDING_VALIDATION` until the clock owes it a
 /// terminal status — `ISSUED` where no proof of domain ownership is required, `FAILED`
-/// with `ADDITIONAL_VERIFICATION_REQUIRED` where the name is one whose control can
-/// never be proven, and `VALIDATION_TIMED_OUT` at the end of the documented 72-hour
-/// validation window for a name whose owner could have published the evidence — and
+/// with `ADDITIONAL_VERIFICATION_REQUIRED` where the name is one the public DNS
+/// delegates to nobody, and `VALIDATION_TIMED_OUT` at the end of the documented 72-hour
+/// validation window for a name whose holder could have published the evidence — and
 /// every reader reports the outcome once it is due.
 #[tokio::test]
 async fn a_requested_certificate_reaches_a_terminal_status() {
@@ -256,21 +256,21 @@ async fn a_requested_certificate_reaches_a_terminal_status() {
     // for (every modelled value, and none), the number of names covered, whether the
     // request names a private certificate authority — the one case that needs no domain
     // validation at all, and so the one that resolves to ISSUED — and whether the names
-    // it covers are reserved ones no requester can be delegated (which ACM refuses up
+    // it covers are ones the public DNS delegates to nobody (which ACM refuses up
     // front) or ordinary ones (which it waits the validation window out for).
     let cases: &[OutcomeCase<'_>] = &[
         (
-            "DNS validation, one reserved name",
-            json!({ "DomainName": "dns.example.com", "ValidationMethod": "DNS" }),
+            "DNS validation, one undelegated name",
+            json!({ "DomainName": "dns.invalid", "ValidationMethod": "DNS" }),
             "FAILED",
             "DNS",
             VALIDATION_SETTLE_DELAY,
         ),
         (
-            "EMAIL validation, two reserved names",
+            "EMAIL validation, two undelegated names",
             json!({
-                "DomainName": "email.example.com",
-                "SubjectAlternativeNames": ["mail.email.example.com"],
+                "DomainName": "email.localhost",
+                "SubjectAlternativeNames": ["mail.email.localhost"],
                 "ValidationMethod": "EMAIL",
             }),
             "FAILED",
@@ -278,15 +278,15 @@ async fn a_requested_certificate_reaches_a_terminal_status() {
             VALIDATION_SETTLE_DELAY,
         ),
         (
-            "HTTP validation, reserved wildcard name",
-            json!({ "DomainName": "*.http.example.org", "ValidationMethod": "HTTP" }),
+            "HTTP validation, undelegated wildcard name",
+            json!({ "DomainName": "*.http.test", "ValidationMethod": "HTTP" }),
             "FAILED",
             "HTTP",
             VALIDATION_SETTLE_DELAY,
         ),
         (
-            "no validation method named, reserved name",
-            json!({ "DomainName": "defaulted.example.net" }),
+            "no validation method named, undelegated name",
+            json!({ "DomainName": "defaulted.example" }),
             "FAILED",
             "EMAIL",
             VALIDATION_SETTLE_DELAY,
@@ -320,10 +320,10 @@ async fn a_requested_certificate_reaches_a_terminal_status() {
             VALIDATION_WINDOW,
         ),
         (
-            "one reserved name beside an ordinary one",
+            "one undelegated name beside an ordinary one",
             json!({
                 "DomainName": "mixed.probe-domain.com",
-                "SubjectAlternativeNames": ["mixed.example.com"],
+                "SubjectAlternativeNames": ["mixed.invalid"],
                 "ValidationMethod": "DNS",
             }),
             "FAILED",
@@ -431,7 +431,7 @@ async fn a_poll_for_a_terminal_status_terminates() {
     let started = std::time::Instant::now();
     let arn = request_certificate(
         &router,
-        &json!({ "DomainName": "polled.example.com", "ValidationMethod": "DNS" }),
+        &json!({ "DomainName": "polled.invalid", "ValidationMethod": "DNS" }),
     )
     .await;
 
@@ -492,7 +492,7 @@ async fn key_usage_filters_find_only_issued_certificates() {
     .await;
     let failed = request_certificate(
         &router,
-        &json!({ "DomainName": "unverifiable.example.com", "ValidationMethod": "DNS" }),
+        &json!({ "DomainName": "unverifiable.invalid", "ValidationMethod": "DNS" }),
     )
     .await;
 

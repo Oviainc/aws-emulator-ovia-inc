@@ -295,7 +295,7 @@ async fn updating_the_options_of_a_certificate_that_is_not_issued_is_a_validatio
         ),
         (
             "a failed certificate asked for the export option it already has",
-            json!({ "DomainName": "failed.classify.example.org", "ValidationMethod": "EMAIL" }),
+            json!({ "DomainName": "failed.classify.invalid", "ValidationMethod": "EMAIL" }),
             false,
             "FAILED",
             json!({ "Export": "DISABLED" }),

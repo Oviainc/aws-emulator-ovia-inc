@@ -16,7 +16,7 @@
 //!
 //! The table spans what the rule generalises over: every non-ISSUED status a stored
 //! certificate can be in, reached the way a request reaches it (a public request held
-//! in its validation window, a name nobody can be delegated control of, a recorded
+//! in its validation window, a name the public DNS delegates to nobody, a recorded
 //! revocation), crossed with each `Options` member a request can name, several at once,
 //! and an `Options` naming none. Every row reads the record back with
 //! `DescribeCertificate` before and after the refusal, so nothing here can pass on a
@@ -57,7 +57,8 @@ enum Fixture {
     /// A public request held inside its validation window, so it is still pending.
     HeldPending,
     /// A request whose owed validation outcome is materialised, which the names it
-    /// covers decide (a reserved name fails, any other times out).
+    /// covers decide (a name the public DNS delegates to nobody fails, any other times
+    /// out).
     Settled,
     /// An issued certificate carried all the way to a recorded revocation.
     Revoked,
@@ -181,9 +182,10 @@ fn not_issued_cases() -> Vec<NotIssuedCase<'static>> {
         }),
     ));
     cases.push((
-        // A name RFC 2606 reserves, so the request fails rather than waiting.
+        // A name whose top-level label the public DNS delegates to nobody (RFC 6761),
+        // so the request fails up front rather than waiting.
         "a request that failed, asked to migrate validation",
-        json!({ "DomainName": "failed.example.org", "ValidationMethod": "EMAIL" }),
+        json!({ "DomainName": "failed.invalid", "ValidationMethod": "EMAIL" }),
         Fixture::Settled,
         "FAILED",
         json!({ "ValidationMethod": "HTTP" }),

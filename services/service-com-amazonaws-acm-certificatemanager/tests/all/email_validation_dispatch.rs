@@ -374,16 +374,16 @@ async fn a_dispatched_mailbox_list_outlives_the_request() {
     let (router, engine) = router_with_engine();
     let arn = request_certificate(
         &router,
-        &json!({ "DomainName": "outlives.example.com", "ValidationMethod": "EMAIL" }),
+        &json!({ "DomainName": "outlives.invalid", "ValidationMethod": "EMAIL" }),
     )
     .await;
     hold_pending_validations(&engine);
     dispatch_validation_mail_now(&engine);
     let detail = describe(&router, &arn).await;
-    let validation = validation_for("mailed", &detail, "outlives.example.com");
+    let validation = validation_for("mailed", &detail, "outlives.invalid");
     assert_eq!(
         reported_mailboxes(&validation),
-        Some(expected_mailboxes("outlives.example.com")),
+        Some(expected_mailboxes("outlives.invalid")),
         "case mailed: expected the dispatched mailboxes, got {validation}"
     );
 
@@ -396,7 +396,7 @@ async fn a_dispatched_mailbox_list_outlives_the_request() {
         Some("FAILED"),
         "case settled: a public request whose domains cannot be proven ends FAILED, got {detail}"
     );
-    let validation = validation_for("settled", &detail, "outlives.example.com");
+    let validation = validation_for("settled", &detail, "outlives.invalid");
     assert_eq!(
         validation["ValidationStatus"].as_str(),
         Some("FAILED"),
@@ -404,7 +404,7 @@ async fn a_dispatched_mailbox_list_outlives_the_request() {
     );
     assert_eq!(
         reported_mailboxes(&validation),
-        Some(expected_mailboxes("outlives.example.com")),
+        Some(expected_mailboxes("outlives.invalid")),
         "case settled: the addresses ACM mailed are not retracted by the outcome, got {validation}"
     );
 }
@@ -417,7 +417,7 @@ async fn a_request_that_settles_first_is_never_mailed() {
     let (router, engine) = router_with_engine();
     let arn = request_certificate(
         &router,
-        &json!({ "DomainName": "settled.example.com", "ValidationMethod": "EMAIL" }),
+        &json!({ "DomainName": "settled.invalid", "ValidationMethod": "EMAIL" }),
     )
     .await;
     // The outcome falls due before the mail does, which is the only order in which the
@@ -430,7 +430,7 @@ async fn a_request_that_settles_first_is_never_mailed() {
         Some("FAILED"),
         "case settled first: the outcome must have been materialised, got {detail}"
     );
-    let validation = validation_for("settled first", &detail, "settled.example.com");
+    let validation = validation_for("settled first", &detail, "settled.invalid");
     assert_eq!(
         reported_mailboxes(&validation),
         Some(Vec::new()),
@@ -442,7 +442,7 @@ async fn a_request_that_settles_first_is_never_mailed() {
     // due in, the list is still empty.
     tokio::time::sleep(VALIDATION_EMAIL_DISPATCH_DELAY + Duration::from_millis(250)).await;
     let detail = describe(&router, &arn).await;
-    let validation = validation_for("well past the span", &detail, "settled.example.com");
+    let validation = validation_for("well past the span", &detail, "settled.invalid");
     assert_eq!(
         reported_mailboxes(&validation),
         Some(Vec::new()),

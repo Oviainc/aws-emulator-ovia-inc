@@ -652,14 +652,14 @@ async fn options_cannot_be_updated_unless_the_certificate_is_issued() {
         ),
         (
             "a failed certificate, asked for the export option it already has",
-            json!({ "DomainName": "failed.example.org", "ValidationMethod": "EMAIL" }),
+            json!({ "DomainName": "failed.invalid", "ValidationMethod": "EMAIL" }),
             false,
             "FAILED",
             json!({ "Export": "DISABLED" }),
         ),
         (
             "a failed certificate, asked for the transparency logging preference",
-            json!({ "DomainName": "failed.example.com", "ValidationMethod": "HTTP" }),
+            json!({ "DomainName": "failed.localhost", "ValidationMethod": "HTTP" }),
             false,
             "FAILED",
             json!({ "CertificateTransparencyLoggingPreference": "ENABLED" }),
