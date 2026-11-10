@@ -9,7 +9,9 @@
 //! **run group** that caps the compute those runs may use (`CreateRunGroup` /
 //! `GetRunGroup` / `ListRunGroups`), the **run cache** a run reads task outputs from (`CreateRunCache` /
 //! `GetRunCache`) and the **sequence store** that holds read sets
-//! (`CreateSequenceStore` / `GetSequenceStore`). Each resource is stored exactly once, keyed by the numeric id
+//! (`CreateSequenceStore` / `GetSequenceStore`), together with the **multipart read set
+//! upload** a caller initiates against that store
+//! (`CreateMultipartReadSetUpload`). Each resource is stored exactly once, keyed by the numeric id
 //! the model's `^[0-9]+$` patterns describe (a version by its name, inside its
 //! workflow's record), so every operation reads and writes the one record.
 //!
@@ -110,6 +112,16 @@ pub const WORKFLOW_STATUS_ACTIVE: &str = "ACTIVE";
 /// exactly ten digits wide, inside that length and inside `u64` for the whole life of
 /// a process.
 pub const FIRST_SEQUENCE_STORE_ID: u64 = 1_000_000_000;
+
+/// How far above [`FIRST_SEQUENCE_STORE_ID`] the multipart-read-set-upload counter
+/// starts.
+///
+/// The modelled `UploadId` is the same `^[0-9]+$` with length 10..36 as a
+/// `SequenceStoreId`, so every id this mints is ten digits wide too. Offsetting it keeps
+/// an upload id and a store id in separate ranges, so a cross-type mix-up (a store id
+/// handed to an upload operation) resolves to nothing and is answered "not found"
+/// instead of reaching an unrelated record.
+pub const UPLOAD_ID_OFFSET: u64 = 1_000_000_000;
 
 /// `SequenceStoreStatus` a freshly created sequence store carries, from the modelled
 /// `SequenceStoreStatus` enum.
@@ -289,6 +301,14 @@ pub const MAX_RUN_CACHES: usize = 500;
 /// quota. A create past it is refused with the modelled
 /// `ServiceQuotaExceededException`.
 pub const MAX_RUN_GROUPS: usize = 500;
+
+/// The most multipart read set uploads this emulator will hold for ONE sequence store.
+///
+/// Emulator resource guard, not an AWS quota: an upload is initiated by a caller and
+/// reclaimed only by an explicit abort or completion, so the per-store collection
+/// carries a cap like every other growth site here. A create past it is refused with the
+/// modelled `ServiceQuotaExceededException`.
+pub const MAX_MULTIPART_READ_SET_UPLOADS: usize = 100;
 
 /// The most tags one workflow or run may carry.
 ///
@@ -534,6 +554,49 @@ impl SequenceStore {
     }
 }
 
+/// One initiated multipart read set upload: every member
+/// `CreateMultipartReadSetUpload` answers with, and the record the parts uploaded for
+/// that upload id are collected against.
+///
+/// The model gives an upload no status member at all, so nothing here is owed to the
+/// clock: an upload is usable for `UploadReadSetPart` from the moment its create
+/// answered.
+#[derive(Debug, Clone, Default)]
+pub struct MultipartReadSetUpload {
+    /// The decimal numeric id: this record's store key, rendered.
+    pub upload_id: String,
+    /// The sequence store this upload writes into, so one listing can be narrowed to
+    /// the store the request names and an upload id cannot be reached through another
+    /// store.
+    pub sequence_store_id: String,
+    pub source_file_type: String,
+    pub subject_id: String,
+    pub sample_id: String,
+    pub generated_from: Option<String>,
+    /// The reference the create named, when it named one. HealthOmics needs a reference
+    /// genome only for the aligned source formats, so an upload of an unaligned one
+    /// carries none.
+    pub reference_arn: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub creation_time_ms: i64,
+    pub tags: BTreeMap<String, String>,
+    /// The `clientToken` of the request that initiated this upload, so a replay of that
+    /// token answers with this record instead of initiating a second upload — which is
+    /// what that member documents ("An idempotency token that can be used to avoid
+    /// triggering multiple multipart uploads"). The token's namespace is the store's own
+    /// upload collection, which [`MAX_MULTIPART_READ_SET_UPLOADS`] already bounds, so no
+    /// separate token map grows here.
+    pub client_token: Option<String>,
+}
+
+impl MultipartReadSetUpload {
+    /// `tags` as the wire shapes want it: omitted when none were ever set.
+    pub fn tags_output(&self) -> Option<HashMap<String, String>> {
+        tags_output(&self.tags)
+    }
+}
+
 /// One stored run cache: every member `GetRunCache` reports.
 ///
 /// A run cache is a reference to a caller-owned S3 location, not a resource this
@@ -750,6 +813,10 @@ pub struct ComAmazonawsOmicsOmicsState {
     /// Every sequence store, keyed by its numeric id, in creation order for the same
     /// reason.
     pub sequence_stores: BTreeMap<u64, SequenceStore>,
+    /// Every multipart read set upload, keyed by its numeric upload id, in creation
+    /// order for the same reason. Each record names the sequence store it writes into,
+    /// so one store's uploads are the records that name it.
+    pub multipart_read_set_uploads: BTreeMap<u64, MultipartReadSetUpload>,
     /// Every run cache, keyed by its numeric id, in creation order for the same reason.
     pub run_caches: BTreeMap<u64, RunCache>,
     /// Every run group, keyed by its numeric id, in creation order for the same reason.
@@ -761,6 +828,7 @@ pub struct ComAmazonawsOmicsOmicsState {
     next_workflow_id: u64,
     next_run_id: u64,
     next_sequence_store_id: u64,
+    next_multipart_read_set_upload_id: u64,
     next_run_cache_id: u64,
     next_run_group_id: u64,
 }
@@ -806,6 +874,33 @@ impl ComAmazonawsOmicsOmicsState {
         self.sequence_stores.get(&numeric_id(id)?)
     }
 
+    /// The multipart read set upload the modelled `UploadId` `upload_id` names INSIDE
+    /// the sequence store `sequence_store_id`, or `None`.
+    ///
+    /// An upload belongs to the store it was initiated against — every upload operation
+    /// names both ids — so an upload id presented under another store resolves to
+    /// nothing here rather than reaching that record.
+    pub fn multipart_read_set_upload(
+        &self,
+        sequence_store_id: &str,
+        upload_id: &str,
+    ) -> Option<&MultipartReadSetUpload> {
+        self.multipart_read_set_uploads
+            .get(&numeric_id(upload_id)?)
+            .filter(|upload| upload.sequence_store_id == sequence_store_id)
+    }
+
+    /// Every multipart read set upload initiated against `sequence_store_id`, in
+    /// creation order: the map's own key order.
+    pub fn multipart_read_set_uploads_for<'a>(
+        &'a self,
+        sequence_store_id: &'a str,
+    ) -> impl Iterator<Item = (&'a u64, &'a MultipartReadSetUpload)> + 'a {
+        self.multipart_read_set_uploads
+            .iter()
+            .filter(move |(_, upload)| upload.sequence_store_id == sequence_store_id)
+    }
+
     /// The run cache the modelled `RunCacheId` `id` names, or `None`.
     pub fn run_cache(&self, id: &str) -> Option<&RunCache> {
         self.run_caches.get(&numeric_id(id)?)
@@ -837,6 +932,16 @@ impl ComAmazonawsOmicsOmicsState {
     pub fn next_sequence_store_id(&mut self) -> (u64, String) {
         let key = FIRST_SEQUENCE_STORE_ID + self.next_sequence_store_id;
         self.next_sequence_store_id += 1;
+        (key, key.to_string())
+    }
+
+    /// Mint the next multipart-read-set-upload id, from [`FIRST_SEQUENCE_STORE_ID`] plus
+    /// [`UPLOAD_ID_OFFSET`] so every one is the ten-digit decimal the modelled
+    /// `UploadId` length admits and no upload shares an id with a sequence store.
+    pub fn next_multipart_read_set_upload_id(&mut self) -> (u64, String) {
+        let key =
+            FIRST_SEQUENCE_STORE_ID + UPLOAD_ID_OFFSET + self.next_multipart_read_set_upload_id;
+        self.next_multipart_read_set_upload_id += 1;
         (key, key.to_string())
     }
 
@@ -1289,6 +1394,8 @@ pub enum AuditOutcome {
     RunDeleted,
     /// A sequence store was minted and stored.
     SequenceStoreCreated,
+    /// A multipart read set upload was initiated and stored against a sequence store.
+    MultipartReadSetUploadCreated,
     /// A run cache was minted and stored.
     RunCacheCreated,
     /// A run group was minted and stored.
@@ -1324,6 +1431,7 @@ impl AuditOutcome {
             Self::RunStarted => "run-started",
             Self::RunDeleted => "run-deleted",
             Self::SequenceStoreCreated => "sequence-store-created",
+            Self::MultipartReadSetUploadCreated => "multipart-read-set-upload-created",
             Self::RunCacheCreated => "run-cache-created",
             Self::RunGroupCreated => "run-group-created",
             Self::NoChange => "no-change",

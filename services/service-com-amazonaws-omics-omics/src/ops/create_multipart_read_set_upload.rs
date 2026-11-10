@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMultipartReadSetUpload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMultipartReadSetUpload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMultipartReadSetUpload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Initiates a multipart read set upload against a sequence store and PERSISTS it in
+//! [`crate::state`]: this handler resolves the store the request names, mints the
+//! ten-digit numeric `uploadId`, stores every member the request carried, and answers
+//! from that record — so the parts a caller later uploads under that id, and the
+//! listings that report the upload, read the one record this created. `clientToken`
+//! documents itself as an idempotency token, so a replay of the same token against the
+//! same store answers with the upload the first call initiated.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +200,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMultipartReadSetUpload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMultipartReadSetUploadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMultipartReadSetUpload"))
+        // Every string length and pattern on this input, and the `sourceFileType` enum,
+        // are modelled constraints the centralized walk has already refused anything
+        // outside of. The `tags` map carries NO modelled length, so its bound is checked
+        // here, under the one rule every tag-storing operation in this crate applies.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            CreateMultipartReadSetUploadErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the omics sequence store registry is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        if let Some(why) = crate::state::tag_bounds_rejection(input.tags.as_ref()) {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::ValidationRefused,
+                None,
+            );
+            return Err(CreateMultipartReadSetUploadErrorModeled::ValidationException(
+                ValidationException { message: why },
+            )
+            .into());
+        }
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        // An upload writes into the sequence store its path names, so there is nothing
+        // to initiate until that store is one this emulator holds.
+        let sequence_store_id = match registry.sequence_store(&input.sequence_store_id) {
+            Some(store) => store.id.clone(),
+            None => {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::NotFound,
+                    Some(&input.sequence_store_id),
+                );
+                return Err(
+                    CreateMultipartReadSetUploadErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: format!(
+                                "no sequence store with id {} exists in this region",
+                                input.sequence_store_id
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // A replayed idempotency token answers with the upload the first call initiated:
+        // same uploadId, same creation time, same members — nothing is initiated twice.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some((_, upload)) = registry
+                .multipart_read_set_uploads_for(&sequence_store_id)
+                .find(|(_, upload)| upload.client_token.as_deref() == Some(token))
+            {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::NoChange,
+                    Some(&upload.upload_id),
+                );
+                return Ok(reported(upload));
+            }
+        }
+
+        // The registry is finite: an upload that would take this store's collection past
+        // its cap is refused rather than growing it, the way the service refuses one past
+        // its quota.
+        let held = registry
+            .multipart_read_set_uploads_for(&sequence_store_id)
+            .count();
+        if held >= crate::state::MAX_MULTIPART_READ_SET_UPLOADS {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::QuotaExceeded,
+                Some(&sequence_store_id),
+            );
+            return Err(
+                CreateMultipartReadSetUploadErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "sequence store {sequence_store_id} already holds the maximum of {} \
+                             active multipart read set uploads",
+                            crate::state::MAX_MULTIPART_READ_SET_UPLOADS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let (key, upload_id) = registry.next_multipart_read_set_upload_id();
+        let upload = crate::state::MultipartReadSetUpload {
+            upload_id,
+            sequence_store_id,
+            source_file_type: input.source_file_type,
+            subject_id: input.subject_id,
+            sample_id: input.sample_id,
+            generated_from: input.generated_from,
+            // What the caller declared is what is stored: this emulator resolves no
+            // reference store, so no reference ARN is invented for an upload that named
+            // none.
+            reference_arn: input.reference_arn,
+            name: input.name,
+            description: input.description,
+            creation_time_ms: now_ms,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            client_token: input.client_token,
+        };
+        let response = reported(&upload);
+        let created = upload.upload_id.clone();
+        registry.multipart_read_set_uploads.insert(key, upload);
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::MultipartReadSetUploadCreated,
+            Some(&created),
+        );
+
+        Ok(response)
+    }
+}
+
+/// This operation's response for `upload`, read from the stored record alone, so a fresh
+/// create and a replayed `clientToken` answer with exactly the same members.
+///
+/// `referenceArn` is required on the response while the request's own member is
+/// optional, and HealthOmics needs a reference genome only for the aligned source
+/// formats: an upload that named no reference has none to report, so the member carries
+/// the empty value rather than an ARN this emulator resolved from nothing.
+fn reported(upload: &crate::state::MultipartReadSetUpload) -> CreateMultipartReadSetUploadOutput {
+    CreateMultipartReadSetUploadOutput {
+        sequence_store_id: upload.sequence_store_id.clone(),
+        upload_id: upload.upload_id.clone(),
+        source_file_type: upload.source_file_type.clone(),
+        subject_id: upload.subject_id.clone(),
+        sample_id: upload.sample_id.clone(),
+        generated_from: upload.generated_from.clone(),
+        reference_arn: upload.reference_arn.clone().unwrap_or_default(),
+        name: Some(upload.name.clone()),
+        description: upload.description.clone(),
+        tags: upload.tags_output(),
+        creation_time: crate::state::timestamp(upload.creation_time_ms),
     }
 }
