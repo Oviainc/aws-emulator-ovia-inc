@@ -47,6 +47,8 @@ service-common = { path = "../common" }
 # which 0.37's `libsqlite3-sys` 0.35 shipped. The two components 0.41 adds —
 # `sqlite-wasm-rs` and its `rsqlite-vfs` — are gated to `wasm32` upstream and are not
 # linked into a host build, so the engine in the process is still one bundled SQLite.
+# The linked release is asserted against that floor by the engine-release suite of
+# `services/service-com-amazonaws-rdsdata-rdsdataservice`.
 rusqlite = { version = "0.41", features = ["bundled", "column_decltype", "hooks", "limits"] }
 # `regex`: the pattern a `SHOW TABLES`/`SHOW VIEWS` statement narrows its answer by is
 # matched by the linear-time matcher the Data Catalog's own listings use, not by a

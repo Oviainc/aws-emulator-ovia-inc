@@ -44,6 +44,7 @@ tracing = { workspace = true }
 # which 0.37's `libsqlite3-sys` 0.35 shipped. The two components 0.41 adds —
 # `sqlite-wasm-rs` and its `rsqlite-vfs` — are gated to `wasm32` upstream and are not
 # linked into a host build, so the engine in the process is still one bundled SQLite.
+# `tests/all/engine_release_floor.rs` asserts the linked release against that floor.
 rusqlite = { version = "0.41", features = ["bundled", "backup", "column_decltype", "functions", "hooks", "limits"] }
 # The PostgreSQL and MySQL parsers in front of that engine: a Data API statement is
 # written in the dialect of the engine the caller addresses, so it is parsed with this
@@ -92,6 +93,10 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The SAME SQL engine binding this crate's data plane runs on (see `[dependencies]`),
+# so `engine_release_floor` can read which engine release the workspace actually
+# linked rather than infer it from the lock file.
+rusqlite = { version = "0.41", features = ["bundled"] }
 # The owners of the cluster, the secret and the caller's identity, mounted beside this
 # service in the precondition suite so the facts the Data API resolves are real resources
 # of this emulator, created through those services' own operations.

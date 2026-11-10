@@ -21,7 +21,11 @@
 //! 4. a row a constraint refused NAMES that constraint: `duplicate key value violates
 //!    unique constraint "<name>"` (SQLSTATE `23505`) and the two sentences of a foreign-key
 //!    violation (SQLSTATE `23503`), under the name the client gave the constraint or the one
-//!    PostgreSQL gives a constraint it names itself.
+//!    PostgreSQL gives a constraint it names itself;
+//! 5. deferring the foreign-key checks is the SERVER's own, not a session's: a session
+//!    cannot stop the engine checking them, and the one span the server defers them —
+//!    putting a rolled-back transaction's rows back — is closed again by the time the
+//!    session's next statement runs.
 //!
 //! The client is the one the sibling endpoint suites drive
 //! ([`crate::db_instance_engine_endpoint`]), written against the PostgreSQL wire itself, so
@@ -745,6 +749,103 @@ async fn a_refused_row_names_the_constraint_it_violated() {
             "case {case:?}: expected the engine's own sentence, got {refusal:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 5: deferring the foreign-key checks is the SERVER's, not a session's.
+// ---------------------------------------------------------------------------
+
+/// RULE: foreign-key enforcement on a DB instance's databases is the SERVER's, not a
+/// session's: a statement that asks the engine to stop checking its constraints leaves
+/// enforcement exactly as it was, and the one span the server itself defers the checks —
+/// putting a rolled-back transaction's rows back, where a child row can only come back
+/// before its parent — is closed again by the time the session's next statement runs.
+///
+/// The rows span the forms a session could ask in: the engine's own switch for deferring
+/// the checks and for turning them off, each written in the spellings the engine accepts,
+/// plus the statement PostgreSQL itself defines for deferring constraints. Whether a given
+/// form is refused by the parser or by the engine is not the rule — what is asserted is
+/// that after each one a row that breaks a foreign key is STILL refused, with the SQLSTATE
+/// PostgreSQL gives that violation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_cannot_stop_the_engine_checking_its_foreign_keys() {
+    // (case, the statement a session sends to try to stop the checks)
+    let asks = [
+        (
+            "the engine's switch for deferring the checks",
+            "PRAGMA defer_foreign_keys = 1",
+        ),
+        (
+            "the same switch, spelled as the engine also accepts it",
+            "PRAGMA defer_foreign_keys = ON",
+        ),
+        (
+            "the switch under a schema qualifier",
+            "PRAGMA main.defer_foreign_keys = 1",
+        ),
+        (
+            "the engine's switch for turning the checks off entirely",
+            "PRAGMA foreign_keys = OFF",
+        ),
+        (
+            "the statement PostgreSQL defines for deferring constraints",
+            "SET CONSTRAINTS ALL DEFERRED",
+        ),
+    ];
+
+    let case = "a session that asks for the checks to stop";
+    let router = emulator();
+    let (address, port) = available_cluster(&router, "emu-truth-deferral").await;
+    let mut client = session(case, &address, port).await;
+    for statement in [
+        "CREATE TABLE s2r_homes (id integer PRIMARY KEY)",
+        "CREATE TABLE s2r_tenants (id integer PRIMARY KEY, home integer, CONSTRAINT \
+         s2r_tenants_home_fk FOREIGN KEY (home) REFERENCES s2r_homes (id) ON DELETE CASCADE)",
+        "INSERT INTO s2r_homes (id) VALUES (1), (2)",
+        "INSERT INTO s2r_tenants (id, home) VALUES (10, 1), (11, 1), (20, 2)",
+    ] {
+        must_run(case, &mut client, statement).await;
+    }
+
+    // The violation every row below is measured by: a child whose parent does not exist.
+    let breaking = "INSERT INTO s2r_tenants (id, home) VALUES (99, 999)";
+    for (ask, statement) in asks {
+        // The ask itself may be refused or served; either is the engine's business.
+        let _ = client.query(statement).await;
+        let refusal = client
+            .query(breaking)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("case {ask:?}: {breaking:?} was served after {statement:?}"));
+        assert_eq!(
+            refusal.code, FOREIGN_KEY_VIOLATION,
+            "case {ask:?}: after {statement:?} the checks must still be in force, got \
+             {refusal:?}"
+        );
+    }
+
+    // And the one span the SERVER defers them — putting back a rolled-back transaction's
+    // rows, where a child comes back before its parent — leaves them in force for the
+    // session's next statement.
+    must_run(case, &mut client, "BEGIN").await;
+    must_run(case, &mut client, "DELETE FROM s2r_homes WHERE id = 1").await;
+    must_run(case, &mut client, "ROLLBACK").await;
+    let restored = column_of(case, &mut client, "SELECT id FROM s2r_tenants ORDER BY id").await;
+    assert_eq!(
+        restored,
+        vec!["10".to_string(), "11".to_string(), "20".to_string()],
+        "case {case:?}: the rollback must put the cascaded children back, got {restored:?}"
+    );
+    let refusal = client
+        .query(breaking)
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("case {case:?}: {breaking:?} was served after the rollback"));
+    assert_eq!(
+        refusal.code, FOREIGN_KEY_VIOLATION,
+        "case {case:?}: the server's own deferral must be closed by the session's next \
+         statement, got {refusal:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

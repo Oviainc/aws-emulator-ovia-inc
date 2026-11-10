@@ -429,6 +429,79 @@ async fn a_statement_past_the_sessions_statement_timeout_is_cancelled() {
     }
 }
 
+/// RULE: every piece of caller SQL an engine endpoint runs for one statement is bounded by
+/// THAT statement's deadline — the session's `statement_timeout` clamped by the endpoint's
+/// own budget — including the row query the endpoint runs to identify the rows a locking
+/// statement will take. So a server function that WAITS, called from such a statement's
+/// predicate, stops at the statement's deadline and never at the number the caller asked
+/// for.
+///
+/// The rows span the statement forms whose predicate the endpoint evaluates ahead of the
+/// statement itself: a locking `SELECT`, an `UPDATE` and a `DELETE`. Each is refused
+/// promptly — a locking clause whose rows the endpoint could not identify inside the
+/// statement's budget is the clause it cannot serve (SQLSTATE `54000`), and a statement
+/// with no clause goes on to run and is cancelled by the same deadline (`57014`) — and in
+/// no case does the endpoint wait for the number the predicate asked for.
+#[tokio::test]
+async fn a_waiting_function_in_a_locking_statements_predicate_stops_at_the_deadline() {
+    let router = emulator();
+    let (address, port) = available_instance(
+        &router,
+        "emu-rowquery-postgres",
+        "postgres",
+        &params!["EngineVersion" => "16.4"],
+    )
+    .await;
+    let mut session = session(&address, port).await;
+    let _ = value(
+        &mut session,
+        "CREATE TABLE waits (id int PRIMARY KEY, label text)",
+    )
+    .await;
+    let _ = value(&mut session, "INSERT INTO waits (id, label) VALUES (1, 'a')").await;
+    // "The time in milliseconds after which a statement is aborted."
+    let _ = value(&mut session, "SET statement_timeout = 100").await;
+
+    // The number the predicate asks to wait for, far past the timeout above.
+    let asked = std::time::Duration::from_secs(3);
+    // (case, the statement whose predicate waits, the refusal the endpoint answers with)
+    let cases = [
+        (
+            "a locking SELECT",
+            "SELECT id FROM waits WHERE pg_sleep(3) IS NULL FOR UPDATE",
+            "54000",
+        ),
+        (
+            "an UPDATE",
+            "UPDATE waits SET label = 'b' WHERE pg_sleep(3) IS NULL",
+            "57014",
+        ),
+        (
+            "a DELETE",
+            "DELETE FROM waits WHERE pg_sleep(3) IS NULL",
+            "57014",
+        ),
+    ];
+
+    for (case, statement, code) in cases {
+        let before = std::time::Instant::now();
+        let answer = session.query(statement).await;
+        let elapsed = before.elapsed();
+        let refusal = answer.err().unwrap_or_else(|| {
+            panic!("case {case:?}: {statement:?} must not be served, it was")
+        });
+        assert_eq!(
+            refusal.code, code,
+            "case {case:?}: expected SQLSTATE {code}, got {refusal:?}"
+        );
+        assert!(
+            elapsed < asked,
+            "case {case:?}: the statement must stop at its own deadline, not after the \
+             {asked:?} its predicate asked for, got {elapsed:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_postgresql_endpoint_parses_the_postgresql_dialect() {
     let router = emulator();
