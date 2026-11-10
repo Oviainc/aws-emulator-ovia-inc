@@ -151,6 +151,8 @@ mod scratch_sqs_handler_run;
 // appended tail: both of those are where concurrently landing suites put their line, so a
 // declaration there loses a squash merge to every one of them, while these neighbouring
 // lines are stable.
+#[path = "all/execution_role_grant_withdrawal.rs"]
+mod execution_role_grant_withdrawal;
 #[path = "all/execution_role_resolution.rs"]
 mod execution_role_resolution;
 #[path = "all/function_aliases.rs"]
