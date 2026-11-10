@@ -154,12 +154,23 @@ fn official_lens_arn() -> String {
     )
 }
 
-/// The publication instant of the shipped official lens, in epoch seconds — how a
-/// restJson1 `Timestamp` travels.
+/// The instant the shipped official lens's summary reports as its last revision, in epoch
+/// seconds — how a restJson1 `Timestamp` travels. The instant it reports as its CREATION is
+/// the day AWS first published that lens, which its catalog entry states on its own.
 fn framework_published_epoch_seconds() -> f64 {
     state::framework_lens_published_at()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("the shipped lens was published after the Unix epoch")
+        .as_secs_f64()
+}
+
+/// The instant that lens's summary reports as its creation, in epoch seconds.
+fn framework_created_epoch_seconds() -> f64 {
+    state::official_lens(state::FRAMEWORK_LENS_ALIAS)
+        .expect("the framework lens is carried by the catalog")
+        .created_at()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("the shipped lens was created after the Unix epoch")
         .as_secs_f64()
 }
 
@@ -289,8 +300,8 @@ async fn the_catalog_reports_every_stored_lens_from_its_own_record() {
     );
     assert_eq!(
         timestamp(&official, "CreatedAt"),
-        Some(framework_published_epoch_seconds()),
-        "case \"official\": CreatedAt is the shipped version's publication instant, got {official:?}"
+        Some(framework_created_epoch_seconds()),
+        "case \"official\": CreatedAt is the day AWS first published the lens, got {official:?}"
     );
     assert_eq!(
         timestamp(&official, "UpdatedAt"),
@@ -384,7 +395,7 @@ async fn the_shipped_lens_version_and_its_publication_instant_name_the_same_day(
         "case \"shipped-lens-date\": expected the shipped lens version, got {official:?}"
     );
     assert_eq!(
-        timestamp(&official, "CreatedAt"),
+        timestamp(&official, "UpdatedAt"),
         Some(framework_published_epoch_seconds()),
         "case \"shipped-lens-date\": expected that version's publication instant, got {official:?}"
     );

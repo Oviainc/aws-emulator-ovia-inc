@@ -41,9 +41,23 @@
 //! Below each SPECIALISED lens, the pillars, questions and best practices are a question
 //! set written from that lens's published focus areas, under this emulator's own stable ids
 //! ([`super::bp`]), because AWS publishes those lenses' content in no machine-readable form
-//! the model or the service docs carry. [`SPECIALISED_LENS_VERSION`] is what every
-//! specialised entry reports as its `LensVersion`, and it names THIS catalog's revision of
-//! that content.
+//! the model or the service docs carry. A row whose published `LensVersion` is not one of
+//! those AWS states for the lens reports [`AUTHORED_CONTENT_REVISION`] instead, which names
+//! THIS catalog's revision of the question set it carries.
+//!
+//! ## Catalog METADATA is per lens
+//!
+//! A lens's description, the `LensVersion` its content is published at and the instants it
+//! was created and last revised are that lens's OWN published data, so every row states its
+//! own and nothing is shared across the catalog: a review of one lens cannot report
+//! another's version, and a lens AWS has revised reports an `UpdatedAt` later than its
+//! `CreatedAt` ([`OfficialLens::created_at`], [`OfficialLens::updated_at`]).
+//!
+//! The descriptions are the ones AWS's lens catalog publishes: the framework lens carries
+//! its own published sentence ([`super::FRAMEWORK_LENS_DESCRIPTION`]) and a specialised lens
+//! is described in the catalog's short form, `Best practices for <subject> workload` over the
+//! subject its `LensName` names — the form the Connected Mobility lens is published with. A
+//! test pins that form against each row's name, so a row cannot drift into prose of its own.
 //!
 //! The catalog is extensible by construction: adding a lens AWS publishes is adding a row
 //! here and its alias to [`super::AWS_OFFICIAL_LENS_ALIASES`].
@@ -102,16 +116,32 @@ pub const WELL_ARCHITECTED_PILLARS: &[(&str, &str)] = &[
     ("sustainability", "Sustainability"),
 ];
 
-/// The `LensVersion` every SPECIALISED AWS-official lens in this catalog reports: the
-/// revision of this emulator's content for those lenses.
+/// The `LensVersion` a catalog row reports when the version AWS publishes that lens's
+/// content at is not one this emulator carries: the revision of this emulator's own content
+/// for the lens.
 ///
-/// It names THIS catalog's content, not a version string AWS publishes (the model
-/// publishes none, and the lens content here is this emulator's own) — the same reading as
+/// It names THIS catalog's content, not a version string AWS publishes (the model publishes
+/// none, and such a lens's question set here is this emulator's own) — the same reading as
 /// [`super::FRAMEWORK_LENS_VERSION`], which names the revision of the framework lens's
-/// question set. A change to a specialised lens's questions changes it. `LensVersion` is
+/// question set. A change to that lens's questions changes it. `LensVersion` is
 /// `@length(min: 1, max: 32)` (`smithy_query(query="shape", shape="LensReview")`), and a
 /// date names a revision inside that.
-pub const SPECIALISED_LENS_VERSION: &str = "2025-01-15";
+pub const AUTHORED_CONTENT_REVISION: &str = "2025-01-15";
+
+/// The form AWS's lens catalog describes a SPECIALISED published lens in — `Best practices
+/// for <subject> workload`, the subject being what the lens's `LensName` names (the
+/// Connected Mobility lens is published as `Best practices for Connected Mobility
+/// workload`). Stated here as the two halves a row's `Description` is spelled from, so the
+/// catalog and the test that pins the form read the same words.
+pub const CATALOG_DESCRIPTION_PREFIX: &str = "Best practices for ";
+
+/// The tail of [`CATALOG_DESCRIPTION_PREFIX`]'s form.
+pub const CATALOG_DESCRIPTION_SUFFIX: &str = " workload";
+
+/// The suffix a specialised lens's `LensName` ends in, which the catalog's description form
+/// drops to name the lens's subject: `Connected Mobility Lens` is a lens about Connected
+/// Mobility.
+pub const LENS_NAME_SUFFIX: &str = " Lens";
 
 /// What this emulator knows ABOUT a lens, as a lens review reports it: the members that
 /// describe the LENS itself rather than the answers recorded against it.
@@ -135,11 +165,23 @@ pub struct OfficialLens {
     /// `LensSummary$LensName` / `LensReview$LensName` — the full name AWS publishes for
     /// the lens, which is what `ListLenses$LensName` selects on.
     pub name: &'static str,
-    /// `LensSummary$LensVersion` / `LensReview$LensVersion`: the revision of the content
-    /// below. A date, so [`Self::published_at`] can report the instant that version names.
+    /// `LensSummary$LensVersion` / `LensReview$LensVersion`: the day AWS published the
+    /// content this row carries, or [`AUTHORED_CONTENT_REVISION`] where this emulator's own
+    /// content stands in for it. A date, so [`Self::updated_at`] can report the instant that
+    /// version names.
     pub version: &'static str,
-    /// `LensSummary$Description` — what this lens asks about, within `LensDescription`'s
-    /// modelled 1..1024 characters (`smithy_query(query="shape", shape="LensSummary")`).
+    /// The day AWS FIRST published this lens, for a lens it has since revised, and `None`
+    /// for a lens this catalog carries at its first published version.
+    ///
+    /// `LensSummary$CreatedAt` is "The date and time when the lens was created", which for a
+    /// revised lens is earlier than the day the version it now carries was published: the
+    /// two instants are what tell a client the lens was ever revised, so a row that knows
+    /// them apart states them apart ([`Self::created_at`]).
+    pub first_published: Option<&'static str>,
+    /// `LensSummary$Description` — the description AWS's lens catalog publishes for this
+    /// lens, within `LensDescription`'s modelled 1..1024 characters
+    /// (`smithy_query(query="shape", shape="LensSummary")`). A specialised lens is published
+    /// in the catalog's short form (see this module's docs).
     pub description: &'static str,
     /// The questions this lens asks, in the lens's own order (pillar by pillar, in
     /// [`WELL_ARCHITECTED_PILLARS`] order): what `ListAnswers` lists and what every risk
@@ -194,13 +236,22 @@ impl OfficialLens {
     /// When the version this lens reports was published: midnight UTC of the day
     /// [`Self::version`] names.
     ///
-    /// `LensSummary$CreatedAt`/`UpdatedAt` are "The date and time when the lens was
-    /// created"/"last updated", and for a lens AWS publishes that is when the version this
-    /// emulator carries was published. Derived from the version rather than stored beside
-    /// it, so the two cannot name different days, and read from the version rather than
-    /// from the clock: a lens nobody changed must report the same instants to every caller.
-    pub fn published_at(&self) -> SystemTime {
+    /// `LensSummary$UpdatedAt` is "The date and time when the lens was last updated", and
+    /// for a lens AWS publishes that is when the version it carries was published. Derived
+    /// from the version rather than stored beside it, so the two cannot name different days,
+    /// and read from the version rather than from the clock: a lens nobody changed must
+    /// report the same instants to every caller.
+    pub fn updated_at(&self) -> SystemTime {
         midnight_utc(self.version)
+    }
+
+    /// When this lens was created: midnight UTC of the day [`Self::first_published`] names,
+    /// and of the version's own day for a lens that has never been revised.
+    ///
+    /// Never later than [`Self::updated_at`]: a lens is created before it is revised, which
+    /// is what makes the pair readable as "this lens was revised after it was published".
+    pub fn created_at(&self) -> SystemTime {
+        midnight_utc(self.first_published.unwrap_or(self.version))
     }
 
     /// The `LensSummary` `ListLenses` reports this lens as.
@@ -211,15 +262,14 @@ impl OfficialLens {
     /// ([`AWS_OFFICIAL_LENS_OWNER`]): AWS publishes the lens rather than an account owning
     /// it, which is the distinction [`is_aws_official_lens`] reads.
     pub fn summary(&self) -> LensSummary {
-        let published_at = ::aws_smithy_types::DateTime::from(self.published_at());
         LensSummary {
             lens_arn: Some(official_lens_arn(self.alias)),
             lens_alias: Some(self.alias.to_string()),
             lens_name: Some(self.name.to_string()),
             lens_type: Some(LENS_TYPE_AWS_OFFICIAL.to_string()),
             description: Some(self.description.to_string()),
-            created_at: Some(published_at),
-            updated_at: Some(published_at),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at())),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at())),
             lens_version: Some(self.version.to_string()),
             owner: Some(AWS_OFFICIAL_LENS_OWNER.to_string()),
             // AWS's own lenses are published content: their content IS the version they
@@ -338,9 +388,10 @@ pub fn framework_lens() -> &'static OfficialLens {
 }
 
 /// When the framework lens version this emulator carries was published — midnight UTC of
-/// the day [`super::FRAMEWORK_LENS_VERSION`] names.
+/// the day [`super::FRAMEWORK_LENS_VERSION`] names, which is the instant that lens's
+/// summary reports as its `UpdatedAt`.
 pub fn framework_lens_published_at() -> SystemTime {
-    framework_lens().published_at()
+    framework_lens().updated_at()
 }
 
 /// The AWS-official Well-Architected Framework lens, as this catalog carries it: the lens
@@ -351,6 +402,10 @@ pub const FRAMEWORK_LENS: OfficialLens = OfficialLens {
     alias: FRAMEWORK_LENS_ALIAS,
     name: FRAMEWORK_LENS_NAME,
     version: FRAMEWORK_LENS_VERSION,
+    // The framework lens is the one lens in the catalog AWS has published REVISIONS of: the
+    // day AWS's lens catalog reports it was created, which is well before the day the
+    // version it carries now was published.
+    first_published: Some("2019-09-13"),
     description: FRAMEWORK_LENS_DESCRIPTION,
     questions: FRAMEWORK_LENS_QUESTIONS,
 };
@@ -358,139 +413,115 @@ pub const FRAMEWORK_LENS: OfficialLens = OfficialLens {
 /// The AWS-official lenses this emulator publishes: the Well-Architected Framework lens
 /// and the specialised lenses AWS publishes beside it.
 ///
-/// The aliases and names are AWS's own (see this module's docs); the question sets are this
-/// emulator's content for those lenses, at [`SPECIALISED_LENS_VERSION`].
+/// The aliases, names, descriptions and — where AWS states one for the lens — the versions
+/// are AWS's own (see this module's docs); a row carrying no version of AWS's reports
+/// [`AUTHORED_CONTENT_REVISION`], the revision of this emulator's question set for it.
 pub const OFFICIAL_LENS_CATALOG: &[OfficialLens] = &[
     FRAMEWORK_LENS,
     OfficialLens {
         alias: "serverless",
         name: "Serverless Lens",
-        version: SPECIALISED_LENS_VERSION,
-        description: "The Serverless Lens covers how to design, deploy and \
-             operate serverless application workloads: the health of an event-driven \
-             application, access to its APIs, the request rates it regulates and the cost \
-             of the functions and managed services it is built from.",
+        // The day AWS publishes the Serverless lens at.
+        version: "2020-02-04",
+        first_published: None,
+        description: "Best practices for Serverless workload",
         questions: SERVERLESS_LENS_QUESTIONS,
     },
     OfficialLens {
         alias: "softwareasaservice",
         name: "SaaS Lens",
-        version: SPECIALISED_LENS_VERSION,
-        description: "The SaaS Lens covers how to design and operate a multi-tenant \
-             software-as-a-service application: onboarding and offboarding tenants, \
-             isolating tenant resources and data, keeping one tenant from affecting \
-             another, and attributing consumption and cost to the tenant that caused it.",
+        version: AUTHORED_CONTENT_REVISION,
+        first_published: None,
+        description: "Best practices for SaaS workload",
         questions: SAAS_LENS_QUESTIONS,
     },
     OfficialLens {
         alias: "iot",
         name: "IoT Lens",
-        version: SPECIALISED_LENS_VERSION,
-        description: "The IoT Lens covers how to design and operate Internet of Things \
-             workloads: provisioning device identity, authorizing what a device may \
-             publish, ingesting and processing telemetry from a fleet, operating through \
-             intermittent connectivity and delivering software updates to devices.",
+        version: AUTHORED_CONTENT_REVISION,
+        first_published: None,
+        description: "Best practices for IoT workload",
         questions: IOT_LENS_QUESTIONS,
     },
     OfficialLens {
         alias: "machinelearning",
         name: "Machine Learning Lens",
-        version: SPECIALISED_LENS_VERSION,
-        description: "The Machine Learning Lens covers the machine learning lifecycle: \
-             framing the business problem, preparing and versioning data, training and \
-             tuning models, deploying them reproducibly, and monitoring the quality of the \
-             predictions they make in production.",
+        version: AUTHORED_CONTENT_REVISION,
+        first_published: None,
+        description: "Best practices for Machine Learning workload",
         questions: MACHINE_LEARNING_LENS_QUESTIONS,
     },
     OfficialLens {
         alias: "dataanalytics",
         name: "Data Analytics Lens",
-        version: SPECIALISED_LENS_VERSION,
-        description: "The Data Analytics Lens covers how to design and operate analytics \
-             workloads: ingesting data reliably, cataloging and governing it, choosing the \
-             storage and query layer for the access pattern, and controlling what each \
-             query and each stored data set costs.",
+        version: AUTHORED_CONTENT_REVISION,
+        first_published: None,
+        description: "Best practices for Data Analytics workload",
         questions: ANALYTICS_LENS_QUESTIONS,
     },
     OfficialLens {
         alias: "financialservices",
         name: "Financial Services Industry Lens",
-        version: SPECIALISED_LENS_VERSION,
-        description: "The Financial Services Industry Lens covers the obligations a \
-             regulated financial institution's workloads carry: demonstrating compliance, \
-             protecting customer and transaction data, keeping critical business services \
-             available, and managing the third parties in their critical path.",
+        version: AUTHORED_CONTENT_REVISION,
+        first_published: None,
+        description: "Best practices for Financial Services Industry workload",
         questions: FINANCIAL_SERVICES_LENS_QUESTIONS,
     },
     OfficialLens {
         alias: "sap",
         name: "SAP Lens",
-        version: SPECIALISED_LENS_VERSION,
-        description: "The SAP Lens covers how to run an SAP landscape: sizing SAP systems \
-             from SAP's own figures, keeping their central services and databases highly \
-             available, backing them up and recovering them, and operating production and \
-             non-production systems at a cost the business accepts.",
+        version: AUTHORED_CONTENT_REVISION,
+        first_published: None,
+        description: "Best practices for SAP workload",
         questions: SAP_LENS_QUESTIONS,
     },
     OfficialLens {
         alias: "migration",
         name: "Migration Lens",
-        version: SPECIALISED_LENS_VERSION,
-        description: "The Migration Lens covers a migration to the cloud end to end: \
-             assessing the portfolio and choosing a strategy per application, migrating in \
-             waves, keeping data secure while it moves, validating and cutting over each \
-             workload, and right-sizing it once it runs in its target environment.",
+        version: AUTHORED_CONTENT_REVISION,
+        first_published: None,
+        description: "Best practices for Migration workload",
         questions: MIGRATION_LENS_QUESTIONS,
     },
     OfficialLens {
         alias: "genai",
         name: "Generative AI Lens",
-        version: SPECIALISED_LENS_VERSION,
-        description: "The Generative AI Lens covers how to build on foundation models: \
-             selecting and sizing a model, grounding its responses in your own data, \
-             evaluating the quality of what it generates, guarding prompts and responses, \
-             and controlling the cost of inference.",
+        version: AUTHORED_CONTENT_REVISION,
+        first_published: None,
+        description: "Best practices for Generative AI workload",
         questions: GENERATIVE_AI_LENS_QUESTIONS,
     },
     OfficialLens {
         alias: "healthcareindustry",
         name: "Healthcare Industry Lens",
-        version: SPECIALISED_LENS_VERSION,
-        description: "The Healthcare Industry Lens covers the obligations healthcare and \
-             life sciences workloads carry: protecting patient health information, meeting \
-             the regulations that govern its use, keeping clinical systems available to the \
-             people delivering care, and exchanging clinical data through interoperability \
-             standards.",
+        version: AUTHORED_CONTENT_REVISION,
+        first_published: None,
+        description: "Best practices for Healthcare Industry workload",
         questions: HEALTHCARE_LENS_QUESTIONS,
     },
     OfficialLens {
         alias: "connectedmobility",
         name: "Connected Mobility Lens",
-        version: SPECIALISED_LENS_VERSION,
-        description: "The Connected Mobility Lens covers how to design and operate \
-             connected vehicle workloads: onboarding vehicles and their identities, \
-             ingesting vehicle telemetry at fleet scale, protecting the personal data a \
-             vehicle produces, and delivering software to vehicles over the air.",
+        // The day AWS publishes the Connected Mobility lens at.
+        version: "2024-03-26",
+        first_published: None,
+        description: "Best practices for Connected Mobility workload",
         questions: CONNECTED_MOBILITY_LENS_QUESTIONS,
     },
     OfficialLens {
         alias: "devops",
         name: "DevOps Lens",
-        version: SPECIALISED_LENS_VERSION,
-        description: "The DevOps Lens covers how teams build and run software together: \
-             organizing delivery teams and their ownership, automating the path from commit \
-             to production, keeping environments reproducible, and learning from the \
-             operational signals a release produces.",
+        version: AUTHORED_CONTENT_REVISION,
+        first_published: None,
+        description: "Best practices for DevOps workload",
         questions: DEVOPS_LENS_QUESTIONS,
     },
     OfficialLens {
         alias: "games",
         name: "Games Industry Lens",
-        version: SPECIALISED_LENS_VERSION,
-        description: "The Games Industry Lens covers how to build and operate game \
-             workloads: running game servers and matchmaking for players, keeping player \
-             data and progression safe, scaling for a launch or an event, and operating \
-             live content at a cost each title can carry.",
+        version: AUTHORED_CONTENT_REVISION,
+        first_published: None,
+        description: "Best practices for Games Industry workload",
         questions: GAMES_LENS_QUESTIONS,
     },
 ];

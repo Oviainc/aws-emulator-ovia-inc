@@ -167,8 +167,9 @@ pub use trusted_advisor_checks::{
 
 pub use official_lenses::{
     framework_lens_published_at, lens_metadata, lens_pillars, lens_question, lens_question_count,
-    lens_questions, official_lens, LensMetadata, OfficialLens, OFFICIAL_LENS_CATALOG,
-    SPECIALISED_LENS_VERSION, WELL_ARCHITECTED_PILLARS,
+    lens_questions, official_lens, LensMetadata, OfficialLens, AUTHORED_CONTENT_REVISION,
+    CATALOG_DESCRIPTION_PREFIX, CATALOG_DESCRIPTION_SUFFIX, LENS_NAME_SUFFIX,
+    OFFICIAL_LENS_CATALOG, WELL_ARCHITECTED_PILLARS,
 };
 
 use crate::ops::types::{
@@ -271,15 +272,18 @@ pub const JIRA_INTEGRATION_NOT_CONFIGURED: &str = "NOT_CONFIGURED";
 /// (`smithy_query(query="shape", shape="LensAlias")`).
 pub const FRAMEWORK_LENS_ALIAS: &str = "wellarchitected";
 
-/// The `LensSummary$Description` of the AWS-official Well-Architected Framework lens —
-/// what that lens's question set ([`FRAMEWORK_LENS_QUESTIONS`]) asks
-/// about, within `LensDescription`'s modelled 1..1024 characters
-/// (`smithy_query(query="shape", shape="LensSummary")`). Catalog content rather than a
-/// stored value, so it lives beside the question set it describes, next to that lens's
-/// name and version ([`FRAMEWORK_LENS_NAME`], [`FRAMEWORK_LENS_VERSION`]).
-pub const FRAMEWORK_LENS_DESCRIPTION: &str = "The Amazon Web Services Well-Architected \
-     Framework provides a consistent approach for customers and partners to evaluate \
-     architectures, and implement designs that scale over time.";
+/// The `LensSummary$Description` of the AWS-official Well-Architected Framework lens: the
+/// description AWS's lens catalog publishes for it, within `LensDescription`'s modelled
+/// 1..1024 characters (`smithy_query(query="shape", shape="LensSummary")`).
+///
+/// The framework lens is the one lens AWS describes in prose of its own; every other
+/// published lens is described in the catalog's short form
+/// ([`official_lenses::CATALOG_DESCRIPTION_PREFIX`]). Catalog content rather than a stored
+/// value, so it lives beside the question set it describes, next to that lens's name and
+/// version ([`FRAMEWORK_LENS_NAME`], [`FRAMEWORK_LENS_VERSION`]).
+pub const FRAMEWORK_LENS_DESCRIPTION: &str = "The AWS Well-Architected Framework Lens \
+     provides a set of foundational questions for you to consider for all of your cloud \
+     architectures.";
 
 /// `LensSummary$LensStatus` for a lens whose current content no version has been
 /// published from.

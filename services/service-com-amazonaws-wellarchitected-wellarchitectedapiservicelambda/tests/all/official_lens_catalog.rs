@@ -314,34 +314,41 @@ async fn list_lenses_reports_every_aws_official_lens() {
             (DESCRIPTION_LENGTH.0..=DESCRIPTION_LENGTH.1).contains(&description.len()),
             "case {alias:?}: Description is @length{DESCRIPTION_LENGTH:?}, got {description:?}"
         );
-        // The description must describe THIS lens, so it names the lens — the framework
-        // lens's published description spells its name out in full ("Amazon Web Services"
-        // rather than "AWS"), so the subject rather than the exact `LensName` is what is
-        // looked for.
-        let subject = name.strip_prefix("AWS ").unwrap_or(name).to_lowercase();
-        assert!(
-            description.to_lowercase().contains(&subject),
-            "case {alias:?}: the description must describe THIS lens, got {description:?}"
+        // The description must describe THIS lens: a specialised lens is published in the
+        // catalog's short form over the subject its name names, and the framework lens
+        // carries the published sentence that names the framework itself.
+        let expected_description = match name.strip_suffix(state::LENS_NAME_SUFFIX) {
+            Some(subject) => format!(
+                "{}{subject}{}",
+                state::CATALOG_DESCRIPTION_PREFIX,
+                state::CATALOG_DESCRIPTION_SUFFIX
+            ),
+            None => state::FRAMEWORK_LENS_DESCRIPTION.to_string(),
+        };
+        assert_eq!(
+            description, expected_description,
+            "case {alias:?}: expected the catalog's description of this lens, got \
+             {description:?}"
         );
 
-        // `CreatedAt`/`UpdatedAt` are the instants the version this lens reports was
-        // published, so they name the same day the version does — one hand-written fact
-        // cannot drift from the other.
+        // `UpdatedAt` is the instant the version this lens reports was published, so it
+        // names the same day the version does — one hand-written fact cannot drift from the
+        // other — and `CreatedAt` is no later: a lens AWS has revised was created before the
+        // version it carries now.
         let created = summary.get("CreatedAt").and_then(Value::as_f64);
         let updated = summary.get("UpdatedAt").and_then(Value::as_f64);
-        assert_eq!(
-            created, updated,
-            "case {alias:?}: a lens nobody changed was created and updated at one instant, \
-             got {summary:?}"
+        assert!(
+            created.zip(updated).is_some_and(|(at, then)| at <= then),
+            "case {alias:?}: a lens is created no later than it is revised, got {summary:?}"
         );
-        let rendered = created
+        let rendered = updated
             .map(::aws_smithy_types::DateTime::from_secs_f64)
             .and_then(|at| at.fmt(::aws_smithy_types::date_time::Format::DateTime).ok())
             .unwrap_or_default();
         assert_eq!(
             rendered,
             format!("{version}T00:00:00Z"),
-            "case {alias:?}: CreatedAt must be midnight of the day {version:?} names, got \
+            "case {alias:?}: UpdatedAt must be midnight of the day {version:?} names, got \
              {rendered:?}"
         );
     }
@@ -919,16 +926,37 @@ async fn the_catalog_is_internally_consistent() {
             "case {case:?}: the questions must be grouped in the lens's pillar order"
         );
 
-        // The version names a day, and the instants the summary reports are that day's
-        // midnight — the two cannot drift apart.
-        let rendered = ::aws_smithy_types::DateTime::from(official.published_at())
+        // The version names a day, and the instant the summary reports as the lens's last
+        // revision is that day's midnight — the two cannot drift apart.
+        let rendered = ::aws_smithy_types::DateTime::from(official.updated_at())
             .fmt(::aws_smithy_types::date_time::Format::DateTime)
             .unwrap_or_default();
         assert_eq!(
             rendered,
             format!("{}T00:00:00Z", official.version),
-            "case {case:?}: the publication instant must be midnight of the day the version \
+            "case {case:?}: the revision instant must be midnight of the day the version \
              names, got {rendered:?}"
+        );
+
+        // And the lens was created no later than it was last revised: a row that names the
+        // day AWS first published the lens reports that day, and one that names none was
+        // created at the version it carries.
+        let created = ::aws_smithy_types::DateTime::from(official.created_at())
+            .fmt(::aws_smithy_types::date_time::Format::DateTime)
+            .unwrap_or_default();
+        assert_eq!(
+            created,
+            format!(
+                "{}T00:00:00Z",
+                official.first_published.unwrap_or(official.version)
+            ),
+            "case {case:?}: the creation instant must be midnight of the day the lens was \
+             first published, got {created:?}"
+        );
+        assert!(
+            official.created_at() <= official.updated_at(),
+            "case {case:?}: a lens is created no later than it is revised, got \
+             {created:?} and {rendered:?}"
         );
 
         // A lens is the same lens however a request names it: alias, ARN, version-pinned

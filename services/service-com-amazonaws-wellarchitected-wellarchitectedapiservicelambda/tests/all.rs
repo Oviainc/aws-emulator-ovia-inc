@@ -97,6 +97,8 @@ mod milestone_name_uniqueness;
 mod no_op_updates;
 #[path = "all/official_lens_catalog.rs"]
 mod official_lens_catalog;
+#[path = "all/official_lens_catalog_metadata.rs"]
+mod official_lens_catalog_metadata;
 #[path = "all/profile_deletion.rs"]
 mod profile_deletion;
 #[path = "all/profile_lifecycle.rs"]
@@ -338,11 +340,11 @@ mod check_best_practice_agreement;
 mod lens_content_validation;
 #[path = "all/lens_catalog_identity.rs"]
 mod lens_catalog_identity;
+#[path = "all/lens_review_report.rs"]
+mod lens_review_report;
 #[path = "all/cleared_answer_risk.rs"]
 mod cleared_answer_risk;
 #[path = "all/submitted_name_conflict_echo.rs"]
 mod submitted_name_conflict_echo;
 #[path = "all/enum_refusal_wording.rs"]
 mod enum_refusal_wording;
-#[path = "all/lens_review_report.rs"]
-mod lens_review_report;

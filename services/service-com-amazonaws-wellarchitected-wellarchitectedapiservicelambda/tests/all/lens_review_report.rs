@@ -50,15 +50,17 @@ const FRAMEWORK_LENS_VERSION: &str = "2025-02-25";
 /// numbering (OPS 1-11, SEC 1-11, REL 1-13, PERF 1-5, COST 1-11, SUS 1-6).
 const FRAMEWORK_QUESTIONS: i64 = 11 + 11 + 13 + 5 + 11 + 6;
 
-/// The version every SPECIALISED AWS-official lens in this emulator's catalog is published
-/// at (`state::official_lenses::SPECIALISED_LENS_VERSION`), with two of those lenses and
-/// the names the catalog gives them — rows the issue this suite was written for cited
-/// neither of.
-const SPECIALISED_LENS_VERSION: &str = "2025-01-15";
+/// The version this emulator's catalog publishes two SPECIALISED AWS-official lenses at,
+/// and the names the catalog gives them — rows the issue this suite was written for cited
+/// neither of. The Serverless lens is published at a version of AWS's own; the SAP lens's
+/// row carries this emulator's content revision
+/// (`state::official_lenses::AUTHORED_CONTENT_REVISION`).
 const SERVERLESS_LENS: &str = "serverless";
 const SERVERLESS_LENS_NAME: &str = "Serverless Lens";
+const SERVERLESS_LENS_VERSION: &str = "2020-02-04";
 const SAP_LENS: &str = "sap";
 const SAP_LENS_NAME: &str = "SAP Lens";
+const SAP_LENS_VERSION: &str = "2025-01-15";
 
 /// A lens alias AWS publishes that this emulator's AWS-official catalog carries no content
 /// for, so it is organized into no pillars and asks nothing here: a review of it reports no
@@ -364,14 +366,14 @@ async fn every_lens_review_is_reported_as_a_document_derived_from_it() {
             lens: SERVERLESS_LENS.to_string(),
             lens_arn: official_lens_arn(REGION, SERVERLESS_LENS),
             lens_name: Some(SERVERLESS_LENS_NAME),
-            lens_version: Some(SPECIALISED_LENS_VERSION.to_string()),
+            lens_version: Some(SERVERLESS_LENS_VERSION.to_string()),
         },
         Row {
             case: "another-specialised-official-lens",
             lens: SAP_LENS.to_string(),
             lens_arn: official_lens_arn(REGION, SAP_LENS),
             lens_name: Some(SAP_LENS_NAME),
-            lens_version: Some(SPECIALISED_LENS_VERSION.to_string()),
+            lens_version: Some(SAP_LENS_VERSION.to_string()),
         },
         Row {
             case: "official-lens-without-content",

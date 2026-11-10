@@ -56,7 +56,7 @@ pub const PROFILE_TEMPLATE_NAME: &str = "Default Profile Template";
 /// `ProfileTemplate$CreatedAt`/`$UpdatedAt` are when the template was created and last
 /// updated, and for content the SERVICE publishes that is when the revision a caller reads
 /// was published ([`profile_template_published_at`]) — the same reading as
-/// [`super::official_lenses::SPECIALISED_LENS_VERSION`] for a published lens. A change to
+/// [`super::official_lenses::AUTHORED_CONTENT_REVISION`] for a published lens. A change to
 /// the questions below changes it. Read from here rather than from the clock: a template
 /// nobody can revise must report the same instants to every caller.
 pub const PROFILE_TEMPLATE_REVISION: &str = "2025-01-15";
