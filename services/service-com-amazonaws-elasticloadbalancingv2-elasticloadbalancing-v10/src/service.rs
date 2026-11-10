@@ -94,6 +94,8 @@ pub mod lambda_target;
 
 pub mod web_acl;
 
+pub mod listener_socket;
+
 pub mod management_events;
 
 use service_common::audited_operation::AuditedDefinition;

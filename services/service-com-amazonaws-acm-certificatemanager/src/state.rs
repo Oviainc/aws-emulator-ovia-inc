@@ -2183,6 +2183,40 @@ pub fn certificate_association_directory<Eng: Send + Sync + 'static>(
         )
 }
 
+/// The SHARED certificate key-material directory in the shared engine: call it with a
+/// handler's `&*self.engine`.
+///
+/// A certificate this service holds is PRESENTED by another service — a load balancer
+/// listener terminates a connection with it — and the handshake that service runs needs
+/// the certificate's own bytes and the private key that matches them, which only a caller
+/// that imports key material brings. Those are held in ONE directory under one shared type
+/// ([`::service_common::acm_certificate_key_material::CertificateKeyMaterialDirectory`]),
+/// written here and read by the presenting service; the engine keys state by TYPE, so a
+/// copy of its own inside [`ComAmazonawsAcmCertificatemanagerState`] would be invisible to
+/// the reader.
+///
+/// LOCK ORDER: a writer takes [`service_state`] first and this directory second, and
+/// nothing holds this one while taking another store, so the order cannot invert.
+///
+/// Answer `None` by leaving the directory unwritten: the material is an aid to the service
+/// that presents the certificate, never part of this operation's own answer, so an engine
+/// carrying no directory still serves the call.
+pub fn certificate_key_material_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<
+        ::service_common::acm_certificate_key_material::CertificateKeyMaterialDirectory,
+    >,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::acm_certificate_key_material::CertificateKeyMaterialDirectory,
+            >,
+        )
+}
+
 /// The region to mint ARNs in: the one the caller signed for, else [`DEFAULT_REGION`].
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)

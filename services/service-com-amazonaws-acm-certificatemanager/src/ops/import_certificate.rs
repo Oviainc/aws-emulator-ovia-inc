@@ -298,6 +298,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // certificate itself decides is replaced. The resources using it are no part
             // of the record at all — they are keyed by this ARN in the shared
             // association directory, so they survive a reimport untouched.
+            // The material the certificate is SERVED from, taken before the record
+            // consumes the import: a reimport replaces what a presenting service
+            // terminates a connection with, exactly as it replaces the certificate.
+            let material = serving_material(&imported, &input);
             let replaced = imported.record(target.to_string(), existing.tags.clone(), now);
             *existing = crate::state::Certificate {
                 options: existing.options.clone(),
@@ -305,8 +309,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 exported: existing.exported,
                 ..replaced
             };
+            let target = target.to_string();
+            drop(store);
+            record_serving_material(&*self.engine, &target, material);
             return Ok(ImportCertificateOutput {
-                certificate_arn: Some(target.to_string()),
+                certificate_arn: Some(target),
             });
         }
 
@@ -361,12 +368,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let certificate_id = uuid::Uuid::new_v4().to_string();
         let arn = crate::state::certificate_arn(&region, &certificate_id);
+        // The material the certificate is SERVED from, taken before the record consumes
+        // the import.
+        let material = serving_material(&imported, &input);
         let certificate = imported.record(arn.clone(), tags, now);
         store.certificates.insert(arn.clone(), certificate);
+        drop(store);
+        record_serving_material(&*self.engine, &arn, material);
 
         Ok(ImportCertificateOutput {
             certificate_arn: Some(arn),
         })
+    }
+}
+
+/// What the certificate this import brings in is SERVED from, for the service that
+/// PRESENTS it on a connection: the leaf and the chain as the request carried them, the
+/// private key that matches the leaf, and the names the certificate covers.
+///
+/// The key is read here and nowhere else in this operation: it is held in memory for the
+/// certificate's lifetime so a handshake can be run with it, and is written to no file,
+/// named in no log and reported in no response.
+fn serving_material(
+    imported: &ImportedCertificate,
+    input: &ImportCertificateInput,
+) -> ::service_common::acm_certificate_key_material::CertificateKeyMaterial {
+    ::service_common::acm_certificate_key_material::CertificateKeyMaterial {
+        certificate_pem: imported.body.clone(),
+        certificate_chain_pem: imported.chain.clone(),
+        // The private key the request carried, held as it arrived apart from its line
+        // endings — the same reading the certificate's own body is stored under. It has
+        // already been held to "The private key must be unencrypted" and to matching the
+        // certificate's public key ([`check_private_key`]), so what is recorded here is
+        // material that can actually complete a handshake for this certificate.
+        private_key_pem: ::std::str::from_utf8(&input.private_key)
+            .map(stored_pem)
+            .unwrap_or_default(),
+        domain_names: imported.subject_alternative_names.clone(),
+    }
+}
+
+/// Record the serving material of `certificate_arn` in the shared directory the
+/// presenting service reads ([`crate::state::certificate_key_material_directory`]).
+///
+/// Called with this service's own store already released, which is the lock order that
+/// directory documents. An engine carrying no directory leaves the material unrecorded:
+/// it is an aid to the service that presents the certificate, never part of this
+/// operation's answer.
+fn record_serving_material<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
+    certificate_arn: &str,
+    material: ::service_common::acm_certificate_key_material::CertificateKeyMaterial,
+) {
+    if let Some(directory) = crate::state::certificate_key_material_directory(engine) {
+        directory.lock().record(certificate_arn, material);
     }
 }
 

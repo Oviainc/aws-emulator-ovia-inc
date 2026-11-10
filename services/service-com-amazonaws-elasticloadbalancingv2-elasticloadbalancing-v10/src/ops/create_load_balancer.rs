@@ -20,7 +20,9 @@
 //! already exists.
 //!
 //! What the create itself fills: the ARN and the `DNSName` the load balancer publishes —
-//! composed in the form its FAMILY publishes
+//! the `host:port` of the socket this emulator opens for an Application Load Balancer
+//! ([`crate::state::open_load_balancer_endpoint`]), which is the address a client that
+//! honours that name can actually reach it at, and otherwise the form its FAMILY publishes
 //! ([`crate::state::load_balancer_dns_name`]) — and, for an Application Load Balancer a
 //! request names no `SecurityGroups` for, the default security group of the VPC it is
 //! placed in ([`starting_security_groups`]).
@@ -482,6 +484,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             listener_arns: Vec::new(),
         };
 
+        // The ADDRESS this load balancer answers on, opened BEFORE the store is locked
+        // because opening a socket is asynchronous. A family whose traffic this emulator
+        // serves gets one and publishes it; any other keeps the name Elastic Load
+        // Balancing's own zone would carry, because a port that answered nothing would be
+        // worse than a name. A create this request goes on to refuse drops the handle,
+        // which closes the port again.
+        let endpoint = match family {
+            crate::state::LoadBalancerFamily::Application => {
+                crate::state::open_load_balancer_endpoint(&*self.engine, ctx.callback().clone())
+                    .await
+            }
+            _ => None,
+        };
+
         let mut guard = state.lock();
         guard.settle(now);
 
@@ -530,13 +546,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &format!("loadbalancer/{type_code}/{}/{id}", candidate.name),
         );
-        candidate.dns_name = crate::state::load_balancer_dns_name(
-            &candidate.name,
-            &candidate.scheme,
-            family,
-            &guard.dns_id(family, &id),
-            &region,
-        );
+        candidate.dns_name = match &endpoint {
+            // The address the socket this create opened answers on: a client that dials
+            // what this load balancer published reaches this load balancer.
+            Some(endpoint) => endpoint.authority().to_string(),
+            None => crate::state::load_balancer_dns_name(
+                &candidate.name,
+                &candidate.scheme,
+                family,
+                &guard.dns_id(family, &id),
+                &region,
+            ),
+        };
         candidate.id = id;
         // A load balancer is reached at an ADDRESS inside each subnet it is attached to, and
         // those addresses belong to elastic network interfaces of the account's EC2
@@ -550,6 +571,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .insert(candidate.name.clone(), candidate.arn.clone());
         let arn = candidate.arn.clone();
         guard.load_balancers.insert(arn.clone(), candidate);
+        // The socket now has a load balancer to serve, and its handle is held for as long
+        // as that load balancer is: dropping it closes the port.
+        if let Some(endpoint) = endpoint {
+            endpoint.serves(&arn);
+            guard.load_balancer_endpoints.insert(arn.clone(), endpoint);
+        }
         let stored = guard
             .load_balancers
             .get(&arn)

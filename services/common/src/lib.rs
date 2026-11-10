@@ -64,6 +64,11 @@
 //!   certificate — written by the service that owns the referencing resource (a custom
 //!   domain name, a listener) and read by ACM, which cannot see those resources and yet
 //!   has to report them and refuse to delete or revoke a certificate while one remains;
+//! * [`acm_certificate_key_material`], the SERVING material of an ACM certificate — the
+//!   leaf, its chain and the private key that matches it — written by ACM when a caller
+//!   imports key material into it and read by the service that TERMINATES a connection
+//!   presenting that certificate (a load balancer listener), which cannot see ACM's store
+//!   and cannot run a handshake without the certificate's own bytes and its key;
 //! * [`iot_job_executions`], the IoT job-execution store the IoT control plane writes
 //!   (a job targets a thing) and the IoT Jobs data plane reads and updates (the device
 //!   polls, starts and reports);
@@ -264,6 +269,10 @@ pub mod rds_event_source_types;
 /// The directory of which resources of the other services reference an ACM certificate,
 /// written by the service that owns the referencing resource and read by ACM.
 pub mod acm_certificate_associations;
+/// The serving material of an ACM certificate — the leaf, its chain and the private key
+/// that matches it — written by ACM when a caller imports key material into it and read by
+/// the service that TERMINATES a connection presenting that certificate.
+pub mod acm_certificate_key_material;
 /// The inventory of which Active Directory directories the account holds, written by the
 /// AWS Directory Service control plane — which creates and deletes them — and read by the
 /// Directory Service DATA plane, which serves the objects inside a directory and creates

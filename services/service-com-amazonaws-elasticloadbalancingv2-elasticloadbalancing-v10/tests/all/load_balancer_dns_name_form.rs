@@ -2,29 +2,31 @@
 
 //! The host a load balancer publishes as its `DNSName`, over the wire.
 //!
-//! One rule: the host is composed in the form Elastic Load Balancing publishes for the
-//! FAMILY the load balancer belongs to, and the family decides all three ways the two
-//! forms differ — the label order, the id beside the name, and whether an internal load
-//! balancer's scheme shows in it:
+//! One rule: the value is the address a client that honours it reaches the load balancer
+//! AT, and the FAMILY decides what that is:
 //!
-//! * an Application Load Balancer publishes
-//!   `[internal-]<name>-<decimal id>.<region>.elb.amazonaws.com`
-//!   (`my-load-balancer-1234567890.us-west-2.elb.amazonaws.com`), whose id is minted for
-//!   the host alone — its ARN carries another;
-//! * a Network or Gateway Load Balancer publishes
+//! * an Application Load Balancer — the family whose listeners this emulator serves traffic
+//!   for — publishes the `host:port` of the socket the emulator opened for it, an address a
+//!   client on this machine can dial;
+//! * a Network or Gateway Load Balancer has no traffic served here, so it keeps the host
+//!   Elastic Load Balancing's own zone gives it:
 //!   `<name>-<hexadecimal id>.elb.<region>.amazonaws.com`
 //!   (`my-network-load-balancer-1234567890abcdef.elb.us-west-2.amazonaws.com`), whose id
-//!   is the very one its ARN carries, and whose host states its scheme nowhere.
+//!   is the very one its ARN carries, and whose host states its scheme nowhere — a port
+//!   that answered nothing would be worse than a name.
 //!
 //! The rows span what the rule generalises over: every family the model's
 //! `LoadBalancerTypeEnum` names, both schemes its `LoadBalancerSchemeEnum` names, names of
-//! different shapes, and two Regions — the Region and the family are exactly what the form
-//! is keyed on. Every assertion is made on what a later `DescribeLoadBalancers` reports as
-//! well as on what the create answered, and no row asserts a literal id: the id is minted,
-//! so what is under test is its FORM and that the two reads agree on it.
+//! different shapes, and two Regions — the Region and the family are exactly what the
+//! published value is keyed on. Every assertion is made on what a later
+//! `DescribeLoadBalancers` reports as well as on what the create answered, and no row
+//! asserts a literal id or port: both are assigned, so what is under test is the FORM and
+//! that the two reads agree on it.
 //!
 //! The wire harness (`emulator`, `call_in_region`, `action`, `p`) comes from
-//! `provisioning_loop`; nothing here restates it.
+//! `provisioning_loop`; nothing here restates it. That a published address really ANSWERS —
+//! a client dialling it, completing the handshake and being served — is
+//! `alb_https_listener_tls.rs`; what this suite holds is the FORM each family publishes.
 
 use crate::provisioning_loop::{action, call_in_region, emulator, p, Reply};
 use smithy_server_runtime::MultiServiceRouter;
@@ -32,10 +34,6 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The two Regions the rows run in: the one every other suite signs for, and a second one,
 /// so a host that hard-coded a Region would fail a row.
 const REGIONS: [&str; 2] = ["us-west-2", "eu-west-1"];
-
-/// How many decimal digits an Application Load Balancer's published id has
-/// (`my-load-balancer-1234567890.us-west-2.elb.amazonaws.com`).
-const DECIMAL_ID_DIGITS: usize = 10;
 
 /// How many hexadecimal digits the id a Network or Gateway Load Balancer publishes has: the
 /// width of the id its own ARN carries.
@@ -113,78 +111,66 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// The host the published form says a load balancer of `row` in `region` must have, split
-/// into the text before the id, the id's own rule, and the text after it.
-struct Published {
-    /// Everything the host carries before the minted id, including the trailing hyphen.
-    head: String,
-    /// Everything it carries after the id.
-    tail: String,
-    /// How many characters the id has.
-    digits: usize,
-    /// Whether the id is hexadecimal (a Network or Gateway Load Balancer's) rather than
-    /// decimal (an Application Load Balancer's).
-    hexadecimal: bool,
+/// What the `DNSName` of a load balancer of `row` in `region` must be.
+enum Published {
+    /// An address a client on this machine can DIAL: the `host:port` of the socket this
+    /// emulator opened for the load balancer.
+    Dialable,
+    /// A host under Elastic Load Balancing's own zone, split into the text before the id,
+    /// the id's own rule, and the text after it.
+    Zone {
+        /// Everything the host carries before the id, including the trailing hyphen.
+        head: String,
+        /// Everything it carries after the id.
+        tail: String,
+        /// How many characters the id has.
+        digits: usize,
+    },
 }
 
 impl Published {
-    /// The form for `row` in `region`.
+    /// The published value for `row` in `region`.
     fn of(row: &Row, region: &str) -> Self {
         match row.lb_type {
-            "application" => {
-                // An internal Application Load Balancer's host states its scheme.
-                let prefix = if row.scheme == "internal" {
-                    "internal-"
-                } else {
-                    ""
-                };
-                Self {
-                    head: format!("{prefix}{}-", row.name),
-                    tail: format!(".{region}.elb.amazonaws.com"),
-                    digits: DECIMAL_ID_DIGITS,
-                    hexadecimal: false,
-                }
-            }
+            // The family whose traffic this emulator serves answers on a socket of its own,
+            // and publishes that socket's address.
+            "application" => Self::Dialable,
             // A Network or Gateway Load Balancer's host states its scheme nowhere, whatever
             // the scheme is.
-            _ => Self {
+            _ => Self::Zone {
                 head: format!("{}-", row.name),
                 tail: format!(".elb.{region}.amazonaws.com"),
                 digits: HEX_ID_DIGITS,
-                hexadecimal: true,
             },
         }
     }
 
-    /// The id `host` carries, or an explanation of how it breaks this form.
-    fn id_of(&self, host: &str) -> Result<String, String> {
-        let id = host
-            .strip_prefix(&self.head)
-            .ok_or_else(|| format!("expected the host to start with {:?}", self.head))?
-            .strip_suffix(&self.tail)
-            .ok_or_else(|| format!("expected the host to end with {:?}", self.tail))?;
-        if id.len() != self.digits {
-            return Err(format!(
-                "expected an id of {} characters, got {id:?}",
-                self.digits
-            ));
-        }
-        let well_formed = if self.hexadecimal {
-            id.chars().all(|c| c.is_ascii_hexdigit())
-        } else {
-            // A decimal id of the published width: digits only, and not one the service
-            // padded out of a shorter number.
-            id.chars().all(|c| c.is_ascii_digit()) && !id.starts_with('0')
+    /// The id `host` carries, or an explanation of how it breaks this form. `None` for a
+    /// published address, which carries no id at all — it carries a port.
+    fn id_of(&self, host: &str) -> Result<Option<String>, String> {
+        let (head, tail, digits) = match self {
+            Self::Dialable => {
+                return match host.parse::<std::net::SocketAddr>() {
+                    Ok(_) => Ok(None),
+                    Err(error) => Err(format!(
+                        "expected an address a client can dial, got {host:?} ({error})"
+                    )),
+                };
+            }
+            Self::Zone { head, tail, digits } => (head, tail, *digits),
         };
-        if !well_formed {
-            let kind = if self.hexadecimal {
-                "hexadecimal"
-            } else {
-                "decimal"
-            };
-            return Err(format!("expected a {kind} id, got {id:?}"));
+        let id = host
+            .strip_prefix(head)
+            .ok_or_else(|| format!("expected the host to start with {head:?}"))?
+            .strip_suffix(tail)
+            .ok_or_else(|| format!("expected the host to end with {tail:?}"))?;
+        if id.len() != digits {
+            return Err(format!("expected an id of {digits} characters, got {id:?}"));
         }
-        Ok(id.to_string())
+        if !id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("expected a hexadecimal id, got {id:?}"));
+        }
+        Ok(Some(id.to_string()))
     }
 }
 
@@ -213,8 +199,10 @@ async fn create(router: &MultiServiceRouter, region: &str, row: &Row) -> Reply {
     reply
 }
 
-/// The host a load balancer publishes follows the form of its FAMILY, in whichever Region
-/// it was created, and a later read reports the same host.
+/// The value a load balancer publishes as its `DNSName` is the address a client reaches it
+/// at: a dialable address for the family this emulator serves traffic for, and the host its
+/// own zone gives it for the families it does not — in whichever Region it was created, with
+/// a later read reporting the same value.
 #[tokio::test]
 async fn the_published_host_follows_the_form_of_its_family() {
     // Every host seen, so no two load balancers publish the same one.
@@ -237,21 +225,13 @@ async fn the_published_host_follows_the_form_of_its_family() {
                 .unwrap_or_else(|why| panic!("case {:?} in {region}: {why}, host {host:?}", row.case));
 
             // A Network or Gateway Load Balancer publishes the very id its ARN carries; an
-            // Application Load Balancer publishes a decimal id of its own, which its ARN
-            // does not carry.
+            // Application Load Balancer publishes an address, which carries no id at all.
             let arn_id = arn.rsplit('/').next().unwrap_or_default().to_string();
-            if published.hexadecimal {
+            if let Some(id) = id {
                 assert_eq!(
                     id, arn_id,
                     "case {:?} in {region}: expected the host to carry the ARN's own id, \
                      host {host:?} arn {arn}",
-                    row.case
-                );
-            } else {
-                assert_ne!(
-                    id, arn_id,
-                    "case {:?} in {region}: an application load balancer's host carries a \
-                     decimal id of its own, host {host:?} arn {arn}",
                     row.case
                 );
             }

@@ -110,6 +110,17 @@ use ::service_common::data_plane_addressing::{
 /// the `arnNamespace`/`endpointPrefix` both Elastic Load Balancing models publish.
 const DATA_PLANE_SEGMENT: &str = "elasticloadbalancing";
 
+/// The PREFIXED PATH-STYLE address of one load balancer's plane:
+/// `/_aws/elasticloadbalancing/{dns-name-or-name}`, which a request path follows.
+///
+/// The one place that addressing is WRITTEN, beside [`prefixed_addressing`], which is the
+/// one place it is read: the socket a load balancer's own address is served on
+/// ([`super::listener_socket`]) hands the request it accepts to this plane under it, so the
+/// two cannot drift on how a plane is named.
+pub fn data_plane_path(named: &str) -> String {
+    format!("/{EMULATOR_PATH_NAMESPACE}/{DATA_PLANE_SEGMENT}/{named}")
+}
+
 /// The protocols whose listeners have rules to evaluate and a response to render — the
 /// two `ProtocolEnum` values an Application Load Balancer's listeners carry.
 const HTTP_PROTOCOLS: &[&str] = &["HTTP", "HTTPS"];
@@ -362,11 +373,11 @@ fn resolve<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) 
     let host = addressed.host.map(host_only);
 
     // HOST-STYLE: the published `DNSName` itself.
-    if let Some(host) = host {
+    if let Some(addressed_authority) = addressed.host {
         if let Some(record) = store
             .load_balancers
             .values()
-            .find(|record| record.dns_name.eq_ignore_ascii_case(host))
+            .find(|record| addresses_published_name(&record.dns_name, addressed_authority))
         {
             return resolved(&store, record, addressed.path);
         }
@@ -457,6 +468,23 @@ fn resolved(store: &ElbState, record: &LoadBalancerRecord, path: &str) -> Option
 fn serves_http(store: &ElbState, record: &LoadBalancerRecord) -> bool {
     record.family() == LoadBalancerFamily::Application
         && listener_addressed(store, record, None).is_some()
+}
+
+/// Whether the authority a request ADDRESSED is the name a load balancer published.
+///
+/// A load balancer publishes one of two kinds of `DNSName`, and each is addressed by what
+/// it states: the `host:port` of the socket this emulator opened for it names the PORT it
+/// answers on, so a request addresses it by the whole authority — the emulator's own
+/// endpoint is on the same host at another port, and matching the host alone would take
+/// every request to that endpoint away from the service it was meant for — while a name
+/// under Elastic Load Balancing's own zone states no port, so a request addresses it by the
+/// host alone, whichever of the load balancer's listener ports it dialled. Both are read
+/// case-insensitively, as a DNS name compares.
+fn addresses_published_name(dns_name: &str, addressed: &str) -> bool {
+    if addressed_port(Some(dns_name)).is_some() {
+        return dns_name.eq_ignore_ascii_case(addressed);
+    }
+    dns_name.eq_ignore_ascii_case(host_only(addressed))
 }
 
 /// The load balancer `named` names, by its DNS name or by its own name, both read

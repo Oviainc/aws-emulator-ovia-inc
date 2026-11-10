@@ -230,6 +230,30 @@ struct PolicyEntry {
     load_balancer_types: &'static [&'static str],
 }
 
+/// The security policy a new HTTPS or TLS listener negotiates under when the request names
+/// none: the first entry of the catalogue below, which is "the default policy for a new
+/// HTTPS or TLS listener".
+pub const DEFAULT_SSL_POLICY: &str = "ELBSecurityPolicy-2016-08";
+
+/// The `SslProtocol` versions the predefined policy `name` negotiates, out of the published
+/// catalogue — the versions a listener set to that policy may complete a handshake under.
+///
+/// `None` for a name no predefined policy carries, which is a policy this service publishes
+/// no protocol list for; the caller decides what to do with a listener configured that way
+/// rather than being handed a list that is not the policy's.
+///
+/// The catalogue is the ONE place the published policies live
+/// ([`POLICY_CATALOGUE`]), so the socket a listener terminates TLS on
+/// (`crate::service::listener_socket`) negotiates under exactly the versions
+/// `DescribeSSLPolicies` reports for it.
+#[must_use]
+pub fn policy_ssl_protocols(name: &str) -> Option<&'static [&'static str]> {
+    POLICY_CATALOGUE
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.ssl_protocols)
+}
+
 impl PolicyEntry {
     /// This entry as the modelled `SslPolicy`.
     fn to_shape(&self) -> SslPolicy {

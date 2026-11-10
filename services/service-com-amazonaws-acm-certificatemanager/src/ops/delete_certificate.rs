@@ -268,6 +268,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.remove_certificate(&input.certificate_arn);
+        drop(associations);
+        drop(store);
+        // The key material a presenting service terminates connections with belongs to the
+        // certificate: once the certificate is gone there is nothing left to present it
+        // for, so the shared directory forgets it rather than holding a key for a resource
+        // that no longer exists ([`crate::state::certificate_key_material_directory`]).
+        if let Some(material) = crate::state::certificate_key_material_directory(&*self.engine) {
+            material.lock().forget(&input.certificate_arn);
+        }
         Ok(DeleteCertificateOutput)
     }
 }

@@ -89,6 +89,14 @@ pub mod cascaded_releases;
 
 pub use cascaded_releases::CascadedReleases;
 
+/// The ADDRESS a load balancer publishes as its `DNSName`, and the socket of this
+/// emulator's own that answers there.
+pub mod load_balancer_endpoint;
+
+pub use load_balancer_endpoint::{
+    certificate_key_material_directory, open_load_balancer_endpoint, LoadBalancerEndpoint,
+};
+
 use crate::ops::types::{
     Action, AvailabilityZone, Certificate, ForwardActionConfig, IpamPools, Listener,
     ListenerAttribute, LoadBalancer, LoadBalancerAddress, LoadBalancerAttribute, LoadBalancerState,
@@ -4356,6 +4364,12 @@ pub struct ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     /// got to, and the one clock that advances them ([`host_counts`]). A series per pair
     /// being checked, so it does not grow with the number of calls either.
     pub host_counts: HostCountPublisher,
+    /// The ADDRESS each load balancer answers on, by load balancer ARN: the socket of this
+    /// emulator's own whose `host:port` the load balancer publishes as its `DNSName`
+    /// ([`LoadBalancerEndpoint`]). One entry per load balancer that serves traffic of its
+    /// own, so it is bounded by the load balancer quota the create enforces; dropping an
+    /// entry closes the port and severs every connection in flight on it.
+    pub load_balancer_endpoints: HashMap<String, LoadBalancerEndpoint>,
 }
 
 impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
@@ -4625,6 +4639,10 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
             return false;
         };
         self.name_to_lb_arn.remove(&removed.name);
+        // The ADDRESS it answered on goes with it: dropping the handle closes the port and
+        // severs every connection in flight on it, so nothing is listening on the name a
+        // deleted load balancer published ([`LoadBalancerEndpoint`]).
+        self.load_balancer_endpoints.remove(arn);
         for listener_arn in &removed.listener_arns {
             if let Some(listener) = self.listeners.remove(listener_arn) {
                 for rule in &listener.rules {
