@@ -616,7 +616,7 @@ async fn restoring_an_unknown_snapshot_is_refused_and_creates_no_cluster() {
         );
         assert_eq!(
             response["resourceType"].as_str(),
-            Some("ClusterSnapshot"),
+            Some("Snapshot"),
             "case {form:?}: resourceType must be the AWS resource type name of the \
              resource this operation addresses, got {response}"
         );

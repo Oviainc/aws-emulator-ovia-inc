@@ -40,7 +40,13 @@
 //!
 //! Nothing else about a response changes: the status, the body and every other header stay
 //! as the renderer wrote them, and a success keeps every byte.
+//!
+//! Those same two layers are where the other response header this service's wire carries is
+//! completed — the media type a JSON payload is announced with
+//! ([`super::json_media_type`]) — so [`answered`] composes the two and each layer applies
+//! that one function.
 
+use super::json_media_type::{announced_media_type, with_json_media_type};
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use smithy_server_runtime::{
     BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, OperationRoutingTable,
@@ -112,6 +118,20 @@ pub fn with_error_type_locator(mut resp: RtResponse, locator: &str) -> RtRespons
     resp
 }
 
+/// `resp` as this service ANSWERS `req`: the two completions of a response this service
+/// owns, applied together at every layer a response passes through.
+///
+/// Each is its own concern and lives in its own module — the error shape's locator here,
+/// the media type a JSON payload is announced with in
+/// [`super::json_media_type`] — and this is the one place they are composed, so no layer
+/// can apply one and forget the other.
+fn answered(resp: RtResponse, req: &RtRequest, locator: &str) -> RtResponse {
+    with_json_media_type(
+        with_error_type_locator(resp, locator),
+        &announced_media_type(req),
+    )
+}
+
 /// The modelled operation the service's own routing table names for this request, or `None`
 /// when the request names none.
 fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dyn ErasedOperation> {
@@ -121,7 +141,8 @@ fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dy
 }
 
 /// Serves the modelled operation the service's routing table names for a request exactly as
-/// that table would, then names the error shape the way this service names it.
+/// that table would, then completes the response headers this service's wire carries (see
+/// [`answered`]).
 ///
 /// It stores no operation of its own and makes no routing decision: the operation it
 /// delegates to is the one the service's own table names for the request, so the framework
@@ -144,7 +165,7 @@ impl ErasedOperation for QualifyingErrorType {
             let locator = locator(svc.definition().identity().shape_id());
             match modeled_operation(svc, req) {
                 Some(operation) => {
-                    with_error_type_locator(operation.run(svc, req, ctx).await, &locator)
+                    answered(operation.run(svc, req, ctx).await, req, &locator)
                 }
                 // Unreachable through a `Service::override_operation` that claims a request
                 // only when the routing table holds its key; answered as the framework
@@ -164,15 +185,15 @@ impl ErasedOperation for QualifyingErrorType {
 }
 
 /// This service's model-derived half with its framework-level error renderers wrapped, so a
-/// response NO operation produced names its error shape exactly as one an operation
-/// produced does.
+/// response NO operation produced carries the same completed headers (see [`answered`]) as
+/// one an operation produced.
 ///
 /// Identity, the routing table and the protocol come from the wrapped definition untouched:
 /// nothing model-derived is restated here.
 pub struct ErrorTypeLocatorDefinition<D>(D);
 
 impl<D: ErasedServiceDefinition> ErrorTypeLocatorDefinition<D> {
-    /// Wrap `inner`, qualifying the error shape of every framework-level failure it renders.
+    /// Wrap `inner`, completing the headers of every framework-level response it renders.
     pub fn new(inner: D) -> Self {
         Self(inner)
     }
@@ -209,7 +230,7 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for ErrorTypeLocatorDef
     }
 
     fn routing_error_response(&self, req: &RtRequest) -> RtResponse {
-        with_error_type_locator(self.0.routing_error_response(req), &self.locator())
+        answered(self.0.routing_error_response(req), req, &self.locator())
     }
 
     fn framework_error_response(
@@ -217,8 +238,9 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for ErrorTypeLocatorDef
         error: aws_smithy_schema_server::ProtocolError,
         req: &RtRequest,
     ) -> RtResponse {
-        with_error_type_locator(
+        answered(
             self.0.framework_error_response(error, req),
+            req,
             &self.locator(),
         )
     }
@@ -229,8 +251,9 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for ErrorTypeLocatorDef
         chosen: Option<Refused>,
         req: &RtRequest,
     ) -> RtResponse {
-        with_error_type_locator(
+        answered(
             self.0.refusal_response(error, chosen, req),
+            req,
             &self.locator(),
         )
     }

@@ -37,6 +37,8 @@ mod refusal_wording;
 mod resource_tag_writes;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/response_media_type.rs"]
+mod response_media_type;
 #[path = "all/snapshot_listing_is_repeatable.rs"]
 mod snapshot_listing_is_repeatable;
 #[path = "all/state_roundtrip.rs"]

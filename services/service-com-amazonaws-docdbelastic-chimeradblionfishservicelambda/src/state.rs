@@ -782,13 +782,17 @@ pub fn validate_admin_user_name(member: &str, value: &str) -> Result<(), Validat
 ///
 /// Each kind has TWO spellings, and they are not interchangeable:
 ///
-/// * the RESOURCE TYPE NAME, which is the modelled resource shape's own name —
-///   `Cluster` / `ClusterSnapshot` (`smithy_query(query="shape",
-///   shape="Cluster,ClusterSnapshot")`). It is what the error shapes' `resourceType`
-///   member carries: "The type of the resource that could not be found"
+/// * the RESOURCE TYPE NAME, which is the capitalised name this service's API gives the
+///   resource class itself — the class each operation reads and writes one of, as its
+///   own input and output members name it: a `Cluster` (`GetCluster` answers `cluster`,
+///   addressed by `clusterArn`) and a `Snapshot` (`GetClusterSnapshot` answers
+///   `snapshot`, addressed by `snapshotArn`; `smithy_query(query="operation",
+///   operation="GetCluster,GetClusterSnapshot")`). It is what the error shapes'
+///   `resourceType` member carries: "The type of the resource that could not be found"
 ///   (`ResourceNotFoundException$resourceType`) and "The type of the resource where
 ///   there was an access conflict" (`ConflictException$resourceType`), both
-///   `@required`;
+///   `@required`. It is NOT the operation's own name, nor the name of the Smithy
+///   structure the class is projected onto on the wire;
 /// * the ARN RESOURCE SEGMENT, which is lowercase and hyphenated — `cluster/<id>`,
 ///   `cluster-snapshot/<id>`.
 ///
@@ -797,9 +801,9 @@ pub fn validate_admin_user_name(member: &str, value: &str) -> Result<(), Validat
 /// the ARN segment spelled in exactly one place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceKind {
-    /// An elastic cluster: the modelled `Cluster` shape.
+    /// An elastic cluster, projected onto the modelled `Cluster` shape.
     Cluster,
-    /// An elastic cluster snapshot: the modelled `ClusterSnapshot` shape.
+    /// An elastic cluster snapshot, projected onto the modelled `ClusterSnapshot` shape.
     ClusterSnapshot,
 }
 
@@ -808,7 +812,7 @@ impl ResourceKind {
     pub const fn type_name(self) -> &'static str {
         match self {
             Self::Cluster => "Cluster",
-            Self::ClusterSnapshot => "ClusterSnapshot",
+            Self::ClusterSnapshot => "Snapshot",
         }
     }
 

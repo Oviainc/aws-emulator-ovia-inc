@@ -51,10 +51,12 @@ const SNAPSHOT_SENTENCE: &str = "Unable to find the snapshot";
 
 /// The AWS resource type NAMES this service reports in `resourceType`.
 ///
-/// Source: the modelled resource shapes — `smithy_query(query="shape",
-/// shape="Cluster,ClusterSnapshot")` — whose own names are the type names.
+/// Source: the resource class each operation reads and writes one of, as its own
+/// members name it — `GetCluster` answers `cluster` and is addressed by `clusterArn`,
+/// `GetClusterSnapshot` answers `snapshot` and is addressed by `snapshotArn`
+/// (`smithy_query(query="operation", operation="GetCluster,GetClusterSnapshot")`).
 const CLUSTER_TYPE: &str = "Cluster";
-const SNAPSHOT_TYPE: &str = "ClusterSnapshot";
+const SNAPSHOT_TYPE: &str = "Snapshot";
 
 /// The header a restJson1 client resolves an error shape from.
 const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";

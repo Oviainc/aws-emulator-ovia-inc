@@ -40,17 +40,28 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
-//! ## Naming the error shape a failure is refused with
+//! ## Completing the response headers this service's wire carries
 //!
-//! Every failure this service answers names its error shape in the `x-amzn-errortype`
-//! header in the QUALIFIED form its wire carries — the shape name, the separator, then
-//! the locator of the namespace that declares it — where the framework's restJson1
-//! renderers write the bare name. [`error_type_locator`] owns that one value and wires it
-//! at the two layers every response of this service passes through: the per-operation
-//! wrapper handed back from [`Service::override_operation`], and the definition wrapper
-//! handed back from [`Service::definition`].
+//! Two response headers of this service's wire are not what the framework's restJson1
+//! renderers write, and neither belongs to a modelled shape, so no handler can set them:
+//!
+//! * `x-amzn-errortype`, which every failure names its error shape in, in the QUALIFIED
+//!   form this wire carries — the shape name, the separator, then the locator of the
+//!   namespace that declares it — where the renderers write the bare name
+//!   ([`error_type_locator`]);
+//! * `content-type`, which every response carrying a JSON payload — a success and a
+//!   failure alike — announces as the JSON media type the REQUEST named for its own
+//!   payload, defaulting to this service's native AWS JSON 1.1 media type when the
+//!   request carried no payload, where the renderers always announce the generic
+//!   `application/json` ([`json_media_type`]).
+//!
+//! Each lives in its own module, and both are applied at the two layers every response of
+//! this service passes through: the per-operation wrapper handed back from
+//! [`Service::override_operation`], and the definition wrapper handed back from
+//! [`Service::definition`].
 
 pub mod error_type_locator;
+pub mod json_media_type;
 
 use error_type_locator::{ErrorTypeLocatorDefinition, QualifyingErrorType};
 use smithy_server_runtime::{

@@ -5,10 +5,11 @@
 //! The rule these suites assert: on an error shape that models `resourceId` and
 //! `resourceType` (`ResourceNotFoundException`, `ConflictException`), `resourceType`
 //! carries the AWS RESOURCE TYPE NAME of the kind of resource the request addressed —
-//! the modelled resource shape's own name, `Cluster` or `ClusterSnapshot` — and
-//! `resourceId` carries the identifier the request named. The lowercase, hyphenated
-//! token (`cluster`, `cluster-snapshot`) is the ARN's resource segment and this
-//! service's internal key for the kind; it is never what `resourceType` reports.
+//! the capitalised name this service's API gives that resource class, `Cluster` or
+//! `Snapshot` — and `resourceId` carries the identifier the request named. The
+//! lowercase, hyphenated token (`cluster`, `cluster-snapshot`) is the ARN's resource
+//! segment and this service's internal key for the kind, and the operation's own name
+//! (`ClusterSnapshot`) is neither; none of them is what `resourceType` reports.
 //!
 //! The rule generalises over the kind of resource and over the identifier's form, so
 //! the tables below span every not-found and conflict path of the implemented
@@ -28,13 +29,15 @@ const ACCOUNT: &str = "000000000000";
 
 /// The AWS resource type NAMES this service reports in `resourceType`.
 ///
-/// Source: the modelled resource shapes — `smithy_query(query="shape",
-/// shape="Cluster,ClusterSnapshot")` — whose own names are the type names; the
+/// Source: the resource class each operation reads and writes one of, as its own
+/// members name it — `GetCluster` answers `cluster` and is addressed by `clusterArn`,
+/// `GetClusterSnapshot` answers `snapshot` and is addressed by `snapshotArn`
+/// (`smithy_query(query="operation", operation="GetCluster,GetClusterSnapshot")`). The
 /// `resourceType` members of `ResourceNotFoundException` ("The type of the resource
 /// that could not be found") and `ConflictException` ("The type of the resource where
 /// there was an access conflict") are both `@required` Strings.
 const CLUSTER_TYPE: &str = "Cluster";
-const SNAPSHOT_TYPE: &str = "ClusterSnapshot";
+const SNAPSHOT_TYPE: &str = "Snapshot";
 
 /// The `@required` members of both error shapes, which every error body must carry.
 ///
@@ -398,15 +401,16 @@ async fn a_conflict_error_reports_the_aws_resource_type_name() {
 #[tokio::test]
 async fn a_reported_resource_type_is_never_the_arn_segment() {
     // The regression this pins: the ARN resource segment and this service's internal
-    // key for a resource kind are lowercase and hyphenated, and neither is a resource
-    // type name. Asserted for both kinds over every spelling an ARN segment has.
+    // key for a resource kind are lowercase and hyphenated, and the operation's own
+    // name is `ClusterSnapshot`; none of them is a resource type name. Asserted for
+    // both kinds over every spelling an ARN segment and an operation name have.
     let router = emulator();
     let rows = [
         (
             "Cluster",
             CLUSTER_TYPE,
             format!("/cluster/{}", label("arn:aws:docdb-elastic:eu-west-2:000000000000:cluster/absent")),
-            ["cluster", "clusters", "Clusters"],
+            ["cluster", "clusters", "Clusters", "GetCluster"],
         ),
         (
             "ClusterSnapshot",
@@ -415,7 +419,12 @@ async fn a_reported_resource_type_is_never_the_arn_segment() {
                 "/cluster-snapshot/{}",
                 label("arn:aws:docdb-elastic:eu-west-2:000000000000:cluster-snapshot/absent")
             ),
-            ["cluster-snapshot", "clusterSnapshot", "cluster_snapshot"],
+            [
+                "cluster-snapshot",
+                "clusterSnapshot",
+                "cluster_snapshot",
+                "ClusterSnapshot",
+            ],
         ),
     ];
 
