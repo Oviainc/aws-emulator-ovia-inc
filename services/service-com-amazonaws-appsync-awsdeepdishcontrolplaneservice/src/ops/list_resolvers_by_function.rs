@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResolversByFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResolversByFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResolversByFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a pure read that cuts a page out of the resolvers of the API that invoke
+//! the function the request names — whatever type each is attached to — in creation
+//! order, reporting each one as the record `GetResolver` answers. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +146,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResolversByFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResolversByFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResolversByFunction"))
+        // A pure read: the page is cut from stored state only, so `ctx` is unused.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListResolversByFunctionErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(ListResolversByFunctionErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let guard = state.lock();
+        let Some(api) = guard.graphql_apis.get(&input.api_id) else {
+            return Err(ListResolversByFunctionErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The resolvers of that API which invoke the function, in the creation order
+        // each record keeps — one total order every page is cut from, so two walks
+        // report the same resolvers in the same order however the caller pages. A
+        // function no resolver invokes is reported by no resolver, which is the empty
+        // page: this operation lists what references the function rather than resolving
+        // the function itself.
+        let ordered = api.resolvers_using_function(&input.function_id);
+
+        // The cursor is the first resolver of the NEXT page, keyed by the type/field
+        // pair that addresses one within its API: this listing crosses types, so a field
+        // name alone would not tell two entries apart.
+        let Some(page) = crate::state::paginate_by(
+            &ordered,
+            crate::state::ResolverRecord::cursor,
+            input.next_token.as_deref(),
+            input.max_results,
+        ) else {
+            return Err(ListResolversByFunctionErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::INVALID_PAGINATION_TOKEN_MESSAGE.to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        Ok(ListResolversByFunctionOutput {
+            resolvers: Some(
+                page.items
+                    .iter()
+                    .map(|resolver| resolver.to_resolver())
+                    .collect(),
+            ),
+            next_token: page.next_token,
+        })
     }
 }

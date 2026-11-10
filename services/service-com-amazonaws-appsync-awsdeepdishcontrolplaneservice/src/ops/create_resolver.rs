@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResolver
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResolver`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResolver::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: attaches a resolver to the field of the type the request addresses,
+//! persisting it under its API in [`crate::state`] and answering the stored record, and
+//! refusing a definition AppSync could not run or a field that already carries one.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +182,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResolver` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResolverErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResolver"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateResolverErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(CreateResolverErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // "A UNIT resolver is the default resolver type" (`Resolver$kind`), so a
+        // request that names no kind asks for one, and the resolver is stored — and
+        // judged below — as the kind it is.
+        let kind = input
+            .kind
+            .unwrap_or_else(|| crate::state::UNIT_KIND.to_string());
+
+        // A resolver whose definition members do not pair up describes nothing AppSync
+        // could run, so it is refused before anything is written and the refusal leaves
+        // no resolver on the field.
+        if let Some(message) = crate::state::resolver_definition_refusal(
+            &kind,
+            input.data_source_name.as_deref(),
+            input.pipeline_config.as_ref(),
+            input.code.as_deref(),
+            input.runtime.as_ref(),
+        ) {
+            return Err(CreateResolverErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // The resolver is reported in the region the caller addressed, so its ARN is
+        // built from that region rather than from a fixed one.
+        let region = crate::state::request_region(ctx);
+        let mut guard = state.lock();
+        let seq = guard.next_seq();
+
+        // A resolver is attached to a field of a type OF a GraphQL API, so it cannot be
+        // created under an API this account does not hold.
+        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+            return Err(CreateResolverErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // A field is resolved by at most one resolver, so a field that already carries
+        // one is not re-attached: the create is refused and the resolver already there
+        // is left exactly as it was.
+        if api.resolver(&input.type_name, &input.field_name).is_some() {
+            return Err(CreateResolverErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::RESOLVER_EXISTS_MESSAGE.to_string()),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // The store is bounded, so a repeated create cannot grow it without limit: the
+        // per-API collection this create writes to is bounded by the AppSync per-API
+        // quota of resolvers, the way the sibling creates in this crate bound theirs.
+        if api.resolvers.len() >= crate::state::RESOLVERS_PER_API {
+            return Err(CreateResolverErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "an API may hold at most {} resolvers",
+                    crate::state::RESOLVERS_PER_API
+                )),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        let key = (input.type_name.clone(), input.field_name.clone());
+        let record = crate::state::ResolverRecord {
+            seq,
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_SERVICE,
+                &region,
+                &crate::state::resolver_resource(
+                    &input.api_id,
+                    &input.type_name,
+                    &input.field_name,
+                ),
+            ),
+            type_name: input.type_name,
+            field_name: input.field_name,
+            data_source_name: input.data_source_name,
+            request_mapping_template: input.request_mapping_template,
+            response_mapping_template: input.response_mapping_template,
+            kind,
+            pipeline_config: input.pipeline_config,
+            sync_config: input.sync_config,
+            caching_config: input.caching_config,
+            max_batch_size: input.max_batch_size,
+            runtime: input.runtime,
+            code: input.code,
+            metrics_config: input.metrics_config,
+        };
+        api.resolvers.insert(key.clone(), record);
+
+        // Answer from the STORED record, so this body is the one `GetResolver` and
+        // `ListResolvers` answer with later.
+        Ok(CreateResolverOutput {
+            resolver: api
+                .resolvers
+                .get(&key)
+                .map(crate::state::ResolverRecord::to_resolver),
+        })
     }
 }

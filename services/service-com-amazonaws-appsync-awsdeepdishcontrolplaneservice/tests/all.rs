@@ -89,6 +89,8 @@ mod list_apis;
 mod merged_api_association_topology;
 #[path = "all/merged_api_disassociation.rs"]
 mod merged_api_disassociation;
+#[path = "all/resolvers.rs"]
+mod resolvers;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/schema_creation.rs"]

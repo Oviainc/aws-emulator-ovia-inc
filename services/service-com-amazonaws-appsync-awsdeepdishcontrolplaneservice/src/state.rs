@@ -25,6 +25,11 @@ pub use schema_types::*;
 mod schema_creation;
 pub use schema_creation::*;
 
+/// The resolvers attached to a GraphQL API's fields, and how one is kept, addressed and
+/// reported.
+mod resolvers;
+pub use resolvers::*;
+
 use crate::ops::types::{
     AdditionalAuthenticationProvider, Api, ApiAssociation, ApiCache, ApiKey, AppSyncRuntime,
     AuthMode, ChannelNamespace, DataSource, DomainNameConfig, DynamodbDataSourceConfig,
@@ -109,6 +114,13 @@ pub struct GraphqlApiRecord {
     /// Bounded: `CreateType` refuses a create once the API holds the AppSync per-API
     /// quota of types, so this map cannot grow without limit.
     pub types: BTreeMap<String, TypeRecord>,
+    /// The resolvers attached to the fields of this API's types, keyed by the
+    /// `typeName`/`fieldName` pair that addresses one ([`ResolverKey`]) — a field
+    /// carries at most one resolver, so the pair identifies it within its API and no
+    /// id is minted for it.
+    /// Bounded: `CreateResolver` refuses a create once the API holds the AppSync
+    /// per-API quota of resolvers, so this map cannot grow without limit.
+    pub resolvers: BTreeMap<ResolverKey, ResolverRecord>,
     /// This API's schema creation, or `None` while no `StartSchemaCreation` has ever
     /// run for it: the document the last call carried, the `SchemaStatus` it left
     /// behind and the outcome the clock still owes ([`SchemaCreationRecord`]). A
@@ -665,15 +677,33 @@ pub fn function_definition_refusal(
     function_version: Option<&str>,
 ) -> Option<String> {
     match (code, runtime) {
-        (Some(_), None) => Some("Invalid runtime given. A runtime is required when code is specified.".to_string()),
-        (None, Some(_)) => Some("Invalid code given. Code is required when a runtime is specified.".to_string()),
-        (Some(_), Some(_)) => None,
         (None, None) if function_version.is_none_or(str::is_empty) => Some(
             "Invalid functionVersion given. A functionVersion is required when using mapping \
              templates."
                 .to_string(),
         ),
-        (None, None) => None,
+        pair => code_runtime_refusal(pair.0, pair.1),
+    }
+}
+
+/// The refusal text for a `code`/`runtime` pair that defines nothing AppSync could run,
+/// or `None` when the two agree.
+///
+/// Two documented requirements, both over the pair rather than over one request's
+/// values, and both carried by every operation that takes the two members (a function's
+/// `code` and a resolver's alike):
+///
+/// * "When code is used, the runtime is required";
+/// * "if a runtime is specified, code must also be specified".
+pub fn code_runtime_refusal(code: Option<&str>, runtime: Option<&AppSyncRuntime>) -> Option<String> {
+    match (code, runtime) {
+        (Some(_), None) => Some(
+            "Invalid runtime given. A runtime is required when code is specified.".to_string(),
+        ),
+        (None, Some(_)) => Some(
+            "Invalid code given. Code is required when a runtime is specified.".to_string(),
+        ),
+        (Some(_), Some(_)) | (None, None) => None,
     }
 }
 
@@ -2933,6 +2963,24 @@ pub fn paginate<'a, T, K>(
 where
     K: Fn(&T) -> &str,
 {
+    paginate_by(ordered, |item| key(item).to_string(), next_token, max_results)
+}
+
+/// Cut the same page out of `ordered` where an item's cursor is COMPOSED rather than
+/// carried by one member, so the key function hands back an owned value.
+///
+/// One pagination for both: [`paginate`] is this function over a borrowed member, so a
+/// listing keyed on a single id and one keyed on a pair cut their pages, bound their
+/// sizes and report their cursors identically.
+pub fn paginate_by<'a, T, K>(
+    ordered: &[&'a T],
+    key: K,
+    next_token: Option<&str>,
+    max_results: i32,
+) -> Option<Page<'a, T>>
+where
+    K: Fn(&T) -> String,
+{
     let start = match next_token {
         None => 0,
         Some(token) => ordered.iter().position(|item| key(item) == token)?,
@@ -2945,9 +2993,7 @@ where
     let end = start.saturating_add(page_size).min(ordered.len());
     Some(Page {
         items: ordered[start..end].to_vec(),
-        next_token: ordered
-            .get(end)
-            .map(|item| key(item).to_string()),
+        next_token: ordered.get(end).map(|item| key(item)),
     })
 }
 
