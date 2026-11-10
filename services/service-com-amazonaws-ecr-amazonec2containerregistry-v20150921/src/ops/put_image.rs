@@ -238,9 +238,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        // The signing jobs this push creates are decided by the registry's signing
+        // configuration and by the AWS Signer profiles its rules name, so they are planned
+        // here, with no lock of this store held: the resolution reads another service's
+        // store, exactly as the authorization gate above does.
+        let planned_signings = crate::state::signing::planned_signings(
+            &*self.engine,
+            &input.repository_name,
+            now,
+        );
         // The store is written under its lock, which the helper below holds for its own
         // body alone: the guard is not `Send`, and the publication that follows is awaited.
-        let (output, pushed) = Self::store_pushed_image(&state, &input, digest, now)?;
+        let (output, pushed) =
+            Self::store_pushed_image(&state, &input, digest, now, planned_signings)?;
         // The push STORED an image, so the registry publishes the image action it
         // performed, with the store's lock released — EventBridge delivers the event to the
         // rules that match it, and a target of one may call back into this service.
@@ -263,6 +273,7 @@ impl<Eng> PutImage<Eng> {
         input: &PutImageInput,
         digest: String,
         now: ::std::time::SystemTime,
+        planned_signings: Vec<crate::state::signing::ImageSigning>,
     ) -> Result<(PutImageOutput, crate::state::image_events::ImageAction), PutImageError> {
         let mut store = state.lock();
 
@@ -416,7 +427,9 @@ impl<Eng> PutImage<Eng> {
         // here, once, so no read re-parses it. The copies the registry's replication
         // configuration asks for are started by the push that STORES the image, which is
         // why they are set here and not on a later push of the same content: replication
-        // copies an image as it arrives.
+        // copies an image as it arrives. The signing jobs the registry's signing
+        // configuration asks for are set with them, for the same reason: a signing job
+        // signs an image as it arrives.
         repo.images.entry(digest.clone()).or_insert_with(|| {
             let mut stored = crate::state::ImageRecord::pushed(
                 digest.clone(),
@@ -428,6 +441,7 @@ impl<Eng> PutImage<Eng> {
                 now,
             );
             stored.replications = planned_replications;
+            stored.signings = planned_signings;
             stored
         });
 

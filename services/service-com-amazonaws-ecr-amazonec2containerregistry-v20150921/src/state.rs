@@ -695,6 +695,12 @@ pub struct ImageRecord {
     /// instant — what `DescribeImageReplicationStatus` reports. Empty for an image pushed
     /// while no rule matched its repository.
     pub replications: Vec<ImageReplication>,
+    /// The signing jobs the push that stored it created, one per signing profile the
+    /// registry's signing configuration pointed at this repository at that instant — what
+    /// `DescribeImageSigningStatus` reports. Empty for an image pushed while no signing
+    /// rule matched its repository, which is the empty status list ECR answers with for an
+    /// image nothing signed. See [`signing`].
+    pub signings: Vec<signing::ImageSigning>,
 }
 
 impl ImageRecord {
@@ -724,6 +730,11 @@ impl ImageRecord {
             // rules and sets them (see
             // [`ComAmazonawsEcrAmazonec2containerregistryV20150921State::planned_replications`]).
             replications: Vec::new(),
+            // The signing jobs a push starts are decided by the registry's signing
+            // configuration and by AWS Signer's own profiles, neither of which this record
+            // knows anything about: `PutImage` reads them and sets the jobs (see
+            // [`signing::planned_signings`]).
+            signings: Vec::new(),
             // A scan is started by `StartImageScan`, never by a push: a freshly stored
             // image carries none, which is what `DescribeImageScanFindings` reports
             // `ScanNotFoundException` for.
@@ -4212,6 +4223,11 @@ pub mod image_events;
 /// re-exported, so a handler names the gate it consults) here, so a handler reaches it as
 /// `crate::state::authorization::…` like every other part of this store.
 pub mod authorization;
+/// The signing jobs a push starts under the registry's signing configuration, and the
+/// status each one reports, in `state/signing.rs`. Declared (and not glob re-exported, so a
+/// handler names the part of the store it reads) here, so a handler reaches it as
+/// `crate::state::signing::…` like every other part of this store.
+pub mod signing;
 mod image_scan;
 mod layer_download;
 pub use layer_download::*;

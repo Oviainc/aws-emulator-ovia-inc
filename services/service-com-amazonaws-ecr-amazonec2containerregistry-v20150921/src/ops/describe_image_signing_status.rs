@@ -2,13 +2,15 @@
 
 //! @op DescribeImageSigningStatus
 //!
-//! The registry's stored signing configuration is deliberately NOT consulted here. It
-//! says which images a push WOULD sign; a status reports a signing job, and nothing in
-//! this emulator runs an AWS Signer job, so no job exists for any stored image however
-//! the configuration is set. `signingStatuses` is therefore the empty list ECR answers
-//! with for an image no signing rule signed — a status for a job that never ran would be
-//! an invented one. A later change that really records signing jobs is where the
-//! per-profile statuses belong.
+//! One status per signing job the push that stored the image created, projected from the
+//! jobs the image carries ([`crate::state::signing`]): a job is `IN_PROGRESS` until the
+//! clock owes it its terminal value and `COMPLETE` or `FAILED` afterwards, so the report is
+//! derived from stored state and reading it writes nothing. An image pushed while no rule of
+//! the registry's signing configuration matched its repository carries no job, which is the
+//! empty `signingStatuses` list ECR answers with for an image nothing signed. The stored
+//! configuration is deliberately NOT consulted here: it says which images a push WOULD sign,
+//! and a status reports a signing job, so a status is never invented for a job no push
+//! started.
 //!
 //! ## Shape of an operation
 //!
@@ -216,14 +218,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(fault_error)?;
         let image = repo.resolve_image(&input.image_id).map_err(fault_error)?;
 
-        // One status per signing profile that signed this image. ECR records a signing
-        // job per signing rule that matched the image when it was pushed, and reports one
-        // status per job; nothing in this emulator runs an AWS Signer signing job, so no
-        // job exists for any stored image and the list is empty — which is what ECR
-        // answers for an image no signing rule matched. The registry's signing
-        // configuration (`PutSigningConfiguration`) says which images WOULD be signed; it
-        // is not a signing job, and a status is never invented for one that never ran.
-        let signing_statuses: Vec<ImageSigningStatus> = Vec::new();
+        // One status per signing job this image carries: ECR records a signing job per
+        // signing profile the configuration matched the image with when it was pushed, and
+        // reports one status per job. Each one's status follows from the instant the clock
+        // owes that job its terminal value, so this read derives the answer and writes
+        // nothing — an image no rule matched carries no job and reports the empty list.
+        let now = ::std::time::SystemTime::now();
+        let signing_statuses: Vec<ImageSigningStatus> = image
+            .signings
+            .iter()
+            .map(|signing| signing.to_status(now))
+            .collect();
 
         Ok(DescribeImageSigningStatusOutput {
             repository_name: Some(repo.name.clone()),
