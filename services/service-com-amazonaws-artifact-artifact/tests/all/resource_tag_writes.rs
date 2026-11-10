@@ -636,6 +636,9 @@ async fn a_write_past_the_per_resource_tag_ceiling_is_refused_and_changes_nothin
     .await;
 }
 
+/// Every row is a well-formed ARN: a value the tagging surface cannot read an ARN out of
+/// at all is a request-shape failure refused 400 before this rule is reached, which
+/// `tagging_arn_syntax.rs` pins.
 #[tokio::test]
 async fn an_arn_naming_no_resource_this_account_holds_is_refused_unauthorized() {
     let router = emulator();
@@ -664,8 +667,7 @@ async fn an_arn_naming_no_resource_this_account_holds_is_refused_unauthorized() 
 
     let account = engine::emulator_account_id().to_string();
     let suffix = id.strip_prefix("compliance-inquiry-").unwrap_or(&id);
-    // One row per field of the ARN that can name no resource this account holds, plus
-    // values that are no ARN at all.
+    // One row per field of the ARN that can name no resource this account holds.
     let cases: Vec<(String, String)> = vec![
         (
             "a never-issued inquiry id".to_string(),
@@ -695,8 +697,6 @@ async fn an_arn_naming_no_resource_this_account_holds_is_refused_unauthorized() 
             format!("arn:aws:s3:{REGION}:{account}:bucket/compliance"),
         ),
         ("a report the catalog publishes".to_string(), report_arn),
-        ("the inquiry id, not its ARN".to_string(), id.clone()),
-        ("free text".to_string(), "not-an-arn".to_string()),
     ];
 
     for (case, resource_arn) in cases {

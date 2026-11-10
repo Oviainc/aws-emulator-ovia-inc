@@ -117,8 +117,8 @@
 //! (`crate::state::document_url_host`), because this emulator is what serves it. That
 //! plane is authorised by the SAME kind of receipt: the term grant's `termToken`
 //! (`crate::state::TermGrant::token`), minted per acceptance from no counter, is the one
-//! thing a caller that accepted the term holds, so a fetch of a gated document presenting
-//! anything derivable is refused `403` too.
+//! thing a caller that accepted the term holds, so a fetch of a report or term document
+//! presenting anything derivable is refused `403` too.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema::serde::SerializableStruct;
@@ -716,9 +716,9 @@ struct WantedDocument {
 ///
 /// A download is authorised by the SAME rule `GetReport` applies, from the one place that
 /// rule lives (`crate::state::ComAmazonawsArtifactArtifactState::download_authorised`):
-/// where the report's acceptance type requires the explicit acceptance of its term, only a
-/// grant covering that term authorises the fetch. A path this rule authorises is then
-/// answered for the version and the object the report publishes, and no others.
+/// only a grant covering the term governing the report authorises the fetch, whatever that
+/// report's acceptance type. A path this rule authorises is then answered for the version
+/// and the object the report publishes, and no others.
 ///
 /// Carries nothing: the document a fetch names travels as the walk's target, so one
 /// instance serves every caller.
@@ -927,9 +927,13 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     ///
     /// The three tag operations' `resourceArn` is deliberately not a [`Target`]: it is a
     /// `LongStringAttribute` the model gives no identifier syntax (any string without
-    /// `<>` is admissible), so whether it names a resource at all is a question about
-    /// this service's STATE — which tag set the ARN addresses — and each tag handler
-    /// answers it with the same 401 through `crate::scaffolded::Scaffolded::unauthorized`.
+    /// `<>` is admissible), so the gateway's own pre-dispatch pass has no identifier form
+    /// to judge it against here. Each tag handler therefore answers both halves itself:
+    /// whether the value is an ARN at all is a question about the REQUEST, refused with the
+    /// front door's 400 request shape
+    /// (`crate::scaffolded::Scaffolded::invalid_resource_arn`), and which tag set an ARN
+    /// addresses is a question about this service's STATE, refused with that door's 401
+    /// through `crate::scaffolded::Scaffolded::unauthorized`.
     fn examine(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Option<PreDispatchRefusal> {
         use crate::ops;
 

@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReport
-//! Serves the report document for one report version. A report whose `AcceptanceType`
-//! requires the explicit click-through acceptance of its term is served ONLY under a term
-//! grant this service issued for the TERM governing it: its `termToken` is checked against
-//! the grants [`crate::state`] holds, so a token nobody was ever given and a token
+//! Serves the report document for one report version. A report is served ONLY under a term
+//! grant this service issued for the TERM governing it: the request's `termToken` is checked
+//! against the grants [`crate::state`] holds, so a token nobody was ever given and a token
 //! accepted under another term are both refused with the modelled `ValidationException`.
-//! A report whose acceptance type requires no such acceptance is served whatever token the
-//! request carries, because no acceptance exists for a grant to be the receipt of.
+//! The member is `@required` and is documented as the "Unique download token provided by
+//! GetTermForReport API", so a value no acceptance minted is no token on any report,
+//! whatever that report's `AcceptanceType` says: the acceptance type tells a client whether
+//! it has to put the term document in front of a person before asking for the receipt, and
+//! it decides nothing about which receipts this service issued.
 //! The grant is not consumed — this handler only READS.
 //!
 //! A `reportId` the catalog does not hold is refused by the front door's 401
@@ -193,12 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .report_version(&input.report_id, input.report_version)
             .map_err(|refusal| refusal.lift(GetReportErrorModeled::ResourceNotFoundException))?;
 
-        // The term token is the receipt of the acceptance a report's `AcceptanceType`
-        // REQUIRES, and it is bound to the TERM: where the report requires that
-        // acceptance, a token that was never issued is not a token at all, and one
-        // accepted under a different term document does not authorise this download.
-        // Either way no URL is served, and the refusal names neither the token nor the
-        // term it covers.
+        // The term token is the receipt `GetTermForReport` mints, and it is bound to the
+        // TERM governing the report: a token that was never issued is not a token at all,
+        // and one accepted under a different term document does not authorise this
+        // download. Either way no URL is served, and the refusal names neither the token nor
+        // the term it covers.
         if !store.download_authorised(&input.term_token, report) {
             ::tracing::info!(
                 operation = "GetReport",

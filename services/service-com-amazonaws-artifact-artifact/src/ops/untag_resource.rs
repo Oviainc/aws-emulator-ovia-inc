@@ -24,9 +24,12 @@
 //! `ListTagsForResource` reports back. A request naming only keys the resource does not
 //! carry changes nothing, so it leaves that instant where it was.
 //!
-//! An ARN that names no resource this account holds is answered HTTP 401
-//! `UnauthorizedException`, as every resource lookup in this service is — see
-//! [`crate::ops::tag_resource`].
+//! A `resourceArn` that is not a well-formed ARN is refused with the front door's own 400
+//! `BadRequestException` request shape
+//! ([`crate::scaffolded::Scaffolded::invalid_resource_arn`]) before anything resolves a
+//! target, and an ARN this surface can read that names no resource this account holds is
+//! answered HTTP 401 `UnauthorizedException`, as every resource lookup in this service is —
+//! see [`crate::ops::tag_resource`].
 //!
 //! ## Shape of an operation
 //!
@@ -194,6 +197,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The `resourceArn` is read as an ARN before anything resolves a target, exactly as
+        // the tag write reads it: a value this surface cannot read an ARN out of names no
+        // resource to authorize, so it is the front door's own 400 request shape rather than
+        // the authorization refusal below. Decided from the request alone, so nothing is
+        // removed and nothing about what this account holds is disclosed.
+        if !crate::state::is_resource_arn(&input.resource_arn) {
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "UntagResource",
+                akid = %akid,
+                region = %region,
+                resource_arn = ?input.resource_arn,
+                tag_keys = ?tag_keys,
+                tag_count,
+                outcome = "refused",
+                reason = "resourceArn is not a well-formed ARN",
+                "state-changing operation"
+            );
+            return Err(crate::scaffolded::Scaffolded::invalid_resource_arn());
+        }
 
         // A key in the reserved namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) names
         // a tag AWS itself owns: a caller may no more remove one than create it, so the

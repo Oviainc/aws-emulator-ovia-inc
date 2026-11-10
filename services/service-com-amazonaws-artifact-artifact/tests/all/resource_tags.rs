@@ -446,6 +446,10 @@ async fn a_fully_percent_encoded_resource_arn_names_the_same_resource() {
 /// Rule 2: an ARN this account holds no taggable resource for is refused 401, and the
 /// refusal is the same whatever is wrong with it — so a tag read cannot be used to probe
 /// for what another account, or another service, holds.
+///
+/// Every row here IS a well-formed ARN: a value the surface cannot read an ARN out of at
+/// all is a request-shape failure refused 400 before this rule is reached, which
+/// `tagging_arn_syntax.rs` pins.
 #[tokio::test]
 async fn an_arn_this_account_holds_no_taggable_resource_for_is_refused_with_401() {
     let router = emulator();
@@ -467,12 +471,10 @@ async fn an_arn_this_account_holds_no_taggable_resource_for_is_refused_with_401(
         .expect("a published report carries an ARN")
         .to_string();
 
-    // Rows differ along WHICH field of the ARN is wrong — the whole value, the
-    // partition, the service, the region, the account, the resource type, the id — plus
-    // the two resources of this service that carry no tags.
+    // Rows differ along WHICH field of the ARN is wrong — the partition, the service, the
+    // region, the account, the resource type, the id — plus the two resources of this
+    // service that carry no tags.
     let rows: Vec<(String, String)> = vec![
-        ("not an ARN at all".to_string(), "tagged-thing".to_string()),
-        ("the resource id alone".to_string(), id.clone()),
         (
             "another partition".to_string(),
             arn(

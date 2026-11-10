@@ -255,9 +255,14 @@ pub fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// What the emulator answered: the HTTP status and the JSON body.
+/// What the emulator answered: the HTTP status, the `x-amzn-errortype` header a restJson1
+/// client resolves an error shape from, and the JSON body.
 pub struct Answer {
     pub status: u16,
+    /// The `x-amzn-errortype` header, or the empty string when the answer carries none —
+    /// which is every success. Carried here so a suite asserting the SHAPE a refusal
+    /// travels in does not need a sender of its own.
+    pub error_type: String,
     pub body: Value,
 }
 
@@ -297,6 +302,7 @@ pub async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: By
 
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let error_type = error_type_of(&response);
     let bytes = response.into_body();
     let body = if bytes.is_empty() {
         Value::Null
@@ -308,7 +314,21 @@ pub async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: By
             )
         })
     };
-    Answer { status, body }
+    Answer {
+        status,
+        error_type,
+        body,
+    }
+}
+
+/// The `x-amzn-errortype` header of one answer, or the empty string when it carries none.
+fn error_type_of(response: &::http::Response<Bytes>) -> String {
+    response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub async fn get_signed(router: &MultiServiceRouter, uri: &str, authorization: &str) -> Answer {
@@ -322,6 +342,7 @@ pub async fn get_signed(router: &MultiServiceRouter, uri: &str, authorization: &
 
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let error_type = error_type_of(&response);
     let bytes = response.into_body();
     let body = if bytes.is_empty() {
         Value::Null
@@ -333,7 +354,11 @@ pub async fn get_signed(router: &MultiServiceRouter, uri: &str, authorization: &
             )
         })
     };
-    Answer { status, body }
+    Answer {
+        status,
+        error_type,
+        body,
+    }
 }
 
 pub async fn list_reports(router: &MultiServiceRouter, query: &str) -> Answer {

@@ -236,14 +236,27 @@ pub const BAD_REQUEST_STATUS: u16 = 400;
 /// names neither the member nor the constraint (that is the SERVICE's
 /// `ValidationException`, which does).
 pub const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
+/// The gateway's own text for a `resourceArn` it cannot read an ARN out of: the fixed
+/// clause it states for the tagging surface's ARN member, followed by the reason the parse
+/// failed.
+///
+/// The tagging surface addresses its resource by an ARN the caller supplies, and the
+/// gateway PARSES that value before this service resolves anything — so a value whose
+/// syntax is not an ARN's is refused there, in the gateway's own request shape
+/// ([`BAD_REQUEST_CODE`], HTTP 400), and not as the modelled `ValidationException`, which
+/// is what the SERVICE states for a value it judged itself. One sentence for the whole
+/// class: it carries nothing of the request, neither the submitted value nor the member it
+/// was bound to.
+pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn: bad syntax";
 
 /// One refusal stated by the AWS front door — the gateway that authorizes the targeted
 /// resource and validates the request envelope BEFORE this service runs.
 ///
 /// It carries its own wire code and status because the shape is not in the model: the
-/// two refusals this service's front door states are
-/// [`unauthorized`](Self::unauthorized) (HTTP 401 `UnauthorizedException`) and
-/// [`invalid_request_body`](Self::invalid_request_body) (HTTP 400
+/// refusals this service's front door states are
+/// [`unauthorized`](Self::unauthorized) (HTTP 401 `UnauthorizedException`),
+/// [`invalid_request_body`](Self::invalid_request_body) and
+/// [`invalid_resource_arn`](Self::invalid_resource_arn) (HTTP 400
 /// `BadRequestException`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrontDoorRefusal {
@@ -273,6 +286,17 @@ impl FrontDoorRefusal {
             code: BAD_REQUEST_CODE,
             status: BAD_REQUEST_STATUS,
             message: INVALID_REQUEST_BODY_MESSAGE,
+        }
+    }
+
+    /// The refusal of a request whose `resourceArn` the front door cannot read an ARN out
+    /// of: the same HTTP 400 `BadRequestException` request shape, stating the ARN parse
+    /// failure ([`INVALID_RESOURCE_ARN_MESSAGE`]).
+    pub const fn invalid_resource_arn() -> Self {
+        Self {
+            code: BAD_REQUEST_CODE,
+            status: BAD_REQUEST_STATUS,
+            message: INVALID_RESOURCE_ARN_MESSAGE,
         }
     }
 }
@@ -337,6 +361,18 @@ impl<E> Scaffolded<E> {
     /// of its type) is refused in `crate::service`, before any handler runs.
     pub const fn unauthorized() -> Self {
         Self::FrontDoor(FrontDoorRefusal::unauthorized())
+    }
+
+    /// Refuse the request the way the front door does when the `resourceArn` it was handed
+    /// is not an ARN at all: HTTP 400 `BadRequestException`, stating the parse failure
+    /// ([`INVALID_RESOURCE_ARN_MESSAGE`]).
+    ///
+    /// Reached from a handler for the same reason [`unauthorized`](Self::unauthorized) is:
+    /// the model gives the tagging surface's `resourceArn` no identifier syntax, so the
+    /// value reaches the handler and the ARN form is read there — before the lookup that
+    /// would decide whether the account holds the resource.
+    pub const fn invalid_resource_arn() -> Self {
+        Self::FrontDoor(FrontDoorRefusal::invalid_resource_arn())
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.

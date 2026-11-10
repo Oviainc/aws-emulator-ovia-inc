@@ -4,7 +4,7 @@
 //! Records the caller's rating of a compliance inquiry's response and answers the instant
 //! the feedback was submitted.
 //!
-//! Four rules shape the handler:
+//! Five rules shape the handler:
 //!
 //! * it writes onto a PERSISTED inquiry: an id the store does not hold names no inquiry
 //!   this account may give feedback on, which the front door answers with its 401 — the
@@ -15,6 +15,15 @@
 //!   `ValidationException` naming the member and the requirement it failed — the same
 //!   refusal `ExportComplianceInquiry` gives its own `queryIdentifiers`; naming none
 //!   records the feedback on the inquiry's response as a whole;
+//! * a QUESTION-LEVEL submission — one that names a `queryIdentifier` — is feedback on a
+//!   VERSION of that query's response, so it must name the version it is about:
+//!   `responseRevisionId` is what identifies that version ("use this value to prevent
+//!   submitting feedback on a stale response"), and a question-level submission carrying
+//!   none is refused with the modelled `ValidationException`
+//!   ([`crate::state::question_level_revision_required`]) rather than attributed to
+//!   whichever revision happens to be current. Feedback on the inquiry's response as a
+//!   whole names no query, so it names no revision of one either and the requirement does
+//!   not apply;
 //! * the feedback RECORD is unique per response revision: `queryIdentifier` together with
 //!   `responseRevisionId` names the response version being rated
 //!   ([`crate::state::FeedbackTarget`]), that version accepts exactly ONE submitted
@@ -30,8 +39,9 @@
 //!   error". So a request carrying a remembered token is IGNORED rather than refused for
 //!   carrying it — nothing further is recorded — and answered with the `submittedAt` the
 //!   call that recorded the token answered, however the rest of that request differs from
-//!   it: NO refusal of this operation is keyed on a token, and the one thing that can still
-//!   refuse such a request is the targeted version's own state above. A RETRY (the token on
+//!   it: NO refusal of this operation is keyed on a token, and what can still refuse such a
+//!   request is what the request itself carried (the two rules above) or the targeted
+//!   version's own state. A RETRY (the token on
 //!   the very request it was recorded for) is ignored before that state rule, because the
 //!   record it would conflict with is the one it already made; the same token on another
 //!   request is ignored after it, because the rule judges the targeted version's state
@@ -310,6 +320,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+
+        // "The response revision ID. Use this value to prevent submitting feedback on a
+        // stale response": a submission scoped to ONE query is feedback on a VERSION of
+        // that query's response, so it has to name which version it is about. A
+        // question-level submission that names none is refused with the modelled
+        // `ValidationException` ([`crate::state::question_level_revision_required`]) —
+        // nothing is recorded, because recording it would attribute the rating to whatever
+        // revision happened to be current, which is exactly the stale-response attribution
+        // the member exists to prevent. Feedback on the inquiry's response as a WHOLE names
+        // no query, so it names no revision of one either and the requirement does not
+        // apply. Judged after the ownership rule above: which query the request named is
+        // the first thing about a question-level submission.
+        if input.query_identifier.is_some() && input.response_revision_id.is_none() {
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "PutComplianceInquiryFeedback",
+                akid = %akid,
+                region = %region,
+                compliance_inquiry_id = %input.compliance_inquiry_id,
+                query_identifier = input.query_identifier,
+                outcome = "refused",
+                reason = "a question-level submission named no response revision",
+                "state-changing operation"
+            );
+            return Err(PutComplianceInquiryFeedbackErrorModeled::ValidationException(
+                crate::state::question_level_revision_required(),
+            )
+            .into());
         }
 
         // "If this token matches a previous request, the service ignores the request, but

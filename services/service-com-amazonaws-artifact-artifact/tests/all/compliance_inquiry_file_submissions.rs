@@ -550,6 +550,9 @@ async fn every_query_an_inquiry_owns_can_be_named_in_feedback() {
                     json!({
                         "complianceInquiryId": id,
                         "queryIdentifier": identifier,
+                        // A question-level submission is feedback on a VERSION of that
+                        // query's response, so it names the revision it is about.
+                        "responseRevisionId": 1,
                         "rating": "THUMBS_UP",
                     })
                     .to_string(),

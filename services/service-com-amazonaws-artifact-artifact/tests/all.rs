@@ -69,8 +69,12 @@ mod minted_store_ids;
 mod pagination_page_walk;
 #[path = "all/pagination_token_opacity.rs"]
 mod pagination_token_opacity;
+#[path = "all/question_level_feedback_revision.rs"]
+mod question_level_feedback_revision;
 #[path = "all/report_acceptance_type.rs"]
 mod report_acceptance_type;
+#[path = "all/report_download_receipt_rule.rs"]
+mod report_download_receipt_rule;
 #[path = "all/report_projection.rs"]
 mod report_projection;
 #[path = "all/report_published_description.rs"]
@@ -93,6 +97,8 @@ mod resource_tags;
 mod service_stated_validation_envelope;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging_arn_syntax.rs"]
+mod tagging_arn_syntax;
 #[path = "all/target_authorized_before_absent_members.rs"]
 mod target_authorized_before_absent_members;
 #[path = "all/term_grant_receipt.rs"]

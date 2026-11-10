@@ -3,12 +3,12 @@
 //! What a report's `AcceptanceType` decides, over HTTP.
 //!
 //! ONE rule, asserted over the whole published catalog rather than over any single
-//! report: **a report whose `acceptanceType` requires the explicit click-through
-//! acceptance of the term governing it downloads only under a term grant this service
-//! issued for that term, and a report whose `acceptanceType` requires no such acceptance
-//! downloads whatever well-formed `termToken` the request carries.** The decision follows
-//! the attribute the catalog REPORTS, so every row reads that attribute back from the API
-//! rather than assuming it.
+//! report: **every report downloads only under a term grant this service issued for the
+//! term governing it, whatever its `acceptanceType` — that attribute says whether a client
+//! has to put the term document in front of a person before asking for the receipt, and it
+//! decides nothing about which receipts this service issued.** The rows read the attribute
+//! back from the API rather than assuming it, because the claim is about what it does NOT
+//! change.
 //!
 //! The rows differ along what the rule generalises over: the acceptance type, the report,
 //! how many versions it publishes, which version is asked for, and the shape of the token
@@ -85,7 +85,7 @@ async fn reported_acceptance_types(router: &MultiServiceRouter) -> BTreeMap<Stri
 }
 
 #[tokio::test]
-async fn acceptance_type_decides_whether_a_download_needs_a_term_grant() {
+async fn no_acceptance_type_waives_the_term_grant_a_download_needs() {
     let router = emulator();
     let reported = reported_acceptance_types(&router).await;
 
@@ -98,14 +98,13 @@ async fn acceptance_type_decides_whether_a_download_needs_a_term_grant() {
             "case {:?}: expected acceptanceType {:?}, got {acceptance:?}",
             expected.id, expected.acceptance_type
         );
-        // Only the two values the model declares exist, and the gate is what the
-        // EXPLICIT one requires.
+        // Only the two values the model declares exist, and neither of them waives the
+        // receipt the download needs.
         assert!(
             acceptance == ACCEPTANCE_EXPLICIT || acceptance == ACCEPTANCE_PASSTHROUGH,
             "case {:?}: acceptanceType must be one of the modelled values, got {acceptance:?}",
             expected.id
         );
-        let gated = acceptance == ACCEPTANCE_EXPLICIT;
 
         for version in expected.versions {
             for (shape, token) in never_issued_tokens() {
@@ -118,54 +117,35 @@ async fn acceptance_type_decides_whether_a_download_needs_a_term_grant() {
                     ),
                 )
                 .await;
-                if gated {
-                    assert_eq!(
-                        answer.status, 400,
-                        "case {case:?}: a report requiring explicit acceptance must refuse a \
-                         token no acceptance minted, got {} with {:?}",
-                        answer.status, answer.body
-                    );
-                    assert_eq!(
-                        answer.error_code(),
-                        "ValidationException",
-                        "case {case:?}: expected ValidationException, got {:?}",
-                        answer.body
-                    );
-                    assert_eq!(
-                        answer.body["message"].as_str(),
-                        Some(INVALID_TOKEN),
-                        "case {case:?}: expected the fixed invalid-token text, got {:?}",
-                        answer.body
-                    );
-                    assert_eq!(
-                        answer.body["reason"].as_str(),
-                        Some(INVALID_TOKEN_REASON),
-                        "case {case:?}: expected the invalidToken reason, got {:?}",
-                        answer.body
-                    );
-                    assert!(
-                        answer.body["documentPresignedUrl"].is_null(),
-                        "case {case:?}: a refused request must carry no document URL, got {:?}",
-                        answer.body
-                    );
-                } else {
-                    assert_eq!(
-                        answer.status, 200,
-                        "case {case:?}: a report requiring no acceptance must be served without \
-                         a grant, got {} with {:?}",
-                        answer.status, answer.body
-                    );
-                    let url = answer.body["documentPresignedUrl"]
-                        .as_str()
-                        .unwrap_or_default();
-                    assert!(
-                        url.starts_with("https://")
-                            && url.contains(expected.id)
-                            && url.contains(&format!("v{version}")),
-                        "case {case:?}: the answer must locate this report version's document, \
-                         got {url:?}"
-                    );
-                }
+                assert_eq!(
+                    answer.status, 400,
+                    "case {case:?}: a token no acceptance minted must be refused whatever the \
+                     acceptance type, got {} with {:?}",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    answer.error_code(),
+                    "ValidationException",
+                    "case {case:?}: expected ValidationException, got {:?}",
+                    answer.body
+                );
+                assert_eq!(
+                    answer.body["message"].as_str(),
+                    Some(INVALID_TOKEN),
+                    "case {case:?}: expected the fixed invalid-token text, got {:?}",
+                    answer.body
+                );
+                assert_eq!(
+                    answer.body["reason"].as_str(),
+                    Some(INVALID_TOKEN_REASON),
+                    "case {case:?}: expected the invalidToken reason, got {:?}",
+                    answer.body
+                );
+                assert!(
+                    answer.body["documentPresignedUrl"].is_null(),
+                    "case {case:?}: a refused request must carry no document URL, got {:?}",
+                    answer.body
+                );
             }
         }
     }
@@ -232,7 +212,7 @@ async fn accepting_a_term_serves_every_report_whatever_its_acceptance_type() {
 }
 
 #[tokio::test]
-async fn a_grant_minted_under_another_term_authorises_only_what_needs_no_acceptance() {
+async fn a_grant_minted_under_another_term_authorises_nothing_it_does_not_cover() {
     let router = emulator();
     let source = CATALOG
         .first()
@@ -251,8 +231,8 @@ async fn a_grant_minted_under_another_term_authorises_only_what_needs_no_accepta
         .to_string();
 
     // Presented on every OTHER report, it is a token like any other the service did not
-    // mint for them: refused where the report requires the acceptance it is not a
-    // receipt for, served where the report requires none.
+    // mint for them: refused, whatever that report's acceptance type says, because the
+    // receipt is the acceptance of ONE term document.
     for expected in CATALOG.iter().filter(|row| row.id != source.id) {
         let case = format!(
             "{} {} under the grant for {}",
@@ -263,25 +243,22 @@ async fn a_grant_minted_under_another_term_authorises_only_what_needs_no_accepta
             &format!("?reportId={}&termToken={token}", expected.id),
         )
         .await;
-        if expected.requires_explicit_acceptance() {
-            assert_eq!(
-                answer.status, 400,
-                "case {case:?}: a grant under another term must not authorise it, got {} \
-                 with {:?}",
-                answer.status, answer.body
-            );
-            assert!(
-                answer.body["documentPresignedUrl"].is_null(),
-                "case {case:?}: a refused request must carry no document URL, got {:?}",
-                answer.body
-            );
-        } else {
-            assert_eq!(
-                answer.status, 200,
-                "case {case:?}: a report requiring no acceptance must be served, got {} \
-                 with {:?}",
-                answer.status, answer.body
-            );
-        }
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: a grant under another term must not authorise it, got {} \
+             with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.body["message"].as_str(),
+            Some(INVALID_TOKEN),
+            "case {case:?}: expected the fixed invalid-token text, got {:?}",
+            answer.body
+        );
+        assert!(
+            answer.body["documentPresignedUrl"].is_null(),
+            "case {case:?}: a refused request must carry no document URL, got {:?}",
+            answer.body
+        );
     }
 }

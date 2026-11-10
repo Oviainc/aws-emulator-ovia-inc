@@ -35,12 +35,18 @@
 //! `ListTagsForResource` reports back. A request writing the values the resource already
 //! carries changes nothing, so it leaves that instant where it was.
 //!
-//! The resource is named by its ARN, and the only resource an account owns in this service
-//! is a compliance inquiry — see
-//! [`crate::state::ComAmazonawsArtifactArtifactState::tagged_resource`]. An ARN that
-//! names no such resource is answered the way the front door answers a target it cannot
-//! authorize (HTTP 401 `UnauthorizedException`), as every resource lookup in this service
-//! does: whether the account holds the resource is not information this API discloses.
+//! The resource is named by its ARN, which this handler READS as an ARN before it resolves
+//! anything: the model gives that member no identifier syntax, so a value that is not a
+//! well-formed ARN names no resource to authorize and is refused with the front door's own
+//! 400 `BadRequestException` request shape
+//! ([`crate::scaffolded::Scaffolded::invalid_resource_arn`]) — the same refusal the other
+//! two tagging operations state for the same value. The only resource an account owns
+//! in this service is a compliance inquiry — see
+//! [`crate::state::ComAmazonawsArtifactArtifactState::tagged_resource`] — so an ARN this
+//! surface CAN read and that names no such resource is answered the way the front door
+//! answers a target it cannot authorize (HTTP 401 `UnauthorizedException`), as every
+//! resource lookup in this service does: whether the account holds the resource is not
+//! information this API discloses.
 //!
 //! ## Shape of an operation
 //!
@@ -208,6 +214,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The `resourceArn` is read as an ARN before anything resolves a target: the model
+        // gives that member no identifier syntax, so a value this surface cannot read an
+        // ARN out of reaches this handler, where it names no resource to authorize and is a
+        // request-shape failure — the front door's own 400, ahead of the authorization
+        // refusal below, and the same refusal the other two tagging operations state for the
+        // same value. Decided from the REQUEST alone, so nothing is written and nothing
+        // about what this account holds is disclosed.
+        if !crate::state::is_resource_arn(&input.resource_arn) {
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "TagResource",
+                akid = %akid,
+                region = %region,
+                resource_arn = ?input.resource_arn,
+                tag_keys = ?tag_keys,
+                tag_count,
+                outcome = "refused",
+                reason = "resourceArn is not a well-formed ARN",
+                "state-changing operation"
+            );
+            return Err(crate::scaffolded::Scaffolded::invalid_resource_arn());
+        }
 
         // The reserved tag-key namespace is AWS's own
         // ([`crate::state::RESERVED_TAG_KEY_PREFIX`]): a key under it may not be created or

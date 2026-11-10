@@ -21,7 +21,9 @@
 //!   that recorded the token answered, however the rest of that request differs from it, so
 //!   no refusal of this operation is keyed on a token;
 //! * `queryIdentifier` must name a query of THAT inquiry, so one it does not own is
-//!   refused with the modelled `ValidationException` naming the member;
+//!   refused with the modelled `ValidationException` naming the member, and a submission
+//!   that names a query must name the `responseRevisionId` of the response it is feedback
+//!   on — `question_level_feedback_revision.rs` pins that requirement over its own table;
 //! * an inquiry id the store does not hold is refused the way every other inquiry
 //!   operation refuses it — the front door's 401 `UnauthorizedException`;
 //! * recording feedback changes nothing a later reader of the inquiry's own record sees.
@@ -389,6 +391,7 @@ fn cases() -> Vec<Case> {
             inquiry: text_body("Encryption", "Is data encrypted at rest?"),
             submission: Submission::rated(RATINGS[1])
                 .on_query(1)
+                .on_revision(1)
                 .because(&REASON_CODES)
                 .commenting("The answer missed the EU regions."),
             after_terminal: true,
@@ -408,6 +411,7 @@ fn cases() -> Vec<Case> {
             inquiry: text_body("Subprocessors", "Who are the subprocessors?"),
             submission: Submission::rated(RATINGS[0])
                 .on_query(1)
+                .on_revision(2)
                 .because(&[
                     REASON_CODES[1],
                     REASON_CODES[0],
@@ -826,11 +830,11 @@ async fn one_response_version_accepts_exactly_one_feedback() {
                 .with_token("token-shared"),
         ),
         (
-            "no revision named by either request",
+            "the inquiry's response as a whole at a named revision",
             Submission::rated(RATINGS[1])
-                .on_query(1)
+                .on_revision(3)
                 .because(&[REASON_CODES[2]]),
-            Submission::rated(RATINGS[0]).on_query(1).with_token("token-no-revision"),
+            Submission::rated(RATINGS[0]).on_revision(3).with_token("token-no-query"),
         ),
         (
             "the inquiry's response as a whole, rated twice",
@@ -921,8 +925,8 @@ async fn one_response_version_accepts_exactly_one_feedback() {
 async fn feedback_on_another_response_version_is_a_record_of_its_own() {
     // Each row is a pair of submissions on ONE inquiry that target DIFFERENT response
     // versions, so both are recorded. The rows differ along which coordinate of the version
-    // the two requests differ in — the query, the revision, or a revision named against
-    // none — and along the values and bounds those coordinates take.
+    // the two requests differ in — the query or the revision — and along the values and
+    // bounds those coordinates take.
     let rows: Vec<(&str, Submission, Submission)> = vec![
         (
             "two revisions of the same query",
@@ -930,14 +934,14 @@ async fn feedback_on_another_response_version_is_a_record_of_its_own() {
             Submission::rated(RATINGS[1]).on_query(1).on_revision(1),
         ),
         (
-            "the same query, with and without a revision",
-            Submission::rated(RATINGS[0]).on_query(1),
-            Submission::rated(RATINGS[1]).on_query(1).on_revision(0),
+            "the same query at two revisions one apart",
+            Submission::rated(RATINGS[0]).on_query(1).on_revision(4),
+            Submission::rated(RATINGS[1]).on_query(1).on_revision(5),
         ),
         (
             "the inquiry's response as a whole and one of its queries",
             Submission::rated(RATINGS[0]),
-            Submission::rated(RATINGS[0]).on_query(1),
+            Submission::rated(RATINGS[0]).on_query(1).on_revision(0),
         ),
         (
             "two revisions of the inquiry's response as a whole",
@@ -1078,6 +1082,7 @@ async fn recording_feedback_changes_nothing_a_later_reader_of_the_inquiry_sees()
         &router,
         &Submission::rated(RATINGS[1])
             .on_query(1)
+            .on_revision(1)
             .commenting("Not specific enough.")
             .body(&inquiry_id),
     )

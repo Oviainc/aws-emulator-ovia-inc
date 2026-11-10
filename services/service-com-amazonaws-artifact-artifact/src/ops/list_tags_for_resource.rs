@@ -14,21 +14,27 @@
 //! the collection it listed, and an absent member is a different answer for a client
 //! that reads `tags` without a default.
 //!
-//! A `resourceArn` this account holds no resource for — one that is not an ARN at all,
-//! or an ARN of another account, region or service — is refused the way the AWS front
-//! door refuses every target it cannot authorize: HTTP 401 `UnauthorizedException`
+//! The `resourceArn` is read as an ARN before anything resolves a target: the model gives
+//! `LongStringAttribute` no identifier syntax (see `crate::service`), so a value that is
+//! not a well-formed ARN reaches this handler, where it is a REQUEST-SHAPE failure and not
+//! an authorization one — there is no resource ARN to authorize — and is refused with the
+//! front door's own 400 `BadRequestException` request shape
+//! ([`crate::scaffolded::Scaffolded::invalid_resource_arn`]), stating the ARN parse
+//! failure: the same refusal the two tag WRITES state for the same value.
+//!
+//! An ARN this surface CAN read and this account holds no resource for — an ARN of another
+//! account, region, service or resource type — is refused the way the AWS front door
+//! refuses every target it cannot authorize: HTTP 401 `UnauthorizedException`
 //! ([`crate::scaffolded::Scaffolded::unauthorized`]), ahead of this service's own
-//! not-found, exactly as the report and inquiry read paths beside it do. The gateway
-//! cannot make that judgement for a `resourceArn` itself — the model gives
-//! `LongStringAttribute` no identifier syntax, see `crate::service` — so this handler
-//! makes it from state and answers the same refusal.
+//! not-found, exactly as the report and inquiry read paths beside it do. That judgement is
+//! about this service's STATE, so this handler makes it.
 //!
 //! The modelled `ResourceNotFoundException` (404) is therefore NOT reachable here, and
 //! that is deliberate rather than unimplemented: the front door's refusal precedes this
-//! service's not-found for every target it authorizes, so an ARN naming nothing, naming
-//! another account's resource, or naming a resource of this service that carries no
-//! tags (a report is service-owned and carries none) all answer the one 401 instead —
-//! which is also what stops a tag read being used to probe for a resource.
+//! service's not-found for every target it authorizes, so an ARN naming no resource of
+//! this account, naming another account's resource, or naming a resource of this service
+//! that carries no tags (a report is service-owned and carries none) all answer the one
+//! 401 instead — which is also what stops a tag read being used to probe for a resource.
 //!
 //! ## Shape of an operation
 //!
@@ -174,6 +180,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The ARN is read BEFORE the target is resolved: a value this surface cannot read
+        // an ARN out of names no resource to authorize, so it is the request-shape refusal
+        // the two tag writes state for the same value rather than the authorization one
+        // below. Decided from the REQUEST alone, so the answer neither depends on nor
+        // discloses what this account holds.
+        if !crate::state::is_resource_arn(&input.resource_arn) {
+            return Err(crate::scaffolded::Scaffolded::invalid_resource_arn());
+        }
 
         let store = state.lock();
         let Some(resource) = store.tagged_resource(&input.resource_arn) else {

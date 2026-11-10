@@ -5,9 +5,9 @@
 //! One rule is pinned here, over a SET of documents rather than any one of them:
 //! **an announced document URL resolves.** The `documentPresignedUrl` `GetReport` and
 //! `GetTermForReport` answer with is fetchable over plain HTTP and serves the stored
-//! document, under the content type that document's file name implies — and, where the
-//! report's `acceptanceType` requires the explicit acceptance of its term, only under a
-//! term grant covering the TERM governing that report. Fetching it changes nothing.
+//! document, under the content type that document's file name implies — and only under the
+//! receipt that URL carries: a term grant covering the TERM governing that report,
+//! whatever the report's `acceptanceType`. Fetching it changes nothing.
 //!
 //! Every assertion goes through the router, so each case exercises the same path a
 //! client takes: routing, the front door, the handler, the persisted state and
@@ -466,13 +466,15 @@ async fn a_document_is_served_only_under_a_grant_for_its_term() {
 }
 
 #[tokio::test]
-async fn a_report_requiring_no_acceptance_serves_its_document_without_a_grant() {
+async fn a_report_requiring_no_acceptance_still_serves_its_document_only_under_a_grant() {
     let router = emulator();
 
     // The rule generalises over the report, so the rows are every (report, version) the
     // catalog publishes whose `acceptanceType` requires no explicit acceptance of its
-    // term — reports with one version and reports with several. Nothing here accepts a
-    // term: `GetTermForReport` is never called, so this emulator holds no grant at all.
+    // term — reports with one version and reports with several. The acceptance type says
+    // whether a client has to show the term document to a person, not whether the receipt
+    // is needed: with no grant minted, the download is refused; once the term is accepted,
+    // the same request is served and its URL resolves.
     let mut covered = 0usize;
     for (id, versions) in catalog(&router).await {
         if acceptance_type(&router, &id).await != ACCEPTANCE_PASSTHROUGH {
@@ -480,15 +482,48 @@ async fn a_report_requiring_no_acceptance_serves_its_document_without_a_grant() 
         }
         for version in versions {
             let case = format!("{id} v{version}");
-            let download = get(
+            let refused = get(
                 &router,
                 &format!("/v1/report/get?reportId={id}&reportVersion={version}&termToken=unaccepted"),
             )
             .await;
             assert_eq!(
+                refused.status, 400,
+                "case {case:?}: a token no acceptance minted must be refused whatever the \
+                 acceptance type, got {} with {:?}",
+                refused.status, refused.body
+            );
+            assert!(
+                refused.body["documentPresignedUrl"].is_null(),
+                "case {case:?}: a refused download must announce no URL, got {:?}",
+                refused.body
+            );
+
+            let term = get(
+                &router,
+                &format!("/v1/report/getTermForReport?reportId={id}&reportVersion={version}"),
+            )
+            .await;
+            assert_eq!(
+                term.status, 200,
+                "case {case:?}: the term must be served, got {} with {:?}",
+                term.status, term.body
+            );
+            let token = term.body["termToken"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let download = get(
+                &router,
+                &format!(
+                    "/v1/report/get?reportId={id}&reportVersion={version}&termToken={token}"
+                ),
+            )
+            .await;
+            assert_eq!(
                 download.status, 200,
-                "case {case:?}: a report requiring no acceptance must be served, got {} \
-                 with {:?}",
+                "case {case:?}: the receipt its own acceptance minted must download the \
+                 report, got {} with {:?}",
                 download.status, download.body
             );
             let url = fetchable(
@@ -511,22 +546,22 @@ async fn a_report_requiring_no_acceptance_serves_its_document_without_a_grant() 
                 String::from_utf8_lossy(&document.bytes[..document.bytes.len().min(16)])
             );
 
-            // Including with no term token on it at all: there is no acceptance for one
-            // to be the receipt of.
+            // And the data plane applies the same rule: the receipt the URL carries is what
+            // authorises the fetch, so the same path without it serves nothing.
             let path = url
                 .split_once('?')
                 .map_or(url.as_str(), |(path, _)| path)
                 .to_string();
             let bare = get_unsigned(&router, &path).await;
             assert_eq!(
-                bare.status, 200,
-                "case {case:?}: an ungated document needs no token to fetch, got {} with {:?}",
+                bare.status, 403,
+                "case {case:?}: a fetch carrying no receipt must be refused, got {} with {:?}",
                 bare.status,
                 String::from_utf8_lossy(&bare.bytes)
             );
-            assert_eq!(
-                bare.bytes, document.bytes,
-                "case {case:?}: both fetches must serve the same document"
+            assert!(
+                !bare.bytes.starts_with(b"%PDF-"),
+                "case {case:?}: a refused fetch must serve no document"
             );
             covered += 1;
         }

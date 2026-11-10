@@ -315,6 +315,7 @@ async fn a_recorded_submission_reports_submitted_at_as_an_rfc3339_date_time_stri
             json!({
                 "rating": RATINGS[0],
                 "queryIdentifier": 1,
+                "responseRevisionId": 2,
                 "clientToken": "token-submitted-at",
             }),
             false,

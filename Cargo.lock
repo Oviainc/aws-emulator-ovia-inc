@@ -9045,6 +9045,7 @@ dependencies = [
  "pdf-writer",
  "percent-encoding",
  "serde_json",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",

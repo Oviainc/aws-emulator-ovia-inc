@@ -96,6 +96,12 @@ use crate::ops::types::{
     ValidationExceptionField, NOTIFICATION_SUBSCRIPTION_STATUS_VALUES,
 };
 
+/// The ARN syntax the tagging surface reads a caller-supplied `resourceArn` against.
+/// Re-exported by name, so a handler reaches it through `crate::state` like every other
+/// rule this module decides.
+mod resource_arn;
+pub use resource_arn::is_resource_arn;
+
 /// The region a report ARN names when the request carries no SigV4 credential scope to
 /// read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -546,10 +552,14 @@ pub struct Report {
     pub category: String,
     pub company_name: String,
     pub product_name: String,
-    /// One of `AcceptanceType`'s values: [`ACCEPTANCE_TYPE_EXPLICIT`] requires
-    /// click-through acceptance of the report's term,
-    /// [`ACCEPTANCE_TYPE_PASSTHROUGH`] does not — which is what
-    /// [`Report::requires_explicit_acceptance`] decides a download by.
+    /// One of `AcceptanceType`'s values: [`ACCEPTANCE_TYPE_EXPLICIT`] requires the
+    /// click-through acceptance of the report's term and
+    /// [`ACCEPTANCE_TYPE_PASSTHROUGH`] does not.
+    ///
+    /// A REPORTED attribute: it tells a client whether it has to put the term document in
+    /// front of a person before asking for the receipt, and it decides nothing about the
+    /// receipt itself — `GetReport` requires a `termToken` of every download whatever this
+    /// value is ([`ComAmazonawsArtifactArtifactState::download_authorised`]).
     pub acceptance_type: String,
     /// The TERM document governing this report: the thing a caller accepts to download
     /// any version of it. One per report, not per version — which is why a term grant
@@ -581,17 +591,6 @@ impl Report {
             Some(version) => self.versions.get(&version),
             None => self.versions.values().next_back(),
         }
-    }
-
-    /// Whether downloading any version of this report requires the explicit
-    /// click-through acceptance of the term governing it — the distinction its stored
-    /// `AcceptanceType` is for.
-    ///
-    /// A value this emulator does not publish is read as requiring the acceptance: an
-    /// acceptance type is a requirement, and only the one that names itself as waiving
-    /// it waives it.
-    pub fn requires_explicit_acceptance(&self) -> bool {
-        self.acceptance_type != ACCEPTANCE_TYPE_PASSTHROUGH
     }
 
     /// The `ReportSummary` projection `ListReports` and `ListReportVersions` return for
@@ -1754,13 +1753,18 @@ impl ComAmazonawsArtifactArtifactState {
     /// Whether a download of `report` presenting `token` is authorised.
     ///
     /// The one place the download rule is decided, so `GetReport` and the document data
-    /// plane cannot disagree about which report downloads under which token. A report
-    /// whose acceptance type requires the explicit click-through acceptance of its term
-    /// downloads only under a grant covering that term ([`Self::grant_covers`]); a report
-    /// that requires no such acceptance downloads without one, because there is no
-    /// acceptance for a grant to be the receipt of.
+    /// plane cannot disagree about which report downloads under which token: a download is
+    /// served only under a grant covering the term governing that report
+    /// ([`Self::grant_covers`]), and nothing else is a receipt.
+    ///
+    /// The report's `AcceptanceType` does not enter into it. `GetReport`'s `termToken` is
+    /// `@required` and documented as the "Unique download token provided by
+    /// GetTermForReport API", so a value no acceptance of this service ever minted is not a
+    /// token on any report; what the acceptance type says is whether the caller has to be
+    /// shown the term document before asking for one, which is a statement about the
+    /// client's flow and not about which receipts this service issued.
     pub fn download_authorised(&self, token: &str, report: &Report) -> bool {
-        !report.requires_explicit_acceptance() || self.grant_covers(token, report)
+        self.grant_covers(token, report)
     }
 
     /// The stored document a data-plane path names, when this service holds it: the
@@ -2654,6 +2658,33 @@ pub fn feedback_already_submitted(inquiry_id: &str) -> ConflictException {
 /// The message [`feedback_already_submitted`] states, as AWS states it for this condition.
 pub const FEEDBACK_ALREADY_SUBMITTED_MESSAGE: &str =
     "Feedback already submitted for this response version.";
+
+/// The modelled `ValidationException` for a QUESTION-LEVEL feedback submission that names
+/// no response revision — feedback on one query of an inquiry, with nothing saying which
+/// version of that query's response it is feedback on.
+///
+/// The requirement is the condition: `responseRevisionId` is what identifies the response
+/// version a rating is about ("use this value to prevent submitting feedback on a stale
+/// response"), so a submission scoped to a single query has to carry it, while one on the
+/// inquiry's response as a whole names no query and no revision of one.
+///
+/// The message is the service's own fixed sentence for this condition
+/// ([`QUESTION_LEVEL_REVISION_REQUIRED_MESSAGE`]) rather than the field-clause envelope
+/// [`field_validation_failed`] renders, so there is no clause for `fieldList` to name a
+/// member with; `reason` is `ValidationExceptionReason`'s `fieldValidationFailed`, because
+/// what the request failed on is a member of its own input.
+pub fn question_level_revision_required() -> ValidationException {
+    ValidationException {
+        message: QUESTION_LEVEL_REVISION_REQUIRED_MESSAGE.to_string(),
+        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: None,
+    }
+}
+
+/// The message [`question_level_revision_required`] states, as AWS states it for this
+/// condition: one fixed sentence that interpolates nothing from the request.
+pub const QUESTION_LEVEL_REVISION_REQUIRED_MESSAGE: &str =
+    "expectedResponseRevisionId is required for question-level feedback submission.";
 
 /// The modelled `ValidationException` for a token this service never issued, carrying
 /// `ValidationExceptionReason`'s `invalidToken`.
