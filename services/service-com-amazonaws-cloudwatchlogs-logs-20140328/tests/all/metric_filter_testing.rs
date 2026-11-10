@@ -432,8 +432,10 @@ async fn an_event_number_is_the_position_in_the_sample_sent() {
     );
 }
 
-/// Every defect the filter-pattern syntax has is refused as a bad parameter, with the
-/// message that states which defect it is — and nothing is written while refusing.
+/// Every defect the filter-pattern syntax has is refused as a bad parameter, with the one
+/// fixed text the service answers for a METRIC filter's pattern it cannot read — and nothing
+/// is written while refusing. The two defects that carry a message of their own are the
+/// bracketed form that closes with the wrong delimiter and the regular-expression quota.
 #[tokio::test]
 async fn a_pattern_that_does_not_parse_is_refused() {
     let logs = Logs::new();
@@ -443,6 +445,9 @@ async fn a_pattern_that_does_not_parse_is_refused() {
         "a single filter pattern can contain at most {MAX_REGEX_PER_PATTERN} regular \
          expression patterns"
     );
+    // Source: the recorded refusal for a metric filter's `filterPattern` the service cannot
+    // read, which carries this text and no detail about what it could not read.
+    let unreadable = "Invalid metric filter pattern".to_string();
 
     let cases: [(&str, String); 18] = [
         (
@@ -453,83 +458,33 @@ async fn a_pattern_that_does_not_parse_is_refused() {
             "{$.a = 1",
             "If a filter pattern starts with '{' it must end with '}'".to_string(),
         ),
-        (
-            "[a, \"b]",
-            "Invalid filter pattern: a quoted string is not terminated".to_string(),
-        ),
-        (
-            "[%a]",
-            "Invalid filter pattern: a regular expression is not terminated".to_string(),
-        ),
-        (
-            "[a, b]]",
-            "Invalid filter pattern: the brackets in a '[' … ']' filter pattern must be \
-             balanced"
-                .to_string(),
-        ),
-        (
-            "[]",
-            "Invalid filter pattern: a space-delimited pattern names at least one field"
-                .to_string(),
-        ),
-        (
-            "[a, ..., b, ..., c]",
-            "Invalid filter pattern: a space-delimited pattern uses '...' at most once"
-                .to_string(),
-        ),
-        (
-            "[a, b, c = 1 && $z9 = 2]",
-            "Invalid filter pattern: '$z9' names no field this pattern declares".to_string(),
-        ),
-        (
-            "{}",
-            "Invalid filter pattern: a JSON pattern states at least one condition on a '$.' \
-             selector"
-                .to_string(),
-        ),
-        (
-            "{$a = 1}",
-            "Invalid filter pattern: a JSON pattern selects a field with '$.', got '$a'"
-                .to_string(),
-        ),
+        // A quoted string, a regular-expression literal or a bracket the pattern never
+        // closes.
+        ("[a, \"b]", unreadable.clone()),
+        ("[%a]", unreadable.clone()),
+        ("[a, b]]", unreadable.clone()),
+        // A space-delimited pattern that names no field, or uses the `...` wildcard twice,
+        // or whose condition names a field it never declared.
+        ("[]", unreadable.clone()),
+        ("[a, ..., b, ..., c]", unreadable.clone()),
+        ("[a, b, c = 1 && $z9 = 2]", unreadable.clone()),
+        // A JSON pattern that states no condition on a `$.` selector, or selects a field
+        // some other way.
+        ("{}", unreadable.clone()),
+        ("{$a = 1}", unreadable.clone()),
         // A condition states its structure with `&&`, `||` and `( )`; a comma is no part of
         // it, and neither is a single `&` or `|`.
-        (
-            "{$.a = 1, $.b = 2}",
-            "Invalid filter pattern: the condition does not parse".to_string(),
-        ),
-        (
-            "[a, (b,c)]",
-            "Invalid filter pattern: the condition does not parse".to_string(),
-        ),
-        (
-            "{$.a = 1 & $.b = 2}",
-            "Invalid filter pattern: the condition does not parse".to_string(),
-        ),
-        (
-            "{$.a = 1 | $.b = 2}",
-            "Invalid filter pattern: the condition does not parse".to_string(),
-        ),
+        ("{$.a = 1, $.b = 2}", unreadable.clone()),
+        ("[a, (b,c)]", unreadable.clone()),
+        ("{$.a = 1 & $.b = 2}", unreadable.clone()),
+        ("{$.a = 1 | $.b = 2}", unreadable.clone()),
         // A `?` or `-` prefixes a term; one that prefixes nothing names no term, whether the
         // pattern ends there or whitespace follows it.
-        (
-            "ERROR - x",
-            "Invalid filter pattern: '?' and '-' each prefix a term, and this one prefixes \
-             nothing"
-                .to_string(),
-        ),
-        (
-            "ERROR ?",
-            "Invalid filter pattern: '?' and '-' each prefix a term, and this one prefixes \
-             nothing"
-                .to_string(),
-        ),
-        // A `$.path` segment is a member name and the decimal indices applied to it; a
-        // bracket group that is no index selects nothing.
-        (
-            "{$.a[x] = 1}",
-            "Invalid filter pattern: '$.a[x]' selects no field".to_string(),
-        ),
+        ("ERROR - x", unreadable.clone()),
+        ("ERROR ?", unreadable.clone()),
+        // A `$.path` segment is a member name and the element selectors applied to it; a
+        // bracket group that is neither an index nor `*` selects nothing.
+        ("{$.a[x] = 1}", unreadable.clone()),
         (three_regexes, quota),
     ];
 

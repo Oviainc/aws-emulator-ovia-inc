@@ -186,7 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // create holds the member to rather than storing a pattern that can never match. It
         // is checked before the store is touched, so a refused update changes nothing.
         if let Some(pattern) = input.filter_pattern.as_deref() {
-            if let Err(message) = crate::state::validate_filter_pattern(pattern) {
+            if let Err(message) =
+                crate::state::filter_pattern::validate_configured_pattern(pattern)
+            {
                 return Err(invalid_parameter(message));
             }
         }

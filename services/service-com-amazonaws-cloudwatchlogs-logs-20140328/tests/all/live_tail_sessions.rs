@@ -2,8 +2,11 @@
 
 //! `StartLiveTail` sessions over the stored log events, end to end over the wire.
 //!
-//! RULE: a Live Tail session is served as HTTP 200 whose body is an AWS event stream —
-//! "A single LiveTailSessionStart object is sent at the start of the session", then a
+//! RULE: a Live Tail session is served as HTTP 200 whose body is an AWS event stream that
+//! OPENS with the frame a client reads the output shape itself out of (`:event-type`
+//! `initial-response`) — a client that does not find it there reads none of the frames
+//! behind it — and then carries "A single LiveTailSessionStart object […] at the start of
+//! the session", then a
 //! `LiveTailSessionUpdate` whose "array of log events" holds the events of the log
 //! groups the request named that every selector of the request admits (`logStreamNames`
 //! "only log events in the log streams that you specify here", `logStreamNamePrefixes`,
@@ -37,6 +40,11 @@ const SYS_ONE: &str = "sys-one";
 
 /// The media type an event-stream body carries.
 const EVENT_STREAM: &str = "application/vnd.amazon.eventstream";
+
+/// The `:event-type` of the frame an event-stream response opens with, which carries the
+/// output's non-stream members (source:
+/// `service_common::event_stream::INITIAL_RESPONSE_EVENT`).
+const INITIAL_RESPONSE: &str = "initial-response";
 
 /// One stored event: the group and stream it is written to, its offset from the suite's
 /// base instant and its message. The offsets are distinct across BOTH groups, so the
@@ -189,10 +197,21 @@ async fn session(case: &str, logs: &Logs, request: &Value) -> (Value, Value) {
         .collect();
     assert_eq!(
         types,
-        vec!["sessionStart", "sessionUpdate"],
-        "case {case:?}: a session sends one sessionStart then its update, got {types:?}"
+        vec![INITIAL_RESPONSE, "sessionStart", "sessionUpdate"],
+        "case {case:?}: a session opens with the frame the output shape arrives in, then \
+         sends one sessionStart and its update, got {types:?}"
     );
     let mut frames = frames.into_iter();
+    let initial = frames
+        .next()
+        .unwrap_or_else(|| panic!("case {case:?}: the session sent no initial response"))
+        .payload;
+    assert_eq!(
+        initial,
+        json!({}),
+        "case {case:?}: StartLiveTailResponse's only member is the stream, so the initial \
+         response carries none, got {initial}"
+    );
     let start = frames
         .next()
         .unwrap_or_else(|| panic!("case {case:?}: the session sent no sessionStart"))
@@ -627,7 +646,7 @@ struct Refusal {
 
 /// The refusal table. Every modelled error of this operation is a client error at HTTP
 /// 400, which [`Logs::refusal`] asserts for each row.
-const REFUSALS: [Refusal; 10] = [
+const REFUSALS: [Refusal; 11] = [
     Refusal {
         case: "a log group name the account does not hold",
         request: |_| json!({"logGroupIdentifiers": ["/aws/emulator/never-created"]}),
@@ -669,14 +688,25 @@ const REFUSALS: [Refusal; 10] = [
         message: "logStreamNames and logStreamNamePrefixes are mutually exclusive parameters.",
     },
     Refusal {
-        case: "a log stream selector across two log groups",
+        case: "named log streams across two log groups",
         request: |_| json!({
             "logGroupIdentifiers": [GROUP_A, GROUP_B],
             "logStreamNames": [APP_ONE],
         }),
         code: "InvalidParameterException",
-        message: "logStreamNames and logStreamNamePrefixes can be specified only with a single \
-                  log group in logGroupIdentifiers.",
+        message: "LogStreamNames provided with more than one LogGroupIdentifier. \
+                  LogStreamNames is disabled if more than one LogGroupIdentifier is provided.",
+    },
+    Refusal {
+        case: "log stream prefixes across two log groups",
+        request: |_| json!({
+            "logGroupIdentifiers": [GROUP_A, GROUP_B],
+            "logStreamNamePrefixes": ["app-"],
+        }),
+        code: "InvalidParameterException",
+        message: "LogStreamPrefixes provided with more than one LogGroupIdentifier. \
+                  LogStreamPrefixes is disabled if more than one LogGroupIdentifier is \
+                  provided.",
     },
     Refusal {
         case: "no logGroupIdentifiers at all, which the model requires",

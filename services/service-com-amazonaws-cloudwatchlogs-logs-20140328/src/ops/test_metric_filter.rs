@@ -151,8 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pattern that does not parse describes no log events at all, so there is no
         // verdict to report for it: it is a bad PARAMETER, refused by the same reading of
         // the filter-pattern syntax that refuses a configuration write — and checked FIRST,
-        // because what a pattern IS precedes what it may carry.
+        // because what a pattern IS precedes what it may carry. This member carries a METRIC
+        // FILTER's pattern ("Tests the filter pattern of a metric filter against a sample of
+        // log event messages"), so an unreadable one is refused by the name the service
+        // gives that kind of pattern
+        // ([`crate::state::filter_pattern::as_metric_pattern_refusal`]).
         let pattern = crate::state::filter_pattern::FilterPattern::parse(&input.filter_pattern)
+            .map_err(crate::state::filter_pattern::as_metric_pattern_refusal)
             .map_err(invalid)?;
 
         // "Using regular expressions in filter patterns is supported. For these filters,

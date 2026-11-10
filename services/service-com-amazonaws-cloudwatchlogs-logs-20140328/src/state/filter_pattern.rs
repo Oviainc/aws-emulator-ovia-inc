@@ -13,8 +13,10 @@
 //! reading `super::FILTER_PATTERN_DELIMITERS` records:
 //!
 //! * `{ … }` — a JSON pattern: conditions over the fields of an event that IS a JSON
-//!   document, each field selected with `$.path`. An event that is not JSON matches no JSON
-//!   pattern.
+//!   document, each field selected with `$.path`. A path segment may index into an array
+//!   member — `$.arr[0]` names one element and `$.arr[*]` names every element, so a
+//!   condition on the latter holds when one element satisfies it. An event that is not JSON
+//!   matches no JSON pattern.
 //! * `[ … ]` — a space-delimited pattern: a comma-separated field list, optionally with
 //!   conditions on the fields it names, matched against the event's fields. A field of the
 //!   EVENT is a run of non-space characters, except that a `"…"` or `[…]` group is ONE field
@@ -108,11 +110,63 @@ const MAX_COMPILED_REGEX_BYTES: usize = 1 << 20;
 /// The wildcard a space-delimited field list uses to stand for any number of fields.
 const ELLIPSIS: &str = "...";
 
-/// How every refusal this module answers opens, so one sentence states the member at fault
-/// and the next states the defect. The same opening
-/// `super::validate_filter_pattern` uses for the defects it detects, because both are
-/// answering the same question about the same member.
-const INVALID_PATTERN: &str = "Invalid filter pattern";
+/// The fixed text CloudWatch Logs refuses an unreadable `filterPattern` with: the whole
+/// message for the class, with NO detail appended — a pattern whose structure or whose
+/// conditions the service cannot read is refused with exactly this sentence, whatever about
+/// it did not read, because that is the one text the service answers for the class. The two
+/// defects that have a message of their OWN are the only exceptions: a bracketed form that
+/// closes with the wrong delimiter (`super::validate_filter_pattern`) and a term carrying a
+/// character the grammar admits nowhere ([`invalid_characters_in_term`]).
+pub const INVALID_PATTERN: &str = "Invalid filter pattern";
+
+/// [`INVALID_PATTERN`] as a refusal: the message every reader below hands back when it
+/// cannot read the pattern it was given.
+fn invalid_pattern() -> String {
+    INVALID_PATTERN.to_string()
+}
+
+/// The fixed text the service refuses an unreadable pattern of a METRIC FILTER with: the
+/// same message as [`INVALID_PATTERN`] for the same defect, naming the kind of pattern the
+/// member carries. The members that take a metric filter's pattern are `PutMetricFilter`'s
+/// and `TestMetricFilter`'s ("Tests the filter pattern of a metric filter against a sample
+/// of log event messages"); every other `filterPattern` is a log-event filter pattern.
+pub const INVALID_METRIC_PATTERN: &str = "Invalid metric filter pattern";
+
+/// `refusal` as the refusal of a METRIC filter's pattern.
+///
+/// The one fixed text for a pattern the service cannot read is the metric one for a member
+/// that carries a metric filter's pattern; every other refusal the reading answers — the
+/// delimiter rule, a term carrying a character the grammar admits nowhere — is one sentence
+/// for either member and is handed back as it is.
+#[must_use]
+pub fn as_metric_pattern_refusal(refusal: String) -> String {
+    if refusal == INVALID_PATTERN {
+        return INVALID_METRIC_PATTERN.to_string();
+    }
+    refusal
+}
+
+/// Hold a `filterPattern` a request CONFIGURES to what a configuration write reads of it:
+/// the bracket, quote and expression structure of any form (`super::validate_filter_pattern`),
+/// and, for one of the syntax's STRUCTURED forms (`{ … }` and `[ … ]`), the whole condition —
+/// a stored pattern whose conditions the service cannot read could never select a log event,
+/// so it is refused where it is written rather than at every later read.
+///
+/// An UNSTRUCTURED pattern is held to its structure only: its terms are read by whatever
+/// RUNS it, which is the side that reports a term the running grammar does not admit.
+pub fn validate_configured_pattern(pattern: &str) -> Result<(), String> {
+    super::validate_filter_pattern(pattern)?;
+    if !opens_a_structured_form(pattern) {
+        return Ok(());
+    }
+    FilterPattern::parse(pattern).map(|_| ())
+}
+
+/// Whether `pattern` opens one of the syntax's structured forms, which is what its first
+/// character says (`super::FILTER_PATTERN_DELIMITERS`).
+fn opens_a_structured_form(pattern: &str) -> bool {
+    pattern.trim().starts_with(['{', '['])
+}
 
 /// How the service refuses a TERM of an unstructured pattern that carries a character the
 /// pattern grammar admits nowhere in it: the fixed sentence, naming the term the request
@@ -134,15 +188,18 @@ fn term_text(characters: &[char], at: usize) -> String {
 }
 
 /// Whether `character` may appear in a BARE term of an unstructured pattern: the syntax's
-/// own word characters, which are the alphanumerics and `_`. Everything else — a delimiter,
-/// a punctuation mark, a path separator — is spelled inside a `"…"` string or a `%…%`
-/// regular expression, which is what the syntax gives a term carrying one: the filter and
-/// pattern syntax the `filterPattern` members point at states that a term including
-/// characters other than these is enclosed in double quotes, and the service refuses the
-/// ones that are not (recorded for a quote, a colon and a slash alike). A letter outside
-/// ASCII is still a letter and so is admitted: what the refusals name is the punctuation.
+/// own word characters — the alphanumerics, `_` and the `-` an ordinary word carries inside
+/// it. Everything else — a delimiter, a punctuation mark, a path separator — is spelled
+/// inside a `"…"` string or a `%…%` regular expression, which is what the syntax gives a
+/// term carrying one: the filter and pattern syntax the `filterPattern` members point at
+/// states that a term including characters other than these is enclosed in double quotes,
+/// and the service refuses the ones that are not (recorded for a quote, a colon and a slash
+/// alike). A `-` is admitted because a term that carries one is accepted as the term it
+/// spells (recorded); only a `-` where a term STARTS is the exclusion prefix, which the
+/// pattern's own walk reads before a term is read. A letter outside ASCII is still a letter
+/// and so is admitted: what the refusals name is the punctuation.
 fn is_term_character(character: char) -> bool {
-    character.is_alphanumeric() || character == '_'
+    character.is_alphanumeric() || matches!(character, '_' | '-')
 }
 
 /// A `filterPattern` parsed into the form it is RUN in.
@@ -164,9 +221,7 @@ impl FilterPattern {
     pub fn parse(pattern: &str) -> Result<Self, String> {
         // The module's own input bound, so nothing below scans more than this.
         if pattern.chars().count() > MAX_PATTERN_CHARS {
-            return Err(format!(
-                "{INVALID_PATTERN}: a filter pattern is at most {MAX_PATTERN_CHARS} characters"
-            ));
+            return Err(invalid_pattern());
         }
         // The bracket, quote and regular-expression structure is one rule for every member
         // that takes a filter pattern, so it is checked by the one checker a configuration
@@ -250,7 +305,7 @@ impl TermPattern {
         }
         if parsed.required.is_empty() && parsed.optional.is_empty() && parsed.excluded.is_empty()
         {
-            return Err(format!("{INVALID_PATTERN}: it states no term to match"));
+            return Err(invalid_pattern());
         }
         Ok(parsed)
     }
@@ -295,9 +350,7 @@ impl Term {
 /// refused as [`invalid_characters_in_term`] naming the run of such characters, because the
 /// syntax spells a term carrying one inside a string or an expression instead.
 fn read_term(characters: &[char], at: &mut usize) -> Result<Term, String> {
-    let dangling = || {
-        format!("{INVALID_PATTERN}: '?' and '-' each prefix a term, and this one prefixes nothing")
-    };
+    let dangling = invalid_pattern;
     match characters.get(*at).copied() {
         // Only reachable through a `?` or `-` that prefixes nothing: the pattern's own
         // walk skips whitespace before reading a term.
@@ -394,11 +447,7 @@ fn read_delimited(
             found => text.push(found),
         }
     }
-    Err(if delimiter == '"' {
-        format!("{INVALID_PATTERN}: a quoted string is not terminated")
-    } else {
-        format!("{INVALID_PATTERN}: a regular expression is not terminated")
-    })
+    Err(invalid_pattern())
 }
 
 /// Compile a `%…%` literal under this module's bound, refusing a literal that is no regular
@@ -407,7 +456,7 @@ fn compile(source: &str) -> Result<::regex::Regex, String> {
     ::regex::RegexBuilder::new(source)
         .size_limit(MAX_COMPILED_REGEX_BYTES)
         .build()
-        .map_err(|_| format!("{INVALID_PATTERN}: '%{source}%' is not a regular expression"))
+        .map_err(|_| invalid_pattern())
 }
 
 /// A space-delimited pattern: the field list, and the conditions its fields carry.
@@ -433,9 +482,7 @@ impl SpaceDelimitedPattern {
     /// Parse the inside of a `[ … ]` pattern.
     fn parse(body: &str) -> Result<Self, String> {
         if body.trim().is_empty() {
-            return Err(format!(
-                "{INVALID_PATTERN}: a space-delimited pattern names at least one field"
-            ));
+            return Err(invalid_pattern());
         }
         // Two passes: the field NAMES are what tells a condition's field reference from a
         // literal, and a condition may refer to a field the list names after it.
@@ -455,12 +502,7 @@ impl SpaceDelimitedPattern {
                 None => None,
                 Some(Token::Word(word)) => Some(word.clone()),
                 Some(Token::Selector(selector)) => Some(selector.clone()),
-                Some(_) => {
-                    return Err(format!(
-                        "{INVALID_PATTERN}: a space-delimited pattern's field is named before \
-                         any condition on it"
-                    ))
-                }
+                Some(_) => return Err(invalid_pattern()),
             };
             if let Some(name) = &name {
                 names.insert(name.clone());
@@ -476,9 +518,7 @@ impl SpaceDelimitedPattern {
             }
         }
         if slots.iter().filter(|slot| slot.is_none()).count() > 1 {
-            return Err(format!(
-                "{INVALID_PATTERN}: a space-delimited pattern uses '{ELLIPSIS}' at most once"
-            ));
+            return Err(invalid_pattern());
         }
         let declared = Declared {
             names,
@@ -655,20 +695,14 @@ impl JsonPattern {
     fn parse(body: &str) -> Result<Self, String> {
         let tokens = lex(body)?;
         if tokens.is_empty() {
-            return Err(format!(
-                "{INVALID_PATTERN}: a JSON pattern states at least one condition on a '$.' \
-                 selector"
-            ));
+            return Err(invalid_pattern());
         }
         let condition = parse_expression(&tokens, &Context::Json)?;
         // A JSON pattern is a condition over the event DOCUMENT's fields, so one that
         // selects no field describes no event: `{ foo = 1 }` relates two literals and is
         // not a pattern at all.
         if !condition.references_a_field() {
-            return Err(format!(
-                "{INVALID_PATTERN}: a JSON pattern states at least one condition on a '$.' \
-                 selector"
-            ));
+            return Err(invalid_pattern());
         }
         Ok(Self { condition })
     }
@@ -700,22 +734,64 @@ impl Lookup for JsonDocument<'_> {
     fn value(&self, key: &str) -> FieldValue {
         resolve(self.document, key).map_or(FieldValue::Absent, field_value)
     }
+
+    fn values(&self, key: &str) -> Vec<FieldValue> {
+        let selected = resolve_all(self.document, key);
+        if selected.is_empty() {
+            // A selector the document satisfies nowhere reads as the ABSENT field it is,
+            // exactly as one naming a member the document does not carry does.
+            return vec![FieldValue::Absent];
+        }
+        selected.into_iter().map(field_value).collect()
+    }
 }
 
 /// The node a `$.path` selector names, or `None` when the document carries no such field.
+/// A selector naming every element of an array (`[*]`) resolves to the FIRST element it
+/// selects, which is what a single-valued reader of a selector can report;
+/// [`resolve_all`] is what a condition is run over.
 fn resolve<'a>(document: &'a ::serde_json::Value, selector: &str) -> Option<&'a ::serde_json::Value> {
-    let path = selector.strip_prefix("$.")?;
-    let mut current = document;
+    resolve_all(document, selector).into_iter().next()
+}
+
+/// Every node a `$.path` selector names in `document`.
+///
+/// A path of member names and decimal indices names at most ONE node, so the answer is
+/// empty or a single node. The `[*]` element selector names every element of the array it
+/// is applied to, so a path carrying one names as many nodes as those arrays hold between
+/// them — which is what makes `{$.arr[*] = "red"}` a condition over the array's elements.
+/// The walk is held to [`MAX_SELECTED_NODES`], so a document cannot make one selector
+/// resolve to more nodes than that.
+fn resolve_all<'a>(
+    document: &'a ::serde_json::Value,
+    selector: &str,
+) -> Vec<&'a ::serde_json::Value> {
+    let Some(path) = selector.strip_prefix("$.") else {
+        return Vec::new();
+    };
+    let mut current: Vec<&::serde_json::Value> = vec![document];
     for segment in path.split('.') {
         let (name, indices) = split_indices(segment);
         if !name.is_empty() {
-            current = current.get(name)?;
+            current = current.iter().filter_map(|node| node.get(name)).collect();
         }
         for index in indices {
-            current = current.get(index)?;
+            current = match index {
+                Index::At(at) => current.iter().filter_map(|node| node.get(at)).collect(),
+                Index::Every => current
+                    .iter()
+                    .filter_map(|node| node.as_array())
+                    .flatten()
+                    .take(MAX_SELECTED_NODES)
+                    .collect(),
+            };
+            current.truncate(MAX_SELECTED_NODES);
+        }
+        if current.is_empty() {
+            return Vec::new();
         }
     }
-    Some(current)
+    current
 }
 
 /// The text a `$.path` selector names in one JSON log event, or `None` when the event
@@ -735,8 +811,9 @@ pub fn json_selector_text(document: &::serde_json::Value, selector: &str) -> Opt
     }
 }
 
-/// Whether one segment of a `$.path` selects anything: a member name, followed by the
-/// decimal array indices applied to it. A bracket group that is not a decimal index selects
+/// Whether one segment of a `$.path` selects anything: a member name, followed by the array
+/// element selectors applied to it. An element selector is a decimal index (`[0]`) or the
+/// `[*]` that names every element ([`Index`]); a bracket group that is neither selects
 /// nothing, so a selector carrying one is refused rather than read as if the brackets were
 /// not there.
 fn is_selector_segment(segment: &str) -> bool {
@@ -754,7 +831,7 @@ fn is_selector_segment(segment: &str) -> bool {
         let Some(closed) = opened.find(']') else {
             return false;
         };
-        if opened.get(..closed).is_none_or(|index| index.parse::<usize>().is_err()) {
+        if opened.get(..closed).and_then(Index::read).is_none() {
             return false;
         }
         remaining = opened.get(closed + 1..).unwrap_or_default();
@@ -762,23 +839,54 @@ fn is_selector_segment(segment: &str) -> bool {
     true
 }
 
-/// One path segment split into its member name and the array indices applied to it, so
-/// `items[2]` reads the third element of `items`. The segment has already been held to
-/// [`is_selector_segment`] when the pattern was parsed, so every bracket group here is a
-/// decimal index.
-fn split_indices(segment: &str) -> (&str, Vec<usize>) {
+/// One array element selector of a `$.path` segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Index {
+    /// `[N]`: the element at this position.
+    At(usize),
+    /// `[*]`: every element of the array.
+    Every,
+}
+
+impl Index {
+    /// The element selector `text` spells, between the brackets it was read from, or `None`
+    /// when it spells neither form.
+    fn read(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text == EVERY_ELEMENT {
+            return Some(Self::Every);
+        }
+        text.parse::<usize>().ok().map(Self::At)
+    }
+}
+
+/// The element selector that names EVERY element of an array, as the filter-pattern syntax
+/// spells it: `$.arr[*]`.
+const EVERY_ELEMENT: &str = "*";
+
+/// How many nodes ONE selector may resolve to. THE EMULATOR'S OWN BOUND: `[*]` selects as
+/// many nodes as the event's array holds, and an event is caller-supplied, so the frontier
+/// the walk carries is capped here rather than left to grow with the event.
+const MAX_SELECTED_NODES: usize = 1_024;
+
+/// One path segment split into its member name and the array element selectors applied to
+/// it, so `items[2]` reads the third element of `items` and `items[*]` reads every element.
+/// The segment has already been held to [`is_selector_segment`] when the pattern was
+/// parsed, so every bracket group here is an element selector.
+fn split_indices(segment: &str) -> (&str, Vec<Index>) {
     let Some(at) = segment.find('[') else {
         return (segment, Vec::new());
     };
     let indices = segment[at..]
         .split('[')
         .filter_map(|part| part.strip_suffix(']'))
-        .filter_map(|digits| digits.trim().parse::<usize>().ok())
+        .filter_map(Index::read)
         .collect();
     (&segment[..at], indices)
 }
 
-/// One JSON node as a condition compares it.
+/// One JSON node as a condition compares it. A container node is no value: a selector that
+/// lands on one names a subtree ([`FieldValue::Container`]).
 fn field_value(value: &::serde_json::Value) -> FieldValue {
     match value {
         ::serde_json::Value::Null => FieldValue::Null,
@@ -787,7 +895,7 @@ fn field_value(value: &::serde_json::Value) -> FieldValue {
             .as_f64()
             .map_or_else(|| FieldValue::Text(number.to_string()), FieldValue::Number),
         ::serde_json::Value::String(text) => FieldValue::Text(text.clone()),
-        container => FieldValue::Text(container.to_string()),
+        ::serde_json::Value::Object(_) | ::serde_json::Value::Array(_) => FieldValue::Container,
     }
 }
 
@@ -895,6 +1003,11 @@ enum FieldValue {
     /// A string, which is also how a space-delimited field reads before any comparison
     /// decides to read it as a number.
     Text(String),
+    /// The field is there and is a CONTAINER — a JSON object or array. A selector that lands
+    /// on one names a subtree rather than a value, so the field EXISTS and yet stands in no
+    /// comparison: an element of it is selected with a `[…]` element selector or a further
+    /// member name.
+    Container,
 }
 
 impl FieldValue {
@@ -908,15 +1021,24 @@ impl FieldValue {
         }
     }
 
-    /// This value as text, or `None` for a field the event does not carry.
+    /// This value as text, or `None` for a value that has no text form: a field the event
+    /// does not carry, and a container node, which is a subtree rather than a value.
     fn as_text(&self) -> Option<String> {
         match self {
-            Self::Absent => None,
+            Self::Absent | Self::Container => None,
             Self::Null => Some("null".to_string()),
             Self::Boolean(flag) => Some(flag.to_string()),
             Self::Number(number) => Some(render_number(*number)),
             Self::Text(text) => Some(text.clone()),
         }
+    }
+
+    /// Whether this value can stand in a comparison at all. A field the event does not carry
+    /// and one that lands on a container node have no value to compare, so a comparison
+    /// naming one is unsatisfied whichever relation it states — `!=` included, because only
+    /// `NOT EXISTS` speaks about a field's PRESENCE.
+    fn comparable(&self) -> bool {
+        !matches!(self, Self::Absent | Self::Container)
     }
 }
 
@@ -935,6 +1057,15 @@ trait Lookup {
     /// The value under `key` — a field name or 1-based position for a space-delimited
     /// event, a `$.path` selector for a JSON one.
     fn value(&self, key: &str) -> FieldValue;
+
+    /// EVERY value under `key`. A key names one value unless it selects every element of an
+    /// array (`$.arr[*]`), which is why a condition is run over this rather than over
+    /// [`Self::value`]: a key that selects several values satisfies a predicate when ONE of
+    /// them does. Never empty — a key the event satisfies nowhere reads as one absent value,
+    /// so a selector that selects nothing behaves exactly like one naming a missing member.
+    fn values(&self, key: &str) -> Vec<FieldValue> {
+        vec![self.value(key)]
+    }
 }
 
 /// One condition of a pattern.
@@ -972,9 +1103,15 @@ impl Expression {
                 comparison,
                 right,
             } => compare(left, *comparison, right, lookup),
-            Self::Present(field) => lookup.value(field) != FieldValue::Absent,
-            Self::Missing(field) => lookup.value(field) == FieldValue::Absent,
-            Self::IsNull(field) => lookup.value(field) == FieldValue::Null,
+            Self::Present(field) => lookup
+                .values(field)
+                .iter()
+                .any(|value| *value != FieldValue::Absent),
+            Self::Missing(field) => lookup
+                .values(field)
+                .iter()
+                .all(|value| *value == FieldValue::Absent),
+            Self::IsNull(field) => lookup.values(field).contains(&FieldValue::Null),
         }
     }
 
@@ -1024,13 +1161,18 @@ enum Operand {
 }
 
 impl Operand {
-    /// This operand against one event.
-    fn resolve<L: Lookup>(&self, lookup: &L) -> Resolved<'_> {
+    /// This operand against one event: every value it resolves to, which is one value unless
+    /// it selects every element of an array ([`Lookup::values`]).
+    fn resolve<L: Lookup>(&self, lookup: &L) -> Vec<Resolved<'_>> {
         match self {
-            Self::Field(key) => Resolved::Value(lookup.value(key)),
-            Self::Literal(value) => Resolved::Value(value.clone()),
-            Self::Glob(glob) => Resolved::Glob(glob),
-            Self::Expression(expression) => Resolved::Expression(expression),
+            Self::Field(key) => lookup
+                .values(key)
+                .into_iter()
+                .map(Resolved::Value)
+                .collect(),
+            Self::Literal(value) => vec![Resolved::Value(value.clone())],
+            Self::Glob(glob) => vec![Resolved::Glob(glob)],
+            Self::Expression(expression) => vec![Resolved::Expression(expression)],
         }
     }
 }
@@ -1048,6 +1190,10 @@ enum Resolved<'a> {
 
 /// Whether the two operands stand in `comparison`. Ordering is NUMERIC: `<`, `<=`, `>` and
 /// `>=` relate numbers, so a side that reads as no number stands in no ordering at all.
+///
+/// A side that selects SEVERAL values (`$.arr[*]`) stands in the relation when one of the
+/// values it selects does, which is what makes such a selector a condition over the array's
+/// elements.
 fn compare<L: Lookup>(
     left: &Operand,
     comparison: Comparison,
@@ -1056,12 +1202,35 @@ fn compare<L: Lookup>(
 ) -> bool {
     let left = left.resolve(lookup);
     let right = right.resolve(lookup);
+    left.iter()
+        .flat_map(|left| right.iter().map(move |right| (left, right)))
+        // THE EMULATOR'S OWN BOUND on one comparison: each side is already held to
+        // [`MAX_SELECTED_NODES`], and this caps their PRODUCT, so a condition relating two
+        // element-wildcard selectors over a caller-supplied event cannot multiply out.
+        .take(MAX_COMPARED_PAIRS)
+        .any(|(left, right)| related(left, comparison, right))
+}
+
+/// How many (left, right) value pairs ONE comparison considers. THE EMULATOR'S OWN BOUND:
+/// see [`compare`].
+const MAX_COMPARED_PAIRS: usize = MAX_SELECTED_NODES;
+
+/// Whether ONE value on each side stands in `comparison`.
+///
+/// A side with no value to compare ([`FieldValue::comparable`]) stands in NO relation, so
+/// every comparison on it — `!=` as much as `=` — is unsatisfied: a condition on a field the
+/// event does not carry, or on one that lands on a container node, says nothing about the
+/// event, and the syntax's own way of asking about PRESENCE is `EXISTS` / `NOT EXISTS`.
+fn related(left: &Resolved<'_>, comparison: Comparison, right: &Resolved<'_>) -> bool {
+    if !comparable(left) || !comparable(right) {
+        return false;
+    }
     match comparison {
-        Comparison::Equal => equal(&left, &right),
-        Comparison::NotEqual => !equal(&left, &right),
+        Comparison::Equal => equal(left, right),
+        Comparison::NotEqual => !equal(left, right),
         Comparison::Less | Comparison::LessOrEqual | Comparison::Greater
         | Comparison::GreaterOrEqual => {
-            let (Resolved::Value(left), Resolved::Value(right)) = (&left, &right) else {
+            let (Resolved::Value(left), Resolved::Value(right)) = (left, right) else {
                 return false;
             };
             let (Some(left), Some(right)) = (left.as_number(), right.as_number()) else {
@@ -1077,9 +1246,23 @@ fn compare<L: Lookup>(
     }
 }
 
+/// Whether one side of a comparison carries something to compare. A pattern's own literal
+/// always does; a field of the event may not ([`FieldValue::comparable`]).
+fn comparable(side: &Resolved<'_>) -> bool {
+    match side {
+        Resolved::Value(value) => value.comparable(),
+        Resolved::Glob(_) | Resolved::Expression(_) => true,
+    }
+}
+
 /// Whether the two operands are equal: a `*` literal or a regular expression is matched
 /// against the other side's text, two sides that both read as numbers are compared as
 /// numbers, and anything else is compared as text.
+///
+/// A BOOLEAN and a NULL are states rather than text: the syntax's literals are numbers and
+/// strings, and what asks about either state is `IS TRUE` / `IS FALSE` / `IS NULL`, so a
+/// boolean or null field equals only the same state and never the text that renders it. That
+/// is what tells `{$.flag IS TRUE}` (the boolean) from `{$.flag = true}` (the string).
 fn equal(left: &Resolved<'_>, right: &Resolved<'_>) -> bool {
     match (left, right) {
         (Resolved::Value(value), Resolved::Glob(glob))
@@ -1093,12 +1276,16 @@ fn equal(left: &Resolved<'_>, right: &Resolved<'_>) -> bool {
         | (Resolved::Expression(expression), Resolved::Value(value)) => {
             value.as_text().is_some_and(|text| expression.is_match(&text))
         }
-        (Resolved::Value(left), Resolved::Value(right)) => {
-            match (left.as_number(), right.as_number()) {
+        (Resolved::Value(left), Resolved::Value(right)) => match (left, right) {
+            (FieldValue::Boolean(left), FieldValue::Boolean(right)) => left == right,
+            (FieldValue::Null, FieldValue::Null) => true,
+            (FieldValue::Boolean(_) | FieldValue::Null, _)
+            | (_, FieldValue::Boolean(_) | FieldValue::Null) => false,
+            (left, right) => match (left.as_number(), right.as_number()) {
                 (Some(left), Some(right)) => left == right,
                 _ => left.as_text() == right.as_text(),
-            }
-        }
+            },
+        },
         _ => false,
     }
 }
@@ -1132,7 +1319,7 @@ fn parse_expression(tokens: &[Token], context: &Context<'_>) -> Result<Expressio
     };
     let expression = parser.any()?;
     if parser.at < tokens.len() {
-        return Err(format!("{INVALID_PATTERN}: the condition does not parse"));
+        return Err(invalid_pattern());
     }
     Ok(expression)
 }
@@ -1185,17 +1372,12 @@ impl Parser<'_> {
             self.at += 1;
             self.depth += 1;
             if self.depth > MAX_CONDITION_DEPTH {
-                return Err(format!(
-                    "{INVALID_PATTERN}: a condition nests at most {MAX_CONDITION_DEPTH} \
-                     parenthesised groups"
-                ));
+                return Err(invalid_pattern());
             }
             let inner = self.any()?;
             self.depth -= 1;
             if !matches!(self.tokens.get(self.at), Some(Token::Close)) {
-                return Err(format!(
-                    "{INVALID_PATTERN}: a '(' in the condition is not closed"
-                ));
+                return Err(invalid_pattern());
             }
             self.at += 1;
             return Ok(inner);
@@ -1216,9 +1398,7 @@ impl Parser<'_> {
                 self.at += 1;
                 let field = Self::field(&left)?;
                 let Some(Token::Word(state)) = self.tokens.get(self.at) else {
-                    return Err(format!(
-                        "{INVALID_PATTERN}: 'IS' is followed by TRUE, FALSE or NULL"
-                    ));
+                    return Err(invalid_pattern());
                 };
                 self.at += 1;
                 if state.eq_ignore_ascii_case("null") {
@@ -1229,9 +1409,7 @@ impl Parser<'_> {
                 } else if state.eq_ignore_ascii_case("false") {
                     false
                 } else {
-                    return Err(format!(
-                        "{INVALID_PATTERN}: 'IS' is followed by TRUE, FALSE or NULL"
-                    ));
+                    return Err(invalid_pattern());
                 };
                 Ok(Expression::Compare {
                     left,
@@ -1243,10 +1421,10 @@ impl Parser<'_> {
                 self.at += 1;
                 let field = Self::field(&left)?;
                 let Some(Token::Word(exists)) = self.tokens.get(self.at) else {
-                    return Err(format!("{INVALID_PATTERN}: 'NOT' is followed by EXISTS"));
+                    return Err(invalid_pattern());
                 };
                 if !exists.eq_ignore_ascii_case("exists") {
-                    return Err(format!("{INVALID_PATTERN}: 'NOT' is followed by EXISTS"));
+                    return Err(invalid_pattern());
                 }
                 self.at += 1;
                 Ok(Expression::Missing(field))
@@ -1258,9 +1436,7 @@ impl Parser<'_> {
     /// One side of a comparison.
     fn operand(&mut self) -> Result<Operand, String> {
         let Some(token) = self.tokens.get(self.at).cloned() else {
-            return Err(format!(
-                "{INVALID_PATTERN}: the condition ends where a value is expected"
-            ));
+            return Err(invalid_pattern());
         };
         self.at += 1;
         match token {
@@ -1272,9 +1448,9 @@ impl Parser<'_> {
             }),
             Token::Expression(source) => Ok(Operand::Expression(compile(&source)?)),
             Token::Word(word) => Ok(self.word(&word)),
-            Token::Compare(_) | Token::And | Token::Or | Token::Open | Token::Close => Err(
-                format!("{INVALID_PATTERN}: the condition does not parse"),
-            ),
+            Token::Compare(_) | Token::And | Token::Or | Token::Open | Token::Close => {
+                Err(invalid_pattern())
+            }
         }
     }
 
@@ -1283,13 +1459,10 @@ impl Parser<'_> {
         match self.context {
             Context::Json => {
                 let Some(path) = selector.strip_prefix('.') else {
-                    return Err(format!(
-                        "{INVALID_PATTERN}: a JSON pattern selects a field with '$.', got \
-                         '${selector}'"
-                    ));
+                    return Err(invalid_pattern());
                 };
                 if path.is_empty() || !path.split('.').all(is_selector_segment) {
-                    return Err(format!("{INVALID_PATTERN}: '${selector}' selects no field"));
+                    return Err(invalid_pattern());
                 }
                 Ok(format!("${selector}"))
             }
@@ -1303,29 +1476,24 @@ impl Parser<'_> {
                 {
                     return Ok(selector.to_string());
                 }
-                Err(format!(
-                    "{INVALID_PATTERN}: '${selector}' names no field this pattern declares"
-                ))
+                Err(invalid_pattern())
             }
         }
     }
 
     /// A bare word: a field of a space-delimited list when the list declares that name,
     /// otherwise the literal it spells.
+    ///
+    /// A literal of a condition is a NUMBER or a STRING — the two kinds of value the syntax
+    /// compares with `=`, `!=` and the orderings — so `true`, `false` and `null` spell the
+    /// text they are written as rather than a boolean or null state. The state of a boolean
+    /// or null field is asked about with `IS TRUE`, `IS FALSE` and `IS NULL`, which build
+    /// those values themselves.
     fn word(&self, word: &str) -> Operand {
         if let Context::Fields(declared) = self.context {
             if declared.names.contains(word) {
                 return Operand::Field(word.to_string());
             }
-        }
-        if word.eq_ignore_ascii_case("true") {
-            return Operand::Literal(FieldValue::Boolean(true));
-        }
-        if word.eq_ignore_ascii_case("false") {
-            return Operand::Literal(FieldValue::Boolean(false));
-        }
-        if word.eq_ignore_ascii_case("null") {
-            return Operand::Literal(FieldValue::Null);
         }
         if let Ok(number) = word.parse::<f64>() {
             return Operand::Literal(FieldValue::Number(number));
@@ -1341,9 +1509,9 @@ impl Parser<'_> {
     fn field(operand: &Operand) -> Result<String, String> {
         match operand {
             Operand::Field(key) => Ok(key.clone()),
-            Operand::Literal(_) | Operand::Glob(_) | Operand::Expression(_) => Err(format!(
-                "{INVALID_PATTERN}: a condition with no comparison selects a field"
-            )),
+            Operand::Literal(_) | Operand::Glob(_) | Operand::Expression(_) => {
+                Err(invalid_pattern())
+            }
         }
     }
 }
@@ -1386,10 +1554,42 @@ fn is_word_character(character: char) -> bool {
 }
 
 /// The characters a `$…` selector may carry after its `$`: a path of member names, the
-/// array indices applied to them, and the name of a space-delimited slot.
+/// array element selectors applied to them, and the name of a space-delimited slot. The `*`
+/// of the `[*]` element selector is admitted only INSIDE a bracket group
+/// ([`selector_characters`]), so it keeps its wildcard meaning everywhere else a condition
+/// spells a value.
 fn is_selector_character(character: char) -> bool {
     character.is_alphanumeric() || matches!(character, '_' | '.' | '[' | ']' | '@' | '-')
 }
+
+/// The run of selector characters at `at`, with `at` left one past it: the body of a `$…`
+/// token. A `*` is read only between `[` and `]`, where it is the element selector that
+/// names every element of an array rather than a wildcard literal.
+fn selector_characters(characters: &[char], at: &mut usize) -> String {
+    let mut selector = String::new();
+    let mut in_brackets = false;
+    while let Some(found) = characters.get(*at).copied() {
+        if found == EVERY_ELEMENT_CHARACTER && in_brackets {
+            selector.push(found);
+            *at += 1;
+            continue;
+        }
+        if !is_selector_character(found) {
+            break;
+        }
+        if found == '[' {
+            in_brackets = true;
+        } else if found == ']' {
+            in_brackets = false;
+        }
+        selector.push(found);
+        *at += 1;
+    }
+    selector
+}
+
+/// [`EVERY_ELEMENT`] as the one character it is.
+const EVERY_ELEMENT_CHARACTER: char = '*';
 
 /// Split a condition into its tokens.
 fn lex(source: &str) -> Result<Vec<Token>, String> {
@@ -1415,7 +1615,7 @@ fn lex(source: &str) -> Result<Vec<Token>, String> {
             // path through this loop consuming at least one character.
             '&' | '|' => {
                 if characters.get(at + 1) != Some(&character) {
-                    return Err(format!("{INVALID_PATTERN}: the condition does not parse"));
+                    return Err(invalid_pattern());
                 }
                 tokens.push(if character == '&' { Token::And } else { Token::Or });
                 at += 2;
@@ -1426,7 +1626,7 @@ fn lex(source: &str) -> Result<Vec<Token>, String> {
             }
             '!' => {
                 if characters.get(at + 1) != Some(&'=') {
-                    return Err(format!("{INVALID_PATTERN}: the condition does not parse"));
+                    return Err(invalid_pattern());
                 }
                 tokens.push(Token::Compare(Comparison::NotEqual));
                 at += 2;
@@ -1459,18 +1659,10 @@ fn lex(source: &str) -> Result<Vec<Token>, String> {
             // top-level commas BEFORE a slot's condition reaches here
             // ([`split_fields`]), so a comma that arrives here is in no condition the
             // syntax describes.
-            ',' => return Err(format!("{INVALID_PATTERN}: the condition does not parse")),
+            ',' => return Err(invalid_pattern()),
             '$' => {
                 at += 1;
-                let mut selector = String::new();
-                while let Some(found) = characters.get(at) {
-                    if !is_selector_character(*found) {
-                        break;
-                    }
-                    selector.push(*found);
-                    at += 1;
-                }
-                tokens.push(Token::Selector(selector));
+                tokens.push(Token::Selector(selector_characters(&characters, &mut at)));
             }
             _ => {
                 // A bare word of a condition is a run of the characters a word carries
@@ -1504,7 +1696,7 @@ fn lex(source: &str) -> Result<Vec<Token>, String> {
                 // reads at least one. Refusing an empty word is what keeps that true — and
                 // keeps this loop making progress — if that ever stops holding.
                 if word.is_empty() {
-                    return Err(format!("{INVALID_PATTERN}: the condition does not parse"));
+                    return Err(invalid_pattern());
                 }
                 tokens.push(Token::Word(word));
             }

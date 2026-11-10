@@ -1808,7 +1808,7 @@ pub(super) const GATEWAY_AND_INTERFACE: &[&str] = &[VPC_ENDPOINT_TYPE_GATEWAY, V
 /// Every Region offers every entry: which Regions a given service has reached is a fact of
 /// that service's own rollout, which neither this model nor a request carries and this
 /// emulator holds no copy of, so nothing here distinguishes Regions by catalog.
-pub(super) const AWS_ENDPOINT_SERVICES: [AwsEndpointService; 46] = [
+pub(super) const AWS_ENDPOINT_SERVICES: [AwsEndpointService; 47] = [
     AwsEndpointService { label: "appstream.api", types: INTERFACE_ONLY },
     AwsEndpointService { label: "appstream.streaming", types: INTERFACE_ONLY },
     AwsEndpointService { label: "athena", types: INTERFACE_ONLY },
@@ -1855,6 +1855,11 @@ pub(super) const AWS_ENDPOINT_SERVICES: [AwsEndpointService; 46] = [
     AwsEndpointService { label: "ssmmessages", types: INTERFACE_ONLY },
     AwsEndpointService { label: "states", types: INTERFACE_ONLY },
     AwsEndpointService { label: "sts", types: INTERFACE_ONLY },
+    // The DEDICATED regional service a CloudWatch Logs syslog ingestion endpoint is created
+    // to, which the PrivateLink guide publishes beside the plain `logs` API service: the two
+    // are different services, and only an endpoint to this one carries syslog data into a log
+    // group.
+    AwsEndpointService { label: "syslog-logs", types: INTERFACE_ONLY },
 ];
 
 /// The endpoint services Amazon Web Services offers in every Region under the `aws.api`

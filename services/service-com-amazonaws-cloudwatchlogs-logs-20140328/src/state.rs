@@ -2784,18 +2784,12 @@ pub fn validate_filter_pattern(pattern: &str) -> Result<(), String> {
             "If a filter pattern starts with '{open}' it must end with '{close}'"
         ));
     }
-    if let Err(defect) = filter_pattern_structure(pattern, open) {
-        return Err(match defect {
-            PatternDefect::UnbalancedBrackets => format!(
-                "Invalid filter pattern: the brackets in a '{open}' … '{close}' filter pattern must be balanced"
-            ),
-            PatternDefect::UnterminatedQuotedString => {
-                "Invalid filter pattern: a quoted string is not terminated".to_string()
-            }
-            PatternDefect::UnterminatedRegex => {
-                "Invalid filter pattern: a regular expression is not terminated".to_string()
-            }
-        });
+    // Every structural defect is refused with the one fixed text the service answers for a
+    // pattern it cannot read ([`filter_pattern::INVALID_PATTERN`]): which of the three the
+    // pattern has is not part of that message, so the reading below is kept as the check it
+    // is and nothing of it is reported.
+    if filter_pattern_structure(pattern, open).is_err() {
+        return Err(filter_pattern::INVALID_PATTERN.to_string());
     }
     Ok(())
 }

@@ -70,8 +70,11 @@
 //!
 //! ## Output
 //!
-//! * `responseStream` (StartLiveTailResponseStream, `@streaming`) — the body: the
-//!   `sessionStart` event, then one `sessionUpdate`.
+//! * `responseStream` (StartLiveTailResponseStream, `@streaming`) — the body: the frame a
+//!   client reads the output shape itself out of
+//!   (`service_common::event_stream::INITIAL_RESPONSE_EVENT`, carrying no member, because
+//!   the stream is this output's only one), then the `sessionStart` event, then one
+//!   `sessionUpdate`.
 //!
 //! ## Errors
 //!
@@ -89,7 +92,9 @@ use super::types::*;
 use aws_smithy_runtime_api::http::{Request, Response};
 use aws_smithy_schema_server::constraints::{validate, Violation, ViolationKind};
 use aws_smithy_schema_server::DeserializableStruct;
-use service_common::event_stream::{error_response, event_stream_only_response, frame_event};
+use service_common::event_stream::{
+    error_response, event_stream_only_response, frame_empty_initial_response, frame_event,
+};
 use smithy_server_runtime::{BoxFuture, OperationContext, ServerHttpProtocol, Service};
 use std::sync::Arc;
 
@@ -145,11 +150,26 @@ static STREAM_SELECTORS_EXCLUSIVE: std::sync::LazyLock<String> = std::sync::Lazy
 /// The refusal for a request that selects streams while tailing more than one log group:
 /// "You can specify this parameter only if you specify only one log group in
 /// logGroupIdentifiers" (`StartLiveTailRequest$logStreamNames` and
-/// `$logStreamNamePrefixes`). Worded like the sentence above, naming the members the rule
-/// holds between.
-const STREAM_SELECTOR_NEEDS_ONE_LOG_GROUP: &str =
-    "logStreamNames and logStreamNamePrefixes can be specified only with a single log \
-     group in logGroupIdentifiers.";
+/// `$logStreamNamePrefixes`). The service states this one as the selector being DISABLED
+/// past one log group ([`crate::state::parameter_pairs::disabled_past_one`]), naming the
+/// selector the request spelled and the identifier member it spelled more than once — both
+/// in the capitalised spellings that sentence names members in.
+fn stream_selector_needs_one_log_group(selector: &str) -> StartLiveTailErrorModeled {
+    invalid(crate::state::parameter_pairs::disabled_past_one(
+        selector,
+        LOG_GROUP_IDENTIFIER_PARAMETER,
+    ))
+}
+
+/// `logStreamNames` as the refusal above names it.
+const LOG_STREAM_NAMES_PARAMETER: &str = "LogStreamNames";
+/// `logStreamNamePrefixes` as the refusal above names it — the service states this rule
+/// about the stream-prefix selector under the name `LogStreamPrefixes` (recorded), which is
+/// the member's name in the words of the rule rather than its wire spelling.
+const LOG_STREAM_NAME_PREFIXES_PARAMETER: &str = "LogStreamPrefixes";
+/// One item of `logGroupIdentifiers` as the refusal above names it: the rule is about how
+/// MANY of them the request named, so the sentence names the member in the singular.
+const LOG_GROUP_IDENTIFIER_PARAMETER: &str = "LogGroupIdentifier";
 
 /// The refusal CloudWatch Logs answers a Live Tail session that names a log group it does
 /// not hold. Fixed text for the class: it states the resource the session could not be
@@ -199,10 +219,17 @@ impl<Eng: Send + Sync + 'static> StartLiveTail<Eng> {
         if input.log_stream_names.is_some() && input.log_stream_name_prefixes.is_some() {
             return Err(invalid(STREAM_SELECTORS_EXCLUSIVE.clone()));
         }
-        let selects_streams =
-            input.log_stream_names.is_some() || input.log_stream_name_prefixes.is_some();
-        if selects_streams && input.log_group_identifiers.len() > 1 {
-            return Err(invalid(STREAM_SELECTOR_NEEDS_ONE_LOG_GROUP.to_string()));
+        if input.log_group_identifiers.len() > 1 {
+            if input.log_stream_names.is_some() {
+                return Err(stream_selector_needs_one_log_group(
+                    LOG_STREAM_NAMES_PARAMETER,
+                ));
+            }
+            if input.log_stream_name_prefixes.is_some() {
+                return Err(stream_selector_needs_one_log_group(
+                    LOG_STREAM_NAME_PREFIXES_PARAMETER,
+                ));
+            }
         }
 
         // The pattern is parsed before anything is looked up: a filter pattern that does
@@ -310,14 +337,23 @@ impl<Eng: Send + Sync + 'static> StartLiveTail<Eng> {
         };
         drop(store);
 
-        let mut frames = frame_event(
-            protocol,
-            SESSION_START_EVENT,
-            false,
-            &session_start,
-            &LiveTailSessionStart::SCHEMA,
-        )
-        .map_err(|error| internal(format!("the sessionStart event could not be framed: {error}")))?;
+        // The body opens with the frame a client reads the OUTPUT shape out of, before any
+        // frame of the session: `StartLiveTailResponse`'s only member is the stream itself,
+        // so that frame carries no member.
+        let mut frames = frame_empty_initial_response(protocol)
+            .map_err(|error| internal(format!("the initial response could not be framed: {error}")))?;
+        frames.extend(
+            frame_event(
+                protocol,
+                SESSION_START_EVENT,
+                false,
+                &session_start,
+                &LiveTailSessionStart::SCHEMA,
+            )
+            .map_err(|error| {
+                internal(format!("the sessionStart event could not be framed: {error}"))
+            })?,
+        );
         frames.extend(
             frame_event(
                 protocol,

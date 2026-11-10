@@ -215,11 +215,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
 
-        // The filter pattern is parsed at configuration time, so a pattern that opens a
-        // bracketed form and never closes it is refused here rather than silently matching
-        // nothing once log events start flowing. Same rule, same checker, as a subscription
-        // filter's pattern: both members target the one `FilterPattern` syntax.
-        if let Err(message) = crate::state::validate_filter_pattern(&input.filter_pattern) {
+        // The filter pattern is READ at configuration time, so a pattern the service cannot
+        // read — one that opens a bracketed form and never closes it, or one of the
+        // structured forms whose conditions do not parse — is refused here rather than
+        // silently matching nothing once log events start flowing
+        // ([`crate::state::filter_pattern::validate_configured_pattern`]). This member
+        // carries a METRIC FILTER's pattern, so an unreadable one is refused by the name the
+        // service gives that kind of pattern.
+        if let Err(message) =
+            crate::state::filter_pattern::validate_configured_pattern(&input.filter_pattern)
+                .map_err(crate::state::filter_pattern::as_metric_pattern_refusal)
+        {
             return Err(invalid(message));
         }
 

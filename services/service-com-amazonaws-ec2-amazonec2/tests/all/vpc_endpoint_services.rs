@@ -384,6 +384,118 @@ async fn available_zones(router: &MultiServiceRouter, region: &str) -> Vec<Strin
     super::ec2_query::elements(&body, "zoneName")
 }
 
+/// One API whose data plane is reached through a DEDICATED PrivateLink service of the Region
+/// rather than through that API's plain endpoint service: the label of the dedicated service,
+/// and the label of the plain one it must not be confused with.
+///
+/// Source: the PrivateLink service list, which publishes the CloudWatch Logs syslog-ingestion
+/// service as `com.amazonaws.<region>.syslog-logs` beside the plain API service
+/// `com.amazonaws.<region>.logs`. A client provisioning syslog ingestion discovers the
+/// Region's name for it here, so a catalogue that publishes only the plain service leaves it
+/// with no endpoint to create.
+const DEDICATED_SERVICES: [(&str, &str); 1] = [("syslog-logs", "logs")];
+
+/// A Region publishes each dedicated interface service of [`DEDICATED_SERVICES`] under its own
+/// name, beside — and distinct from — the plain service of the same API: a walk of the
+/// Region's interface services finds both names, each resolves on its own, and the two carry
+/// different ids and different endpoint DNS names.
+#[tokio::test]
+async fn a_dedicated_interface_service_is_published_beside_the_plain_one() {
+    let router = super::ec2_query::emulator().0;
+
+    for region in REGIONS {
+        // The whole selection a client discovers with, walked to exhaustion the way a client
+        // pages it: the Region's interface services.
+        let case = format!("the interface services of {region}");
+        let mut names: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut params = filters(&[("service-type", &["Interface"])]);
+            params.push(param("MaxResults", "5"));
+            if let Some(token) = token.as_deref() {
+                params.push(param("NextToken", token));
+            }
+            let body = ok_in(&case, &router, region, &params).await;
+            names.extend(
+                reported(&case, &body)
+                    .into_iter()
+                    .map(|service| service.name),
+            );
+            match next_token(&case, &body) {
+                None => break,
+                Some(next) => token = Some(next),
+            }
+        }
+
+        for (dedicated, plain) in DEDICATED_SERVICES {
+            let dedicated_name = format!("com.amazonaws.{region}.{dedicated}");
+            let plain_name = format!("com.amazonaws.{region}.{plain}");
+            assert!(
+                names.contains(&dedicated_name),
+                "case {case:?}: expected the dedicated service {dedicated_name} in the walk, \
+                 got {names:?}"
+            );
+            assert!(
+                names.contains(&plain_name),
+                "case {case:?}: expected the plain service {plain_name} beside it, got {names:?}"
+            );
+
+            // Each name resolves on its own, and the two are different services: different
+            // ids, and the endpoint DNS names an endpoint to one answers under are not the
+            // other's.
+            let selected = ok_in(
+                &case,
+                &router,
+                region,
+                &indexed("ServiceName", &[&dedicated_name, &plain_name]),
+            )
+            .await;
+            let services = reported(&case, &selected);
+            assert_eq!(
+                services.len(),
+                2,
+                "case {case:?}: both names must resolve, got {services:?}"
+            );
+            let dedicated_service = services
+                .iter()
+                .find(|service| service.name == dedicated_name)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: {dedicated_name} must be reported, got {services:?}")
+                });
+            let plain_service = services
+                .iter()
+                .find(|service| service.name == plain_name)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: {plain_name} must be reported, got {services:?}")
+                });
+            assert_eq!(
+                dedicated_service.types,
+                vec!["Interface".to_string()],
+                "case {case:?}: {dedicated_name} is reached through an interface endpoint, got \
+                 {:?}",
+                dedicated_service.types
+            );
+            assert_eq!(
+                dedicated_service.region, region,
+                "case {case:?}: {dedicated_name} is a service of {region}, got {:?}",
+                dedicated_service.region
+            );
+            assert_ne!(
+                dedicated_service.id, plain_service.id,
+                "case {case:?}: the dedicated service and the plain one are two services, got \
+                 the one id {:?}",
+                dedicated_service.id
+            );
+            assert_ne!(
+                dedicated_service.base_dns_names, plain_service.base_dns_names,
+                "case {case:?}: an endpoint to {dedicated_name} answers under its own base \
+                 names, got {:?}",
+                dedicated_service.base_dns_names
+            );
+        }
+    }
+}
+
 /// Every service of a Region's report is a service OF that Region, named once, with an id of
 /// its own — and a second identical call reports exactly the same thing, a describe being a
 /// read.

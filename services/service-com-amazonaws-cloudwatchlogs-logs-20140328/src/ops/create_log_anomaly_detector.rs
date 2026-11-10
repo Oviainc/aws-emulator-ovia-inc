@@ -241,7 +241,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // other pattern member carries, so it is parsed at configuration time rather than
         // left to silently match nothing once the detector runs.
         if let Some(pattern) = input.filter_pattern.as_deref() {
-            if let Err(message) = crate::state::validate_filter_pattern(pattern) {
+            if let Err(message) =
+                crate::state::filter_pattern::validate_configured_pattern(pattern)
+            {
                 return Err(invalid(message));
             }
         }

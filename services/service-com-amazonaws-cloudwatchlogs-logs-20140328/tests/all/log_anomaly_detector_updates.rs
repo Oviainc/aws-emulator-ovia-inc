@@ -616,11 +616,7 @@ async fn a_value_the_model_or_the_pattern_syntax_rejects_is_refused() {
         (
             "a filter pattern whose brackets do not balance",
             json!({"filterPattern": "[ip, [user, timestamp]"}),
-            Some(
-                "Invalid filter pattern: the brackets in a '[' … ']' filter pattern must be \
-                 balanced"
-                    .to_string(),
-            ),
+            Some("Invalid filter pattern".to_string()),
         ),
     ];
 

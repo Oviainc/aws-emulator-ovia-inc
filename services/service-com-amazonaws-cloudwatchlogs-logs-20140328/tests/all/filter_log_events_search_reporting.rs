@@ -370,12 +370,18 @@ struct Term {
 }
 
 /// The term table. The refused rows differ in WHICH character the term carries (a quote, a
-/// colon, a slash, a two-character run) and in which form of pattern carries it (an
-/// unstructured term, a JSON condition, a space-delimited condition); the admitted rows
-/// cover every form a term may take — a word with an underscore, a `"…"` string carrying
-/// spaces, a `%…%` expression, the `?` and `-` prefixes, a number, a dotted word, a `*`
-/// wildcard and the `...` of a field list.
-const TERMS: [Term; 19] = [
+/// colon, a slash, a semicolon, a run of them after a character a term admits) and in which
+/// form of pattern carries it (an unstructured term, a JSON condition, a space-delimited
+/// condition); the admitted rows cover every form a term may take — a word with an
+/// underscore, a word carrying a `-`, a `"…"` string carrying spaces, a `%…%` expression,
+/// the `?` and `-` prefixes, a number, a dotted word, a `*` wildcard and the `...` of a
+/// field list.
+const TERMS: [Term; 20] = [
+    Term {
+        case: "a word carrying a hyphen, which a term admits inside it",
+        pattern: "live-tail-session",
+        refusal: None,
+    },
     Term {
         case: "a pattern that is nothing but a quote",
         pattern: "\"",
@@ -407,9 +413,9 @@ const TERMS: [Term; 19] = [
         refusal: Some("Invalid character(s) in term '/'"),
     },
     Term {
-        case: "a run of two characters no term admits",
+        case: "a run of characters no term admits, after one it does",
         pattern: "handler->skips",
-        refusal: Some("Invalid character(s) in term '->'"),
+        refusal: Some("Invalid character(s) in term '>'"),
     },
     Term {
         case: "a semicolon between two words",

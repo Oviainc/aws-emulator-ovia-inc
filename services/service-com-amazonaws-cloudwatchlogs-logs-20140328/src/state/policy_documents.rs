@@ -168,7 +168,8 @@ pub(super) fn check_subscription_filter_policy_document(document: &str) -> Resul
         ));
     }
     if let Some(filter_pattern) = string("FilterPattern") {
-        validate_filter_pattern(filter_pattern)?;
+        // The same reading a subscription filter's own put holds the member to.
+        super::filter_pattern::validate_configured_pattern(filter_pattern)?;
     }
     // "the grouping can be set to Random for a more even distribution": the two values of
     // the model's `Distribution` enum, which no boundary validator holds a JSON document

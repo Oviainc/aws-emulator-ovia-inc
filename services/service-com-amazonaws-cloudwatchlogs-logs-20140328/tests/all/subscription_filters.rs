@@ -800,12 +800,10 @@ async fn an_unclosed_bracketed_filter_pattern_is_refused() {
         "{ $.level = \"ERROR\" }",
         "{ ($.a = 1) || ($.b = 2) }",
         "{ $.items[0].id = 7 }",
+        "{ $.items[*].id = 7 }",
         "{ $.message = \"a } brace inside a string\" }",
         "{ $.message = %^\\[ERROR\\]% }",
         "[w1=ERROR, w2]",
-        // A space-delimited pattern's terms can carry a bare parenthesis, which is not
-        // bracket structure.
-        "[w1=ERROR, w2=f(x]",
         "  { $.level = \"ERROR\" }  ",
     ] {
         logs.ok("PutSubscriptionFilter", &put(accepted_group, pattern))
@@ -847,26 +845,21 @@ async fn an_unclosed_bracketed_filter_pattern_is_refused() {
     }
 
     // A pattern that closes the form it opened but whose structure does not close inside
-    // it is refused too — the parse covers the whole pattern, not just its ends — and the
-    // refusal names the defect it detected.
-    let brackets = |open: char, close: char| {
-        format!(
-            "Invalid filter pattern: the brackets in a '{open}' … '{close}' filter pattern must be balanced"
-        )
-    };
+    // it is refused too — the parse covers the whole pattern, not just its ends — with the
+    // one fixed text the service answers for a pattern it cannot read. A STRUCTURED form is
+    // read whole at configuration time, so a condition the service cannot read is refused
+    // where it is written rather than stored to select nothing.
+    let unreadable = "Invalid filter pattern".to_string();
     for (pattern, expected) in [
-        ("{ { $.level = \"ERROR\" }", brackets('{', '}')),
-        ("{ $.level = \"ERROR\" } }", brackets('{', '}')),
-        ("{ ($.a = 1 }", brackets('{', '}')),
-        ("[w1=ERROR, w2]]", brackets('[', ']')),
-        (
-            "{ $.message = \"unterminated }",
-            "Invalid filter pattern: a quoted string is not terminated".to_string(),
-        ),
-        (
-            "{ $.message = %unterminated }",
-            "Invalid filter pattern: a regular expression is not terminated".to_string(),
-        ),
+        ("{ { $.level = \"ERROR\" }", unreadable.clone()),
+        ("{ $.level = \"ERROR\" } }", unreadable.clone()),
+        ("{ ($.a = 1 }", unreadable.clone()),
+        ("[w1=ERROR, w2]]", unreadable.clone()),
+        ("{ $.message = \"unterminated }", unreadable.clone()),
+        ("{ $.message = %unterminated }", unreadable.clone()),
+        // A space-delimited slot's condition is read as a condition: a bare parenthesis in
+        // one is no part of the syntax it states.
+        ("[w1=ERROR, w2=f(x]", unreadable.clone()),
     ] {
         let (code, message) = logs
             .refusal("PutSubscriptionFilter", &put(refused_group, pattern))
@@ -877,7 +870,8 @@ async fn an_unclosed_bracketed_filter_pattern_is_refused() {
         );
         assert_eq!(
             message, expected,
-            "case pattern {pattern:?}: the refusal names the defect, got {message}"
+            "case pattern {pattern:?}: the refusal is the fixed text for an unreadable \
+             pattern, got {message}"
         );
     }
 

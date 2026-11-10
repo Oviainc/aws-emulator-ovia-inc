@@ -352,10 +352,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutSubscriptionFi
             return Err(PutSubscriptionFilterError::access_denied(message));
         }
 
-        // The filter pattern is parsed at configuration time, so a pattern that opens a
-        // bracketed form and never closes it is refused here rather than silently
-        // matching nothing once log events start flowing.
-        if let Err(message) = crate::state::validate_filter_pattern(&input.filter_pattern) {
+        // The filter pattern is READ at configuration time, so a pattern the service cannot
+        // read — one that opens a bracketed form and never closes it, or one of the
+        // structured forms whose conditions do not parse — is refused here rather than
+        // silently matching nothing once log events start flowing
+        // ([`crate::state::filter_pattern::validate_configured_pattern`]).
+        if let Err(message) =
+            crate::state::filter_pattern::validate_configured_pattern(&input.filter_pattern)
+        {
             return Err(invalid(message));
         }
 

@@ -22,7 +22,10 @@
 //!   log-group selector pair and for the lookup-table source pair are worded;
 //! * [`cannot_be_combined`] — the two cannot be combined, as the recorded `StartQuery`
 //!   refusal for two of its three log-group members is worded, which states the pair as a
-//!   pair rather than as a rule over a list.
+//!   pair rather than as a rule over a list;
+//! * [`disabled_past_one`] — one is DISABLED once the other is named more than once, as the
+//!   recorded `StartLiveTail` refusal for a stream selector across several log groups is
+//!   worded: two sentences, the first stating what the request did and the second the rule.
 //!
 //! Each form takes the parameters as the service NAMES them, which is a property of the
 //! pair: the selector pair is stated in the service's display words (`LogGroup name`), the
@@ -57,9 +60,24 @@ pub fn cannot_be_combined(first: &str, second: &str) -> String {
     format!("Both {first} and {second} cannot be specified at the same time")
 }
 
+/// The sentence for a parameter that is disabled once another is provided more than once:
+/// `<disabled> provided with more than one <item>. <disabled> is disabled if more than one
+/// <item> is provided.` — two sentences, each ending in a period, naming the two parameters
+/// and nothing from the request. `item` names ONE item of the member the request listed
+/// several of, which is what the rule counts.
+pub fn disabled_past_one(disabled: &str, item: &str) -> String {
+    format!(
+        "{disabled} provided with more than one {item}. {disabled} is disabled if more than \
+         one {item} is provided."
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{cannot_be_combined, either_required, must_contain_both, mutually_exclusive};
+    use super::{
+        cannot_be_combined, disabled_past_one, either_required, must_contain_both,
+        mutually_exclusive,
+    };
 
     /// Each form states the two parameters it is given, in the order it is given them, and
     /// nothing else: the fixed words, the punctuation and the spacing are the form's own.
@@ -156,6 +174,31 @@ mod tests {
         ];
         for (first, second, expected) in combined {
             let actual = cannot_be_combined(first, second);
+            assert_eq!(
+                actual, expected,
+                "case {first}/{second}: expected {expected:?}, got {actual:?}"
+            );
+        }
+
+        let disabled = [
+            // The recorded `StartLiveTail` refusal for named streams across several groups.
+            (
+                "LogStreamNames",
+                "LogGroupIdentifier",
+                "LogStreamNames provided with more than one LogGroupIdentifier. \
+                 LogStreamNames is disabled if more than one LogGroupIdentifier is provided.",
+            ),
+            // The same rule, for the other selector of the same pair.
+            (
+                "LogStreamPrefixes",
+                "LogGroupIdentifier",
+                "LogStreamPrefixes provided with more than one LogGroupIdentifier. \
+                 LogStreamPrefixes is disabled if more than one LogGroupIdentifier is \
+                 provided.",
+            ),
+        ];
+        for (first, second, expected) in disabled {
+            let actual = disabled_past_one(first, second);
             assert_eq!(
                 actual, expected,
                 "case {first}/{second}: expected {expected:?}, got {actual:?}"

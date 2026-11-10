@@ -125,6 +125,10 @@ mod ingestion_window;
 mod insights_queries;
 #[path = "all/integrations.rs"]
 mod integrations;
+#[path = "all/json_filter_pattern_element_selectors.rs"]
+mod json_filter_pattern_element_selectors;
+#[path = "all/json_filter_pattern_value_types.rs"]
+mod json_filter_pattern_value_types;
 #[path = "all/list_anomalies.rs"]
 mod list_anomalies;
 #[path = "all/live_tail_sessions.rs"]

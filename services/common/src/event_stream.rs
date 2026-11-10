@@ -21,6 +21,8 @@
 //! * [`frame_event`] — serialize one modelled event structure as ONE
 //!   `vnd.amazon.eventstream` frame, through the service's own protocol (so the frame
 //!   headers and the payload encoding are the protocol's, not this file's).
+//! * [`frame_initial_response`] / [`frame_empty_initial_response`] — the frame an
+//!   event-stream RESPONSE opens with, before any modelled event frame.
 //! * [`event_stream_response`] / [`event_stream_only_response`] / [`error_response`] —
 //!   a 200 whose modelled response headers come from the output shape and whose body is
 //!   the concatenated frames, and a modelled error in the service's own envelope.
@@ -46,8 +48,8 @@
 //! should inline the framing again — call this module.
 
 use aws_smithy_runtime_api::http::{Request, Response, StatusCode};
-use aws_smithy_schema::serde::{SerdeError, SerializableStruct};
-use aws_smithy_schema::Schema;
+use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use aws_smithy_schema::{Schema, ShapeId, ShapeType};
 use aws_smithy_schema_server::constraints::{envelope, validate};
 use aws_smithy_schema_server::{DeserializableStruct, ProtocolError, Violation, ViolationKind};
 use aws_smithy_types::body::SdkBody;
@@ -172,6 +174,54 @@ pub fn frame_event(
         .map(<[u8]>::to_vec)
         .unwrap_or_default())
 }
+
+/// The `:event-type` of the frame an event-stream response OPENS with.
+///
+/// A response whose body is an event stream begins with a frame of this type carrying the
+/// output's non-stream members, and only then the frames of the `@streaming` union. A
+/// client reads that frame FIRST — it is how the output shape itself arrives — and treats a
+/// body whose first frame is of any other type as unparseable, so a stream that omits it
+/// delivers none of the events behind it.
+pub const INITIAL_RESPONSE_EVENT: &str = "initial-response";
+
+/// The leading frame of an event-stream response, carrying the output's non-stream members.
+///
+/// Framed exactly as a data event is ([`frame_event`]), through the service's own protocol,
+/// so the payload encoding is the protocol's.
+pub fn frame_initial_response(
+    protocol: &dyn ServerHttpProtocol,
+    members: &dyn SerializableStruct,
+    schema: &Schema,
+) -> Result<Vec<u8>, ProtocolError> {
+    frame_event(protocol, INITIAL_RESPONSE_EVENT, false, members, schema)
+}
+
+/// The leading frame for an output whose ONLY member is the `@streaming` payload: there are
+/// no other members to carry, so the frame's payload is the empty document — which is what a
+/// client reads the output shape out of.
+pub fn frame_empty_initial_response(
+    protocol: &dyn ServerHttpProtocol,
+) -> Result<Vec<u8>, ProtocolError> {
+    frame_initial_response(protocol, &NoMembers, &NO_MEMBERS_SCHEMA)
+}
+
+/// An output with no non-stream members, for [`frame_empty_initial_response`]: it writes no
+/// member, so the protocol's codec renders it as the empty document.
+struct NoMembers;
+
+impl SerializableStruct for NoMembers {
+    fn serialize_members(&self, _: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        Ok(())
+    }
+}
+
+/// The schema [`NoMembers`] is written through: a structure with no members, which is what
+/// `smithy.api#Unit` is.
+static NO_MEMBERS_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
+    ShapeType::Structure,
+    &[],
+);
 
 /// A 200 carrying `frames` as its event-stream body and the operation's modelled
 /// response headers.
