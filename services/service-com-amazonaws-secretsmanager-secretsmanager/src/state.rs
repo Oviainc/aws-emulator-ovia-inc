@@ -241,18 +241,30 @@ pub const STAGE_LIMIT_MESSAGE: &str =
     "You exceeded the maximum number of staging labels allowed on a secret.";
 
 /// The `ResourceNotFoundException` message for a `VersionId` the named secret
-/// holds no version under.
+/// holds no version under, for an operation that moves a staging label onto that
+/// version rather than reading a value.
 ///
 /// The secret itself was found, so the missing thing is the version the request
 /// named — and the caller cannot tell which of the ids it sent was wrong unless
-/// the message names it. Every operation that resolves a `VersionId` answers
-/// with THIS sentence.
+/// the message names it.
 pub fn version_not_found_message(version_id: &str) -> String {
     format!("Secrets Manager can't find the specified secret version: {version_id}")
 }
 
-/// The `ResourceNotFoundException` message for a staging label no version of the
-/// named secret carries.
+/// The `ResourceNotFoundException` message for a READ of a secret value that
+/// resolves the value by `VersionId` and finds no such version.
+///
+/// A read of a secret value reports the VALUE it could not find, naming the
+/// request member it resolved by and that member's value — the same sentence
+/// shape as the staging-label form below, whose fixed text differs only in the
+/// member it names ([`stage_not_found_message`]). The only variable part is the
+/// `VersionId` echoed from the request.
+pub fn value_version_not_found_message(version_id: &str) -> String {
+    format!("Secrets Manager can't find the specified secret value for VersionId: {version_id}")
+}
+
+/// The `ResourceNotFoundException` message for a READ of a secret value that
+/// resolves the value by staging label and finds no version carrying it.
 ///
 /// The secret was found and the label was not, so the message names the label
 /// the request asked for. Every operation that resolves a value BY STAGE — the

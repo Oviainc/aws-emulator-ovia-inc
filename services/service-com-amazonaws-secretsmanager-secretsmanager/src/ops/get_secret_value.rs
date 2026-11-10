@@ -272,8 +272,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(GetSecretValueErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(match (input.version_id.as_deref(), stage) {
+                            // A read resolves the VALUE, so a read that finds none
+                            // reports the value it could not find and the member it
+                            // resolved by: the `VersionId` it was given, else the
+                            // staging label it looked under.
                             (Some(version_id), _) => {
-                                crate::state::version_not_found_message(version_id)
+                                crate::state::value_version_not_found_message(version_id)
                             }
                             (None, stage) => crate::state::stage_not_found_message(
                                 stage.unwrap_or(crate::state::STAGE_CURRENT),
