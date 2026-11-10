@@ -1,0 +1,41 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: sns__sqs.platform-application-event-endpoint-created-notifies-configured-topic sns__sqs.queue-maximum-message-size-does-not-bound-sns-delivery
+Issue-Key: sns__sqs.platform-application-event-endpoint-created-notifies-configured-topic|run#25|Timeout|resp = sqs.receive_message(
+Issue-Key: sns__sqs.queue-maximum-message-size-does-not-bound-sns-delivery|run#28|Timeout|resp = sqs.receive_message(
+Issue-Commit: 8b7ff9be7fbfdfa6a874338015bc2fd39ac1e37f
+
+# sns__sqs: platform-application EndpointCreated event is never published, and SNS→SQS delivery is bounded by the destination queue's MaximumMessageSize (2 causes)
+
+> _Note: this issue was identified against the code base at commit `8b7ff9be7fbfdfa6a874338015bc2fd39ac1e37f`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+Publish
+
+## Description
+Two net-new root causes in the sns__sqs behavioral suite. Both are silent message-loss defects on the SNS→SQS delivery path; each is listed with its own failing check id and both must be closed.
+
+NOTE on prior art: open issue 20261109T185037Z-sns-sqs-3-net-new-causes-no-platform-application-event.md describes the same two behaviors and even lists these two check ids in its Issue-Trace-Ids, but it no longer carries their replay keys (its keys are `run#25|AssertionError` and `run#28|AssertionError`, while both checks now end as a harness timeout), so the replay suite does not bind them to it and they are re-filed here. Whoever fixes this should close that issue's Cause 1/Cause 2 together with this one.
+
+Cause 1 of 2: a platform application's EventEndpointCreated topic receives no EndpointCreated notification when CreatePlatformEndpoint succeeds.
+AWS: Smithy — SetPlatformApplicationAttributes.Attributes (the same attribute map CreatePlatformApplication takes, per CreatePlatformApplicationInput.Attributes docs) documents `EventEndpointCreated – Topic ARN to which EndpointCreated event notifications are sent`. So after CreatePlatformApplication(Platform=…, Attributes={PlatformPrincipal, PlatformCredential, EventEndpointCreated=<topic ARN>}), every successful CreatePlatformEndpoint publishes a notification to that topic. Its JSON body carries `EventType` with the fixed text `EndpointCreated` and `EndpointArn` set to the ARN CreatePlatformEndpoint returned (of the form arn:aws:sns:<region>:<account>:endpoint/<platform>/<application name>/<endpoint id>) — the ARN, platform, application name and endpoint id are values taken from the request and the emulator's state, not fixed text. Nothing in the model constrains the rest of the envelope; recorded behavior only for the remaining fields.
+Emulator: CreatePlatformApplication accepts the attribute and GetPlatformApplicationAttributes reads EventEndpointCreated back as the configured topic (that positive control passes), but CreatePlatformEndpoint publishes nothing: no message naming the new EndpointArn ever reaches the queue subscribed to that topic, and the check exhausts its budget polling for it ("Check timed out after 60.0s", inside the loop whose own failure text is "no EventEndpointCreated notification naming <endpoint arn> arrived within 90s").
+Why: a client that provisions mobile endpoints and reacts to the lifecycle event (registration bookkeeping, token refresh, de-duplication of endpoints) receives nothing and cannot distinguish a missing subscription from a service that never emits the event.
+Fix: platform-application event notifications in the SNS endpoint lifecycle — the CreatePlatformEndpoint handler must publish the EndpointCreated event to the application's EventEndpointCreated topic through the normal Publish path.
+Traces: sns__sqs.platform-application-event-endpoint-created-notifies-configured-topic
+
+Cause 2 of 2: SNS→SQS delivery is dropped when the message exceeds the destination queue's MaximumMessageSize.
+AWS: Smithy — SetQueueAttributes.Attributes documents `MaximumMessageSize – The limit of how many bytes a message can contain before Amazon SQS rejects it` (1,024 … 1,048,576 bytes). That attribute bounds what SendMessage accepts, and the model says nothing about SNS-originated deliveries; recorded behavior only for the SNS side: a message published to a topic is delivered intact to a subscribed queue whose own MaximumMessageSize is smaller than the delivered body. The same body sent directly with SendMessage is refused with HTTP 400, error code `InvalidParameterValue`, message `One or more parameters are invalid. Reason: Message must be shorter than <MaximumMessageSize> bytes.` — the fixed text is "One or more parameters are invalid. Reason: Message must be shorter than " + " bytes." and the number is the queue's configured MaximumMessageSize (1024 in this recording), not a literal.
+Emulator: the direct-SendMessage refusal and the queue's MaximumMessageSize read-back both hold (those graded asserts never fire), but the message published to the topic never arrives on the subscribed queue: the emulator applies the queue's MaximumMessageSize to the SNS delivery and drops it with no error on either side. The check exhausts its budget in the receive loop ("Check timed out after 60.0s"; the loop's own failure text is "the SNS-delivered message carrying the 4096-byte body never arrived within 90s"). The body size is a per-run value; the requirement is that any body SNS accepts for the topic is delivered regardless of the subscriber queue's MaximumMessageSize.
+Why: messages vanish between SNS and SQS with no error anywhere — no Publish failure, no dead-letter, nothing in the queue — which is the hardest class of defect to diagnose, and it makes the queue attribute silently change fan-out semantics.
+Fix: the SNS→SQS delivery path (the subscription dispatcher that calls SendMessage internally) must not enforce the destination queue's MaximumMessageSize on SNS-originated deliveries; keep that check in the SQS SendMessage request validator only.
+Traces: sns__sqs.queue-maximum-message-size-does-not-bound-sns-delivery
+
+## Evidence
+Cause 1: [mismatch] sns__sqs.platform-application-event-endpoint-created-notifies-configured-topic — "Error: Check timed out after 60.0s". Expected: a message on the subscribed queue with EventType == 'EndpointCreated' and EndpointArn == the ARN returned by CreatePlatformEndpoint. Actual: nothing delivered; the positive control (GetPlatformApplicationAttributes echoing EventEndpointCreated == the topic ARN) passes, so the configuration is stored and only the publish is missing.
+Cause 2: [mismatch] sns__sqs.queue-maximum-message-size-does-not-bound-sns-delivery — "Error: Check timed out after 60.0s". Expected: SendMessage of the 4096-byte body refused with ('InvalidParameterValue', 'One or more parameters are invalid. Reason: Message must be shorter than 1024 bytes.') — which the emulator does — AND the same body, published to the topic, delivered byte-for-byte to the same queue. Actual: the SNS delivery never arrives; the check times out in the receive loop whose assertion text is "the SNS-delivered message carrying the 4096-byte body never arrived within 90s".
+
+## Steps to Reproduce
+Cause 1: CreateTopic; CreateQueue; SetQueueAttributes with a Policy allowing sns.amazonaws.com sqs:SendMessage on the queue for that topic; Subscribe the queue (Protocol=sqs, RawMessageDelivery=true) and wait for PendingConfirmation=false; CreatePlatformApplication(Platform=BAIDU, Attributes={PlatformPrincipal, PlatformCredential, EventEndpointCreated=<topic arn>}); GetPlatformApplicationAttributes (EventEndpointCreated reads back); CreatePlatformEndpoint(Token=<channel id>); poll ReceiveMessage on the queue — no EndpointCreated notification naming the returned EndpointArn ever arrives.
+Cause 2: CreateQueue with Attributes={MaximumMessageSize: '1024'}; allow sns.amazonaws.com sqs:SendMessage on it; Subscribe it to a topic with RawMessageDelivery=true; SendMessage a 4096-byte body directly (refused, as AWS does); Publish the same 4096-byte body to the topic; poll ReceiveMessage — the delivery never arrives.
