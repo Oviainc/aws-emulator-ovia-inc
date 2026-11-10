@@ -254,11 +254,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_default();
 
         // "Attempting to use InstanceInformationFilterList and Filters leads to an
-        // exception error" — the two members are alternatives, not a union.
+        // exception error" — the two members are alternatives, not a union, and the
+        // refusal is the one both node describes state for the same request shape.
         if !string_filters.is_empty() && !legacy_filters.is_empty() {
             return Err(crate::scaffolded::Scaffolded::validation(
-                "Filters and InstanceInformationFilterList can't be used in the same request: \
-                 use Filters, which supersedes the legacy InstanceInformationFilterList",
+                crate::state::LEGACY_AND_NEW_FILTERS_REJECTION,
             ));
         }
 

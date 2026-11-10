@@ -17,6 +17,8 @@ mod association_dispatch_options;
 mod automation_executions;
 #[path = "all/automation_step_executions.rs"]
 mod automation_step_executions;
+#[path = "all/boundary_refusal_wording.rs"]
+mod boundary_refusal_wording;
 #[path = "all/document_content.rs"]
 mod document_content;
 #[path = "all/document_default_version.rs"]

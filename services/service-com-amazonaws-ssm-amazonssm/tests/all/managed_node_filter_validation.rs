@@ -480,3 +480,86 @@ async fn a_key_the_operation_does_not_know_is_refused_naming_that_key() {
         }
     }
 }
+
+/// The LEGACY filter list and the current one are ALTERNATIVES on both node APIs: a
+/// request naming both is refused with the one sentence that states the rule, whichever
+/// keys the two lists carry and however many filters each holds.
+///
+/// The rows differ along what makes the two lists legal on their own — the key each names,
+/// how many filters it holds — so the refusal is about naming BOTH members and not about
+/// any filter in them.
+#[tokio::test]
+async fn naming_both_filter_members_is_refused() {
+    let router = seeded_router();
+
+    /// The sentence both describes state, written out here independently of the service
+    /// (`crate::state::LEGACY_AND_NEW_FILTERS_REJECTION`): it names neither member, so it
+    /// is the same sentence for both operations.
+    const BOTH_FILTER_MEMBERS: &str = "Cannot use both legacy and new filter simultaneously";
+
+    // (case, the filters the legacy member carries, the filters the current member carries)
+    let cases: &[(&str, &[Filter<'_>], &[Filter<'_>])] = &[
+        (
+            "one filter in each",
+            &[("ResourceType", &["EC2Instance"])],
+            &[("PingStatus", &["Online"])],
+        ),
+        (
+            "the same key in both",
+            &[("PingStatus", &["Online"])],
+            &[("PingStatus", &["Online"])],
+        ),
+        (
+            "two filters beside one",
+            &[("ResourceType", &["EC2Instance"]), ("PingStatus", &["Online"])],
+            &[("AgentVersion", &["3.0.1124.0"])],
+        ),
+        (
+            "a node id beside a tag",
+            &[("InstanceIds", &[SEEDED_NODE])],
+            &[("tag:Purpose", &["Test"])],
+        ),
+    ];
+
+    for api in BOTH {
+        for (case, legacy, current) in cases {
+            let mut body = Map::new();
+            body.insert(
+                api.legacy_member.to_string(),
+                Value::Array(
+                    legacy
+                        .iter()
+                        .map(|(key, values)| json!({ "key": key, "valueSet": values }))
+                        .collect(),
+                ),
+            );
+            body.insert(
+                api.filters_member.to_string(),
+                Value::Array(
+                    current
+                        .iter()
+                        .map(|(key, values)| json!({ "Key": key, "Values": values }))
+                        .collect(),
+                ),
+            );
+            let body = Value::Object(body);
+            let case = format!("{} {case} in {body}", api.operation);
+            let (status, parsed) = call(&router, api.operation, &body).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} with {parsed}"
+            );
+            assert_eq!(
+                error_code(&parsed),
+                "ValidationException",
+                "case {case:?}: expected ValidationException, got {parsed}"
+            );
+            assert_eq!(
+                error_message(&parsed),
+                BOTH_FILTER_MEMBERS,
+                "case {case:?}: expected {BOTH_FILTER_MEMBERS:?}, got {:?}",
+                error_message(&parsed)
+            );
+        }
+    }
+}

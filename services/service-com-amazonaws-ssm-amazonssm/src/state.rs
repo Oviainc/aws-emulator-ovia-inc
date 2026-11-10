@@ -205,10 +205,9 @@ use service_settings::ServiceSettingRecord;
 use crate::ops::types::{
     Activation, AttachmentInformation, AttachmentsSource, DocumentDescription, DocumentParameter,
     DocumentRequires, InstanceInformation, InstanceProperty, Parameter, ParameterHistory,
-    ParameterInlinePolicy, ParameterMetadata, Tag, ASSOCIATION_STATUS_NAME_VALUES,
-    DESCRIBE_ACTIVATIONS_FILTER_KEYS_VALUES, INSTANCE_INFORMATION_FILTER_KEY_VALUES,
-    INSTANCE_PROPERTY_FILTER_KEY_VALUES, PARAMETER_TIER_VALUES, PARAMETER_TYPE_VALUES,
-    PING_STATUS_VALUES, PLATFORM_TYPE_VALUES, RESOURCE_TYPE_VALUES, SOURCE_TYPE_VALUES,
+    ParameterInlinePolicy, ParameterMetadata, Tag, DESCRIBE_ACTIVATIONS_FILTER_KEYS_VALUES,
+    INSTANCE_INFORMATION_FILTER_KEY_VALUES, INSTANCE_PROPERTY_FILTER_KEY_VALUES,
+    PARAMETER_TIER_VALUES, PARAMETER_TYPE_VALUES, PLATFORM_TYPE_VALUES,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service, all three
@@ -1930,10 +1929,7 @@ pub fn is_agent_version(version: &str) -> bool {
 pub fn node_filter_value_rejection(key: &str, value: &str) -> Option<String> {
     if let Some(catalog) = node_filter_key_value_set(key) {
         if !catalog.contains(&value) {
-            return Some(format!(
-                "Value '{value}' for filter key '{key}' is not valid: valid values are {}",
-                catalog.join(" | ")
-            ));
+            return Some(node_filter_value_set_rejection(key, catalog));
         }
         return None;
     }
@@ -3727,19 +3723,51 @@ pub fn node_filter_keys() -> Vec<&'static str> {
 /// publishes, or `None` for a key whose values are free text (a node id, an agent
 /// version, a role name, a tag value).
 ///
-/// Each set is the modelled enum the property targets, which is also what
-/// `InstanceInformationStringFilter$Key` lists for the same keys ("Valid values for the
-/// `PingStatus` filter key: Online | ConnectionLost | Inactive", and so on for
-/// `AssociationStatus`, `PlatformTypes`, `ResourceType` and `SourceType`).
+/// Each set is the modelled enum the property targets, LISTED in the order
+/// `InstanceInformationStringFilter$Key` publishes it ("Valid values for the `PingStatus`
+/// filter key: Online | ConnectionLost | Inactive (deprecated)", and so on for
+/// `AssociationStatus`, `PlatformTypes`, `ResourceType` and `SourceType`) — which is the
+/// order a refusal lists them in, so a caller reads the published list back. The generated
+/// `*_VALUES` constants carry the same values sorted; the test below holds the two to the
+/// same SET, so a model revision cannot leave this listing behind.
 pub fn node_filter_key_value_set(key: &str) -> Option<&'static [&'static str]> {
     match key {
-        "AssociationStatus" => Some(ASSOCIATION_STATUS_NAME_VALUES),
-        "PingStatus" => Some(PING_STATUS_VALUES),
-        "PlatformTypes" => Some(PLATFORM_TYPE_VALUES),
-        "ResourceType" => Some(RESOURCE_TYPE_VALUES),
-        "SourceTypes" => Some(SOURCE_TYPE_VALUES),
+        "AssociationStatus" => Some(&["Success", "Pending", "Failed"]),
+        "PingStatus" => Some(&["Online", "ConnectionLost", "Inactive"]),
+        "PlatformTypes" => Some(&["Windows", "Linux", "MacOS"]),
+        "ResourceType" => Some(&["EC2Instance", "ManagedInstance"]),
+        "SourceTypes" => Some(&[
+            "AWS::EC2::Instance",
+            "AWS::SSM::ManagedInstance",
+            "AWS::IoT::Thing",
+            "Microsoft.Compute/virtualMachines",
+        ]),
         _ => None,
     }
+}
+
+/// How a managed-node describe refuses a filter whose VALUE is outside the set its key
+/// publishes: the key the caller filtered on, then the values that key accepts, as
+/// `InstanceInformationStringFilter$Key` publishes them
+/// ([`node_filter_key_value_set`]).
+///
+/// The sentence names the KEY and the set, and quotes none of the values the request sent:
+/// what a caller has to fix is which values that key may carry, which is the same answer
+/// whichever of them was wrong and however many were. It is the same shape as
+/// [`filter_key_rejection`], the refusal of a key the describe does not know at all.
+///
+/// RECORDED BEHAVIOUR (corpus `simparity-wire-aws-v1`, fixture
+/// `ssm-w22n-traj-instance-properties-route`, step `task#2`): a `DescribeInstanceProperties`
+/// filtering on `PlatformTypes` with a value outside the published set is answered 400
+/// `InvalidInstancePropertyFilterValue` with
+/// `PlatformTypes filter is invalid, valid values are Windows, Linux, MacOS` — the key, then
+/// the set in the order the doc above publishes it, and no value echoed. The same sentence
+/// serves the sibling describe, which reads the same catalog for the same keys.
+pub fn node_filter_value_set_rejection(key: &str, published: &[&str]) -> String {
+    format!(
+        "{key} filter is invalid, valid values are {}",
+        published.join(", ")
+    )
 }
 
 /// Whether `id` is shaped like a managed-node id, from the modelled `InstanceId`
@@ -3796,6 +3824,24 @@ pub fn pattern_constraint_violation(member: &str, pattern: &str) -> String {
 pub fn managed_node_id_constraint_violation() -> String {
     pattern_constraint_violation(MANAGED_NODE_ID_MEMBER, MANAGED_NODE_ID_PATTERN)
 }
+
+/// How a managed-node describe refuses a request that names BOTH its LEGACY filter list and
+/// its current filter member — `InstancePropertyFilterList` beside `FiltersWithOperator`, or
+/// `InstanceInformationFilterList` beside `Filters`.
+///
+/// The two members are alternatives rather than a union ("Attempting to use
+/// InstanceInformationFilterList and Filters leads to an exception error"), and the sentence
+/// names NEITHER of them: it states that the legacy and the current filter cannot be used
+/// together, which is the same answer whichever describe was called and whatever the two
+/// lists held.
+///
+/// RECORDED BEHAVIOUR (corpus `simparity-wire-aws-v1`, fixture
+/// `ssm-w22n-traj-instance-properties-route`, step `task#3`): a `DescribeInstanceProperties`
+/// naming both `InstancePropertyFilterList` and `FiltersWithOperator` is answered 400
+/// `ValidationException` with exactly this sentence. It carries nothing of the request, so
+/// the sibling describe — whose doc states the rule — states the same one.
+pub const LEGACY_AND_NEW_FILTERS_REJECTION: &str =
+    "Cannot use both legacy and new filter simultaneously";
 
 /// The refusal a request that mixes filter kinds carries, as the service words it: one
 /// sentence about the KINDS, carrying none of the request's keys — a tag filter and an

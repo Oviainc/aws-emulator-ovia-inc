@@ -409,8 +409,8 @@ async fn filters_select_the_nodes_the_store_holds() {
             vec![LINUX],
         ),
         (
-            "BeginWith on a published value set takes a prefix",
-            string_filter("PlatformTypes", &["Mac"], Some("BeginWith")),
+            "BeginWith on a published value set takes a whole published value",
+            string_filter("PlatformTypes", &["MacOS"], Some("BeginWith")),
             vec![MACOS],
         ),
         (
@@ -474,10 +474,12 @@ async fn filters_select_the_nodes_the_store_holds() {
             vec![WINDOWS],
         ),
         (
-            "both filter lists are ANDed",
+            "two legacy filters are ANDed",
             json!({
-                "InstancePropertyFilterList": [{ "key": "ResourceType", "valueSet": ["EC2Instance"] }],
-                "FiltersWithOperator": [{ "Key": "PingStatus", "Values": ["Online"] }],
+                "InstancePropertyFilterList": [
+                    { "key": "ResourceType", "valueSet": ["EC2Instance"] },
+                    { "key": "PingStatus", "valueSet": ["Online"] },
+                ],
             }),
             vec![LINUX],
         ),
@@ -533,9 +535,9 @@ async fn filters_select_the_nodes_the_store_holds() {
     }
 }
 
-/// A filter value outside the set the model publishes for its key is refused where the
-/// operator compares the whole value, and accepted where the operator compares a part of
-/// it.
+/// A filter value outside the set its key publishes is refused whichever operator the
+/// filter names: the published set is the domain of the node property the key selects on,
+/// so a value outside it is one no node can hold — a prefix of a published value included.
 #[tokio::test]
 async fn filter_values_outside_a_published_set_are_refused() {
     let router = seeded_router();
@@ -557,9 +559,10 @@ async fn filter_values_outside_a_published_set_are_refused() {
                 "case {key}={value}: a published value is accepted, got {status} {body}"
             );
         }
-        // And a value that is not one of them is the modelled filter-value refusal,
-        // under both whole-value operators.
-        for operator in ["Equal", "NotEqual"] {
+        // And a value that is not one of them is the modelled filter-value refusal, under
+        // every modelled operator — including the ones that compare a PART of the value,
+        // which a value the property can never hold is no part of either.
+        for operator in ["Equal", "NotEqual", "BeginWith", "LessThan", "GreaterThan"] {
             let (status, body) = call(
                 &router,
                 &string_filter(key, &["NotAPublishedValue"], Some(operator)),
@@ -575,13 +578,19 @@ async fn filter_values_outside_a_published_set_are_refused() {
                 "case {key}/{operator}: the refusal is the modelled one, got {body}"
             );
         }
-        // A prefix or a bound is not a member of the set and must still be accepted.
+        // A PREFIX of a published value is not a published value, so it is refused too,
+        // and the refusal names the key and the set rather than the value it refused.
         let prefix = &values[0][..1];
         for operator in ["BeginWith", "LessThan", "GreaterThan"] {
             let (status, body) = call(&router, &string_filter(key, &[prefix], Some(operator))).await;
             assert_eq!(
-                status, 200,
-                "case {key}/{operator}={prefix}: a partial value is accepted, got {status} {body}"
+                status, 400,
+                "case {key}/{operator}={prefix}: a partial value is refused, got {status} {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "InvalidInstancePropertyFilterValue",
+                "case {key}/{operator}={prefix}: the refusal is the modelled one, got {body}"
             );
         }
     }

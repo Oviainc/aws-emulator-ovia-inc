@@ -12,12 +12,15 @@
 //!
 //! ## Filters
 //!
-//! A request may carry both filter lists, and a node is reported only when it satisfies
-//! EVERY filter in them (a filter is satisfied by ANY of its values). The two lists
-//! differ only in what they can say: `InstancePropertyFilterList` carries a modelled
+//! A request names ONE of the two filter lists, and a node is reported only when it
+//! satisfies EVERY filter in it (a filter is satisfied by ANY of its values). The two
+//! lists differ only in what they can say: `InstancePropertyFilterList` carries a modelled
 //! `InstancePropertyFilterKey` and no operator, so it selects the nodes whose property
 //! EQUALS one of its values, while `FiltersWithOperator` carries a free-text key and one
-//! of the modelled operators.
+//! of the modelled operators. They are ALTERNATIVES: a request naming both is refused
+//! ([`crate::state::LEGACY_AND_NEW_FILTERS_REJECTION`]), as it is on the sibling node
+//! describe, whose own doc states the rule ("Attempting to use
+//! InstanceInformationFilterList and Filters leads to an exception error").
 //!
 //! The set of filter keys is CLOSED, so a key that names no property of a node is
 //! refused before any node is looked at — as a `ValidationException` whose message names
@@ -27,11 +30,13 @@
 //! ANDed with a filter on a property of a node is refused the same way: both keys are
 //! keys this operation accepts, so what is invalid is their COMBINATION ("Tag filters
 //! can't be combined with other filter types"), which two tag filters and two property
-//! filters do not trip ([`crate::state::tag_filter_combination_rejection`]). For the
-//! operators that compare a whole value, a value outside the set the model publishes for
-//! its key is the modelled `InvalidInstancePropertyFilterValue` ("The specified filter
-//! value isn't valid"), and a node id that is not shaped like one is the modelled
-//! `InvalidInstanceId`, carrying the constraint it violated
+//! filters do not trip ([`crate::state::tag_filter_combination_rejection`]). A value
+//! outside the set its key publishes is the modelled
+//! `InvalidInstancePropertyFilterValue`, naming the key and the values it accepts
+//! ([`crate::state::node_filter_value_set_rejection`]) whichever operator the filter
+//! names — the published set is the DOMAIN of the property the key selects on, so a value
+//! outside it is one no node can hold. A node id that is not shaped like one is the
+//! modelled `InvalidInstanceId`, carrying the constraint it violated
 //! ([`crate::state::MANAGED_NODE_ID_PATTERN`]). [`crate::state`] holds the key set, the
 //! value sets, the combination rule and the operator comparison, so the describes over
 //! the same nodes cannot disagree about them.
@@ -215,18 +220,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The LEGACY filter list and the current one are alternatives rather than a union:
+        // a request naming both is refused the way the sibling node describe refuses the
+        // same request shape ([`crate::state::LEGACY_AND_NEW_FILTERS_REJECTION`]), before
+        // either list is read.
+        let legacy = input.instance_property_filter_list.as_deref().unwrap_or_default();
+        let with_operator = input.filters_with_operator.as_deref().unwrap_or_default();
+        if !legacy.is_empty() && !with_operator.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::LEGACY_AND_NEW_FILTERS_REJECTION,
+            ));
+        }
+
         // Every filter the request carries: the modelled filter list compares whole
         // values and carries no operator of its own, so it is served with `Equal`, and
         // so is a string filter that names none.
         let mut filters: Vec<RequestFilter<'_>> = Vec::new();
-        for filter in input.instance_property_filter_list.iter().flatten() {
+        for filter in legacy {
             filters.push(RequestFilter {
                 key: filter.key.as_str(),
                 values: filter.value_set.as_slice(),
                 operator: crate::state::OPERATOR_EQUAL,
             });
         }
-        for filter in input.filters_with_operator.iter().flatten() {
+        for filter in with_operator {
             filters.push(RequestFilter {
                 key: filter.key.as_str(),
                 values: filter.values.as_slice(),
@@ -262,29 +279,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let RequestFilter {
                 key,
                 values,
-                operator,
+                operator: _,
             } = filter;
-            // A value belongs to a published set only where the operator compares the
-            // WHOLE value. `BeginWith`, `LessThan` and `GreaterThan` are satisfied by a
-            // prefix of, or a bound on, such a value, so a set membership test there
-            // would refuse filters the operators exist to express.
-            let compares_whole_value = *operator == crate::state::OPERATOR_EQUAL
-                || *operator == crate::state::OPERATOR_NOT_EQUAL;
-            if !compares_whole_value {
-                continue;
-            }
+            // Whichever operator the filter names: the published set is the DOMAIN of the
+            // node property the key selects on, so a value outside it is not a value that
+            // property can ever hold — nothing a prefix or a bound could match either.
             if let Some(allowed) = crate::state::node_filter_key_value_set(key) {
-                if let Some(rejected) = values
+                if values
                     .iter()
-                    .find(|value| !allowed.contains(&value.as_str()))
+                    .any(|value| !allowed.contains(&value.as_str()))
                 {
                     return Err(
                         DescribeInstancePropertiesErrorModeled::InvalidInstancePropertyFilterValue(
                             InvalidInstancePropertyFilterValue {
-                                message: Some(format!(
-                                    "Value '{rejected}' for filter key '{key}' isn't valid: valid \
-                                     values are {}",
-                                    allowed.join(" | ")
+                                message: Some(crate::state::node_filter_value_set_rejection(
+                                    key, allowed,
                                 )),
                             },
                         )
