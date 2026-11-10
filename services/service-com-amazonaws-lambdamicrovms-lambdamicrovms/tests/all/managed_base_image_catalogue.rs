@@ -16,7 +16,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    base_image_not_found_message, managed_base_image_arn, MANAGED_BASE_IMAGE_IDS, MAX_LIST_PAGE,
+    base_image_not_found_message, managed_base_image_arn, managed_base_image_publication,
+    MANAGED_BASE_IMAGE_IDS, MAX_LIST_PAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -76,6 +77,25 @@ fn hex_token(value: &str) -> String {
     ::hex::encode(value.as_bytes())
 }
 
+/// The instants the catalogue published the entry `item` reports with
+/// (`state::managed_base_image_publication`, keyed by the base image id its `imageArn`
+/// names), as the epoch-seconds numbers a listing reports them as.
+fn published_instants(item: &Value, case: &str) -> (Option<f64>, Option<f64>) {
+    let image_arn = item["imageArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: every entry carries an imageArn, got {item}"));
+    let image_id = image_arn
+        .split(':')
+        .next_back()
+        .unwrap_or_else(|| panic!("case {case}: the ARN names a base image, got {image_arn}"));
+    let (created_at, updated_at) = managed_base_image_publication(image_id)
+        .unwrap_or_else(|| panic!("case {case}: the catalogue publishes {image_id}"));
+    (
+        Some(created_at.secs() as f64),
+        Some(updated_at.secs() as f64),
+    )
+}
+
 /// RULE: however the pages are cut, the listing walks the whole published catalogue —
 /// every entry exactly once, in one stable order, at most `maxResults` per page — and
 /// hands back a `nextToken` only while entries remain.
@@ -120,19 +140,14 @@ async fn the_catalogue_is_served_once_per_published_entry_over_every_page_size()
                 page.len()
             );
             for item in page_items(&body, &case) {
-                let created_at = item["createdAt"].as_f64();
-                assert!(
-                    created_at.is_some_and(|at| at > 0.0),
-                    "case {case}: every entry carries the instant it was published, got {:?}",
-                    item["createdAt"]
-                );
+                // The entry reports the catalogue's own published metadata, whichever
+                // page it is served on; the distinction between the two instants is the
+                // subject of `managed_catalogue_publication_metadata`.
                 assert_eq!(
-                    item["updatedAt"].as_f64(),
-                    created_at,
-                    "case {case}: nothing has written the entry since it was published, got \
-                     createdAt {:?} updatedAt {:?}",
-                    item["createdAt"],
-                    item["updatedAt"]
+                    (item["createdAt"].as_f64(), item["updatedAt"].as_f64()),
+                    published_instants(&item, &case),
+                    "case {case}: every entry carries the instants the catalogue published \
+                     it with, got {item}"
                 );
             }
             seen.extend(page);

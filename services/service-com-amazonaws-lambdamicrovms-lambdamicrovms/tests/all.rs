@@ -47,6 +47,8 @@ mod managed_base_image_catalogue;
 mod managed_base_image_generations;
 #[path = "all/managed_base_image_versions.rs"]
 mod managed_base_image_versions;
+#[path = "all/managed_catalogue_publication_metadata.rs"]
+mod managed_catalogue_publication_metadata;
 #[path = "all/managed_namespace_authorization.rs"]
 mod managed_namespace_authorization;
 #[path = "all/microvm_endpoint_data_plane.rs"]

@@ -401,6 +401,7 @@ dependencies = [
  "service-com-amazonaws-accessanalyzer-accessanalyzer",
  "service-com-amazonaws-account-account",
  "service-com-amazonaws-accountaccess-awsaccountaccess",
+ "service-com-amazonaws-accountaccessruntime-awsaccountaccessruntime",
  "service-com-amazonaws-acm-certificatemanager",
  "service-com-amazonaws-acmpca-acmprivateca",
  "service-com-amazonaws-agentregistry-agentregistry",
@@ -8201,6 +8202,29 @@ dependencies = [
 
 [[package]]
 name = "service-com-amazonaws-accountaccess-awsaccountaccess"
+version = "0.1.0"
+dependencies = [
+ "aws-emulator-build-support",
+ "aws-emulator-emulator-telemetry",
+ "aws-emulator-engine",
+ "aws-emulator-server",
+ "aws-emulator-smithy-macros",
+ "aws-emulator-smithy-schema-server",
+ "aws-emulator-smithy-server-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 0.2.1",
+ "aws-smithy-types",
+ "bytes",
+ "hex",
+ "http",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "service-com-amazonaws-accountaccessruntime-awsaccountaccessruntime"
 version = "0.1.0"
 dependencies = [
  "aws-emulator-build-support",

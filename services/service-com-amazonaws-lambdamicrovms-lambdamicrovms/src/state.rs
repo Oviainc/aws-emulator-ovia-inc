@@ -468,7 +468,8 @@ pub fn managed_base_image_arn(region: &str, image_id: &str) -> String {
 }
 
 /// The generations the AWS-managed catalogue publishes, as `(base image id,
-/// generation, the CPU architectures that generation supports)`.
+/// generation, the instant AWS published that generation as epoch seconds, the CPU
+/// architectures that generation supports)`.
 ///
 /// An AWS-PUBLISHED base image is versioned by a plain integer GENERATION counter —
 /// not the `major.minor` form this service mints for an account's own images
@@ -485,9 +486,19 @@ pub fn managed_base_image_arn(region: &str, image_id: &str) -> String {
 /// which is how a caller selects a base image by architecture; the catalogue's images
 /// support every architecture this API models (`ARCHITECTURE_VALUES`, the values
 /// `smithy_query(query="shape",shape="Architecture")` lists).
-pub const MANAGED_BASE_IMAGE_VERSIONS: &[(&str, &str, &[&str])] = &[
-    ("al2023-1", "1", ARCHITECTURE_VALUES),
-    ("al2023-1", "0", ARCHITECTURE_VALUES),
+///
+/// A generation's publication INSTANT is published metadata of AWS's own catalogue, not
+/// anything this emulator or an account does, so it is a constant of this table: the
+/// same value on every read, for the life of the entry. The instants below are chosen
+/// (this emulator does not hold AWS's own publication dates), anchored on the API
+/// version this service serves the catalogue under, and ordered as the generations are:
+/// a later generation is published later.
+pub const MANAGED_BASE_IMAGE_VERSIONS: &[(&str, &str, i64, &[&str])] = &[
+    // Generation 1, published 2025-10-14T00:00:00Z.
+    ("al2023-1", "1", 1_760_400_000, ARCHITECTURE_VALUES),
+    // Generation 0, published 2025-09-09T00:00:00Z — the service's own API version date,
+    // the first instant it could have published a base image under.
+    ("al2023-1", "0", 1_757_376_000, ARCHITECTURE_VALUES),
 ];
 
 /// A `ManagedMicrovmImageVersionStatus` value
@@ -507,8 +518,8 @@ pub fn published_managed_base_image_versions(image_id: &str) -> Vec<&'static str
     let mut versions: Vec<&'static str> = match is_published_managed_base_image(image_id) {
         true => MANAGED_BASE_IMAGE_VERSIONS
             .iter()
-            .filter(|(id, _, _)| *id == image_id)
-            .map(|(_, version, _)| *version)
+            .filter(|(id, ..)| *id == image_id)
+            .map(|(_, version, ..)| *version)
             .collect(),
         false => Vec::new(),
     };
@@ -526,12 +537,60 @@ pub fn managed_base_image_supported_architectures(
 ) -> Vec<CpuConfiguration> {
     MANAGED_BASE_IMAGE_VERSIONS
         .iter()
-        .filter(|(id, version, _)| *id == image_id && *version == image_version)
-        .flat_map(|(_, _, architectures)| architectures.iter())
+        .filter(|(id, version, ..)| *id == image_id && *version == image_version)
+        .flat_map(|(.., architectures)| architectures.iter())
         .map(|architecture| CpuConfiguration {
             architecture: (*architecture).to_string(),
         })
         .collect()
+}
+
+/// When the catalogue published `image_version` of the base image `image_id`, as the
+/// wire timestamp type a listing reports it with. `None` for a generation the catalogue
+/// does not publish, which was never published at all.
+///
+/// The instant is the table's own ([`MANAGED_BASE_IMAGE_VERSIONS`]) rather than any
+/// clock this emulator reads, so every read of the catalogue reports the same value for
+/// a given entry and a client can cache it, diff it and key its own records on it.
+pub fn managed_base_image_version_published_at(
+    image_id: &str,
+    image_version: &str,
+) -> Option<DateTime> {
+    match is_published_managed_base_image(image_id) {
+        true => MANAGED_BASE_IMAGE_VERSIONS
+            .iter()
+            .find(|(id, version, ..)| *id == image_id && *version == image_version)
+            .map(|(_, _, published_at, _)| DateTime::from_secs(*published_at)),
+        false => None,
+    }
+}
+
+/// When the catalogue entry for the base image `image_id` was published and when it was
+/// last republished, as `(createdAt, updatedAt)`. `None` for an id the catalogue does
+/// not publish.
+///
+/// A catalogue ENTRY is published with its first generation and written again every time
+/// AWS publishes another generation of it, so its `createdAt` is the publication instant
+/// of its OLDEST generation and its `updatedAt` that of its NEWEST — both read from the
+/// one generation table, which is why a listing of the entry and a listing of its
+/// versions cannot disagree, and why the two instants differ for every image the
+/// catalogue publishes more than one generation of.
+pub fn managed_base_image_publication(image_id: &str) -> Option<(DateTime, DateTime)> {
+    let mut published: Vec<i64> = match is_published_managed_base_image(image_id) {
+        true => MANAGED_BASE_IMAGE_VERSIONS
+            .iter()
+            .filter(|(id, ..)| *id == image_id)
+            .map(|(_, _, published_at, _)| *published_at)
+            .collect(),
+        false => Vec::new(),
+    };
+    published.sort_unstable();
+    let created_at = *published.first()?;
+    let updated_at = *published.last()?;
+    Some((
+        DateTime::from_secs(created_at),
+        DateTime::from_secs(updated_at),
+    ))
 }
 
 /// The newest generation the catalogue publishes for the base image `image_id`: the
@@ -1396,7 +1455,7 @@ pub struct IdempotencyRecord {
 /// `microvms` by [`MAX_ACTIVE_MICROVMS`] plus the [`TERMINATED_MICROVM_RETENTION`]
 /// reclaim, and its `idempotency` by [`MAX_IDEMPOTENCY_RECORDS`] and
 /// [`IDEMPOTENCY_RETENTION`].
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     /// The records of each region, keyed by the region they were created in. A region
     /// nothing was ever created in holds no entry at all.
@@ -1414,29 +1473,6 @@ pub struct ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     pub next_microvm_seq: u64,
     /// The sequence the next minted `buildId` is formatted from.
     pub next_build_seq: u64,
-    /// When this store published the AWS-managed base-image catalogue
-    /// ([`MANAGED_BASE_IMAGE_IDS`]) — the `createdAt` every entry of it reports.
-    ///
-    /// The catalogue is AWS's, not an account's: nothing a caller does adds to it or
-    /// changes it, and this emulator does not hold AWS's own publication dates. So the
-    /// catalogue is published when this store comes up, stamped ONCE here, and every
-    /// read of it reports that same instant.
-    pub managed_catalogue_published_at: DateTime,
-}
-
-impl Default for ComAmazonawsLambdamicrovmsLambdamicrovmsState {
-    /// A store holding no account resources, with the AWS-managed catalogue published
-    /// as of now — see [`Self::managed_catalogue_published_at`].
-    fn default() -> Self {
-        Self {
-            regions: BTreeMap::new(),
-            auth_tokens: BTreeMap::new(),
-            microvm_proxy: None,
-            next_microvm_seq: 0,
-            next_build_seq: 0,
-            managed_catalogue_published_at: now_datetime(),
-        }
-    }
 }
 
 /// One entry of the AWS-managed base-image catalogue, as a reporting operation
@@ -1448,12 +1484,13 @@ pub struct ManagedBaseImage {
     pub image_id: String,
     /// The ARN this entry carries in the region the request was signed for.
     pub image_arn: String,
-    /// When the catalogue entry was published.
+    /// When the catalogue entry was published: the publication instant of the oldest
+    /// generation the catalogue holds of it ([`managed_base_image_publication`]).
     pub created_at: DateTime,
-    /// When the entry was last written. Publishing it is its first write, which is how
-    /// this service reports every record it holds (`CreateMicrovmImage` stamps the
-    /// created image's `updatedAt` from the same instant as its `createdAt`), and
-    /// nothing an account does writes a catalogue entry again.
+    /// When the entry was last written: the publication instant of the NEWEST generation
+    /// the catalogue holds of it, which is the last time AWS republished the entry. An
+    /// image the catalogue publishes a single generation of was written once, when it was
+    /// published.
     pub updated_at: Option<DateTime>,
 }
 
@@ -1468,9 +1505,12 @@ pub struct ManagedBaseImageVersion {
     pub image_version: String,
     /// The version's lifecycle status; see [`MANAGED_VERSION_STATUS_AVAILABLE`].
     pub status: String,
-    /// When the version was published, as [`ManagedBaseImage::created_at`].
+    /// When the version was published — the generation's own publication instant
+    /// ([`managed_base_image_version_published_at`]).
     pub created_at: DateTime,
-    /// When the version was last written, as [`ManagedBaseImage::updated_at`].
+    /// When the version was last written. A published generation is never rewritten —
+    /// AWS publishes another generation instead — so this is the instant it was
+    /// published.
     pub updated_at: Option<DateTime>,
     /// The CPU architectures this published generation supports — see
     /// [`managed_base_image_supported_architectures`].
@@ -1684,17 +1724,22 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     /// ([`MANAGED_BASE_IMAGE_IDS`], [`is_published_managed_base_image`]), so a listing
     /// of it and a create that builds on it cannot disagree about which base images
     /// exist. The entries are AWS-owned, so each ARN carries `aws` in its account field
-    /// and the region the request named; nothing an account does changes an entry, so
-    /// each reports the instant the catalogue was published.
+    /// and the region the request named; the instants an entry reports are the
+    /// catalogue's own published metadata ([`managed_base_image_publication`]) rather
+    /// than any clock this store reads, so every read of the catalogue reports the same
+    /// pair and a client can cache and diff it.
     pub fn managed_base_images(&self, region: &str) -> Vec<ManagedBaseImage> {
         let mut ids: Vec<&str> = MANAGED_BASE_IMAGE_IDS.to_vec();
         ids.sort_unstable();
         ids.into_iter()
-            .map(|image_id| ManagedBaseImage {
-                image_id: image_id.to_string(),
-                image_arn: managed_base_image_arn(region, image_id),
-                created_at: self.managed_catalogue_published_at,
-                updated_at: Some(self.managed_catalogue_published_at),
+            .filter_map(|image_id| {
+                let (created_at, updated_at) = managed_base_image_publication(image_id)?;
+                Some(ManagedBaseImage {
+                    image_id: image_id.to_string(),
+                    image_arn: managed_base_image_arn(region, image_id),
+                    created_at,
+                    updated_at: Some(updated_at),
+                })
             })
             .collect()
     }
@@ -1706,8 +1751,9 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     /// The same catalogue [`Self::managed_base_images`] serves, read one image deep
     /// ([`MANAGED_BASE_IMAGE_VERSIONS`]), so a listing of an image's versions, the
     /// version a build that pins none resolves to, and the images the catalogue
-    /// publishes cannot disagree. Nothing an account does writes a catalogue entry, so
-    /// each version reports the instant the catalogue was published.
+    /// publishes cannot disagree. Each version reports the instant the catalogue
+    /// published that generation ([`managed_base_image_version_published_at`]), a
+    /// constant of the catalogue rather than a clock this store reads.
     pub fn managed_base_image_versions(
         &self,
         image_id: &str,
@@ -1715,16 +1761,20 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     ) -> Vec<ManagedBaseImageVersion> {
         published_managed_base_image_versions(image_id)
             .into_iter()
-            .map(|image_version| ManagedBaseImageVersion {
-                image_arn: managed_base_image_arn(region, image_id),
-                image_version: image_version.to_string(),
-                status: MANAGED_VERSION_STATUS_AVAILABLE.to_string(),
-                created_at: self.managed_catalogue_published_at,
-                updated_at: Some(self.managed_catalogue_published_at),
-                supported_cpu_configurations: managed_base_image_supported_architectures(
-                    image_id,
-                    image_version,
-                ),
+            .filter_map(|image_version| {
+                let published_at =
+                    managed_base_image_version_published_at(image_id, image_version)?;
+                Some(ManagedBaseImageVersion {
+                    image_arn: managed_base_image_arn(region, image_id),
+                    image_version: image_version.to_string(),
+                    status: MANAGED_VERSION_STATUS_AVAILABLE.to_string(),
+                    created_at: published_at,
+                    updated_at: Some(published_at),
+                    supported_cpu_configurations: managed_base_image_supported_architectures(
+                        image_id,
+                        image_version,
+                    ),
+                })
             })
             .collect()
     }

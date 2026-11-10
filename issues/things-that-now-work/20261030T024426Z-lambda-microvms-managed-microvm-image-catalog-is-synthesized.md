@@ -59,3 +59,33 @@ Model grounding (services/service-com-amazonaws-lambdamicrovms-lambdamicrovms/sm
    AWS: several items, imageVersion values are integer generations ('1', '0'), each with status='AVAILABLE' and supportedCpuConfigurations=[{'architecture': 'ARM_64'}].
    Emulator: a single item with imageVersion='1.0' and no supportedCpuConfigurations. (Cause 1)
 4. CreateMicrovmImage(..., baseImageArn=arn, baseImageVersion='1') - the generation id AWS publishes - and confirm the emulator's catalog never offered it.
+
+## Fix status
+
+Cause 1: FIXED, and already so in the code base this fix starts from (the report was filed
+against an older commit): `MANAGED_BASE_IMAGE_VERSIONS` in
+`services/service-com-amazonaws-lambdamicrovms-lambdamicrovms/src/state.rs` publishes both
+generations with integer ids and the per-generation architectures, and
+`ListManagedMicrovmImageVersions` writes `supportedCpuConfigurations` beside the modelled
+payload. Replay reports the `ListManagedMicrovmImageVersions|$.items[*]` key as `fixed`.
+
+Cause 2: the rule is implemented. The generation table now carries the instant the catalogue
+published each generation, and a catalogue entry reports the oldest generation's instant as
+`createdAt` and the newest one's as `updatedAt` (`managed_base_image_publication`), so both
+listings report fixed per-entry metadata, identical on every read and in every region, with
+`updatedAt` strictly later than `createdAt` for an image published in more than one
+generation. `tests/all/managed_catalogue_publication_metadata.rs` pins that over the
+published catalogue crossed with several regions and both identifier forms.
+
+What is still reported open is the `ListManagedMicrovmImages|$.items[*]` key on one of the
+two recorded fixtures of that operation, and what it can still be reporting is the recorded
+epoch values themselves, which a replay withholds: of the two recorded listings, the one in
+`lambdamicrovms-managed-image-catalog#task#1` passes with the published instants (and failed
+when the row's `updatedAt` was dropped, and when its `imageArn` was perturbed, so the member
+set and the ARN both match the recording), while `lambda-microvms-catalog-list-managed-microvm-images#task#1`
+diverges at `$.items[0]` with the same body and the same region. No request member, model
+trait or stored record determines those two epochs — AWS's own publication dates for the
+base image are not data this emulator holds — so the seed carries chosen constants anchored
+on the service's API version date rather than a single recording's values. A later fixer with
+access to the fixture can complete the seed from it; guessing the epochs would substitute one
+fidelity defect for another.
