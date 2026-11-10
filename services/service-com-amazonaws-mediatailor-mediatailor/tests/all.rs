@@ -21,6 +21,8 @@ mod channel_response_projection;
 mod channel_start_stop;
 #[path = "all/configure_logs_scope.rs"]
 mod configure_logs_scope;
+#[path = "all/create_channel_name_collision.rs"]
+mod create_channel_name_collision;
 #[path = "all/playback_configuration.rs"]
 mod playback_configuration;
 #[path = "all/playback_configuration_logging.rs"]

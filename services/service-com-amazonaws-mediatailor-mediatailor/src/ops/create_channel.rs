@@ -141,6 +141,18 @@ impl From<CreateChannelErrorModeled> for CreateChannelError {
 /// must configure filler slate if your channel uses the LINEAR PlaybackMode."
 const PLAYBACK_MODE_LINEAR: &str = "LINEAR";
 
+/// How this service states that the requested channel name is already in use.
+///
+/// The service words this refusal as one fixed sentence: it reports the class of
+/// the mistake (the name is taken) and what to do about it (pick another one),
+/// and it carries no value from the request or from the stored channel — not the
+/// requested name, not the ARN. Because the model declares a single client error
+/// for this service, the sentence is the only thing that tells a caller a name
+/// collision apart from any other refused create, so it is held fixed here
+/// rather than built per request.
+const CHANNEL_ALREADY_EXISTS_MESSAGE: &str =
+    "This channel already exists. Create a unique channel and resubmit your request.";
+
 /// The per-channel host label this emulator's generated playback URLs carry: a
 /// 28-character label derived from the channel's ARN, so every output of one
 /// channel shares a host that is stable for the life of the channel and is
@@ -384,15 +396,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A channel name identifies one channel in the account, so a request
         // naming a channel the account already holds is unexpected data: it is
-        // refused, and the channel that is already stored is left exactly as it
-        // was.
+        // refused with the service's own sentence for the collision, and the
+        // channel that is already stored is left exactly as it was — this
+        // returns before anything is written.
         if store.channels.contains_key(&input.channel_name) {
             return Err(CreateChannelErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some(format!(
-                        "Channel with name {} already exists.",
-                        input.channel_name
-                    )),
+                    message: Some(CHANNEL_ALREADY_EXISTS_MESSAGE.to_string()),
                 },
             )
             .into());

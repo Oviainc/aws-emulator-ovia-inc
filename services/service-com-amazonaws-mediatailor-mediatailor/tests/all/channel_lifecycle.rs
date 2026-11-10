@@ -315,6 +315,12 @@ pub(crate) fn table() -> Vec<(&'static str, &'static str, Value)> {
 /// tier MediaTailor assigns unless `STANDARD` is asked for.
 const DEFAULT_TIER: &str = "BASIC";
 
+/// The sentence MediaTailor refuses a create under a name already in use with.
+/// It is fixed text: it names neither the requested channel nor any other value
+/// of the request or of the stored channel.
+pub(crate) const CHANNEL_ALREADY_EXISTS_MESSAGE: &str =
+    "This channel already exists. Create a unique channel and resubmit your request.";
+
 #[tokio::test]
 async fn create_persists_every_member_and_describe_reports_it() {
     let emulator = Emulator::new();
@@ -527,9 +533,10 @@ async fn a_second_create_under_a_stored_name_is_refused_and_changes_nothing() {
             "case {case:?}: expected BadRequestException, got {:?}",
             refused.error_code
         );
-        assert!(
-            refused.message().contains(name),
-            "case {case:?}: expected the refusal to name the channel {name:?}, got {:?}",
+        assert_eq!(
+            refused.message(),
+            CHANNEL_ALREADY_EXISTS_MESSAGE,
+            "case {case:?}: expected the fixed name-collision sentence, got {:?}",
             refused.message()
         );
 
