@@ -89,8 +89,9 @@ const USAGE_PLANS_URI: &str = "/usageplans";
 
 /// The members of one of these creates the model declares `@required`, as `(property, member)`
 /// pairs: a declaration stating none of one asks for a resource that call will not make, so it
-/// is refused here naming the PROPERTY — the one wording every arm below uses, rather than
-/// relaying the request for the owning service to refuse by its own member name.
+/// is refused here naming the PROPERTY — in the one wording of that refusal this control plane
+/// has ([`super::missing_property`]) — rather than relaying the request for the owning service
+/// to refuse by its own member name.
 fn refuse_missing(
     resource: &StoredResource,
     request: &Map<String, Value>,
@@ -98,33 +99,10 @@ fn refuse_missing(
 ) -> Result<(), Refusal> {
     for (property, member) in members {
         if !request.contains_key(*member) {
-            return Err(Refusal {
-                code: MISSING_PROPERTY.to_string(),
-                message: format!(
-                    "{} requires the {property} property",
-                    resource.resource_type
-                ),
-            });
+            return Err(missing_property(resource, property));
         }
     }
     Ok(())
-}
-
-/// This resource's own identifier, which addresses every call on it, or the refusal for a
-/// record carrying none: an empty id would address the account's own COLLECTION rather than one
-/// resource, so a read of it would answer a page and a delete would address nothing.
-fn own_id(resource: &StoredResource) -> Result<&str, Refusal> {
-    let id = resource.physical_resource_id.as_str();
-    if id.is_empty() {
-        return Err(Refusal {
-            code: MISSING_PROPERTY.to_string(),
-            message: format!(
-                "{} cannot be addressed without the identifier API Gateway assigned it",
-                resource.resource_type
-            ),
-        });
-    }
-    Ok(id)
 }
 
 // ---------------------------------------------------------------------------

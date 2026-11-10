@@ -17,6 +17,8 @@ mod agentcore_stack_outputs;
 mod appconfig_estate_provisioning;
 #[path = "all/appconfig_resource_types.rs"]
 mod appconfig_resource_types;
+#[path = "all/apigateway_vpc_link_resources.rs"]
+mod apigateway_vpc_link_resources;
 #[path = "all/application_auto_scaling_resources.rs"]
 mod application_auto_scaling_resources;
 #[path = "all/bedrock_knowledge_base_identity.rs"]

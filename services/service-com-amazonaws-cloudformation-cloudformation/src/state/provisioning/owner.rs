@@ -188,8 +188,12 @@ impl Owner {
             // Each of these resources EXISTS from the moment its create answers: API Gateway
             // reports no state an api, a resource, a method, a deployment or a stage is still
             // coming up in — a stage serves the deployment it points at as soon as the create
-            // that made it has answered.
-            Self::ApiGatewayRestApi(_) => Ok(Readiness::Ready),
+            // that made it has answered. A VPC LINK is the one that comes up in a state no
+            // integration carries traffic through, which that arm waits out
+            // ([`apigateway_rest_api::readiness`]).
+            Self::ApiGatewayRestApi(kind) => {
+                apigateway_rest_api::readiness(ctx, region, kind, physical_resource_id).await
+            }
             // A target is registered, and a policy is in force, from the moment the owning
             // service's own call answers.
             Self::ApplicationAutoScaling(_) => Ok(application_auto_scaling::ready()),
@@ -336,8 +340,8 @@ impl Owner {
                 step_functions_state_machine::removal(ctx, region, physical_resource_id).await
             }
             // Every API Gateway delete here takes the resource away as it answers: that
-            // service reports no state a deleted api, resource, method, deployment or stage is
-            // still being removed in.
+            // service reports no state a deleted api, resource, method, deployment, stage or
+            // VPC link is still being removed in.
             Self::ApiGatewayRestApi(_) => Ok(Removal::Gone),
             // Deregistering a target and deleting a policy each take the resource away as the
             // call answers: Application Auto Scaling reports no state a deleted one is still

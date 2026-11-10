@@ -2,10 +2,11 @@
 
 //! The `AWS::ApiGateway::*` types of the REST control plane this emulator creates in Amazon
 //! API Gateway itself: the five a REST API is built out of — the api, its resources, its
-//! methods, a deployment of them and the stage that serves it — and, in
-//! [`access_control`], the four that govern who reaches that stage — the authorizer that
-//! decides a request, the api key a caller presents, the usage plan that meters a key and
-//! the association that puts a key in a plan.
+//! methods, a deployment of them and the stage that serves it — in [`access_control`], the
+//! four that govern who reaches that stage — the authorizer that decides a request, the api
+//! key a caller presents, the usage plan that meters a key and the association that puts a
+//! key in a plan — and, in [`vpc_link`], the VPC link a private integration reaches a VPC
+//! through.
 //!
 //! This is the per-type half of provisioning for those types, the half
 //! [`super::super::provisioner`] holds for every other type this emulator creates; it lives
@@ -53,7 +54,9 @@
 //!   stage that call creates: the members it takes travel in it, and the rest are applied to
 //!   that stage with `UpdateStage` ([`stage_patches`]);
 //! * `AWS::ApiGateway::Stage` is `CreateStage` (`POST /restapis/{restApiId}/stages`), with
-//!   the same patch tail for the settings that create does not take.
+//!   the same patch tail for the settings that create does not take;
+//! * `AWS::ApiGateway::VpcLink` is `CreateVpcLink` (`POST /vpclinks`), the one create here
+//!   that answers a resource still being provisioned ([`vpc_link`]).
 //!
 //! A declared property no call here carries is REFUSED rather than dropped: an api reported
 //! created with less than its declaration asked for is the shallow success these arms exist
@@ -64,19 +67,27 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use super::{
-    applicable_tags, call_rest_json, call_rest_payload, percent_encoded, Created, Refusal,
+    applicable_tags, call_rest_json, call_rest_payload, percent_encoded, Created, Readiness,
+    Refusal,
 };
 use crate::state::provisioner::{
     api_gateway_answered, api_gateway_deleted, attribute_text, lower_camel_members, tags_as_map,
     tags_of, API_GATEWAY_NOT_FOUND, API_GATEWAY_SIGNING_NAME,
 };
-use crate::state::template::{APIGATEWAY_DEPLOYMENT, APIGATEWAY_RESOURCE, APIGATEWAY_REST_API};
+use crate::state::template::{
+    APIGATEWAY_DEPLOYMENT, APIGATEWAY_RESOURCE, APIGATEWAY_REST_API, APIGATEWAY_VPC_LINK,
+};
 use crate::state::StoredResource;
 
 /// The four types that govern ACCESS to a REST API rather than making one up, in a module of
 /// their own so that neither file grows past the length a change to this repository may
 /// touch. They are reached through the same [`Kind`] every arm here is.
 mod access_control;
+
+/// The VPC link a private integration reaches a VPC through, in a module of its own for the
+/// same reason: it is the one type here whose create leaves the resource still coming up, so
+/// its arms are the only ones that read a status back. Reached through the same [`Kind`].
+mod vpc_link;
 
 /// The two resource types this module provisions that the template module does not name: it
 /// names the three whose `Ref` and `Fn::GetAtt` return an identifier API Gateway assigns
@@ -120,6 +131,8 @@ pub(in crate::state) enum Kind {
     Deployment,
     /// `AWS::ApiGateway::Stage`.
     Stage,
+    /// `AWS::ApiGateway::VpcLink`, whose arms are [`vpc_link`]'s.
+    VpcLink,
     /// One of the four types that govern ACCESS to a REST API, whose arms are
     /// [`access_control`]'s. Which of them it is travels with the kind, as the kind itself
     /// travels with [`super::Owner`].
@@ -134,6 +147,7 @@ pub(super) fn kind_of(resource_type: &str) -> Option<Kind> {
         APIGATEWAY_METHOD => Kind::Method,
         APIGATEWAY_DEPLOYMENT => Kind::Deployment,
         APIGATEWAY_STAGE => Kind::Stage,
+        APIGATEWAY_VPC_LINK => Kind::VpcLink,
         _ => return access_control::kind_of(resource_type).map(Kind::AccessControl),
     };
     Some(kind)
@@ -159,9 +173,35 @@ pub(super) async fn create(
         Kind::Method => put_method(ctx, region, resource).await,
         Kind::Deployment => create_deployment(ctx, region, resource).await,
         Kind::Stage => create_stage(ctx, region, resource, propagated).await,
+        Kind::VpcLink => vpc_link::create(ctx, region, resource, propagated).await,
         Kind::AccessControl(kind) => {
             access_control::create(ctx, region, kind, resource, propagated).await
         }
+    }
+}
+
+/// Whether API Gateway reports one of these resources ready for a client to use — see
+/// [`super::Owner::readiness`].
+///
+/// Every type here but one EXISTS from the moment its create answers: that service reports no
+/// state an api, a resource, a method, a deployment, a stage, an authorizer, a key, a plan or
+/// an association is still coming up in. A VPC LINK is the exception — creating one is "an
+/// asynchronous operation" whose answer carries the status the link is still in — so that arm
+/// reads the status back ([`vpc_link::readiness`]).
+pub(super) async fn readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kind: Kind,
+    physical_resource_id: &str,
+) -> Result<Readiness, Refusal> {
+    match kind {
+        Kind::VpcLink => vpc_link::readiness(ctx, region, physical_resource_id).await,
+        Kind::RestApi
+        | Kind::Resource
+        | Kind::Method
+        | Kind::Deployment
+        | Kind::Stage
+        | Kind::AccessControl(_) => Ok(Readiness::Ready),
     }
 }
 
@@ -195,6 +235,7 @@ pub(super) async fn delete(
             &required(resource, REST_API_ID)?,
             &resource.physical_resource_id,
         ),
+        Kind::VpcLink => vpc_link::vpc_link_uri(own_id(resource)?),
         Kind::AccessControl(kind) => {
             return access_control::delete(ctx, region, kind, resource).await
         }
@@ -257,6 +298,10 @@ pub(super) async fn actual_configuration(
                 ),
             })
         }
+        Kind::VpcLink => (
+            vpc_link::vpc_link_uri(own_id(resource)?),
+            vpc_link::VPC_LINK_REPORTED,
+        ),
         Kind::AccessControl(kind) => {
             return access_control::actual_configuration(ctx, region, kind, resource).await
         }
@@ -1445,14 +1490,45 @@ fn stated<'r>(resource: &'r StoredResource, property: &str) -> Option<&'r Value>
 fn required(resource: &StoredResource, property: &str) -> Result<String, Refusal> {
     match stated(resource, property).map(attribute_text) {
         Some(value) if !value.is_empty() => Ok(value),
-        _ => Err(Refusal {
+        _ => Err(missing_property(resource, property)),
+    }
+}
+
+/// The refusal for a declaration that states none of a property a call here cannot be made
+/// without, naming the PROPERTY rather than relaying the request for API Gateway to refuse by
+/// its own member name.
+///
+/// The ONE wording of that refusal for this module and both its children, so a declaration
+/// missing a property that ADDRESSES a call ([`required`]) and one missing a member its create
+/// declares `@required` ([`access_control::refuse_missing`], [`vpc_link`]) are refused alike.
+fn missing_property(resource: &StoredResource, property: &str) -> Refusal {
+    Refusal {
+        code: MISSING_PROPERTY.to_string(),
+        message: format!(
+            "{} requires the {property} property",
+            resource.resource_type
+        ),
+    }
+}
+
+/// This resource's own identifier, which addresses every call on it, or the refusal for a
+/// record carrying none: an empty id would address the account's own COLLECTION rather than
+/// one resource, so a read of it would answer a page and a delete would address nothing.
+///
+/// Shared by the arms of this module and of both its children, so none of them can word that
+/// refusal differently.
+fn own_id(resource: &StoredResource) -> Result<&str, Refusal> {
+    let id = resource.physical_resource_id.as_str();
+    if id.is_empty() {
+        return Err(Refusal {
             code: MISSING_PROPERTY.to_string(),
             message: format!(
-                "{} requires the {property} property",
+                "{} cannot be addressed without the identifier API Gateway assigned it",
                 resource.resource_type
             ),
-        }),
+        });
     }
+    Ok(id)
 }
 
 /// The `StatusCode` of one response, which is the `@httpLabel` its put binds.

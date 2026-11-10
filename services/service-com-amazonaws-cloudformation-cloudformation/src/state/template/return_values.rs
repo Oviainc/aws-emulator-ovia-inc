@@ -385,6 +385,15 @@ pub(super) fn return_values(
             attributes.insert("Id".to_string(), id.clone());
             (id, attributes)
         }
+        // "Ref returns the VPC link ID"; Fn::GetAtt: VpcLinkId. API Gateway ASSIGNS the id —
+        // a template names the link but not its identifier — so the stand-in takes the same
+        // shape and is REPLACED by the id `CreateVpcLink` really minted, which is what
+        // [`identity_is_service_assigned`] names this type for.
+        APIGATEWAY_VPC_LINK => {
+            let id = api_gateway_assigned_id(APIGATEWAY_VPC_LINK_ID_SALT, name);
+            attributes.insert("VpcLinkId".to_string(), id.clone());
+            (id, attributes)
+        }
         // "Ref returns the API ID"; Fn::GetAtt: ApiEndpoint ("The default endpoint for an
         // API"). API Gateway v2 ASSIGNS the id — a template names the api but not its
         // identifier — so the id is of the form [`api_gateway_assigned_id`] describes and
@@ -1829,6 +1838,12 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == APIGATEWAY_AUTHORIZER
         || resource_type == APIGATEWAY_USAGE_PLAN
         || resource_type == APIGATEWAY_USAGE_PLAN_KEY
+        // A VPC LINK is one more, for the reason its own constant records
+        // ([`APIGATEWAY_VPC_LINK`]): `CreateVpcLink` takes no identifier and answers the id
+        // API Gateway assigned, every call on a link — and the private integration that
+        // reaches a VPC through it — takes that id, and a template declares the link's name
+        // rather than its identifier.
+        || resource_type == APIGATEWAY_VPC_LINK
         // An Amazon EKS pod identity association is one more: that create takes no
         // identifier and answers the ARN and the id Amazon EKS minted for the association,
         // and "Ref returns the association ARN" — a template declares the cluster, the
@@ -3021,6 +3036,18 @@ pub const APIGATEWAY_AUTHORIZER: &str = "AWS::ApiGateway::Authorizer";
 pub const APIGATEWAY_USAGE_PLAN: &str = "AWS::ApiGateway::UsagePlan";
 pub const APIGATEWAY_USAGE_PLAN_KEY: &str = "AWS::ApiGateway::UsagePlanKey";
 
+/// `AWS::ApiGateway::VpcLink`: the VPC link a PRIVATE integration reaches a VPC through,
+/// whose published `Ref` is a SERVICE-ASSIGNED id in the same position as the types above.
+///
+/// `CreateVpcLink` takes no identifier and answers the `id` API Gateway assigned — "Ref
+/// returns the VPC link ID", which is also this type's one `Fn::GetAtt` attribute
+/// (`VpcLinkId`) — and every call on a link takes that id (`GetVpcLink$vpcLinkId`,
+/// `DeleteVpcLink$vpcLinkId`), as does the integration that reaches a VPC through it
+/// (`Integration$connectionId`). A template declares the link's NAME, never its id, so
+/// [`identity_is_service_assigned`] names this type: the identifier in force is the one that
+/// service minted ([`crate::state::provisioning::apigateway_rest_api`]).
+pub const APIGATEWAY_VPC_LINK: &str = "AWS::ApiGateway::VpcLink";
+
 /// `AWS::ApiGateway::DomainName`: a custom domain name of the REST control plane, which a
 /// stack creates in API Gateway itself ([`super::provisioner`]).
 ///
@@ -3102,6 +3129,7 @@ pub(super) const APIGATEWAY_API_KEY_ID_SALT: &str = "apigateway/api-key-id";
 pub(super) const APIGATEWAY_AUTHORIZER_ID_SALT: &str = "apigateway/authorizer-id";
 pub(super) const APIGATEWAY_USAGE_PLAN_ID_SALT: &str = "apigateway/usage-plan-id";
 pub(super) const APIGATEWAY_USAGE_PLAN_KEY_ID_SALT: &str = "apigateway/usage-plan-key-id";
+pub(super) const APIGATEWAY_VPC_LINK_ID_SALT: &str = "apigateway/vpc-link-id";
 pub(super) const APIGATEWAYV2_API_ID_SALT: &str = "apigatewayv2/api-id";
 pub(super) const APIGATEWAYV2_API_MAPPING_ID_SALT: &str = "apigatewayv2/api-mapping-id";
 pub(super) const APIGATEWAYV2_DOMAIN_LABEL_SALT: &str = "apigatewayv2/regional-domain-label";
