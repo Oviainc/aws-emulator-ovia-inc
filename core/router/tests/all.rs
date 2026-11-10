@@ -22,7 +22,6 @@ mod cloudformation_fifo_resource_generated_names;
 // target can mount both and ask which of them claims a request.
 #[path = "all/migrationhub_signing_name_routing.rs"]
 mod migrationhub_signing_name_routing;
-// Declared here, in this same head region, for the reason the entry above records: the two
 // services sharing the `agent-registry` signing name are two crates, so neither crate's own
 // test target can mount both and ask which of them claims a request.
 #[path = "all/agent_registry_signing_name_routing.rs"]
@@ -537,8 +536,6 @@ mod elbv2_subnet_vpc_membership;
 mod elbv2_certificate_in_use_by_acm;
 #[path = "all/elbv2_load_balancer_security_groups.rs"]
 mod elbv2_load_balancer_security_groups;
-// Declared beside its sibling ELBv2 suites, in this span of the sorted list rather than
-// appended at the tail of this file, for the reason the notes above give.
 #[path = "all/elbv2_zonal_shift_managed_resource.rs"]
 mod elbv2_zonal_shift_managed_resource;
 // Declared beside the Classic/ELBv2 suites above, in this span of the sorted list rather
@@ -777,8 +774,6 @@ mod personalize_signing_name_routing;
 #[path = "all/pcs_compute_node_group_instance_profile.rs"]
 mod pcs_compute_node_group_instance_profile;
 // Declared HERE, beside the sibling Personalize suite, for the reason the entries around it
-// record: the appended tail at the end of this file and the head of the list are both regions
-// every concurrently landing router suite puts its line in.
 #[path = "all/personalize_ingestion_targets.rs"]
 mod personalize_ingestion_targets;
 // Declared HERE, in this quiet span of the sorted list, for the reason the entries around
@@ -1013,10 +1008,6 @@ mod cloudformation_lambda_versions_and_aliases;
 mod cloudformation_sam_http_api_definitions;
 #[path = "all/opensearch_vpc_endpoint_vpc_membership.rs"]
 mod opensearch_vpc_endpoint_vpc_membership;
-// Declared here, beside the suite whose wire harness it reuses: the DOMAIN half of the
-// one-VPC rule.
-#[path = "all/opensearch_domain_vpc_placement.rs"]
-mod opensearch_domain_vpc_placement;
 // Declared here, in this quiet span rather than in the appended tail every concurrently
 // landing router suite adds its line to.
 #[path = "all/apigatewayv2_vpc_link_subnets_resolve_in_ec2.rs"]
@@ -1256,13 +1247,21 @@ mod elbv2_host_counts_and_interfaces;
 // Declared in the appended tail, which is where every new suite inserts its lines: the whole
 // deploy -> fire -> deliver -> stack-delete round trip of a stack-deployed
 // `AWS::Scheduler::Schedule`.
-// Declared in the appended tail, which is where every new suite inserts its lines: the
 // deploy -> read-back -> delete round trip of a stack-declared `AWS::Pipes::Pipe`, and the
 // refusal of one whose declaration omits a property its type's schema requires.
 #[path = "all/cloudformation_provisions_eventbridge_pipes.rs"]
 mod cloudformation_provisions_eventbridge_pipes;
 #[path = "all/cloudformation_deployed_schedule_invokes_its_target.rs"]
 mod cloudformation_deployed_schedule_invokes_its_target;
+// Declared in the appended tail, which is where every new suite inserts its lines: an
+// EventBridge rule whose target is a Firehose delivery stream, and the object that stream's
+// destination holds once the event reached it.
+#[path = "all/events_rule_firehose_target_delivery.rs"]
+mod events_rule_firehose_target_delivery;
+// Declared here, beside the suite whose wire harness it reuses: the DOMAIN half of the
+// one-VPC rule.
+#[path = "all/opensearch_domain_vpc_placement.rs"]
+mod opensearch_domain_vpc_placement;
 // Declared in the appended tail, beside the suite above: the UPDATE half of that same
 // flow — a stack that re-declares its `AWS::Scheduler::Schedule` re-arms it, so the next
 // occurrence reaches the target the new declaration names and the one it dropped is

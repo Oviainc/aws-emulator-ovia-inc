@@ -155,6 +155,8 @@ mod target_delivery;
 mod target_dispatch;
 #[path = "all/target_response_members.rs"]
 mod target_response_members;
+#[path = "all/target_role_assumption.rs"]
+mod target_role_assumption;
 #[path = "all/topic_target_policy_authorization.rs"]
 mod topic_target_policy_authorization;
 #[path = "all/trace_header_propagation.rs"]

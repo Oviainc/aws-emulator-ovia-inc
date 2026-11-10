@@ -3087,20 +3087,13 @@ pub fn delivery_refusal(
     let role_arn = role_arn?;
     let role = iam.roles.values().find(|role| role.arn == role_arn)?;
     // The trust policy first: a role EventBridge cannot assume never gets as far
-    // as its permissions.
-    let trust = role.assume_role_policy_document.as_deref();
-    if trust.and_then(|document| {
-        ::service_common::iam_trust_policy::admits_service_principal(document, SERVICE_PRINCIPAL)
-    }) == Some(false)
-    {
-        return Some((
-            FAILED_TO_ASSUME_ROLE.to_string(),
-            format!(
-                "Event bus failed to assume role {role_arn}: its trust policy does not let \
-                 {SERVICE_PRINCIPAL} perform {}.",
-                ::service_common::iam_trust_policy::ASSUME_ROLE_ACTION
-            ),
-        ));
+    // as its permissions. The step is stated on its own in
+    // [`role_assumption::assume_role_refusal`], because it is about the role
+    // alone — which API call would have followed does not enter into it — so a
+    // handover whose target call this emulator does not make is decided by that
+    // step and nothing else.
+    if let Some(refusal) = role_assumption::assume_role_refusal(Some(role_arn), iam) {
+        return Some(refusal);
     }
     let documents = role_documents(role_arn, iam)?;
     let (action, resource) = (attempt.action, attempt.resource);
@@ -4977,6 +4970,11 @@ pub mod schedule;
 /// document in force over a delivery to such a topic, beside the topic's own
 /// access policy.
 pub mod topic_encryption;
+
+/// Whether EventBridge may ASSUME the role a rule's target names — the step
+/// every target invocation begins with, and the one that decides a handover
+/// whose own API call never gets made.
+pub mod role_assumption;
 
 
 

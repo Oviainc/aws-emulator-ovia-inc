@@ -12425,6 +12425,7 @@ dependencies = [
  "aws-emulator-smithy-server-runtime",
  "aws-sdk-cloudwatchlogs",
  "aws-sdk-codepipeline",
+ "aws-sdk-firehose",
  "aws-sdk-kinesis",
  "aws-sdk-lambda",
  "aws-sdk-sfn",

@@ -29,7 +29,8 @@
 //! EventBridge makes the API call that target's service is invoked by
 //! (`sqs:SendMessage` for a queue, `lambda:InvokeFunction` for a function,
 //! `sns:Publish` for a topic, `states:StartExecution` for a state machine,
-//! `kinesis:PutRecord` for a data stream, `logs:PutLogEvents` for a CloudWatch
+//! `kinesis:PutRecord` for a data stream, `firehose:PutRecord` for a delivery
+//! stream, `logs:PutLogEvents` for a CloudWatch
 //! Logs log group),
 //! carrying the whole event envelope. For the kinds AWS invokes under the
 //! target's `RoleArn` it acts as that role, so a role it cannot assume or whose
@@ -1665,7 +1666,14 @@ impl DeliveryBudget {
 /// `PutTargets`. For Lambda functions, Amazon SNS topics and Amazon SQS queues,
 /// EventBridge relies on resource-based policies" — so the role gate below is
 /// asked only of the kinds AWS invokes under the role
-/// ([`TargetKind::invoked_under_target_role`]).
+/// ([`invoked_under_target_role`]).
+///
+/// Assuming that role is the FIRST step of such an invocation and does not
+/// depend on which call follows it, so a role EventBridge cannot assume fails
+/// the delivery whatever the target was — a target kind this emulator makes no
+/// API call for included, where the assume-role step is all there was to reach.
+/// What the policies in force on an assumable role allow is a question about the
+/// call itself, so it is asked only where that call is known.
 ///
 /// A target is reached the way any emulated service reaches another: through the
 /// in-process callback ([`smithy_server_runtime::OperationContext::callback`]),
@@ -1690,15 +1698,33 @@ pub(crate) async fn deliver(
     budget: &mut DeliveryBudget,
 ) -> Option<crate::state::InvocationOutcome> {
     let target = handover.target;
-    // Which API call this target is invoked by. A target kind this emulator has
-    // no invocation path for is recorded as NOT ATTEMPTED and nothing is
-    // invented for it.
-    let Some(kind) = TargetKind::of(&target.arn) else {
-        return Some(crate::state::InvocationOutcome::NotAttempted(format!(
-            "no invocation is implemented for a target of {}",
-            ::service_common::arn::vendor(&target.arn).unwrap_or("an unknown service")
-        )));
-    };
+    // Which API call this target is invoked by — `None` for a target kind this
+    // emulator has no invocation path for, which is recorded as NOT ATTEMPTED
+    // with nothing invented in its place UNLESS the assume-role step below is
+    // what the delivery failed at: that step comes before the call and does not
+    // depend on which call it was, so AWS fails such a handover too.
+    let kind = TargetKind::of(&target.arn);
+    // EventBridge acts AS the target's role for the kinds AWS invokes under one,
+    // so a role it cannot assume at all is a delivery that fails before any
+    // target API call is made — whatever that call would have been, and so
+    // whether or not this emulator makes it. The question of WHICH kinds the
+    // role governs is asked of the target's ARN ([`invoked_under_target_role`])
+    // rather than of its resolved kind, for the same reason. The decision is
+    // taken with the IAM guard held only for as long as reading the role takes,
+    // never across the invocation.
+    let role_arn = target
+        .role_arn
+        .as_deref()
+        .filter(|_| invoked_under_target_role(&target.arn));
+    let unassumable = assume_role_refusal(stores.iam, role_arn);
+    // A target whose invocation this emulator does not make, under a role it
+    // could have assumed, is a gap in this emulator rather than a refusal: it
+    // spends nothing of the request's budget and is dead-lettered nowhere.
+    if kind.is_none() && unassumable.is_none() {
+        return Some(crate::state::InvocationOutcome::NotAttempted(
+            no_invocation_reason(&target.arn),
+        ));
+    }
     // WHAT the target receives: the whole event envelope, unless the target asks
     // for something else. "Input: valid JSON text passed to the target. In this
     // case, nothing from the event itself is passed to the target" — so the
@@ -1729,34 +1755,35 @@ pub(crate) async fn deliver(
     // (see [`invoke_api_destination`]) and read by the dead-letter message
     // below; `None` for an invocation nothing retried.
     let mut retries: Option<Retries> = None;
-    // EventBridge acts AS the target's role for the kinds AWS invokes under one,
-    // so a role it cannot assume, or one whose policies withhold the target's API
-    // call, is a delivery that fails before the call is made. The decision is
-    // taken with the IAM guard held only for as long as reading the role takes,
-    // never across the invocation. For a kind whose invocation is governed by the
+    // A role EventBridge cannot assume fails the delivery first of all; a role it
+    // can assume is asked next whether the policies in force on it allow the
+    // target's own API call, which is a question about THAT call and so is asked
+    // where the call is known. For a kind whose invocation is governed by the
     // target's own resource policy instead, the `RoleArn` is not what decides it
-    // and this gate refuses nothing: that target's own document is what decides
-    // the delivery, where the invocation reads it (a queue's `Policy`, a topic's
-    // and a function's, see [`queue_delivery_refusal`],
+    // and neither gate refuses anything: that target's own document is what
+    // decides the delivery, where the invocation reads it (a queue's `Policy`, a
+    // topic's and a function's, see [`queue_delivery_refusal`],
     // [`topic_delivery_refusal`] and [`function_delivery_refusal`]).
-    let role_arn = target
-        .role_arn
-        .as_deref()
-        .filter(|_| kind.invoked_under_target_role());
-    let attempt = crate::state::DeliveryAttempt {
-        rule: handover.rule,
-        target_id: &target.id,
-        action: kind.action(),
-        resource: &target.arn,
-    };
-    let outcome = match role_refusal(stores.iam, role_arn, &attempt) {
-        Some((code, message)) => crate::state::InvocationOutcome::Failed { code, message },
-        None => {
-            kind.invoke(
-                callback, clients, stores, region, handover, body, &mut retries, budget,
-            )
-            .await
+    let outcome = if let Some((code, message)) = unassumable {
+        crate::state::InvocationOutcome::Failed { code, message }
+    } else if let Some(kind) = kind {
+        let attempt = crate::state::DeliveryAttempt {
+            rule: handover.rule,
+            target_id: &target.id,
+            action: kind.action(),
+            resource: &target.arn,
+        };
+        match role_refusal(stores.iam, role_arn, &attempt) {
+            Some((code, message)) => crate::state::InvocationOutcome::Failed { code, message },
+            None => {
+                kind.invoke(
+                    callback, clients, stores, region, handover, body, &mut retries, budget,
+                )
+                .await
+            }
         }
+    } else {
+        crate::state::InvocationOutcome::NotAttempted(no_invocation_reason(&target.arn))
     };
 
     // "If EventBridge can't deliver an event to a target, it sends the event to
@@ -2228,6 +2255,61 @@ fn role_refusal(
     crate::state::delivery_refusal(role_arn, attempt, &iam.lock())
 }
 
+/// Why EventBridge cannot ASSUME `role_arn` at all, as the account's IAM records
+/// show it — the first step of the decision above, in
+/// [`crate::state::role_assumption::assume_role_refusal`] and asked here with
+/// the IAM guard held for the read alone.
+///
+/// Asked ON ITS OWN for a handover whose target API call this emulator does not
+/// make: the step comes before that call and does not depend on it, so it is the
+/// whole of what such a delivery can fail at.
+fn assume_role_refusal(
+    iam: Option<&::engine::ServiceState<crate::state::IamState>>,
+    role_arn: Option<&str>,
+) -> Option<(String, String)> {
+    let iam = iam?;
+    crate::state::role_assumption::assume_role_refusal(role_arn, &iam.lock())
+}
+
+/// What is recorded for a handover to a target this emulator makes no API call
+/// for: which service it would have been made on, and that there is no
+/// invocation for it. Nothing is invented in its place.
+fn no_invocation_reason(arn: &str) -> String {
+    format!(
+        "no invocation is implemented for a target of {}",
+        ::service_common::arn::vendor(arn).unwrap_or("an unknown service")
+    )
+}
+
+/// The ARN namespaces whose targets EventBridge invokes under the TARGET's own
+/// resource-based policy rather than as the role the target names.
+///
+/// "For Lambda functions, Amazon SNS topics and Amazon SQS queues, EventBridge
+/// relies on resource-based policies", and a CloudWatch Logs log group is in
+/// that same class — EventBridge writes into one as its own service principal,
+/// admitted by the GROUP's resource policy ([`log_group_grants`]).
+const RESOURCE_POLICY_ARN_NAMESPACES: [&str; 4] = [
+    SQS_ARN_NAMESPACE,
+    SNS_ARN_NAMESPACE,
+    LAMBDA_ARN_NAMESPACE,
+    crate::state::log_group_target::LOGS_ARN_NAMESPACE,
+];
+
+/// Whether EventBridge invokes the target `arn` names AS the role that target
+/// names, which is what makes that role's trust and permissions decide the
+/// delivery.
+///
+/// Read off the SERVICE the ARN names rather than off a resolved
+/// [`TargetKind`]: the role is assumed before the target's call is made, so the
+/// question is answered for a target this emulator makes no call for as well —
+/// and it is the service, not the shape of the resource, that says whether a
+/// `RoleArn` governs the invocation at all. An ARN naming no service at all
+/// shows nothing, so no role governs it.
+fn invoked_under_target_role(arn: &str) -> bool {
+    ::service_common::arn::vendor(arn)
+        .is_some_and(|vendor| !RESOURCE_POLICY_ARN_NAMESPACES.contains(&vendor))
+}
+
 /// The kind of target an ARN names: which service is invoked, and how.
 ///
 /// The vendor field of the ARN is what says it (`service_common::arn`, the ONE
@@ -2263,6 +2345,10 @@ enum TargetKind {
     /// A CloudWatch Logs log group: `logs:PutLogEvents` writing ONE log event
     /// into it, carrying what the target receives (see [`deliver_log_event`]).
     LogGroup,
+    /// An Amazon Data Firehose delivery stream: `firehose:PutRecord` with what
+    /// the target receives as the record's data, which that stream then buffers
+    /// and delivers to its own destination.
+    DeliveryStream,
 }
 
 /// The ARN namespace of Amazon SQS, whose queues a rule delivers to.
@@ -2279,6 +2365,10 @@ const KINESIS_ARN_NAMESPACE: &str = "kinesis";
 const GLUE_ARN_NAMESPACE: &str = "glue";
 /// The ARN namespace of AWS CodePipeline, whose pipelines a rule starts.
 const CODEPIPELINE_ARN_NAMESPACE: &str = "codepipeline";
+/// The ARN namespace of Amazon Data Firehose, whose delivery streams a rule
+/// writes records into (`smithy_query(query="service_info")` of that service:
+/// `arnNamespace` `firehose`).
+const FIREHOSE_ARN_NAMESPACE: &str = "firehose";
 
 /// The resource type a Lambda function ARN names.
 const FUNCTION_RESOURCE_TYPE: &str = "function";
@@ -2290,6 +2380,9 @@ const API_DESTINATION_RESOURCE_TYPE: &str = "api-destination";
 const STREAM_RESOURCE_TYPE: &str = "stream";
 /// The resource type a Glue workflow ARN names.
 const WORKFLOW_RESOURCE_TYPE: &str = "workflow";
+/// The resource type an Amazon Data Firehose delivery stream ARN names
+/// (`arn:<partition>:firehose:<region>:<account>:deliverystream/<name>`).
+const DELIVERY_STREAM_RESOURCE_TYPE: &str = "deliverystream";
 
 impl TargetKind {
     /// The kind `arn` names, or `None` when this emulator has no invocation for
@@ -2366,6 +2459,19 @@ impl TargetKind {
             {
                 Some(Self::LogGroup)
             }
+            // A delivery stream's ARN names the stream directly
+            // (`deliverystream/<name>`): a resource carrying a further segment
+            // addresses something within a stream rather than the stream, so no
+            // record is put into it.
+            FIREHOSE_ARN_NAMESPACE
+                if ::service_common::arn::resource_id_of_type(
+                    arn,
+                    DELIVERY_STREAM_RESOURCE_TYPE,
+                )
+                .is_some_and(|name| !name.is_empty() && !name.contains(['/', ':'])) =>
+            {
+                Some(Self::DeliveryStream)
+            }
             _ => None,
         }
     }
@@ -2386,6 +2492,7 @@ impl TargetKind {
             Self::Workflow => "glue:notifyEvent",
             Self::Pipeline => "codepipeline:StartPipelineExecution",
             Self::LogGroup => crate::state::log_group_target::PUT_LOG_EVENTS_ACTION,
+            Self::DeliveryStream => "firehose:PutRecord",
         }
     }
 
@@ -2616,6 +2723,41 @@ impl TargetKind {
                 deliver_log_event(callback, clients, region, arn, self.action(), handover, body)
                     .await
             }
+            Self::DeliveryStream => {
+                // `PutRecord` addresses the stream by NAME
+                // (`PutRecordInput$DeliveryStreamName`), which is the resource
+                // segment of its ARN.
+                let name = ::service_common::arn::resource_id_of_type(
+                    arn,
+                    DELIVERY_STREAM_RESOURCE_TYPE,
+                );
+                let Some(name) = name.filter(|name| !name.is_empty()) else {
+                    return crate::state::InvocationOutcome::NotAttempted(
+                        "the target ARN names no delivery stream".to_string(),
+                    );
+                };
+                // The record's data is what the target receives, as the bytes
+                // the stream then delivers to its own destination: "the data
+                // blob … is the data that the producer sends to Firehose"
+                // (`Record$Data`).
+                let record = ::aws_sdk_firehose::types::Record::builder()
+                    .data(::aws_sdk_firehose::primitives::Blob::new(body.as_bytes()))
+                    .build();
+                match record {
+                    Ok(record) => outcome(
+                        clients
+                            .firehose(callback, region)
+                            .put_record()
+                            .delivery_stream_name(name)
+                            .record(record)
+                            .send()
+                            .await,
+                    ),
+                    Err(error) => crate::state::InvocationOutcome::NotAttempted(format!(
+                        "the record this event would be put as could not be built: {error}"
+                    )),
+                }
+            }
         }
     }
 
@@ -2631,40 +2773,7 @@ impl TargetKind {
             Self::Workflow => GLUE_ARN_NAMESPACE,
             Self::Pipeline => CODEPIPELINE_ARN_NAMESPACE,
             Self::LogGroup => crate::state::log_group_target::LOGS_ARN_NAMESPACE,
-        }
-    }
-
-    /// Whether EventBridge invokes this kind of target AS the role the target
-    /// names, which is what makes that role's trust and permissions decide the
-    /// delivery.
-    ///
-    /// "For EC2 instances, Kinesis data streams, Step Functions state machines
-    /// and API Gateway APIs, EventBridge relies on IAM roles that you specify in
-    /// the `RoleARN` argument in `PutTargets`. For Lambda functions, Amazon SNS
-    /// topics and Amazon SQS queues, EventBridge relies on resource-based
-    /// policies" — so a `RoleArn` on a queue, topic or function target is not
-    /// what governs its invocation, and withholding a permission there does not
-    /// stop the delivery.
-    fn invoked_under_target_role(self) -> bool {
-        match self {
-            // An API destination is invoked under the target's role as well:
-            // EventBridge needs `events:InvokeApiDestination` on the
-            // destination, and the `RoleArn` the target names is what carries
-            // it — and so is a Glue workflow, which needs `glue:notifyEvent` on
-            // the workflow off that same role. A CodePipeline pipeline is in that
-            // same class: "the role used for this rule" is what EventBridge calls
-            // `codepipeline:StartPipelineExecution` under.
-            Self::StateMachine
-            | Self::ApiDestination
-            | Self::Stream
-            | Self::Workflow
-            | Self::Pipeline => true,
-            // A CloudWatch Logs log group is in the resource-policy class with
-            // the three above: EventBridge writes into it as its own service
-            // principal, and the GROUP's own resource policy is what admits the
-            // write ([`log_group_grants`]), so a `RoleArn` on such a
-            // target governs nothing.
-            Self::Queue | Self::Function | Self::Topic | Self::LogGroup => false,
+            Self::DeliveryStream => FIREHOSE_ARN_NAMESPACE,
         }
     }
 }
@@ -4070,6 +4179,7 @@ pub(crate) struct Clients {
     kinesis: Option<(String, ::aws_sdk_kinesis::Client)>,
     codepipeline: Option<(String, ::aws_sdk_codepipeline::Client)>,
     logs: Option<(String, ::aws_sdk_cloudwatchlogs::Client)>,
+    firehose: Option<(String, ::aws_sdk_firehose::Client)>,
 }
 
 /// Build the clients the same way: over the in-process callback into this
@@ -4125,15 +4235,16 @@ impl Clients {
     callback_client!(codepipeline, aws_sdk_codepipeline, "codepipeline");
     // Amazon CloudWatch Logs publishes its endpoint and signs under `logs`.
     callback_client!(logs, aws_sdk_cloudwatchlogs, "logs");
+    callback_client!(firehose, aws_sdk_firehose, "firehose");
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{kinesis_partition_key, sqs_queue, TargetKind};
+    use super::{invoked_under_target_role, kinesis_partition_key, sqs_queue, TargetKind};
 
     /// One row of the table below: the case, the target's ARN, the kind that ARN
-    /// names, the IAM action its invocation performs, and whether that
-    /// invocation is made under the target's own role.
+    /// names, the IAM action its invocation performs, and whether a target of
+    /// that ARN's service is invoked under the target's own role.
     type Row = (&'static str, String, Option<TargetKind>, Option<&'static str>, bool);
 
     /// Which invocation a target ARN names, the IAM action that invocation
@@ -4146,15 +4257,20 @@ mod tests {
     /// targets reference states for them: `sqs:SendMessage` for a queue,
     /// `lambda:InvokeFunction` for a function, `sns:Publish` for a topic,
     /// `states:StartExecution` for a state machine, `kinesis:PutRecord` for a
-    /// data stream and `glue:notifyEvent` for a workflow. Which of them is
+    /// data stream, `firehose:PutRecord` for a delivery stream and
+    /// `glue:notifyEvent` for a workflow. Which of them is
     /// invoked under the target's role is that reference's other sentence: a role
-    /// for a state machine, a Kinesis data stream and a Glue workflow, a
-    /// resource-based policy for a queue, a topic and a function.
+    /// for a state machine, a Kinesis data stream, a Firehose delivery stream and
+    /// a Glue workflow, a resource-based policy for a queue, a topic and a
+    /// function. That half is a question about the target's SERVICE rather than
+    /// about the resource it names — the role is assumed before the call is made
+    /// — so it is answered for an ARN naming no invocable resource too, and only
+    /// an ARN naming no service at all is governed by no role.
     #[test]
     fn a_target_arn_names_the_invocation_its_service_is_reached_by() {
         let account = ::engine::emulator_account_id();
         // (case, the target's ARN, the kind it names, the action it performs,
-        //  whether its invocation is made under the target's role)
+        //  whether a target of its service is invoked under the target's role)
         let rows: Vec<Row> = vec![
             (
                 "an SQS queue",
@@ -4219,7 +4335,7 @@ mod tests {
                 format!("arn:aws:glue:eu-west-2:{account}:workflow/nightly/run/wr_1"),
                 None,
                 None,
-                false,
+                true,
             ),
             // A resource of the same service that is not a workflow at all.
             (
@@ -4227,7 +4343,7 @@ mod tests {
                 format!("arn:aws:glue:eu-west-2:{account}:table/sales/orders"),
                 None,
                 None,
-                false,
+                true,
             ),
             // A resource WITHIN a stream rather than the stream: a consumer is
             // not something a record is written to.
@@ -4236,7 +4352,7 @@ mod tests {
                 format!("arn:aws:kinesis:eu-west-2:{account}:stream/telemetry/consumer/reader"),
                 None,
                 None,
-                false,
+                true,
             ),
             // A resource of a service this invokes, but not one it can invoke.
             (
@@ -4244,7 +4360,7 @@ mod tests {
                 format!("arn:aws:states:eu-west-2:{account}:activity:worker"),
                 None,
                 None,
-                false,
+                true,
             ),
             (
                 "a Lambda layer",
@@ -4267,14 +4383,14 @@ mod tests {
                 format!("arn:aws:codepipeline:eu-west-2:{account}:webhook:on-push"),
                 None,
                 None,
-                false,
+                true,
             ),
             (
                 "a CodePipeline custom action type",
                 format!("arn:aws:codepipeline:eu-west-2:{account}:actiontype:Build/Custom/1"),
                 None,
                 None,
-                false,
+                true,
             ),
             // A CloudWatch Logs log group, in both forms of its ARN: the group
             // alone and the group with everything under it, which is the ARN a
@@ -4302,13 +4418,29 @@ mod tests {
                 None,
                 false,
             ),
+            // An Amazon Data Firehose delivery stream, which a record is put
+            // into, and a resource field that names no stream at all.
+            (
+                "a Firehose delivery stream",
+                format!("arn:aws:firehose:eu-west-2:{account}:deliverystream/orders"),
+                Some(TargetKind::DeliveryStream),
+                Some("firehose:PutRecord"),
+                true,
+            ),
+            (
+                "a Firehose resource that is not a delivery stream",
+                format!("arn:aws:firehose:eu-west-2:{account}:deliverystream"),
+                None,
+                None,
+                true,
+            ),
             // Services with no invocation here at all.
             (
                 "an ECS task definition",
                 format!("arn:aws:ecs:eu-west-2:{account}:task-definition/batch:1"),
                 None,
                 None,
-                false,
+                true,
             ),
             (
                 "a value that is not an ARN",
@@ -4331,7 +4463,7 @@ mod tests {
                 "case {case:?}: expected the action {action:?}, got {:?}",
                 kind.map(TargetKind::action)
             );
-            let governed = kind.is_some_and(TargetKind::invoked_under_target_role);
+            let governed = invoked_under_target_role(&arn);
             assert_eq!(
                 governed, under_role,
                 "case {case:?}: expected invoked-under-role {under_role}, got {governed}"

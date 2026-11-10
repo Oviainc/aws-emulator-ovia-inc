@@ -69,6 +69,10 @@ aws-sdk-codepipeline = { version = "1", default-features = false }
 # the resource policies in force over that group — which decide the write — are
 # read through `DescribeResourcePolicies`.
 aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
+# An Amazon Data Firehose delivery-stream target is delivered to with `PutRecord`
+# over the same in-process callback: the stream then buffers the record and
+# delivers it to its own destination.
+aws-sdk-firehose = { version = "1", default-features = false }
 # `FailedInvocations`, the metric EventBridge counts an undeliverable event on,
 # is appended to the CloudWatch store in the SAME shared engine (the `AWS/Events`
 # namespace). CloudWatch refuses a `PutMetricData` into a reserved `AWS/`
