@@ -156,9 +156,13 @@ use super::types::*;
 
 use std::time::SystemTime;
 
+use crate::state::vpc_network::{
+    placed_vpc_options, resolve_subnets, subnets_not_in_one_vpc, subnets_span_two_vpcs,
+    SubnetPlacement,
+};
 use crate::state::{
     stored_advanced_security_options, stored_aiml_options,
-    stored_automated_snapshot_pause_options, stored_identity_center_options, stored_vpc_options,
+    stored_automated_snapshot_pause_options, stored_identity_center_options,
     Domain, OPT_ACCESS_POLICIES, OPT_ADVANCED_OPTIONS, OPT_ADVANCED_SECURITY_OPTIONS,
     OPT_AIML_OPTIONS, OPT_AUTOMATED_SNAPSHOT_PAUSE_OPTIONS, OPT_AUTO_TUNE_OPTIONS,
     OPT_CLUSTER_CONFIG, OPT_COGNITO_OPTIONS, OPT_DEPLOYMENT_STRATEGY_OPTIONS,
@@ -219,7 +223,12 @@ const CLUSTER_SHAPING_OPTIONS: &[&str] = &[
 /// does not name keeps the value it had. Nothing else about the record moves — the
 /// name, id, ARN, endpoint and engine version a domain was created with are not
 /// members of this request.
-fn merge(domain: &mut Domain, input: UpdateDomainConfigInput, now: SystemTime) -> Vec<&'static str> {
+fn merge(
+    domain: &mut Domain,
+    input: UpdateDomainConfigInput,
+    placements: &[SubnetPlacement],
+    now: SystemTime,
+) -> Vec<&'static str> {
     let mut touched: Vec<&'static str> = Vec::new();
 
     if let Some(cluster_config) = input.cluster_config {
@@ -235,7 +244,7 @@ fn merge(domain: &mut Domain, input: UpdateDomainConfigInput, now: SystemTime) -
         touched.push(OPT_SNAPSHOT_OPTIONS);
     }
     if let Some(vpc_options) = input.vpc_options {
-        domain.vpc_options = Some(stored_vpc_options(vpc_options));
+        domain.vpc_options = Some(placed_vpc_options(vpc_options, placements));
         touched.push(OPT_VPC_OPTIONS);
     }
     if let Some(cognito_options) = input.cognito_options {
@@ -428,7 +437,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state =
             crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
@@ -441,6 +450,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // advisory warning codes the caller accepted for the change.
         let dry_run_mode = input.dry_run_mode.clone();
         let accepted_warnings = input.accepted_warnings.clone().unwrap_or_default();
+
+        // The VPC and the Availability Zones a VPC-access domain reports are DERIVED from
+        // the subnets a request names, and a subnet is the resource of the service that
+        // owns subnets: they are RESOLVED there, before the store is touched, because an
+        // async hop cannot be made while the store is held. The placement they describe is
+        // judged below, after the domain this change addresses has been resolved, so
+        // resolving them changes the order of nothing.
+        let placements = match input
+            .vpc_options
+            .as_ref()
+            .and_then(|options| options.subnet_ids.as_deref())
+        {
+            None => Vec::new(),
+            Some(subnet_ids) => {
+                resolve_subnets(ctx, &crate::state::request_region(ctx.parts()), subnet_ids).await
+            }
+        };
 
         let mut store = state.lock();
 
@@ -471,6 +497,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|options| options.enabled)
             == Some(true);
         let input_dry_run_mode = input.dry_run_mode.clone();
+
+        // A domain reached inside a VPC lives in exactly ONE VPC, so a change whose subnets
+        // the account's network puts in different VPCs describes a network placement the
+        // service cannot provision, by the same rule the create path applies: it is refused
+        // with the modelled `ValidationException` and the domain keeps the placement it
+        // had. Judged on the REQUEST's container, which REPLACES the stored one whole, and
+        // answered after the domain itself has been resolved, so a change to a domain this
+        // account does not hold is still the not-found refusal. A dry run is refused too —
+        // it reports what applying the change would do, and this change cannot be applied.
+        if subnets_span_two_vpcs(&placements).is_some() {
+            return Err(UpdateDomainConfigErrorModeled::ValidationException(
+                subnets_not_in_one_vpc(),
+            )
+            .into());
+        }
 
         // The master credential of the internal user database has to meet the
         // published complexity requirement, whichever call sets it. It is checked on
@@ -524,7 +565,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
         }
 
-        let touched = merge(&mut merged, input, now);
+        let touched = merge(&mut merged, input, &placements, now);
         // A block the update INTRODUCES is completed the same way the create completes
         // one: a volume switched to `gp3` gets the baseline performance the service
         // provisions it at, so the merged configuration is a whole one whichever call

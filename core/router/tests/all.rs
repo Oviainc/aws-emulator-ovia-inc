@@ -1007,6 +1007,10 @@ mod cloudformation_lambda_versions_and_aliases;
 mod cloudformation_sam_http_api_definitions;
 #[path = "all/opensearch_vpc_endpoint_vpc_membership.rs"]
 mod opensearch_vpc_endpoint_vpc_membership;
+// Declared here, beside the suite whose wire harness it reuses: the DOMAIN half of the
+// one-VPC rule.
+#[path = "all/opensearch_domain_vpc_placement.rs"]
+mod opensearch_domain_vpc_placement;
 // Declared here, in this quiet span rather than in the appended tail every concurrently
 // landing router suite adds its line to.
 #[path = "all/apigatewayv2_vpc_link_subnets_resolve_in_ec2.rs"]

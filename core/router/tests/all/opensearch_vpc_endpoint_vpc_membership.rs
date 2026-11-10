@@ -14,6 +14,11 @@
 //! operations on the SAME engine that serves OpenSearch Service, so every id in a request
 //! is one EC2 handed out and every refusal is grounded in what EC2 actually answered.
 //!
+//! Its wire harness — the router carrying both services, the two clients and the VPCs
+//! minted through EC2 — is `pub(crate)` because
+//! [`crate::opensearch_domain_vpc_placement`] drives the same estate for the DOMAIN half
+//! of the one-VPC rule, so there is one copy of it rather than two.
+//!
 //! The rows differ along what the rule generalises over: how many subnets the change
 //! names, which of them is the foreign one and in which position, whether the change also
 //! names security groups, and whether it names subnets at all — and every refusal is
@@ -32,13 +37,13 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::query_wire::{element, form_encode};
 
 /// The region every request below is signed for.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The EC2 API version a client sends in an ec2Query body.
 const EC2_API_VERSION: &str = "2016-11-15";
 
 /// The API version every path of the OpenSearch Service control plane is prefixed with.
-const PREFIX: &str = "/2021-01-01";
+pub(crate) const PREFIX: &str = "/2021-01-01";
 
 /// Long enough for the span the clock owes a VPC endpoint's create or update to have
 /// fallen due, so the endpoint is idle again and the next change is served.
@@ -54,7 +59,7 @@ fn settle_wait() -> Duration {
 
 /// One emulator carrying Amazon EC2 and Amazon OpenSearch Service over ONE shared
 /// engine, as the production router mounts them.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -77,15 +82,15 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// One answer: its HTTP status and its body as JSON (`Value::Null` when it is not JSON).
-struct Reply {
-    status: u16,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// The wire error code (`__type` of the restJson1 error envelope), or `""` on
     /// success.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.body
             .get("__type")
             .and_then(Value::as_str)
@@ -93,7 +98,7 @@ impl Reply {
     }
 
     /// The error envelope's message, or `""` when there is none.
-    fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         self.body
             .get("message")
             .and_then(Value::as_str)
@@ -102,7 +107,7 @@ impl Reply {
 }
 
 /// Call one OpenSearch Service operation over its restJson1 wire.
-async fn opensearch(
+pub(crate) async fn opensearch(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -126,7 +131,11 @@ async fn opensearch(
 }
 
 /// One ec2Query action that must succeed, answered with its XML body.
-async fn ec2(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)]) -> String {
+pub(crate) async fn ec2(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> String {
     let mut body = format!("Action={action}&Version={EC2_API_VERSION}");
     for (name, value) in params {
         body.push('&');
@@ -153,7 +162,7 @@ async fn ec2(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)])
 }
 
 /// One VPC with one subnet per zone named, minted by EC2 itself: `(vpc id, subnet ids)`.
-async fn vpc_with_subnets(
+pub(crate) async fn vpc_with_subnets(
     router: &MultiServiceRouter,
     cidr_prefix: &str,
     zones: &[&str],

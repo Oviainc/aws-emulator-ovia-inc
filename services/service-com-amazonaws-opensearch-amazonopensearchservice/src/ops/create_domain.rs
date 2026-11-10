@@ -142,10 +142,13 @@ use super::types::*;
 
 use std::collections::{BTreeMap, VecDeque};
 
+use crate::state::vpc_network::{
+    placed_vpc_options, resolve_subnets, subnets_not_in_one_vpc, subnets_span_two_vpcs,
+};
 use crate::state::{
     domain_arn, domain_endpoint, domain_id, stored_advanced_security_options, stored_aiml_options,
     stored_auto_tune_options, stored_automated_snapshot_pause_options,
-    stored_identity_center_options, stored_vpc_options, Domain, ServiceSoftware,
+    stored_identity_center_options, Domain, ServiceSoftware,
     DEFAULT_ENGINE_MODE, DEFAULT_ENGINE_VERSION, DEFAULT_USE_CASE, DOMAIN_QUOTA,
     OPT_ACCESS_POLICIES, OPT_ADVANCED_OPTIONS, OPT_ADVANCED_SECURITY_OPTIONS, OPT_AIML_OPTIONS,
     OPT_AUTOMATED_SNAPSHOT_PAUSE_OPTIONS, OPT_AUTO_TUNE_OPTIONS, OPT_CLUSTER_CONFIG,
@@ -264,6 +267,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let name = input.domain_name;
+
+        // The VPC and the Availability Zones a VPC-access domain reports are DERIVED from
+        // the subnets the request names, and a subnet is the resource of the service that
+        // owns subnets: they are RESOLVED there, before the store is touched, because an
+        // async hop cannot be made while the store is held. The placement they describe is
+        // judged further down, among the other refusals, so resolving them changes the
+        // order of nothing. An emulator with no EC2 to ask resolves nothing, and then the
+        // domain reports neither member rather than one this service invented.
+        let placements = match input
+            .vpc_options
+            .as_ref()
+            .and_then(|options| options.subnet_ids.as_deref())
+        {
+            None => Vec::new(),
+            Some(subnet_ids) => resolve_subnets(ctx, &region, subnet_ids).await,
+        };
 
         let mut store = state.lock();
 
@@ -394,6 +413,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A domain reached inside a VPC lives in exactly ONE VPC — the one its subnets name
+        // — so a request whose subnets the account's network puts in different VPCs
+        // describes a network placement the service cannot provision, and is refused with
+        // the operation's modelled `ValidationException` rather than creating a domain
+        // whose own VPC nothing could state afterwards. Decided from what EC2 ANSWERED, so
+        // subnets it resolved nothing for refuse nothing.
+        if subnets_span_two_vpcs(&placements).is_some() {
+            return Err(
+                CreateDomainErrorModeled::ValidationException(subnets_not_in_one_vpc()).into(),
+            );
+        }
+
         // A domain is created carrying the tags the request named, and the same bound
         // holds on them as on a later `AddTags`: a resource carries at most
         // `TAG_QUOTA` tags, so a create naming more is refused rather than storing a
@@ -460,7 +491,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             ip_address_type: input.ip_address_type,
             snapshot_options: input.snapshot_options,
-            vpc_options: input.vpc_options.map(stored_vpc_options),
+            vpc_options: input
+                .vpc_options
+                .map(|options| placed_vpc_options(options, &placements)),
             cognito_options: input.cognito_options,
             encryption_at_rest_options: input.encryption_at_rest_options,
             node_to_node_encryption_options: input.node_to_node_encryption_options,

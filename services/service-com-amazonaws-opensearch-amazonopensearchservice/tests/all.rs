@@ -111,6 +111,8 @@ mod domain_package_listing_cursor;
 mod domain_rest_data_plane;
 #[path = "all/domain_server_defaults.rs"]
 mod domain_server_defaults;
+#[path = "all/domain_vpc_placement.rs"]
+mod domain_vpc_placement;
 #[path = "all/dry_run_progress.rs"]
 mod dry_run_progress;
 #[path = "all/ebs_volume_size_limit.rs"]

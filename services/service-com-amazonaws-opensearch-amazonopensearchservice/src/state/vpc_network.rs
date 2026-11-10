@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The network a VPC endpoint is placed in: facts this service RESOLVES rather than
-//! holds.
+//! The network a VPC-access domain or a VPC endpoint is placed in: facts this service
+//! RESOLVES rather than holds.
 //!
-//! `VPCOptions` names the subnets and security groups an endpoint is created in, and
+//! `VPCOptions` names the subnets and security groups a placement is created in, and
 //! `VPCDerivedInfo` reports back the two members the model says are DERIVED from those
 //! subnets: `VPCId` — "the ID for your VPC. Amazon VPC generates this value when you
 //! create a VPC" — and `AvailabilityZones`, "the list of Availability Zones associated
@@ -191,10 +191,10 @@ pub fn placed_vpc(placements: &[SubnetPlacement]) -> Option<String> {
 /// the order the request named them — or `None` where every resolved subnet is in one VPC
 /// (which includes a placement nothing resolved for).
 ///
-/// An endpoint lives in exactly one VPC, and the subnets it is created in are what name it,
-/// so a placement whose subnets disagree names no VPC at all: the create that asked for it
-/// is refused rather than stored with no `VPCId` — a record whose own VPC nothing could
-/// state afterwards.
+/// A VPC-access placement — a domain's or an endpoint's — lives in exactly one VPC, and
+/// the subnets it is created in are what name it, so a placement whose subnets disagree
+/// names no VPC at all: the call that asked for it is refused rather than stored with no
+/// `VPCId` — a record whose own VPC nothing could state afterwards.
 pub fn subnets_span_two_vpcs(placements: &[SubnetPlacement]) -> Option<(&SubnetPlacement, &SubnetPlacement)> {
     let mut placed = placements
         .iter()
@@ -203,6 +203,23 @@ pub fn subnets_span_two_vpcs(placements: &[SubnetPlacement]) -> Option<(&SubnetP
     placed
         .find(|placement| placement.vpc_id != first.vpc_id)
         .map(|other| (first, other))
+}
+
+/// How this service states that the subnets a VPC-access placement names do not all
+/// belong to ONE VPC: one fixed sentence with no variable part.
+///
+/// A placement lives in exactly one VPC — `VPCDerivedInfo$VPCId` is a single VPC derived
+/// from those subnets — so a set of subnets that disagrees names no placement at all, and
+/// what the caller is told is the requirement the set failed rather than which of its
+/// members is the odd one out.
+pub const SUBNETS_NOT_IN_ONE_VPC: &str = "The subnets must be in the same VPC.";
+
+/// The `ValidationException` payload ([`SUBNETS_NOT_IN_ONE_VPC`]) for a request whose
+/// `VPCOptions$SubnetIds` resolve, in EC2, to subnets of more than one VPC.
+pub fn subnets_not_in_one_vpc() -> ValidationException {
+    ValidationException {
+        message: Some(SUBNETS_NOT_IN_ONE_VPC.to_string()),
+    }
 }
 
 /// The Availability Zones the resolved subnets sit in, in the order the request named the
