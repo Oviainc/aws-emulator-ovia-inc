@@ -767,12 +767,14 @@ async fn an_undocumented_filter_name_is_refused() {
     let (router, engine) = super::ec2_query::emulator();
     seed(&engine);
 
-    // Rows: a plural misspelling, a member of the reported shape that is not a documented
-    // filter name, the tag filters a taggable resource has and this request does not, a name
-    // differing only in case, and an empty name.
+    // Rows: a plural misspelling, the plural of the id filter this operation DOES serve, the
+    // tag filters a taggable resource has and this record does not, a name differing only in
+    // case, and an empty name. `capacity-reservation-id` is SERVED — it selects on the
+    // reported record's own id — so it is covered by
+    // `describe_filters_on_reported_members` instead.
     for name in [
         "statuses",
-        "capacity-reservation-id",
+        "capacity-reservation-ids",
         "tag-key",
         "tag:Name",
         "Status",

@@ -15,6 +15,22 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The FILTERS a describe serves for the members of the records it reports — the reported
+// record's own id, and the tag pair for a record that carries tags — whether or not that
+// operation's own documentation enumerates them. Declared beside `prefix_lists` for the reason
+// the note above gives: the sorted neighbourhood and the tail of this file are where every new
+// ec2 suite inserts its lines.
+#[path = "all/describe_filters_on_reported_members.rs"]
+mod describe_filters_on_reported_members;
+// An application status check's `Protocol`, spelled in another ASCII case: the create is served
+// and the declared spelling is stored. Declared beside `prefix_lists` for the same reason.
+#[path = "all/application_status_check_protocol_case.rs"]
+mod application_status_check_protocol_case;
+// An EMPTY LIST member as a query client renders it — the member's own key with an empty value
+// and no index — read as the list of zero elements it names. Declared beside `prefix_lists` for
+// the same reason.
+#[path = "all/query_empty_list_members.rs"]
+mod query_empty_list_members;
 // The LOCAL GATEWAYS an account's Outposts put it behind, as `DescribeLocalGateways`
 // reports them: every stored gateway with each member of the modelled shape, the narrowing
 // its documented filters and `LocalGatewayIds` do, the pages it cuts the store into, the

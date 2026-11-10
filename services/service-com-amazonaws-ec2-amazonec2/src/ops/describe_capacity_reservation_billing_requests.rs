@@ -368,19 +368,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The filter names this operation documents, from
+/// The filter names this operation serves.
+///
+/// Its own documentation names three, from
 /// `DescribeCapacityReservationBillingRequestsRequest$Filters`:
 ///
 /// ```text
 /// smithy_query(query="doc",shape="DescribeCapacityReservationBillingRequestsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
 /// ```
 ///
-/// That list is the whole set: `status`, `requested-by` and
-/// `unused-reservation-billing-owner`. A billing request carries no tags — the modelled
-/// `CapacityReservationBillingRequest` has no `Tags` member — so this operation documents
-/// none of the `tag:<key>` / `tag-key` filters the describes of a taggable resource do.
-/// Every entry must be answered by [`filter_values`].
-const CAPACITY_RESERVATION_BILLING_REQUEST_FILTERS: [&str; 3] = [
+/// `status`, `requested-by` and `unused-reservation-billing-owner`. Beside them EC2 serves
+/// `capacity-reservation-id`, which selects on the reported record's OWN identifier
+/// (`CapacityReservationBillingRequest$CapacityReservationId`, the same id
+/// `CapacityReservationIds` names): the recorded traffic has EC2 serving a describe narrowed
+/// by it, and every describe of this crate narrows on the id of the record it reports. A
+/// billing request carries no tags — the modelled `CapacityReservationBillingRequest` has no
+/// `Tags` member — so this operation serves none of the `tag:<key>` / `tag-key` filters the
+/// describes of a taggable resource do. Every entry must be answered by [`filter_values`].
+const CAPACITY_RESERVATION_BILLING_REQUEST_FILTERS: [&str; 4] = [
+    "capacity-reservation-id",
     "requested-by",
     "status",
     "unused-reservation-billing-owner",
@@ -482,6 +488,7 @@ fn filter_values<'a>(
         value.map(Cow::Borrowed).into_iter().collect()
     };
     match name {
+        "capacity-reservation-id" => text(request.capacity_reservation_id.as_deref()),
         "requested-by" => text(request.requested_by.as_deref()),
         "status" => text(request.status.as_deref()),
         "unused-reservation-billing-owner" => {

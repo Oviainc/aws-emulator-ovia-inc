@@ -635,7 +635,9 @@ async fn an_undefined_filter_name_is_refused() {
 
     // Rows: a near-miss of a documented name, the underscore spelling, a documented name
     // with the wrong case, the plural, members of the described shape the `Filters` doc does
-    // NOT name, the tag filters this operation documents neither of, and an empty name.
+    // NOT name, a tag prefix with no key, and an empty name. The `tag:<key>` / `tag-key` pair
+    // is SERVED — the endpoint carries tags — so it is covered by
+    // `describe_filters_on_reported_members` instead.
     let cases = [
         "endpoint",
         "endpoint_id",
@@ -645,8 +647,8 @@ async fn an_undefined_filter_name_is_refused() {
         "transport-protocols",
         "vpc-id",
         "status.code",
-        "tag-key",
-        "tag:Name",
+        "tag:",
+        "tag-keys",
         "",
     ];
     for name in cases {

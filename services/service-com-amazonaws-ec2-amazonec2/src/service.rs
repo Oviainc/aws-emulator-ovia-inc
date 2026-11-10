@@ -594,10 +594,12 @@ impl ServerProtocol for Ec2QueryEnvelope {
 /// equality instead refuses the request at the boundary, before any handler runs, with a code
 /// that is not EC2's.
 ///
-/// WHICH members are read that way is a fact of the MEMBER, recorded with it
-/// ([`crate::state::CASE_INSENSITIVE_MEMBERS`]) — not of a value set, which a dozen members of
-/// this model share, and not of enums in general: every other member is judged by its value
-/// set exactly as declared, which is what this service's suites pin.
+/// WHICH members are read that way is a fact of the MEMBER OF ONE INPUT SHAPE, recorded with
+/// it ([`crate::state::CASE_INSENSITIVE_MEMBERS`]) — not of a member name, which several of
+/// this model's input shapes share, not of a value set, which a dozen members share, and not
+/// of enums in general: every other member is judged by its value set exactly as declared,
+/// which is what this service's suites pin. The shape asked about is the one whose INPUT is
+/// being read here, so a member of the same name on another operation's input is untouched.
 ///
 /// The value set is still ENFORCED: a value outside it, in any case, is left exactly as the
 /// request sent it and refused by the framework's constraint walk as before. Only the
@@ -611,6 +613,8 @@ impl ServerProtocol for Ec2QueryEnvelope {
 /// untouched.
 fn enum_cased_body(body: &[u8], input_schema: &Schema) -> Option<Vec<u8>> {
     let text = std::str::from_utf8(body).ok()?;
+    // The input shape being read, which is what the table is keyed by beside the member name.
+    let shape = input_schema.shape_id().shape_name();
     let mut rewritten = String::with_capacity(text.len());
     let mut changed = false;
     for (index, pair) in text.split('&').enumerate() {
@@ -619,7 +623,7 @@ fn enum_cased_body(body: &[u8], input_schema: &Schema) -> Option<Vec<u8>> {
         }
         let respelled = pair.split_once('=').and_then(|(key, value)| {
             let member = member_at(input_schema, key)?;
-            let spelled = crate::state::declared_enum_spelling(member, value)?;
+            let spelled = crate::state::declared_enum_spelling(shape, member, value)?;
             Some(format!("{key}={spelled}"))
         });
         match respelled {

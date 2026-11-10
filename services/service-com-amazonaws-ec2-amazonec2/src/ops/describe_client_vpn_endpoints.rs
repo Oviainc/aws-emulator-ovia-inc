@@ -184,10 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
         for filter in filters {
             let name = filter.name.as_deref().unwrap_or_default();
-            // A filter name this operation does not document is refused whether or not any
+            // A filter name this operation does not serve is refused whether or not any
             // endpoint would have matched it, so an unsupported filter can never read as "no
-            // results".
-            if !CLIENT_VPN_ENDPOINT_FILTERS.contains(&name) {
+            // results". The tag filter family is resolved by the crate's one resolver rather
+            // than listed in the catalog ([`crate::state::is_tag_filter_name`]).
+            if !crate::state::is_tag_filter_name(name)
+                && !CLIENT_VPN_ENDPOINT_FILTERS.contains(&name)
+            {
                 return Err(crate::state::invalid_filter(&CLIENT_VPN_ENDPOINT_FILTERS));
             }
             let values: &[String] = filter.values.as_deref().unwrap_or_default();
@@ -363,7 +366,9 @@ const DEFAULT_MAX_RESULTS: usize = 1000;
 /// token for a page carrying nothing — unreachable however the request is read.
 const MIN_MAX_RESULTS: usize = 5;
 
-/// The filter names this operation documents, from
+/// The filter names this operation serves beside the tag filter family.
+///
+/// Its own documentation names these two, from
 /// `DescribeClientVpnEndpointsRequest$Filters`:
 ///
 /// ```text
@@ -371,17 +376,29 @@ const MIN_MAX_RESULTS: usize = 5;
 /// ```
 ///
 /// "endpoint-id - The ID of the Client VPN endpoint. transport-protocol - The transport
-/// protocol (tcp | udp)." That doc names no `tag:<key>` or `tag-key` filter, so neither is
-/// accepted here even though an endpoint carries tags. Every entry must be answered by
-/// [`filter_values`], and the order is the one the refusal enumerates them in.
+/// protocol (tcp | udp)." The member enumerates no tag filter, but an endpoint carries tags
+/// (`ClientVpnEndpoint$Tags`, `tagSet`) and EC2 answers the `tag:<key>` / `tag-key` /
+/// `tag-value` family on every describe of a resource that does — the recorded traffic has it
+/// SERVING a describe of this operation narrowed by one — so those names are resolved by the
+/// crate's one resolver ([`crate::state::is_tag_filter_name`]) rather than listed here. Every
+/// entry must be answered by [`filter_values`], and the order is the one the refusal
+/// enumerates them in.
 const CLIENT_VPN_ENDPOINT_FILTERS: [&str; 2] = ["endpoint-id", "transport-protocol"];
 
 /// The values the EC2 filter `name` compares against this Client VPN endpoint.
 ///
 /// A filter naming an attribute this endpoint does not carry compares against NO values, so
 /// it selects nothing — the same answer AWS gives for any attribute a resource holds no
-/// value for.
+/// value for. `name` is one of [`CLIENT_VPN_ENDPOINT_FILTERS`] or a tag filter.
 fn filter_values<'a>(endpoint: &'a ClientVpnEndpoint, name: &str) -> Vec<Cow<'a, str>> {
+    // The tag filter family, read off the endpoint's own `tagSet` by the crate's one resolver
+    // so every describe that answers it reads a tag list the same way.
+    if let Some(values) =
+        crate::state::tag_filter_values(name, endpoint.tags.as_deref().unwrap_or_default())
+    {
+        return values;
+    }
+
     let text =
         |value: Option<&'a str>| -> Vec<Cow<'a, str>> { value.map(Cow::Borrowed).into_iter().collect() };
     match name {

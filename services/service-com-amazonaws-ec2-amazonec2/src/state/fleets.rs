@@ -1616,8 +1616,8 @@ pub fn require_mac_instance<'store, E>(
     Ok(instance)
 }
 
-/// The members this service reads WITHOUT REGARD TO ASCII CASE, as `(the modelled member
-/// name, the values it is read against)`.
+/// The members this service reads WITHOUT REGARD TO ASCII CASE, as `(the input shape that
+/// carries the member, the modelled member name, the values it is read against)`.
 ///
 /// EC2 holds a modelled enum to its value set, and this service's suites pin that: a value
 /// outside the set, in any case, is refused. The table is deliberately a list of MEMBERS
@@ -1631,34 +1631,55 @@ pub fn require_mac_instance<'store, E>(
 /// and is answered for its INSTANCE ID, so the status was read as the member it spells. A
 /// member with no such recording keeps the strict reading.
 ///
-/// It is keyed by the modelled member NAME because that is what a member schema carries: the
-/// generated schema of a structure member holds the member's own shape id and kind, not the
-/// id of the shape it targets (`vendor/smithy-macros/src/lib.rs` emits
-/// `Schema::new_member(...)` with the member's own id), so the enum behind it is not
-/// reachable from there. The name identifies ONE member of this model's input shapes
-/// (`CreateMacSystemIntegrityProtectionModificationTaskRequest$MacSystemIntegrityProtectionStatus`
-/// — it is the only member of that name in the crate's generated types), and the rule fires
-/// only for a value that IS one of the declared members in some other case. The value set is
-/// the generated constant of that member's own enum shape, so this rule and the framework's
-/// validating walk cannot disagree about what the model declares.
-pub const CASE_INSENSITIVE_MEMBERS: &[(&str, &[&str])] = &[(
-    "MacSystemIntegrityProtectionStatus",
-    crate::ops::types::MAC_SYSTEM_INTEGRITY_PROTECTION_SETTING_STATUS_VALUES,
-)];
+/// `CreateApplicationStatusCheckRequest$Protocol` is in it for the same reason: the recorded
+/// traffic has EC2 SERVING a `CreateApplicationStatusCheck` whose `Protocol` differs from the
+/// declared `[http, https]` only in ASCII case, and answering the rest of the request — so
+/// the protocol was read as the member it spells, where holding it to the declared spelling
+/// refuses the create at the boundary before the handler runs.
+///
+/// Each row names the INPUT SHAPE as well as the member, because a bare member name does not
+/// identify one member of this model: `Protocol` is also a member of
+/// `CreateNetworkAclEntryRequest`, `ReplaceNetworkAclEntryRequest` (free-text `String`s, where
+/// a rewrite would report back a value the client never sent),
+/// `CreateNetworkInsightsPathRequest`, `CreateTransitGatewayConnectRequest` and
+/// `ModifyApplicationStatusCheckRequest`. The shape is the one whose INPUT is being read, which
+/// is what [`crate::service`] hands [`declared_enum_spelling`]; the member schema itself carries
+/// only its own id and kind (`vendor/smithy-macros/src/lib.rs` emits `Schema::new_member(...)`
+/// with the member's own id), so the enum behind it is not reachable from there and the value
+/// set is named here as the generated constant of that member's own enum shape — this rule and
+/// the framework's validating walk cannot disagree about what the model declares. The rule
+/// fires only for a value that IS one of those declared values in some other case.
+pub const CASE_INSENSITIVE_MEMBERS: &[(&str, &str, &[&str])] = &[
+    (
+        "CreateMacSystemIntegrityProtectionModificationTaskRequest",
+        "MacSystemIntegrityProtectionStatus",
+        crate::ops::types::MAC_SYSTEM_INTEGRITY_PROTECTION_SETTING_STATUS_VALUES,
+    ),
+    (
+        "CreateApplicationStatusCheckRequest",
+        "Protocol",
+        crate::ops::types::NETWORK_PROTOCOL_ENUM_VALUES,
+    ),
+];
 
-/// The declared spelling of `value` for the member `member_name` names, when that member is
-/// one this service reads without regard to case and `value` is one of its declared values in
-/// some other case.
+/// The declared spelling of `value` for the member `member_name` of the input shape
+/// `input_shape`, when that member is one this service reads without regard to case and
+/// `value` is one of its declared values in some other case.
 ///
 /// `None` leaves the value exactly as the client sent it, for the framework's walk to accept
 /// or refuse as it would have — which is what every member outside
-/// [`CASE_INSENSITIVE_MEMBERS`], and every value that is no declared one in any case, gets.
-/// The member name is matched without regard to case too, because the wire key a client sends
-/// is the member name with its first letter capitalised and nothing should turn on that.
-pub fn declared_enum_spelling(member_name: &str, value: &str) -> Option<&'static str> {
-    let (_, declared) = CASE_INSENSITIVE_MEMBERS
-        .iter()
-        .find(|(member, _)| member.eq_ignore_ascii_case(member_name))?;
+/// [`CASE_INSENSITIVE_MEMBERS`], every member of another shape, and every value that is no
+/// declared one in any case, gets. The member name is matched without regard to case too,
+/// because the wire key a client sends is the member name with its first letter capitalised
+/// and nothing should turn on that; the shape name is the model's own and is matched exactly.
+pub fn declared_enum_spelling(
+    input_shape: &str,
+    member_name: &str,
+    value: &str,
+) -> Option<&'static str> {
+    let (_, _, declared) = CASE_INSENSITIVE_MEMBERS.iter().find(|(shape, member, _)| {
+        *shape == input_shape && member.eq_ignore_ascii_case(member_name)
+    })?;
     if declared.contains(&value) {
         return None;
     }
