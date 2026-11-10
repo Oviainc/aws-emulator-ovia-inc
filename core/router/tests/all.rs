@@ -73,7 +73,6 @@ mod s3_notification_invokes_its_lambda_target;
 // Declared here, in this same head region, beside the suite above it shares its wiring with:
 // what the handler a bucket's notification runs DOES — the signed index request it sends to a
 // deployed search domain — which spans S3, Lambda, IAM, STS, Amazon OpenSearch Service and
-// CloudFormation at once.
 #[path = "all/s3_notification_indexes_into_its_opensearch_domain.rs"]
 mod s3_notification_indexes_into_its_opensearch_domain;
 #[path = "all/cloudformation_asset_bucket_publishing_role.rs"]
@@ -567,7 +566,6 @@ mod elb_classic_zone_membership_follows_its_subnets;
 #[path = "all/elb_classic_network_resources_resolve_in_ec2.rs"]
 mod elb_classic_network_resources_resolve_in_ec2;
 // Declared beside its sibling Classic suites above, in this span of the sorted list rather
-// than in the appended tail, for the same reason the notes above give.
 #[path = "all/elb_classic_zone_enable_turns_on_the_vpc.rs"]
 mod elb_classic_zone_enable_turns_on_the_vpc;
 // Alphabetically between the `elbv2_` and `es_` suites, rather than appended at the end
@@ -769,10 +767,6 @@ mod eks_wrapped_peer_refusals;
 // reason their entries record: the appended tail at the end of this file and the `e…` span
 #[path = "all/eks_bootstrap_cluster_creator_access_entry.rs"]
 mod eks_bootstrap_cluster_creator_access_entry;
-// Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
-// reason their entries record: the appended tail at the end of this file and the `e…` span
-// beside the other `eks_*` suites are both regions every concurrently landing router suite
-// puts its line in.
 #[path = "all/eks_capability_role_trust.rs"]
 mod eks_capability_role_trust;
 // Declared HERE, in this same quiet `n`/`o` gap rather than in the appended tail at the end
@@ -1315,3 +1309,9 @@ mod cloudformation_stamps_s3_bucket_stack_provenance;
 // the alarm to the queue subscribed to the alarm's topic.
 #[path = "all/logs_metric_filter_drives_the_alarm_notification_chain.rs"]
 mod logs_metric_filter_drives_the_alarm_notification_chain;
+// Declared here, in this same head region, for the reason the entry above records: which
+// copies of the in-process SQL engine a build of this workspace may contain is a property
+// of the committed lock and of every service manifest at once, so no single service
+// crate's test target can ask it.
+#[path = "all/sql_engine_single_locked_copy.rs"]
+mod sql_engine_single_locked_copy;

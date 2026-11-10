@@ -23,6 +23,10 @@
 //! `no_manifest_declares_a_dependency_in_a_form_the_suite_cannot_read` pins that the
 //! declaration forms it does not read — a `[dependencies.<name>]` sub-table and a dotted
 //! key — are absent from the tree rather than silently skipped.
+//!
+//! Those readers are `pub(crate)`: `sql_engine_single_locked_copy` pairs the same two
+//! committed files for a different invariant, so the lock and the manifests are read here
+//! once rather than by a second reader of the same formats.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -32,17 +36,17 @@ use std::path::{Path, PathBuf};
 /// of `version`, `package` (the crate the lock knows, when the key is an alias) and
 /// `workspace = true` (the requirement lives in the root `[workspace.dependencies]`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Declared {
-    package: Option<String>,
-    req: Option<String>,
-    from_workspace: bool,
+pub(crate) struct Declared {
+    pub(crate) package: Option<String>,
+    pub(crate) req: Option<String>,
+    pub(crate) from_workspace: bool,
 }
 
 /// The crate names the lock carries, each with the versions locked for it.
-type Locked = BTreeMap<String, Vec<String>>;
+pub(crate) type Locked = BTreeMap<String, Vec<String>>;
 
 /// The workspace root: this crate's manifest sits at `<root>/core/router`.
-fn workspace_root() -> PathBuf {
+pub(crate) fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
@@ -55,7 +59,7 @@ fn unquote(value: &str) -> &str {
 }
 
 /// Every `[[package]]` in the lock, as crate name -> the versions locked for it.
-fn locked_packages(lock: &str) -> Locked {
+pub(crate) fn locked_packages(lock: &str) -> Locked {
     let mut locked: Locked = BTreeMap::new();
     let mut name: Option<String> = None;
     for line in lock.lines() {
@@ -77,7 +81,7 @@ fn locked_packages(lock: &str) -> Locked {
 }
 
 /// The directories listed in the root manifest's `members` array.
-fn workspace_members(root_manifest: &str) -> Vec<String> {
+pub(crate) fn workspace_members(root_manifest: &str) -> Vec<String> {
     let mut members = Vec::new();
     let mut inside = false;
     for line in root_manifest.lines() {
@@ -185,7 +189,10 @@ fn logical_lines(manifest: &str) -> Vec<String> {
 /// header, the name the manifest uses and the declaration. A name may be declared once per
 /// table — `[dependencies]` and `[dev-dependencies]` can require different versions of one
 /// crate — so these are a sequence, not a map keyed by name.
-fn dependencies_in(manifest: &str, wanted: fn(&str) -> bool) -> Vec<(String, String, Declared)> {
+pub(crate) fn dependencies_in(
+    manifest: &str,
+    wanted: fn(&str) -> bool,
+) -> Vec<(String, String, Declared)> {
     let mut declared = Vec::new();
     let mut table = String::new();
     let mut inside = false;
@@ -223,7 +230,7 @@ fn workspace_dependency_table(root_manifest: &str) -> BTreeMap<String, Declared>
         .collect()
 }
 
-fn is_member_dependency_table(section: &str) -> bool {
+pub(crate) fn is_member_dependency_table(section: &str) -> bool {
     matches!(
         section,
         "[dependencies]" | "[dev-dependencies]" | "[build-dependencies]"
@@ -276,7 +283,7 @@ fn unreadable_dependency_forms(manifest_path: &str, manifest: &str) -> Vec<Strin
 }
 
 /// `major.minor.patch` and how many of the three the text actually spelled out.
-fn parse_version(value: &str) -> Option<([u64; 3], usize)> {
+pub(crate) fn parse_version(value: &str) -> Option<([u64; 3], usize)> {
     let mut parsed = [0u64; 3];
     let mut spelled = 0usize;
     for part in value.trim().split('.') {
@@ -296,7 +303,7 @@ fn parse_version(value: &str) -> Option<([u64; 3], usize)> {
 /// form — a comparison, a tilde, a wildcard, a union, a prerelease — is reported accepted:
 /// this suite pins lock COVERAGE, and cargo stays the authority on the requirement forms it
 /// does not read here.
-fn accepts(req: &str, version: &str) -> bool {
+pub(crate) fn accepts(req: &str, version: &str) -> bool {
     let Some((actual, _)) = parse_version(version) else {
         return true;
     };
