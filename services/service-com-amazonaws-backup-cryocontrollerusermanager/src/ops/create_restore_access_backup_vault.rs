@@ -379,6 +379,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the SOURCE vault: the restore access vault associates none of
             // its own.
             mpa_approval_team_arn: None,
+            // A create attaches no resource policy: one is attached only by
+            // the call that puts it there.
+            access_policy: None,
         };
         let output = CreateRestoreAccessBackupVaultOutput {
             restore_access_backup_vault_arn: Some(vault.arn.clone()),

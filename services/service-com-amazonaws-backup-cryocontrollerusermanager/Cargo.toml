@@ -38,6 +38,13 @@ chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 # the emulator supplies the transport, so the SDK's own HTTPS stack and runtime are
 # left out.
 aws-sdk-eventbridge = { version = "1", default-features = false }
+# The AWS SDK for DynamoDB, driven over the in-process callback
+# (`OperationContext::callback`): a restore re-creates the protected resource in
+# the service that owns it, so the restore of a DynamoDB table recovery point
+# creates that table through DynamoDB's own API
+# (`state::restore_execution::perform_restore`). Only the generated client is
+# needed — the emulator supplies the transport.
+aws-sdk-dynamodb = { version = "1", default-features = false }
 # `eventbridge_client`: the tree's ONE construction of that in-process EventBridge
 # client, so this service configures the publication hop exactly as every other
 # publisher does. `iam_role`: the shared reading of a caller-supplied IAM role ARN
@@ -61,6 +68,10 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # creates the roles it resolves through IAM's own wire, so the records read are
 # the ones `CreateRole` wrote.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# DynamoDB is mounted beside Backup in the restore suite: a restore re-creates
+# the protected resource in the service that owns it, so the table a restore
+# creates is read back through DynamoDB's own wire.
+service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 
 [lints]
 workspace = true

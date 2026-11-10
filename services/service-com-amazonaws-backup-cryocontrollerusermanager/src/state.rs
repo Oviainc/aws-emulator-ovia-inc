@@ -23,6 +23,18 @@
 //!   stored members every legal-hold read projects through
 //!   [`LegalHoldRecord::listed`] and whose stored selection decides, through
 //!   [`LegalHoldRecord::holds`], which recovery points the hold is on.
+//! * [`RestoreJobRecord`] — the restore `StartRestoreJob` starts from a stored
+//!   recovery point, which every call that names a `RestoreJobId` resolves
+//!   against (the `restore` module).
+//! * [`TieringConfigurationRecord`] — the tiering configuration
+//!   `CreateTieringConfiguration` stores under its account-unique name, which
+//!   the tiering read, listing and delete all answer from (the `tiering`
+//!   module).
+//!
+//! A vault's resource policy is one of [`BackupVault`]'s own members
+//! ([`BackupVault::access_policy`]): `PutBackupVaultAccessPolicy` stores it
+//! there and `GetBackupVaultAccessPolicy` reports it from there, so the policy
+//! a client attaches is the policy the vault carries.
 //!
 //! A job's state is also ANNOUNCED, not only stored: the `events` module holds the one diff
 //! that turns every state a stored job moves into after its start call into an event on the
@@ -62,6 +74,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// other part of this service's state.
 mod events;
 pub use events::*;
+
+/// The restore jobs this service stores, and the resolution steps the calls that
+/// name one share. Re-exported for the reason given on `events`.
+mod restore;
+pub use restore::*;
+
+/// Performing a restore: re-creating the protected resource in the service that
+/// owns it. Re-exported for the reason given on `events`.
+mod restore_execution;
+pub use restore_execution::*;
+
+/// The tiering configurations this service stores, and the two projections its
+/// reads answer from. Re-exported for the reason given on `events`.
+mod tiering;
+pub use tiering::*;
+
+/// The tags this service's resources carry, and the resolution step the tagging
+/// calls share. Re-exported for the reason given on `events`.
+mod tagging;
+pub use tagging::*;
 
 use crate::ops::types::{
     AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupPlanInput, BackupRule,
@@ -452,6 +484,22 @@ pub fn legal_hold_arn(region: &str, legal_hold_id: &str) -> String {
         ARN_NAMESPACE,
         region,
         &format!("legal-hold:{legal_hold_id}"),
+    )
+}
+
+/// The ARN of a tiering configuration:
+/// `arn:aws:backup:<region>:<account>:tiering-configuration:<name>`.
+///
+/// A tiering configuration is addressed by NAME — the name "cannot be changed
+/// after creation" (model doc for `TieringConfigurationName`) and is unique to
+/// the account — so the name is what its ARN carries, spelled with the
+/// resource type separated by `:` as [`backup_vault_arn`] spells
+/// `backup-vault` and [`legal_hold_arn`] spells `legal-hold`.
+pub fn tiering_configuration_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("tiering-configuration:{name}"),
     )
 }
 
@@ -933,6 +981,49 @@ pub const MESSAGE_MISSING_RESOURCE_SELECTION: &str = "Missing Resource Selection
 /// so the list a caller is told about is the list the model declares.
 pub const AGGREGATION_PERIODS: [&str; 3] = ["ONE_DAY", "SEVEN_DAYS", "FOURTEEN_DAYS"];
 
+/// The sentence AWS states for "the restore job asked about is not one this
+/// account holds" — fixed, and worded as this service words the same condition
+/// for a backup job ([`MESSAGE_BACKUP_JOB_NOT_FOUND`]) and for a recovery point
+/// ([`MESSAGE_RECOVERY_POINT_NOT_FOUND`]): it names no part of the request, so
+/// the id asked about does not appear in it. It answers every call that
+/// addresses a restore job by id — the read, the metadata read and the
+/// validation result. No `Code`: this condition has no observed token.
+pub const MESSAGE_RESTORE_JOB_NOT_FOUND: &str = "Cannot find restore job";
+
+/// The sentence AWS states for "the tiering configuration asked about is not
+/// one this account holds" — fixed, and worded as the conditions above are: it
+/// names no part of the request, so the name asked about does not appear in it.
+/// No `Code`: this condition has no observed token.
+pub const MESSAGE_TIERING_CONFIGURATION_NOT_FOUND: &str = "Cannot find tiering configuration";
+
+/// The sentence AWS states for "a tiering configuration of this name already
+/// exists", worded as this service words the same condition for a vault
+/// ([`MESSAGE_VAULT_ALREADY_EXISTS`]) — fixed, and with no observed `Code`.
+pub const MESSAGE_TIERING_CONFIGURATION_ALREADY_EXISTS: &str =
+    "Tiering configuration with the same name already exists";
+
+/// The FIXED text AWS states for "the vault named carries no resource policy to
+/// report", up to and after the one variable part: the ARN of the vault the
+/// read addressed. Composed by [`vault_access_policy_not_found`], the one place
+/// the sentence is built. No `Code`: this condition has no observed token.
+pub const MESSAGE_VAULT_ACCESS_POLICY_NOT_FOUND_PREFIX: &str = "Vault ";
+/// The text that follows the vault ARN in that sentence.
+pub const MESSAGE_VAULT_ACCESS_POLICY_NOT_FOUND_SUFFIX: &str =
+    " has no associated vault policy";
+
+/// The sentence AWS states for "the document offered as this vault's resource
+/// policy is not a policy" — fixed text: it names neither the vault nor any
+/// part of the document, and tells the caller what to do instead. No `Code`:
+/// this condition has no observed token.
+pub const MESSAGE_VAULT_ACCESS_POLICY_INVALID: &str =
+    "Provided Policy is not valid. Please input a valid policy and retry the request.";
+
+/// The sentence AWS states for "the ARN a tagging call carries names no
+/// resource of this account" — fixed, and worded as the not-found conditions
+/// above are: it names no part of the request, so the ARN asked about does not
+/// appear in it. No `Code`: this condition has no observed token.
+pub const MESSAGE_TAGGED_RESOURCE_NOT_FOUND: &str = "Cannot find resource";
+
 /// The modelled refusal for an unknown backup job id, with its `Code`.
 pub fn backup_job_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
@@ -1260,6 +1351,95 @@ pub fn recovery_point_not_found() -> ResourceNotFoundException {
 pub fn recovery_point_locked() -> InvalidRequestException {
     InvalidRequestException {
         message: Some(MESSAGE_RECOVERY_POINT_LOCKED.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The SAME condition as [`recovery_point_not_found`] — the recovery point
+/// named is not one the account holds — in the PARAMETER-value class, for the
+/// call that carries the recovery point as a member of its own request rather
+/// than as the resource it addresses.
+///
+/// `StartRestoreJob` is that call: the restore it starts is a resource of its
+/// own, and the `RecoveryPointArn` it names is an input to it, so AWS Backup
+/// reports an ARN that resolves to nothing there as a value it cannot accept —
+/// the same reading as for a `RestoreAccessBackupVaultArn`
+/// ([`rejected_restore_access_vault_arn`]) — while the calls that ADDRESS a
+/// stored recovery point report it absent. The sentence is the condition's, so
+/// it is the same one either way: a client reads which INPUT to fix from the
+/// class, and what went wrong from the sentence.
+pub fn recovery_point_not_found_value() -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        message: Some(MESSAGE_RECOVERY_POINT_NOT_FOUND.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a `RestoreJobId` this account holds no restore job
+/// under — see [`MESSAGE_RESTORE_JOB_NOT_FOUND`].
+pub fn restore_job_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(MESSAGE_RESTORE_JOB_NOT_FOUND.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a `TieringConfigurationName` this account holds no
+/// tiering configuration under — see
+/// [`MESSAGE_TIERING_CONFIGURATION_NOT_FOUND`].
+pub fn tiering_configuration_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(MESSAGE_TIERING_CONFIGURATION_NOT_FOUND.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a create naming a tiering configuration that
+/// already exists.
+///
+/// `Arn` and `CreatorRequestId` are left UNSET for the reason given on
+/// [`vault_already_exists`].
+pub fn tiering_configuration_already_exists() -> AlreadyExistsException {
+    AlreadyExistsException {
+        message: Some(MESSAGE_TIERING_CONFIGURATION_ALREADY_EXISTS.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a `ResourceArn` naming no taggable resource of this
+/// account — see [`MESSAGE_TAGGED_RESOURCE_NOT_FOUND`].
+pub fn tagged_resource_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(MESSAGE_TAGGED_RESOURCE_NOT_FOUND.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a read of the resource policy of a vault that
+/// carries none — see [`MESSAGE_VAULT_ACCESS_POLICY_NOT_FOUND_PREFIX`].
+///
+/// `vault_arn` is the stored vault's own ARN ([`BackupVault::arn`]), which is
+/// the only variable part of the sentence.
+pub fn vault_access_policy_not_found(vault_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "{MESSAGE_VAULT_ACCESS_POLICY_NOT_FOUND_PREFIX}{vault_arn}\
+             {MESSAGE_VAULT_ACCESS_POLICY_NOT_FOUND_SUFFIX}"
+        )),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a `Policy` that is not a policy document — see
+/// [`MESSAGE_VAULT_ACCESS_POLICY_INVALID`].
+///
+/// This condition has a sentence of its OWN rather than the member-named one
+/// every other rejected value gets ([`rejected_parameter`]): AWS states what
+/// the document failed to be and what to do about it, and states it the same
+/// way for every document outside the policy language.
+pub fn rejected_vault_access_policy() -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        message: Some(MESSAGE_VAULT_ACCESS_POLICY_INVALID.to_string()),
         ..Default::default()
     }
 }
@@ -1849,6 +2029,11 @@ pub struct BackupVault {
     /// [`VAULT_STATE_CREATING`], and for every vault type that asks for no
     /// approval at all.
     pub approval_date: Option<SystemTime>,
+    /// The resource policy `PutBackupVaultAccessPolicy` attached to this vault,
+    /// once one has been, in the one layout an attached policy document is
+    /// reported in (`::service_common::iam_policy::canonical_document`). `None`
+    /// for a vault carrying none, which is what the policy read reports absent.
+    pub access_policy: Option<String>,
 }
 
 impl BackupVault {
@@ -2449,6 +2634,13 @@ pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
     pub frameworks: BTreeMap<String, FrameworkRecord>,
     /// Legal holds by `LegalHoldId`. Bounded by [`MAX_LEGAL_HOLDS`].
     pub legal_holds: BTreeMap<String, LegalHoldRecord>,
+    /// Restore jobs by `RestoreJobId`. Bounded by [`MAX_RESTORE_JOBS`].
+    pub restore_jobs: BTreeMap<String, RestoreJobRecord>,
+    /// Tiering configurations by `TieringConfigurationName` — the name a
+    /// tiering configuration is addressed by, so the map itself is what makes
+    /// that name unique to the account. Bounded by
+    /// [`MAX_TIERING_CONFIGURATIONS`].
+    pub tiering_configurations: BTreeMap<String, TieringConfigurationRecord>,
     /// `StartBackupJob`'s `IdempotencyToken` -> what it replays. Bounded by
     /// [`MAX_IDEMPOTENCY_TOKENS`] and [`IDEMPOTENCY_TOKEN_TTL`].
     pub idempotency_tokens: BTreeMap<String, IdempotencyRecord>,

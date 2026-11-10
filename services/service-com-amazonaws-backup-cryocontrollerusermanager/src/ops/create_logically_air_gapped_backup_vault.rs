@@ -356,6 +356,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An MPA approval team is associated by its own operation, never
             // at creation: this create models no team.
             mpa_approval_team_arn: None,
+            // A create attaches no resource policy: one is attached only by
+            // the call that puts it there.
+            access_policy: None,
         };
         let output = CreateLogicallyAirGappedBackupVaultOutput {
             backup_vault_name: Some(vault.name.clone()),

@@ -283,6 +283,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source_backup_vault_arn: None,
             approval_date: None,
             mpa_approval_team_arn: None,
+            // A create attaches no resource policy: one is attached only by
+            // the call that puts it there.
+            access_policy: None,
         };
         let output = CreateBackupVaultOutput {
             backup_vault_name: Some(vault.name.clone()),

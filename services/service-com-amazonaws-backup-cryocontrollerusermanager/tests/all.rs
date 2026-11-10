@@ -43,6 +43,8 @@ mod legal_hold_date_range;
 mod legal_hold_vault_selection;
 #[path = "all/logically_air_gapped_vault.rs"]
 mod logically_air_gapped_vault;
+#[path = "all/mpa_approval_team_disassociation.rs"]
+mod mpa_approval_team_disassociation;
 #[path = "all/plan_and_selection_refusals.rs"]
 mod plan_and_selection_refusals;
 #[path = "all/recovery_point_deletion.rs"]
@@ -51,14 +53,22 @@ mod recovery_point_deletion;
 mod recovery_point_read;
 #[path = "all/restore_access_vault.rs"]
 mod restore_access_vault;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
+#[path = "all/restore_job.rs"]
+mod restore_job;
 #[path = "all/scheduled_runs_preview.rs"]
 mod scheduled_runs_preview;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/supported_resource_types.rs"]
 mod supported_resource_types;
+#[path = "all/tiering_configuration.rs"]
+mod tiering_configuration;
 #[path = "all/vault_and_backup_job.rs"]
 mod vault_and_backup_job;
+#[path = "all/vault_access_policy.rs"]
+mod vault_access_policy;
 #[path = "all/vault_lock_refusal_order.rs"]
 mod vault_lock_refusal_order;
 #[path = "all/vault_read_projection.rs"]
