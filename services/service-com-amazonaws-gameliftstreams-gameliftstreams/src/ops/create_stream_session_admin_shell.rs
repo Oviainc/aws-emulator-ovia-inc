@@ -7,6 +7,16 @@
 //! nothing stored is a `ResourceNotFoundException`, and a session whose status is
 //! not one this operation documents as eligible is a `ValidationException` too.
 //!
+//! Resolution is OUTSIDE-IN, and that is what the not-found path reports: the
+//! stream group the `Identifier` label names is resolved first, so a request whose
+//! group is absent is reported against the GROUP — the service's generic
+//! `Resource '<stream group ARN>' does not exist` text over the ARN that label
+//! resolves to — and the stream session is named only once its group resolved. The
+//! other session-scoped operations of this service (`GetStreamSession`,
+//! `TerminateStreamSession`, `CreateStreamSessionConnection`) report the session
+//! itself even for an absent group, which is their own recorded wording and not
+//! this one.
+//!
 //! Two different texts are involved in that last one, and they must not be mixed
 //! up. The operation's DOCUMENTATION (quoted further down, from the model) states
 //! the requirement as "The stream session must be in one of the following statuses:
@@ -250,22 +260,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // they were owed whether or not anybody called — so the status this
             // request is judged against is the one the session actually holds.
             state.materialize(now);
+            // Outside-in: the stream group that runs the session has to resolve
+            // before anything under it is looked up, so a request whose group is
+            // absent is a miss on the GROUP and is reported as one.
+            let Some(group) = state.stream_group(&input.identifier) else {
+                return Err(group_not_found(&region, &input.identifier));
+            };
             let session = crate::state::identifier_id(
                 &input.stream_session_identifier,
                 crate::state::STREAM_SESSION_RESOURCE,
             )
-            .and_then(|session_id| {
-                state
-                    .stream_group(&input.identifier)
-                    .and_then(|group| group.sessions.get(&session_id))
-            });
-            // Session-scoped: the resource this call addresses is the stream session
-            // its two path labels name, so an unresolvable session identifier, an
-            // absent group and an absent session are the SAME miss, reported against
-            // the composite stream session ARN — the rule `GetStreamSession` and
-            // `TerminateStreamSession` already answer by.
+            .and_then(|session_id| group.sessions.get(&session_id));
+            // The group resolved, so the resource that went missing is the stream
+            // session the second label names, reported against the composite stream
+            // session ARN the two labels resolve to.
             let Some(session) = session else {
-                return Err(not_found(&region, &input));
+                return Err(session_not_found(&region, &input));
             };
             if !session.admits_an_admin_shell() {
                 return Err(not_eligible(&session.arn));
@@ -297,11 +307,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // session opened into it after it.
         let mut state = state.lock();
         let suffix = state.mint_token(crate::state::ADMIN_SHELL_SESSION_SUFFIX_LENGTH);
-        let Some(session) = state
-            .stream_group_mut(&input.identifier)
-            .and_then(|group| group.sessions.get_mut(&session_id))
-        else {
-            return Err(not_found(&region, &input));
+        let Some(group) = state.stream_group_mut(&input.identifier) else {
+            return Err(group_not_found(&region, &input.identifier));
+        };
+        let Some(session) = group.sessions.get_mut(&session_id) else {
+            return Err(session_not_found(&region, &input));
         };
         if !session.admits_an_admin_shell() {
             return Err(not_eligible(&session.arn));
@@ -326,9 +336,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled miss for two path labels that name no stored stream session,
-/// reported against the composite stream session ARN they resolve to.
-fn not_found(
+/// The modelled miss for an `Identifier` that names no stored stream group.
+///
+/// The stream group is the resource this operation resolves FIRST ("The stream
+/// group that runs this stream session"), so when it is absent it is the resource
+/// the service failed to resolve and the one the message names, through the
+/// service's generic resource-not-found text over the stream group ARN that label
+/// resolves to.
+fn group_not_found(region: &str, identifier: &str) -> CreateStreamSessionAdminShellError {
+    CreateStreamSessionAdminShellErrorModeled::ResourceNotFoundException(
+        crate::state::resource_not_found(&crate::state::resolved_arn(
+            region,
+            identifier,
+            crate::state::STREAM_GROUP_RESOURCE,
+        )),
+    )
+    .into()
+}
+
+/// The modelled miss for a `StreamSessionIdentifier` that names no stream session
+/// of a stream group that DID resolve, reported against the composite stream
+/// session ARN the two path labels resolve to.
+fn session_not_found(
     region: &str,
     input: &CreateStreamSessionAdminShellInput,
 ) -> CreateStreamSessionAdminShellError {

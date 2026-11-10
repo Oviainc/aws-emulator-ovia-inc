@@ -19,7 +19,10 @@
 //! session reads back as. A session whose placement SUCCEEDED gets past this gate,
 //! which `stream_session_placement.rs` covers. The second table spans the
 //! identifier class: unknown group, unknown session, either label carrying another
-//! resource type's ARN, and both labels in ARN form.
+//! resource type's ARN, and both labels in ARN form. Which resource an unknown
+//! label is reported against — the group is resolved before the session, so an
+//! absent group is reported as the group — is tabled in
+//! `admin_shell_not_found.rs`.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -214,8 +217,9 @@ async fn an_ineligible_stream_session_status_is_refused_as_a_validation_error() 
 /// The two path labels are resolved the way every session-scoped operation of this
 /// service resolves them: a label that can name no resource of its own type is a
 /// 400 `ValidationException` decided from the request, an identifier naming nothing
-/// stored is a 404 `ResourceNotFoundException` reported against the composite stream
-/// session ARN, and either label in ARN form resolves the same stored session a bare
+/// stored is a 404 `ResourceNotFoundException` reported against the resource that
+/// failed to resolve (the stream group first, then the session under it), and either
+/// label in ARN form resolves the same stored session a bare
 /// id does.
 #[tokio::test]
 async fn the_path_labels_resolve_the_stream_session_they_name() {
@@ -235,7 +239,10 @@ async fn the_path_labels_resolve_the_stream_session_they_name() {
             session_id.clone(),
             404,
             "ResourceNotFoundException",
-            format!("arn:aws:gameliftstreams:{REGION}:{ACCOUNT}:streamsession/sg-missing/{session_id}"),
+            format!(
+                "Resource 'arn:aws:gameliftstreams:{REGION}:{ACCOUNT}:streamgroup/\
+                 sg-missing' does not exist"
+            ),
         ),
         (
             "an unknown stream session",
@@ -244,7 +251,8 @@ async fn the_path_labels_resolve_the_stream_session_they_name() {
             404,
             "ResourceNotFoundException",
             format!(
-                "arn:aws:gameliftstreams:{REGION}:{ACCOUNT}:streamsession/{group_id}/ss-missing"
+                "Stream session 'arn:aws:gameliftstreams:{REGION}:{ACCOUNT}:streamsession/\
+                 {group_id}/ss-missing' does not exist"
             ),
         ),
         (
