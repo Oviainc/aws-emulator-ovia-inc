@@ -523,14 +523,14 @@ impl ComAmazonawsConnectcasesAmazonconnectcasesState {
     pub fn domain(&self, domain_id: &str) -> Result<&Domain, ResourceNotFoundException> {
         self.domains
             .get(domain_id)
-            .ok_or_else(|| not_found("Domain", domain_id))
+            .ok_or_else(|| not_found(ResourceKind::Domain, domain_id))
     }
 
     /// The domain `domain_id` names for writing, or the modelled 404 for it.
     pub fn domain_mut(&mut self, domain_id: &str) -> Result<&mut Domain, ResourceNotFoundException> {
         self.domains
             .get_mut(domain_id)
-            .ok_or_else(|| not_found("Domain", domain_id))
+            .ok_or_else(|| not_found(ResourceKind::Domain, domain_id))
     }
 
     /// Refuse a new domain once the store holds [`MAX_DOMAINS`] of them.
@@ -599,7 +599,7 @@ impl ComAmazonawsConnectcasesAmazonconnectcasesState {
         let removed = self
             .domains
             .remove(domain_id)
-            .ok_or_else(|| not_found("Domain", domain_id))?;
+            .ok_or_else(|| not_found(ResourceKind::Domain, domain_id))?;
         self.case_idempotency
             .retain(|(domain, _), _| domain != domain_id);
         self.idempotency_order
@@ -628,7 +628,7 @@ impl Domain {
     pub fn case(&self, case_id: &str) -> Result<&Case, ResourceNotFoundException> {
         self.cases
             .get(case_id)
-            .ok_or_else(|| not_found("Case", case_id))
+            .ok_or_else(|| not_found(ResourceKind::Case, case_id))
     }
 
     /// The LIVE template `template_id` names, or the modelled 404 for it. A
@@ -639,7 +639,7 @@ impl Domain {
         self.templates
             .get(template_id)
             .filter(|template| !template.deleted)
-            .ok_or_else(|| not_found("Template", template_id))
+            .ok_or_else(|| not_found(ResourceKind::Template, template_id))
     }
 
     /// The RECORD this domain holds for `template_id`, live or deleted, or
@@ -660,7 +660,7 @@ impl Domain {
         self.fields
             .get(field_id)
             .filter(|field| !field.deleted)
-            .ok_or_else(|| not_found("Field", field_id))
+            .ok_or_else(|| not_found(ResourceKind::Field, field_id))
     }
 
     /// The live field `field_id` names, for writing, or the modelled 404 for it.
@@ -668,7 +668,7 @@ impl Domain {
         self.fields
             .get_mut(field_id)
             .filter(|field| !field.deleted)
-            .ok_or_else(|| not_found("Field", field_id))
+            .ok_or_else(|| not_found(ResourceKind::Field, field_id))
     }
 
     /// The RECORD this domain holds for `field_id`, live or deleted, or `None`
@@ -768,7 +768,7 @@ impl Domain {
     pub fn layout(&self, layout_id: &str) -> Result<&Layout, ResourceNotFoundException> {
         self.layouts
             .get(layout_id)
-            .ok_or_else(|| not_found("Layout", layout_id))
+            .ok_or_else(|| not_found(ResourceKind::Layout, layout_id))
     }
 
     /// Every layout this domain still holds, in creation order and each paired
@@ -1750,16 +1750,18 @@ pub fn not_configurable_in_a_layout<'a, I: IntoIterator<Item = &'a str>>(ids: I)
 /// while one unresolvable item is `ResourceNotFound`.
 pub const BATCH_ITEM_NOT_FOUND_CODE: &str = "ResourceNotFound";
 
-/// The kind of resource a name-conflict refusal is about: the four kinds this
-/// service names within a container. Taking the kind as a value rather than a
-/// string is what makes [`name_conflict`]'s rendering total — there is no
-/// unknown kind to fall back on, and no runtime capitalisation.
+/// The kind of resource a refusal is about: the kinds this service addresses
+/// within a container, plus the container itself. Taking the kind as a value
+/// rather than a string is what makes the rendering of [`name_conflict`] and
+/// [`not_found`] total — there is no unknown kind to fall back on, no runtime
+/// capitalisation, and the text of a refusal class can be chosen per kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceKind {
     Domain,
     Field,
     Template,
     Layout,
+    Case,
 }
 
 impl ResourceKind {
@@ -1770,6 +1772,29 @@ impl ResourceKind {
             Self::Field => ("Field", "field"),
             Self::Template => ("Template", "template"),
             Self::Layout => ("Layout", "layout"),
+            Self::Case => ("Case", "case"),
+        }
+    }
+
+    /// The `resourceType` a refusal about this kind reports.
+    pub fn resource_type(self) -> &'static str {
+        self.words().0
+    }
+
+    /// The `message` the not-found class carries for THIS kind of resource.
+    ///
+    /// The service does not use one sentence for every kind: a case that cannot
+    /// be resolved is reported with the sentence that names the case id the
+    /// request carried, single-quoted, while the kinds nothing records a
+    /// per-kind sentence for answer the service's generic one
+    /// ([`RESOURCE_NOT_FOUND_MESSAGE`]) and report the resource through the
+    /// error's own `resourceId`/`resourceType` members instead.
+    pub fn not_found_message(self, resource_id: &str) -> String {
+        match self {
+            Self::Case => format!("A case with id '{resource_id}' could not be found."),
+            Self::Domain | Self::Field | Self::Template | Self::Layout => {
+                RESOURCE_NOT_FOUND_MESSAGE.to_string()
+            }
         }
     }
 }
@@ -1798,25 +1823,24 @@ pub fn name_conflict(resource_kind: ResourceKind, name: &str) -> ConflictExcepti
     }
 }
 
-/// The modelled 404 for a resource this service does not hold.
+/// The modelled 404 for a resource of `resource_kind` this service does not
+/// hold, addressed by `resource_id`.
 ///
-/// The `message` of this error class is the service's FIXED sentence, with no
-/// variable part: the resource the call could not resolve is reported in the
-/// error's own `resourceId` and `resourceType` members, which the model makes
-/// required for exactly that
-/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), so nothing
-/// from the request is interpolated into the sentence and a client matching on
-/// it reads the same text for every resource kind.
-pub fn not_found(resource_type: &str, resource_id: &str) -> ResourceNotFoundException {
+/// The `resourceId` and `resourceType` members the model makes required
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`) always
+/// report what could not be resolved; the `message` is the sentence this
+/// service sends for that KIND of resource, which
+/// [`ResourceKind::not_found_message`] owns.
+pub fn not_found(resource_kind: ResourceKind, resource_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+        message: resource_kind.not_found_message(resource_id),
         resource_id: resource_id.to_string(),
-        resource_type: resource_type.to_string(),
+        resource_type: resource_kind.resource_type().to_string(),
     }
 }
 
-/// The `message` every [`not_found`] carries: the service's fixed sentence for
-/// the `ResourceNotFoundException` class.
+/// The `message` a [`not_found`] carries for a kind of resource the service has
+/// no sentence of its own for: its generic sentence, with no variable part.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Requested resource not found.";
 
 /// The modelled 500 for a request that reached a handler with no store behind

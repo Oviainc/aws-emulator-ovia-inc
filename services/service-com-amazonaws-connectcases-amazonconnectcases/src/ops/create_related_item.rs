@@ -245,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let content_check = content_refusal(domain, &input.content);
         let Some(case) = domain.cases.get_mut(&input.case_id) else {
             return Err(CreateRelatedItemErrorModeled::ResourceNotFoundException(
-                crate::state::not_found("Case", &input.case_id),
+                crate::state::not_found(crate::state::ResourceKind::Case, &input.case_id),
             )
             .into());
         };
@@ -337,7 +337,7 @@ fn content_refusal(
         RelatedItemInputContent::connectCase(connect_case) => {
             if !domain.cases.contains_key(&connect_case.case_id) {
                 return Err(CreateRelatedItemErrorModeled::ResourceNotFoundException(
-                    crate::state::not_found("Case", &connect_case.case_id),
+                    crate::state::not_found(crate::state::ResourceKind::Case, &connect_case.case_id),
                 ));
             }
         }

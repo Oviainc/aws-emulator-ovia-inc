@@ -16,9 +16,11 @@
 //! 2. A request that references a field id the domain's schema does not define is
 //!    refused with `ValidationException` (400) naming the unresolvable ids after
 //!    the service's fixed text, whichever member carried them.
-//! 3. `ResourceNotFoundException` (404) carries the service's FIXED sentence; the
-//!    resource that could not be resolved is reported in the error's own
-//!    `resourceId` / `resourceType` members, which the model makes required.
+//! 3. `ResourceNotFoundException` (404) carries the sentence this service sends
+//!    for the KIND of resource that could not be resolved (its generic one for
+//!    the kinds that have none of their own); the resource that could not be
+//!    resolved is reported in the error's own `resourceId` / `resourceType`
+//!    members, which the model makes required.
 //! 4. A create refused because the template it names requires a value the request
 //!    did not provide answers `ValidationException` (400) with the service's fixed
 //!    sentence naming that one field id and nothing else.
@@ -434,8 +436,21 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
     }
 }
 
+/// The sentence the not-found class carries for a resource of `resource_type`
+/// addressed by `resource_id`, written out here rather than taken from the
+/// crate so the expectation is independent of the code under test. A case has
+/// the service's own sentence naming the id; every other kind answers the
+/// generic one.
+fn expected_not_found_message(resource_type: &str, resource_id: &str) -> String {
+    if resource_type == "Case" {
+        format!("A case with id '{resource_id}' could not be found.")
+    } else {
+        RESOURCE_NOT_FOUND_MESSAGE.to_string()
+    }
+}
+
 #[tokio::test]
-async fn a_resource_that_cannot_be_resolved_is_refused_with_the_fixed_sentence() {
+async fn a_resource_that_cannot_be_resolved_is_refused_with_its_classs_sentence() {
     let emulator = Emulator::new();
     let domain_id = domain(&emulator, "not-found-domain").await;
     let fields = fields_of_every_type(&emulator, &domain_id).await;
@@ -551,17 +566,22 @@ async fn a_resource_that_cannot_be_resolved_is_refused_with_the_fixed_sentence()
             (404, Some("ResourceNotFoundException")),
             "case {case:?}: expected 404 ResourceNotFoundException, got {status} {response:?}"
         );
+        let expected = expected_not_found_message(resource_type, &resource_id);
         assert_eq!(
             response.get("message").and_then(Value::as_str),
-            Some(RESOURCE_NOT_FOUND_MESSAGE),
-            "case {case:?}: expected the fixed sentence {RESOURCE_NOT_FOUND_MESSAGE:?}, \
-             got {response:?}"
+            Some(expected.as_str()),
+            "case {case:?}: expected the sentence {expected:?}, got {response:?}"
         );
-        // Nothing from the request is interpolated into the sentence: the
-        // resource is reported in the error's own required members instead.
+        // Beyond the id the case sentence quotes, nothing from the request is
+        // interpolated: the resource is reported in the error's own required
+        // members instead.
         let message = string_at(&response, "message", case);
         assert!(
-            !message.contains(resource_id.as_str()),
+            !message.contains(domain_id.as_str()),
+            "case {case:?}: the sentence must carry no domain id, got {message:?}"
+        );
+        assert!(
+            resource_type == "Case" || !message.contains(resource_id.as_str()),
             "case {case:?}: the sentence must carry no part of the request, got {message:?}"
         );
         assert_eq!(

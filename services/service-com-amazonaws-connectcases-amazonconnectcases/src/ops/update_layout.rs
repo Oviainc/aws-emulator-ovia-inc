@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .deleted;
         if deleted {
             return Err(UpdateLayoutErrorModeled::ResourceNotFoundException(
-                crate::state::not_found("Layout", &input.layout_id),
+                crate::state::not_found(crate::state::ResourceKind::Layout, &input.layout_id),
             )
             .into());
         }
@@ -261,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `content` leaves the stored one as it was.
         let Some(layout) = domain.layouts.get_mut(&input.layout_id) else {
             return Err(UpdateLayoutErrorModeled::ResourceNotFoundException(
-                crate::state::not_found("Layout", &input.layout_id),
+                crate::state::not_found(crate::state::ResourceKind::Layout, &input.layout_id),
             )
             .into());
         };

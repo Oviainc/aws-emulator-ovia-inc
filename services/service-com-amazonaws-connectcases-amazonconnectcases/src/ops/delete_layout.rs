@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(DeleteLayoutErrorModeled::ResourceNotFoundException)?;
         let Some(layout) = domain.layouts.get_mut(&input.layout_id) else {
             return Err(DeleteLayoutErrorModeled::ResourceNotFoundException(
-                crate::state::not_found("Layout", &input.layout_id),
+                crate::state::not_found(crate::state::ResourceKind::Layout, &input.layout_id),
             )
             .into());
         };

@@ -326,7 +326,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|template| !template.deleted)
         else {
             return Err(UpdateTemplateErrorModeled::ResourceNotFoundException(
-                crate::state::not_found("Template", &input.template_id),
+                crate::state::not_found(crate::state::ResourceKind::Template, &input.template_id),
             )
             .into());
         };

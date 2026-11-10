@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // has one, and the repeat delete below has to succeed on it.
         let Some(template) = domain.templates.get_mut(&input.template_id) else {
             return Err(DeleteTemplateErrorModeled::ResourceNotFoundException(
-                crate::state::not_found("Template", &input.template_id),
+                crate::state::not_found(crate::state::ResourceKind::Template, &input.template_id),
             )
             .into());
         };

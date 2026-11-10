@@ -194,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one, and the repeat delete below has to succeed on it.
         let Some(field) = domain.fields.get_mut(&input.field_id) else {
             return Err(DeleteFieldErrorModeled::ResourceNotFoundException(
-                crate::state::not_found("Field", &input.field_id),
+                crate::state::not_found(crate::state::ResourceKind::Field, &input.field_id),
             )
             .into());
         };
