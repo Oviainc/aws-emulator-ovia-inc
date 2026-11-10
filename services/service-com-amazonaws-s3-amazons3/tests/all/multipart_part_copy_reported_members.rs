@@ -37,8 +37,6 @@ use super::multipart_part_copy::upload_part_copy;
 use super::object_and_tagging_roundtrip::{bucket, expected_etag, put_object, text};
 use super::object_partial_reads::seeded_payload;
 
-use super::object_encryption::KEY_ARN;
-
 /// The bound headers an upload's encryption is reported in. This output binds three of the
 /// four an object's encryption travels in: it carries no `SSEKMSEncryptionContext` member
 /// (`smithy_query(query="operation",operation="UploadPartCopy")`).
@@ -252,7 +250,16 @@ struct EncryptionRow {
 
 #[tokio::test]
 async fn a_copied_part_reports_the_encryption_of_the_upload_it_was_recorded_into() {
-    let router = router();
+    // The rows that initiate under a KMS key name a key KMS really holds: an initiation
+    // settles the encryption the upload's writes are stored under, so that reference is
+    // resolved against KMS before the upload is recorded, and the key is made with KMS's own
+    // operations over the same engine ([`super::kms_key_references`]). The ARN is minted by
+    // KMS rather than spelled here, and the rows carry `&'static str`, so it is kept for the
+    // process.
+    let router = super::kms_key_references::router_with_kms();
+    let (_, key_arn) =
+        super::kms_key_references::created_key(&router, "the key these uploads name").await;
+    let key_arn: &'static str = Box::leak(key_arn.into_boxed_str());
     let origin = "part-copy-encryption-origin";
     let target = "part-copy-encryption-target";
     bucket(&router, origin).await;
@@ -300,13 +307,13 @@ async fn a_copied_part_reports_the_encryption_of_the_upload_it_was_recorded_into
             case: "an upload initiated under SSE-KMS with the key named by ARN",
             initiation: vec![
                 ("x-amz-server-side-encryption", "aws:kms"),
-                ("x-amz-server-side-encryption-aws-kms-key-id", KEY_ARN),
+                ("x-amz-server-side-encryption-aws-kms-key-id", key_arn),
             ],
             expected: vec![
                 ("x-amz-server-side-encryption", Some("aws:kms")),
                 (
                     "x-amz-server-side-encryption-aws-kms-key-id",
-                    Some(KEY_ARN),
+                    Some(key_arn),
                 ),
                 ("x-amz-server-side-encryption-bucket-key-enabled", None),
             ],
@@ -315,14 +322,14 @@ async fn a_copied_part_reports_the_encryption_of_the_upload_it_was_recorded_into
             case: "an upload initiated under SSE-KMS with a Bucket Key switched on",
             initiation: vec![
                 ("x-amz-server-side-encryption", "aws:kms"),
-                ("x-amz-server-side-encryption-aws-kms-key-id", KEY_ARN),
+                ("x-amz-server-side-encryption-aws-kms-key-id", key_arn),
                 ("x-amz-server-side-encryption-bucket-key-enabled", "true"),
             ],
             expected: vec![
                 ("x-amz-server-side-encryption", Some("aws:kms")),
                 (
                     "x-amz-server-side-encryption-aws-kms-key-id",
-                    Some(KEY_ARN),
+                    Some(key_arn),
                 ),
                 (
                     "x-amz-server-side-encryption-bucket-key-enabled",
@@ -334,13 +341,13 @@ async fn a_copied_part_reports_the_encryption_of_the_upload_it_was_recorded_into
             case: "an upload initiated under dual-layer SSE-KMS",
             initiation: vec![
                 ("x-amz-server-side-encryption", "aws:kms:dsse"),
-                ("x-amz-server-side-encryption-aws-kms-key-id", KEY_ARN),
+                ("x-amz-server-side-encryption-aws-kms-key-id", key_arn),
             ],
             expected: vec![
                 ("x-amz-server-side-encryption", Some("aws:kms:dsse")),
                 (
                     "x-amz-server-side-encryption-aws-kms-key-id",
-                    Some(KEY_ARN),
+                    Some(key_arn),
                 ),
                 ("x-amz-server-side-encryption-bucket-key-enabled", None),
             ],

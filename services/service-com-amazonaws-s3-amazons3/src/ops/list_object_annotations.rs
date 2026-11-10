@@ -241,14 +241,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a prefix of this namespace at all — which is the modelled `InvalidPrefix` (400).
         // Judged by the one place the name rules live
         // ([`crate::state::annotation_name_rejection`]), so the prefix filter and the writer
-        // agree on which names exist: past the 512-byte name maximum, or under a prefix S3
-        // reserves for itself. An EMPTY prefix is not a name — it filters nothing out — so it
-        // is the whole listing, exactly as an empty `prefix` is for an object listing.
+        // agree on which names exist: past the 512-byte name maximum, opening with a
+        // character no name opens with, or under a prefix S3 reserves for itself. An EMPTY
+        // prefix is not a name — it filters nothing out — so it is the whole listing, exactly
+        // as an empty `prefix` is for an object listing.
         if let Some(prefix) = input.annotation_prefix.as_deref() {
             match crate::state::annotation_name_rejection(prefix) {
                 None | Some(crate::state::AnnotationNameRejection::Empty) => {}
                 Some(
                     crate::state::AnnotationNameRejection::TooLong { .. }
+                    | crate::state::AnnotationNameRejection::LeadingCharacter { .. }
                     | crate::state::AnnotationNameRejection::ReservedPrefix { .. },
                 ) => {
                     return Err(

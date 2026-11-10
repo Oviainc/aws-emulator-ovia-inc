@@ -44,6 +44,11 @@
 //! service-principal calls) belong to services that do not read this one's, so no call here
 //! can come back round to the guard a caller holds.
 //!
+//! The other half of this module is about a WRITE rather than a read: an object S3 is asked
+//! to encrypt under a named customer key is encrypted under a data key KMS mints for that
+//! key, so the reference is resolved against KMS before anything is stored and a reference
+//! KMS holds no key for refuses the write ([`missing_key_refusal`]).
+//!
 //! What is NOT decided here: a read that serves no bytes. "A HEAD request has the same
 //! options as a GET operation on an object" (`HeadObject`'s own documentation) except that
 //! it answers no body at all, and the metadata it reports is S3's own record of the object
@@ -147,6 +152,77 @@ pub fn decrypt_refusal<Eng: Send + Sync + 'static>(
         None,
     )
     .err()
+}
+
+/// The wire error code S3 answers a WRITE whose SSE-KMS key reference KMS holds no key for,
+/// and the status it carries.
+///
+/// Such a write is encrypted under a data key S3 asks KMS for, so a reference that resolves
+/// to no key fails inside KMS rather than in S3: S3 relays KMS's own failure, under the KMS
+/// exception's name qualified by the service that raised it, and refuses the write. Recorded
+/// behaviour — the s3 model binds no error shape for the relay, so neither the code nor the
+/// status can come from it; the message is KMS's own ([`missing_key_refusal`]).
+pub const KMS_NOT_FOUND_CODE: &str = "KMS.NotFoundException";
+
+/// The HTTP status [`KMS_NOT_FOUND_CODE`] is answered with.
+pub const KMS_NOT_FOUND_STATUS: u16 = 400;
+
+/// KMS's own sentence for `key_id` naming no key at this endpoint, or `None` when the
+/// reference is one a write may be encrypted under.
+///
+/// Every write that asks S3 to encrypt an object under a NAMED customer key resolves that
+/// reference against KMS before anything is stored, because the object's data key comes of
+/// asking KMS for one under it: a reference KMS holds no key for cannot produce a data key,
+/// so there is nothing to encrypt the object with and the write is refused rather than
+/// recorded under a key that does not exist. The resolution accepts every form a key
+/// reference takes — a key id, a key ARN, `alias/<name>` and an alias ARN — because it is
+/// KMS's own ([`kms_store::ComAmazonawsKmsTrentserviceState::resolve`]), and the sentence is
+/// the one KMS words for the form the request supplied
+/// ([`kms_store::key_not_found_message`]), so S3 and KMS cannot disagree about which key a
+/// reference names or about how its absence reads.
+///
+/// `region` is the Region the request was signed for, which is where the key is resolved: a
+/// KMS key is a regional resource, and the object and the key it is encrypted under live at
+/// the same endpoint.
+///
+/// A PREDEFINED Amazon Web Services alias — `alias/aws/<service>`, the Amazon Web Services
+/// managed key of a service — is resolved through KMS's own association instead of through
+/// the plain lookup: such an alias "exists in every account and Region while carrying no
+/// target key", and "if you specify a predefined Amazon Web Services alias … KMS associates
+/// the alias with an Amazon Web Services managed key"
+/// ([`kms_store::ComAmazonawsKmsTrentserviceState::associate_predefined_aws_alias`]), so
+/// asking for it is what gives it a key and a write naming one is served — the same
+/// resolution every other service of this tree makes of such a reference.
+///
+/// NOT refused here: a reference KMS declines BEFORE it resolves anything — an ARN naming
+/// another account, or an identifier that is no key reference at all — which is a want of
+/// permission rather than an absence, and so a different relay from this one.
+///
+/// An engine carrying no KMS service holds no key to ask, so nothing is refused on evidence
+/// that is not there.
+///
+/// LOCKING: this takes the KMS store's lock and no other, and a caller holds NONE of this
+/// service's own while it asks — the reference it asks about is read out of this service's
+/// store and that guard released first, so no request can hold the two in opposite orders.
+pub fn missing_key_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    key_id: &str,
+) -> Option<String> {
+    let kms = kms_store::service_state(engine)?;
+    let mut store = kms.lock();
+    if kms_store::is_predefined_aws_alias(key_id) {
+        return store
+            .associate_predefined_aws_alias(region, key_id)
+            .is_none()
+            .then(|| kms_store::key_not_found_message(region, key_id));
+    }
+    match store.resolve(region, key_id) {
+        kms_store::KeyRef::NotFound => Some(kms_store::key_not_found_message(region, key_id)),
+        kms_store::KeyRef::Found(_)
+        | kms_store::KeyRef::MalformedArn
+        | kms_store::KeyRef::UnauthorizedAccount => None,
+    }
 }
 
 /// Whose read this is, as the key policy decides it.

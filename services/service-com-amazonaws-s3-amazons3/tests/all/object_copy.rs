@@ -51,8 +51,11 @@ use super::object_versioning::set_versioning;
 
 /// A KMS key in two of the three forms `KMSMasterKeyID` documents ("you can specify the
 /// key ID, key alias, or the Amazon Resource Name (ARN) of the KMS key").
-const SOURCE_KEY_ARN: &str =
-    "arn:aws:kms:us-east-1:111122223333:key/1111aaaa-11aa-11aa-11aa-111111111111";
+///
+/// Only the rows that name a reference NOTHING resolves use these: a key an object write is
+/// stored under is resolved against KMS before anything is stored, so the rows whose write
+/// has to be served name a key made with KMS's own operations
+/// ([`super::kms_key_references`]) instead.
 const DESTINATION_KEY_ARN: &str =
     "arn:aws:kms:us-east-1:111122223333:key/2222bbbb-22bb-22bb-22bb-222222222222";
 const DESTINATION_KEY_ALIAS: &str = "alias/destination-cmk";
@@ -335,7 +338,24 @@ struct EncryptionRow {
 
 #[tokio::test]
 async fn a_copy_is_encrypted_under_the_destination_rule_not_the_source_one() {
-    let router = router();
+    // Each side's default names a key KMS really holds: a write stored under a KMS key
+    // resolves that reference against KMS before storing anything, and the SOURCE object of
+    // every copy below is such a write ([`super::kms_key_references`]). The ids are minted
+    // by KMS rather than spelled here, and the rows carry `&'static str`, so they are kept
+    // for the process.
+    let router = super::kms_key_references::router_with_kms();
+    let (_, source_key_arn) =
+        super::kms_key_references::created_key(&router, "the source bucket's key").await;
+    let (destination_key_id, destination_key_arn) =
+        super::kms_key_references::created_key(&router, "the destination bucket's key").await;
+    super::kms_key_references::created_alias(
+        &router,
+        DESTINATION_KEY_ALIAS,
+        &destination_key_id,
+    )
+    .await;
+    let source_key_arn: &'static str = Box::leak(source_key_arn.into_boxed_str());
+    let destination_key_arn: &'static str = Box::leak(destination_key_arn.into_boxed_str());
 
     // The rows differ along what the rule generalises over: WHICH algorithm each side's
     // default names (SSE-KMS, dual-layer SSE-KMS, SSE-S3, and `aws:fsx`, a published value
@@ -346,7 +366,7 @@ async fn a_copy_is_encrypted_under_the_destination_rule_not_the_source_one() {
     let rows: Vec<EncryptionRow> = vec![
         EncryptionRow {
             case: "out of an SSE-KMS bucket into one no PutBucketEncryption configured",
-            source_rules: Some(vec![Rule::by_default("aws:kms").with_key(SOURCE_KEY_ARN)]),
+            source_rules: Some(vec![Rule::by_default("aws:kms").with_key(source_key_arn)]),
             destination_rules: None,
             request_headers: Vec::new(),
             expected: Reported {
@@ -358,14 +378,14 @@ async fn a_copy_is_encrypted_under_the_destination_rule_not_the_source_one() {
         },
         EncryptionRow {
             case: "out of an SSE-KMS bucket into one whose default names another CMK",
-            source_rules: Some(vec![Rule::by_default("aws:kms").with_key(SOURCE_KEY_ARN)]),
+            source_rules: Some(vec![Rule::by_default("aws:kms").with_key(source_key_arn)]),
             destination_rules: Some(vec![
-                Rule::by_default("aws:kms").with_key(DESTINATION_KEY_ARN)
+                Rule::by_default("aws:kms").with_key(destination_key_arn)
             ]),
             request_headers: Vec::new(),
             expected: Reported {
                 algorithm: Some("aws:kms"),
-                key_id: Some(DESTINATION_KEY_ARN),
+                key_id: Some(destination_key_arn),
                 bucket_key: None,
                 context: None,
             },
@@ -386,14 +406,14 @@ async fn a_copy_is_encrypted_under_the_destination_rule_not_the_source_one() {
         },
         EncryptionRow {
             case: "out of an SSE-KMS bucket into a dual-layer SSE-KMS one",
-            source_rules: Some(vec![Rule::by_default("aws:kms").with_key(SOURCE_KEY_ARN)]),
+            source_rules: Some(vec![Rule::by_default("aws:kms").with_key(source_key_arn)]),
             destination_rules: Some(vec![Rule::by_default("aws:kms:dsse")
-                .with_key(DESTINATION_KEY_ARN)
+                .with_key(destination_key_arn)
                 .with_bucket_key(false)]),
             request_headers: Vec::new(),
             expected: Reported {
                 algorithm: Some("aws:kms:dsse"),
-                key_id: Some(DESTINATION_KEY_ARN),
+                key_id: Some(destination_key_arn),
                 bucket_key: Some("false"),
                 context: None,
             },
@@ -412,9 +432,9 @@ async fn a_copy_is_encrypted_under_the_destination_rule_not_the_source_one() {
         },
         EncryptionRow {
             case: "out of an SSE-KMS bucket into an SSE-KMS one, the request naming SSE-S3",
-            source_rules: Some(vec![Rule::by_default("aws:kms").with_key(SOURCE_KEY_ARN)]),
+            source_rules: Some(vec![Rule::by_default("aws:kms").with_key(source_key_arn)]),
             destination_rules: Some(vec![
-                Rule::by_default("aws:kms").with_key(DESTINATION_KEY_ARN)
+                Rule::by_default("aws:kms").with_key(destination_key_arn)
             ]),
             request_headers: vec![("x-amz-server-side-encryption", "AES256")],
             expected: Reported {
@@ -432,14 +452,14 @@ async fn a_copy_is_encrypted_under_the_destination_rule_not_the_source_one() {
                 ("x-amz-server-side-encryption", "aws:kms"),
                 (
                     "x-amz-server-side-encryption-aws-kms-key-id",
-                    DESTINATION_KEY_ARN,
+                    destination_key_arn,
                 ),
                 ("x-amz-server-side-encryption-context", ENCRYPTION_CONTEXT),
                 ("x-amz-server-side-encryption-bucket-key-enabled", "true"),
             ],
             expected: Reported {
                 algorithm: Some("aws:kms"),
-                key_id: Some(DESTINATION_KEY_ARN),
+                key_id: Some(destination_key_arn),
                 bucket_key: Some("true"),
                 context: Some(ENCRYPTION_CONTEXT),
             },

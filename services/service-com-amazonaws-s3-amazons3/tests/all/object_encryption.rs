@@ -76,7 +76,11 @@ const ENCRYPTION_HEADERS: &[&str] = &[
 pub(crate) const KEY_ARN: &str =
     "arn:aws:kms:us-east-1:000000000000:key/1234abcd-12ab-34cd-56ef-1234567890ab";
 
-/// The same key named by alias, which is the second documented form.
+/// The ALIAS form of a reference, which is the second documented form: the Amazon Web
+/// Services managed key for Amazon S3, a predefined Amazon Web Services alias that "exists
+/// in every account and Region" and that KMS associates with its key the first time
+/// something asks for it — so a write naming it needs no `CreateAlias` of its own and is
+/// served ([`super::kms_key_references`] spans the other forms).
 const KEY_ALIAS: &str = "alias/aws/s3";
 
 /// A `SSEKMSEncryptionContext`: "a Base64-encoded string holding a UTF-8 encoded JSON of
@@ -85,7 +89,15 @@ const ENCRYPTION_CONTEXT: &str = "eyJwcm9qZWN0IjoiZGFncyJ9";
 
 #[tokio::test]
 async fn a_write_is_stored_under_the_encryption_it_names_and_every_read_reports_it() {
-    let router = router();
+    // The KMS rows name a key KMS really holds: a write asking for SSE-KMS under a named key
+    // resolves that reference against KMS before storing anything, so the key is made with
+    // KMS's own operations over the same engine ([`super::kms_key_references`]). The
+    // predefined `alias/aws/s3` row needs none: KMS associates such an alias with its Amazon
+    // Web Services managed key the first time a caller names it.
+    let router = super::kms_key_references::router_with_kms();
+    let (_, key_arn) =
+        super::kms_key_references::created_key(&router, "the key these writes name").await;
+    let key_arn = key_arn.as_str();
     bucket(&router, "encryption-bucket").await;
 
     // The rows differ along what the rule generalises over: WHICH algorithm (every value
@@ -115,13 +127,13 @@ async fn a_write_is_stored_under_the_encryption_it_names_and_every_read_reports_
             "SSE-KMS with the key named by ARN",
             &[
                 ("x-amz-server-side-encryption", "aws:kms"),
-                ("x-amz-server-side-encryption-aws-kms-key-id", KEY_ARN),
+                ("x-amz-server-side-encryption-aws-kms-key-id", key_arn),
             ],
             &[
                 ("x-amz-server-side-encryption", Some("aws:kms")),
                 (
                     "x-amz-server-side-encryption-aws-kms-key-id",
-                    Some(KEY_ARN),
+                    Some(key_arn),
                 ),
                 ("x-amz-server-side-encryption-bucket-key-enabled", None),
             ],
@@ -153,7 +165,7 @@ async fn a_write_is_stored_under_the_encryption_it_names_and_every_read_reports_
             "dual-layer SSE-KMS, with the Bucket Key switched off",
             &[
                 ("x-amz-server-side-encryption", "aws:kms:dsse"),
-                ("x-amz-server-side-encryption-aws-kms-key-id", KEY_ARN),
+                ("x-amz-server-side-encryption-aws-kms-key-id", key_arn),
                 (
                     "x-amz-server-side-encryption-bucket-key-enabled",
                     "false",
@@ -403,7 +415,10 @@ async fn a_replacing_write_replaces_the_encryption_the_key_was_stored_under() {
     // object. You must put the entire object with updated metadata": the encryption is
     // part of the object, so a replacing write that names another one — or none — leaves
     // the key under THAT, and the readers follow.
-    let router = router();
+    let router = super::kms_key_references::router_with_kms();
+    let (_, key_arn) =
+        super::kms_key_references::created_key(&router, "the key the first write names").await;
+    let key_arn = key_arn.as_str();
     bucket(&router, "encryption-replacement").await;
 
     // (case, the headers the write carries, what the readers must report afterwards)
@@ -412,7 +427,7 @@ async fn a_replacing_write_replaces_the_encryption_the_key_was_stored_under() {
             "first written with SSE-KMS",
             &[
                 ("x-amz-server-side-encryption", "aws:kms"),
-                ("x-amz-server-side-encryption-aws-kms-key-id", KEY_ARN),
+                ("x-amz-server-side-encryption-aws-kms-key-id", key_arn),
             ],
             Some("aws:kms"),
         ),

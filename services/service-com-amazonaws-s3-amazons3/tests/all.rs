@@ -157,6 +157,8 @@ mod head_object_read_back;
 mod identity_authorization;
 #[path = "all/json_payload_media_type.rs"]
 mod json_payload_media_type;
+#[path = "all/kms_key_references.rs"]
+mod kms_key_references;
 #[path = "all/list_buckets.rs"]
 mod list_buckets;
 #[path = "all/listing_encoding_type.rs"]

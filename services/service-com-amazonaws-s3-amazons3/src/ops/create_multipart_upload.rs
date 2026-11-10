@@ -579,6 +579,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The KEY the upload's SSE-KMS encryption names has to be one KMS can mint a data key
+        // under, judged exactly as a one-shot write judges its own and through the same seam
+        // ([`crate::state::sse_kms::missing_key_refusal`]): the initiation settles the
+        // encryption every part write and the finished object are stored under, so the
+        // reference it settled on is resolved against KMS before the upload is recorded. A
+        // reference KMS holds no key for yields no data key, so S3 relays KMS's own failure
+        // and no upload is initiated. Asked with no guard of this service's held — the two
+        // reads above each take and release their own — because it reads another service's
+        // store through the shared engine.
+        if let Some(key_id) = encryption.kms_key_id.as_deref() {
+            if let Some(relay) = crate::state::sse_kms::missing_key_refusal(
+                &*self.engine,
+                &crate::state::request_region(ctx.parts()),
+                key_id,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::sse_kms::KMS_NOT_FOUND_CODE,
+                    crate::state::sse_kms::KMS_NOT_FOUND_STATUS,
+                    relay,
+                ));
+            }
+        }
+
         let upload = crate::state::MultipartUpload {
             key: input.key.clone(),
             // Read here, where the upload comes into being, so `Initiated` is the moment

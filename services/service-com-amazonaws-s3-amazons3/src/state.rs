@@ -498,23 +498,58 @@ pub enum AnnotationNameRejection {
     TooLong { bytes: usize },
     /// The name carries no character at all, under the documented minimum length of 1.
     Empty,
+    /// The name begins with a character no annotation name may begin with — see
+    /// [`names_begin_with_a_letter_or_a_digit`].
+    LeadingCharacter { character: char },
     /// The name starts with one of the [`RESERVED_ANNOTATION_NAME_PREFIXES`].
     ReservedPrefix { prefix: &'static str },
 }
 
+/// Whether an annotation name may begin with `character`.
+///
+/// An annotation name opens with a LETTER, a DIGIT or one of the separators a namespaced
+/// name is spelled with ([`ANNOTATION_NAME_OPENING_SEPARATORS`]). Recorded behaviour: S3
+/// refuses an annotation selector that no name of the namespace could begin with — a listing
+/// filtered by a prefix of `/` is answered `InvalidPrefix` rather than with an empty page —
+/// so a name opening with a path separator, a space or a symbol is not a name this namespace
+/// holds. The model states no character rule of its own (`AnnotationName` carries no
+/// `pattern` trait), so what is refused here is only what the recording evidences: a leading
+/// character outside letters, digits and those separators. The test is made over UTF-8 rather
+/// than ASCII because "annotation names are UTF-8 encoded"
+/// (`DeleteObjectAnnotationRequest$AnnotationName`): `char::is_alphanumeric` is the
+/// letter-or-digit test over that alphabet, so a name opening with a letter of any script is
+/// one this service accepts.
+///
+/// It says nothing about the REST of the name.
+pub fn names_begin_with_a_letter_or_a_digit(character: char) -> bool {
+    character.is_alphanumeric() || ANNOTATION_NAME_OPENING_SEPARATORS.contains(&character)
+}
+
+/// The separators an annotation name may OPEN with beside a letter or a digit: the ones a
+/// namespaced name of this service's own corpus is spelled with (`team.review.notes`,
+/// `my-aws-notes`, `com.example.pipeline.stage`), which a name may therefore also lead with.
+///
+/// A path separator is deliberately NOT one of them: that is the leading character the
+/// recorded `InvalidPrefix` refusal is about.
+pub const ANNOTATION_NAME_OPENING_SEPARATORS: [char; 3] = ['-', '_', '.'];
+
 /// Why `name` is not an annotation name this service accepts, or `None` when it is one.
 ///
 /// ONE place, so a name is valid or invalid wherever it arrives: the two bounds its own
-/// member documents (1 to [`MAX_ANNOTATION_NAME_BYTES`] bytes) and the prefixes S3 keeps
-/// for itself ([`RESERVED_ANNOTATION_NAME_PREFIXES`]). The length is measured in BYTES
-/// because that is the unit both the member and the `AnnotationNameTooLong` error state it
-/// in, which differs from the character count for any name outside ASCII.
+/// member documents (1 to [`MAX_ANNOTATION_NAME_BYTES`] bytes), the character a name may
+/// OPEN with ([`names_begin_with_a_letter_or_a_digit`]) and the prefixes S3 keeps for itself
+/// ([`RESERVED_ANNOTATION_NAME_PREFIXES`]). The length is measured in BYTES because that is
+/// the unit both the member and the `AnnotationNameTooLong` error state it in, which differs
+/// from the character count for any name outside ASCII.
 pub fn annotation_name_rejection(name: &str) -> Option<AnnotationNameRejection> {
     if name.len() > MAX_ANNOTATION_NAME_BYTES {
         return Some(AnnotationNameRejection::TooLong { bytes: name.len() });
     }
-    if name.is_empty() {
+    let Some(first) = name.chars().next() else {
         return Some(AnnotationNameRejection::Empty);
+    };
+    if !names_begin_with_a_letter_or_a_digit(first) {
+        return Some(AnnotationNameRejection::LeadingCharacter { character: first });
     }
     RESERVED_ANNOTATION_NAME_PREFIXES
         .into_iter()

@@ -292,7 +292,14 @@ fn initiation_cases() -> Vec<InitiationCase> {
 
 #[tokio::test]
 async fn an_initiated_upload_answers_a_fresh_id_and_reads_back_as_it_was_initiated() {
-    let router = router();
+    // One row initiates under a KMS key named by alias, and an initiation settles the
+    // encryption the finished object is stored under — so that reference is resolved against
+    // KMS before the upload is recorded, and the alias is made with KMS's own operations over
+    // the same engine ([`super::kms_key_references`]).
+    let router = super::kms_key_references::router_with_kms();
+    let (key_id, _) =
+        super::kms_key_references::created_key(&router, "the key this upload names").await;
+    super::kms_key_references::created_alias(&router, "alias/emulator", &key_id).await;
     let bucket = "multipart-initiation-bucket";
     create_bucket(&router, bucket).await;
 

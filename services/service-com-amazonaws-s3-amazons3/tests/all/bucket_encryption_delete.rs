@@ -262,7 +262,13 @@ async fn a_delete_resets_the_bucket_to_the_sse_s3_default() {
 /// exactly as it was, and each stored object keeps the encryption it was written under.
 #[tokio::test]
 async fn a_delete_leaves_the_rest_of_the_bucket_alone() {
-    let router = router();
+    // The object below is written while a KMS default is in force, so the default has to
+    // name a key KMS really holds: a write stored under a KMS key resolves that reference
+    // against KMS before storing anything ([`super::kms_key_references`]).
+    let router = super::kms_key_references::router_with_kms();
+    let (_, key_arn) =
+        super::kms_key_references::created_key(&router, "the key this default names").await;
+    let key_arn = key_arn.as_str();
     let bucket = "encryption-reset-scope";
     let created = create_bucket(&router, bucket, None, None).await;
     assert_eq!(
@@ -303,7 +309,7 @@ async fn a_delete_leaves_the_rest_of_the_bucket_alone() {
     );
 
     let configured = vec![Rule::by_default("aws:kms")
-        .with_key(KEY_ARN)
+        .with_key(key_arn)
         .with_bucket_key(true)];
     let put = put_encryption(&router, bucket, &configured).await;
     assert_eq!(
@@ -358,7 +364,7 @@ async fn a_delete_leaves_the_rest_of_the_bucket_alone() {
         object
             .header("x-amz-server-side-encryption-aws-kms-key-id")
             .as_deref(),
-        Some(KEY_ARN),
+        Some(key_arn),
         "expected the object to keep the key it was stored under, got {:?}",
         object.header("x-amz-server-side-encryption-aws-kms-key-id")
     );

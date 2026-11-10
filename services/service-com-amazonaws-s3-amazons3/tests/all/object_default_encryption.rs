@@ -39,16 +39,40 @@
 use service_com_amazonaws_s3_amazons3::state::{
     DEFAULT_BLOCKED_ENCRYPTION_TYPES, DEFAULT_BUCKET_KEY_ENABLED, DEFAULT_SSE_ALGORITHM,
 };
+use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_encryption::{as_reported, get_encryption, put_encryption, reported_rules, Rule};
-use super::bucket_lifecycle::{router, Answer};
+use super::bucket_lifecycle::Answer;
 use super::object_and_tagging_roundtrip::{bucket, get_object, put_object, text};
 use super::object_encryption::head_object;
 
-/// A KMS key in each of the three forms `KMSMasterKeyID` documents.
-const KEY_ID: &str = "1234abcd-12ab-34cd-56ef-1234567890ab";
-const KEY_ARN: &str = "arn:aws:kms:us-west-2:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab";
+/// The alias every row that names a key BY ALIAS uses.
 const KEY_ALIAS: &str = "alias/compliance-cmk";
+
+/// ONE KMS key in each of the three forms `KMSMasterKeyID` documents.
+///
+/// The key is made with KMS's own `CreateKey` and `CreateAlias` over the same engine
+/// ([`super::kms_key_references`]) rather than spelled here, because a write stored under a
+/// bucket default naming a KMS key resolves that reference against KMS before it stores
+/// anything: the three forms have to name a key KMS really holds. The id and the ARN are
+/// minted by KMS, and the rows carry `&'static str`, so they are kept for the process.
+struct KeyForms {
+    id: &'static str,
+    arn: &'static str,
+    alias: &'static str,
+}
+
+/// [`KeyForms`] over a router that holds KMS beside S3.
+async fn key_forms(router: &MultiServiceRouter) -> KeyForms {
+    let (id, arn) =
+        super::kms_key_references::created_key(router, "the key these defaults name").await;
+    super::kms_key_references::created_alias(router, KEY_ALIAS, &id).await;
+    KeyForms {
+        id: Box::leak(id.into_boxed_str()),
+        arn: Box::leak(arn.into_boxed_str()),
+        alias: KEY_ALIAS,
+    }
+}
 
 /// What an answer about an inherited-encryption object must report: the algorithm, the KMS
 /// key id and the Bucket Key setting, each `None` where the header must be ABSENT.
@@ -73,7 +97,7 @@ struct Row {
 /// three the issue never cited), WHICH form its KMS key takes (key id, ARN, alias), whether
 /// the Bucket Key is on, off or unnamed, whether the configuration names an algorithm at
 /// all, and HOW MANY rules it carries and in which order.
-fn rows() -> Vec<Row> {
+fn rows(key: &KeyForms) -> Vec<Row> {
     vec![
         Row {
             case: "a bucket no PutBucketEncryption has configured",
@@ -105,31 +129,31 @@ fn rows() -> Vec<Row> {
         Row {
             case: "a default of SSE-KMS with a customer managed key by ARN and the Bucket Key off",
             configuration: Some(vec![Rule::by_default("aws:kms")
-                .with_key(KEY_ARN)
+                .with_key(key.arn)
                 .with_bucket_key(false)]),
             expected: Reported {
                 algorithm: Some("aws:kms"),
-                key_id: Some(KEY_ARN),
+                key_id: Some(key.arn),
                 bucket_key: Some("false"),
             },
         },
         Row {
             case: "a default of SSE-KMS with the key by alias and the Bucket Key on",
             configuration: Some(vec![Rule::by_default("aws:kms")
-                .with_key(KEY_ALIAS)
+                .with_key(key.alias)
                 .with_bucket_key(true)]),
             expected: Reported {
                 algorithm: Some("aws:kms"),
-                key_id: Some(KEY_ALIAS),
+                key_id: Some(key.alias),
                 bucket_key: Some("true"),
             },
         },
         Row {
             case: "a default of SSE-KMS with a bare key id and no Bucket Key named",
-            configuration: Some(vec![Rule::by_default("aws:kms").with_key(KEY_ID)]),
+            configuration: Some(vec![Rule::by_default("aws:kms").with_key(key.id)]),
             expected: Reported {
                 algorithm: Some("aws:kms"),
-                key_id: Some(KEY_ID),
+                key_id: Some(key.id),
                 bucket_key: None,
             },
         },
@@ -144,10 +168,10 @@ fn rows() -> Vec<Row> {
         },
         Row {
             case: "a default of dual-layer SSE-KMS with a key ARN",
-            configuration: Some(vec![Rule::by_default("aws:kms:dsse").with_key(KEY_ARN)]),
+            configuration: Some(vec![Rule::by_default("aws:kms:dsse").with_key(key.arn)]),
             expected: Reported {
                 algorithm: Some("aws:kms:dsse"),
-                key_id: Some(KEY_ARN),
+                key_id: Some(key.arn),
                 bucket_key: None,
             },
         },
@@ -181,12 +205,12 @@ fn rows() -> Vec<Row> {
         Row {
             case: "two rules, the first of which names the algorithm",
             configuration: Some(vec![
-                Rule::by_default("aws:kms:dsse").with_key(KEY_ID),
+                Rule::by_default("aws:kms:dsse").with_key(key.id),
                 Rule::by_default("AES256"),
             ]),
             expected: Reported {
                 algorithm: Some("aws:kms:dsse"),
-                key_id: Some(KEY_ID),
+                key_id: Some(key.id),
                 bucket_key: None,
             },
         },
@@ -195,12 +219,12 @@ fn rows() -> Vec<Row> {
             configuration: Some(vec![
                 Rule::bucket_key_only(false),
                 Rule::by_default("aws:kms")
-                    .with_key(KEY_ARN)
+                    .with_key(key.arn)
                     .with_bucket_key(true),
             ]),
             expected: Reported {
                 algorithm: Some("aws:kms"),
-                key_id: Some(KEY_ARN),
+                key_id: Some(key.arn),
                 bucket_key: Some("true"),
             },
         },
@@ -209,9 +233,10 @@ fn rows() -> Vec<Row> {
 
 #[tokio::test]
 async fn a_write_naming_no_encryption_inherits_the_bucket_default_and_every_read_reports_it() {
-    let router = router();
+    let router = super::kms_key_references::router_with_kms();
+    let key = key_forms(&router).await;
 
-    for (index, row) in rows().into_iter().enumerate() {
+    for (index, row) in rows(&key).into_iter().enumerate() {
         let Row {
             case,
             configuration,
@@ -308,13 +333,19 @@ async fn a_write_naming_its_own_encryption_is_stored_under_that_and_not_the_buck
     // own: "You can optionally tell Amazon S3 to encrypt data at rest by using server-side
     // encryption with other key options" — so what the request names stands on its own,
     // with nothing of the bucket's configuration merged into it.
-    let router = router();
+    let router = super::kms_key_references::router_with_kms();
+    // The key each write names, and the one the bucket's default names, are keys KMS really
+    // holds: a write stored under a KMS key resolves that reference against KMS before
+    // storing anything ([`super::kms_key_references`]).
+    let (_, other_key) =
+        super::kms_key_references::created_key(&router, "the key each write names").await;
+    let key = key_forms(&router).await;
     bucket(&router, "default-encryption-override").await;
     let configured = put_encryption(
         &router,
         "default-encryption-override",
         &[Rule::by_default("aws:kms")
-            .with_key(KEY_ARN)
+            .with_key(key.arn)
             .with_bucket_key(true)],
     )
     .await;
@@ -326,8 +357,7 @@ async fn a_write_naming_its_own_encryption_is_stored_under_that_and_not_the_buck
 
     // The rows differ along WHICH member the write names: the algorithm alone, the
     // algorithm with a key of its own, and a Bucket Key setting beside it.
-    const OTHER_KEY: &str =
-        "arn:aws:kms:us-west-2:111122223333:key/0000ffff-1111-2222-3333-444455556666";
+    let other_key: &'static str = Box::leak(other_key.into_boxed_str());
     let rows: Vec<OverrideRow> = vec![
         (
             "a write naming SSE-S3 on a bucket whose default is SSE-KMS",
@@ -342,11 +372,11 @@ async fn a_write_naming_its_own_encryption_is_stored_under_that_and_not_the_buck
             "a write naming SSE-KMS with a key of its own",
             vec![
                 ("x-amz-server-side-encryption", "aws:kms"),
-                ("x-amz-server-side-encryption-aws-kms-key-id", OTHER_KEY),
+                ("x-amz-server-side-encryption-aws-kms-key-id", other_key),
             ],
             Reported {
                 algorithm: Some("aws:kms"),
-                key_id: Some(OTHER_KEY),
+                key_id: Some(other_key),
                 bucket_key: None,
             },
         ),
@@ -354,12 +384,12 @@ async fn a_write_naming_its_own_encryption_is_stored_under_that_and_not_the_buck
             "a write naming dual-layer SSE-KMS with the Bucket Key off",
             vec![
                 ("x-amz-server-side-encryption", "aws:kms:dsse"),
-                ("x-amz-server-side-encryption-aws-kms-key-id", OTHER_KEY),
+                ("x-amz-server-side-encryption-aws-kms-key-id", other_key),
                 ("x-amz-server-side-encryption-bucket-key-enabled", "false"),
             ],
             Reported {
                 algorithm: Some("aws:kms:dsse"),
-                key_id: Some(OTHER_KEY),
+                key_id: Some(other_key),
                 bucket_key: Some("false"),
             },
         ),
@@ -396,7 +426,8 @@ async fn the_encryption_an_object_inherited_is_the_one_in_force_when_it_was_writ
     // update a single piece of metadata for an existing object" — so a later
     // `PutBucketEncryption` changes what the NEXT write inherits and nothing about the
     // object already stored.
-    let router = router();
+    let router = super::kms_key_references::router_with_kms();
+    let key = key_forms(&router).await;
     bucket(&router, "default-encryption-in-force").await;
 
     let before = put_object(
@@ -427,7 +458,7 @@ async fn the_encryption_an_object_inherited_is_the_one_in_force_when_it_was_writ
     let configured = put_encryption(
         &router,
         "default-encryption-in-force",
-        &[Rule::by_default("aws:kms").with_key(KEY_ARN)],
+        &[Rule::by_default("aws:kms").with_key(key.arn)],
     )
     .await;
     assert_eq!(
@@ -461,7 +492,7 @@ async fn the_encryption_an_object_inherited_is_the_one_in_force_when_it_was_writ
     .await;
     let expected = Reported {
         algorithm: Some("aws:kms"),
-        key_id: Some(KEY_ARN),
+        key_id: Some(key.arn),
         bucket_key: None,
     };
     assert_reported("written after the configuration", "PutObject", &after, &expected);

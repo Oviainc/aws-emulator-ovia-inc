@@ -625,6 +625,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
         // than taken on trust.
         let replication_role =
             crate::state::replication::role_access(&*self.engine, ctx, &input.bucket).await;
+
+        // And so is the KEY this write's SSE-KMS encryption names, for the same reason: it is
+        // resolved against KMS's own store, and no request may hold this service's guard while
+        // it reaches another service's store through the shared engine. The reference is the
+        // one the object would be stored UNDER — the write's own when it named a key, and the
+        // bucket default's `KMSMasterKeyID` when it named none — so the bucket's default is
+        // read here, under a guard taken and released before KMS is asked.
+        //
+        // What makes the resolution part of the write: the object is encrypted under a data
+        // key KMS mints for that key, so a reference KMS holds no key for yields no data key
+        // and there is nothing to encrypt the object with. S3 relays KMS's own failure rather
+        // than recording an object under a key that does not exist — the decision and the
+        // sentence are KMS's ([`crate::state::sse_kms::missing_key_refusal`]). That is also
+        // why the CONFIGURATION itself is not resolved: S3 "doesn't validate the KMS key ID
+        // provided in PutBucketEncryption requests" (`PutBucketEncryption`'s own
+        // documentation), so a default naming a key that is gone is stored and fails at the
+        // write that would have used it.
+        let stored_under = {
+            let store = state.lock();
+            match store.bucket(&input.bucket) {
+                Some(bucket) if requested.names_no_member() => {
+                    bucket.default_object_encryption().kms_key_id
+                }
+                // A bucket this emulator does not hold is answered below, where the write is;
+                // nothing about a key is decided for it.
+                _ => requested.kms_key_id.clone(),
+            }
+        };
+        if let Some(key_id) = stored_under.as_deref() {
+            if let Some(relay) = crate::state::sse_kms::missing_key_refusal(
+                &*self.engine,
+                &crate::state::request_region(ctx.parts()),
+                key_id,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::sse_kms::KMS_NOT_FOUND_CODE,
+                    crate::state::sse_kms::KMS_NOT_FOUND_STATUS,
+                    relay,
+                ));
+            }
+        }
+
         let mut store = state.lock();
         // The bucket decides the encryption of a write that named none of it: "Amazon S3
         // encrypts data with server-side encryption by using Amazon S3 managed keys

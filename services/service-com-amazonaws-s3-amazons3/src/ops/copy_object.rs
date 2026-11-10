@@ -877,6 +877,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // borrows the store — the source object is a clone — so the guard is given up here
         // and taken again for the write.
         drop(store);
+
+        // The KEY the destination object's SSE-KMS encryption names has to be one KMS can mint
+        // a data key under, judged exactly as a `PutObject` of the same object judges it and
+        // through the same seam ([`crate::state::sse_kms::missing_key_refusal`]): the copy
+        // writes a new object, so the data key it is encrypted under is minted for whichever
+        // reference it ends up stored under — the request's own, or the destination bucket
+        // default's `KMSMasterKeyID` when the request names no encryption member (read above,
+        // while the guard was held). A reference KMS holds no key for yields no data key, so
+        // S3 relays KMS's own failure and nothing is written. Asked HERE, with the guard given
+        // up, for the same reason the decision below is: it reads another service's store
+        // through the shared engine.
+        if let Some(key_id) = encryption.kms_key_id.as_deref() {
+            if let Some(relay) = crate::state::sse_kms::missing_key_refusal(
+                &*self.engine,
+                &crate::state::request_region(ctx.parts()),
+                key_id,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::sse_kms::KMS_NOT_FOUND_CODE,
+                    crate::state::sse_kms::KMS_NOT_FOUND_STATUS,
+                    relay,
+                ));
+            }
+        }
+
         if let Some(denial) = crate::state::sse_kms::decrypt_refusal(
             &*self.engine,
             ctx,

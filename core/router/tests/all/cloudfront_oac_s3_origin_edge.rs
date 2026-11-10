@@ -427,14 +427,17 @@ struct Row {
     expected: Expected,
 }
 
-/// The CMK an SSE-KMS object names. The key is not created in KMS here — the ARN names no
-/// key this endpoint holds, so no key policy decides these reads — and what an SSE-KMS row
-/// pins is the EDGE's half alone: the object's own bytes are served through the
-/// distribution, exactly as for an SSE-S3 object. The algorithm and key id a write recorded
-/// are members the S3 crate's own suites pin, and which callers a key that DOES exist lets
-/// read its objects is that crate's `sse_kms_decrypt_authorization` suite.
-fn kms_key_arn() -> String {
-    format!("arn:aws:kms:{REGION}:{ACCOUNT_ID}:key/0d8a1e3f-1111-4a1b-9c2d-5e6f70819203")
+/// The CMK an SSE-KMS object names: the Amazon Web Services managed key for Amazon S3,
+/// named by the predefined Amazon Web Services alias that "exists in every account and
+/// Region" and that KMS associates with its key the first time something asks for it — so
+/// the write below needs no `CreateKey` of its own, and no CUSTOMER key policy decides these
+/// reads, which is what an SSE-KMS row here is for: it pins the EDGE's half alone, the
+/// object's own bytes served through the distribution exactly as for an SSE-S3 object. The
+/// algorithm and key id a write recorded are members the S3 crate's own suites pin, and which
+/// callers a customer key lets read its objects is that crate's `sse_kms_decrypt_authorization`
+/// suite.
+fn kms_key_reference() -> String {
+    "alias/aws/s3".to_string()
 }
 
 /// The table: one row per shape of grant, signing behaviour and object.
@@ -625,7 +628,7 @@ async fn an_origin_access_control_serves_a_private_s3_origin_through_the_edge() 
     for (index, row) in rows().into_iter().enumerate() {
         create_bucket(&setup, row.case, row.bucket).await;
         let mut encryption = row.encryption.clone();
-        let key_arn = kms_key_arn();
+        let key_arn = kms_key_reference();
         if encryption.is_empty() {
             // An SSE-KMS object: the algorithm and the CMK the write names, which is the
             // other encryption an origin bucket holds objects under.

@@ -270,7 +270,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request is: `AnnotationName` carries no `length` trait in the model, so
         // nothing refused an over-long or empty one at the boundary. Each rejection has its
         // own modelled error — a name past 512 bytes is `AnnotationNameTooLong`, and a name
-        // that is empty or starts with a prefix S3 reserves is `InvalidAnnotationName`.
+        // that is empty, that opens with a character no name opens with, or that starts with
+        // a prefix S3 reserves is `InvalidAnnotationName`.
         match crate::state::annotation_name_rejection(&input.annotation_name) {
             None => {}
             Some(crate::state::AnnotationNameRejection::TooLong { .. }) => {
@@ -281,6 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             Some(
                 crate::state::AnnotationNameRejection::Empty
+                | crate::state::AnnotationNameRejection::LeadingCharacter { .. }
                 | crate::state::AnnotationNameRejection::ReservedPrefix { .. },
             ) => {
                 return Err(PutObjectAnnotationErrorModeled::InvalidAnnotationName(

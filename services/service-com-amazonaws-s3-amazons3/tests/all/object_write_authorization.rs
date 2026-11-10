@@ -377,7 +377,15 @@ async fn configured_bucket(router: &MultiServiceRouter, row: &WriteRow) {
 
 #[tokio::test]
 async fn a_bucket_policy_decides_whether_a_write_is_stored() {
-    let router = router();
+    // The two rows whose policy is written over a KMS key id name keys KMS really holds: a
+    // write naming a key resolves that reference against KMS before storing anything
+    // ([`super::kms_key_references`]), so what these rows turn on is the policy alone.
+    let router = super::kms_key_references::router_with_kms();
+    let (key_id, _) =
+        super::kms_key_references::created_key(&router, "the key these policies name").await;
+    for alias in ["alias/forbidden", "alias/permitted"] {
+        super::kms_key_references::created_alias(&router, alias, &key_id).await;
+    }
 
     for row in write_rows() {
         configured_bucket(&router, &row).await;
