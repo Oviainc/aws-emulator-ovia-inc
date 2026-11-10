@@ -175,6 +175,8 @@ fn name_list(names: &[String]) -> String {
 fn client_name(token: &str) -> String {
     const EXPORTED: &[(&str, &str)] = &[
         ("s3", "S3"),
+        ("appconfig", "AppConfig"),
+        ("appconfigdata", "AppConfigData"),
         ("dynamodb", "DynamoDB"),
         ("dynamodbstreams", "DynamoDBStreams"),
         ("sqs", "SQS"),

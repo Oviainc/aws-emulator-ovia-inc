@@ -428,6 +428,44 @@ pub const APIS: &[Api] = &[
         protocol: Protocol::RestJson(&RDS_DATA),
         answer_model: Some(&RDS_DATA_ANSWERS),
     },
+    // `services/service-com-amazonaws-appconfigdata-appconfigdata/smithy-model/
+    // com-amazonaws-appconfigdata-appconfigdata.json`: restJson1, sigv4Name `appconfig`,
+    // endpointPrefix `appconfigdata`, sdkId `AppConfigData`. Its requests are bound per
+    // operation out of that same model ([`APPCONFIGDATA`]).
+    //
+    // The CONFIGURATION a function runs against is read through this data plane: a handler
+    // opens a configuration session over an (application, environment, configuration profile)
+    // triple and polls the deployed document's own bytes, which is what a feature-flagged
+    // handler branches on — so a handler that cannot reach it can only ever serve its own
+    // hard-coded default, and cannot tell a configuration it was served from an identifier
+    // that resolves to nothing.
+    Api {
+        sdk_token: "appconfigdata",
+        signing_name: "appconfig",
+        endpoint_prefix: "appconfigdata",
+        model: Some(APPCONFIGDATA_MODEL),
+        protocol: Protocol::RestJson(&APPCONFIGDATA),
+        answer_model: Some(&APPCONFIGDATA_ANSWERS),
+    },
+    // `services/service-com-amazonaws-appconfig-amazonappconfig/smithy-model/
+    // com-amazonaws-appconfig-amazonappconfig.json`: restJson1, sigv4Name `appconfig`,
+    // endpointPrefix `appconfig`, sdkId `AppConfig`. Its requests are bound per operation out
+    // of that same model ([`APPCONFIG`]).
+    //
+    // The CONTROL PLANE beside the data plane above: the application, environment,
+    // configuration profile and hosted version a session is opened over, and the deployment
+    // that put one in force, are read and written through these operations — so a handler that
+    // authors or inspects the configuration it later reads reaches them here. It signs as
+    // `appconfig` exactly as the data plane does, and the two are told apart by the paths
+    // their own models bind.
+    Api {
+        sdk_token: "appconfig",
+        signing_name: "appconfig",
+        endpoint_prefix: "appconfig",
+        model: Some(APPCONFIG_MODEL),
+        protocol: Protocol::RestJson(&APPCONFIG),
+        answer_model: Some(&APPCONFIG_ANSWERS),
+    },
 ];
 
 /// Whether `named` and `asked` name the ONE service.
@@ -543,6 +581,14 @@ pub(super) const XRAY_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-xray-awsxray/smithy-model/\
      com-amazonaws-xray-awsxray.json"
 );
+pub(super) const APPCONFIGDATA_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-appconfigdata-appconfigdata/smithy-model/\
+     com-amazonaws-appconfigdata-appconfigdata.json"
+);
+pub(super) const APPCONFIG_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-appconfig-amazonappconfig/smithy-model/\
+     com-amazonaws-appconfig-amazonappconfig.json"
+);
 
 /// AWS X-Ray's own model, which a call to it is bound by, embedded exactly as the API
 /// Gateway model below is and for the same reason: the wire facts of its operations are that
@@ -624,6 +670,15 @@ static RDS_DATA_ANSWERS: super::blob_members::ServiceModel = super::blob_members
     source: RDS_DATA_MODEL,
     plan: ::std::sync::OnceLock::new(),
 };
+static APPCONFIGDATA_ANSWERS: super::blob_members::ServiceModel =
+    super::blob_members::ServiceModel {
+        source: APPCONFIGDATA_MODEL,
+        plan: ::std::sync::OnceLock::new(),
+    };
+static APPCONFIG_ANSWERS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: APPCONFIG_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
 
 /// Amazon API Gateway's own model, which a call to it is bound by.
 ///
@@ -663,6 +718,22 @@ static SESV2: super::rest_json::RestApi = super::rest_json::RestApi {
 static RDS_DATA: super::rest_json::RestApi = super::rest_json::RestApi {
     model: RDS_DATA_MODEL,
     namespace: "com.amazonaws.rdsdata",
+    parsed: ::std::sync::OnceLock::new(),
+};
+
+/// AppConfig's DATA plane's own model, which a call to it is bound by, embedded exactly as the
+/// models above are and for the same reason: the wire facts of its operations are that model's,
+/// so this seam states none of them.
+static APPCONFIGDATA: super::rest_json::RestApi = super::rest_json::RestApi {
+    model: APPCONFIGDATA_MODEL,
+    namespace: "com.amazonaws.appconfigdata",
+    parsed: ::std::sync::OnceLock::new(),
+};
+
+/// AppConfig's CONTROL plane's own model, embedded the same way and for the same reason.
+static APPCONFIG: super::rest_json::RestApi = super::rest_json::RestApi {
+    model: APPCONFIG_MODEL,
+    namespace: "com.amazonaws.appconfig",
     parsed: ::std::sync::OnceLock::new(),
 };
 
@@ -999,7 +1070,8 @@ pub struct Answer {
     /// The id it gave the request it answered.
     pub request_id: Option<String>,
     /// The output members of [`Self::body`] that carry BYTES rather than text, as the
-    /// base64 the answer's document carries them as — an object's own payload, say. The
+    /// base64 the answer's document carries them as — an object's own payload, say, or the
+    /// member a REST-bound answer binds to the whole body whose shape is a blob. The
     /// SDK the guest calls hands each of them over as the stream its own client answers
     /// with ([`super::aws_sdk_guest`]), so a handler reads bytes where it reads bytes on a
     /// managed runtime. Empty for every answer whose members are all text, which is every
@@ -1074,7 +1146,7 @@ async fn sent(
             for (name, value) in bound.headers {
                 builder = builder.header(name, value);
             }
-            bound.body.into_bytes()
+            bound.body
         }
         // Amazon S3's own protocol is bound by the client [`super::aws_s3`] holds, which is
         // where a call to it is dispatched ([`AwsAccess::dispatched`]): no request to it is
@@ -1130,6 +1202,20 @@ async fn sent(
         ),
         _ => answered,
     };
+    // A member the answer binds to the WHOLE body whose shape is a blob is the body's own
+    // BYTES, with nothing of the protocol encoded around them, so it is not read back as the
+    // text those bytes happened to decode to: the bytes travel as base64 and the SDK the guest
+    // calls hands them over as the stream its own client answers one with
+    // ([`super::rest_json::streamed_payload`]).
+    let (body, streams) = match (&api.protocol, (200..300).contains(&status)) {
+        (Protocol::RestJson(rest), true) => {
+            match super::rest_json::streamed_payload(rest, operation, &body, payload) {
+                Some((document, member)) => (document, vec![member]),
+                None => (body, Vec::new()),
+            }
+        }
+        _ => (body, Vec::new()),
+    };
     // WHICH of the answer's values carry bytes is the called service's own model's to say, so
     // the SDK the guest calls hands each of them over as bytes rather than as the base64 a
     // JSON protocol travels a blob as. A REFUSAL carries no output member at all.
@@ -1158,7 +1244,7 @@ async fn sent(
         body,
         error_type,
         request_id,
-        streams: Vec::new(),
+        streams,
         blobs,
     })
 }

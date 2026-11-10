@@ -14213,6 +14213,8 @@ dependencies = [
  "rustpython-vm",
  "serde_json",
  "service-com-amazonaws-apigateway-backplanecontrolservice",
+ "service-com-amazonaws-appconfig-amazonappconfig",
+ "service-com-amazonaws-appconfigdata-appconfigdata",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-dynamodb-dynamodb-20120810",

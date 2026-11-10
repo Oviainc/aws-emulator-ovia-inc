@@ -254,6 +254,12 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # the matching rule targets — and the role policies that decide the publication are written
 # with IAM's own operations.
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+# AppConfig's two APIs, mounted beside lambda on ONE engine for the suite that reads a
+# function's own configuration: the application, environment, configuration profile and
+# hosted version a handler reads are written with the control plane's own operations, and the
+# deployed document the handler polls is served by the data plane.
+service-com-amazonaws-appconfig-amazonappconfig = { workspace = true }
+service-com-amazonaws-appconfigdata-appconfigdata = { workspace = true }
 
 [lints]
 workspace = true

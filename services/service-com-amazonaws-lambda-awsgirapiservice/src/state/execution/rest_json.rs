@@ -14,6 +14,13 @@
 //! answer back is the same walk in reverse, so what the guest reads are the output's own
 //! member names whatever the wire called them.
 //!
+//! A member bound to the WHOLE body whose shape is a `blob` is the one value here that is not
+//! text: the body IS its bytes, with nothing of the protocol encoded around them. So such a
+//! member travels as the bytes it names in both directions ([`payload_bytes`],
+//! [`streamed_payload`]) rather than as the text the body happens to decode to, and the SDK
+//! the guest calls hands the answer's half over as the stream its own client answers one
+//! with.
+//!
 //! Nothing here is a per-operation table: the model is the authority, so every operation the
 //! service binds is reachable and none is described twice. An operation the model does not
 //! hold, or one whose input the guest filled with a value that cannot be bound, is reported
@@ -186,8 +193,9 @@ pub struct Bound {
     pub target: String,
     /// The headers the input's own members bound.
     pub headers: Vec<(String, String)>,
-    /// The body, when the operation carries one.
-    pub body: String,
+    /// The body, when the operation carries one — the request's own BYTES, because a member
+    /// bound to the whole body may be a blob, whose value is not text at all.
+    pub body: Vec<u8>,
     /// Whether that body is a JSON document (so the request carries a JSON media type).
     pub json_body: bool,
 }
@@ -326,15 +334,20 @@ pub fn bind(api: &RestApi, operation: &str, input: &Value) -> Result<Bound, Stri
         let value = supplied.get(name)?;
         // A payload that is itself a structure travels as that structure's JSON; one
         // that is text or a blob travels as its own bytes.
-        Some(match value {
-            Value::String(text) => (text.clone(), false),
-            other => (to_wire(model, shape, other).to_string(), true),
+        Some(match (model.kind(shape), value) {
+            // A BLOB bound to the whole body IS the request's bytes, and the SDK the guest
+            // calls carries a blob as the base64 text of them ([`super::aws_sdk_guest`]), so
+            // those bytes are what travels — a text body the guest wrote as text travels as
+            // its own UTF-8, which is what a client sends for one.
+            ("blob", Value::String(text)) => (payload_bytes(text), false),
+            (_, Value::String(text)) => (text.clone().into_bytes(), false),
+            (_, other) => (to_wire(model, shape, other).to_string().into_bytes(), true),
         })
     });
     let (body, json_body) = match payload {
-        Some((text, json)) => (text, json),
-        None if document.is_empty() => (String::new(), false),
-        None => (Value::Object(document).to_string(), true),
+        Some((bytes, json)) => (bytes, json),
+        None if document.is_empty() => (Vec::new(), false),
+        None => (Value::Object(document).to_string().into_bytes(), true),
     };
     Ok(Bound {
         method: parts.method,
@@ -343,6 +356,64 @@ pub fn bind(api: &RestApi, operation: &str, input: &Value) -> Result<Bound, Stri
         body,
         json_body,
     })
+}
+
+/// The bytes a blob bound to the whole body carries, as the SDK the guest calls hands them
+/// over: the base64 text of those bytes, which is how every protocol this runtime's SDKs speak
+/// carries a blob. Text that is not that encoding at all is carried as its own UTF-8, so a
+/// handler writing a text body is never sent bytes it did not write.
+fn payload_bytes(text: &str) -> Vec<u8> {
+    use ::base64::Engine as _;
+
+    ::base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .unwrap_or_else(|_not_base64| text.as_bytes().to_vec())
+}
+
+/// The output member of `operation` that carries the ANSWER's own BYTES, when it has one: the
+/// member bound to the whole response body (`@httpPayload`) whose shape is a `blob`.
+///
+/// An SDK hands such a member over as a readable STREAM rather than as a value of the answer's
+/// document — the Python SDK builds a `botocore.response.StreamingBody` for the payload member
+/// of every output whose payload shape is a blob, and the JavaScript SDK a byte stream —
+/// because the body IS those bytes, with nothing of the protocol encoded around them. So the
+/// bytes are reported apart from the document's text ([`super::aws_api::Answer::streams`])
+/// rather than read back as the text the body happened to decode to.
+pub fn blob_payload(api: &RestApi, operation: &str) -> Option<String> {
+    let model = api.model();
+    let shape = model.operation(operation)?;
+    let output = shape
+        .get("output")
+        .and_then(|output| output.get("target"))
+        .and_then(Value::as_str)?;
+    model.members(output).iter().find_map(|(name, member)| {
+        (member_trait(member, PAYLOAD).is_some() && model.kind(target(member)) == "blob")
+            .then(|| name.clone())
+    })
+}
+
+/// The answer's document with the bytes of its blob payload in place of the text the body
+/// decoded to, and the member they belong to — `None` for an operation whose answer binds no
+/// blob payload, or a document that is not one this seam built.
+///
+/// The bytes travel to the guest as base64, which is how the one call seam carries bytes in
+/// either direction, and the SDK the guest calls hands them over as the stream its own client
+/// answers with.
+pub fn streamed_payload(
+    api: &RestApi,
+    operation: &str,
+    document: &str,
+    bytes: &[u8],
+) -> Option<(String, String)> {
+    use ::base64::Engine as _;
+
+    let member = blob_payload(api, operation)?;
+    let mut read = ::serde_json::from_str::<Map<String, Value>>(document).ok()?;
+    read.insert(
+        member.clone(),
+        Value::String(::base64::engine::general_purpose::STANDARD.encode(bytes)),
+    );
+    Some((Value::Object(read).to_string(), member))
 }
 
 /// The output document of one answered call, keyed by the output shape's OWN member names —
@@ -751,8 +822,11 @@ mod tests {
             let carried: Value = if bound.body.is_empty() {
                 Value::Null
             } else {
-                ::serde_json::from_str(&bound.body).unwrap_or_else(|why| {
-                    panic!("case {case:?}: expected a JSON body, got {:?} ({why})", bound.body)
+                ::serde_json::from_slice(&bound.body).unwrap_or_else(|why| {
+                    panic!(
+                        "case {case:?}: expected a JSON body, got {:?} ({why})",
+                        String::from_utf8_lossy(&bound.body)
+                    )
                 })
             };
             let wanted: Value = if body.is_empty() {
