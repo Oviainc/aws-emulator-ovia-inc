@@ -49,6 +49,25 @@ pub fn router_with_engine() -> (Harness, Arc<engine::InMemoryEngine>) {
     (harness, engine)
 }
 
+/// [`router`], with AWS KMS mounted beside this service on the SAME engine — for a case
+/// whose onboarding job is put on a KMS key, which the job resolves in KMS's own store
+/// (`crate::state::onboarding_encryption_failure`) exactly as the assembled emulator
+/// does.
+///
+/// A case that needs a key KMS really holds mints it through [`Harness::kms`], so the
+/// key the onboarding resolves is one KMS's own API created.
+pub fn router_with_kms() -> Harness {
+    let harness = router();
+    let mut router = harness.router;
+    router.register_service(
+        service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(&harness.engine)),
+    );
+    Harness {
+        router,
+        engine: harness.engine,
+    }
+}
+
 /// The router under test together with the engine it was built over.
 ///
 /// It DEREFS to the router, so a case drives its requests through it exactly as it
@@ -78,6 +97,38 @@ impl Harness {
     /// [`deregister_connect_instance`] against the engine this harness was built over.
     pub fn deregister_connect_instance(&self, instance: &str) -> bool {
         deregister_connect_instance(&self.engine, instance)
+    }
+
+    /// Drive one AWS KMS request — `target` is the operation's `X-Amz-Target` suffix and
+    /// `body` its awsJson1_1 payload — and answer its status and parsed body.
+    ///
+    /// Only a harness built by [`router_with_kms`] has KMS mounted; it is how a case
+    /// gives the account a KMS key an onboarding job can be put on, through the API that
+    /// OWNS those keys rather than by writing one into KMS's store.
+    pub async fn kms(&self, region: &str, target: &str, body: &Value) -> (u16, Value) {
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/kms/aws4_request, \
+             SignedHeaders=host;x-amz-target, Signature=0123456789abcdef"
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://kms.{region}.amazonaws.com/"))
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("TrentService.{target}"))
+            .header("authorization", authorization)
+            .body(bytes::Bytes::from(
+                serde_json::to_vec(body).expect("a test body always serializes"),
+            ))
+            .expect("a well-formed test request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let bytes = response.into_body();
+        let parsed = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        (status, parsed)
     }
 }
 

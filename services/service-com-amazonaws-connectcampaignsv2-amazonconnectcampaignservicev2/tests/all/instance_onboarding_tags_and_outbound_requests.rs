@@ -30,7 +30,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // One harness per crate: the routing header, the router under test and the
 // request/response plumbing live in `tests/all/common.rs`.
-use super::common::{call, error_code, router, Harness};
+use super::common::{call, error_code, router, router_with_kms, Harness};
 
 /// `StartInstanceOnboardingJob` for `instance`, returning its status and body — on an
 /// instance registered in the account's Connect registry first, since onboarding
@@ -137,11 +137,22 @@ fn job_status(response: &Value) -> &str {
 /// The rows differ along what the rule generalises over: the shape of the instance id
 /// (every character class `InstanceId`'s pattern `^[-_.a-zA-Z0-9]+$` admits, and the
 /// 1-character minimum of its 1..256 length bound) and the encryption config, enabled
-/// with a KMS key and disabled.
+/// with a KMS key and disabled. The enabled row is put on a key AWS KMS really holds,
+/// minted through KMS's own `CreateKey`, because a job whose key resolves to nothing
+/// settles FAILED instead — which is `onboarding_job_failure`'s rule.
 #[tokio::test]
 async fn an_onboarding_job_settles_on_the_clock_and_then_publishes_the_config() {
     let region = "us-west-2";
-    let router = router();
+    let router = router_with_kms();
+    let (status, created) = router.kms(region, "CreateKey", &json!({})).await;
+    assert_eq!(
+        status, 200,
+        "the fixture's KMS key must be created, got {status} {created}"
+    );
+    let key_arn = created["KeyMetadata"]["Arn"]
+        .as_str()
+        .expect("CreateKey reports the new key's ARN")
+        .to_string();
 
     // (case, instance id, encryptionConfig)
     let cases: &[(&str, &str, Value)] = &[
@@ -152,7 +163,7 @@ async fn an_onboarding_job_settles_on_the_clock_and_then_publishes_the_config() 
             json!({
                 "enabled": true,
                 "encryptionType": "KMS",
-                "keyArn": "arn:aws:kms:us-west-2:000000000000:key/11111111-2222-3333-4444-555555555555"
+                "keyArn": key_arn
             }),
         ),
         ("a single-character id", "i", json!({"enabled": false})),

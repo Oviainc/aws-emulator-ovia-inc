@@ -9,6 +9,11 @@
 //! `GetInstanceOnboardingJobStatus` reports and the config
 //! `GetConnectInstanceConfig` projects — untouched.
 //!
+//! A job settles FAILED when the dependency it needs is not one the service can use —
+//! the KMS key its encryption config names (see
+//! `crate::state::onboarding_encryption_failure`) — so clearing that record here is
+//! what lets the instance be onboarded afresh.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

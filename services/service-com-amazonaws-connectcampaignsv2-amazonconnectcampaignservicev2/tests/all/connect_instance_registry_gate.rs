@@ -390,7 +390,15 @@ async fn an_onboarding_record_alone_does_not_make_an_instance_usable() {
         {
             let mut store = state.lock();
             store
-                .start_instance_onboarding(REGION, instance, EncryptionConfig::default(), started)
+                .start_instance_onboarding(
+                    REGION,
+                    instance,
+                    EncryptionConfig::default(),
+                    // A job whose encryption config asks for the service's own key
+                    // needs no key of the caller's, so it settles SUCCEEDED.
+                    None,
+                    started,
+                )
                 .expect("room for one onboarding record");
             assert!(
                 store.is_onboarded(REGION, instance, SystemTime::now()),

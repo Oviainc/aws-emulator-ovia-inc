@@ -113,6 +113,8 @@ mod integration_identifier_precedes_lookup;
 mod integration_mutation_audit;
 #[path = "all/onboarding_job_deletion.rs"]
 mod onboarding_job_deletion;
+#[path = "all/onboarding_job_failure.rs"]
+mod onboarding_job_failure;
 #[path = "all/outbound_batch_is_one_rule.rs"]
 mod outbound_batch_is_one_rule;
 #[path = "all/outbound_request_expiration.rs"]

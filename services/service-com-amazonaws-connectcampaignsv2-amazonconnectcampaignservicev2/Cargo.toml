@@ -30,6 +30,10 @@ sha2 = { workspace = true }
 # `CreateInstance` and by nothing else, so the instance-existence gate on onboarding
 # reads that store through the shared engine rather than keeping a second registry here.
 service-com-amazonaws-connect-amazonconnectservice = { workspace = true }
+# AWS KMS's key store: the `encryptionConfig.keyArn` an onboarding job is put on is a KMS
+# key KMS itself mints, so the job's dependency check resolves that key in KMS's own store
+# through the shared engine instead of reading the ARN's text.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

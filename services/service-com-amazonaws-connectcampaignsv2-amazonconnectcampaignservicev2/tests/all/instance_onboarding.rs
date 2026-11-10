@@ -8,8 +8,10 @@
 //!
 //! * `StartInstanceOnboardingJob` PERSISTS the `encryptionConfig` it is given as the
 //!   named instance's onboarding record and reports that record's job status, which
-//!   is `IN_PROGRESS` until the job is due to have finished and `SUCCEEDED` from then
-//!   on — whatever the instance id or the encryption config;
+//!   is `IN_PROGRESS` until the job is due to have settled — whatever the instance id
+//!   or the encryption config — and `SUCCEEDED` from then on for a job whose encryption
+//!   key the service can use (what a job whose key it cannot use settles on is
+//!   `onboarding_job_failure`'s rule);
 //! * `GetInstanceOnboardingJobStatus` only REPORTS: polling it never starts or moves
 //!   a job, repeated reads at the same point of the job agree, and an instance with
 //!   no record is HTTP 404 `ResourceNotFoundException`;

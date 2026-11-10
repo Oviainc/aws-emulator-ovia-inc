@@ -29,6 +29,13 @@
 //! record: `PutInstanceCommunicationLimits` writes them and
 //! `GetInstanceCommunicationLimits` reports them, so neither keeps a copy of its own.
 //!
+//! An onboarding job is owed to the CLOCK like a campaign's state, and it settles on
+//! the outcome the call that started it determined: the key its encryption config names
+//! is resolved in the KMS store ([`onboarding_encryption_failure`]) when the job starts,
+//! so a job the service cannot finish settles `FAILED` carrying the
+//! `InstanceOnboardingJobFailureCode` of the dependency that stopped it, which is the
+//! record `DeleteInstanceOnboardingJob` clears.
+//!
 //! The integration store is the single source of truth for what an onboarded Connect
 //! instance is integrated with: `PutConnectInstanceIntegration` writes one record per
 //! integration the instance holds, keyed by the kind and resource ARN that identify
@@ -1770,11 +1777,27 @@ pub const ONBOARDING_STATUS_SUCCEEDED: &str = "SUCCEEDED";
 /// `DeleteInstanceOnboardingJob` accepts: "Instance onboarding job is not in failed
 /// status. Only failed job can be deleted."
 ///
-/// No job this emulator stores reaches it — the onboarding it performs is writing
-/// the record, which either happened or was refused before the job started (see
-/// [`StoredInstanceOnboarding::to_job_status`]) — so the delete edge it opens is the
-/// one a failing job would use.
+/// A job carries it exactly while its record names the
+/// `InstanceOnboardingJobFailureCode` it ended on
+/// ([`StoredInstanceOnboarding::failure_code`]), which is what the onboarding's own
+/// dependency check writes: a job the service cannot finish settles here instead of at
+/// [`ONBOARDING_STATUS_SUCCEEDED`], and it is that record a delete clears.
 pub const ONBOARDING_STATUS_FAILED: &str = "FAILED";
+
+/// The `InstanceOnboardingJobFailureCode` an onboarding job ends on when the KMS key
+/// its `encryptionConfig` names resolves to no key the account holds in the request's
+/// region, as the model's catalog declares it (see
+/// `INSTANCE_ONBOARDING_JOB_FAILURE_CODE_VALUES` in [`crate::ops::types`]).
+pub const ONBOARDING_FAILURE_KMS_KEY_NOT_FOUND: &str = "KMS_KEY_NOT_FOUND";
+
+/// The `InstanceOnboardingJobFailureCode` an onboarding job ends on when the key its
+/// `encryptionConfig` names IS held but the service cannot use it to encrypt the
+/// instance's campaign data, from the same catalog.
+///
+/// It is the catalog's only KMS code for a key that was resolved and still could not be
+/// used, the other being [`ONBOARDING_FAILURE_KMS_KEY_NOT_FOUND`] for one that resolves
+/// to nothing at all.
+pub const ONBOARDING_FAILURE_KMS_ACCESS_DENIED: &str = "KMS_ACCESS_DENIED";
 
 /// Why `DeleteInstanceOnboardingJob` refuses to delete a job that has not failed.
 ///
@@ -1849,27 +1872,41 @@ pub fn instance_config_not_found_message(connect_instance_id: &str) -> String {
 }
 
 /// How long after the `StartInstanceOnboardingJob` call that started it an
-/// onboarding job is due to reach `SUCCEEDED`.
+/// onboarding job is due to have settled — on `SUCCEEDED`, or on the
+/// `InstanceOnboardingJobFailureCode` its dependency check found.
 ///
 /// AWS documents no duration for the job, so this is the emulator's own: long
 /// enough that a caller which polls immediately still observes `IN_PROGRESS` (the
-/// transient state the real job has), short enough that a poller reaches
-/// `SUCCEEDED` straight away. Nothing sleeps for it — the due instant is stored
+/// transient state the real job has), short enough that a poller reaches the
+/// settled status straight away. Nothing sleeps for it — the due instant is stored
 /// and the status is read off the clock.
 pub const ONBOARDING_JOB_DURATION: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The onboarding job of one Connect instance: the encryption config the
 /// `StartInstanceOnboardingJob` call persisted, the instant its job is due to
-/// have finished, and the instance-wide configuration set on it since.
+/// have finished, what became of it, and the instance-wide configuration set on it
+/// since.
 #[derive(Debug, Clone)]
 pub struct StoredInstanceOnboarding {
     pub connect_instance_id: String,
     /// What the instance's campaign data is encrypted with, exactly as the call
     /// that started the job supplied it.
     pub encryption_config: EncryptionConfig,
-    /// The instant this job reaches `SUCCEEDED`: the start instant plus
+    /// The instant this job settles: the start instant plus
     /// [`ONBOARDING_JOB_DURATION`]. Before it the job reports `IN_PROGRESS`.
-    pub succeeds_at: std::time::SystemTime,
+    pub settles_at: std::time::SystemTime,
+    /// The `InstanceOnboardingJobFailureCode` this job settles on, or `None` for a job
+    /// that settles `SUCCEEDED`.
+    ///
+    /// It is what makes a record's job a FAILED one: [`Self::status_at`] reports that
+    /// status exactly while this member is set and the job has settled, and
+    /// [`Self::to_job_status`] reports the code beside it, so a job's status and its
+    /// failure code cannot disagree. The call that STARTS the job decides it — that is
+    /// when the service resolves the dependencies the onboarding needs (see
+    /// [`onboarding_encryption_failure`]) — so the outcome a reader reports is the
+    /// outcome of the job that ran and not of whatever those dependencies look like
+    /// when somebody happens to poll.
+    pub failure_code: Option<String>,
     /// The instance-wide communication limits `PutInstanceCommunicationLimits`
     /// persisted for this instance, exactly as that call supplied them, and `None`
     /// while no call has set any. `GetInstanceCommunicationLimits` reports this
@@ -1879,29 +1916,39 @@ pub struct StoredInstanceOnboarding {
 }
 
 impl StoredInstanceOnboarding {
-    /// A job just started for `connect_instance_id` at `now`, due to succeed one
-    /// [`ONBOARDING_JOB_DURATION`] later.
+    /// A job just started for `connect_instance_id` at `now`, due to settle one
+    /// [`ONBOARDING_JOB_DURATION`] later on `failure_code`: `None` for a job whose
+    /// dependencies all held, so it settles `SUCCEEDED`, and otherwise the
+    /// `InstanceOnboardingJobFailureCode` the one that did not held it up.
     pub fn starting(
         connect_instance_id: String,
         encryption_config: EncryptionConfig,
+        failure_code: Option<String>,
         now: std::time::SystemTime,
     ) -> Self {
         Self {
             connect_instance_id,
             encryption_config,
-            succeeds_at: now + ONBOARDING_JOB_DURATION,
+            settles_at: now + ONBOARDING_JOB_DURATION,
+            failure_code,
             communication_limits: None,
         }
     }
 
-    /// The job's status at `now`: `SUCCEEDED` once the clock has passed the due
-    /// instant, `IN_PROGRESS` until then.
+    /// The job's status at `now`: `IN_PROGRESS` until the clock has passed the instant
+    /// it settles at, and from then on the outcome the record carries — `FAILED` when
+    /// it names the code the job ended on, `SUCCEEDED` when it names none.
     ///
-    /// A pure read of the stored instant, so reporting the status writes nothing
-    /// and two callers reading at the same moment see the same value.
+    /// The span is never zero either way, so a caller that polls straight after the
+    /// start call still sees the transient status a real job has before it fails.
+    ///
+    /// A pure read of the stored instant and outcome, so reporting the status writes
+    /// nothing and two callers reading at the same moment see the same value.
     pub fn status_at(&self, now: std::time::SystemTime) -> &'static str {
-        if now < self.succeeds_at {
+        if now < self.settles_at {
             ONBOARDING_STATUS_IN_PROGRESS
+        } else if self.failure_code.is_some() {
+            ONBOARDING_STATUS_FAILED
         } else {
             ONBOARDING_STATUS_SUCCEEDED
         }
@@ -1910,14 +1957,17 @@ impl StoredInstanceOnboarding {
     /// This record as the modelled `InstanceOnboardingJobStatus` shape the
     /// onboarding operations return.
     ///
-    /// `failureCode` is absent: the onboarding this emulator performs is writing
-    /// the record, which either happened or was refused before the job started, so
-    /// no stored job is in the modelled `FAILED` state.
+    /// `failureCode` is the code the record names, reported exactly while the job is at
+    /// `FAILED`: a job that has not settled yet has not failed, so it carries no code —
+    /// the model declares the member for the failure of a job, not for its prospects.
     pub fn to_job_status(&self, now: std::time::SystemTime) -> InstanceOnboardingJobStatus {
+        let status = self.status_at(now);
         InstanceOnboardingJobStatus {
             connect_instance_id: self.connect_instance_id.clone(),
-            status: self.status_at(now).to_string(),
-            failure_code: None,
+            status: status.to_string(),
+            failure_code: (status == ONBOARDING_STATUS_FAILED)
+                .then(|| self.failure_code.clone())
+                .flatten(),
         }
     }
 
@@ -2095,6 +2145,72 @@ pub fn connect_instance_registry_refusal<Eng: Send + Sync + 'static>(
         Some(true) => None,
         Some(false) => Some(InstanceRegistryRefusal::NoSuchInstance),
         None => Some(InstanceRegistryRefusal::Unavailable),
+    }
+}
+
+/// The `InstanceOnboardingJobFailureCode` an onboarding job started with
+/// `encryption_config` in `region` settles on, or `None` for one whose encryption key
+/// the service can use \u2014 which is every job whose config asks for the service's own
+/// key, since such a job needs no key of the caller's at all.
+///
+/// Onboarding an instance puts its campaign data on the KMS key the config names:
+/// "if enabled, a KMS key id needs to be provided"
+/// (`smithy_query(query="shape",shape="EncryptionConfig")`), so a key the account does
+/// not hold in the request's region, or holds in a form the service cannot encrypt
+/// with, is a job the service cannot finish. AWS owns that key in KMS \u2014 `CreateKey` is
+/// the only call that mints one and `ScheduleKeyDeletion` the only one that takes it
+/// away \u2014 so the answer is read from THAT service's own store through the one shared
+/// engine, in every identifier form KMS itself accepts, rather than guessed from the
+/// text of the ARN.
+///
+/// The two codes are the two the catalog declares about a KMS key: the key resolves to
+/// nothing ([`ONBOARDING_FAILURE_KMS_KEY_NOT_FOUND`]), or it resolves and the service
+/// still cannot use it to encrypt ([`ONBOARDING_FAILURE_KMS_ACCESS_DENIED`]) \u2014 a key
+/// disabled, awaiting deletion or awaiting its material, one whose usage is not
+/// encryption, and an identifier whose account segment names no account at all, which
+/// KMS refuses for want of permission before it looks anything up.
+///
+/// `None` when KMS's store cannot be read at all (the engine is not the shared
+/// in-memory one): nothing has then been attributed to the key, and a condition nobody
+/// attributed to the key fails no job.
+///
+/// LOCK ORDER: this takes KMS's store lock, holds no other while it does, and hands
+/// back an owned value \u2014 so it is called with NO guard of this service's store held,
+/// which is why a handler asks it BEFORE locking its own.
+pub fn onboarding_encryption_failure<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    encryption_config: &EncryptionConfig,
+) -> Option<String> {
+    // A config that is not on a customer key names no key to resolve: the service
+    // encrypts with its own, which is always there.
+    if !encryption_config.enabled {
+        return None;
+    }
+    let key_arn = encryption_config.key_arn.as_deref()?;
+    let state = ::service_com_amazonaws_kms_trentservice::state::service_state(engine)?;
+    let store = state.lock();
+    match store.resolve(region, key_arn) {
+        // A key the service can use in a cryptographic operation right now, and whose
+        // usage is the symmetric encryption a data key is generated under, is a key the
+        // onboarding can put the instance's data on.
+        ::service_com_amazonaws_kms_trentservice::state::KeyRef::Found(key)
+            if key.is_usable() && key.is_symmetric_encryption() =>
+        {
+            None
+        }
+        ::service_com_amazonaws_kms_trentservice::state::KeyRef::Found(_) => {
+            Some(ONBOARDING_FAILURE_KMS_ACCESS_DENIED.to_string())
+        }
+        // An identifier KMS cannot read as one of its own names no key either, so it is
+        // reported as the key that was not found rather than as a key held back.
+        ::service_com_amazonaws_kms_trentservice::state::KeyRef::NotFound
+        | ::service_com_amazonaws_kms_trentservice::state::KeyRef::MalformedArn => {
+            Some(ONBOARDING_FAILURE_KMS_KEY_NOT_FOUND.to_string())
+        }
+        ::service_com_amazonaws_kms_trentservice::state::KeyRef::UnauthorizedAccount => {
+            Some(ONBOARDING_FAILURE_KMS_ACCESS_DENIED.to_string())
+        }
     }
 }
 
@@ -3006,8 +3122,9 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// The onboarding record `region` holds for `connect_instance_id` when that
     /// instance is onboarded to Campaigns there at `now` — a record exists in that
     /// region AND its job has reached `SUCCEEDED` — and `None` otherwise. An instance
-    /// whose job is still `IN_PROGRESS` is not a campaign target yet, and neither is
-    /// one onboarded only in another region.
+    /// whose job is still `IN_PROGRESS` is not a campaign target yet, one whose job
+    /// settled `FAILED` never became one, and neither is one onboarded only in another
+    /// region.
     ///
     /// The one place "is this instance onboarded?" is decided, so `CreateCampaign`'s
     /// gate ([`Self::is_onboarded`]) and `GetConnectInstanceConfig`'s projection
@@ -3085,14 +3202,17 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     }
 
     /// Start the onboarding job `region` holds for `connect_instance_id` with
-    /// `encryption_config`, and hand back the record now in the store.
+    /// `encryption_config`, settling on `failure_code` (see
+    /// [`StoredInstanceOnboarding::failure_code`]), and hand back the record now in
+    /// the store.
     ///
     /// An instance with no record in that region gets a job that starts at `now` —
     /// including one already onboarded in another region, whose record is another
     /// region's resource. An instance that already has one there keeps that job —
     /// repeating the call does not re-onboard an instance, which is what makes the
-    /// operation idempotent — and takes the request's encryption config, since the
-    /// call carries the instance's config.
+    /// operation idempotent, and so does not re-run the job's dependency check either —
+    /// and takes the request's encryption config, since the call carries the instance's
+    /// config.
     ///
     /// `None` means the region already holds [`MAX_ONBOARDED_INSTANCES`] instances
     /// and nothing was written.
@@ -3101,6 +3221,7 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         region: &str,
         connect_instance_id: &str,
         encryption_config: EncryptionConfig,
+        failure_code: Option<String>,
         now: std::time::SystemTime,
     ) -> Option<StoredInstanceOnboarding> {
         // Past the region ceiling there is no room for a region's first onboarding
@@ -3116,6 +3237,7 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         let record = StoredInstanceOnboarding::starting(
             connect_instance_id.to_string(),
             encryption_config,
+            failure_code,
             now,
         );
         store
@@ -3183,9 +3305,10 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// and report whether there was one to delete.
     ///
     /// `false` means the instance holds no configuration in that region at `now` — it
-    /// was never onboarded there, its onboarding job has not finished, or its
-    /// configuration is already gone — so nothing was written, and the caller answers
-    /// as not found.
+    /// was never onboarded there, its onboarding job has not settled or settled
+    /// `FAILED`, or its configuration is already gone — so nothing was written, and the
+    /// caller answers as not found. A failed job is cleared by
+    /// `DeleteInstanceOnboardingJob`, the operation whose own resource that job is.
     ///
     /// Deleting the configuration takes with it everything held ON that
     /// configuration: the instance's onboarding record (so the instance is no longer

@@ -3,12 +3,19 @@
 //! @op StartInstanceOnboardingJob
 //! Onboards a Connect instance to Campaigns: persists the `encryptionConfig` the call
 //! carries as that instance's onboarding record and reports the record's job status,
-//! which starts `IN_PROGRESS` and the clock moves to `SUCCEEDED`.
+//! which starts `IN_PROGRESS` and the clock settles — on `SUCCEEDED`, or on `FAILED`
+//! with the `InstanceOnboardingJobFailureCode` of the dependency the job could not get
+//! past.
 //!
 //! The onboarding is GATED on the Connect instance existing: Amazon Connect owns the
 //! instance registry (`crate::state::connect_instance_registry_refusal` reads it), and a
 //! `connectInstanceId` that account holds no instance for is answered with the modelled
 //! `ResourceNotFoundException` (HTTP 404) with nothing persisted.
+//!
+//! The KMS key the config names is the job's own dependency rather than a gate on the
+//! call: the call is accepted and the job it starts settles `FAILED` when that key is
+//! one the service cannot use (`crate::state::onboarding_encryption_failure` resolves it
+//! in the KMS store), which is the only status `DeleteInstanceOnboardingJob` clears.
 //!
 //! That record is what the rest of the service reads: `GetInstanceOnboardingJobStatus`
 //! reports its job, `GetConnectInstanceConfig` projects its config, and
@@ -277,16 +284,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Starting the job is what persists the instance's config, so the write
         // happens here rather than in the reporting operations; the job itself is
         // owed by the clock, which is why the record carries the instant it is due
-        // to have finished rather than a status nothing would ever move. The
+        // to have settled rather than a status nothing would ever move. The
         // configuration belongs to the region the request was signed for: an instance
         // onboarded there is a campaign target there and nowhere else.
         let now = std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
+        // What the job will settle on, decided HERE: the onboarding puts the instance's
+        // campaign data on the key the config names, so the job that does it either
+        // finds a key it can use or ends on the failure code of the one it was given.
+        // KMS's store is read before this service's own is locked, so no two store
+        // guards are ever held at once.
+        let failure_code = crate::state::onboarding_encryption_failure(
+            &*self.engine,
+            &region,
+            &input.encryption_config,
+        );
         let mut store = state.lock();
         let Some(stored) = store.start_instance_onboarding(
             &region,
             &input.connect_instance_id,
             input.encryption_config,
+            failure_code,
             now,
         ) else {
             // The store is bounded: past its ceiling the call is refused rather than
