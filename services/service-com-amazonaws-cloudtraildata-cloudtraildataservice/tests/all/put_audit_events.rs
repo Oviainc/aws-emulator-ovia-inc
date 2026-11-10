@@ -102,7 +102,7 @@ impl Ev {
     }
 
     /// Carry an explicit `eventDataChecksum`.
-    fn with_checksum(mut self, checksum: impl Into<String>) -> Self {
+    pub fn with_checksum(mut self, checksum: impl Into<String>) -> Self {
         self.checksum = Some(checksum.into());
         self
     }

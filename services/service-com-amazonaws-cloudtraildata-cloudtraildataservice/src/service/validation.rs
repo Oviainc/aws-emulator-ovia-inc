@@ -30,18 +30,38 @@ use smithy_server_runtime::{ErasedOperation, Operation, Refused, Service, Violat
 /// message together.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
+/// The member positions one element of the batch spends: one per member `AuditEvent`
+/// declares — id, eventData, eventDataChecksum
+/// (`smithy_query(query="shape", shape="AuditEvent")`) — and one for the structure itself.
+const ECHO_POSITIONS_PER_EVENT: usize = 4;
+
+/// The members `PutAuditEventsRequest` declares, each a position of its own: the batch, the
+/// channel reference and the external id
+/// (`smithy_query(query="operation", operation="PutAuditEvents")`).
+const REQUEST_MEMBERS: usize = 3;
+
+/// The largest batch the shared echo-collecting walk renders at all: it renders a composite
+/// from at most 256 children and keeps no rendering for one holding more, so a batch past
+/// this is stated with the framework's own count summary whatever this service allows. The
+/// other bound on the same rendering is its SIZE, which this service states separately
+/// ([`MAX_QUOTED_BATCH`]), so a batch of this many very large events is the case that bound
+/// answers.
+const LARGEST_RENDERED_BATCH: usize = 256;
+
 /// The member POSITIONS the echo-collecting walk may visit for one request of this
-/// service, stated from this model rather than taken from the shared default (256).
+/// service, stated from this model rather than taken from that walk's own default.
 ///
 /// A collection is quoted in a clause only when every one of its elements was walked, and
-/// the largest collection of STRUCTURES this model declares is `AuditEvents` (`@length`
-/// max 100 over `AuditEvent`: `smithy_query(query="shape", shape="AuditEvents")`), so the
-/// ceiling has to cover the 101 elements that break that bound. Each element contributes
-/// one position per leaf its three members bottom out in and one for the structure itself,
-/// so 101 of them need a little over 400. Past this the framework's own count summary
-/// stands, which is the fail-safe direction: a batch whose events each carry a
-/// megabyte-sized payload is not quoted at all rather than quoted short.
-const MAX_ECHO_POSITIONS: usize = 512;
+/// the clause this service states about the `auditEvents` member quotes the batch the
+/// request carried — at EVERY size that breaks the member's `@length` maximum (100:
+/// `smithy_query(query="shape", shape="AuditEvents")`), not only at the first size past it,
+/// since a caller chooses how far past the bound its batch runs. So the ceiling covers
+/// every batch that can be rendered at all: [`LARGEST_RENDERED_BATCH`] elements at
+/// [`ECHO_POSITIONS_PER_EVENT`] positions each, plus the request's own members. Past this
+/// the framework's own count summary stands, which is the fail-safe direction: a batch
+/// larger than any the walk renders is not quoted at all rather than quoted short.
+const MAX_ECHO_POSITIONS: usize =
+    ECHO_POSITIONS_PER_EVENT * LARGEST_RENDERED_BATCH + REQUEST_MEMBERS;
 
 /// The largest batch rendering one clause of this service quotes.
 ///

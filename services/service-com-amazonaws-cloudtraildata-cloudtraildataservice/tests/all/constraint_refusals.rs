@@ -27,7 +27,7 @@ const GOOD_EVENT: &str = r#"{"eventSource":"custom.app","eventName":"Login"}"#;
 
 /// The largest batch `auditEvents` admits, from the member's own `@length`
 /// (`smithy_query(query="shape", shape="AuditEvents")`: min 1, max 100).
-const MAX_BATCH: usize = 100;
+pub const MAX_BATCH: usize = 100;
 const MIN_BATCH: usize = 1;
 
 /// The expression `AuditEvent$id` is modelled with, and the bounds on it
@@ -50,7 +50,7 @@ fn unanchored(pattern: &str) -> &str {
 }
 
 /// The prose member of a refusal.
-fn message_of(reply: &Reply) -> String {
+pub fn message_of(reply: &Reply) -> String {
     reply
         .body
         .get("message")
@@ -60,7 +60,7 @@ fn message_of(reply: &Reply) -> String {
 }
 
 /// The envelope one clause travels in.
-fn one_violation(clause: &str) -> String {
+pub fn one_violation(clause: &str) -> String {
     format!("1 validation error detected: {clause}")
 }
 
@@ -68,7 +68,7 @@ fn one_violation(clause: &str) -> String {
 /// member it declares, in declaration order, with one the request left unset stated as
 /// `null` (`smithy_query(query="shape", shape="AuditEvent")`: id, eventData,
 /// eventDataChecksum).
-fn rendered_event(id: &str, event_data: &str, checksum: Option<&str>) -> String {
+pub fn rendered_event(id: &str, event_data: &str, checksum: Option<&str>) -> String {
     format!(
         "AuditEvent(id={id}, eventData={event_data}, eventDataChecksum={})",
         checksum.unwrap_or("null")
@@ -84,7 +84,7 @@ fn batch(count: usize) -> Vec<Ev> {
 
 /// How that batch reads inside a clause: the elements in order, comma-separated, in
 /// brackets.
-fn rendered_batch(events: &[Ev]) -> String {
+pub fn rendered_batch(events: &[Ev]) -> String {
     let elements: Vec<String> = events
         .iter()
         .map(|event| rendered_event(event.id(), event.data(), event.checksum()))
