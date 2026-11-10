@@ -51,6 +51,8 @@ mod idempotency_contents_and_refusal_fidelity;
 mod knowledge_base_lifecycle;
 #[path = "all/knowledge_base_listing_and_queries.rs"]
 mod knowledge_base_listing_and_queries;
+#[path = "all/message_template.rs"]
+mod message_template;
 #[path = "all/modelled_refusals.rs"]
 mod modelled_refusals;
 #[path = "all/notify_recommendations_error_text.rs"]

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMessageTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMessageTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMessageTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored message template the route names, out of the record
+//! `CreateMessageTemplate` wrote, so a create's answer and this read cannot disagree.
+//! `@readonly`: it writes nothing, so a read cannot change what a later caller sees.
+//!
+//! The `messageTemplateId` label may carry a version qualifier, and a label that carries
+//! none addresses `$LATEST` — the working copy — as the operation's own documentation
+//! states.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +80,24 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> GetMessageTemplateError {
+    GetMessageTemplateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400).
+fn validation(message: String) -> GetMessageTemplateError {
+    GetMessageTemplateErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,18 +171,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMessageTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMessageTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMessageTemplate"))
+        // `GetMessageTemplate` is `@readonly`: it reports the stored record and writes
+        // nothing, so a read cannot change what a later caller sees.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("GetMessageTemplate")
+        })?;
+        let store = state.lock();
+
+        // A message template is reachable only through the knowledge base it was created
+        // under, so the parent is resolved first and a knowledge base this account does
+        // not hold is reported as the resource that is missing.
+        let Some(knowledge_base) = store.knowledge_base(&input.knowledge_base_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND,
+                &input.knowledge_base_id,
+            ));
+        };
+        let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
+
+        // The label names the template and, optionally, ONE version of it. A label that
+        // carries no qualifier addresses `$LATEST` — "If it is not supplied, then $LATEST
+        // is assumed implicitly" — so the working copy is the default rather than a
+        // separate case.
+        let (message_template_id, qualifier) =
+            crate::state::resolve_qualified_id(&input.message_template_id);
+        let qualifier = qualifier.unwrap_or(crate::state::VERSION_QUALIFIER_LATEST);
+
+        // A label pair that crosses one knowledge base with another's template names
+        // nothing either.
+        let Some(message_template) = store.message_template(&knowledge_base_id, message_template_id)
+        else {
+            return Err(not_found(
+                crate::state::MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND,
+                &input.message_template_id,
+            ));
+        };
+
+        // Which version the qualifier addresses. `$LATEST` is the working copy, which is
+        // not a version: it reports neither `versionNumber` nor `isActive`, because neither
+        // member applies to it. Every other qualifier names a PUBLISHED version, and this
+        // store holds none — a version exists only once one is published out of the working
+        // copy — so such a label names nothing and gets this operation's not-found answer
+        // rather than the working copy under a version's name.
+        match crate::state::addressed_version(qualifier) {
+            Some(crate::state::AddressedVersion::Latest) => {}
+            Some(crate::state::AddressedVersion::Published) => {
+                return Err(not_found(
+                    crate::state::MESSAGE_MESSAGE_TEMPLATE_NOT_FOUND,
+                    &input.message_template_id,
+                ))
+            }
+            None => {
+                return Err(validation(crate::state::message_invalid_version_qualifier(
+                    qualifier,
+                )))
+            }
+        }
+
+        Ok(GetMessageTemplateOutput {
+            message_template: Some(message_template.to_extended_message_template_data(
+                qualifier,
+                // The working copy is not a version: see above.
+                None,
+                None,
+            )),
+        })
     }
 }

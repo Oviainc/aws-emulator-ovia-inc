@@ -6,6 +6,14 @@
 //! created inside one assistant and is reachable only through its parent. Everything a
 //! handler answers with is derived from the records kept here, so what one request
 //! writes is what the next request reads.
+//!
+//! One resource FAMILY whose records and projections stand on their own lives in a child
+//! module beside this one, re-exported here so every handler keeps reaching the store
+//! through `crate::state::…`.
+
+/// The message-template family: the record, its projections and its lookups.
+mod message_templates;
+pub use message_templates::*;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::SystemTime;
@@ -2922,6 +2930,11 @@ pub struct ComAmazonawsQconnectWisdomserviceState {
     /// names the knowledge base it lives in, so a lookup is always scoped to the parent
     /// the route named.
     pub contents: HashMap<String, Content>,
+    /// Every live message template, keyed by its `messageTemplateId`. Each record names
+    /// the knowledge base it belongs to, so a lookup is always scoped to the parent the
+    /// route named, and at most [`MAX_MESSAGE_TEMPLATES_PER_KNOWLEDGE_BASE`] of them
+    /// belong to any one knowledge base.
+    pub message_templates: HashMap<String, MessageTemplate>,
 }
 
 impl ComAmazonawsQconnectWisdomserviceState {
@@ -3168,8 +3181,8 @@ impl ComAmazonawsQconnectWisdomserviceState {
     /// `UntagResource` take an `Arn` rather than one family's path label
     /// (`smithy_query(query="operation",operation="ListTagsForResource")`), so the lookup
     /// covers EVERY family this store holds a tag map for — assistants, knowledge bases,
-    /// contents, sessions, AI guardrails, assistant associations and quick responses — and
-    /// reads the tags off that one stored record. Nothing is copied into a second place: a
+    /// contents, sessions, AI guardrails, assistant associations, quick responses and
+    /// message templates — and reads the tags off that one stored record. Nothing is copied into a second place: a
     /// tag a create persisted on its resource is the tag reported here, and a resource a
     /// delete removed holds none.
     ///
@@ -3214,6 +3227,13 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .filter(|quick_response| quick_response.quick_response_arn == resource_arn)
         {
             return Some(&quick_response.tags);
+        }
+        if let Some(message_template) = self
+            .message_templates
+            .get(id)
+            .filter(|template| template.message_template_arn == resource_arn)
+        {
+            return Some(&message_template.tags);
         }
         // A resource nested inside an assistant — a session, an AI agent, an AI guardrail
         // — is reachable only through its parent, whose id its ARN carries in the segment
@@ -3303,6 +3323,16 @@ impl ComAmazonawsQconnectWisdomserviceState {
                 .get_mut(&id)
                 .map(|quick_response| &mut quick_response.tags);
         }
+        if self
+            .message_templates
+            .get(&id)
+            .is_some_and(|template| template.message_template_arn == resource_arn)
+        {
+            return self
+                .message_templates
+                .get_mut(&id)
+                .map(|template| &mut template.tags);
+        }
         // A resource nested inside an assistant — a session, an AI agent, an AI guardrail
         // — is reachable only through its parent, whose id its ARN carries in the segment
         // before the resource's own.
@@ -3381,6 +3411,10 @@ impl ComAmazonawsQconnectWisdomserviceState {
         for quick_response_id in &orphaned {
             self.quick_responses.remove(quick_response_id);
         }
+        // A message template lives INSIDE its knowledge base on the same footing, so it
+        // goes the same way: a later read of one names nothing, and the name it held is
+        // released.
+        let templates = self.forget_message_templates_of(&knowledge_base.knowledge_base_id);
         let gone: Vec<String> = self
             .idempotency
             .iter()
@@ -3388,6 +3422,7 @@ impl ComAmazonawsQconnectWisdomserviceState {
                 created.resource_id == knowledge_base.knowledge_base_id
                     || contents.contains(&created.resource_id)
                     || orphaned.contains(&created.resource_id)
+                    || templates.contains(&created.resource_id)
             })
             .map(|(token, _)| token.clone())
             .collect();

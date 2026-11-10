@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMessageTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMessageTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMessageTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a message template INSIDE the knowledge base the route names, stores it, and
+//! answers out of the STORED record, so what this call reports is what every later
+//! `GetMessageTemplate` reports. The service answers the create with the template already
+//! usable through the `$LATEST` qualifier, so no status change is owed afterwards; a
+//! replayed `clientToken` answers with the template that token already created; a `name` a
+//! live template of the same knowledge base already holds is the conflict
+//! `ConflictException` describes.
 //!
 //! ## Shape of an operation
 //!
@@ -107,6 +106,58 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::MessageTemplate;
+
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> CreateMessageTemplateError {
+    CreateMessageTemplateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ConflictException` (HTTP 409).
+fn conflict(message: &str) -> CreateMessageTemplateError {
+    CreateMessageTemplateErrorModeled::ConflictException(ConflictException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400).
+fn validation(message: String) -> CreateMessageTemplateError {
+    CreateMessageTemplateErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The request member whose absence [`missing_member`] reports, as a caller names it.
+const MEMBER_NAME: &str = "name";
+
+/// The modelled `ValidationException` for a member the request had to carry and did not.
+///
+/// The sentence is the SAME one this endpoint's boundary states for an absent member — the
+/// framework's clause for that constraint, in the envelope
+/// `service_common::validation_message` renders every AWS constraint refusal in — so a
+/// member the model marks required and one this operation requires itself are refused in
+/// one wording rather than two. Its only variable part is the member name.
+fn missing_member(member: &str) -> CreateMessageTemplateError {
+    let clause = smithy_server_runtime::Violation {
+        path: member.to_string(),
+        kind: smithy_server_runtime::ViolationKind::MissingRequiredMember,
+        value: None,
+        sensitive: false,
+    }
+    .message();
+    validation(
+        ::service_common::validation_message::envelope_over(std::slice::from_ref(&clause))
+            .unwrap_or(clause),
+    )
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -180,18 +231,196 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMessageTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMessageTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMessageTemplate"))
+        // Modeled constraints (`name`'s and `description`'s length and pattern,
+        // `channelSubtype`'s value set, the content union's own bounds) are already
+        // refused BEFORE this handler runs, so reaching here means the input satisfies
+        // every one of them.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("CreateMessageTemplate")
+        })?;
+
+        // `MessageTemplateData.name` is `@required` while the request's `name` is not
+        // (`smithy_query(query="operation",operation="CreateMessageTemplate")`), so a
+        // create that names none could not produce the resource this operation answers
+        // with: it is refused where an absent member is refused, in the sentence this
+        // endpoint states for a member that must not be null.
+        let Some(name) = input.name.clone() else {
+            return Err(missing_member(MEMBER_NAME));
+        };
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A message template exists only inside a knowledge base, so the parent is
+        // resolved first: a create naming a knowledge base this account does not hold is
+        // not found, whatever else the request carries. Its id and ARN are read off the
+        // stored record rather than rebuilt, so the template reports the knowledge base's
+        // own ARN.
+        let Some(knowledge_base) = store.knowledge_base(&input.knowledge_base_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND,
+                &input.knowledge_base_id,
+            ));
+        };
+        let knowledge_base_id = knowledge_base.knowledge_base_id.clone();
+        let knowledge_base_arn = knowledge_base.knowledge_base_arn.clone();
+
+        // The `MessageTemplateContentProvider` union declares one member per channel
+        // subtype, each documented as the content that applies to THAT subtype, so content
+        // given under another subtype's member is not content for the template being
+        // created and the request is refused rather than stored half-meaningless.
+        if let Some(content) = input.content.as_ref() {
+            let applies_to = crate::state::content_channel_subtype(content);
+            if applies_to != input.channel_subtype {
+                return Err(validation(
+                    crate::state::message_content_channel_subtype_mismatch(
+                        &input.channel_subtype,
+                        crate::state::content_member_name(content),
+                    ),
+                ));
+            }
+        }
+        // `sourceConfiguration`'s own documentation states its rule — "Only set this
+        // argument for WHATSAPP channel subtype" — so a create that carries one for any
+        // other subtype is refused instead of persisting a configuration nothing reads.
+        if input.source_configuration.is_some()
+            && input.channel_subtype != crate::state::CHANNEL_SUBTYPE_WHATSAPP
+        {
+            return Err(validation(
+                crate::state::message_source_configuration_not_applicable(&input.channel_subtype),
+            ));
+        }
+
+        // The model puts no bound on the `tags` map, so the store does: AWS's tagging
+        // restrictions allow at most 50 tags on a resource, and a request past that is
+        // outside what the service accepts. The count is taken from what the caller sent,
+        // before the map is stored.
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(validation(crate::state::message_too_many_tags()));
+        }
+
+        // What this create's `@idempotencyToken` identifies: every member the record below
+        // is built from. Each shape that reaches a MAP is rendered in key order by the one
+        // helper this service renders it with (`crate::state::attributes_fingerprint`,
+        // `crate::state::tags_fingerprint`), so a replay of the identical request
+        // fingerprints identically whatever order a `HashMap` iterates in; the members that
+        // reach none are rendered by the helper that owns that decision.
+        // `groupingConfiguration` carries a criterion and a value list and reaches no map
+        // either, so its own `Debug` rendering is a deterministic, field-ordered one.
+        let fingerprint = crate::state::request_fingerprint(&[
+            name.clone(),
+            input.channel_subtype.clone(),
+            crate::state::content_fingerprint(input.content.as_ref()),
+            input.description.clone().unwrap_or_default(),
+            input.language.clone().unwrap_or_default(),
+            crate::state::source_configuration_fingerprint(input.source_configuration.as_ref()),
+            crate::state::attributes_fingerprint(input.default_attributes.as_ref()),
+            format!("{:?}", input.grouping_configuration),
+            crate::state::tags_fingerprint(&tags),
+        ]);
+
+        // A replayed `@idempotencyToken` answers with the message template it already
+        // created under THIS knowledge base rather than creating a second one, while the
+        // same token carrying a DIFFERENT request is the modelled idempotency conflict
+        // rather than a record the caller did not ask for. The token is scoped to this
+        // operation and this parent, so the same token on another create is another
+        // resource.
+        let token_scope = format!("{}/{knowledge_base_id}", Self::NAME);
+        match store.replayed_create(&token_scope, input.client_token.as_deref(), &fingerprint) {
+            crate::state::Replay::Conflict => {
+                return Err(conflict(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT))
+            }
+            crate::state::Replay::Retry(created) => {
+                if let Some(message_template) = store.message_template(&knowledge_base_id, &created)
+                {
+                    return Ok(CreateMessageTemplateOutput {
+                        message_template: Some(message_template.to_message_template_data()),
+                    });
+                }
+            }
+            crate::state::Replay::Fresh => {}
+        }
+
+        // This operation's own documentation states the rule — "The name of the message
+        // template has to be unique for each knowledge base" — so a create under a name a
+        // live template of this knowledge base already holds is the modelled conflict
+        // (HTTP 409) rather than a second record, and the refusal leaves the first
+        // untouched.
+        if store
+            .message_template_with_name(&knowledge_base_id, &name)
+            .is_some()
+        {
+            return Err(conflict(crate::state::MESSAGE_NAME_IN_USE));
+        }
+
+        // The knowledge base's message-template bound, which is what keeps this store
+        // finite.
+        if store.message_templates_of(&knowledge_base_id).len()
+            >= crate::state::MAX_MESSAGE_TEMPLATES_PER_KNOWLEDGE_BASE
+        {
+            return Err(
+                CreateMessageTemplateErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::message_message_template_quota()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(message_template_id) = store.mint_message_template_id() else {
+            return Err(validation(
+                "could not mint a unique messageTemplateId; retry the request".to_string(),
+            ));
+        };
+        store.insert_message_template(MessageTemplate {
+            message_template_arn: crate::state::message_template_arn(
+                &region,
+                &knowledge_base_id,
+                &message_template_id,
+            ),
+            message_template_id: message_template_id.clone(),
+            knowledge_base_id: knowledge_base_id.clone(),
+            knowledge_base_arn,
+            name,
+            channel_subtype: input.channel_subtype.clone(),
+            content: input.content.clone(),
+            description: input.description.clone(),
+            language: input.language.clone(),
+            source_configuration: input.source_configuration.clone(),
+            default_attributes: input.default_attributes.clone(),
+            grouping_configuration: input.grouping_configuration.clone(),
+            tags,
+            created_at: now,
+            // Nothing has modified the record yet, so it was last written when it was
+            // created…
+            last_modified_at: now,
+            // …and by whoever made this call.
+            last_modified_by: crate::state::caller_principal(),
+            // A template is created with no attachment: one is uploaded to it afterwards.
+            attachments: Vec::new(),
+        });
+        store.remember_create(
+            &token_scope,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &message_template_id,
+        );
+
+        // Render out of the INSERTED record rather than out of the request: what this call
+        // answers is what a later `GetMessageTemplate` answers.
+        let Some(stored) = store.message_template(&knowledge_base_id, &message_template_id) else {
+            // Unreachable: the insert above put this id in the map while the lock is held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateMessageTemplate",
+            ));
+        };
+        Ok(CreateMessageTemplateOutput {
+            message_template: Some(stored.to_message_template_data()),
+        })
     }
 }
