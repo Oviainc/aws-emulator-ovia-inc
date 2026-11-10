@@ -195,6 +195,8 @@ mod member_monitoring;
 mod member_monitoring_outstanding_invitation;
 #[path = "all/member_monitoring_restart.rs"]
 mod member_monitoring_restart;
+#[path = "all/member_monitoring_unanswered_invitation_addresses.rs"]
+mod member_monitoring_unanswered_invitation_addresses;
 #[path = "all/member_organization_auto_enable.rs"]
 mod member_organization_auto_enable;
 #[path = "all/member_relationship_scope.rs"]

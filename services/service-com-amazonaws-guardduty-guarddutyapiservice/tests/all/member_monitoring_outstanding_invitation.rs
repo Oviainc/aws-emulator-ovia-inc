@@ -42,13 +42,13 @@ use crate::member_association::{
 
 /// Where the two monitoring calls are bound under `/detector/{DetectorId}/member`,
 /// from their own `http` bindings (`smithy_query(operation="StopMonitoringMembers,\
-/// StartMonitoringMembers")`).
-const STOP: &str = "stop";
-const START: &str = "start";
+/// StartMonitoringMembers")`). Shared with the monitoring suites beside this one.
+pub(crate) const STOP: &str = "stop";
+pub(crate) const START: &str = "start";
 
 /// One member-batch call: the path segment under `/detector/{DetectorId}/member` and
 /// the accounts its `AccountIds` names.
-async fn member_call(
+pub(crate) async fn member_call(
     router: &Router,
     detector_id: &str,
     step: &str,
@@ -125,7 +125,7 @@ async fn detector_with_members_driven(router: &Router, steps: &[&str], case: &st
 }
 
 /// The `relationshipStatus` a read reports for one account.
-fn relationship_status(read: &Value, account_id: &str, case: &str) -> String {
+pub(crate) fn relationship_status(read: &Value, account_id: &str, case: &str) -> String {
     let member = member_of(read, account_id)
         .unwrap_or_else(|| panic!("case {case}: expected a member record, got {read:?}"));
     member["relationshipStatus"]
@@ -148,8 +148,9 @@ const RELATIONSHIPS: [(&str, &[&str]); 3] = [
 
 /// The monitoring-call sequences one row sends: each call alone, each order of the
 /// pair, and the pair repeated — so neither a single call, nor an order of them, nor a
-/// repetition can accumulate into a write.
-const SEQUENCES: [&[&str]; 5] = [
+/// repetition can accumulate into a write. Shared with the monitoring suites beside this
+/// one, so the sequences every one of them spans are enumerated once.
+pub(crate) const SEQUENCES: [&[&str]; 5] = [
     &[STOP],
     &[START],
     &[STOP, START],

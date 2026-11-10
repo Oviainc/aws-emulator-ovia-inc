@@ -37,11 +37,14 @@ use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
 
 /// One address under test: the account it belongs to, the address itself, why it is a
 /// row, and the relationship the send leaves the member in.
-struct Row {
-    account_id: &'static str,
-    email: &'static str,
-    why: &'static str,
-    expected: &'static str,
+///
+/// Shared with the monitoring suites, so what the catalogue of addresses is — and the
+/// relationship each send ends in — is stated in ONE place and no two suites drift on it.
+pub(crate) struct Row {
+    pub(crate) account_id: &'static str,
+    pub(crate) email: &'static str,
+    pub(crate) why: &'static str,
+    pub(crate) expected: &'static str,
 }
 
 /// The addresses whose domain can NEVER receive mail: the reserved special-use
@@ -55,7 +58,7 @@ struct Row {
 /// Beside them, addresses in ordinary domains — including the ones that merely LOOK
 /// reserved, where the reserved word is part of a longer label or of another
 /// namespace, which is the boundary of the catalogue.
-const ROWS: [Row; 14] = [
+pub(crate) const ROWS: [Row; 14] = [
     Row {
         account_id: "100000000001",
         email: "member@example.com",

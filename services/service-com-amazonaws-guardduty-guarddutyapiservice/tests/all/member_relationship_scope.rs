@@ -284,7 +284,10 @@ async fn stored(router: &Router, detector_id: &str, account_id: &str) -> Option<
 /// and not one this emulator can be asked to make on its behalf — while every call
 /// under test below is one the administrator itself sends. The same seam the
 /// free-trial suite uses to age a trial window no test can wait out.
-fn monitor_member(
+///
+/// Shared with the monitoring suites, so the one relationship no administrator
+/// request can reach is driven into the store from ONE place.
+pub(crate) fn monitor_member(
     engine: &engine::InMemoryEngine,
     detector_id: &str,
     account_id: &str,
