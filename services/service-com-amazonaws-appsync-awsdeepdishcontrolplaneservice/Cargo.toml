@@ -45,17 +45,23 @@ http-body-util = "0.1"
 # token, which is the only place a WebSocket client can put a request's own fields.
 base64 = "0.22"
 # `rquickjs` is the QuickJS JavaScript engine, embedded in this process, which is what RUNS
-# a channel namespace's `codeHandlers` — "the event handler functions that run custom
-# business logic to process published events and subscribe requests". It is an EXECUTION
-# SUBSTRATE: caller-supplied code runs in it, so every run is bounded in host code the code
-# cannot reach (wall clock, engine steps, memory, stack and answer size — see
-# `src/service/event_api/handlers.rs`).
+# the two kinds of APPSYNC_JS code this service is handed: a channel namespace's
+# `codeHandlers` — "the event handler functions that run custom business logic to process
+# published events and subscribe requests" (`src/service/event_api/handlers.rs`) — and the
+# `code` an `EvaluateCode` call asks to be evaluated
+# (`src/ops/evaluate_code/appsync_js.rs`). It is an EXECUTION SUBSTRATE: caller-supplied
+# code runs in it, so every run is bounded in host code the code cannot reach (wall clock,
+# engine steps, memory, stack, answer size, and — for the evaluation sandbox — how many log
+# lines and appended errors one run may produce), with the breach LATCHED in host state so
+# code that catches what the engine raises cannot report a result.
 #
 # `loader` is on so an `import` is resolved through this crate's own resolver, which answers
 # with ONE module of this emulator's own and with nothing else; `dyn-load` is NOT enabled,
 # so no host shared object can be loaded, and no other feature that reaches the host is on.
 # Plain QuickJS registers no filesystem, process, environment, network or thread API, and
-# this crate installs exactly one host function (the handler's own logging).
+# this crate installs only the host functions one run writes its own log, appended errors
+# and minted ids through. Each run gets a FRESH engine, so nothing of one call is reachable
+# from the next.
 #
 # It is also a NATIVE component: `rquickjs-sys` compiles the QuickJS C sources with `cc`
 # at build time, and the binding code is `unsafe` by nature; that is accepted because it is

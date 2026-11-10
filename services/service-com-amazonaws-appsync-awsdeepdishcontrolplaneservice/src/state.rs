@@ -3076,7 +3076,7 @@ pub fn map_out(map: &BTreeMap<String, String>) -> std::collections::HashMap<Stri
 }
 
 /// Wall-clock nanoseconds since the epoch, used only to seed the id counter.
-fn now_nanos() -> u64 {
+pub(crate) fn now_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(1, |d| d.as_nanos() as u64)
@@ -3085,7 +3085,7 @@ fn now_nanos() -> u64 {
 
 /// SplitMix64: a bijection on `u64`, so advancing the id counter through it never
 /// revisits a value before the counter wraps.
-fn splitmix64(state: u64) -> u64 {
+pub(crate) fn splitmix64(state: u64) -> u64 {
     let mut z = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);

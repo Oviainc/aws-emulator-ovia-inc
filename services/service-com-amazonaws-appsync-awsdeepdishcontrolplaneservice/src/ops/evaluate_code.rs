@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EvaluateCode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EvaluateCode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EvaluateCode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: RUNS the request's APPSYNC_JS code in the engine this process embeds
+//! ([`appsync_js`]) and answers with what the evaluated function returned, the lines it
+//! logged, the stash it left and the errors it appended; code the engine cannot compile, or
+//! that defines no function the request named, is refused `BadRequestException` with the
+//! `CODE_ERROR` detail. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +91,25 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The APPSYNC_JS sandbox the evaluated code runs in.
+///
+/// The `#[path]` is what points this declaration into `ops/evaluate_code/`: this file is
+/// itself declared with a `#[path]` from the generated `ops/mod.rs`, so a bare `mod` item
+/// in it resolves against `ops/` rather than against a directory of its own.
+#[path = "evaluate_code/appsync_js.rs"]
+pub mod appsync_js;
+
+use appsync_js::{
+    CodeFault, Evaluation, Outcome, DEFAULT_FUNCTION, EVALUATED_FUNCTIONS, STASH_MEMBER,
+};
+
+/// The only `runtimeVersion` the APPSYNC_JS runtime has: "The `version` of the runtime to
+/// use. Currently, the only allowed version is `1.0.0`"
+/// (`AppSyncRuntime$runtimeVersion`). The `name` member targets an enum, so a name other
+/// than `APPSYNC_JS` is already refused at the boundary; the version is a plain string, so
+/// this operation is where it is read.
+pub const APPSYNC_JS_RUNTIME_VERSION: &str = "1.0.0";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -165,18 +180,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EvaluateCode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EvaluateCodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EvaluateCode"))
+        // "Evaluates the given code and returns the response": the whole answer is that
+        // one run, and no resource is created, read or changed by it — so this handler
+        // holds no store guard, and a later caller sees exactly what it saw before.
+        let _ = (ctx, &self.engine);
+
+        // "Currently, only the APPSYNC_JS runtime is supported" and its only version is
+        // 1.0.0, so a request naming another version names a runtime nothing can run.
+        if input.runtime.runtime_version != APPSYNC_JS_RUNTIME_VERSION {
+            return Err(invalid_member("runtimeVersion"));
+        }
+
+        // "The function within the code to be evaluated. If provided, the valid values are
+        // request and response" — anything else names no function of a resolver.
+        let function = match input.function.as_deref() {
+            None => DEFAULT_FUNCTION.to_string(),
+            Some(named) if EVALUATED_FUNCTIONS.contains(&named) => named.to_string(),
+            Some(_) => return Err(bad_request(invalid_function_message())),
+        };
+
+        // "The map that holds all of the contextual information for your resolver
+        // invocation": a context that is not a map carries no member the code could read,
+        // so it is refused before anything runs.
+        let context = match ::serde_json::from_str::<::serde_json::Value>(&input.context) {
+            Ok(context) if context.is_object() => with_stash(context),
+            _ => return Err(invalid_member("context")),
+        };
+
+        answer(appsync_js::evaluate(input.code, function, context).await)
+    }
+}
+
+/// `context` with a stash on it, so the evaluated code can write to `ctx.stash` the way a
+/// resolver does: "A single stash object lives through a single resolver run", and the
+/// response reports it as the run left it. A context that already carries one keeps it.
+fn with_stash(mut context: ::serde_json::Value) -> ::serde_json::Value {
+    if let Some(members) = context.as_object_mut() {
+        members
+            .entry(STASH_MEMBER)
+            .or_insert_with(|| ::serde_json::Value::Object(::serde_json::Map::new()));
+    }
+    context
+}
+
+/// The response one evaluation is reported as.
+///
+/// A run that RETURNED answers with its `evaluationResult`; a run that raised, or that a
+/// bound stopped, answers 200 with the `error` payload instead, because the call itself was
+/// served — the code is what failed. Code the engine could not compile at all, or that
+/// defines no function the request named, is a malformed REQUEST
+/// ([`code_faults_refusal`]).
+fn answer(evaluation: Evaluation) -> Result<EvaluateCodeOutput, EvaluateCodeError> {
+    let Evaluation {
+        outcome,
+        logs,
+        stash,
+        out_errors,
+    } = evaluation;
+    let mut output = EvaluateCodeOutput {
+        logs: Some(logs),
+        stash,
+        out_errors,
+        ..Default::default()
+    };
+    match outcome {
+        Outcome::Returned(result) => output.evaluation_result = Some(result),
+        Outcome::Raised(message) | Outcome::Stopped(message) => {
+            output.error = Some(EvaluateCodeErrorDetail {
+                message: Some(message),
+                code_errors: None,
+            });
+        }
+        Outcome::Faults(faults) => return Err(code_faults_refusal(&faults)),
+    }
+    Ok(output)
+}
+
+/// The member a code fault is reported against.
+const CODE_MEMBER: &str = "code";
+
+/// The `reason` a code fault is reported under: "Provides context for the cause of the bad
+/// request. The only supported value is `CODE_ERROR`" (`BadRequestException$reason`), for
+/// which "the detail will contain a list of code errors" (`BadRequestDetail`).
+const CODE_ERROR_REASON: &str = "CODE_ERROR";
+
+/// The refusal text a `function` outside the two valid values takes: AppSync names the
+/// member and lists the values it accepts, so the sentence is built from that value set
+/// ([`EVALUATED_FUNCTIONS`]) rather than written out.
+fn invalid_function_message() -> String {
+    let quoted: Vec<String> = EVALUATED_FUNCTIONS
+        .iter()
+        .map(|function| format!("{function:?}"))
+        .collect();
+    format!("Function must be {}", quoted.join(", or "))
+}
+
+/// AppSync's own refusal for a member this operation cannot run with: the service's
+/// `BadRequestException` (400), naming the member the way every other refusal of this
+/// service names one (`crate::service`'s "Invalid <member> given.").
+fn invalid_member(member: &str) -> EvaluateCodeError {
+    bad_request(format!("Invalid {member} given."))
+}
+
+/// The operation's modelled `BadRequestException` (400) carrying `message`.
+fn bad_request(message: String) -> EvaluateCodeError {
+    EvaluateCodeErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The refusal for code that defines nothing this call could run: the same
+/// `BadRequestException`, with the `CODE_ERROR` reason and one `CodeError` per fault the
+/// engine reported, so a client can place each one in the code it sent.
+fn code_faults_refusal(faults: &[CodeFault]) -> EvaluateCodeError {
+    EvaluateCodeErrorModeled::BadRequestException(BadRequestException {
+        message: Some(format!("Invalid {CODE_MEMBER} given.")),
+        reason: Some(CODE_ERROR_REASON.to_string()),
+        detail: Some(BadRequestDetail {
+            code_errors: Some(faults.iter().map(code_error).collect()),
+        }),
+    })
+    .into()
+}
+
+/// One fault as the modelled `CodeError` reports it: its type, the user-presentable error
+/// the engine worded, and where in the code it sits.
+fn code_error(fault: &CodeFault) -> CodeError {
+    CodeError {
+        error_type: Some(fault.error_type.to_string()),
+        value: Some(fault.value.clone()),
+        location: Some(CodeErrorLocation {
+            line: fault.line,
+            column: fault.column,
+            span: fault.span,
+        }),
     }
 }

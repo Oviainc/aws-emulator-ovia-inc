@@ -57,6 +57,8 @@ mod domain_name_list;
 mod environment_variables;
 #[path = "all/error_contract.rs"]
 mod error_contract;
+#[path = "all/evaluate_code.rs"]
+mod evaluate_code;
 #[path = "all/event_api.rs"]
 mod event_api;
 #[path = "all/event_api_create_outcomes.rs"]
