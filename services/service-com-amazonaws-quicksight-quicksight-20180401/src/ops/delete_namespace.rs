@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +149,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNamespace"))
+        let request_id = crate::state::next_request_id();
+        // This operation's refusals and its output are built from the request and the
+        // store alone, so nothing here reads the request's metadata.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteNamespaceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        // The namespace every account has is not one of the namespaces a caller
+        // created, and nothing can take it away from the account: asking for it to be
+        // deleted is an invalid value for the `Namespace` parameter rather than a
+        // namespace that could not be found.
+        if input.namespace == crate::state::DEFAULT_NAMESPACE {
+            return Err(DeleteNamespaceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some("Cannot delete the default namespace.".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Whatever this call goes on to do, the deletions the clock already made due
+        // happened: their namespaces are gone before this one is looked up.
+        store.settle_namespace_deletions(now);
+
+        let key = (input.aws_account_id.clone(), input.namespace.clone());
+        let Some(record) = store.namespaces.get_mut(&key) else {
+            return Err(DeleteNamespaceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // The wording the namespace handlers beside this one answer a
+                    // namespace nobody holds with: one template for the refusal, so a
+                    // caller reads the same sentence whichever of them it called.
+                    message: Some(format!(
+                        "Namespace {} not found in account {}.",
+                        input.namespace, input.aws_account_id
+                    )),
+                    resource_type: Some(
+                        crate::state::EXCEPTION_RESOURCE_TYPE_NAMESPACE.to_string(),
+                    ),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        // Deleting a namespace is an asynchronous process, so the namespace enters the
+        // non-terminal deletion status now and the clock owes its removal a span later.
+        // A delete of a namespace already on its way out asks for nothing further: the
+        // instant its removal is due stands.
+        if record.deletion_settles_at.is_none() {
+            record.deletion_settles_at = Some(now + crate::state::NAMESPACE_DELETION_SPAN);
+        }
+        // The users and groups associated with the namespace are deleted with it. The
+        // assets — dashboards, analyses, datasets and data sources — are not: they
+        // belong to the account, and their own delete operations are what removes them.
+        store.remove_groups_in(&input.aws_account_id, &input.namespace);
+
+        Ok(DeleteNamespaceOutput {
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

@@ -435,9 +435,45 @@ pub const MAX_ACCOUNT_SUBSCRIPTIONS: usize = 10_000;
 impl ComAmazonawsQuicksightQuicksight20180401State {
     /// The namespace `aws_account_id` holds under `name`, or `None` when that account
     /// never created one — the stored record a read answers from.
+    ///
+    /// The record is returned whatever stage it has reached, a namespace whose
+    /// deletion already fell due included; a caller serving a request wants
+    /// [`Self::namespace_at`], which is that record only while the namespace is still
+    /// there.
     pub fn namespace(&self, aws_account_id: &str, name: &str) -> Option<&NamespaceRecord> {
         self.namespaces
             .get(&(aws_account_id.to_string(), name.to_string()))
+    }
+
+    /// The namespace a call addressing `(aws_account_id, name)` at `now` reaches: the
+    /// stored record, and only until the deletion the clock owes it falls due — from
+    /// that instant the namespace is gone whether or not anything has purged the map.
+    pub fn namespace_at(
+        &self,
+        aws_account_id: &str,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<&NamespaceRecord> {
+        self.namespace(aws_account_id, name)
+            .filter(|record| !record.is_deleted_at(now))
+    }
+
+    /// Materialises the namespace deletions the clock has already made due: each one
+    /// was owed at the same instant whether or not anybody called, so a handler that
+    /// takes the store may drop the records they left behind — and, with each namespace,
+    /// whatever groups it still held.
+    pub fn settle_namespace_deletions(&mut self, now: SystemTime) {
+        let gone: Vec<(String, String)> = self
+            .namespaces
+            .iter()
+            .filter(|(_, record)| record.is_deleted_at(now))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (aws_account_id, namespace) in gone {
+            self.namespaces
+                .remove(&(aws_account_id.clone(), namespace.clone()));
+            self.remove_groups_in(&aws_account_id, &namespace);
+        }
     }
 
     /// The namespace a read of `(aws_account_id, name)` reports.
@@ -452,7 +488,7 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
         region: &str,
         now: SystemTime,
     ) -> Option<NamespaceInfoV2> {
-        match self.namespace(aws_account_id, name) {
+        match self.namespace_at(aws_account_id, name, now) {
             Some(record) => Some(record.to_namespace_info(now)),
             None if name == DEFAULT_NAMESPACE => {
                 Some(default_namespace(region, aws_account_id).to_namespace_info(now))
@@ -461,19 +497,33 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
         }
     }
 
-    /// How many namespaces `aws_account_id` holds — what
-    /// [`MAX_NAMESPACES_PER_ACCOUNT`] is checked against.
-    pub fn namespace_count(&self, aws_account_id: &str) -> usize {
+    /// How many namespaces `aws_account_id` holds as of `now` — what
+    /// [`MAX_NAMESPACES_PER_ACCOUNT`] is checked against. A namespace whose deletion
+    /// fell due is gone, so it holds none of the account's quota.
+    pub fn namespace_count(&self, aws_account_id: &str, now: SystemTime) -> usize {
         self.namespaces
-            .keys()
-            .filter(|(account, _)| account == aws_account_id)
+            .iter()
+            .filter(|((account, _), record)| {
+                account == aws_account_id && !record.is_deleted_at(now)
+            })
             .count()
     }
 
-    /// Whether `(aws_account_id, name)` addresses a namespace that exists — the
-    /// stored one a create put there, or the namespace every account already has.
-    pub fn namespace_exists(&self, aws_account_id: &str, name: &str) -> bool {
-        self.namespace(aws_account_id, name).is_some() || name == DEFAULT_NAMESPACE
+    /// Whether `(aws_account_id, name)` addresses a namespace that exists as of `now` —
+    /// the stored one a create put there, or the namespace every account already has.
+    pub fn namespace_exists(&self, aws_account_id: &str, name: &str, now: SystemTime) -> bool {
+        self.namespace_at(aws_account_id, name, now).is_some() || name == DEFAULT_NAMESPACE
+    }
+
+    /// Removes the groups `(aws_account_id, namespace)` holds, answering how many went:
+    /// deleting a namespace deletes the users and groups associated with it, so they go
+    /// with the namespace rather than outliving it.
+    pub fn remove_groups_in(&mut self, aws_account_id: &str, namespace: &str) -> usize {
+        let before = self.groups.len();
+        self.groups.retain(|(account, group_namespace, _), _| {
+            account != aws_account_id || group_namespace != namespace
+        });
+        before - self.groups.len()
     }
 
     /// The group `(aws_account_id, namespace)` holds under `group_name`, or `None`
@@ -567,18 +617,33 @@ pub struct NamespaceRecord {
     /// than waited on: a reader materialises the transition the clock has already made
     /// due.
     pub creation_settles_at: SystemTime,
+    /// When the clock owes this namespace its removal, once a delete has asked for it;
+    /// `None` for a namespace no delete has addressed. Deleting a namespace is an
+    /// asynchronous process, so the record stays — reporting the non-terminal
+    /// `DELETING` status — until that instant, and is gone from then on.
+    pub deletion_settles_at: Option<SystemTime>,
     pub tags: Vec<Tag>,
 }
 
 impl NamespaceRecord {
     /// This namespace's `NamespaceStatus` as of `now`: the non-terminal creation status
-    /// until the transition the clock owes falls due, `CREATED` from then on.
+    /// until the transition the clock owes falls due, `CREATED` from then on, and the
+    /// non-terminal deletion status for as long as a delete it has been asked for is
+    /// still in flight.
     pub fn status_at(&self, now: SystemTime) -> &'static str {
-        if now >= self.creation_settles_at {
+        if self.deletion_settles_at.is_some() {
+            NAMESPACE_STATUS_DELETING
+        } else if now >= self.creation_settles_at {
             NAMESPACE_STATUS_CREATED
         } else {
             NAMESPACE_STATUS_CREATING
         }
+    }
+
+    /// Whether the deletion this namespace was asked for has fallen due as of `now` —
+    /// the instant from which the namespace is gone, so nothing reaches it any more.
+    pub fn is_deleted_at(&self, now: SystemTime) -> bool {
+        self.deletion_settles_at.is_some_and(|due| now >= due)
     }
 
     /// The modelled `NamespaceInfoV2` structure this record describes, as of `now`.
@@ -612,6 +677,9 @@ fn default_namespace(region: &str, aws_account_id: &str) -> NamespaceRecord {
         capacity_region: region.to_string(),
         identity_store: IDENTITY_STORE_QUICKSIGHT.to_string(),
         creation_settles_at: SystemTime::UNIX_EPOCH,
+        // The namespace every account has cannot be deleted, so no delete is ever in
+        // flight for it.
+        deletion_settles_at: None,
         tags: Vec::new(),
     }
 }
@@ -630,6 +698,12 @@ pub const NAMESPACE_STATUS_CREATED: &str = "CREATED";
 /// has elapsed.
 pub const NAMESPACE_STATUS_CREATING: &str = "CREATING";
 
+/// `NamespaceStatus` of a namespace whose deletion is still in flight (same model
+/// enum). `DeleteNamespace` is documented as an asynchronous process, so a namespace it
+/// accepted reports this non-terminal status until [`NAMESPACE_DELETION_SPAN`] has
+/// elapsed, and is gone from then on.
+pub const NAMESPACE_STATUS_DELETING: &str = "DELETING";
+
 /// The only `IdentityStore` the model admits, and so the store every namespace uses.
 pub const IDENTITY_STORE_QUICKSIGHT: &str = "QUICKSIGHT";
 
@@ -638,6 +712,13 @@ pub const IDENTITY_STORE_QUICKSIGHT: &str = "QUICKSIGHT";
 /// reading the namespace straight after the create still observes the non-terminal
 /// status the create reported, short enough to be over by the time anything polls.
 pub const NAMESPACE_CREATION_SPAN: Duration = Duration::from_secs(3);
+
+/// How long a namespace stays in `DELETING` before the clock owes its removal. Chosen
+/// on the same ground as [`NAMESPACE_CREATION_SPAN`] (QuickSight publishes no
+/// duration): long enough that a caller reading the namespace straight after the delete
+/// still observes the non-terminal status, short enough to be over by the time anything
+/// polls.
+pub const NAMESPACE_DELETION_SPAN: Duration = Duration::from_secs(3);
 
 /// How many namespaces one account may hold before `CreateNamespace` refuses with the
 /// modelled `LimitExceededException`. The model documents the limit: by default there

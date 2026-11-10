@@ -207,13 +207,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
 
         let mut store = state.lock();
+        // A namespace whose deletion the clock has already made due is gone, so the
+        // name it held is free again and the account's quota no longer counts it.
+        store.settle_namespace_deletions(now);
         let key = (input.aws_account_id.clone(), input.namespace.clone());
         // A namespace is unique within the account, and every account already has the
         // namespace the model's `Namespace` members call the default one, so neither can
         // be created a second time: a name already in use conflicts with the namespace
         // holding it.
-        if store.namespaces.contains_key(&key) || input.namespace == crate::state::DEFAULT_NAMESPACE
-        {
+        if store.namespace_exists(&input.aws_account_id, &input.namespace, now) {
             return Err(CreateNamespaceErrorModeled::ConflictException(
                 ConflictException {
                     message: Some(format!("The namespace {} already exists.", input.namespace)),
@@ -241,7 +243,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if store.namespace_count(&input.aws_account_id) >= crate::state::MAX_NAMESPACES_PER_ACCOUNT
+        if store.namespace_count(&input.aws_account_id, now)
+            >= crate::state::MAX_NAMESPACES_PER_ACCOUNT
         {
             return Err(CreateNamespaceErrorModeled::LimitExceededException(
                 LimitExceededException {
@@ -264,6 +267,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             capacity_region: capacity_region.clone(),
             identity_store: input.identity_store.clone(),
             creation_settles_at: now + crate::state::NAMESPACE_CREATION_SPAN,
+            // Nothing has asked for this namespace to be deleted yet.
+            deletion_settles_at: None,
             tags: input.tags.unwrap_or_default(),
         };
         // Creating a namespace is an asynchronous process, so the status this call

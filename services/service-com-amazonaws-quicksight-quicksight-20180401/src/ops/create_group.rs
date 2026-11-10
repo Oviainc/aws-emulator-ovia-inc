@@ -192,7 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A group belongs to a namespace: one the account does not hold is no place to
         // create a group in.
-        if !store.namespace_exists(&input.aws_account_id, &input.namespace) {
+        if !store.namespace_exists(
+            &input.aws_account_id,
+            &input.namespace,
+            std::time::SystemTime::now(),
+        ) {
             return Err(CreateGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(

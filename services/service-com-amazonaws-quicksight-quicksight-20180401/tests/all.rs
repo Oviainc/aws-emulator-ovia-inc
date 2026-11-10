@@ -17,6 +17,8 @@ mod data_set_permissions;
 mod data_source_data_set_lifecycle;
 #[path = "all/data_source_update.rs"]
 mod data_source_update;
+#[path = "all/delete_namespace.rs"]
+mod delete_namespace;
 #[path = "all/describe_namespace.rs"]
 mod describe_namespace;
 #[path = "all/iam_policy_assignment_lifecycle.rs"]
