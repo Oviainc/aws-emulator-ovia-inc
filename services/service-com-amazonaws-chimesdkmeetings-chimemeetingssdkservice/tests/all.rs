@@ -39,3 +39,5 @@ mod resource_tagging;
 mod state_roundtrip;
 #[path = "all/stop_meeting_transcription.rs"]
 mod stop_meeting_transcription;
+#[path = "all/transcription_engine_choice_message.rs"]
+mod transcription_engine_choice_message;

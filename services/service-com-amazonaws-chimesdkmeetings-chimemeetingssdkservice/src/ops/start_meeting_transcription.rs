@@ -237,6 +237,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// How the service words the one rule `TranscriptionConfiguration` itself states: the
+/// choice between the two engines' settings is EXCLUSIVE, so exactly one of them has to be
+/// there. The sentence is fixed text for this refusal — the only names in it are the
+/// modelled member names it cites, so neither half of the violation (neither block, or
+/// both blocks) nor anything else the request carried changes a word of it.
+const ENGINE_CHOICE_PROBLEM: &str = "Exactly one out of EngineTranscribeSettings and \
+     EngineTranscribeMedicalSettings must be specified in the TranscriptionConfiguration";
+
 /// The message for the first combination rule a `TranscriptionConfiguration` breaks, or
 /// `None` when it breaks none.
 ///
@@ -253,12 +261,11 @@ fn configuration_problem(configuration: &TranscriptionConfiguration) -> Option<S
     ) {
         // `TranscriptionConfiguration`: "Must contain EngineTranscribeSettings or
         // EngineTranscribeMedicalSettings." One engine transcribes the meeting's audio,
-        // so naming both is as unserveable as naming neither.
-        (None, None) | (Some(_), Some(_)) => Some(
-            "TranscriptionConfiguration must contain either EngineTranscribeSettings or \
-             EngineTranscribeMedicalSettings"
-                .to_string(),
-        ),
+        // so naming both is as unserveable as naming neither, and the service words the
+        // exclusive choice itself — one fixed sentence for both halves of the violation,
+        // naming the two engine members and the structure they sit in and nothing from
+        // the request.
+        (None, None) | (Some(_), Some(_)) => Some(ENGINE_CHOICE_PROBLEM.to_string()),
         (Some(settings), None) => transcribe_settings_problem(settings),
         // `EngineTranscribeMedicalSettings` constrains each member on its own —
         // `LanguageCode`, `Specialty` and `Type` are required and every member of it is an
