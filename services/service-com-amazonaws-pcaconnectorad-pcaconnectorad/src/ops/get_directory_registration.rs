@@ -170,12 +170,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetDirectoryRegistrationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "DirectoryRegistration was not found: {}.",
-                            input.directory_registration_arn
+                        message: crate::state::not_found_message(
+                            crate::state::RESOURCE_TYPE_DIRECTORY_REGISTRATION,
+                            &input.directory_registration_arn,
                         ),
                         resource_id: input.directory_registration_arn.clone(),
-                        resource_type: "DirectoryRegistration".to_string(),
+                        resource_type: crate::state::RESOURCE_TYPE_DIRECTORY_REGISTRATION
+                            .to_string(),
                     },
                 )
                 .into(),

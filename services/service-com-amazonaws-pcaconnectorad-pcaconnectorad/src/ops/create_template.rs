@@ -192,9 +192,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.connectors.contains_key(&input.connector_arn) {
             return Err(CreateTemplateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Connector {} not found", input.connector_arn),
+                    message: crate::state::not_found_message(
+                        crate::state::RESOURCE_TYPE_CONNECTOR,
+                        &input.connector_arn,
+                    ),
                     resource_id: input.connector_arn.clone(),
-                    resource_type: "Connector".to_string(),
+                    resource_type: crate::state::RESOURCE_TYPE_CONNECTOR.to_string(),
                 },
             )
             .into());

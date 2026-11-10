@@ -21,5 +21,9 @@ mod directory_registration_lifecycle;
 mod harness;
 #[path = "all/pagination_token_refusals.rs"]
 mod pagination_token_refusals;
+#[path = "all/pattern_refusal_messages.rs"]
+mod pattern_refusal_messages;
+#[path = "all/resource_not_found_messages.rs"]
+mod resource_not_found_messages;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

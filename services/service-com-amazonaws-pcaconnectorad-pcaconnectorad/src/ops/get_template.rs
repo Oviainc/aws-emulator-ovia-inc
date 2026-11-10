@@ -164,9 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.templates.get(&input.template_arn) else {
             return Err(GetTemplateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Template {} not found", input.template_arn),
+                    message: crate::state::not_found_message(
+                        crate::state::RESOURCE_TYPE_TEMPLATE,
+                        &input.template_arn,
+                    ),
                     resource_id: input.template_arn.clone(),
-                    resource_type: "Template".to_string(),
+                    resource_type: crate::state::RESOURCE_TYPE_TEMPLATE.to_string(),
                 },
             )
             .into());

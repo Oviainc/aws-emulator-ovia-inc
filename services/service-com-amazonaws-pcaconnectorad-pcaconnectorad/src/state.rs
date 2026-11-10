@@ -120,6 +120,29 @@ const PAGE_TOKEN_SEQ_WIDTH: usize = 16;
 /// template's object identifier sits under.
 const AD_TEMPLATE_OID_ARC: &str = "1.3.6.1.4.1.311.21.8";
 
+/// How this service words the refusal of a request naming a resource it does not
+/// hold: the resource's type, then the identifier the request supplied, then a full
+/// stop — `Connector was not found: <arn>.`
+///
+/// ONE wording for every resource type and every operation, because the sentence is
+/// the service's and not any one handler's: a handler that spelled it itself is how
+/// `GetConnector` and `GetDirectoryRegistration` came to answer the same failure in
+/// two different voices. The identifier is quoted exactly as the request carried it,
+/// so the caller reads back the value it sent rather than a normalised form of it.
+#[must_use]
+pub fn not_found_message(resource_type: &str, identifier: &str) -> String {
+    format!("{resource_type} was not found: {identifier}.")
+}
+
+/// The `ResourceType` a refusal names for each resource this service holds, spelled
+/// as the modelled shape names it.
+pub const RESOURCE_TYPE_CONNECTOR: &str = "Connector";
+/// See [`RESOURCE_TYPE_CONNECTOR`].
+pub const RESOURCE_TYPE_TEMPLATE: &str = "Template";
+/// See [`RESOURCE_TYPE_CONNECTOR`].
+pub const RESOURCE_TYPE_DIRECTORY_REGISTRATION: &str = "DirectoryRegistration";
+
+
 /// One persisted connector. Mirrors the modelled `Connector`/`ConnectorSummary`
 /// members, plus the bookkeeping the wire shapes do not carry (`seq` for stable
 /// list ordering, `active_at` for the clock-due settle, `tags`).

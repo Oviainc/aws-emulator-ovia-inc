@@ -24,8 +24,9 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. This service keeps the framework's envelope and states
+//!   one rendering of its own, a `@pattern` requirement quoted without the
+//!   whole-value anchors the model wraps it in. See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -96,17 +97,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // The centralized walk calls this on a framework-level refusal (a value
+        // outside a declared bound, a value a `@pattern` does not admit) to let this
+        // service state it its own way.
+        //
+        // This service answers the `ValidationException` envelope the framework
+        // already renders — same 400, same code, same `N validation error(s)
+        // detected:` prefix, same member paths, same echoed value — with ONE
+        // rendering of its own: a `@pattern` requirement is quoted as the expression
+        // a value has to satisfy, WITHOUT the `^` / `$` the model wraps it in to turn
+        // Smithy's find into a whole-value match. The anchoring is how the model
+        // spells that match, not part of the character grammar this service
+        // publishes, so a client that lifts the expression out of the message and
+        // re-validates locally gets the one the service advertises. The CHECK is
+        // unchanged: it still runs the model's pattern as written.
+        //
+        // That rendering is shared by every service on a JSON protocol (this one
+        // answers restJson1), so it lives in `service-common` rather than being
+        // spelled here, and it reaches every member of every operation this service
+        // models rather than the one `@pattern` a recording happened to break.
+        ::service_common::validation_message::aws_validation_refusal(refusal)
     }
 
     fn override_routing_error(
