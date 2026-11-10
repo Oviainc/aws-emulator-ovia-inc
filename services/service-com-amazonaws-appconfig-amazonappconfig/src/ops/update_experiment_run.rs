@@ -305,6 +305,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An inline override assigns an entity to a TREATMENT OF THIS EXPERIMENT, so the
+        // name it carries is checked against the treatments the run is delivering — the
+        // definition it was started from, as the run carries it — through the same function
+        // `StartExperimentRun` refuses through. A name no treatment of that definition
+        // carries assigns the entity to nothing, so the update is refused as a bad request
+        // and the stored assignment is left exactly as it was.
+        if let Some(reason) = input.treatment_overrides.as_ref().and_then(|overrides| {
+            crate::state::treatment_assignments::unknown_treatment_rejection(
+                overrides,
+                &crate::state::treatment_assignments::snapshot_treatment_keys(
+                    &run.definition_snapshot,
+                ),
+            )
+        }) {
+            return Err(UpdateExperimentRunErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(reason),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
+
         // "Audience exposure can only be increased, not decreased" (this operation's own
         // documentation), so an exposure below the one the run is already delivering is an
         // input this service will not satisfy, and nothing is written for it. An exposure

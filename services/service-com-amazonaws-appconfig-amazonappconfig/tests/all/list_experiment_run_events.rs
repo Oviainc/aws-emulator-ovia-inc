@@ -292,7 +292,7 @@ async fn the_timeline_of_a_started_run_reports_what_the_start_recorded() {
         ),
         (
             "one treatment override",
-            json!({ "TreatmentOverrides": { "Inline": string_map([("entity-1", "T1")]) } }),
+            json!({ "TreatmentOverrides": { "Inline": string_map([("entity-1", "t1")]) } }),
         ),
         (
             "several treatment overrides beside every other member",
@@ -300,9 +300,9 @@ async fn the_timeline_of_a_started_run_reports_what_the_start_recorded() {
                 "Description": "overridden assignment",
                 "ExposurePercentage": 37.5,
                 "TreatmentOverrides": { "Inline": string_map([
-                    ("entity-1", "T1"),
-                    ("entity-2", "C"),
-                    ("entity-3", "T1"),
+                    ("entity-1", "t1"),
+                    ("entity-2", "c"),
+                    ("entity-3", "t1"),
                 ]) },
             }),
         ),

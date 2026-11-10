@@ -170,7 +170,7 @@ fn assert_descending(case: &str, entries: &[Value]) {
 async fn an_update_records_one_entry_for_each_state_it_moved() {
     let router = router();
     let scope = scope(&router, "moved").await;
-    let one_override = json!({ "Inline": string_map([("entity-1", "T1")]) });
+    let one_override = json!({ "Inline": string_map([("entity-1", "t1")]) });
 
     // Rows differ along what the run already holds, which members the patch carries and
     // whether each of them MOVES the state it addresses.
@@ -227,8 +227,8 @@ async fn an_update_records_one_entry_for_each_state_it_moved() {
             "overrides replaced by a different assignment",
             json!({ "TreatmentOverrides": one_override.clone() }),
             json!({ "TreatmentOverrides": { "Inline": string_map([
-                ("entity-1", "C"),
-                ("entity-2", "T1"),
+                ("entity-1", "c"),
+                ("entity-2", "t1"),
             ]) } }),
             vec!["OVERRIDES_UPDATED"],
         ),
@@ -244,7 +244,7 @@ async fn an_update_records_one_entry_for_each_state_it_moved() {
             json!({
                 "Description": "both",
                 "ExposurePercentage": 2.5,
-                "TreatmentOverrides": { "Inline": string_map([("entity-9", "T1")]) },
+                "TreatmentOverrides": { "Inline": string_map([("entity-9", "t1")]) },
             }),
             vec!["EXPOSURE_UPDATED", "OVERRIDES_UPDATED"],
         ),
@@ -354,7 +354,7 @@ async fn the_timeline_is_served_most_recent_first_however_it_is_paged() {
     let router = router();
     let scope = scope(&router, "newest").await;
     let raise = json!({ "ExposurePercentage": 25.0 });
-    let reassign = json!({ "TreatmentOverrides": { "Inline": string_map([("entity-1", "T1")]) } });
+    let reassign = json!({ "TreatmentOverrides": { "Inline": string_map([("entity-1", "t1")]) } });
 
     // Rows differ along HOW MANY entries the timeline holds and which actions put them
     // there. Each action is its own call, so the order is the order the calls happened in,
@@ -490,7 +490,7 @@ async fn an_update_of_a_terminal_run_is_a_bad_request_and_writes_nothing() {
     let name = format!("{LABEL}-definition");
     let definition = create_test_definition(&router, &scope, &name).await;
     let definition_id = id_of(&name, &definition);
-    let overrides = json!({ "Inline": string_map([("entity-1", "T1")]) });
+    let overrides = json!({ "Inline": string_map([("entity-1", "t1")]) });
 
     // The refusal is exercised on TWO run numbers of the same definition, so the number the
     // template renders is not one row's constant: run 1 is stopped first, then run 2 serves
@@ -643,7 +643,7 @@ async fn a_walk_resumes_where_it_left_off_and_the_timeline_keeps_the_newest_entr
     // one entry: the timeline grows by one per call.
     let reassign = |entity: usize| {
         let key = format!("entity-{entity}");
-        json!({ "TreatmentOverrides": { "Inline": string_map([(key.as_str(), "T1")]) } })
+        json!({ "TreatmentOverrides": { "Inline": string_map([(key.as_str(), "t1")]) } })
     };
     for entity in 0..2 {
         let answered = update_run(

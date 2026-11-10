@@ -40,6 +40,7 @@ use crate::ops::types::{
 
 pub mod extension_actions;
 pub mod feature_flags;
+pub mod treatment_assignments;
 pub mod validators;
 
 /// `DeploymentState` values this service moves a deployment through. Each is a member

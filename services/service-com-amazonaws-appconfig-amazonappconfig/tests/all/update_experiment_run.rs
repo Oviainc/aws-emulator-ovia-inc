@@ -158,7 +158,7 @@ async fn an_update_patches_only_the_members_the_request_carries() {
     let full_start = json!({
         "Description": "as started",
         "ExposurePercentage": 25.0,
-        "TreatmentOverrides": { "Inline": { "entity-1": "T1", "entity-2": "C" } },
+        "TreatmentOverrides": { "Inline": { "entity-1": "t1", "entity-2": "c" } },
     });
     // `Description` is len 0..1024: the longest text the member takes.
     let longest_description = filler(1024, 9);
@@ -170,7 +170,7 @@ async fn an_update_patches_only_the_members_the_request_carries() {
             patch: json!({}),
             description: Some(json!("as started")),
             exposure: Some(json!(25.0)),
-            overrides: Some(json!({ "Inline": { "entity-1": "T1", "entity-2": "C" } })),
+            overrides: Some(json!({ "Inline": { "entity-1": "t1", "entity-2": "c" } })),
         },
         Patch {
             case: "a description alone replaces only the description",
@@ -178,7 +178,7 @@ async fn an_update_patches_only_the_members_the_request_carries() {
             patch: json!({ "Description": "revised while running" }),
             description: Some(json!("revised while running")),
             exposure: Some(json!(25.0)),
-            overrides: Some(json!({ "Inline": { "entity-1": "T1", "entity-2": "C" } })),
+            overrides: Some(json!({ "Inline": { "entity-1": "t1", "entity-2": "c" } })),
         },
         Patch {
             case: "a description at the lower length bound is a value, not an omission",
@@ -186,7 +186,7 @@ async fn an_update_patches_only_the_members_the_request_carries() {
             patch: json!({ "Description": "" }),
             description: Some(json!("")),
             exposure: Some(json!(25.0)),
-            overrides: Some(json!({ "Inline": { "entity-1": "T1", "entity-2": "C" } })),
+            overrides: Some(json!({ "Inline": { "entity-1": "t1", "entity-2": "c" } })),
         },
         Patch {
             case: "a description at the upper length bound",
@@ -194,7 +194,7 @@ async fn an_update_patches_only_the_members_the_request_carries() {
             patch: json!({ "Description": longest_description.clone() }),
             description: Some(json!(longest_description.clone())),
             exposure: Some(json!(25.0)),
-            overrides: Some(json!({ "Inline": { "entity-1": "T1", "entity-2": "C" } })),
+            overrides: Some(json!({ "Inline": { "entity-1": "t1", "entity-2": "c" } })),
         },
         Patch {
             case: "a description on a run that was started without one",
@@ -212,7 +212,7 @@ async fn an_update_patches_only_the_members_the_request_carries() {
             patch: json!({ "ExposurePercentage": 37.5 }),
             description: Some(json!("as started")),
             exposure: Some(json!(37.5)),
-            overrides: Some(json!({ "Inline": { "entity-1": "T1", "entity-2": "C" } })),
+            overrides: Some(json!({ "Inline": { "entity-1": "t1", "entity-2": "c" } })),
         },
         Patch {
             case: "an exposure increased to the upper range bound",
@@ -220,7 +220,7 @@ async fn an_update_patches_only_the_members_the_request_carries() {
             patch: json!({ "ExposurePercentage": 100.0 }),
             description: Some(json!("as started")),
             exposure: Some(json!(100.0)),
-            overrides: Some(json!({ "Inline": { "entity-1": "T1", "entity-2": "C" } })),
+            overrides: Some(json!({ "Inline": { "entity-1": "t1", "entity-2": "c" } })),
         },
         Patch {
             case: "an exposure at the lower range bound on a run started without one",
@@ -233,10 +233,10 @@ async fn an_update_patches_only_the_members_the_request_carries() {
         Patch {
             case: "overrides replace the stored assignment map rather than merging into it",
             start: full_start.clone(),
-            patch: json!({ "TreatmentOverrides": { "Inline": { "entity-9": "T1" } } }),
+            patch: json!({ "TreatmentOverrides": { "Inline": { "entity-9": "t1" } } }),
             description: Some(json!("as started")),
             exposure: Some(json!(25.0)),
-            overrides: Some(json!({ "Inline": { "entity-9": "T1" } })),
+            overrides: Some(json!({ "Inline": { "entity-9": "t1" } })),
         },
         Patch {
             case: "an empty inline override map clears the stored assignments",
@@ -250,16 +250,16 @@ async fn an_update_patches_only_the_members_the_request_carries() {
             case: "overrides on a run that was started without any",
             start: json!({ "ExposurePercentage": 12.5 }),
             patch: json!({ "TreatmentOverrides": { "Inline": {
-                "entity-1": "C",
-                "entity-2": "T1",
-                "entity-3": "T1",
+                "entity-1": "c",
+                "entity-2": "t1",
+                "entity-3": "t1",
             } } }),
             description: None,
             exposure: Some(json!(12.5)),
             overrides: Some(json!({ "Inline": {
-                "entity-1": "C",
-                "entity-2": "T1",
-                "entity-3": "T1",
+                "entity-1": "c",
+                "entity-2": "t1",
+                "entity-3": "t1",
             } })),
         },
         Patch {
@@ -268,11 +268,11 @@ async fn an_update_patches_only_the_members_the_request_carries() {
             patch: json!({
                 "Description": "wider audience",
                 "ExposurePercentage": 50.0,
-                "TreatmentOverrides": { "Inline": { "entity-7": "C" } },
+                "TreatmentOverrides": { "Inline": { "entity-7": "c" } },
             }),
             description: Some(json!("wider audience")),
             exposure: Some(json!(50.0)),
-            overrides: Some(json!({ "Inline": { "entity-7": "C" } })),
+            overrides: Some(json!({ "Inline": { "entity-7": "c" } })),
         },
         Patch {
             case: "deployment parameters alongside a patched member",
@@ -286,7 +286,7 @@ async fn an_update_patches_only_the_members_the_request_carries() {
             }),
             description: Some(json!("rolled wider")),
             exposure: Some(json!(25.0)),
-            overrides: Some(json!({ "Inline": { "entity-1": "T1", "entity-2": "C" } })),
+            overrides: Some(json!({ "Inline": { "entity-1": "t1", "entity-2": "c" } })),
         },
     ];
 
@@ -537,12 +537,12 @@ async fn an_update_whose_overrides_break_a_modelled_bound_is_refused_without_wri
         ),
         (
             "an override whose entity id is below its 1-character bound",
-            json!({ "TreatmentOverrides": { "Inline": one_pair("", "T1") } }),
+            json!({ "TreatmentOverrides": { "Inline": one_pair("", "t1") } }),
             Some("Member must have length greater than or equal to 1"),
         ),
         (
             "an override whose entity id is one character past its 2048 bound",
-            json!({ "TreatmentOverrides": { "Inline": one_pair(&filler(2049, 5), "T1") } }),
+            json!({ "TreatmentOverrides": { "Inline": one_pair(&filler(2049, 5), "t1") } }),
             Some("Member must have length less than or equal to 2048"),
         ),
         (
@@ -562,7 +562,7 @@ async fn an_update_whose_overrides_break_a_modelled_bound_is_refused_without_wri
         ),
         (
             "an override whose entity id is at its 2048 upper bound",
-            json!({ "TreatmentOverrides": { "Inline": one_pair(&filler(2048, 5), "C") } }),
+            json!({ "TreatmentOverrides": { "Inline": one_pair(&filler(2048, 5), "c") } }),
             None,
         ),
     ];

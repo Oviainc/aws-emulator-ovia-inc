@@ -406,7 +406,7 @@ async fn a_later_start_while_a_run_is_in_flight_is_refused_without_writing() {
             json!({
                 "Description": "must not be stored either",
                 "ExposurePercentage": 25.0,
-                "TreatmentOverrides": { "Inline": { "entity-1": "T1" } },
+                "TreatmentOverrides": { "Inline": { "entity-1": "t1" } },
                 "Tags": { "owner": "experiments" },
             }),
         ),
@@ -526,7 +526,7 @@ async fn a_started_run_reports_the_members_the_request_carried() {
         ),
         (
             "one treatment override",
-            json!({ "TreatmentOverrides": { "Inline": string_map([("entity-1", "T1")]) } }),
+            json!({ "TreatmentOverrides": { "Inline": string_map([("entity-1", "t1")]) } }),
         ),
         (
             "several treatment overrides and tags",
@@ -534,9 +534,9 @@ async fn a_started_run_reports_the_members_the_request_carried() {
                 "Description": "overridden assignment",
                 "ExposurePercentage": 12.5,
                 "TreatmentOverrides": { "Inline": string_map([
-                    ("entity-1", "T1"),
-                    ("entity-2", "C"),
-                    ("entity-3", "T1"),
+                    ("entity-1", "t1"),
+                    ("entity-2", "c"),
+                    ("entity-3", "t1"),
                 ]) },
                 "Tags": string_map([("owner", "experiments"), ("stage", "beta")]),
             }),
@@ -655,7 +655,7 @@ pub(crate) fn inline_overrides(count: usize) -> Value {
             .map(|index| {
                 (
                     format!("entity-{index}"),
-                    Value::from(if index % 2 == 0 { "T1" } else { "C" }),
+                    Value::from(if index % 2 == 0 { "t1" } else { "c" }),
                 )
             })
             .collect::<Map<String, Value>>(),
@@ -751,7 +751,7 @@ async fn a_start_past_a_modelled_bound_is_refused_without_writing() {
         },
         PastTheBound {
             case: "an override whose entity id is below its 1-character bound".to_string(),
-            body: json!({ "TreatmentOverrides": { "Inline": one_pair("", "T1") } }),
+            body: json!({ "TreatmentOverrides": { "Inline": one_pair("", "t1") } }),
             clause: Some((
                 "treatmentOverrides.inline",
                 "Member must have length greater than or equal to 1".to_string(),
@@ -759,7 +759,7 @@ async fn a_start_past_a_modelled_bound_is_refused_without_writing() {
         },
         PastTheBound {
             case: "an override whose entity id is one character past its 2048 bound".to_string(),
-            body: json!({ "TreatmentOverrides": { "Inline": one_pair(&filler(2049, 3), "T1") } }),
+            body: json!({ "TreatmentOverrides": { "Inline": one_pair(&filler(2049, 3), "t1") } }),
             clause: Some((
                 "treatmentOverrides.inline",
                 "Member must have length less than or equal to 2048".to_string(),
@@ -849,11 +849,11 @@ async fn a_start_past_a_modelled_bound_is_refused_without_writing() {
         ),
         (
             "an override whose entity id is at its 2048 upper bound",
-            json!({ "TreatmentOverrides": { "Inline": one_pair(&filler(2048, 3), "T1") } }),
+            json!({ "TreatmentOverrides": { "Inline": one_pair(&filler(2048, 3), "t1") } }),
         ),
         (
             "an override whose entity id is at its 1-character lower bound",
-            json!({ "TreatmentOverrides": { "Inline": one_pair("e", "C") } }),
+            json!({ "TreatmentOverrides": { "Inline": one_pair("e", "c") } }),
         ),
         (
             "a tag key at its 128 upper bound",

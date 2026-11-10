@@ -71,6 +71,8 @@ mod experiment_definitions;
 mod experiment_run_refusal_messages;
 #[path = "all/experiment_run_timeline.rs"]
 mod experiment_run_timeline;
+#[path = "all/experiment_run_treatment_assignment.rs"]
+mod experiment_run_treatment_assignment;
 #[path = "all/experiment_run_wire_fidelity.rs"]
 mod experiment_run_wire_fidelity;
 #[path = "all/extension_action_points.rs"]

@@ -169,7 +169,7 @@ async fn a_stop_ends_the_run_and_frees_the_definition() {
             "overrides assigned, stopped with every reason at the published maximum",
             json!({
                 "ExposurePercentage": 12.5,
-                "TreatmentOverrides": { "Inline": { "entity-1": "T1", "entity-2": "T1" } },
+                "TreatmentOverrides": { "Inline": { "entity-1": "t1", "entity-2": "t1" } },
             }),
             json!({
                 "Result": {
@@ -612,7 +612,7 @@ async fn a_stop_that_resolves_nothing_refuses_and_changes_nothing() {
         "the run under test",
         &scope,
         &name,
-        &json!({ "TreatmentOverrides": { "Inline": string_map([("entity-1", "T1")]) } }),
+        &json!({ "TreatmentOverrides": { "Inline": string_map([("entity-1", "t1")]) } }),
     )
     .await;
     // A second application, so the definition can be addressed under the wrong parent.
@@ -691,7 +691,7 @@ async fn a_stop_that_resolves_nothing_refuses_and_changes_nothing() {
     // document that carries one.
     assert_eq!(
         running_run.get("TreatmentOverrides"),
-        Some(&json!({ "Inline": string_map([("entity-1", "T1")]) })),
+        Some(&json!({ "Inline": string_map([("entity-1", "t1")]) })),
         "the run under test must carry the overrides the start assigned, got {running_run}"
     );
 }

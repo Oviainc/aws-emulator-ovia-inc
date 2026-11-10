@@ -24,6 +24,11 @@
 //! before anything is written, and stated in the same envelope the boundary refusal of a
 //! modelled constraint uses.
 //!
+//! WHICH treatment an assignment may name is not a constraint of the request at all but of
+//! the experiment it addresses, so it is checked once the definition is resolved, through
+//! `crate::state::treatment_assignments`: an assignment to a name the definition does not
+//! define is refused `BadRequestException` and creates no run.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -292,6 +297,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // An inline override assigns an entity to a TREATMENT OF THIS EXPERIMENT, so the
+        // name it carries is checked against the keys the definition just resolved actually
+        // defines — the modelled pattern says what such a name may look like, not which
+        // names exist. A name no treatment of the definition carries assigns the entity to
+        // nothing, so it is refused as a bad request, before anything is written and before
+        // any run number is issued.
+        if let Some(reason) = input.treatment_overrides.as_ref().and_then(|overrides| {
+            crate::state::treatment_assignments::unknown_treatment_rejection(
+                overrides,
+                &crate::state::treatment_assignments::definition_treatment_keys(definition),
+            )
+        }) {
+            return Err(StartExperimentRunErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(reason),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
 
         // A definition delivers one experiment at a time: while a run of it is still
         // running, a start of another conflicts with the state of the definition that
