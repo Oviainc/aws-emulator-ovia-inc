@@ -85,6 +85,8 @@ mod registry_schema_lifecycle;
 mod registry_write_resolution;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
+#[path = "all/resource_tag_application.rs"]
+mod resource_tag_application;
 #[path = "all/resource_tag_removal.rs"]
 mod resource_tag_removal;
 #[path = "all/resource_tags.rs"]

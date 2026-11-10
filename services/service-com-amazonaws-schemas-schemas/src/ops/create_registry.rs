@@ -152,6 +152,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::validate_names(Some(&input.registry_name), None).map_err(|refusal| {
             CreateRegistryError::from(CreateRegistryErrorModeled::BadRequestException(refusal))
         })?;
+        // The `Tags` map a create seeds the registry's tag set with is checked against
+        // the same bounds a later tag write is, so one resource may hold no more
+        // through its create than through `TagResource`. See
+        // `crate::state::validate_tags`.
+        crate::state::validate_tags(input.tags.as_ref()).map_err(|refusal| {
+            CreateRegistryError::from(CreateRegistryErrorModeled::BadRequestException(refusal))
+        })?;
 
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateRegistryError::from(CreateRegistryErrorModeled::InternalServerErrorException(

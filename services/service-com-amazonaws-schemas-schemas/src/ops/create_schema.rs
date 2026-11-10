@@ -195,6 +195,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             |refusal| CreateSchemaError::from(CreateSchemaErrorModeled::BadRequestException(refusal)),
         )?;
 
+        // The `Tags` map a create seeds the schema's tag set with is checked against
+        // the same bounds a later tag write is, so one resource may hold no more
+        // through its create than through `TagResource`. See
+        // `crate::state::validate_tags`.
+        crate::state::validate_tags(input.tags.as_ref()).map_err(|refusal| {
+            CreateSchemaError::from(CreateSchemaErrorModeled::BadRequestException(refusal))
+        })?;
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateSchemaError::from(CreateSchemaErrorModeled::InternalServerErrorException(
                 crate::state::internal_error(),

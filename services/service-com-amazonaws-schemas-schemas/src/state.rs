@@ -4734,5 +4734,12 @@ pub fn invalid_next_token() -> BadRequestException {
     ))
 }
 
+/// The bounds a tag set is kept within, and the refusals past them: the one
+/// caller-driven growth dimension the model constrains nowhere, so it carries its own
+/// ceilings beside [`MAX_REGISTRIES`] and the budgets around it. Re-exported, so every
+/// handler reaches them as `crate::state::…` like the rest of this store's helpers.
+mod tags;
+pub use tags::*;
+
 #[cfg(test)]
 mod tests;

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the tags a request carries to the resource its ARN names: a key the
+//! resource does not hold becomes one of its tags, a key it already holds takes the
+//! value this call carries, and every key the request does not name stays as it was —
+//! so every later read of that resource reports what this call left.
+//!
+//! What a tag set may hold is bounded here as every other caller-driven growth of this
+//! store is ([`crate::state::MAX_TAGS_PER_RESOURCE`] and the lengths beside it): the
+//! model constrains `Tags` nowhere, so a write past one of those bounds is refused and
+//! the stored set is left exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +162,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // A resource reports the ARN it carries in the region the request is signed
+        // for, so that region is what `ResourceArn` is resolved against. Nothing
+        // here derives an ARN itself.
+        let region = crate::state::request_region(ctx.parts());
+        // The `Tags` map the request carries is checked against the bounds a tag set
+        // is kept within FIRST, on the request alone: a map past them is refused
+        // before the store is reached rather than written and then lived with. See
+        // `crate::state::validate_tags`.
+        crate::state::validate_tags(Some(&input.tags)).map_err(|refusal| {
+            TagResourceError::from(TagResourceErrorModeled::BadRequestException(refusal))
+        })?;
+
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceError::from(TagResourceErrorModeled::InternalServerErrorException(
+                crate::state::internal_error(),
+            ))
+        })?;
+        // ONE lock for the resolve-then-write, so the tag set the pairs are applied
+        // to is the one the resolve found.
+        let mut state = store.lock();
+
+        // Which tag set the call writes to is the ARN's to say — the same ARN a read
+        // of these tags resolves — and only one in a registry the caller owns may be
+        // written to: every other answer is the refusal `refuse` words.
+        let tags = state
+            .writable_tags_for_arn(&input.resource_arn, &region)
+            .map_err(|refusal| refuse(&input.resource_arn, refusal))?;
+
+        // How many tags the write would LEAVE on the resource is only knowable here,
+        // beside the set it writes to: a key already held replaces a value and a new
+        // key grows the set, so the count is checked against the resource's ceiling
+        // before anything is inserted — a refused write leaves the stored set exactly
+        // as it was. See `crate::state::MAX_TAGS_PER_RESOURCE`.
+        let would_hold = crate::state::tag_count_after(tags, &input.tags);
+        if would_hold > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(
+                TagResourceErrorModeled::BadRequestException(crate::state::tags_cap_reached(
+                    would_hold,
+                ))
+                .into(),
+            );
+        }
+
+        // The point of the call: every key the request carries is a tag of the
+        // resource afterwards, holding the value the request carries for it — a key
+        // the resource already held takes that value rather than keeping its old one
+        // or being refused — and every key the request does not name stays exactly as
+        // it was. So the same request repeated answers the same way and leaves the
+        // same tag set, and a request carrying no pair asks for the state the
+        // resource is already in.
+        for (key, value) in &input.tags {
+            tags.insert(key.clone(), value.clone());
+        }
+
+        // A `Unit` output: the application is the whole answer, at the modelled 204.
+        Ok(TagResourceOutput)
     }
+}
+
+/// Word a `ResourceArn` that names no tag set this call may write as the variant of
+/// this operation's modelled error set that carries it.
+///
+/// The resolve states WHY the ARN names no writable tag set; this only chooses the
+/// modelled shape — and so the status — for each: a value that is no resource ARN of
+/// this service is a bad request (400), one naming a resource this store does not
+/// hold is not found (404), and one naming AWS-owned content is forbidden (403),
+/// which is the refusal every other write to a service-owned registry gets.
+fn refuse(resource_arn: &str, refusal: crate::state::ResourceArnWriteError) -> TagResourceError {
+    match refusal {
+        crate::state::ResourceArnWriteError::NotAResourceArn => {
+            TagResourceErrorModeled::BadRequestException(
+                crate::state::resource_arn_not_a_resource_arn(),
+            )
+        }
+        crate::state::ResourceArnWriteError::NoSuchResource => {
+            TagResourceErrorModeled::NotFoundException(crate::state::tagged_resource_not_found(
+                resource_arn,
+            ))
+        }
+        crate::state::ResourceArnWriteError::ServiceOwned(registry) => {
+            TagResourceErrorModeled::ForbiddenException(
+                crate::state::managed_registry_is_read_only(&registry),
+            )
+        }
+    }
+    .into()
 }

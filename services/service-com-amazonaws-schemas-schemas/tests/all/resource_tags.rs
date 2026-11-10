@@ -262,6 +262,40 @@ pub(crate) async fn create_tagged(
     }
 }
 
+/// The tags a resource holds now, read through BOTH readers of one stored tag map —
+/// `ListTagsForResource` and the resource's own Describe — which must agree.
+///
+/// The crate's one reader for a tag-write test: the suites that drive `TagResource` and
+/// `UntagResource` both check what a write LEFT through this, so the two cannot drift
+/// apart on what "the resource's tags" means.
+pub(crate) async fn tags_now(
+    emulator: &Emulator,
+    case: &str,
+    created: &Created,
+) -> BTreeMap<String, String> {
+    let listed = emulator.call("GET", &tags_uri(&created.arn), None).await;
+    assert_eq!(
+        listed.status, 200,
+        "case {case:?}: expected 200 from ListTagsForResource, got {} {:?}",
+        listed.status, listed.body
+    );
+    let described = emulator.call("GET", &created.describe_uri, None).await;
+    assert_eq!(
+        described.status, 200,
+        "case {case:?}: expected 200 from the resource's Describe, got {} {:?}",
+        described.status, described.body
+    );
+    assert_eq!(
+        reported_tags(&described, case),
+        reported_tags(&listed, case),
+        "case {case:?}: the resource's Describe and ListTagsForResource must report \
+         one stored tag set, got {:?} and {:?}",
+        described.body.get("tags"),
+        listed.body.get("tags")
+    );
+    reported_tags(&listed, case)
+}
+
 /// A resource name that is legal for every one of the three types and distinct per row.
 pub(crate) fn resource_name(kind: Kind, row: usize) -> String {
     let kind = match kind {

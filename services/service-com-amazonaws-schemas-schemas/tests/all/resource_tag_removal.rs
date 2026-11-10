@@ -31,7 +31,8 @@ use service_com_amazonaws_schemas_schemas::state::{
 
 use crate::registry_schema_lifecycle::{registry_uri, Emulator, ACCOUNT, REGION};
 use crate::resource_tags::{
-    create_tagged, percent_encode, reported_tags, resource_name, tags, tags_uri, Created, Kind,
+    create_tagged, percent_encode, reported_tags, resource_name, tags, tags_now, tags_uri, Created,
+    Kind,
 };
 
 /// `UntagResource`'s route (`DELETE /tags/{ResourceArn}?tagKeys=…`): the ARN in its
@@ -139,32 +140,6 @@ fn expected_tags(case: &Case) -> BTreeMap<String, String> {
         .filter(|(key, _)| !case.remove.contains(key))
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
         .collect()
-}
-
-/// The tags a resource holds now, read through BOTH readers of one stored tag map —
-/// `ListTagsForResource` and the resource's own Describe — which must agree.
-async fn tags_now(emulator: &Emulator, case: &str, created: &Created) -> BTreeMap<String, String> {
-    let listed = emulator.call("GET", &tags_uri(&created.arn), None).await;
-    assert_eq!(
-        listed.status, 200,
-        "case {case:?}: expected 200 from ListTagsForResource, got {} {:?}",
-        listed.status, listed.body
-    );
-    let described = emulator.call("GET", &created.describe_uri, None).await;
-    assert_eq!(
-        described.status, 200,
-        "case {case:?}: expected 200 from the resource's Describe, got {} {:?}",
-        described.status, described.body
-    );
-    assert_eq!(
-        reported_tags(&described, case),
-        reported_tags(&listed, case),
-        "case {case:?}: the resource's Describe and ListTagsForResource must report \
-         one stored tag set, got {:?} and {:?}",
-        described.body.get("tags"),
-        listed.body.get("tags")
-    );
-    reported_tags(&listed, case)
 }
 
 /// RULE: `UntagResource` removes exactly the keys the request names from the resource

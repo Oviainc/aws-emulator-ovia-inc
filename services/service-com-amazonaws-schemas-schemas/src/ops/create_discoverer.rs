@@ -155,6 +155,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx.parts());
+        // The `Tags` map a create seeds the discoverer's tag set with is checked
+        // against the same bounds a later tag write is, so one resource may hold no
+        // more through its create than through `TagResource`. See
+        // `crate::state::validate_tags`.
+        crate::state::validate_tags(input.tags.as_ref()).map_err(|refusal| {
+            CreateDiscovererError::from(CreateDiscovererErrorModeled::BadRequestException(refusal))
+        })?;
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateDiscovererError::from(
                 CreateDiscovererErrorModeled::InternalServerErrorException(
