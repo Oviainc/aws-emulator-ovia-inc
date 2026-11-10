@@ -21,6 +21,8 @@ mod api_cache_refusal_messages;
 mod api_key_deletes_drawn_expirations;
 #[path = "all/api_key_deletes_listing_agreement.rs"]
 mod api_key_deletes_listing_agreement;
+#[path = "all/api_key_deletes_unmoved_by_other_calls.rs"]
+mod api_key_deletes_unmoved_by_other_calls;
 #[path = "all/api_key_deletion_window.rs"]
 mod api_key_deletion_window;
 #[path = "all/api_key_update.rs"]
