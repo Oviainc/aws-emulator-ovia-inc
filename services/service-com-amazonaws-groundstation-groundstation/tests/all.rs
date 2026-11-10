@@ -55,6 +55,8 @@ mod contact_pointing_ephemeris;
 mod contact_satellite_reference_integrity;
 #[path = "all/contact_version_description.rs"]
 mod contact_version_description;
+#[path = "all/contact_version_last_updated.rs"]
+mod contact_version_last_updated;
 #[path = "all/contact_version_listing.rs"]
 mod contact_version_listing;
 #[path = "all/contact_versions.rs"]

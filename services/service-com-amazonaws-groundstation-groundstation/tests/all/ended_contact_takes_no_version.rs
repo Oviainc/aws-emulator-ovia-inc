@@ -170,8 +170,9 @@ async fn described_version(
 }
 
 /// The members of a version record that say where the version STANDS, with its
-/// `lastUpdated` left out: that one tracks the contact's own, which a release the contact
-/// is still carrying out moves on its own.
+/// `lastUpdated` left out: a version's last change is its supersession, else its
+/// activation, else its creation, so `lastUpdated` is settled by the three instants
+/// above and comparing it again adds nothing.
 fn version_standing(version: &Value) -> Value {
     json!({
         "versionId": version.get("versionId").cloned(),
@@ -187,10 +188,10 @@ fn history_standing(history: &[Value]) -> Vec<Value> {
     history.iter().map(version_standing).collect()
 }
 
-/// The contact's own `lastUpdated` as it reaches the wire: its NEWEST version's, which is
-/// the record every later change to the contact lands on (`ContactVersion$lastUpdated` —
+/// The `lastUpdated` the contact's NEWEST version reports as it reaches the wire — the
+/// version each row's in-flight change appended (`ContactVersion$lastUpdated` —
 /// `smithy_query(query="operation", operation="DescribeContact")`, whose output carries
-/// the contact's `version`).
+/// the contact's `version`), so it stands still unless that version itself moves.
 fn reported_last_updated(described: &Reply) -> Value {
     described
         .field("version")
@@ -375,7 +376,7 @@ async fn a_contact_with_no_pass_left_takes_none_of_the_version_changes_still_in_
             assert_ne!(
                 reported_last_updated(&after),
                 reported_last_updated(before),
-                "case {case}: applying a version is a change to the contact, so its \
+                "case {case}: applying a version is a change to THAT version, so its \
                  lastUpdated moves with it, got {}",
                 reported_last_updated(&after)
             );
@@ -461,7 +462,7 @@ async fn a_contact_with_no_pass_left_takes_none_of_the_version_changes_still_in_
             assert_eq!(
                 reported_last_updated(&after),
                 reported_last_updated(before),
-                "case {case}: nothing changed the contact after the ending, so its \
+                "case {case}: nothing moved the newest version after the ending, so its \
                  lastUpdated must stand at {}, got {}",
                 reported_last_updated(before),
                 reported_last_updated(&after)

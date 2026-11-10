@@ -314,6 +314,24 @@ impl ContactVersionRecord {
             activates_at: None,
         }
     }
+
+    /// When THIS version was last updated, as `ContactVersion$lastUpdated` reports it
+    /// ("time the contact version was last updated in UTC").
+    ///
+    /// A version record is touched exactly three times, each by a move of its own, and
+    /// the last of them that has happened is the answer: it was superseded ("a version is
+    /// superseded when a newer version becomes active"), else it was activated ("a version
+    /// is activated when it becomes the current active version of the contact"), else it
+    /// has only ever been created. Those instants are ordered `created <= activated <=
+    /// superseded`, so the newest one present is the latest change to the version.
+    ///
+    /// Deliberately independent of the CONTACT's own `lastUpdated`: a contact changes for
+    /// reasons that touch no version record of it — its pass reaching a new stage, its
+    /// reservation being confirmed or released, another version being appended or taking
+    /// force — and none of those is an update to a version that stood still through them.
+    pub fn last_updated(&self) -> DateTime {
+        self.superseded.or(self.activated).unwrap_or(self.created)
+    }
 }
 
 /// The `ContactStatus` values in which a contact's reservation holds NO antenna at the
@@ -591,16 +609,21 @@ impl Contact {
     }
 
     /// `record` as a `ContactVersion` response member.
+    ///
+    /// The one projection every reader of a contact version goes through — the history
+    /// `ListContactVersions` pages over ([`Contact::version_history`]), the named version
+    /// `DescribeContactVersion` answers and the newest one `DescribeContact` and
+    /// `ListContacts` report ([`Contact::version`]) — so every one of them reports a
+    /// version the same way.
     pub fn version_record(&self, record: &ContactVersionRecord) -> ContactVersion {
         ContactVersion {
             version_id: Some(record.version_id),
             created: Some(record.created),
             activated: record.activated,
             superseded: record.superseded,
-            // A version that has been superseded was last touched when it was
-            // superseded; the newest version is the one every later change to the
-            // contact lands on, so its lastUpdated is the contact's own.
-            last_updated: Some(record.superseded.unwrap_or(self.last_updated)),
+            // The version's OWN last change, not the contact's: see
+            // [`ContactVersionRecord::last_updated`].
+            last_updated: Some(record.last_updated()),
             status: Some(record.status.clone()),
             // Nothing in this emulator fails applying a version, so the members
             // reporting a failed update carry nothing.
