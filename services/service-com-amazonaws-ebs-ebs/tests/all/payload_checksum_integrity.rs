@@ -28,7 +28,7 @@ use crate::snapshot_block_loop::{
 
 /// How the refusal states the two checksums: the one computed over the received payload,
 /// then the one the request presented.
-fn mismatch_message(computed: &str, supplied: &str) -> String {
+pub(crate) fn mismatch_message(computed: &str, supplied: &str) -> String {
     format!(
         "The value passed in as x-amz-Checksum does not match the computed checksum. \
          Computed checksum: {computed} expected checksum: {supplied}"
@@ -38,7 +38,7 @@ fn mismatch_message(computed: &str, supplied: &str) -> String {
 /// The `message` member of a refusal body. The signing layer's class is not one of this
 /// service's modelled shapes, so its message travels in the lower-case member every AWS
 /// framework error carries.
-fn lowercase_message(reply: &crate::snapshot_block_loop::Reply) -> String {
+pub(crate) fn lowercase_message(reply: &crate::snapshot_block_loop::Reply) -> String {
     reply
         .json()
         .get("message")

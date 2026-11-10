@@ -33,12 +33,12 @@ use crate::snapshot_block_loop::{
 const SNAPSHOT_NOT_FOUND_REASON: &str = "SNAPSHOT_NOT_FOUND";
 
 /// The sentence every snapshot not-found refusal carries, naming the snapshot.
-fn not_found_message(snapshot_id: &str) -> String {
+pub(crate) fn not_found_message(snapshot_id: &str) -> String {
     format!("The snapshot '{snapshot_id}' does not exist.")
 }
 
 /// Assert `reply` is the snapshot not-found refusal for `snapshot_id`.
-fn assert_not_found(case: &str, reply: &Reply, snapshot_id: &str) {
+pub(crate) fn assert_not_found(case: &str, reply: &Reply, snapshot_id: &str) {
     assert_eq!(
         reply.status, 404,
         "case {case:?}: a snapshot the read path cannot see must be refused 404, got {} with \

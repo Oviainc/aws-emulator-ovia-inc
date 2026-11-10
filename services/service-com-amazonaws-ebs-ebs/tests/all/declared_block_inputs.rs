@@ -38,12 +38,12 @@ use crate::snapshot_block_loop::{
 const BLOCKS_PER_GIB: i32 = (1024 * 1024 * 1024) / BLOCK_SIZE;
 
 /// The template `PutSnapshotBlock` refuses an unsupported `DataLength` with.
-fn invalid_length_message(data_length: i32) -> String {
+pub(crate) fn invalid_length_message(data_length: i32) -> String {
     format!("Block data length {data_length} is not valid, expected {BLOCK_SIZE}")
 }
 
 /// The template `PutSnapshotBlock` refuses an out-of-extent `BlockIndex` with.
-fn beyond_extent_message(block_index: i32) -> String {
+pub(crate) fn beyond_extent_message(block_index: i32) -> String {
     format!("Block index {block_index} is beyond the volume size extent")
 }
 
@@ -70,7 +70,7 @@ async fn pending_snapshot(
 }
 
 /// Assert `reply` is the modelled `ValidationException` carrying `reason` and `message`.
-fn assert_validation(case: &str, reply: &Reply, reason: &str, message: &str) {
+pub(crate) fn assert_validation(case: &str, reply: &Reply, reason: &str, message: &str) {
     assert_eq!(
         reply.status, 400,
         "case {case:?}: a declared value the service does not accept must be refused 400, \

@@ -23,6 +23,8 @@ mod minted_query_tokens;
 mod payload_checksum_integrity;
 #[path = "all/read_path_requires_a_completed_snapshot.rs"]
 mod read_path_requires_a_completed_snapshot;
+#[path = "all/refusal_order.rs"]
+mod refusal_order;
 #[path = "all/response_bodies_and_refusals.rs"]
 mod response_bodies_and_refusals;
 #[path = "all/sealed_status_and_fixed_refusal_text.rs"]
