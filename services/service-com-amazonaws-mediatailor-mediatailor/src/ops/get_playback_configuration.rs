@@ -242,15 +242,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(record) = store.playback_configurations.get(&input.name) else {
-            return Err(GetPlaybackConfigurationErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(format!(
-                        "No playback configuration is named {}.",
-                        input.name
-                    )),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                crate::state::playback_configuration_not_found_message(&input.name),
+            ));
         };
         let tags: HashMap<String, String> = store.tags_of(&record.arn);
 

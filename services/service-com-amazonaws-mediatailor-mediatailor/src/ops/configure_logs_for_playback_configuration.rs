@@ -268,17 +268,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .playback_configurations
             .get_mut(&input.playback_configuration_name)
         else {
-            return Err(
-                ConfigureLogsForPlaybackConfigurationErrorModeled::BadRequestException(
-                    BadRequestException {
-                        message: Some(format!(
-                            "No playback configuration is named {}.",
-                            input.playback_configuration_name
-                        )),
-                    },
-                )
-                .into(),
-            );
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                crate::state::playback_configuration_not_found_message(
+                    &input.playback_configuration_name,
+                ),
+            ));
         };
 
         // This call defines where the configuration's logs go, so what it

@@ -27,7 +27,9 @@
 
 use serde_json::{json, Value};
 
-use crate::channel_lifecycle::{encode, table, Emulator, Reply};
+use crate::channel_lifecycle::{
+    encode, table, Emulator, Reply, CHANNEL_NOT_FOUND_MESSAGE, NOT_FOUND_CODE, NOT_FOUND_STATUS,
+};
 
 /// The two calls under test. `ChannelState`'s modelled values are `RUNNING |
 /// STOPPED` (`shared_types::CHANNEL_STATE_VALUES`), and the operations' own
@@ -277,26 +279,27 @@ async fn a_name_the_account_holds_no_channel_under_is_refused() {
         for which in [Call::Start, Call::Stop] {
             let refused = call(&emulator, name, which).await;
             assert_eq!(
-                refused.status, 400,
+                refused.status, NOT_FOUND_STATUS,
                 "case {name:?}/{which:?}: expected a channel the account does not hold to be \
-                 refused with 400, got {} {:?}",
+                 refused as not found, got {} {:?}",
                 refused.status, refused.body
             );
             assert_eq!(
-                refused.error_code, "BadRequestException",
-                "case {name:?}/{which:?}: expected BadRequestException, got {:?}",
+                refused.error_code, NOT_FOUND_CODE,
+                "case {name:?}/{which:?}: expected {NOT_FOUND_CODE}, got {:?}",
                 refused.error_code
             );
-            assert!(
-                refused.message().contains(name),
-                "case {name:?}/{which:?}: expected the refusal to name the channel, got {:?}",
+            assert_eq!(
+                refused.message(),
+                CHANNEL_NOT_FOUND_MESSAGE,
+                "case {name:?}/{which:?}: expected the channel-miss sentence, got {:?}",
                 refused.message()
             );
 
             // The refused call stored nothing: the name is still free.
             let missing = emulator.describe(name).await;
             assert_eq!(
-                missing.status, 400,
+                missing.status, NOT_FOUND_STATUS,
                 "case {name:?}/{which:?}: expected the refused call to store no channel, got \
                  {} {:?}",
                 missing.status, missing.body

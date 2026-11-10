@@ -26,6 +26,7 @@
 
 use serde_json::{json, Value};
 
+use crate::channel_lifecycle::{NOT_FOUND_CODE, NOT_FOUND_STATUS};
 use crate::playback_configuration::{Emulator, Reply};
 use crate::playback_configuration_logging::{
     configure_logs, expected_log_configuration, log_settings_table, LOGGING_STRATEGIES,
@@ -311,18 +312,18 @@ async fn a_name_no_configuration_is_stored_under_is_refused() {
     ] {
         let refused = configure_logs(&emulator, name, &settings).await;
         assert_eq!(
-            refused.status, 400,
-            "case {case:?}: expected the request to be refused, got {} {:?}",
+            refused.status, NOT_FOUND_STATUS,
+            "case {case:?}: expected the request to be refused as not found, got {} {:?}",
             refused.status, refused.body
         );
         assert_eq!(
-            refused.error_code, "BadRequestException",
-            "case {case:?}: expected the service's modelled client error, got {:?}",
+            refused.error_code, NOT_FOUND_CODE,
+            "case {case:?}: expected {NOT_FOUND_CODE}, got {:?}",
             refused.error_code
         );
         assert_eq!(
-            refused.string("/Message"),
-            format!("No playback configuration is named {name}."),
+            refused.string("/message"),
+            format!("PlaybackConfiguration {name} not found"),
             "case {case:?}: expected the refusal to name the configuration it could not find, \
              got {:?}",
             refused.body

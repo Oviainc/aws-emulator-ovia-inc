@@ -23,6 +23,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::channel_lifecycle::{NOT_FOUND_CODE, NOT_FOUND_STATUS, RESOURCE_NOT_FOUND_MESSAGE};
+
 /// The region this suite signs for, so the ARNs and endpoint hosts it asserts
 /// are the ones the request's SigV4 credential scope names.
 const REGION: &str = "us-east-1";
@@ -53,6 +55,26 @@ impl Reply {
     pub(crate) fn string(&self, pointer: &str) -> String {
         self.get(pointer).as_str().unwrap_or_default().to_string()
     }
+
+    /// The refusal's text, under either key this service's error envelopes use:
+    /// the modelled `BadRequestException` renders the member name the model
+    /// declares (`Message`), the service's own not-found envelope renders AWS's
+    /// lowercase `message`.
+    pub(crate) fn message(&self) -> String {
+        let lower = self.string("/message");
+        if lower.is_empty() {
+            self.string("/Message")
+        } else {
+            lower
+        }
+    }
+}
+
+/// The sentence a playback-configuration route answers a name the account holds
+/// no configuration under with: fixed text around the `Name` the request
+/// addressed.
+fn configuration_not_found_message(name: &str) -> String {
+    format!("PlaybackConfiguration {name} not found")
 }
 
 /// The emulator under test: this one service mounted on the real router.
@@ -592,9 +614,16 @@ async fn delete_removes_the_configuration_and_is_idempotent() {
 
     let got = emulator.get("removed").await;
     assert_eq!(
-        got.status, 400,
-        "case {:?}: expected the read of a deleted configuration to fail, got {} {:?}",
+        got.status, NOT_FOUND_STATUS,
+        "case {:?}: expected the read of a deleted configuration to fail as not found, got {} {:?}",
         "read after delete", got.status, got.body
+    );
+    assert_eq!(
+        got.message(),
+        configuration_not_found_message("removed"),
+        "case {:?}: expected the configuration-miss sentence, got {:?}",
+        "read after delete",
+        got.message()
     );
 
     let listed = emulator.list(None, None).await;
@@ -616,9 +645,16 @@ async fn delete_removes_the_configuration_and_is_idempotent() {
     // The deleted resource's tags went with it: its ARN names nothing now.
     let tags = emulator.list_tags(&arn).await;
     assert_eq!(
-        tags.status, 400,
+        tags.status, NOT_FOUND_STATUS,
         "case {:?}: expected the deleted resource's ARN to name nothing, got {} {:?}",
         "tags after delete", tags.status, tags.body
+    );
+    assert_eq!(
+        tags.message(),
+        RESOURCE_NOT_FOUND_MESSAGE,
+        "case {:?}: expected the tagging routes' own not-found sentence, got {:?}",
+        "tags after delete",
+        tags.message()
     );
 
     // `@idempotent`: deleting it again answers the same way.
@@ -735,14 +771,21 @@ async fn tags_written_either_way_are_readable_both_ways() {
             emulator.untag(&bogus, &["Env"]).await,
         ] {
             assert_eq!(
-                reply.status, 400,
-                "case {case:?}: expected the tagging operations to refuse {bogus:?}, got {} {:?}",
+                reply.status, NOT_FOUND_STATUS,
+                "case {case:?}: expected the tagging operations to refuse {bogus:?} as not \
+                 found, got {} {:?}",
                 reply.status, reply.body
             );
             assert_eq!(
-                reply.error_code, "BadRequestException",
-                "case {case:?}: expected BadRequestException, got {:?}",
+                reply.error_code, NOT_FOUND_CODE,
+                "case {case:?}: expected {NOT_FOUND_CODE}, got {:?}",
                 reply.error_code
+            );
+            assert_eq!(
+                reply.message(),
+                RESOURCE_NOT_FOUND_MESSAGE,
+                "case {case:?}: expected the tagging routes' own not-found sentence, got {:?}",
+                reply.message()
             );
         }
     }
@@ -755,14 +798,21 @@ async fn a_request_that_names_no_storable_configuration_is_refused() {
     // A read of a name nothing is stored under fails — it is never a hollow 200.
     let missing = emulator.get("never-created").await;
     assert_eq!(
-        missing.status, 400,
-        "case {:?}: expected the read to fail, got {} {:?}",
+        missing.status, NOT_FOUND_STATUS,
+        "case {:?}: expected the read to fail as not found, got {} {:?}",
         "unknown name", missing.status, missing.body
     );
     assert_eq!(
-        missing.error_code, "BadRequestException",
-        "case {:?}: expected BadRequestException, got {:?}",
+        missing.error_code, NOT_FOUND_CODE,
+        "case {:?}: expected {NOT_FOUND_CODE}, got {:?}",
         "unknown name", missing.error_code
+    );
+    assert_eq!(
+        missing.message(),
+        configuration_not_found_message("never-created"),
+        "case {:?}: expected the configuration-miss sentence, got {:?}",
+        "unknown name",
+        missing.message()
     );
 
     // A `Name` that cannot address a configuration, and a value outside the
@@ -835,7 +885,7 @@ async fn a_request_past_a_bound_on_what_is_stored_is_refused() {
         );
         assert_eq!(
             emulator.get(&format!("{case}-past-bound")).await.status,
-            400,
+            NOT_FOUND_STATUS,
             "case {case:?}: expected the refused configuration not to be stored"
         );
     }

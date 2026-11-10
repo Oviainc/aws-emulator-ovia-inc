@@ -45,6 +45,24 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20260101/u
 const MIN_TIME_SHIFT_SECONDS: i64 = 0;
 const MAX_TIME_SHIFT_SECONDS: i64 = 21_600;
 
+/// The refusal every route that addresses a stored MediaTailor resource answers
+/// a name or an ARN the account holds no such resource under with: HTTP 404
+/// under the error code `NotFoundException`. The model declares no error on
+/// those operations, so the status and the code are the service's recorded
+/// behaviour, and they are what tells "this resource is gone" apart from the
+/// one client error the model DOES declare (`BadRequestException`, HTTP 400,
+/// "A request contains unexpected data").
+pub(crate) const NOT_FOUND_STATUS: u16 = 404;
+pub(crate) const NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// The sentence a channel route answers a channel miss with. It is entirely
+/// FIXED text: the requested `ChannelName` is not interpolated into it.
+pub(crate) const CHANNEL_NOT_FOUND_MESSAGE: &str = "The specified channel doesn't exist.";
+
+/// The sentence the tagging routes answer an ARN that addresses no resource
+/// with — fixed text too, and distinct from the channel sentence.
+pub(crate) const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
 /// One dispatched request's answer.
 pub(crate) struct Reply {
     pub(crate) status: u16,
@@ -63,8 +81,17 @@ impl Reply {
         self.get(pointer).as_str().unwrap_or_default().to_string()
     }
 
+    /// The refusal's text. The service renders a modelled `BadRequestException`
+    /// under the member name the model declares (`Message`) and its own
+    /// not-found envelope under AWS's lowercase `message`, so a caller reading
+    /// "why was this refused" looks under both.
     pub(crate) fn message(&self) -> String {
-        self.string("/Message")
+        let lower = self.string("/message");
+        if lower.is_empty() {
+            self.string("/Message")
+        } else {
+            lower
+        }
     }
 }
 
@@ -134,12 +161,19 @@ impl Emulator {
             .await
     }
 
-    async fn list_tags(&self, arn: &str) -> Reply {
+    /// `DeleteChannel`: `ChannelName` is the `@httpLabel` and the operation
+    /// carries no request body.
+    pub(crate) async fn delete(&self, name: &str) -> Reply {
+        self.request("DELETE", &format!("/channel/{}", encode(name)), None)
+            .await
+    }
+
+    pub(crate) async fn list_tags(&self, arn: &str) -> Reply {
         self.request("GET", &format!("/tags/{}", encode(arn)), None)
             .await
     }
 
-    async fn tag(&self, arn: &str, tags: Value) -> Reply {
+    pub(crate) async fn tag(&self, arn: &str, tags: Value) -> Reply {
         self.request(
             "POST",
             &format!("/tags/{}", encode(arn)),
@@ -148,7 +182,7 @@ impl Emulator {
         .await
     }
 
-    async fn untag(&self, arn: &str, keys: &[&str]) -> Reply {
+    pub(crate) async fn untag(&self, arn: &str, keys: &[&str]) -> Reply {
         let query = keys
             .iter()
             .map(|key| format!("tagKeys={}", encode(key)))
@@ -166,7 +200,7 @@ pub(crate) fn encode(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-fn expected_arn(name: &str) -> String {
+pub(crate) fn expected_arn(name: &str) -> String {
     format!("arn:aws:mediatailor:{REGION}:{ACCOUNT}:channel/{name}")
 }
 
@@ -591,7 +625,7 @@ async fn a_channel_that_cannot_be_built_is_refused_and_nothing_is_stored() {
         // name is still free.
         let missing = emulator.describe(name).await;
         assert_eq!(
-            missing.status, 400,
+            missing.status, NOT_FOUND_STATUS,
             "case {case:?}: expected the refused channel to be absent, got {} {:?}",
             missing.status, missing.body
         );
@@ -621,19 +655,20 @@ async fn describing_a_channel_the_account_does_not_hold_is_refused() {
     for case in ["absent", "STORED", "stored-2"] {
         let reply = emulator.describe(case).await;
         assert_eq!(
-            reply.status, 400,
+            reply.status, NOT_FOUND_STATUS,
             "case {case:?}: expected DescribeChannel to refuse a channel the account does not \
-             hold, got {} {:?}",
+             hold as not found, got {} {:?}",
             reply.status, reply.body
         );
         assert_eq!(
-            reply.error_code, "BadRequestException",
-            "case {case:?}: expected BadRequestException, got {:?}",
+            reply.error_code, NOT_FOUND_CODE,
+            "case {case:?}: expected {NOT_FOUND_CODE}, got {:?}",
             reply.error_code
         );
-        assert!(
-            reply.message().contains(case),
-            "case {case:?}: expected the refusal to name the channel, got {:?}",
+        assert_eq!(
+            reply.message(),
+            CHANNEL_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected the channel-miss sentence, got {:?}",
             reply.message()
         );
     }
@@ -698,8 +733,14 @@ async fn a_channels_tags_are_one_set_whichever_surface_wrote_them() {
     // A channel ARN this account holds no channel under names no resource.
     let absent = emulator.list_tags(&expected_arn("absent-channel")).await;
     assert_eq!(
-        absent.status, 400,
-        "expected ListTagsForResource to refuse an ARN naming no channel, got {} {:?}",
+        absent.status, NOT_FOUND_STATUS,
+        "expected ListTagsForResource to refuse an ARN naming no channel as not found, got {} {:?}",
         absent.status, absent.body
+    );
+    assert_eq!(
+        absent.message(),
+        RESOURCE_NOT_FOUND_MESSAGE,
+        "expected the tagging routes' own not-found sentence, got {:?}",
+        absent.message()
     );
 }

@@ -37,7 +37,9 @@
 
 use serde_json::{json, Value};
 
-use crate::channel_lifecycle::{table, Emulator, Reply};
+use crate::channel_lifecycle::{
+    table, Emulator, Reply, CHANNEL_NOT_FOUND_MESSAGE, NOT_FOUND_CODE, NOT_FOUND_STATUS,
+};
 
 /// `AdMarkupType`'s modelled values, as the generated
 /// `ops::types::AD_MARKUP_TYPE_VALUES` enumerates them
@@ -312,7 +314,7 @@ async fn an_hls_playlist_is_held_to_the_number_of_ad_markup_types_one_output_car
             );
             assert_eq!(
                 emulator.describe(&name).await.status,
-                400,
+                NOT_FOUND_STATUS,
                 "case {case:?}: expected the refused create to store no channel"
             );
         }
@@ -585,19 +587,20 @@ async fn a_configure_call_that_addresses_nothing_is_refused_and_writes_nothing()
     for case in ["absent", "STORED", "stored-2", "stor"] {
         let refused = configure_logs(&emulator, case, &json!(LOG_TYPES)).await;
         assert_eq!(
-            refused.status, 400,
-            "case {case:?}: expected a channel the account does not hold to be refused with \
-             400, got {} {:?}",
+            refused.status, NOT_FOUND_STATUS,
+            "case {case:?}: expected a channel the account does not hold to be refused as not \
+             found, got {} {:?}",
             refused.status, refused.body
         );
         assert_eq!(
-            refused.error_code, "BadRequestException",
-            "case {case:?}: expected BadRequestException, got {:?}",
+            refused.error_code, NOT_FOUND_CODE,
+            "case {case:?}: expected {NOT_FOUND_CODE}, got {:?}",
             refused.error_code
         );
-        assert!(
-            refused.message().contains(case),
-            "case {case:?}: expected the refusal to name the channel, got {:?}",
+        assert_eq!(
+            refused.message(),
+            CHANNEL_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected the channel-miss sentence, got {:?}",
             refused.message()
         );
 
@@ -605,7 +608,7 @@ async fn a_configure_call_that_addresses_nothing_is_refused_and_writes_nothing()
         // exist keeps the types it was given.
         assert_eq!(
             emulator.describe(case).await.status,
-            400,
+            NOT_FOUND_STATUS,
             "case {case:?}: expected the refused call to store no channel"
         );
     }

@@ -55,7 +55,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{channel_not_found_message, STOPPED_CHANNEL_STATE};
+use crate::state::{CHANNEL_NOT_FOUND_MESSAGE, STOPPED_CHANNEL_STATE};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -65,21 +65,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mediatailor-mediatailor
 
 /// This operation's modelled failures.
 ///
-/// The model lists no error on `StopChannel` itself, so `BadRequestException`
+/// The model lists no error on `StopChannel` itself, and `BadRequestException`
 /// — the one client error this SERVICE declares ("A request contains unexpected
-/// data", HTTP 400) — is widened in with `extra_errors` to refuse a stop of a
-/// channel this emulator does not hold. It is the only error shape the model
-/// gives this service, so it is what a miss is answered with rather than a
-/// status and code no model declares, and it is the same refusal the channel
-/// read answers such a name with.
-#[smithy_macros::operation_error(
-    "com.amazonaws.mediatailor#StopChannel",
-    extra_errors = ["BadRequestException"]
-)]
+/// data", HTTP 400) — is not what a name addressing no channel is: that request
+/// is well formed and the channel is simply absent, which the service answers
+/// through [`crate::scaffolded::Scaffolded::not_found`] (HTTP 404), the same
+/// refusal the channel read answers such a name with. So this operation has no
+/// modelled failure of its own.
+#[smithy_macros::operation_error("com.amazonaws.mediatailor#StopChannel")]
 #[derive(Debug)]
-pub enum StopChannelErrorModeled {
-    BadRequestException(BadRequestException),
-}
+pub enum StopChannelErrorModeled {}
 
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::stop_channel::StopChannelError`). The wrapper is kept for the
@@ -145,12 +140,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
         let mut store = state.lock();
         let Some(record) = store.channels.get_mut(&input.channel_name) else {
-            return Err(StopChannelErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(channel_not_found_message(&input.channel_name)),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                CHANNEL_NOT_FOUND_MESSAGE,
+            ));
         };
 
         record.set_channel_state(STOPPED_CHANNEL_STATE, now);

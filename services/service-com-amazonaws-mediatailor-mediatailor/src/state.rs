@@ -261,16 +261,37 @@ impl ComAmazonawsMediatailorMediatailorState {
     }
 }
 
-/// How this service states that `name` addresses no channel this account holds.
+/// How this service states that the channel a request addresses does not exist.
 ///
 /// Every channel route that addresses a stored channel by name answers a miss
-/// the same way — the name the request carried is the whole reason it cannot be
-/// served, so the refusal names it — and the wording lives here once so the
-/// channel read and the start/stop writes cannot drift into two accounts of the
-/// same miss. The caller lifts it into its own modelled `BadRequestException`.
-pub fn channel_not_found_message(name: &str) -> String {
-    format!("Channel {name} not found.")
+/// the same way, and the wording lives here once so the channel read and the
+/// channel writes cannot drift into two accounts of the same miss. The sentence
+/// has NO variable part: it states that the channel the request named does not
+/// exist, and the caller already knows which name it sent. The caller returns it
+/// through [`crate::scaffolded::Scaffolded::not_found`], the service's HTTP 404.
+pub const CHANNEL_NOT_FOUND_MESSAGE: &str = "The specified channel doesn't exist.";
+
+/// How this service states that `name` addresses no playback configuration this
+/// account holds.
+///
+/// Unlike the channel sentence this one DOES carry the name the request sent:
+/// fixed text around the `Name` / `PlaybackConfigurationName` the caller
+/// addressed. Every playback-configuration route that addresses a stored
+/// configuration by name answers a miss with it, as the service's HTTP 404.
+pub fn playback_configuration_not_found_message(name: &str) -> String {
+    format!("PlaybackConfiguration {name} not found")
 }
+
+/// How this service states that the ARN a request addresses names no resource
+/// this account holds.
+///
+/// The tagging routes address a resource by ARN rather than by name, and the
+/// sentence they answer a miss with says only that the resource was not found:
+/// it has NO variable part, so the caller gets this text whichever ARN it sent,
+/// and the text is the tagging routes' own — distinct from the sentence a
+/// channel route answers a missing channel with. Returned as the service's HTTP
+/// 404, the same status a read of the resource itself answers.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
 /// Why a tag set cannot be stored, or `None` when it can.
 ///

@@ -163,17 +163,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // Tags belong to a resource, so there has to be one: an ARN that names
-        // no resource this service holds is unexpected data in the request.
+        // no resource this service holds addresses nothing to untag.
         if !store.taggable_resource_exists(&input.resource_arn) {
-            return Err(UntagResourceErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(format!(
-                        "ResourceArn does not name a MediaTailor resource: {}",
-                        input.resource_arn
-                    )),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                crate::state::RESOURCE_NOT_FOUND_MESSAGE,
+            ));
         }
 
         if let Some(tags) = store.tags_by_arn.get_mut(&input.resource_arn) {

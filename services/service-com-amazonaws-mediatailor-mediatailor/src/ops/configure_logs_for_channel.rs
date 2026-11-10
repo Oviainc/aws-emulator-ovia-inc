@@ -59,7 +59,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::channel_not_found_message;
+use crate::state::CHANNEL_NOT_FOUND_MESSAGE;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -74,11 +74,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mediatailor-mediatailor
 // The model lists no error on `ConfigureLogsForChannel` itself, so
 // `BadRequestException` — the one client error this SERVICE declares ("A request
 // contains unexpected data", HTTP 400) — is widened in with `extra_errors` to
-// refuse a request naming a channel this emulator does not hold, or more log
-// types than one channel's log configuration can hold. It is the only error
-// shape the model gives this service, so it is what such a request is answered
-// with rather than a status and code no model declares, and it is the same
-// refusal the channel read and the start/stop writes answer such a name with.
+// refuse a request naming more log types than one channel's log configuration
+// can hold. A channel name that addresses no channel is NOT that error: the
+// request is well formed and the channel is simply absent, which the service
+// answers through [`crate::scaffolded::Scaffolded::not_found`] (HTTP 404), the
+// same refusal the channel read and the start/stop writes answer such a name
+// with.
 #[smithy_macros::operation_error(
     "com.amazonaws.mediatailor#ConfigureLogsForChannel",
     extra_errors = ["BadRequestException"]
@@ -168,12 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(record) = store.channels.get_mut(&input.channel_name) else {
-            return Err(ConfigureLogsForChannelErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(channel_not_found_message(&input.channel_name)),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                CHANNEL_NOT_FOUND_MESSAGE,
+            ));
         };
 
         // This call says which logs the channel collects, so what it carries is

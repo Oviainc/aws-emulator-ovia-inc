@@ -24,6 +24,7 @@
 
 use serde_json::{json, Value};
 
+use crate::channel_lifecycle::{NOT_FOUND_CODE, NOT_FOUND_STATUS};
 use crate::playback_configuration::{Emulator, Reply};
 
 /// The logging strategies this service accepts, from the model's
@@ -329,13 +330,13 @@ async fn a_refused_configure_call_writes_nothing() {
     // A name no configuration is stored under addresses nothing to configure.
     let unknown = configure_logs(&emulator, "never-created", &in_force).await;
     assert_eq!(
-        unknown.status, 400,
-        "case {:?}: expected an unknown configuration to be refused, got {} {:?}",
+        unknown.status, NOT_FOUND_STATUS,
+        "case {:?}: expected an unknown configuration to be refused as not found, got {} {:?}",
         "unknown configuration", unknown.status, unknown.body
     );
     assert_eq!(
-        unknown.error_code, "BadRequestException",
-        "case {:?}: expected the service's modelled client error, got {:?}",
+        unknown.error_code, NOT_FOUND_CODE,
+        "case {:?}: expected {NOT_FOUND_CODE}, got {:?}",
         "unknown configuration", unknown.error_code
     );
 }
