@@ -173,6 +173,20 @@ async fn default_style_settings(router: &MultiServiceRouter) -> Value {
     merged["Settings"].clone()
 }
 
+/// The image files this service provides for the roles a style supplies none of
+/// its own for: the baseline every merged read of the files is the overlay of.
+/// Read through the API, so a test states the RULE and not the file set.
+async fn provided_style_assets(router: &MultiServiceRouter) -> Value {
+    let (user_pool_id, _, branding_id, _) = style(
+        router,
+        "provided-assets-baseline",
+        &json!({ "UseCognitoProvidedValues": true }),
+    )
+    .await;
+    let provided = describe(router, &user_pool_id, &branding_id, true).await;
+    provided["Assets"].clone()
+}
+
 /// A readable key for one asset slot: its category and its display mode, which
 /// is what a style holds one image file per.
 fn slot(rendered: &Value) -> String {
@@ -377,6 +391,8 @@ fn update_cases() -> Vec<UpdateCase> {
                 "Assets": [light_logo.clone()],
             }),
             update: json!({ "UseCognitoProvidedValues": true }),
+            // The reverted style keeps no customization of its own, so the
+            // service's own options are what its MERGED view reports.
             expected_settings: None,
             expected_assets: Vec::new(),
             expected_use_cognito_provided_values: true,
@@ -522,6 +538,7 @@ async fn an_update_lays_its_options_over_the_stored_style_and_preserves_the_rest
 async fn the_merged_view_is_the_default_style_under_the_style_s_own_options() {
     let router = router();
     let defaults = default_style_settings(&router).await;
+    let provided_assets = provided_style_assets(&router).await;
 
     assert!(
         defaults.as_object().is_some_and(|members| members.len() > 1),
@@ -578,18 +595,23 @@ async fn the_merged_view_is_the_default_style_under_the_style_s_own_options() {
             merged["Settings"], expected,
             "case {label:?}: the merged view is the default style with the style's own options laid over it, got {merged}"
         );
+        // None of these rows supplies an image file of its own, so the merged
+        // view reports the service's own file for every role.
+        assert_eq!(
+            merged["Assets"], provided_assets,
+            "case {label:?}: the merged view reports the service's image files for the roles the style left alone, got {merged}"
+        );
         for member in [
             "ManagedLoginBrandingId",
             "UserPoolId",
             "UseCognitoProvidedValues",
-            "Assets",
             "CreationDate",
             "LastModifiedDate",
         ] {
             assert_eq!(
                 merged.get(member),
                 customized.get(member),
-                "case {label:?}: the two views differ in Settings alone, got {member} as {merged}"
+                "case {label:?}: the two views differ in Settings and Assets alone, got {member} as {merged}"
             );
         }
         // The reader by app client serves the same two views of the same style.

@@ -6,9 +6,11 @@
 //! domain when it does. The domain is stored on the pool it names, so
 //! `DescribeUserPoolDomain` and `DescribeUserPool` render the STORED domain.
 //!
-//! A domain comes up `CREATING` and the clock owes its `ACTIVE`
-//! ([`crate::state::DOMAIN_ACTIVATION_SPAN`]), because "Your prefix domain might
-//! take up to one minute to take effect".
+//! A CUSTOM domain comes up `CREATING` and the clock owes its `ACTIVE`
+//! ([`crate::state::DOMAIN_ACTIVATION_SPAN`]), because the CloudFront
+//! distribution that serves it has to be provisioned first. A PREFIX domain is
+//! served by the managed login infrastructure that is already running, so it is
+//! `ACTIVE` as soon as the create returns.
 //!
 //! ## Shape of an operation
 //!
@@ -219,10 +221,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The pool the domain attaches to is resolved FIRST: a request naming a
         // pool that does not exist names no resource to configure, whatever else
-        // it carries.
-        if guard.pool(&input.user_pool_id).is_none() {
+        // it carries. Its Region is what the domain's static files are served
+        // from.
+        let Some(region) = guard
+            .pool(&input.user_pool_id)
+            .map(|pool| pool.region.clone())
+        else {
             return Err(user_pool_not_found(&input.user_pool_id));
-        }
+        };
 
         // "A value of `1` indicates hosted UI (classic) and a version of `2`
         // indicates managed login" (`ManagedLoginVersion`): those are the only
@@ -274,6 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::UserPoolDomain::new(
             input.domain.clone(),
             input.user_pool_id.clone(),
+            &region,
             input.custom_domain_config.clone(),
             managed_login_version,
             input.routing.clone(),
@@ -329,7 +336,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "Amazon Cognito returns this value if you set a custom domain with
             // `CustomDomainConfig`. If you set an Amazon Cognito prefix domain,
             // this parameter returns null."
-            cloud_front_domain: stored.cloud_front_distribution.clone(),
+            cloud_front_domain: stored.created_cloud_front_domain(),
             routing: stored.routing.clone(),
         })
     }

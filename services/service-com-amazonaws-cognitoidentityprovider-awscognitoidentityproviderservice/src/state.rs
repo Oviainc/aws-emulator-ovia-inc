@@ -2586,11 +2586,13 @@ pub struct UiCustomization {
     pub last_modified_date: SystemTime,
 }
 
-/// The version a write of a classic hosted UI branding configuration at `at`
-/// is at: that instant in UTC as the digits of the modelled timestamp rendering
-/// (`yyyymmddhhmmss`), so a later write is at a later version and the version
-/// is a number as `UICustomizationType.CSSVersion` reports one.
-fn css_version_stamp(at: SystemTime) -> String {
+/// The version a write at `at` leaves the configuration it wrote at: that
+/// instant in UTC as the digits of the modelled timestamp rendering
+/// (`yyyymmddhhmmss`), so a later write is at a later version and the version is
+/// a number as `UICustomizationType.CSSVersion` ("The CSS version number") and
+/// `DomainDescriptionType.Version` ("The app version") each report one. The
+/// stamp is 14 digits, inside `DomainVersionType`'s modelled length 1..20.
+fn version_stamp(at: SystemTime) -> String {
     let seconds = at
         .duration_since(UNIX_EPOCH)
         .map(|since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))

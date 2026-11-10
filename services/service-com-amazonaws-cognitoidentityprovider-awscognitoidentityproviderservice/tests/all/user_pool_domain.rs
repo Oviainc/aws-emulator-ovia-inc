@@ -9,9 +9,11 @@
 //! The rule under test: a created domain is keyed by its `Domain` string alone
 //! (`DescribeUserPoolDomain` models no `UserPoolId`), it carries the
 //! configuration the request set and nothing it did not, a `CustomDomainConfig`
-//! makes it a custom domain served through a CloudFront endpoint while a prefix
-//! domain has none, it comes up `CREATING` and reaches `ACTIVE` only once the
-//! clock makes that transition due, and a domain string any pool already holds —
+//! makes it a custom domain whose CloudFront endpoint the create hands to the
+//! caller while a prefix domain's is the service's own, a custom domain comes up
+//! `CREATING` and reaches `ACTIVE` only once the clock makes that transition due
+//! while a prefix domain is `ACTIVE` from the create, and a domain string any
+//! pool already holds —
 //! or a second domain of the same kind on one pool — is refused with the stored
 //! domain untouched. Each table row names the case it asserts.
 //!
@@ -362,11 +364,23 @@ async fn a_created_domain_round_trips_through_stored_state() {
                 "case {label:?}: a domain created without routing stores none, got {read}"
             ),
         }
-        assert_eq!(
-            description.get("CloudFrontDistribution").and_then(Value::as_str),
-            cloud_front,
-            "case {label:?}: the stored CloudFront endpoint must be the one the create reported, got {read}"
+        // Every hosted domain is served through a CloudFront endpoint, which the
+        // description reports; only a CUSTOM domain's is handed to the caller by
+        // the create, because only that caller has an alias record to point at
+        // it.
+        let distribution = description
+            .get("CloudFrontDistribution")
+            .and_then(Value::as_str);
+        assert!(
+            distribution.is_some_and(|endpoint| endpoint.ends_with(".cloudfront.net")),
+            "case {label:?}: the stored domain must report its CloudFront endpoint, got {read}"
         );
+        if case.is_custom() {
+            assert_eq!(
+                distribution, cloud_front,
+                "case {label:?}: the stored CloudFront endpoint must be the one the create reported, got {read}"
+            );
+        }
 
         // `DescribeUserPool` renders the same stored domain in the member for
         // its kind, and leaves the other kind's member absent.
@@ -395,15 +409,19 @@ async fn a_created_domain_round_trips_through_stored_state() {
 }
 
 #[tokio::test]
-async fn a_created_domain_is_creating_until_the_clock_makes_its_activation_due() {
+async fn a_created_domain_reports_the_status_its_provisioning_is_in() {
     let router = router();
     let user_pool_id = pool(&router, "status-pool").await;
 
-    for (label, domain, body) in [
+    // A prefix domain is served by the managed login infrastructure that is
+    // already running, so it is usable when the create returns; a custom domain
+    // has a CloudFront distribution of its own to provision first.
+    for (label, domain, body, created_status) in [
         (
             "a prefix domain",
             "status-prefix",
             json!({ "UserPoolId": user_pool_id, "Domain": "status-prefix" }),
+            "ACTIVE",
         ),
         (
             "a custom domain",
@@ -413,12 +431,14 @@ async fn a_created_domain_is_creating_until_the_clock_makes_its_activation_due()
                 "Domain": "status-custom",
                 "CustomDomainConfig": { "CertificateArn": US_EAST_1_CERTIFICATE },
             }),
+            "CREATING",
         ),
     ] {
         ok(&router, "CreateUserPoolDomain", &body).await;
 
-        // The span is never zero, so a caller reading straight after the create
-        // still sees the transient status.
+        // The span of a domain that has provisioning to do is never zero, so a
+        // caller reading straight after the create still sees the transient
+        // status.
         let read = ok(
             &router,
             "DescribeUserPoolDomain",
@@ -427,8 +447,8 @@ async fn a_created_domain_is_creating_until_the_clock_makes_its_activation_due()
         .await;
         assert_eq!(
             read["DomainDescription"]["Status"],
-            json!("CREATING"),
-            "case {label:?}: a domain is CREATING before its activation is due, got {read}"
+            json!(created_status),
+            "case {label:?}: a created domain reports the status its provisioning is in, got {read}"
         );
 
         tokio::time::sleep(PAST_THE_ACTIVATION).await;

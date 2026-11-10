@@ -331,7 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "Amazon Cognito returns this value if you set a custom domain with
             // CustomDomainConfig. If you set an Amazon Cognito prefix domain,
             // this operation returns a blank response."
-            cloud_front_domain: stored.cloud_front_distribution.clone(),
+            cloud_front_domain: stored.created_cloud_front_domain(),
             routing: stored.routing.clone(),
         };
         if changed {

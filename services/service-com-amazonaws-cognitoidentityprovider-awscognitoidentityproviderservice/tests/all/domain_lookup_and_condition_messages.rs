@@ -294,10 +294,12 @@ async fn a_read_of_a_domain_no_pool_holds_reports_an_empty_description() {
             json!(domain),
             "case {label:?}: the description names the stored domain string, got {held}"
         );
-        assert_eq!(
-            held["CloudFrontDistribution"].is_string(),
-            case.custom_domain_config.is_some(),
-            "case {label:?}: only a custom domain is served through CloudFront, got {held}"
+        assert!(
+            held["CloudFrontDistribution"]
+                .as_str()
+                .is_some_and(|endpoint| endpoint.ends_with(".cloudfront.net")),
+            "case {label:?}: every hosted domain is served through a CloudFront endpoint, \
+             got {held}"
         );
 
         ok(

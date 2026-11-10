@@ -26,11 +26,24 @@ pub struct UserPoolDomain {
     /// The routing configuration as submitted, which only a custom domain may
     /// carry.
     pub routing: Option<RoutingType>,
-    /// The CloudFront endpoint that hosts a CUSTOM domain, minted with it;
-    /// `None` for a prefix domain, for which `CreateUserPoolDomain` documents
-    /// "If you set an Amazon Cognito prefix domain, this parameter returns
-    /// null."
-    pub cloud_front_distribution: Option<String>,
+    /// The CloudFront endpoint that serves this domain, minted with it:
+    /// `DomainDescriptionType.CloudFrontDistribution`, "The Amazon CloudFront
+    /// endpoint that hosts your custom domain". Every hosted domain is served
+    /// through one, which is why a read of a domain reports it whichever kind
+    /// the domain is; only a CUSTOM domain's is the caller's to point an alias
+    /// record at, which is what [`UserPoolDomain::created_cloud_front_domain`]
+    /// answers.
+    pub cloud_front_distribution: String,
+    /// The bucket this domain's static files are served from:
+    /// `DomainDescriptionType.S3Bucket`, "The Amazon S3 bucket where the static
+    /// files for this domain are stored" — the service's own bucket for the
+    /// Region the pool is in ([`domain_assets_bucket`]), so every domain of a
+    /// Region reports the same one.
+    pub s3_bucket: String,
+    /// The version of the hosted-UI application this domain is deployed at:
+    /// `DomainDescriptionType.Version`, "The app version", stamped when the
+    /// domain was last written ([`version_stamp`]).
+    pub version: String,
     /// When the domain was created.
     pub creation_date: SystemTime,
     /// The instant the clock owes this domain's move to `ACTIVE`. Stored, never
@@ -43,31 +56,39 @@ pub struct UserPoolDomain {
 }
 
 impl UserPoolDomain {
-    /// A new domain for `user_pool_id`, `CREATING` until the clock makes its
-    /// activation due one [`DOMAIN_ACTIVATION_SPAN`] from `now`.
+    /// A new domain for `user_pool_id` of a pool in `region`.
+    ///
+    /// A CUSTOM domain has a CloudFront distribution of its own to provision, so
+    /// it comes up `CREATING` and the clock makes its activation due one
+    /// [`DOMAIN_ACTIVATION_SPAN`] from `now`. An Amazon Cognito PREFIX domain is
+    /// served by the managed login infrastructure that is already running, so it
+    /// is `ACTIVE` as soon as the create returns, which is the status a read
+    /// straight after the create reports.
     pub fn new(
         domain: String,
         user_pool_id: String,
+        region: &str,
         custom_domain_config: Option<CustomDomainConfigType>,
         managed_login_version: i32,
         routing: Option<RoutingType>,
         now: SystemTime,
     ) -> Self {
-        // A custom domain is served through CloudFront, and the caller has to
-        // point an alias record at that endpoint, so one is minted with the
-        // domain; a prefix domain has none.
-        let cloud_front_distribution = custom_domain_config
-            .is_some()
-            .then(new_cloud_front_domain);
+        let custom = custom_domain_config.is_some();
         Self {
             domain,
             user_pool_id,
             custom_domain_config,
             managed_login_version,
             routing,
-            cloud_front_distribution,
+            cloud_front_distribution: new_cloud_front_domain(),
+            s3_bucket: domain_assets_bucket(region),
+            version: version_stamp(now),
             creation_date: now,
-            active_at: now + DOMAIN_ACTIVATION_SPAN,
+            active_at: if custom {
+                now + DOMAIN_ACTIVATION_SPAN
+            } else {
+                now
+            },
             status_until_active: DOMAIN_STATUS_CREATING,
         }
     }
@@ -77,20 +98,41 @@ impl UserPoolDomain {
         self.custom_domain_config.is_some()
     }
 
-    /// Record that this domain's configuration changed at `now`, which the
-    /// service does not serve instantly: "Changes to the domain branding version
-    /// take up to one minute to take effect for a prefix domain and up to five
-    /// minutes for a custom domain" (`UpdateUserPoolDomain`), so the domain is
-    /// `UPDATING` until the clock makes it `ACTIVE` again one
-    /// [`DOMAIN_ACTIVATION_SPAN`] from `now`.
-    pub fn begin_update(&mut self, now: SystemTime) {
-        self.active_at = now + DOMAIN_ACTIVATION_SPAN;
-        self.status_until_active = DOMAIN_STATUS_UPDATING;
+    /// The `CloudFrontDomain` a create or an update of this domain reports:
+    /// "Amazon Cognito returns this value if you set a custom domain with
+    /// `CustomDomainConfig`. If you set an Amazon Cognito prefix domain, this
+    /// parameter returns null" (`CreateUserPoolDomain.CloudFrontDomain`), so
+    /// only a custom domain's endpoint is handed to the caller that has to point
+    /// an alias record at it.
+    pub fn created_cloud_front_domain(&self) -> Option<String> {
+        self.is_custom()
+            .then(|| self.cloud_front_distribution.clone())
     }
 
-    /// This domain's `DomainStatusType` as of `now`: the status its last write
-    /// left it in until the clock has made its activation due, `ACTIVE` from
-    /// then on.
+    /// Record that this domain's configuration changed at `now`.
+    ///
+    /// A CUSTOM domain's own CloudFront distribution has to carry the change
+    /// before it serves it — "changes to the domain branding version take up to
+    /// one minute to take effect for a prefix domain and up to five minutes for a
+    /// custom domain" (`UpdateUserPoolDomain`) — so it is `UPDATING` until the
+    /// clock makes it `ACTIVE` again one [`DOMAIN_ACTIVATION_SPAN`] from `now`. A
+    /// PREFIX domain provisions nothing of its own, so it stays `ACTIVE` through
+    /// the change, as it was from its create.
+    pub fn begin_update(&mut self, now: SystemTime) {
+        if self.is_custom() {
+            self.active_at = now + DOMAIN_ACTIVATION_SPAN;
+            self.status_until_active = DOMAIN_STATUS_UPDATING;
+        }
+        // The change is a new deployment of the domain's hosted-UI application,
+        // so the version it is deployed at is the one this write stamped.
+        self.version = version_stamp(now);
+    }
+
+    /// This domain's `DomainStatusType` as of `now`: the status of its OWN
+    /// provisioning — the status its last write left it in until the clock has
+    /// made its activation due, `ACTIVE` from then on. A domain with nothing of
+    /// its own to provision has its activation due from the write itself, so it
+    /// reports `ACTIVE` throughout.
     pub fn status(&self, now: SystemTime) -> &'static str {
         if now >= self.active_at {
             DOMAIN_STATUS_ACTIVE
@@ -105,19 +147,94 @@ impl UserPoolDomain {
             user_pool_id: Some(self.user_pool_id.clone()),
             aws_account_id: Some(::engine::emulator_account_id().to_string()),
             domain: Some(self.domain.clone()),
-            // `S3Bucket` is "The Amazon S3 bucket where the static files for
-            // this domain are stored" and `Version` "The app version": both
-            // name AWS-internal hosted-UI infrastructure this emulator does not
-            // deploy, so neither is invented.
-            s3_bucket: None,
-            cloud_front_distribution: self.cloud_front_distribution.clone(),
-            version: None,
+            s3_bucket: Some(self.s3_bucket.clone()),
+            cloud_front_distribution: Some(self.cloud_front_distribution.clone()),
+            version: Some(self.version.clone()),
             status: Some(self.status(now).to_string()),
             custom_domain_config: self.custom_domain_config.clone(),
             managed_login_version: Some(self.managed_login_version),
             routing: self.routing.clone(),
         }
     }
+}
+
+/// The bucket the static files of the hosted UI of a domain in `region` are
+/// served from: `DomainDescriptionType.S3Bucket`, "The Amazon S3 bucket where
+/// the static files for this domain are stored".
+///
+/// The bucket belongs to the SERVICE rather than to one domain — Amazon Cognito
+/// serves every hosted domain of a Region from its own bucket there, named for
+/// that Region's location ([`region_location_code`]) — so it is derived from the
+/// Region the pool is in and every domain of that Region reports the same name.
+/// The name satisfies `S3BucketType`'s modelled pattern and length: the Region a
+/// pool is in carries only the characters a bucket name admits
+/// (`crate::state::request_region` reduces it to ASCII alphanumerics and
+/// hyphens), and a location code longer than the bucket name may carry is
+/// clamped to [`MAX_BUCKET_LOCATION_CODE`].
+fn domain_assets_bucket(region: &str) -> String {
+    // Clamped by CHARACTER BOUNDARY, as the store's other clamped identifiers
+    // are, so a Region of any length yields a bucket name and never a panic.
+    let location: String = region_location_code(region)
+        .char_indices()
+        .take_while(|(at, _)| *at < MAX_BUCKET_LOCATION_CODE)
+        .map(|(_, c)| c)
+        .collect();
+    format!("aws-cognito-prod-{location}-assets")
+}
+
+/// How many characters of a location code a bucket name may carry: enough that
+/// the whole name stays inside `S3BucketType`'s modelled length 3..1024, whatever
+/// Region a request was signed for
+/// (`smithy_query(query="shape",shape="S3BucketType")`).
+const MAX_BUCKET_LOCATION_CODE: usize = 1024 - "aws-cognito-prod--assets".len();
+
+/// The location code of `region`: the three-letter code of the place the Region
+/// is in, which AWS names its per-Region internal resources after (the IATA code
+/// of the Region's locality — `iad` for US East (N. Virginia), `pdx` for US West
+/// (Oregon)). A Region this table does not name is named by the Region itself, so
+/// a bucket name is always derived from the Region and never invented.
+///
+/// The codes are the ones this tree already names a Region's facilities by, in
+/// `services/service-com-amazonaws-interconnect-interconnect/src/state.rs`
+/// (`REGION_FACILITY_CODES`), which is the catalogue's canonical copy: this table
+/// names the same Regions with the same codes, so the two cannot disagree about a
+/// Region.
+fn region_location_code(region: &str) -> &str {
+    const LOCATION_CODES: [(&str, &str); 29] = [
+        ("af-south-1", "cpt"),
+        ("ap-east-1", "hkg"),
+        ("ap-northeast-1", "nrt"),
+        ("ap-northeast-2", "icn"),
+        ("ap-northeast-3", "kix"),
+        ("ap-south-1", "bom"),
+        ("ap-south-2", "hyd"),
+        ("ap-southeast-1", "sin"),
+        ("ap-southeast-2", "syd"),
+        ("ap-southeast-3", "cgk"),
+        ("ap-southeast-4", "mel"),
+        ("ca-central-1", "yul"),
+        ("ca-west-1", "yyc"),
+        ("eu-central-1", "fra"),
+        ("eu-central-2", "zrh"),
+        ("eu-north-1", "arn"),
+        ("eu-south-1", "mxp"),
+        ("eu-south-2", "zaz"),
+        ("eu-west-1", "dub"),
+        ("eu-west-2", "lhr"),
+        ("eu-west-3", "cdg"),
+        ("il-central-1", "tlv"),
+        ("me-central-1", "dxb"),
+        ("me-south-1", "bah"),
+        ("sa-east-1", "gru"),
+        ("us-east-1", "iad"),
+        ("us-east-2", "cmh"),
+        ("us-west-1", "sfo"),
+        ("us-west-2", "pdx"),
+    ];
+    LOCATION_CODES
+        .iter()
+        .find_map(|(named, code)| (*named == region).then_some(*code))
+        .unwrap_or(region)
 }
 
 /// One stored SECONDARY replica of a user pool: what `CreateUserPoolReplica`

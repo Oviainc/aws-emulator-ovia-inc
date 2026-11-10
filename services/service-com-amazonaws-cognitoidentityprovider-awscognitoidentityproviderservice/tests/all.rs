@@ -51,6 +51,8 @@ mod app_client_refusal_wording;
 mod app_client_validity_defaults;
 #[path = "all/auth_flow_not_enabled.rs"]
 mod auth_flow_not_enabled;
+#[path = "all/branding_and_domain_generated_reads.rs"]
+mod branding_and_domain_generated_reads;
 #[path = "all/authentication_refusal_classes.rs"]
 mod authentication_refusal_classes;
 #[path = "all/authentication_refusal_wire.rs"]

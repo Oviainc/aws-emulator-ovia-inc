@@ -10,8 +10,9 @@
 //! member the request carries (`ManagedLoginVersion`, `CustomDomainConfig`,
 //! `Routing`) replaces the stored value, a member it leaves unset leaves the
 //! stored value alone, the domain's name, pool and CloudFront endpoint never
-//! move, and a changed domain is `UPDATING` until the clock makes it `ACTIVE`
-//! again. Members that configure a custom domain name nothing on a prefix
+//! move, and a changed CUSTOM domain is `UPDATING` until the clock makes it
+//! `ACTIVE` again while a prefix domain, which provisions nothing of its own,
+//! stays `ACTIVE`. Members that configure a custom domain name nothing on a prefix
 //! domain, a branding version the model does not name is refused, and a domain
 //! the named pool does not hold names no resource the service can find. Each
 //! table row names the case it asserts.
@@ -477,11 +478,15 @@ async fn an_updated_domain_renders_the_members_the_request_set_and_keeps_the_res
             before.get("CloudFrontDistribution"),
             "case {label:?}: an update never moves the CloudFront endpoint, got {after}"
         );
-        let expected_status = if case.changed { "UPDATING" } else { "ACTIVE" };
+        let expected_status = if case.changed && case.created_config.is_some() {
+            "UPDATING"
+        } else {
+            "ACTIVE"
+        };
         assert_eq!(
             after["Status"],
             json!(expected_status),
-            "case {label:?}: a changed domain is UPDATING and an unchanged one stays ACTIVE, got {after}"
+            "case {label:?}: a changed custom domain is UPDATING while a prefix domain stays ACTIVE, got {after}"
         );
 
         // Idempotence: the same request again asks for the state the domain is
@@ -495,19 +500,20 @@ async fn an_updated_domain_renders_the_members_the_request_set_and_keeps_the_res
 }
 
 #[tokio::test]
-async fn an_updated_domain_is_updating_until_the_clock_makes_it_active_again() {
+async fn an_updated_domain_reports_the_status_its_own_provisioning_is_in() {
     let router = router();
     let user_pool_id = pool(&router, "status-pool").await;
 
-    // Both kinds of domain, which the documentation gives different windows
-    // ("up to one minute to take effect for a prefix domain and up to five
-    // minutes for a custom domain").
-    for (label, domain, create_extra) in [
-        ("a prefix domain", "status-prefix", json!({})),
+    // Both kinds of domain: a custom domain's own CloudFront distribution has to
+    // carry the change before it serves it, while a prefix domain provisions
+    // nothing of its own and stays `ACTIVE` through the change.
+    for (label, domain, create_extra, after_update) in [
+        ("a prefix domain", "status-prefix", json!({}), "ACTIVE"),
         (
             "a custom domain",
             "status-custom",
             json!({ "CustomDomainConfig": { "CertificateArn": US_EAST_1_CERTIFICATE } }),
+            "UPDATING",
         ),
     ] {
         let create = update_body(&user_pool_id, domain, &create_extra);
@@ -520,8 +526,8 @@ async fn an_updated_domain_is_updating_until_the_clock_makes_it_active_again() {
         let updating = describe(&router, domain).await;
         assert_eq!(
             updating["Status"],
-            json!("UPDATING"),
-            "case {label:?}: a domain is UPDATING before its activation is due again, got {updating}"
+            json!(after_update),
+            "case {label:?}: a changed domain reports the status its own provisioning is in, got {updating}"
         );
         // A read never moves the status: two reads at the same instant agree.
         let polled = describe(&router, domain).await;

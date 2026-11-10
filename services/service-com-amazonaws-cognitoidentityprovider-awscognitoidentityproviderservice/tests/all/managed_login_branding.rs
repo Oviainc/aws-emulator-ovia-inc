@@ -433,9 +433,13 @@ async fn created_branding_styles_round_trip_through_stored_state() {
             ),
         }
         if case.assets.is_empty() {
+            let rendered = branding["Assets"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {label:?}: Assets must be a list, got {branding}"));
             assert!(
-                branding["Assets"].is_null(),
-                "case {label:?}: a style that customized no assets reports none, got {branding}"
+                rendered.is_empty(),
+                "case {label:?}: a style that customized no assets holds an empty list of them, \
+                 got {branding}"
             );
         } else {
             let rendered = branding["Assets"]
@@ -486,10 +490,10 @@ async fn created_branding_styles_round_trip_through_stored_state() {
             );
         }
 
-        // The MERGED view answers the same style with every branding option it
-        // leaves at the service's defaults filled in, so it carries `Settings`
-        // even for a style that customized none, and differs from the
-        // customized view in `Settings` alone.
+        // The MERGED view answers the same style with every branding option and
+        // every image file it leaves at the service's defaults filled in, so it
+        // carries `Settings` even for a style that customized none, and the two
+        // views differ in `Settings` and `Assets` alone.
         let merged = ok(
             &router,
             "DescribeManagedLoginBranding",
@@ -511,14 +515,13 @@ async fn created_branding_styles_round_trip_through_stored_state() {
             "ManagedLoginBrandingId",
             "UserPoolId",
             "UseCognitoProvidedValues",
-            "Assets",
             "CreationDate",
             "LastModifiedDate",
         ] {
             assert_eq!(
                 merged_branding.get(member),
                 branding.get(member),
-                "case {label:?}: the merged view differs from the customized one in Settings alone, got {member} as {merged_branding:?}"
+                "case {label:?}: the merged view differs from the customized one in Settings and Assets alone, got {member} as {merged_branding:?}"
             );
         }
 

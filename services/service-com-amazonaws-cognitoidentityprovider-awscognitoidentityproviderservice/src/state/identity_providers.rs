@@ -348,46 +348,84 @@ pub struct ManagedLoginBranding {
 }
 
 impl ManagedLoginBranding {
-    /// The modelled view of this style, rendered from what is stored.
+    /// The modelled view of this style, rendered from what is stored: "returns
+    /// only values that you customized in your branding style"
+    /// (`ReturnMergedResources` on the two readers of a style).
     ///
-    /// `Assets` is reported only when the style stores image files, because the
-    /// member is optional and an empty list is not the same answer as no list.
+    /// `Assets` is always reported, as the list of image files the style holds:
+    /// a style that holds none holds an EMPTY list of them, which is what a read
+    /// of its image files answers.
     pub fn to_managed_login_branding_type(&self) -> crate::ops::types::ManagedLoginBrandingType {
         crate::ops::types::ManagedLoginBrandingType {
             managed_login_branding_id: Some(self.branding_id.clone()),
             user_pool_id: Some(self.user_pool_id.clone()),
             use_cognito_provided_values: self.use_cognito_provided_values,
             settings: self.settings.clone(),
-            assets: (!self.assets.is_empty()).then(|| self.assets.clone()),
+            assets: Some(self.assets.clone()),
             creation_date: Some(to_date_time(self.creation_date)),
             last_modified_date: Some(to_date_time(self.last_modified_date)),
         }
     }
 
     /// The MERGED view of this style: the customized view with every branding
-    /// option this style leaves at the service's defaults filled in from
-    /// [`default_branding_settings`].
+    /// option and every image file this style leaves at the service's defaults
+    /// filled in from [`default_branding_settings`] and
+    /// [`default_branding_assets`].
     ///
     /// "When true, returns values for branding options that are unchanged from
     /// Amazon Cognito defaults. When false or when you omit this parameter,
     /// returns only values that you customized in your branding style"
     /// (`ReturnMergedResources` on the two readers of a style), so the merged
-    /// answer differs from the customized one in `Settings` ALONE: the default
-    /// style carries no image file, so a style's `Assets` are its own in both
-    /// views, and every other member identifies the stored style.
+    /// answer reports the service's own value for every option the style did not
+    /// change — its settings document under the style's settings, and its image
+    /// file for every category and display mode the style supplied no file for.
+    /// Every other member identifies the stored style, so the two views agree on
+    /// those.
     pub fn to_merged_managed_login_branding_type(
         &self,
     ) -> crate::ops::types::ManagedLoginBrandingType {
         crate::ops::types::ManagedLoginBrandingType {
             settings: Some(merged_branding_settings(self.settings.as_ref())),
+            assets: Some(self.merged_branding_assets()),
             ..self.to_managed_login_branding_type()
         }
     }
+
+    /// The image files the MERGED view of this style reports: every file the
+    /// style holds, and the service's own file for each role it supplied none
+    /// for, as far as `AssetListType` admits.
+    ///
+    /// The style's own files come first and are never dropped: a style may hold
+    /// a file for a display mode the service provides none for
+    /// (`ColorSchemeModeType`'s `DYNAMIC`), so the two sets together can name
+    /// more roles than the modelled maximum of 40 files, and what the merged view
+    /// then leaves out is the service's own.
+    fn merged_branding_assets(&self) -> Vec<crate::ops::types::AssetType> {
+        let filled: ::std::collections::HashSet<(&str, &str)> = self
+            .assets
+            .iter()
+            .map(|asset| (asset.category.as_str(), asset.color_mode.as_str()))
+            .collect();
+        let mut merged = self.assets.clone();
+        for provided in default_branding_assets() {
+            if merged.len() >= MAX_BRANDING_ASSETS {
+                break;
+            }
+            if !filled.contains(&(provided.category.as_str(), provided.color_mode.as_str())) {
+                merged.push(provided);
+            }
+        }
+        merged
+    }
 }
 
+/// The most image files a branding style's `Assets` may carry: `AssetListType`'s
+/// modelled length maximum
+/// (`smithy_query(query="operation",operation="CreateManagedLoginBranding")`).
+pub const MAX_BRANDING_ASSETS: usize = 40;
+
 /// The branding options this service manages for a style that customizes none
-/// of them: the baseline the MERGED view of a style reports, and therefore the
-/// only `Settings` a style that takes the Cognito-provided values has.
+/// of them: the baseline the MERGED view of a style reports.
 ///
 /// The option names are the ones this API documents — `Settings` names
 /// `signUp`, `instructions`, `sessionTimerDisplay` and `languageSelector` among
@@ -422,25 +460,135 @@ pub fn default_branding_settings() -> ::aws_smithy_types::Document {
                 "pageHeader": { "enabled": false },
                 "spacingDensity": "REGULAR"
             },
-            "signUp": { "acceptanceElements": [] }
+            "signUp": { "acceptanceElements": [{ "enforcement": "NONE", "textKey": "en" }] }
         },
         "componentClasses": {
             "buttons": { "borderRadius": 8 },
-            "divider": { "darkMode": { "borderColor": "232b37ff" }, "lightMode": { "borderColor": "e9ebedff" } },
+            "divider": { "darkMode": { "borderColor": "232b37ff" }, "lightMode": { "borderColor": "ebebf0ff" } },
+            "dropDown": {
+                "borderRadius": 8,
+                "darkMode": {
+                    "defaults": { "itemBackgroundColor": "192534ff" },
+                    "hover": {
+                        "itemBackgroundColor": "081120ff",
+                        "itemBorderColor": "5f6b7aff",
+                        "itemTextColor": "e9ebedff"
+                    },
+                    "match": { "itemBackgroundColor": "d1d5dbff", "itemTextColor": "539fe5ff" }
+                },
+                "lightMode": {
+                    "defaults": { "itemBackgroundColor": "ffffffff" },
+                    "hover": {
+                        "itemBackgroundColor": "f4f4f4ff",
+                        "itemBorderColor": "7d8998ff",
+                        "itemTextColor": "000716ff"
+                    },
+                    "match": { "itemBackgroundColor": "414d5cff", "itemTextColor": "0972d3ff" }
+                }
+            },
             "focusState": { "darkMode": { "borderColor": "539fe5ff" }, "lightMode": { "borderColor": "0972d3ff" } },
             "idpButtons": { "icons": { "enabled": true } },
-            "input": { "borderRadius": 8 },
-            "inputLabel": { "darkMode": {}, "lightMode": {} },
-            "link": { "darkMode": {}, "lightMode": {} },
-            "optionControls": { "darkMode": {}, "lightMode": {} },
-            "statusIndicator": { "darkMode": {}, "lightMode": {} }
+            "input": {
+                "borderRadius": 8,
+                "darkMode": {
+                    "defaults": { "backgroundColor": "0f1b2aff", "borderColor": "5f6b7aff" },
+                    "placeholderColor": "8d99a8ff"
+                },
+                "lightMode": {
+                    "defaults": { "backgroundColor": "ffffffff", "borderColor": "7d8998ff" },
+                    "placeholderColor": "5f6b7aff"
+                }
+            },
+            "inputDescription": {
+                "darkMode": { "textColor": "8d99a8ff" },
+                "lightMode": { "textColor": "5f6b7aff" }
+            },
+            "inputLabel": {
+                "darkMode": { "textColor": "d1d5dbff" },
+                "lightMode": { "textColor": "000716ff" }
+            },
+            "link": {
+                "darkMode": {
+                    "defaults": { "textColor": "539fe5ff" },
+                    "hover": { "textColor": "89bdeeff" }
+                },
+                "lightMode": {
+                    "defaults": { "textColor": "0972d3ff" },
+                    "hover": { "textColor": "033160ff" }
+                }
+            },
+            "optionControls": {
+                "darkMode": {
+                    "defaults": { "backgroundColor": "0f1b2aff", "borderColor": "7d8998ff" },
+                    "selected": { "backgroundColor": "539fe5ff", "foregroundColor": "000716ff" }
+                },
+                "lightMode": {
+                    "defaults": { "backgroundColor": "ffffffff", "borderColor": "7d8998ff" },
+                    "selected": { "backgroundColor": "0972d3ff", "foregroundColor": "ffffffff" }
+                }
+            },
+            "statusIndicator": {
+                "darkMode": {
+                    "error": {
+                        "backgroundColor": "1a0000ff",
+                        "borderColor": "eb6f6fff",
+                        "indicatorColor": "eb6f6fff"
+                    },
+                    "pending": { "indicatorColor": "aeb6c0ff" },
+                    "success": {
+                        "backgroundColor": "001a02ff",
+                        "borderColor": "29ad32ff",
+                        "indicatorColor": "29ad32ff"
+                    },
+                    "warning": {
+                        "backgroundColor": "1d1906ff",
+                        "borderColor": "e0ca57ff",
+                        "indicatorColor": "e0ca57ff"
+                    }
+                },
+                "lightMode": {
+                    "error": {
+                        "backgroundColor": "fff7f7ff",
+                        "borderColor": "d91515ff",
+                        "indicatorColor": "d91515ff"
+                    },
+                    "pending": { "indicatorColor": "5f6b7aff" },
+                    "success": {
+                        "backgroundColor": "f2fcf3ff",
+                        "borderColor": "037f0cff",
+                        "indicatorColor": "037f0cff"
+                    },
+                    "warning": {
+                        "backgroundColor": "fffce9ff",
+                        "borderColor": "8d6605ff",
+                        "indicatorColor": "8d6605ff"
+                    }
+                }
+            }
         },
         "components": {
-            "alert": { "borderRadius": 12 },
+            "alert": {
+                "borderRadius": 12,
+                "darkMode": {
+                    "error": { "backgroundColor": "1a0000ff", "borderColor": "eb6f6fff" },
+                    "info": { "backgroundColor": "001129ff", "borderColor": "539fe5ff" },
+                    "success": { "backgroundColor": "001a02ff", "borderColor": "29ad32ff" },
+                    "warning": { "backgroundColor": "1d1906ff", "borderColor": "e0ca57ff" }
+                },
+                "lightMode": {
+                    "error": { "backgroundColor": "fff7f7ff", "borderColor": "d91515ff" },
+                    "info": { "backgroundColor": "f2f8fdff", "borderColor": "0972d3ff" },
+                    "success": { "backgroundColor": "f2fcf3ff", "borderColor": "037f0cff" },
+                    "warning": { "backgroundColor": "fffce9ff", "borderColor": "8d6605ff" }
+                }
+            },
             "favicon": { "enabledTypes": ["ICO", "SVG"] },
             "form": {
+                "backgroundImage": { "enabled": false },
                 "borderRadius": 8,
                 "borderWidth": 1,
+                "darkMode": { "backgroundColor": "0f1b2aff", "borderColor": "424650ff" },
+                "lightMode": { "backgroundColor": "ffffffff", "borderColor": "c6c6cdff" },
                 "logo": {
                     "enabled": false,
                     "formInclusion": "IN",
@@ -448,17 +596,176 @@ pub fn default_branding_settings() -> ::aws_smithy_types::Document {
                     "position": "TOP"
                 }
             },
-            "idpButton": { "custom": {}, "standard": { "darkMode": {}, "lightMode": {} } },
-            "pageBackground": { "image": { "enabled": false } },
-            "pageFooter": { "logo": { "enabled": false } },
-            "pageHeader": { "logo": { "enabled": false } },
-            "pageText": { "darkMode": {}, "lightMode": {} },
+            "idpButton": {
+                "custom": {},
+                "standard": {
+                    "darkMode": {
+                        "active": {
+                            "backgroundColor": "354150ff",
+                            "borderColor": "89bdeeff",
+                            "textColor": "89bdeeff"
+                        },
+                        "defaults": {
+                            "backgroundColor": "0f1b2aff",
+                            "borderColor": "539fe5ff",
+                            "textColor": "539fe5ff"
+                        },
+                        "hover": {
+                            "backgroundColor": "192534ff",
+                            "borderColor": "89bdeeff",
+                            "textColor": "89bdeeff"
+                        }
+                    },
+                    "lightMode": {
+                        "active": {
+                            "backgroundColor": "d3e7f9ff",
+                            "borderColor": "033160ff",
+                            "textColor": "033160ff"
+                        },
+                        "defaults": {
+                            "backgroundColor": "ffffffff",
+                            "borderColor": "0972d3ff",
+                            "textColor": "0972d3ff"
+                        },
+                        "hover": {
+                            "backgroundColor": "f2f8fdff",
+                            "borderColor": "033160ff",
+                            "textColor": "033160ff"
+                        }
+                    }
+                }
+            },
+            "pageBackground": {
+                "darkMode": { "color": "0f1b2aff" },
+                "image": { "enabled": true },
+                "lightMode": { "color": "ffffffff" }
+            },
+            "pageFooter": {
+                "backgroundImage": { "enabled": false },
+                "darkMode": { "background": { "color": "0f1b2aff" }, "borderColor": "424650ff" },
+                "lightMode": { "background": { "color": "fafafaff" }, "borderColor": "d1d5dbff" },
+                "logo": { "enabled": false, "location": "START" }
+            },
+            "pageHeader": {
+                "backgroundImage": { "enabled": false },
+                "darkMode": { "background": { "color": "0f1b2aff" }, "borderColor": "424650ff" },
+                "lightMode": { "background": { "color": "fafafaff" }, "borderColor": "d1d5dbff" },
+                "logo": { "enabled": false, "location": "START" }
+            },
+            "pageText": {
+                "darkMode": {
+                    "bodyColor": "b6bec9ff",
+                    "descriptionColor": "b6bec9ff",
+                    "headingColor": "d1d5dbff"
+                },
+                "lightMode": {
+                    "bodyColor": "414d5cff",
+                    "descriptionColor": "414d5cff",
+                    "headingColor": "000716ff"
+                }
+            },
             "phoneNumberSelector": { "displayType": "TEXT" },
-            "primaryButton": { "darkMode": {}, "lightMode": {} },
-            "secondaryButton": { "darkMode": {}, "lightMode": {} }
+            "primaryButton": {
+                "darkMode": {
+                    "active": { "backgroundColor": "539fe5ff", "textColor": "000716ff" },
+                    "defaults": { "backgroundColor": "539fe5ff", "textColor": "000716ff" },
+                    "disabled": { "backgroundColor": "5f6b7aff", "textColor": "000716ff" },
+                    "hover": { "backgroundColor": "89bdeeff", "textColor": "000716ff" }
+                },
+                "lightMode": {
+                    "active": { "backgroundColor": "033160ff", "textColor": "ffffffff" },
+                    "defaults": { "backgroundColor": "0972d3ff", "textColor": "ffffffff" },
+                    "disabled": { "backgroundColor": "d1d5dbff", "textColor": "ffffffff" },
+                    "hover": { "backgroundColor": "065299ff", "textColor": "ffffffff" }
+                }
+            },
+            "secondaryButton": {
+                "darkMode": {
+                    "active": {
+                        "backgroundColor": "354150ff",
+                        "borderColor": "89bdeeff",
+                        "textColor": "89bdeeff"
+                    },
+                    "defaults": {
+                        "backgroundColor": "0f1b2aff",
+                        "borderColor": "539fe5ff",
+                        "textColor": "539fe5ff"
+                    },
+                    "hover": {
+                        "backgroundColor": "192534ff",
+                        "borderColor": "89bdeeff",
+                        "textColor": "89bdeeff"
+                    }
+                },
+                "lightMode": {
+                    "active": {
+                        "backgroundColor": "d3e7f9ff",
+                        "borderColor": "033160ff",
+                        "textColor": "033160ff"
+                    },
+                    "defaults": {
+                        "backgroundColor": "ffffffff",
+                        "borderColor": "0972d3ff",
+                        "textColor": "0972d3ff"
+                    },
+                    "hover": {
+                        "backgroundColor": "f2f8fdff",
+                        "borderColor": "033160ff",
+                        "textColor": "033160ff"
+                    }
+                }
+            }
         }
     }))
 }
+
+/// The image files this service provides for the roles a style supplies none of
+/// its own for: the baseline the MERGED view of a style reports, one file per
+/// role the style did not fill itself.
+///
+/// One file for each display mode of every category the service provides
+/// artwork for — every value of `AssetCategoryType` — in `LIGHT` and in `DARK`,
+/// the two display modes an image is served for (`ColorSchemeModeType`'s third
+/// value, `DYNAMIC`, is the mode that follows the browser rather than a third
+/// image to serve). Every file is an `SVG`, the one file type of
+/// `AssetExtensionType` that scales to each of these roles, and the set stays
+/// inside `AssetListType`'s modelled maximum of 40 files. Categories, display
+/// modes and file types from
+/// `smithy_query(query="shape",shape="AssetCategoryType,ColorSchemeModeType,AssetExtensionType")`.
+///
+/// Each file names the role it fills and the display mode it is for, and carries
+/// no `Bytes`: "The image file, in Base64-encoded binary" (`AssetType.Bytes`) is
+/// the file a CALLER uploaded, while the artwork for these roles is the
+/// service's own and is served from the managed login pages rather than handed
+/// back through this API. Rendered fresh per read, so no caller can change what
+/// another caller reads.
+pub fn default_branding_assets() -> Vec<crate::ops::types::AssetType> {
+    crate::ops::types::ASSET_CATEGORY_TYPE_VALUES
+        .iter()
+        .flat_map(|category| {
+            PROVIDED_ASSET_MODES
+                .iter()
+                .map(move |color_mode| crate::ops::types::AssetType {
+                    category: (*category).to_string(),
+                    color_mode: (*color_mode).to_string(),
+                    extension: PROVIDED_ASSET_EXTENSION.to_string(),
+                    bytes: None,
+                    // "The ID of the asset" (`AssetType.ResourceId`) names an
+                    // uploaded file; a file the service provides is not one a
+                    // caller uploaded, so it carries none.
+                    resource_id: None,
+                })
+        })
+        .collect()
+}
+
+/// The file type of every file [`default_branding_assets`] provides: one of the
+/// modelled `AssetExtensionType` values.
+const PROVIDED_ASSET_EXTENSION: &str = "SVG";
+
+/// The display modes [`default_branding_assets`] provides a file for: the two
+/// modelled `ColorSchemeModeType` values an image is served for.
+const PROVIDED_ASSET_MODES: [&str; 2] = ["LIGHT", "DARK"];
 
 /// [`default_branding_settings`] with `customized` laid over it: every option a
 /// style customizes is the style's, and every option it leaves alone is the

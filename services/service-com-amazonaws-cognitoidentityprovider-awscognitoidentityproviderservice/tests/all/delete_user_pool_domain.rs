@@ -134,8 +134,8 @@ async fn pool(router: &MultiServiceRouter, name: &str) -> String {
 /// One row of the delete table. The rows differ along what the rule generalises
 /// over: the kind of domain (prefix or custom, which is also which of the pool's
 /// two slots holds it), the optional members the create set, the length and form
-/// of the domain string, and whether the clock has moved the domain out of
-/// `CREATING` by the time the delete arrives.
+/// of the domain string, and whether the clock has moved the domain out of its
+/// transient status by the time the delete arrives.
 struct DeleteCase {
     case: &'static str,
     domain: String,
@@ -143,7 +143,8 @@ struct DeleteCase {
     custom_domain_config: Option<Value>,
     routing: Option<Value>,
     /// Whether to wait past [`DOMAIN_ACTIVATION_SPAN`] before deleting, so the
-    /// row deletes an `ACTIVE` domain rather than a `CREATING` one.
+    /// row deletes a domain the clock has made `ACTIVE` rather than one still in
+    /// the status its create left it in.
     wait_for_active: bool,
 }
 
@@ -184,7 +185,7 @@ impl DeleteCase {
 fn delete_cases() -> Vec<DeleteCase> {
     vec![
         DeleteCase {
-            case: "a CREATING prefix domain with every optional member unset",
+            case: "a prefix domain deleted straight after the create",
             domain: "delete-prefix".to_string(),
             managed_login_version: None,
             custom_domain_config: None,

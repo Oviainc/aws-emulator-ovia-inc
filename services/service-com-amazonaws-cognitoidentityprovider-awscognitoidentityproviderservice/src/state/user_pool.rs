@@ -1255,7 +1255,7 @@ impl UserPool {
         image_file: Option<Vec<u8>>,
         now: SystemTime,
     ) {
-        let version = css_version_stamp(now);
+        let version = version_stamp(now);
         let stored = self
             .ui_customizations
             .entry(client_id.to_string())
