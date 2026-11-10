@@ -256,12 +256,19 @@ async fn the_default_view_pointer_is_per_region_and_optional() {
     let mut per_region: Vec<(&str, Vec<String>)> = Vec::new();
     for region in regions {
         create_index(&emulator, region, "default-view-pointer").await;
-        let views = vec![
+        // Turning the Region on left it a view of its own, which every association
+        // below replaces as the pointer and which no disassociation deletes.
+        let mut views = vec![reported_default(
+            &emulator.get_default_view(region).await,
+            region,
+        )
+        .expect("a Region that was turned on has a default view")];
+        views.extend([
             create_view(&emulator, region, "first-default").await,
             create_view(&emulator, region, "second-default").await,
             create_view(&emulator, region, "third-default").await,
-        ];
-        for view in &views {
+        ]);
+        for view in &views[1..] {
             let case = format!("{region} associate {view}");
             let associated = emulator
                 .call(region, "AssociateDefaultView", json!({ "ViewArn": view }))
@@ -389,6 +396,9 @@ async fn create_view_refuses_a_name_outside_the_modelled_pattern_as_unauthorized
     let emulator = Emulator::new();
     let region = "us-east-1";
     create_index(&emulator, region, "view-name-pattern").await;
+    // The view the Region was turned on with: the only one there before any CreateView,
+    // and the one a refused CreateView must leave untouched.
+    let turn_on = listed_views(&emulator, region, "after turning the Region on").await;
 
     let rejected: Vec<(&str, String)> = vec![
         ("empty, one short of the minimum", String::new()),
@@ -421,7 +431,7 @@ async fn create_view_refuses_a_name_outside_the_modelled_pattern_as_unauthorized
         );
         assert_eq!(
             listed_views(&emulator, region, case).await,
-            BTreeSet::new(),
+            turn_on,
             "case {case:?}: a refused CreateView must store nothing"
         );
     }
@@ -429,7 +439,7 @@ async fn create_view_refuses_a_name_outside_the_modelled_pattern_as_unauthorized
     // Each published bound of the pattern, plus a compliant name the refusals above did
     // not touch: all served in the same Region.
     let served = ["a", &"b".repeat(64), "Mixed-Case-42"];
-    let mut stored = BTreeSet::new();
+    let mut stored = turn_on.clone();
     for name in served {
         stored.insert(create_view(&emulator, region, name).await);
     }

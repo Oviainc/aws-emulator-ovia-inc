@@ -19,6 +19,8 @@ mod default_view_and_refusal_classes;
 mod index_and_view_lifecycle;
 #[path = "all/index_state_and_resource_tags.rs"]
 mod index_state_and_resource_tags;
+#[path = "all/list_resources.rs"]
+mod list_resources;
 #[path = "all/resource_explorer_setup.rs"]
 mod resource_explorer_setup;
 #[path = "all/state_roundtrip.rs"]

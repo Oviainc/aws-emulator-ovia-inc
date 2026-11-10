@@ -241,7 +241,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "This operation creates only a local index" — UpdateIndexType is what
         // promotes one to AGGREGATOR. Indexing is an asynchronous background task,
-        // so the stored index starts out CREATING and the clock owes it ACTIVE.
+        // so the stored index starts out CREATING and the clock owes it ACTIVE. The
+        // Region is left queryable, with the default view `insert_index` gives it.
         let entry = guard.insert_index(
             &region,
             crate::state::INDEX_TYPE_LOCAL,
@@ -249,6 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.client_token,
             now,
         );
+
         Ok(CreateIndexOutput {
             arn: Some(entry.arn.clone()),
             state: Some(entry.state.as_wire().to_string()),

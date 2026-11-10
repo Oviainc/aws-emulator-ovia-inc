@@ -480,8 +480,9 @@ async fn setup_skips_the_index_and_view_a_region_already_holds() {
             .expect("ListViews answers a Views list")
             .len();
         assert_eq!(
-            views, 1,
-            "case {region:?}: expected the one view the setup asked for, got {views}"
+            views, 2,
+            "case {region:?}: expected the view the Region was turned on with and the \
+             one view the setup asked for, got {views}"
         );
         let indexes = emulator
             .call(region, "ListIndexes", json!({ "Regions": [region] }))

@@ -32,6 +32,11 @@ regex = "1.12"
 # `service-common` carries the ONE resource-ARN parse, which the tagging operations read a
 # caller-supplied `resourceArn`'s vendor and resource type through.
 service-common = { path = "../common" }
+# The services that OWN the resources a Region's index holds: an index reports resources
+# this service does not own, so `crate::state::owners` reads them from those services' own
+# records rather than keeping a second copy of them here.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

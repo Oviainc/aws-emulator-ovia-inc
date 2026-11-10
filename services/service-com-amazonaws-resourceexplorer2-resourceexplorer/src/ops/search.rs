@@ -10,6 +10,10 @@
 //! Region, and a view only ever reports its own Region's resources. The request's Region
 //! is used only to find the default view, which is per-Region by definition.
 //!
+//! The index's contents are resolved the one way `crate::state` resolves them, so what
+//! this operation reports includes the resources the services in `crate::state::owners`
+//! hold in that Region, read from their own records.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -199,6 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The Region whose index this query reads, as the request states it. Resolved,
+        // and the owning services read, BEFORE this service's store is locked: reading
+        // them takes their own locks.
+        let queried_region = crate::state::queried_region(ctx.parts(), input.view_arn.as_deref());
+        let owned = crate::state::owners::indexed_resources(&*self.engine, &queried_region);
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut guard = store.lock();
@@ -207,29 +217,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "All search queries must use a view. If you don't explicitly specify a view,
         // then Resource Explorer uses the default view for the Region in which you call
-        // this operation."
-        let view = match input.view_arn.as_deref() {
-            // An ARN that resolves to no view this account holds is an authorization
-            // failure, not a report that the view is absent: authorization matches the
-            // ARN before the query runs.
-            Some(arn) => guard.views.get(arn).ok_or_else(|| {
+        // this operation" — and a Region with no default view, like an ARN that resolves
+        // to no view this account holds, is the 401 that `ViewArn` documents.
+        let view = guard
+            .query_view(&region, input.view_arn.as_deref())
+            .ok_or_else(|| {
                 SearchErrorModeled::UnauthorizedException(UnauthorizedException {
                     message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
                 })
-            })?,
-            None => guard
-                .default_view_arns
-                .get(&region)
-                .and_then(|arn| guard.views.get(arn))
-                .ok_or_else(|| {
-                    SearchErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                        message: Some(format!(
-                            "Region {region} has no default view: specify ViewArn, or set a \
-                             default with AssociateDefaultView."
-                        )),
-                    })
-                })?,
-        };
+            })?;
 
         // "The results are the logical intersection of the results that match both the
         // QueryString parameter supplied to this operation and the SearchFilter
@@ -256,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         let mut matched: Vec<crate::state::IndexedResource> = guard
-            .indexed_resources(&view.region)
+            .indexed_resources(&view.region, &owned)
             .into_iter()
             .filter(|resource| {
                 crate::state::query_matches(&input.query_string, resource)
@@ -272,40 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let resources: Vec<Resource> = matched
             .iter()
-            .map(|resource| Resource {
-                arn: Some(resource.arn.clone()),
-                owning_account_id: Some(resource.owning_account_id.clone()),
-                region: Some(resource.region.clone()),
-                resource_type: Some(resource.resource_type.clone()),
-                service: Some(resource.service.clone()),
-                cfn_resource_type: resource.cfn_resource_type.clone(),
-                last_reported_at: Some(::aws_smithy_types::DateTime::from(
-                    resource.last_reported_at,
-                )),
-                // IncludedProperties "specifies optional fields that you want included
-                // in search results from this view": `tags` is the one property name the
-                // model documents, so a view that does not ask for it gets no properties.
-                properties: include_tags.then(|| {
-                    vec![ResourceProperty {
-                        name: Some(crate::state::TAGS_PROPERTY.to_string()),
-                        last_reported_at: Some(::aws_smithy_types::DateTime::from(
-                            resource.last_reported_at,
-                        )),
-                        data: Some(::aws_smithy_types::Document::Object(
-                            resource
-                                .tags
-                                .iter()
-                                .map(|(key, value)| {
-                                    (
-                                        key.clone(),
-                                        ::aws_smithy_types::Document::String(value.clone()),
-                                    )
-                                })
-                                .collect(),
-                        )),
-                    }]
-                }),
-            })
+            .map(|resource| resource.to_wire(include_tags))
             .collect();
 
         let view_arn = view.view_arn.clone();

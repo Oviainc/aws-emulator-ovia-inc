@@ -132,6 +132,17 @@ async fn create_index(emulator: &Emulator, region: &str, token: &str) -> String 
         .to_string()
 }
 
+/// The default view turning Resource Explorer on in `region` left there: a Region's
+/// index is created with the view a query that names none uses, and that view is itself
+/// one of the resources the Region's index holds.
+async fn turn_on_view(emulator: &Emulator, region: &str) -> String {
+    let answer = emulator.call(region, "GetDefaultView", json!({})).await;
+    answer.ok(&format!("the default view of {region}"))["ViewArn"]
+        .as_str()
+        .expect("a Region that was turned on has a default view")
+        .to_string()
+}
+
 /// `CreateView` in `region`, asserting success, and the view ARN it answered with.
 async fn create_view(emulator: &Emulator, region: &str, body: Value) -> String {
     let case = format!("{region} {body}");
@@ -378,9 +389,11 @@ async fn create_view_stops_at_the_views_per_region_quota() {
     let region = "us-east-1";
     create_index(&emulator, region, "quota").await;
 
-    // The quota is the only bound on the stored view map, so fill it exactly.
+    // The quota is the only bound on the stored view map, so fill it exactly. Turning
+    // the Region on already left one view there, which counts against the quota like any
+    // other.
     let quota = 100;
-    for n in 0..quota {
+    for n in 0..quota - 1 {
         create_view(&emulator, region, json!({ "ViewName": format!("view-{n}") })).await;
     }
     emulator
@@ -584,7 +597,8 @@ async fn create_view_replays_its_client_token() {
     let views = emulator.call(region, "ListViews", json!({})).await;
     assert_eq!(
         string_set(&views.ok("after replay")["Views"]).len(),
-        1,
+        // The view the Region was turned on with, plus the one created here.
+        2,
         "case after replay: an idempotent replay must not create a second view, got {}",
         views.body
     );
@@ -598,6 +612,7 @@ async fn deleting_a_view_removes_it_everywhere() {
     let emulator = Emulator::new();
     let region = "us-east-1";
     create_index(&emulator, region, "deletions").await;
+    let turn_on = turn_on_view(&emulator, region).await;
 
     let keep = create_view(&emulator, region, json!({ "ViewName": "keeper" })).await;
     let doomed = create_view(&emulator, region, json!({ "ViewName": "doomed" })).await;
@@ -624,8 +639,8 @@ async fn deleting_a_view_removes_it_everywhere() {
     let listed = emulator.call(region, "ListViews", json!({})).await;
     assert_eq!(
         string_set(&listed.ok("after delete")["Views"]),
-        BTreeSet::from([keep.clone()]),
-        "case after delete: only the surviving view may be listed, got {}",
+        BTreeSet::from([turn_on.clone(), keep.clone()]),
+        "case after delete: only the surviving views may be listed, got {}",
         listed.body
     );
 }
@@ -646,13 +661,15 @@ async fn list_views_pages_through_every_view_at_every_page_size() {
     create_index(&emulator, other_region, "paging").await;
 
     let mut expected = Vec::new();
+    // The view the Region was turned on with is listed like any other.
+    expected.push(turn_on_view(&emulator, region).await);
     for n in 0..7 {
         expected.push(create_view(&emulator, region, json!({ "ViewName": format!("view-{n}") })).await);
     }
     expected.sort();
     let elsewhere = create_view(&emulator, other_region, json!({ "ViewName": "elsewhere" })).await;
 
-    for page_size in 1..=8_usize {
+    for page_size in 1..=9_usize {
         let mut seen = Vec::new();
         let mut token: Option<String> = None;
         let mut pages = 0;
@@ -734,8 +751,14 @@ async fn search_answers_from_the_index_with_a_count_that_matches() {
     .await;
 
     let account = engine::emulator_account_id();
-    let everything = BTreeSet::from([index_arn.clone(), alpha.clone(), beta.clone()]);
-    let views_only = BTreeSet::from([alpha.clone(), beta.clone()]);
+    let turn_on = turn_on_view(&emulator, region).await;
+    let everything = BTreeSet::from([
+        index_arn.clone(),
+        turn_on.clone(),
+        alpha.clone(),
+        beta.clone(),
+    ]);
+    let views_only = BTreeSet::from([turn_on.clone(), alpha.clone(), beta.clone()]);
 
     // (query, the ARNs it must match). Filter names are those of the Resource Explorer
     // search query syntax reference.
@@ -770,7 +793,7 @@ async fn search_answers_from_the_index_with_a_count_that_matches() {
         ("globalresourcetype:resource-explorer-2:view".to_string(), BTreeSet::new()),
         (
             "resourcetype:resource-explorer-2:view -alpha".to_string(),
-            BTreeSet::from([beta.clone()]),
+            BTreeSet::from([turn_on.clone(), beta.clone()]),
         ),
         (
             "resourcetype:resource-explorer-2:view beta".to_string(),
@@ -887,7 +910,9 @@ async fn search_answers_degenerate_queries() {
         json!({ "ViewName": "beta-view", "Tags": { "env": "dev" } }),
     )
     .await;
-    let everything = BTreeSet::from([index_arn, alpha.clone(), beta.clone()]);
+    let turn_on = turn_on_view(&emulator, region).await;
+    let everything = BTreeSet::from([index_arn, turn_on, alpha.clone(), beta.clone()]);
+    // Only the two views the rows tagged carry a tag at all.
     let tagged = BTreeSet::from([alpha.clone(), beta.clone()]);
 
     let rows: Vec<(String, BTreeSet<String>)> = vec![
@@ -973,10 +998,10 @@ async fn search_pages_without_changing_its_count() {
     for n in 0..5 {
         create_view(&emulator, region, json!({ "ViewName": format!("extra-{n}") })).await;
     }
-    // The index plus seven views.
-    let total = 7_u64;
+    // The index, the view the Region was turned on with, the pager view and five extras.
+    let total = 8_u64;
 
-    for page_size in 1..=8_usize {
+    for page_size in 1..=9_usize {
         let mut seen = BTreeSet::new();
         let mut token: Option<String> = None;
         loop {
@@ -1046,9 +1071,11 @@ async fn search_pages_without_changing_its_count() {
         .failed("token from another query", 400, "ValidationException");
 }
 
-/// A query needs a view: the one the caller names, else the Region's default. An ARN
-/// that resolves to nothing is an authorization failure, a Region with no default has
-/// nothing to resolve, and a view in another Region cannot be the default for this one.
+/// A query needs a view: the one the caller names, else the Region's default. Both ways
+/// of failing to resolve one are the SAME authorization failure — "if the Region either
+/// doesn't have a default view or if you don't have permission to use the default view,
+/// then the operation fails with a 401 Unauthorized exception" (`ViewArn`'s own
+/// documentation) — and a view in another Region cannot be the default for this one.
 #[tokio::test]
 async fn search_resolves_the_view_it_is_told_to_use() {
     let emulator = Emulator::new();
@@ -1059,10 +1086,16 @@ async fn search_resolves_the_view_it_is_told_to_use() {
     let view = create_view(&emulator, region, json!({ "ViewName": "the-default" })).await;
     let foreign = create_view(&emulator, other, json!({ "ViewName": "foreign" })).await;
 
+    // Turning Resource Explorer on in a Region left that Region with a default view, so
+    // having none is a state the Region has to be CLEARED into.
+    emulator
+        .call(region, "DisassociateDefaultView", json!({}))
+        .await
+        .ok("clear the Region's default view");
     emulator
         .call(region, "Search", json!({ "QueryString": "" }))
         .await
-        .failed("no default view", 404, "ResourceNotFoundException");
+        .failed("no default view", 401, "UnauthorizedException");
     emulator
         .call(
             region,
@@ -1119,7 +1152,7 @@ async fn search_resolves_the_view_it_is_told_to_use() {
     emulator
         .call(region, "Search", json!({ "QueryString": "" }))
         .await
-        .failed("default deleted", 404, "ResourceNotFoundException");
+        .failed("default deleted", 401, "UnauthorizedException");
 }
 
 /// The results are the INTERSECTION of the query and the view's own filter, and a view

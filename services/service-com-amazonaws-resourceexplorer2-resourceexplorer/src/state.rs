@@ -27,8 +27,15 @@
 //!   `@paginated` operations share. The offset travels INSIDE the token, so a
 //!   `@readonly` list operation never writes cursor state.
 //! * [`query_matches`] — the Resource Explorer search query syntax, used by
-//!   `Search` for both the caller's `QueryString` and the view's
-//!   `Filters.FilterString`.
+//!   `Search` and `ListResources` for both the caller's own query and the view's
+//!   `Filters.FilterString`, with [`is_filter_name`] / [`free_form_term`] telling a
+//!   filter prefix from free-form text.
+//! * [`ComAmazonawsResourceexplorer2ResourceexplorerState::query_view`] — the view a
+//!   query must use, and the single refusal both ways of failing to resolve one carry.
+//! * [`IndexedResource::to_wire`] — the modelled `Resource` structure, so the two query
+//!   operations cannot disagree about how an indexed resource is reported.
+//! * [`owners`] — the owning services whose resources a Region's index holds, read from
+//!   those services' own records at query time.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -39,6 +46,8 @@ use sha2::{Digest, Sha256};
 
 mod setup_tasks;
 pub use setup_tasks::*;
+
+pub mod owners;
 
 /// The ARN namespace, SigV4 signing name and endpoint prefix of this service, and
 /// therefore the `Service` of every resource it owns.
@@ -62,6 +71,12 @@ pub const INDEX_SETTLE_DELAY: Duration = Duration::from_millis(500);
 /// exceed it. Documented on `SearchInput$QueryString`: "You can specify an empty
 /// string to return all results up to the limit of 1,000 total results. The
 /// operation can return only the first 1,000 results."
+///
+/// `ListResources` is bounded by the same total, which is what makes its own
+/// documented pagination rule hold: "The ListResources operation does not generate a
+/// NextToken if you set MaxResults to 1000" (`ListResourcesInput$NextToken`) — a page
+/// of 1,000 already carries every result the operation can return, so there is nothing
+/// left for a token to resume at.
 pub const SEARCH_RESULT_LIMIT: usize = 1000;
 
 /// The maximum number of views one Region holds, from Resource Explorer's "Views per
@@ -84,6 +99,15 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// The input member a tagging refusal blames, named the way the model declares it.
 pub const TAGS_MEMBER: &str = "Tags";
+
+/// The `ViewName` of the view a Region gets when Resource Explorer is turned on there.
+///
+/// Turning the service on in a Region indexes that Region's resources "so that they can
+/// be queried by using the `Search` operation" (`CreateIndex`'s own documentation), and
+/// every query must use a view — so the Region starts with one unfiltered view, which is
+/// also its default. A caller that wants a scoped view creates its own with `CreateView`
+/// and can make that one the default with `AssociateDefaultView`.
+pub const DEFAULT_VIEW_NAME: &str = "all-resources";
 
 /// Whether `region` is an AWS Region this emulator serves.
 ///
@@ -329,11 +353,12 @@ impl ViewEntry {
     }
 }
 
-/// A resource the Region's index holds, in the form `Search` reports it.
+/// A resource the Region's index holds, in the form the query operations report it.
 ///
 /// The emulator indexes the resources it can actually observe: the ones this
-/// service owns in that Region — its index and its views — each described from
-/// the values persisted for it, never from the caller's request.
+/// service owns in that Region — its index and its views — plus the ones the
+/// services in [`owners`] hold there, each described from the values persisted
+/// for it by the service that OWNS it, never from the caller's request.
 #[derive(Debug, Clone)]
 pub struct IndexedResource {
     pub arn: String,
@@ -366,6 +391,47 @@ impl IndexedResource {
             fields.push(value.as_str());
         }
         fields
+    }
+
+    /// The modelled `Resource` structure for this indexed resource.
+    ///
+    /// The ONE place a `Resource` is built, so `Search` and `ListResources` cannot
+    /// disagree about what an indexed resource looks like.
+    ///
+    /// `include_tags` is whether the view the query used asks for the
+    /// [`TAGS_PROPERTY`]: `IncludedProperties` "specifies optional fields that you
+    /// want included in search results from this view", and `tags` is the one
+    /// property name the model documents — so a view that does not ask for it gets
+    /// no properties at all.
+    pub fn to_wire(&self, include_tags: bool) -> crate::ops::types::Resource {
+        crate::ops::types::Resource {
+            arn: Some(self.arn.clone()),
+            owning_account_id: Some(self.owning_account_id.clone()),
+            region: Some(self.region.clone()),
+            resource_type: Some(self.resource_type.clone()),
+            service: Some(self.service.clone()),
+            cfn_resource_type: self.cfn_resource_type.clone(),
+            last_reported_at: Some(::aws_smithy_types::DateTime::from(self.last_reported_at)),
+            properties: include_tags.then(|| {
+                vec![crate::ops::types::ResourceProperty {
+                    name: Some(TAGS_PROPERTY.to_string()),
+                    last_reported_at: Some(::aws_smithy_types::DateTime::from(
+                        self.last_reported_at,
+                    )),
+                    data: Some(::aws_smithy_types::Document::Object(
+                        self.tags
+                            .iter()
+                            .map(|(key, value)| {
+                                (
+                                    key.clone(),
+                                    ::aws_smithy_types::Document::String(value.clone()),
+                                )
+                            })
+                            .collect(),
+                    )),
+                }]
+            }),
+        }
     }
 }
 
@@ -508,6 +574,14 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
     ///
     /// The ONE place an index is created: indexing is an asynchronous background
     /// task, so the index starts out `CREATING` and the clock owes it `ACTIVE`.
+    ///
+    /// Turning Resource Explorer on in a Region stores that Region's resources "so that
+    /// they can be queried by using the `Search` operation" (`CreateIndex`'s own
+    /// documentation), and every query must use a view — so a Region being turned on
+    /// also gets the view a query that names none uses: one unfiltered view named
+    /// [`DEFAULT_VIEW_NAME`], which is that Region's default. A Region that already
+    /// holds a view of its own keeps what it has; `AssociateDefaultView` is what moves
+    /// the pointer afterwards and `DisassociateDefaultView` what clears it.
     pub fn insert_index(
         &mut self,
         region: &str,
@@ -533,6 +607,18 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
             client_token,
         };
         self.indexes.insert(region.to_string(), entry.clone());
+        if self.views_in_region(region).is_empty() {
+            let view = self.insert_view(
+                NewView {
+                    view_name: DEFAULT_VIEW_NAME.to_string(),
+                    region: region.to_string(),
+                    ..NewView::default()
+                },
+                now,
+            );
+            self.default_view_arns
+                .insert(region.to_string(), view.view_arn);
+        }
         // What was stored, so the caller reports the stored values and nothing else.
         entry
     }
@@ -693,12 +779,44 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
         indexes
     }
 
-    /// The contents of the Region's index: the resources this service owns there,
-    /// described from persisted state and ordered by ARN.
+    /// The view a query must use: the one the caller named, else the Region's default.
+    ///
+    /// `None` is the ONE refusal both ways of failing to resolve a view carry — "if the
+    /// Region either doesn't have a default view or if you don't have permission to use
+    /// the default view, then the operation fails with a 401 Unauthorized exception"
+    /// (`ViewArn`'s own documentation on both query operations), and an ARN that resolves
+    /// to no view this account holds is the same authorization failure rather than a
+    /// report that the view is absent: authorization matches the ARN before the query
+    /// runs.
+    ///
+    /// A named ARN resolves wherever the request was signed: a view ARN carries its own
+    /// Region, and the index the query then reads is that view's. `region` is used only
+    /// for the default view, which is per-Region by definition.
+    pub fn query_view(&self, region: &str, view_arn: Option<&str>) -> Option<&ViewEntry> {
+        match view_arn {
+            Some(arn) => self.views.get(arn),
+            None => self
+                .default_view_arns
+                .get(region)
+                .and_then(|arn| self.views.get(arn)),
+        }
+    }
+
+    /// The contents of the Region's index: the resources this service owns there and
+    /// the `owned` ones the services in [`owners`] hold there, each described from
+    /// persisted state and ordered by ARN.
     ///
     /// A Region with no index holds nothing, which is what turning Resource
-    /// Explorer off in a Region means.
-    pub fn indexed_resources(&self, region: &str) -> Vec<IndexedResource> {
+    /// Explorer off in a Region means — so a resource another service owns is indexed
+    /// only while this Region's index is there to hold it. `owned` is read from those
+    /// services BEFORE this store is locked, so no two stores are ever locked in two
+    /// orders; rows of another Region are dropped here, because an index holds only
+    /// "the resources that are located in the same Region as the index".
+    pub fn indexed_resources(
+        &self,
+        region: &str,
+        owned: &[IndexedResource],
+    ) -> Vec<IndexedResource> {
         let Some(index) = self.live_index(region) else {
             return Vec::new();
         };
@@ -726,6 +844,12 @@ impl ComAmazonawsResourceexplorer2ResourceexplorerState {
                 tags: view.tags.clone(),
             });
         }
+        resources.extend(
+            owned
+                .iter()
+                .filter(|resource| resource.region == region)
+                .cloned(),
+        );
         resources.sort_by(|a, b| a.arn.cmp(&b.arn));
         resources
     }
@@ -762,6 +886,23 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// The resource-id portion of an ARN: whatever follows the last `/` or `:`.
 pub fn resource_id_of_arn(arn: &str) -> &str {
     arn.rsplit(['/', ':']).next().unwrap_or(arn)
+}
+
+/// The Region whose index a query is going to read, as far as the REQUEST says.
+///
+/// A query that names a view reads the index of THAT view's Region — a view ARN carries
+/// its own Region, and a view only ever reports its own Region's resources — while one
+/// that names none uses the Region it was signed for, which is where its default view
+/// lives. Resolving it from the request alone is what lets a handler read the owning
+/// services ([`owners`]) before it locks this service's store; the authoritative Region
+/// is still the resolved view's own, and [`ComAmazonawsResourceexplorer2ResourceexplorerState::indexed_resources`]
+/// drops any row that does not belong to it.
+pub fn queried_region(parts: &::http::request::Parts, view_arn: Option<&str>) -> String {
+    view_arn
+        .and_then(::service_common::arn::parse)
+        .map(|arn| arn.region.to_string())
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| request_region(parts))
 }
 
 // ---------------------------------------------------------------------------
@@ -975,6 +1116,54 @@ pub fn tags_filter_name(query: &str) -> Option<&str> {
         let (_, _, filter) = split_term(term);
         let (name, _) = filter?;
         is_tag_filter_name(name).then_some(name)
+    })
+}
+
+/// Whether `name` is one of the filter prefixes the search query syntax documents.
+///
+/// Asked of a NAME alone, so it answers the question `ListResources` has to ask of its
+/// own filter string, whose documented restriction is that it "supports only filter
+/// prefixes with optional operators. It doesn't support free-form text."
+///
+/// Answered through [`filter_fields`] itself — the ONE place the filter names live —
+/// against a resource record carrying no values, because which names are filter names
+/// is a property of the name and not of any resource.
+pub fn is_filter_name(name: &str) -> bool {
+    filter_fields(name, valueless_resource()).is_some()
+}
+
+/// A resource record carrying no values, for asking [`filter_fields`] about a filter
+/// name on its own. Built once per process: this is asked once per term of a
+/// caller-supplied filter string.
+fn valueless_resource() -> &'static IndexedResource {
+    static PROBE: OnceLock<IndexedResource> = OnceLock::new();
+    PROBE.get_or_init(|| IndexedResource {
+        arn: String::new(),
+        owning_account_id: String::new(),
+        region: String::new(),
+        service: String::new(),
+        resource_type: String::new(),
+        cfn_resource_type: None,
+        last_reported_at: SystemTime::UNIX_EPOCH,
+        tags: HashMap::new(),
+    })
+}
+
+/// The first term of `query` that is NOT a documented filter prefix, written the way the
+/// query wrote it, or `None` when every term carries one.
+///
+/// A term is free-form text when it has no `name:value` prefix at all, or when its
+/// prefix is not a filter name ([`is_filter_name`]) — exactly the terms
+/// [`term_matches`] falls back to matching as text. An empty term contributes nothing
+/// either way, so it is not free-form text.
+pub fn free_form_term(query: &str) -> Option<&str> {
+    query.split_whitespace().find(|term| {
+        let (_, body, filter) = split_term(term);
+        !body.is_empty()
+            && match filter {
+                Some((name, _)) => !is_filter_name(name),
+                None => true,
+            }
     })
 }
 

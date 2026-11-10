@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: resolves the view, intersects the caller's `Filters.FilterString` with
+//! the view's own filter string over the contents of that Region's index in
+//! `crate::state`, and reports the matching resources a page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The one thing this operation does that `Search` does not is refuse free-form text:
+//! its filter string "supports only filter prefixes with optional operators. It doesn't
+//! support free-form text" (`ListResourcesInput$Filters`), so a term carrying no
+//! documented filter prefix is a 400 `ValidationException` rather than a term matched
+//! against every indexed field.
+//!
+//! An explicit `ViewArn` identifies the view wherever the request was signed for, and
+//! the index read is the one belonging to THAT view's Region. Its contents are resolved
+//! the one way `crate::state` resolves them, so what this operation reports includes the
+//! resources the services in `crate::state::owners` hold in that Region, read from their
+//! own records.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +195,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResources"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListResourcesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Resource Explorer store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "An array of strings that specify which resources are included in the results
+        // of queries made using this view": no filter at all is every resource the view
+        // can return, which is what an empty filter string matches.
+        let query = input
+            .filters
+            .as_ref()
+            .map_or("", |filters| filters.filter_string.as_str());
+        // The Region whose index this query reads, as the request states it. Resolved,
+        // and the owning services read, BEFORE this service's store is locked: reading
+        // them takes their own locks.
+        let queried_region = crate::state::queried_region(ctx.parts(), input.view_arn.as_deref());
+        let owned = crate::state::owners::indexed_resources(&*self.engine, &queried_region);
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut guard = store.lock();
+        // A read, so the only write is the index lifecycle the clock already owed.
+        guard.settle(now);
+
+        // "This query must use a view. If you don't explicitly specify a view, then
+        // Resource Explorer uses the default view for the Region in which you call this
+        // operation" — and a Region with no default view, like an ARN that resolves to
+        // no view this account holds, is the 401 that `ViewArn` documents.
+        let view = guard
+            .query_view(&region, input.view_arn.as_deref())
+            .ok_or_else(|| {
+                ListResourcesErrorModeled::UnauthorizedException(UnauthorizedException {
+                    message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
+                })
+            })?;
+
+        // "This query string in the context of this operation supports only filter
+        // prefixes with optional operators. It doesn't support free-form text." Asked
+        // AFTER the view is resolved, because authorization comes before the request's
+        // own contents: a caller who may not use the view it named learns nothing about
+        // its query from the refusal.
+        if crate::state::free_form_term(query).is_some() {
+            return Err(ListResourcesErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "1 validation error detected: Value at '{FILTER_STRING_MEMBER}' failed \
+                         to satisfy constraint: {FREE_FORM_TEXT_ISSUE}"
+                    ),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: FILTER_STRING_MEMBER.to_string(),
+                        validation_issue: FREE_FORM_TEXT_ISSUE.to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // A view's own filter string scopes what the view can return, so what this
+        // operation reports is the intersection of it with the caller's: both match.
+        let view_filter = view.filter_string.clone().unwrap_or_default();
+        let include_tags = view.includes_property(crate::state::TAGS_PROPERTY);
+
+        // A tag filter reads a resource's TAGS, which a view only carries when it
+        // includes the `tags` property — so a query that filters on tags, whether from
+        // the caller's filter string or from the view's own, is refused unless the view
+        // includes that property. The refusal names the filter at fault.
+        if !include_tags {
+            if let Some(filter) = crate::state::tags_filter_name(query)
+                .or_else(|| crate::state::tags_filter_name(&view_filter))
+            {
+                return Err(ListResourcesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "The specified filter {filter} is not valid because it uses \
+                             properties that are not included in the view."
+                        ),
+                        field_list: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        let matched: Vec<crate::state::IndexedResource> = guard
+            .indexed_resources(&view.region, &owned)
+            .into_iter()
+            .filter(|resource| {
+                crate::state::query_matches(query, resource)
+                    && crate::state::query_matches(&view_filter, resource)
+            })
+            // The query "can return only the first 1,000 results", which is also what
+            // makes a `MaxResults` of 1,000 issue no `NextToken`: that one page already
+            // carries every result there is.
+            .take(crate::state::SEARCH_RESULT_LIMIT)
+            .collect();
+
+        let resources: Vec<Resource> = matched
+            .iter()
+            .map(|resource| resource.to_wire(include_tags))
+            .collect();
+
+        let view_arn = view.view_arn.clone();
+        // The cursor is bound to the request it was issued for, so a NextToken from one
+        // query or view cannot resume a different one at that offset.
+        let cursor = format!(
+            "{}:{}",
+            Self::NAME,
+            crate::state::request_fingerprint(&[query, &view_arn])
+        );
+        let (page, next_token) = crate::state::paginate(
+            &resources,
+            &cursor,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|message| {
+            ListResourcesErrorModeled::ValidationException(ValidationException {
+                message,
+                field_list: None,
+            })
+        })?;
+        Ok(ListResourcesOutput {
+            resources: Some(page),
+            next_token,
+            // "The Amazon resource name (ARN) of the view that this operation used to
+            // perform the search": the view the caller named, or the default view it
+            // resolved to.
+            view_arn: Some(view_arn),
+        })
     }
 }
+
+/// The input member a free-form-text refusal blames, spelled as the member path to it.
+const FILTER_STRING_MEMBER: &str = "Filters.FilterString";
+
+/// What that member has to satisfy, from the restriction `ListResourcesInput$Filters`
+/// documents for it: the query string "supports only filter prefixes with optional
+/// operators. It doesn't support free-form text."
+///
+/// The refusal states the requirement and the member and NO value: `SearchFilter` is
+/// `@sensitive`, so the string a caller sent is not echoed into the response and the
+/// logs it travels through.
+const FREE_FORM_TEXT_ISSUE: &str =
+    "Member must contain only filter prefixes with optional operators, and no free-form \
+     text";
