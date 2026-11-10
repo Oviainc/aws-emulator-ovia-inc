@@ -13,7 +13,9 @@
 //! image holding it, so a version whose asynchronous build is still in flight is
 //! reported `IN_PROGRESS`/`INACTIVE` and the same version reads `SUCCESSFUL`/`ACTIVE`
 //! once the clock has made that build due. `items` is `@required`, so it is always
-//! projected, an empty page included.
+//! projected, an empty page included — which is also what an identifier of this account's
+//! own namespace holding no versions here is answered with: past the authorization
+//! verdict this enumeration reports rather than refuses.
 //!
 //! ## Shape of an operation
 //!
@@ -197,34 +199,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(::std::time::Instant::now());
 
-        // The AUTHORIZATION verdict, decided BEFORE the own-account lookup: an
-        // identifier in the AWS-OWNED namespace names a resource of AWS's own
-        // catalogue, whose versions are read through the managed listing rather than
-        // through this one, so it is DENIED rather than reported missing — the same
-        // verdict the image's own read path answers, and taken first for the same
-        // reason: a 404 would tell a caller with no permission on the identifier
-        // whether it exists.
-        if crate::state::is_managed_microvm_image_arn(&input.image_identifier) {
-            return Err(ListMicrovmImageVersionsErrorModeled::AccessDeniedException(
-                AccessDeniedException {
-                    message: Some(crate::state::access_denied_message()),
-                },
-            )
-            .into());
-        }
-
-        // `MicrovmImageIdentifier` is "The ARN or ID of the MicroVmImage", so the
-        // identifier is resolved as an id this account holds and, failing that, read as
-        // an ARN — the same resolution the image's own read path takes, because this
-        // listing addresses that same image. The outcomes mean different things to a
-        // caller polling an image it believes is being built: a value that is no
-        // identifier this API can address is a request that can NEVER succeed (400),
-        // and only a well-formed identifier naming no image of this account is the
-        // not-yet-created condition a poll may retry (404).
-        let image = match store.resolve_image_reference(&region, &input.image_identifier) {
-            crate::state::ImageReference::Resolved(name) => store.image_named(&region, &name),
-            crate::state::ImageReference::Absent => None,
-            crate::state::ImageReference::Malformed => {
+        // What this ENUMERATION answers for a `MicrovmImageIdentifier` ("The ARN or ID of
+        // the MicroVmImage"), decided AUTHORIZATION FIRST
+        // (`crate::state::resolve_image_access`): an identifier outside this account's
+        // own image namespace — a resource of AWS's own catalogue, another account's,
+        // another partition's — is DENIED whether or not it names anything, so the
+        // listing never tells a caller with no permission on an identifier whether it
+        // exists, and a value that is no identifier this API can address at all is a
+        // request that can NEVER succeed (400).
+        //
+        // Past that verdict the listing REPORTS what this region's store holds for the
+        // address the request named and refuses nothing: an identifier of this account's
+        // own namespace that names no image here — a name nothing was created under, a
+        // record the clock has already removed, one minted through another region's
+        // endpoint — holds no versions to enumerate, which is an EMPTY PAGE rather than a
+        // refusal (recorded AWS behaviour). A paginator may therefore walk a collection
+        // that is empty, or drains to empty, to its end.
+        let image = match store.resolve_image_access(&region, &input.image_identifier) {
+            crate::state::ImageAccess::Granted(name) => store.image_named(&region, &name),
+            crate::state::ImageAccess::Absent => None,
+            crate::state::ImageAccess::Denied => {
+                return Err(ListMicrovmImageVersionsErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(crate::state::access_denied_message()),
+                    },
+                )
+                .into());
+            }
+            crate::state::ImageAccess::Malformed => {
                 return Err(ListMicrovmImageVersionsErrorModeled::ValidationException(
                     ValidationException {
                         message: Some(crate::state::invalid_arn_format_message(
@@ -236,20 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
         let Some(image) = image else {
-            // `ResourceNotFoundException` models `message` as the only required member;
-            // `resourceType` and `resourceId` are optional and this service leaves them
-            // unset, so the message — built from the identifier the request carried — is
-            // the whole envelope.
-            return Err(
-                ListMicrovmImageVersionsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::image_not_found_message(&input.image_identifier),
-                        resource_type: None,
-                        resource_id: None,
-                    },
-                )
-                .into(),
-            );
+            return Ok(empty_page());
         };
 
         // The versions enumerate NEWEST FIRST — the `major.minor` order the versions
@@ -286,6 +275,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|version| summary_of(&image.image_arn, version))
                 .collect(),
         })
+    }
+}
+
+/// The TERMINAL EMPTY PAGE: `items` is `@required`, so a listing with nothing to report
+/// projects it empty rather than omitting it, and issues no `nextToken` — there is no
+/// further page for a paginator to ask for.
+fn empty_page() -> ListMicrovmImageVersionsOutput {
+    ListMicrovmImageVersionsOutput {
+        next_token: None,
+        items: Vec::new(),
     }
 }
 

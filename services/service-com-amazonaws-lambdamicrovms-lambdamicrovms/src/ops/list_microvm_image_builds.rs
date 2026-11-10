@@ -2,6 +2,14 @@
 
 //! @op ListMicrovmImageBuilds
 //!
+//! Pages through the build records the version of the MicroVM image this request
+//! addresses holds — one per target that version's accepted `cpuConfigurations` asked
+//! for, filtered by whichever of `architecture`, `chipset` and `chipsetGeneration` the
+//! request named — under the operation's `@paginated` contract. `items` is `@required`,
+//! so it is always projected, an empty page included: past the authorization verdict this
+//! enumeration reports what this region's store holds at the address the request named
+//! rather than refusing an address it holds nothing at.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -179,18 +187,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(::std::time::Instant::now());
 
-        // The build plane's AUTHORIZATION verdict, decided before anything is looked
-        // up: a caller may read the builds of an image its own account holds, so an
-        // identifier that resolves to no image of this account — an AWS-owned managed
-        // base image, another account's, or one nobody created — is DENIED rather than
-        // reported missing, and a value that is no identifier this API can address at
-        // all is a request that can never succeed (400).
+        // What this ENUMERATION answers for a `MicrovmImageIdentifier` ("The ARN or ID of
+        // the MicroVmImage"), decided AUTHORIZATION FIRST
+        // (`crate::state::resolve_image_access`): an identifier outside this account's
+        // own image namespace — a resource of AWS's own catalogue, another account's,
+        // another partition's — is DENIED whether or not it names anything, so the
+        // listing never tells a caller with no permission on an identifier whether it
+        // exists, and a value that is no identifier this API can address at all is a
+        // request that can NEVER succeed (400).
         //
-        // Deciding this before the lookup is the point: a 404 here would tell a caller
-        // with no permission on the identifier whether it exists.
-        let image_name = match store.resolve_image_reference(&region, &input.image_identifier) {
-            crate::state::ImageReference::Resolved(name) => name,
-            crate::state::ImageReference::Absent => {
+        // Past that verdict the listing REPORTS the builds this region's store holds at
+        // the address the request named — the image and the version together — and
+        // refuses nothing: an address this account's own namespace holds no builds at,
+        // because no image was created under the identifier here or the image holds no
+        // such version, is an EMPTY PAGE rather than a refusal (recorded AWS behaviour),
+        // so a paginator walks a collection that is empty, or drains to empty, to its
+        // end.
+        let image_name = match store.resolve_image_access(&region, &input.image_identifier) {
+            crate::state::ImageAccess::Granted(name) => name,
+            crate::state::ImageAccess::Absent => {
+                return Ok(empty_page());
+            }
+            crate::state::ImageAccess::Denied => {
                 return Err(ListMicrovmImageBuildsErrorModeled::AccessDeniedException(
                     AccessDeniedException {
                         message: Some(crate::state::access_denied_message()),
@@ -198,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            crate::state::ImageReference::Malformed => {
+            crate::state::ImageAccess::Malformed => {
                 return Err(ListMicrovmImageBuildsErrorModeled::ValidationException(
                     ValidationException {
                         message: Some(crate::state::invalid_arn_format_message(
@@ -210,18 +228,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // Past the verdict the lookup is an own-account one, so a version this
-        // account's own image does not hold is the modelled 404.
         let Some(image) = store.image_named(&region, &image_name) else {
-            return Err(not_found(crate::state::image_not_found_message(
-                &input.image_identifier,
-            )));
+            return Ok(empty_page());
         };
         let Some(version) = image.versions.get(&input.image_version) else {
-            return Err(not_found(crate::state::image_version_not_found_message(
-                &image.image_arn,
-                &input.image_version,
-            )));
+            return Ok(empty_page());
         };
 
         // "Lists builds for a MicroVM image version with optional filtering by
@@ -279,18 +290,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// 404: the request named a version the resolved image does not hold.
-///
-/// `ResourceNotFoundException` models `message` as the only required member;
-/// `resourceType` and `resourceId` are optional and this service leaves them unset, so
-/// the message is the whole envelope.
-fn not_found(message: String) -> ListMicrovmImageBuildsError {
-    ListMicrovmImageBuildsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message,
-        resource_type: None,
-        resource_id: None,
-    })
-    .into()
+/// The TERMINAL EMPTY PAGE: `items` is `@required`, so a listing with nothing to report
+/// projects it empty rather than omitting it, and issues no `nextToken` — there is no
+/// further page for a paginator to ask for.
+fn empty_page() -> ListMicrovmImageBuildsOutput {
+    ListMicrovmImageBuildsOutput {
+        next_token: None,
+        items: Vec::new(),
+    }
 }
 
 /// The marker every `nextToken` this operation issues carries, so a token the service

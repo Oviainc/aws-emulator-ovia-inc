@@ -7,9 +7,9 @@
 //! resolved by either form `MicrovmImageIdentifier` accepts — one entry per stored
 //! version record, NEWEST FIRST in the `major.minor` order the versions themselves name,
 //! each carrying that image's ARN and the record's own build inputs, state, status and
-//! instants, paged by the operation's `@paginated` contract; a well-formed identifier
-//! naming no image of this account is HTTP 404 and a value that is no identifier of this
-//! API is HTTP 400.
+//! instants, paged by the operation's `@paginated` contract; a well-formed identifier of
+//! this account's own namespace naming no image of it holds nothing to enumerate and gets
+//! an empty page, and a value that is no identifier of this API is HTTP 400.
 //!
 //! Each test states that rule and exercises it over a SET of inputs; the values any one
 //! row happens to carry are examples, not the specification. The wire harness
@@ -21,8 +21,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    image_not_found_message, invalid_arn_format_message, service_state, version_order,
-    MAX_LIST_PAGE,
+    invalid_arn_format_message, service_state, version_order, MAX_LIST_PAGE,
 };
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -393,13 +392,14 @@ async fn each_entry_is_the_stored_version_record_and_tracks_the_build_clock() {
 }
 
 /// RULE: the identifier is resolved against the images THIS ACCOUNT holds, by either form
-/// `MicrovmImageIdentifier` accepts; a well-formed identifier of this account's own
-/// namespace naming no image of it — an image the clock has already removed included — is
-/// HTTP 404 `ResourceNotFoundException`, and a value that is no identifier of this API at
-/// all is HTTP 400 `ValidationException`. (An identifier of the AWS-OWNED namespace is
-/// refused 403 before any lookup; `managed_namespace_authorization` owns that verdict.)
+/// `MicrovmImageIdentifier` accepts; past the authorization verdict the listing REPORTS
+/// rather than refuses, so a well-formed identifier of this account's own namespace naming
+/// no image of it — an image the clock has already removed included — gets a TERMINAL
+/// EMPTY PAGE, and only a value that is no identifier of this API at all is HTTP 400
+/// `ValidationException`. (An identifier of the AWS-OWNED namespace is refused 403 before
+/// any lookup; `managed_namespace_authorization` owns that verdict.)
 #[tokio::test]
-async fn an_identifier_naming_no_held_image_is_refused() {
+async fn an_identifier_naming_no_held_image_gets_an_empty_page() {
     let (router, _) = emulator_with_store();
     create_image(&router, "held", json!({})).await;
 
@@ -420,65 +420,60 @@ async fn an_identifier_naming_no_held_image_is_refused() {
         );
     }
 
-    // Rows differ in HOW the identifier fails to name an image this account holds: the
-    // right ARN form for a name never created, another region's ARN for a held name, and
-    // values that are no identifier of this API at all.
-    let never_created = expected_image_arn("never-created");
-    let other_region = format!("arn:aws:lambda:eu-central-1:{ACCOUNT}:microvm-image:held");
-    let rows: Vec<(&str, String, u16, String)> = vec![
+    // Rows differ in HOW the identifier of this account's own namespace fails to name an
+    // image this region holds: the right ARN form for a name never created, and another
+    // region's ARN for a held name. Neither holds versions here, so neither has anything
+    // to enumerate.
+    let rows: Vec<(&str, String)> = vec![
         (
             "an ARN for a name never created",
-            never_created.clone(),
-            404,
-            image_not_found_message(&never_created),
+            expected_image_arn("never-created"),
         ),
         (
             "another region's ARN for a held name",
-            other_region.clone(),
-            404,
-            image_not_found_message(&other_region),
+            format!("arn:aws:lambda:eu-central-1:{ACCOUNT}:microvm-image:held"),
         ),
+    ];
+    for (case, identifier) in rows {
+        assert_empty_page(&router, &identifier, case).await;
+    }
+
+    // Rows differ in HOW the value fails to be an identifier of this API at all, which is
+    // a request that can never succeed rather than a collection that is empty.
+    let refused: Vec<(&str, String)> = vec![
         (
             "a name no image of this account carries",
             "never-created".to_string(),
-            400,
-            invalid_arn_format_message("never-created"),
         ),
         (
             "no identifier of this API at all",
             "not-an-identifier".to_string(),
-            400,
-            invalid_arn_format_message("not-an-identifier"),
         ),
     ];
 
-    for (case, identifier, expected_status, expected_message) in rows {
+    for (case, identifier) in refused {
         let (status, body) = list_versions(&router, &identifier, "").await;
         assert_eq!(
-            status, expected_status,
-            "case {case:?}: {identifier:?} expected {expected_status}, got {status} {body}"
+            status, 400,
+            "case {case:?}: {identifier:?} expected 400, got {status} {body}"
         );
-        let expected_type = match expected_status {
-            404 => "ResourceNotFoundException",
-            _ => "ValidationException",
-        };
         assert_eq!(
             body["__type"].as_str(),
-            Some(expected_type),
-            "case {case:?}: expected {expected_type}, got {body}"
+            Some("ValidationException"),
+            "case {case:?}: expected ValidationException, got {body}"
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(expected_message.as_str()),
-            "case {case:?}: expected the refusal built from the identifier the request carried, \
-             got {:?}",
+            Some(invalid_arn_format_message(&identifier).as_str()),
+            "case {case:?}: expected the refusal built from the identifier the request \
+             carried, got {:?}",
             body["message"]
         );
     }
 
     // An image whose asynchronous deletion is in flight is still held, so its versions
-    // are still listed; once the clock has removed it the listing answers the same 404 as
-    // a name never created.
+    // are still listed; once the clock has removed it the listing holds nothing to
+    // enumerate and answers the same empty page as a name never created.
     let (status, deleted) = delete_image(&router, "held").await;
     assert_eq!(status, 200, "the delete expected 200, got {status} {deleted}");
     let (status, during) = list_versions(&router, "held", "").await;
@@ -493,15 +488,31 @@ async fn an_identifier_naming_no_held_image_is_refused() {
     );
 
     tokio::time::sleep(PAST_THE_SPAN).await;
-    let (status, after) = list_versions(&router, &expected_image_arn("held"), "").await;
+    assert_empty_page(
+        &router,
+        &expected_image_arn("held"),
+        "an image the clock has removed",
+    )
+    .await;
+}
+
+/// Assert that the listing of `identifier` is the terminal empty page: HTTP 200, `items`
+/// projected empty (it is `@required`) and no `nextToken` to follow.
+async fn assert_empty_page(router: &MultiServiceRouter, identifier: &str, case: &str) {
+    let (status, body) = list_versions(router, identifier, "").await;
     assert_eq!(
-        status, 404,
-        "a removed image holds no versions to list, got {status} {after}"
+        status, 200,
+        "case {case:?}: {identifier:?} expected 200, got {status} {body}"
     );
     assert_eq!(
-        after["message"].as_str(),
-        Some(image_not_found_message(&expected_image_arn("held")).as_str()),
-        "the removed image answers the lookup's own 404, got {after}"
+        body["items"],
+        json!([]),
+        "case {case:?}: items is projected as an empty list, got {body}"
+    );
+    assert!(
+        body["nextToken"].is_null(),
+        "case {case:?}: an exhausted listing issues no nextToken, got {:?}",
+        body["nextToken"]
     );
 }
 

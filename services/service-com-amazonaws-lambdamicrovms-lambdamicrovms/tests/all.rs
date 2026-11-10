@@ -29,6 +29,8 @@ mod image_identity_and_version_generations;
 mod image_listing;
 #[path = "all/image_read_authorization.rs"]
 mod image_read_authorization;
+#[path = "all/image_refusal_paths.rs"]
+mod image_refusal_paths;
 #[path = "all/image_request_validation.rs"]
 mod image_request_validation;
 #[path = "all/image_version_listing.rs"]

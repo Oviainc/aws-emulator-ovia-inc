@@ -253,8 +253,29 @@ pub fn is_image_lifecycle_in_flight(state: &str) -> bool {
     )
 }
 
-/// The `message` of the 400 a configuration update answers for an image whose own
-/// lifecycle work is still in flight ([`is_image_lifecycle_in_flight`]).
+/// Whether an image in `state` is one a configuration update can build the next version
+/// of.
+///
+/// `UpdateMicrovmImage` "updates the configuration of a MicroVM image and triggers a new
+/// version build", so it needs a record whose own lifecycle work has SETTLED and that has
+/// a built configuration to carry the change forward from. Each lifecycle of an image is
+/// named by a pair of `MicrovmImageState` values — the progressive value this service
+/// reports while the work runs and the settled value that work reaches — and only the
+/// lifecycles that produced a version leave a record an update may start from: the
+/// settled values of the CREATE and UPDATE lifecycles that built one. Every other value
+/// is a record nothing can be built from — one this service is still writing
+/// ([`is_image_lifecycle_in_flight`]), one whose creation never produced a version
+/// ([`IMAGE_STATE_CREATE_FAILED`]), and the values of a deletion, which is one-way —
+/// so the update is refused with the modelled 400 ([`image_not_updatable_message`]).
+pub fn image_state_admits_update(state: &str) -> bool {
+    matches!(
+        state,
+        IMAGE_STATE_CREATED | IMAGE_STATE_UPDATED | IMAGE_STATE_UPDATE_FAILED
+    )
+}
+
+/// The `message` of the 400 a configuration update answers for an image whose current
+/// state admits no update ([`image_state_admits_update`]).
 ///
 /// The refusal names the image by the ARN the service minted for it — the one identity
 /// of the record, whichever form `MicrovmImageIdentifier` the request addressed it by —
@@ -782,11 +803,13 @@ pub fn image_version_not_found_message(image: &str, image_version: &str) -> Stri
 /// The `message` of the 404 a build-addressed call answers when the image version it
 /// resolved holds no build with the `buildId` the request named.
 ///
-/// The template states the same thing one level deeper than
-/// [`image_version_not_found_message`]: the resource that is missing, and the record it
-/// was looked for in.
+/// The sentence is AWS's own for this error class: the fixed text `Build not found for
+/// MicroVMImageID: `, `, VersionID: ` and `, BuildID: `, with the three variable parts
+/// taken from the path labels the request carried — the image identifier, the version and
+/// the build id — so the refusal names the whole address the build was looked for at
+/// (recorded AWS behaviour).
 pub fn image_build_not_found_message(image: &str, image_version: &str, build_id: &str) -> String {
-    format!("MicroVM image {image} version {image_version} has no build {build_id}")
+    format!("Build not found for MicroVMImageID: {image}, VersionID: {image_version}, BuildID: {build_id}")
 }
 
 /// The `message` of the 403 a read answers for a resource the caller may not read.

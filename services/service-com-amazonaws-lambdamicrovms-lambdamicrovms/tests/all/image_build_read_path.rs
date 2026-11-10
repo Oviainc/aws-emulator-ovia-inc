@@ -4,13 +4,14 @@
 //! `GetMicrovmImageBuild` — driven over the same router the emulator boots.
 //!
 //! RULE: the build-read plane decides its authorization verdict on the image the request
-//! names BEFORE looking anything up, so a caller reads builds only of an image its own
-//! account holds: an `imageIdentifier` that resolves to no image of this account is
-//! `AccessDeniedException` (HTTP 403) whatever version or build id accompanies it, a
-//! value that is no identifier this API can address is `ValidationException` (HTTP 400),
-//! and only a resolved own-account image goes on to the version and build lookup — whose
-//! own misses are `ResourceNotFoundException` (HTTP 404) and whose hits report the
-//! persisted build records.
+//! names BEFORE looking anything up, so a caller reads builds only through an identifier
+//! of its own account's image namespace: an identifier of another namespace is
+//! `AccessDeniedException` (HTTP 403) whatever version or build id accompanies it, and a
+//! value that is no identifier this API can address is `ValidationException` (HTTP 400).
+//! Past that verdict the single-build READ reports what it finds and misses with
+//! `ResourceNotFoundException` (HTTP 404), while the paginated LISTING reports the builds
+//! held at the address the request named and answers an EMPTY PAGE for an address this
+//! account holds none at (`image_refusal_paths` owns that rule).
 //!
 //! Each test states that rule and exercises it over a SET of inputs; the values any one
 //! row happens to carry are examples, not the specification. The wire harness
@@ -115,12 +116,13 @@ pub(crate) fn arm64_targets() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-/// RULE (the authorization verdict, decided before any lookup): a build read on an
-/// `imageIdentifier` that resolves to no image of the calling account — the AWS-owned
-/// managed catalogue, another account's or another region's namespace, or an identifier
-/// nobody ever created — is refused with `AccessDeniedException` (HTTP 403), on BOTH
-/// build reads and whatever version or build id accompanies it, so no caller can use the
-/// refusal to learn whether the identifier exists.
+/// RULE (the authorization verdict, decided before any lookup): a build read addressed at
+/// an identifier OUTSIDE the calling account's own image namespace — the AWS-owned managed
+/// catalogue, another account's, another region's or another service's — is refused with
+/// `AccessDeniedException` (HTTP 403), on both build reads and whatever version or build
+/// id accompanies it, so no caller can use the refusal to learn whether the identifier
+/// exists. An identifier OF that namespace holding no builds here is answered about the
+/// records instead: the listing serves an empty page.
 #[tokio::test]
 async fn a_build_read_outside_this_accounts_own_images_is_denied() {
     let router = emulator();
@@ -133,7 +135,8 @@ async fn a_build_read_outside_this_accounts_own_images_is_denied() {
     let managed_version = published_managed_base_image_versions(managed_id)[0];
 
     // Rows differ in WHICH namespace the well-formed identifier belongs to — the
-    // dimension the verdict generalises over.
+    // dimension the verdict generalises over. Every one of them is outside this account's
+    // own image namespace, which is what the denial is about.
     let identifiers: Vec<(&str, String)> = vec![
         (
             "an AWS-owned managed base image ARN",
@@ -144,16 +147,8 @@ async fn a_build_read_outside_this_accounts_own_images_is_denied() {
             managed_base_image_arn(REGION, "no-such-base-image"),
         ),
         (
-            "an own-account ARN nobody created",
-            expected_image_arn("never-created-image"),
-        ),
-        (
             "another account's ARN",
             format!("arn:aws:lambda:{REGION}:210987654321:microvm-image:someone-elses"),
-        ),
-        (
-            "another region's ARN for an image this region holds",
-            format!("arn:aws:lambda:eu-west-1:{ACCOUNT}:microvm-image:{held}"),
         ),
         (
             "another service's ARN",
@@ -183,6 +178,32 @@ async fn a_build_read_outside_this_accounts_own_images_is_denied() {
                 assert_denied(status, &body, &format!("GetMicrovmImageBuild {case}"));
             }
         }
+    }
+
+    // An identifier of this account's OWN namespace that names no image here holds no
+    // builds, and the listing refuses nothing past the verdict: it answers an empty page.
+    // The rows differ in HOW the own-namespace identifier fails to name an image here.
+    let own_absent: Vec<(&str, String)> = vec![
+        (
+            "an own-account ARN nobody created",
+            expected_image_arn("never-created-image"),
+        ),
+        (
+            "another region's ARN for an image this region holds",
+            format!("arn:aws:lambda:eu-west-1:{ACCOUNT}:microvm-image:{held}"),
+        ),
+    ];
+    for (case, identifier) in &own_absent {
+        let (status, body) = list_builds(&router, identifier, FIRST_IMAGE_VERSION, "").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: {identifier:?} holds no builds to list, got {status} {body}"
+        );
+        assert_eq!(
+            body["items"],
+            json!([]),
+            "case {case:?}: an address holding no builds is an empty page, got {body}"
+        );
     }
 
     // The positive control: the image this account holds is readable through the same
@@ -516,16 +537,17 @@ async fn a_version_or_build_a_held_image_does_not_hold_is_not_found() {
         }
     }
 
-    // The listing answers the same 404 for a version the image does not hold.
+    // The LISTING of the same unheld version is not a refusal: the version holds no
+    // builds, so the page is empty (`image_refusal_paths` owns that rule).
     let (status, body) = list_builds(&router, &image_arn, "2.0", "").await;
     assert_eq!(
-        status, 404,
-        "listing an unheld version: expected 404, got {status} {body}"
+        status, 200,
+        "listing an unheld version: expected 200, got {status} {body}"
     );
     assert_eq!(
-        body["message"].as_str(),
-        Some(image_version_not_found_message(&image_arn, "2.0").as_str()),
-        "listing an unheld version: expected the refusal naming it, got {body}"
+        body["items"],
+        json!([]),
+        "listing an unheld version: expected an empty page, got {body}"
     );
 }
 

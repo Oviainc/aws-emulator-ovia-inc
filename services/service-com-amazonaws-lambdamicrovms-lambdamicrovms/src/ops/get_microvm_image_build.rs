@@ -218,9 +218,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
         let Some(build) = version.builds.get(&input.build_id) else {
+            // The refusal is built from the ADDRESS the request carried — its
+            // `imageIdentifier`, `imageVersion` and `buildId` path labels — so the
+            // sentence names the build the caller asked for in the form it asked for it.
             return Err(not_found(crate::state::image_build_not_found_message(
-                &image.image_arn,
-                &version.image_version,
+                &input.image_identifier,
+                &input.image_version,
                 &input.build_id,
             )));
         };

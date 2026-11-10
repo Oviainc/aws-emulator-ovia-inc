@@ -9,6 +9,12 @@
 //! with that version's build in flight. A later read materialises `UPDATED`, and the
 //! new version becomes the image's active one, once the clock has made the build due.
 //!
+//! The call starts from the image's CURRENT state: only a record whose own lifecycle
+//! work has settled on a version it built admits an update
+//! ([`crate::state::image_state_admits_update`]), so an image still being written, one
+//! whose creation never produced a version, and one being deleted are refused with the
+//! modelled `ValidationException` before anything is written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -315,11 +321,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(&input.image_identifier));
         };
 
-        // An image whose own lifecycle work is still in flight is not a record this
-        // call can build the next version from: `MicrovmImageState`'s progressive
-        // values mark the spans this service is still writing the record itself, so the
-        // update is refused for as long as one is in flight.
-        if crate::state::is_image_lifecycle_in_flight(&image.state) {
+        // An image whose CURRENT state admits no update is not a record this call can
+        // build the next version from (`crate::state::image_state_admits_update`), and
+        // the guard runs BEFORE anything is written: the record stays exactly as the
+        // lifecycle that settled it left it, so a client polling for a terminal state
+        // still sees that state rather than one this refused call moved it to.
+        if !crate::state::image_state_admits_update(&image.state) {
             return Err(validation(crate::state::image_not_updatable_message(
                 &image.image_arn,
             )));

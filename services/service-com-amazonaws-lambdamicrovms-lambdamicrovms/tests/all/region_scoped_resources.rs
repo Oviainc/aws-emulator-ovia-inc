@@ -102,8 +102,10 @@ fn assert_not_found(status: u16, body: &Value, expected: &str, case: &str) {
 }
 
 /// RULE: an image minted through one region's endpoint is readable there and reported
-/// ABSENT at every other region's endpoint — by every call addressed at a
-/// `MicrovmImageIdentifier` — and it appears in no other region's listing.
+/// ABSENT at every other region's endpoint — the item reads addressed at a
+/// `MicrovmImageIdentifier` report the modelled not-found, and the paginated version
+/// enumeration (which refuses nothing past the authorization verdict) an empty page — and
+/// it appears in no other region's listing.
 #[tokio::test]
 async fn an_image_is_addressable_only_through_the_region_that_minted_it() {
     let router = emulator();
@@ -121,8 +123,8 @@ async fn an_image_is_addressable_only_through_the_region_that_minted_it() {
 
     for region in FOREIGN_REGIONS {
         // Rows differ in WHICH call asks about the identifier: the image's own read, the
-        // version-addressed read, the version listing and the tag listing all resolve the
-        // same `imageIdentifier`, so each must report the same absence.
+        // version-addressed read and the tag listing all resolve the same
+        // `imageIdentifier`, so each must report the same absence.
         let rows: Vec<(String, String)> = vec![
             (
                 "GetMicrovmImage".to_string(),
@@ -134,13 +136,6 @@ async fn an_image_is_addressable_only_through_the_region_that_minted_it() {
                     "/2025-09-09/microvm-images/{}/versions/{}",
                     as_uri_value(&arn),
                     as_uri_value(FIRST_IMAGE_VERSION)
-                ),
-            ),
-            (
-                "ListMicrovmImageVersions".to_string(),
-                format!(
-                    "/2025-09-09/microvm-images/{}/versions",
-                    as_uri_value(&arn)
                 ),
             ),
             (
@@ -157,6 +152,29 @@ async fn an_image_is_addressable_only_through_the_region_that_minted_it() {
                 &format!("{operation} for {arn} from {region}"),
             );
         }
+
+        // The version ENUMERATION reports what the region holds for the identifier, which
+        // is nothing: an empty page (`image_refusal_paths` owns that rule).
+        let (status, body) = call_in_region(
+            &router,
+            region,
+            "GET",
+            &format!(
+                "/2025-09-09/microvm-images/{}/versions",
+                as_uri_value(&arn)
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {region}: ListMicrovmImageVersions for {arn} expected 200, got {status} {body}"
+        );
+        assert_eq!(
+            body["items"],
+            json!([]),
+            "case {region}: another region's image holds no versions here, got {body}"
+        );
 
         let listed = list_images(&router, region).await;
         assert!(
