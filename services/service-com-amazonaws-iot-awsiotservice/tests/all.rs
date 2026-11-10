@@ -37,6 +37,8 @@ mod indexing_configuration;
 mod job_description;
 #[path = "all/job_document_read.rs"]
 mod job_document_read;
+#[path = "all/job_execution_deletion.rs"]
+mod job_execution_deletion;
 #[path = "all/job_execution_read.rs"]
 mod job_execution_read;
 #[path = "all/job_targeting.rs"]
