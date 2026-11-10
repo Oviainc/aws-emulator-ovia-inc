@@ -304,7 +304,18 @@ impl<'a> ControlArnRef<'a> {
 /// Parsing drops the partition because no modeled ARN pattern here distinguishes one:
 /// every pattern restricts that segment to the `aws` family (`aws(?:[-a-z]*)?`) and
 /// says nothing more about it, so the segment is checked for membership of the family
-/// and then carries no information about which resource the ARN names.
+/// ([`is_aws_partition`]) and then carries no information about which resource the ARN
+/// names. The Region segment is read the same way: it is checked against the class the
+/// patterns admit there ([`is_modeled_region`]), and what it then decides is only
+/// whether the ARN is the global catalog form (an EMPTY Region) or a regional
+/// `controltower` one.
+///
+/// A segment is therefore accepted only when the WHOLE of it is a spelling the modeled
+/// patterns admit. Both of these segments are dropped once read, so a spelling outside
+/// the modeled class would otherwise name a published resource as though the caller had
+/// written a modeled ARN; the patterns refuse such an ARN before a handler runs, so it
+/// is unreachable from the wire, and refusing it here too means an in-process caller
+/// gets the same answer as a client, in every build profile.
 #[derive(Debug)]
 struct AccountlessArn<'a> {
     service: &'a str,
@@ -336,7 +347,7 @@ impl<'a> AccountlessArn<'a> {
         else {
             return None;
         };
-        if !partition.starts_with("aws") {
+        if !is_aws_partition(partition) || !is_modeled_region(region) {
             return None;
         }
         Some(Self {
@@ -345,6 +356,31 @@ impl<'a> AccountlessArn<'a> {
             resource,
         })
     }
+}
+
+/// Is `partition` a member of the partition family every modeled ARN pattern here
+/// restricts that segment to — `aws(?:[-a-z]*)?`, the letters `aws` followed by any
+/// number of lowercase letters and hyphens and nothing else
+/// (`smithy_query(query="shape", shape="ControlArn,DomainArn,ObjectiveArn,CommonControlArn")`)?
+///
+/// So `aws` itself and every partition spelled in that class (`aws-cn`, `aws-us-gov`,
+/// `aws-iso-e`) belong to it, while a segment carrying anything else — a digit
+/// (`aws1`), an uppercase letter (`awsX`, `aws-CN`), an underscore (`aws_cn`) — or one
+/// that does not open with `aws` at all does not, whatever prefix it shares with the
+/// family.
+fn is_aws_partition(partition: &str) -> bool {
+    partition
+        .strip_prefix("aws")
+        .is_some_and(|rest| rest.chars().all(|c| c == '-' || c.is_ascii_lowercase()))
+}
+
+/// Is `region` a Region segment the modeled ARN patterns admit? `ControlArn` allows
+/// `[a-zA-Z0-9-]*` there — letters of either case, digits and hyphens — and the three
+/// ontology patterns pin `controlcatalog:::`, so the empty segment, which that class
+/// contains, is the only one they admit
+/// (`smithy_query(query="shape", shape="ControlArn,DomainArn,ObjectiveArn,CommonControlArn")`).
+fn is_modeled_region(region: &str) -> bool {
+    region.chars().all(|c| c == '-' || c.is_ascii_alphanumeric())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
