@@ -19,6 +19,8 @@ mod automation_executions;
 mod automation_step_executions;
 #[path = "all/document_content.rs"]
 mod document_content;
+#[path = "all/document_default_version.rs"]
+mod document_default_version;
 #[path = "all/document_versions.rs"]
 mod document_versions;
 #[path = "all/cloud_connectors.rs"]

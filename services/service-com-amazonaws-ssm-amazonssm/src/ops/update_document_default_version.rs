@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDocumentDefaultVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDocumentDefaultVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Move an SSM document's DEFAULT version — the version a read that names none resolves
+//! to. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDocumentDefaultVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `CreateDocument` mints version 1 and each `UpdateDocument` appends the next one
+//! without moving the default, so the default moves only here
+//! ([`crate::state::DocumentRecord::default_version`]). What this persists is what
+//! `DescribeDocument` reports as `DefaultVersion`, and what `GetDocument` and
+//! `DescribeDocument` serve a request that names no version at all (the `$DEFAULT`
+//! selector, [`crate::state::DocumentRecord::select`]) — all of them reach the one store
+//! in [`crate::state`].
+//!
+//! "The name of a custom document" and "the version of a custom document": the default
+//! version of a document the account created here is the account's to move, and it moves
+//! to one of the versions that document already holds. A name this endpoint holds no
+//! created document of — including one only the catalogue Systems Manager publishes
+//! carries ([`crate::state::published_document`]), which no caller created and no call
+//! versions — names no custom document, and this operation models one error for a
+//! document it cannot name.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +156,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDocumentDefaultVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDocumentDefaultVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDocumentDefaultVersion"))
+        // `Name`'s pattern and `DocumentVersion`'s are MODELLED constraints, so the
+        // centralized walk has already refused anything outside them: reaching here means
+        // `DocumentVersion` is a positive decimal integer with no leading zero
+        // (`DocumentVersionNumber`, `^(^[1-9][0-9]*$)$` — unlike the `DocumentVersion`
+        // selector a read takes, it admits neither `$LATEST` nor `$DEFAULT`), and `Name`
+        // is a bare document name rather than an ARN.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDocumentDefaultVersionErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the document store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A transition the clock already owed a version of this document was due at the
+        // same instant whether or not anybody called, so it is materialised before this
+        // call resolves anything against the store.
+        store.materialize_due(now);
+
+        // The document whose default version this moves: one a caller CREATED through this
+        // endpoint, which is what a custom document is. A name only the published catalogue
+        // carries is reachable for a READ (it is projected on read, never stored) but is
+        // not the account's to version, and a name neither holds names no document at all.
+        let Some(record) = store.document_mut(&region, &input.name) else {
+            return Err(UpdateDocumentDefaultVersionErrorModeled::InvalidDocument(
+                InvalidDocument {
+                    message: Some(format!("Document with name {} does not exist.", input.name)),
+                },
+            )
+            .into());
+        };
+
+        // "The version of a custom document that you want to set as the default version":
+        // the default version is one of the versions the document holds, so a number it
+        // holds no version of names none to make the default and nothing moves. A number
+        // too large to count a version is such a number.
+        let requested = input.document_version.as_str();
+        let Some(selected) = requested
+            .parse::<u64>()
+            .ok()
+            .and_then(|version| record.version(version))
+        else {
+            let latest_version = record.latest_version();
+            return Err(
+                UpdateDocumentDefaultVersionErrorModeled::InvalidDocumentVersion(
+                    InvalidDocumentVersion {
+                        message: Some(format!(
+                            "Document version: {requested} is invalid, latest version is \
+                             {latest_version}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "The default version of the artifact associated with the document"
+        // (`DocumentDefaultVersionDescription$DefaultVersionName`): the `VersionName` the
+        // version this call makes the default carries, which a version created without one
+        // does not have.
+        let default_version = selected.version;
+        let default_version_name = selected.version_name.clone();
+        record.default_version = default_version;
+
+        // The report is of the document this call moved, read back from the record it
+        // wrote: the name as the store holds it, and the version that is now its default.
+        Ok(UpdateDocumentDefaultVersionOutput {
+            description: Some(DocumentDefaultVersionDescription {
+                name: Some(record.name.clone()),
+                default_version: Some(default_version.to_string()),
+                default_version_name,
+            }),
+        })
     }
 }
