@@ -2138,8 +2138,10 @@ fn boolean_of(value: &::serde_json::Value) -> Option<bool> {
 //
 // `CreateCloudFormationTemplate` prepares the deployable template of ONE published
 // version and hands back the id it is read by; `GetCloudFormationTemplate` reports that
-// same record. Both the status and the expiry are functions of the stored instants and
-// the clock, so neither read moves anything.
+// same record. The template is prepared WITHIN the create — its own 201 reports it
+// `ACTIVE` — so the only instant either operation reports against is the expiry: both the
+// status and the `ExpirationTime` are functions of the stored instants and the clock, so
+// neither read moves anything.
 // ---------------------------------------------------------------------------
 
 /// How long a prepared template lives: SIX hours from the instant it was created.
@@ -2156,24 +2158,21 @@ fn boolean_of(value: &::serde_json::Value) -> Option<bool> {
 /// `status_at` is derived from.
 pub const TEMPLATE_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// How long a prepared template reports [`TEMPLATE_PREPARING`] before the clock owes it
-/// [`TEMPLATE_ACTIVE`].
+/// The states of the template creation workflow this service reports, of the three the
+/// `Status` enum declares (`smithy_query(query="shape", shape="Status")`: PREPARING |
+/// ACTIVE | EXPIRED).
 ///
 /// `Status` is the "Status of the template creation workflow"
 /// (`smithy_query(query="doc", shape="CreateCloudFormationTemplateResponse",
-/// member="Status")`), whose first state is `PREPARING`: the move to `ACTIVE` is owed by
-/// the clock at a fixed instant, whether or not anybody calls, never performed by a read.
-/// AWS publishes no duration for it, so this span is the emulator's own choice: non-zero,
-/// so a caller reading straight after the create still sees `PREPARING`, and short enough
-/// that the next poll of a client sees `ACTIVE`.
-pub const TEMPLATE_PREPARATION_SPAN: Duration = Duration::from_millis(500);
-
-/// The three states of the template creation workflow, as the `Status` enum declares them
-/// (`smithy_query(query="shape", shape="Status")`: PREPARING | ACTIVE | EXPIRED).
-pub const TEMPLATE_PREPARING: &str = "PREPARING";
-/// See [`TEMPLATE_PREPARING`].
+/// member="Status")`), and the service finishes that workflow within the create itself:
+/// the 201 of `CreateCloudFormationTemplate` reports a template that is already `ACTIVE`,
+/// so a caller may deploy it straight from the create response. Nothing here mints
+/// `PREPARING`: there is no later instant at which the template becomes usable, so there
+/// is no transition for the clock to owe. What the clock does owe is the END of the
+/// template's life — [`TEMPLATE_EXPIRED`] once the [`TEMPLATE_LIFETIME`] window its own
+/// `ExpirationTime` states has passed.
 pub const TEMPLATE_ACTIVE: &str = "ACTIVE";
-/// See [`TEMPLATE_PREPARING`].
+/// See [`TEMPLATE_ACTIVE`].
 pub const TEMPLATE_EXPIRED: &str = "EXPIRED";
 
 /// How many prepared templates this emulator retains.
@@ -2203,18 +2202,16 @@ pub struct CloudFormationTemplate {
     /// CloudFormation" — the location of the template body published with that version,
     /// which is what this prepared template serves.
     pub template_url: String,
-    /// When this template was prepared.
+    /// When this template was prepared, and the instant from which it reports
+    /// [`TEMPLATE_ACTIVE`].
     pub created_at: SystemTime,
-    /// The instant the clock owes this template its move from `PREPARING` to `ACTIVE`:
-    /// `created_at + `[`TEMPLATE_PREPARATION_SPAN`].
-    pub active_at: SystemTime,
     /// The instant this template expires: `created_at + `[`TEMPLATE_LIFETIME`].
     pub expires_at: SystemTime,
 }
 
 impl CloudFormationTemplate {
     /// The record for a template prepared at `now` from the version `template_url` was
-    /// published with. Both due instants are derived here, so no caller sets them.
+    /// published with. The expiry is derived here, so no caller sets it.
     pub fn prepared(
         template_id: String,
         application_id: String,
@@ -2228,21 +2225,20 @@ impl CloudFormationTemplate {
             semantic_version,
             template_url,
             created_at: now,
-            active_at: now + TEMPLATE_PREPARATION_SPAN,
             expires_at: now + TEMPLATE_LIFETIME,
         }
     }
 
     /// The status this template reports at `now`, a pure function of the stored instants:
-    /// `PREPARING` until the preparation span is up, `ACTIVE` until it expires, `EXPIRED`
-    /// after that. Nothing is written, so two reads at one instant answer identically.
+    /// `ACTIVE` from the create that prepared it until it expires, `EXPIRED` from its
+    /// `expires_at` on. Nothing is written, so two reads at one instant answer
+    /// identically, and the create's own response reports the same `ACTIVE` the read that
+    /// follows it does.
     pub fn status_at(&self, now: SystemTime) -> &'static str {
         if now >= self.expires_at {
             TEMPLATE_EXPIRED
-        } else if now >= self.active_at {
-            TEMPLATE_ACTIVE
         } else {
-            TEMPLATE_PREPARING
+            TEMPLATE_ACTIVE
         }
     }
 

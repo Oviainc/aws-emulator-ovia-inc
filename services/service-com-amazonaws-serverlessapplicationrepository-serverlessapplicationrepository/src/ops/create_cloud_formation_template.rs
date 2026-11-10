@@ -11,11 +11,11 @@
 //! while an application that carries NO version at all is a request the service cannot act
 //! on (HTTP 400).
 //!
-//! The template is minted `PREPARING` — `Status` is the "Status of the template creation
-//! workflow" — and the clock owes it `ACTIVE` at
-//! [`crate::state::TEMPLATE_PREPARATION_SPAN`] and `EXPIRED` at
-//! [`crate::state::TEMPLATE_LIFETIME`]; both are derived from the stored instants on every
-//! read, so no read moves a status.
+//! The creation workflow `Status` names ("Status of the template creation workflow")
+//! finishes within this call: the template is reported [`crate::state::TEMPLATE_ACTIVE`] by
+//! this very 201, so a caller may deploy it straight from this response, and the clock owes
+//! it only `EXPIRED` at [`crate::state::TEMPLATE_LIFETIME`]. The status is derived from the
+//! stored instants on every read, so no read moves it.
 //!
 //! This is the ONLY file to touch for this operation.
 //!

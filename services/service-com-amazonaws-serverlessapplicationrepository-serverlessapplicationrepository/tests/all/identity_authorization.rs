@@ -32,11 +32,9 @@
 //! wildcard `Allow`, an explicit `Deny` beside a wildcard `Allow`).
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_cloudformation_cloudformation::EmulatedService as CloudFormation;
-use service_com_amazonaws_serverlessapplicationrepository_serverlessapplicationrepository::state::ComAmazonawsServerlessapplicationrepositoryServerlessapplicationrepositoryState;
 use service_com_amazonaws_serverlessapplicationrepository_serverlessapplicationrepository::EmulatedService as ServerlessRepo;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -78,9 +76,11 @@ struct Principal {
 /// The emulator these tests drive: one shared engine carrying this service beside
 /// CloudFormation (where a deploy's change set and stack live) and the IAM and STS services
 /// the principals and their policies are made with.
+///
+/// Every service is constructed from that one engine, so the store the decisions are made
+/// against is reached through the handlers alone: this suite writes none of it directly.
 struct Emulator {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -105,7 +105,7 @@ impl Emulator {
                 Arc::clone(&engine),
             ),
         );
-        Self { router, engine }
+        Self { router }
     }
 
     /// One restJson1 call to this service, with `access_key_id` in the SigV4 credential scope.
@@ -339,8 +339,8 @@ impl Emulator {
     }
 
     /// Prepare a CloudFormation template of version 1.0.0 as the account's own credential and
-    /// answer its `TemplateId`, with the `PREPARING` -> `ACTIVE` transition the clock owes
-    /// made due.
+    /// answer its `TemplateId`. The create's own response reports it `ACTIVE`, so nothing has
+    /// to be held for the template to be deployable.
     async fn prepared_template(&self, application_id: &str) -> String {
         let path = format!("/applications/{}/templates", path_label(application_id));
         let prepared = self
@@ -356,13 +356,6 @@ impl Emulator {
             "preparing a template: expected 201, got {} with {}",
             prepared.status, prepared.body
         );
-        let state = self
-            .engine
-            .state::<ComAmazonawsServerlessapplicationrepositoryServerlessapplicationrepositoryState>();
-        let due = SystemTime::now() - Duration::from_secs(1);
-        for template in state.lock().templates.values_mut() {
-            template.active_at = due;
-        }
         prepared
             .body
             .get("templateId")

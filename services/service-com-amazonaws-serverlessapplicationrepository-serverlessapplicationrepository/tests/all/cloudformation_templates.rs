@@ -12,9 +12,9 @@
 //!    of the template body PUBLISHED with that version, and the template expires exactly
 //!    [`EXPIRY_WINDOW`] after it was created;
 //! 2. `Status` is the state of the "template creation workflow" at the instant of the
-//!    read, a function of the stored instants and the clock: `PREPARING` until the
-//!    preparation span is up, `ACTIVE` until the template expires, `EXPIRED` after that —
-//!    so a read never moves it and two reads at one instant answer identically;
+//!    read, a function of the stored instants and the clock: `ACTIVE` from the create that
+//!    prepared it until the template expires, `EXPIRED` after that — so a read never moves
+//!    it and two reads at one instant answer identically;
 //! 3. `GetCloudFormationTemplate` reports the stored record member for member, and a
 //!    template read through an application that is not the one it was prepared from is as
 //!    absent as one that was never prepared;
@@ -51,7 +51,16 @@ use super::version_templates::SAM_TRANSFORM;
 const EXPIRY_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Prepare a template of `application_id`, naming `semantic_version` when there is one.
-async fn prepare(repo: &Repo, application_id: &str, semantic_version: Option<&str>) -> Answer {
+///
+/// `pub(crate)` because the readiness of what a prepare answers — a template that is
+/// `ACTIVE` in the create's own response — is a rule of its own, asserted in
+/// `prepared_template_readiness.rs` over the class of publishes rather than through a
+/// second copy of this call.
+pub(crate) async fn prepare(
+    repo: &Repo,
+    application_id: &str,
+    semantic_version: Option<&str>,
+) -> Answer {
     let body = match semantic_version {
         Some(semantic_version) => json!({ "semanticVersion": semantic_version }),
         None => json!({}),
@@ -126,7 +135,10 @@ fn epoch_seconds(case: &str, answer: &Answer, member: &str) -> i64 {
 /// Hold the stored template's instants as if it had been prepared `age` ago, so a
 /// transition the CLOCK owes can be asserted without sleeping for it. The emulator derives
 /// every status from these instants, so this is the same record a later clock would see.
-fn age_template(repo: &Repo, template_id: &str, age: Duration) {
+///
+/// `pub(crate)`: the expiry sweep in `prepared_template_readiness.rs` holds a record the
+/// same way rather than writing a second copy of this.
+pub(crate) fn age_template(repo: &Repo, template_id: &str, age: Duration) {
     let handle = repo.engine.state::<ServiceState>();
     let mut store = handle.lock();
     let template = store
@@ -135,7 +147,6 @@ fn age_template(repo: &Repo, template_id: &str, age: Duration) {
         .unwrap_or_else(|| panic!("the store holds template {template_id}"));
     let created_at = SystemTime::now() - age;
     template.created_at = created_at;
-    template.active_at = created_at + state::TEMPLATE_PREPARATION_SPAN;
     template.expires_at = created_at + state::TEMPLATE_LIFETIME;
 }
 
@@ -243,12 +254,12 @@ async fn a_prepared_template_reports_the_version_it_was_prepared_from() {
             is_uuid_shaped(&template_id),
             "case {case:?}: the templateId is a UUID, got {template_id:?}"
         );
-        // A caller acting straight after the call still sees the transient state of the
-        // template creation workflow.
+        // The creation workflow finishes within the create, so the template is deployable
+        // from this very response.
         assert_eq!(
             prepared.at("status").as_str(),
-            Some("PREPARING"),
-            "case {case:?}: a freshly prepared template is PREPARING, got {}",
+            Some("ACTIVE"),
+            "case {case:?}: a freshly prepared template is ACTIVE, got {}",
             prepared.at("status")
         );
         let created_at = epoch_seconds(case, &prepared, "creationTime");
@@ -320,38 +331,29 @@ async fn a_prepared_template_reports_the_version_it_was_prepared_from() {
 /// RULE 2: the status a template reports is the state of the creation workflow AT THE
 /// INSTANT OF THE READ, derived from the stored instants.
 ///
-/// The rows span the whole window by the age of the record: fresh, exactly at the
-/// preparation span, mid-life, the last second before expiry, exactly at expiry, and long
-/// past it. Each row is prepared through the wire and then its stored instants are held at
-/// that age, because the two published bounds of the window — the preparation span and the
-/// hour of life — are the clock's, not a caller's.
+/// The rows span the whole window by the age of the record: fresh, a second old, mid-life,
+/// the last second before expiry, exactly at expiry, and long past it. Each row is prepared
+/// through the wire and then its stored instants are held at that age, because the one
+/// published bound of the window — the life of a prepared template — is the clock's, not a
+/// caller's.
 #[tokio::test]
 async fn the_status_of_a_template_is_its_place_in_the_expiry_window() {
     let repo = Repo::new();
     let application_id = created(&repo, "expiry-app").await;
     published(&repo, &application_id, "1.0.0", inline_template("Queue")).await;
 
-    // The span is the emulator's own, so the test pins the contract it must satisfy: a
-    // non-zero wait, short enough that a polling client sees ACTIVE on its next look.
-    assert!(
-        state::TEMPLATE_PREPARATION_SPAN >= Duration::from_millis(250)
-            && state::TEMPLATE_PREPARATION_SPAN <= Duration::from_millis(750),
-        "the preparation span is a non-zero wait of at most 750ms, got {:?}",
-        state::TEMPLATE_PREPARATION_SPAN
-    );
     assert_eq!(
         state::TEMPLATE_LIFETIME, EXPIRY_WINDOW,
         "a prepared template lives {EXPIRY_WINDOW:?}, got {:?}",
         state::TEMPLATE_LIFETIME
     );
 
-    let span = state::TEMPLATE_PREPARATION_SPAN;
     let lifetime = state::TEMPLATE_LIFETIME;
     // (case, the age the record is held at, the status expected, whether the next
     // transition is far enough away for a second read to be guaranteed the same status)
     let cases: Vec<(&str, Duration, &str, bool)> = vec![
-        ("just prepared", Duration::ZERO, "PREPARING", false),
-        ("exactly at the preparation span", span, "ACTIVE", true),
+        ("just prepared", Duration::ZERO, "ACTIVE", true),
+        ("a second old", Duration::from_secs(1), "ACTIVE", true),
         ("halfway through its life", lifetime / 2, "ACTIVE", true),
         (
             "the last second of its life",

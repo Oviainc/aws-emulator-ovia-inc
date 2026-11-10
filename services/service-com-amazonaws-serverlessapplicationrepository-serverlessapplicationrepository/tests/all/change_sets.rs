@@ -202,18 +202,18 @@ impl Deploy {
         .await
     }
 
-    /// Make every prepared template's `PREPARING` -> `ACTIVE` transition due NOW, the way
-    /// [`Deploy::settle_cloudformation`] does for a stack: the span is the emulator's, and
-    /// a case that slept for it would be racing the machine's load instead of asserting
-    /// the transition.
-    fn prepare_templates(&self) {
+    /// End the life of every prepared template, the way the CLOCK ends it at its own
+    /// `ExpirationTime`: a case that waited six hours for it would not finish. A template
+    /// whose life has ended is the one status a deploy refuses, now that a create reports
+    /// `ACTIVE` from its own response.
+    fn expire_templates(&self) {
         let state = self
             .engine
             .state::<ComAmazonawsServerlessapplicationrepositoryServerlessapplicationrepositoryState>();
         let mut held = state.lock();
-        let due = SystemTime::now() - Duration::from_secs(1);
+        let gone = SystemTime::now() - Duration::from_secs(1);
         for template in held.templates.values_mut() {
-            template.active_at = due;
+            template.expires_at = gone;
         }
     }
 
@@ -1383,7 +1383,8 @@ async fn a_later_deployment_updates_the_stack_the_first_one_created() {
 
 /// RULE: a `TemplateId` names a template this service PREPARED for the application
 /// (`CreateCloudFormationTemplate`), and the deployment is of the version that template
-/// was prepared from — once it is `ACTIVE`, and not while it is still `PREPARING`.
+/// was prepared from — for as long as that template is `ACTIVE`, which it is from the
+/// create that minted it until its own `ExpirationTime` passes.
 ///
 /// The rows prepare a template from each of two published versions, so what the request
 /// names and what gets deployed are independent of which version is the latest.
@@ -1421,26 +1422,9 @@ async fn a_change_set_deploys_the_version_a_prepared_template_names() {
         );
         let stack_name = format!("template-stack-{index}");
 
-        // A template still PREPARING is not deployable, and nothing is created for the
-        // attempt.
-        let (status, answer) = deploy
-            .create_change_set(
-                &application_id,
-                json!({ "stackName": stack_name, "templateId": template_id }),
-            )
-            .await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: a PREPARING template must not deploy, got {status} with {answer}"
-        );
-        assert!(
-            text(&answer, "message").contains("PREPARING"),
-            "case {case:?}: the refusal must name the status that refused it, got {answer}"
-        );
-
-        // Once the clock has made it ACTIVE, the change set deploys the version it was
-        // prepared from — whatever the application's latest version is.
-        deploy.prepare_templates();
+        // The prepared template is deployable from the create that minted it: the change
+        // set deploys the version it was prepared from, whatever the application's latest
+        // version is.
         let (status, answer) = deploy
             .create_change_set(
                 &application_id,
@@ -1497,6 +1481,28 @@ async fn a_change_set_deploys_the_version_a_prepared_template_names() {
             text(&answer, "message").contains("was prepared from version"),
             "case {case:?}: the refusal must say which version the template carries, got \
              {answer}"
+        );
+
+        // The one status that refuses a deploy is the end of the template's own life: once
+        // the clock has passed its `ExpirationTime` the template is gone, and the refusal
+        // names that status.
+        deploy.expire_templates();
+        let (status, answer) = deploy
+            .create_change_set(
+                &application_id,
+                json!({
+                    "stackName": format!("template-expired-{index}"),
+                    "templateId": template_id
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: an EXPIRED template must not deploy, got {status} with {answer}"
+        );
+        assert!(
+            text(&answer, "message").contains("EXPIRED"),
+            "case {case:?}: the refusal must name the status that refused it, got {answer}"
         );
     }
 }

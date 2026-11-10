@@ -261,9 +261,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             crate::state::template_not_found_message(template_id),
                         ));
                     };
-                    // Only a prepared template can be deployed: one still `PREPARING` is
-                    // not ready, and an expired one is gone ("Templates expire 1 hour
-                    // after creation").
+                    // Only a template whose own life has not ended can be deployed: a
+                    // prepared template is `ACTIVE` from the create that minted it, and an
+                    // expired one is gone ("Templates expire 1 hour after creation").
                     let status = template.status_at(now);
                     if status != crate::state::TEMPLATE_ACTIVE {
                         return Err(bad_request(format!(

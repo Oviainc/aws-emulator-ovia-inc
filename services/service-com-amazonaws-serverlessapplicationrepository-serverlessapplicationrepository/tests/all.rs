@@ -33,6 +33,8 @@ mod empty_response_framing;
 mod error_bodies;
 #[path = "all/identity_authorization.rs"]
 mod identity_authorization;
+#[path = "all/prepared_template_readiness.rs"]
+mod prepared_template_readiness;
 #[path = "all/presigned_locators.rs"]
 mod presigned_locators;
 #[path = "all/semantic_version_wording.rs"]
