@@ -146,6 +146,8 @@ mod traffic_policy_identity;
 mod traffic_policy_instance_count;
 #[path = "all/traffic_policy_instance_deletion.rs"]
 mod traffic_policy_instance_deletion;
+#[path = "all/traffic_policy_instance_listing.rs"]
+mod traffic_policy_instance_listing;
 #[path = "all/traffic_policy_instances.rs"]
 mod traffic_policy_instances;
 #[path = "all/traffic_policy_listing.rs"]

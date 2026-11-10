@@ -1814,6 +1814,24 @@ impl StoredTrafficPolicyInstance {
     }
 }
 
+/// The place one traffic policy instance takes in a listing of them: the
+/// hosted zone its record sets live in, the IDENTITY of the DNS name they
+/// answer for, and their record type — the three members a listing's markers
+/// carry.
+///
+/// The key of a STORED instance; a listing positions a marker by comparing the
+/// marker's own members against it, which is why the zone id and the type are
+/// borrowed rather than copied into it.
+pub fn traffic_policy_instance_order_key(
+    instance: &StoredTrafficPolicyInstance,
+) -> (&str, DnsNameKey, &str) {
+    (
+        instance.hosted_zone_id.as_str(),
+        dns_sort_key(&instance.name),
+        instance.traffic_policy_type.as_str(),
+    )
+}
+
 /// A CIDR collection: the named group of CIDR blocks an IP-based record set
 /// routes a client's address through.
 ///
@@ -2242,6 +2260,30 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
             left.created_position
                 .cmp(&right.created_position)
                 .then_with(|| left.id.cmp(&right.id))
+        });
+        ordered
+    }
+
+    /// Every traffic policy instance the account holds, in the order a listing
+    /// of them reports them in: by the hosted zone the instance's record sets
+    /// live in, then by the DNS name they answer for, then by their record
+    /// type.
+    ///
+    /// That triple is what a listing's markers are made of — an account-wide
+    /// page resumes at a `(HostedZoneIdMarker,
+    /// TrafficPolicyInstanceNameMarker, TrafficPolicyInstanceTypeMarker)`
+    /// triple, a per-zone page at the pair of it inside one zone — so an
+    /// instance's place in the listing is exactly what those markers name. The
+    /// name is compared by its IDENTITY ([`dns_sort_key`], the order DNS itself
+    /// gives and the one `ListResourceRecordSets` reports in), and the triple is
+    /// unique among the account's instances
+    /// ([`ComAmazonawsRoute53Awsdnsv20130401State::traffic_policy_instance_for`]),
+    /// so the order is TOTAL: a marker always resumes at the same place.
+    pub fn traffic_policy_instances_in_listing_order(&self) -> Vec<&StoredTrafficPolicyInstance> {
+        let mut ordered: Vec<&StoredTrafficPolicyInstance> =
+            self.traffic_policy_instances.values().collect();
+        ordered.sort_by(|left, right| {
+            traffic_policy_instance_order_key(left).cmp(&traffic_policy_instance_order_key(right))
         });
         ordered
     }

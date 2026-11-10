@@ -193,6 +193,13 @@ async fn seed(router: &MultiServiceRouter) -> Vec<ListingRow> {
             page_bound: 50,
         },
         ListingRow {
+            case: "ListTrafficPolicyInstances",
+            uri: "/2013-04-01/trafficpolicyinstances".to_string(),
+            default_page_size: DEFAULT_PAGE_SIZE,
+            // "Route 53 returns a maximum of 100 items in each response."
+            page_bound: 100,
+        },
+        ListingRow {
             case: "ListTrafficPolicyVersions",
             uri: format!("/2013-04-01/trafficpolicies/{policy_id}/versions"),
             default_page_size: DEFAULT_PAGE_SIZE,
