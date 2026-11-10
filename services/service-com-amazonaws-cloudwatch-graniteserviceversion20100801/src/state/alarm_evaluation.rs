@@ -1051,7 +1051,7 @@ impl State {
             },
         );
         if let Some(notification) = notification {
-            self.enqueue_notification(notification);
+            self.enqueue_notification(notification, now_secs);
         }
         // This alarm's new state is an input to every composite alarm whose rule reads it, so
         // their evaluations are owed from this instant too — and the composite pass that
@@ -1780,8 +1780,41 @@ impl State {
     }
 
     /// Queue one action notification a transition owes, within
-    /// [`MAX_PENDING_NOTIFICATIONS`].
-    pub(crate) fn enqueue_notification(&mut self, notification: AlarmNotification) {
+    /// [`MAX_PENDING_NOTIFICATIONS`] — unless an ACTIVE alarm mute rule MUTES it.
+    ///
+    /// "When a mute rule is active, the targeted alarms continue to evaluate metrics and
+    /// transition between states, but their configured actions (such as Amazon SNS notifications
+    /// or Auto Scaling actions) are muted." (`PutAlarmMuteRule`) — so this is where the mute
+    /// applies, for every transition whichever call or clock materialised it: the alarm has
+    /// already moved and been recorded as moving, and what the mute decides is only whether the
+    /// actions configured for the state it moved to are executed. A muted transition executes
+    /// NONE of them and leaves the account of that in the alarm's own history
+    /// ([`super::muted_actions_history_item`]) instead of a record of an execution that never
+    /// happened.
+    ///
+    /// The question is asked at the instant of the TRANSITION rather than at delivery, because
+    /// that is the instant whose mute windows decide whether these actions fire at all.
+    pub(crate) fn enqueue_notification(
+        &mut self,
+        notification: AlarmNotification,
+        now_secs: f64,
+    ) {
+        if let Some(rule_name) = self.muting_alarm_mute_rule(
+            &notification.alarm_name,
+            notification.alarm_arn.as_deref(),
+            now_secs,
+        ) {
+            let item = super::muted_actions_history_item(
+                &notification.alarm_name,
+                &notification.alarm_type,
+                &rule_name,
+                &notification.new_state_value,
+                &notification.actions,
+                now_secs,
+            );
+            self.record_history(&notification.alarm_name, now_secs, item);
+            return;
+        }
         while self.pending_notifications.len() >= MAX_PENDING_NOTIFICATIONS {
             let Some(dropped) = self.pending_notifications.pop_front() else {
                 break;

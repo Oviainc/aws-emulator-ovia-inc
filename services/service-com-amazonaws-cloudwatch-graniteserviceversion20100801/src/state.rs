@@ -3429,7 +3429,7 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         // their evaluations are owed from this instant too.
         self.make_parents_due(name, now_secs);
         if let Some(notification) = notification {
-            self.enqueue_notification(notification);
+            self.enqueue_notification(notification, now_secs);
         }
         true
     }

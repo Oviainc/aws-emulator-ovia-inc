@@ -14,8 +14,9 @@
 
 use ::chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use ::chrono_tz::Tz;
+use ::serde_json::{Map, Value};
 
-use crate::ops::types::{GetAlarmMuteRuleOutput, Schedule, Tag};
+use crate::ops::types::{AlarmHistoryItem, GetAlarmMuteRuleOutput, Schedule, Tag};
 
 /// The identity of one alarm mute rule: the Region it lives in and its name.
 ///
@@ -103,6 +104,23 @@ impl StoredAlarmMuteRule {
         reported.status = Some(alarm_mute_rule_status(&self.configuration, now).to_string());
         reported
     }
+
+    /// Whether this rule applies to the alarm `alarm_name`: "The list of alarm names that this
+    /// mute rule targets." (`MuteTargets$AlarmNames`).
+    ///
+    /// A rule carrying no `MuteTargets` names no alarm, so it targets none: the member is what
+    /// "specifies which alarms an alarm mute rule applies to" (`MuteTargets`).
+    pub fn targets(&self, alarm_name: &str) -> bool {
+        self.configuration
+            .mute_targets
+            .as_ref()
+            .is_some_and(|targets| {
+                targets
+                    .alarm_names
+                    .iter()
+                    .any(|targeted| targeted == alarm_name)
+            })
+    }
 }
 
 /// Which of the three statuses the rule `configuration` describes is in at `now`.
@@ -156,6 +174,117 @@ pub fn alarm_mute_rule_status(configuration: &GetAlarmMuteRuleOutput, now: f64) 
         Some(opens_at) if opens_at <= now => ALARM_MUTE_RULE_ACTIVE,
         Some(_) => ALARM_MUTE_RULE_SCHEDULED,
         None => ALARM_MUTE_RULE_EXPIRED,
+    }
+}
+
+/// The mute question this store answers about one alarm: whether a rule it holds is muting that
+/// alarm's actions right now.
+impl super::ComAmazonawsCloudwatchGraniteserviceversion20100801State {
+    /// The name of the ACTIVE mute rule targeting `alarm_name` at `now`, or `None` when the
+    /// alarm's actions are muted by nothing.
+    ///
+    /// "When a mute rule is active, the targeted alarms continue to evaluate metrics and
+    /// transition between states, but their configured actions are muted." (`MuteTargets`) — so
+    /// the question a transition asks is whether a rule that NAMES this alarm among its targets
+    /// (`MuteTargets$AlarmNames`, "The list of alarm names that this mute rule targets") is ACTIVE
+    /// at the instant of the transition, which is the one status reading every mute-rule operation
+    /// shares ([`alarm_mute_rule_status`]).
+    ///
+    /// A rule is a resource of ONE Region ([`AlarmMuteRuleKey`]), and so is an alarm — its ARN
+    /// carries the Region it was created in — so only the rules of the alarm's own Region can mute
+    /// it. An alarm whose ARN names no Region is matched against every rule, because nothing then
+    /// says which Region's rules are not its own.
+    ///
+    /// Several rules may target one alarm; the one reported is the first in name order, so what the
+    /// history records about a muted transition does not depend on the store's iteration order.
+    pub fn muting_alarm_mute_rule(
+        &self,
+        alarm_name: &str,
+        alarm_arn: Option<&str>,
+        now: f64,
+    ) -> Option<String> {
+        let region = alarm_arn
+            .and_then(::service_common::arn::parse)
+            .map(|arn| arn.region.to_string());
+        self.alarm_mute_rules
+            .iter()
+            .filter(|(key, _)| region.as_ref().is_none_or(|region| &key.region == region))
+            .filter(|(_, stored)| stored.targets(alarm_name))
+            .filter(|(_, stored)| {
+                alarm_mute_rule_status(&stored.configuration, now) == ALARM_MUTE_RULE_ACTIVE
+            })
+            .map(|(key, _)| key.name.clone())
+            .min()
+    }
+}
+
+/// The `HistoryItemType` a muted transition is recorded under: `Action` is the type every record
+/// of what became of a transition's actions carries (`smithy_query(query="shape",
+/// shape="HistoryItemType")`), and a mute is what became of these.
+const MUTED_HISTORY_ITEM_TYPE: &str = "Action";
+
+/// What the record of a muted transition states happened to the actions, beside the `Succeeded`
+/// and `Failed` an executed action is recorded with.
+const MUTED_ACTION_STATE: &str = "Muted";
+
+/// The history item recording that a transition's configured actions were MUTED by a mute rule,
+/// rather than executed.
+///
+/// "When a mute rule is active, the targeted alarms continue to evaluate metrics and transition
+/// between states, but their configured actions […] are muted." (`PutAlarmMuteRule`) — the
+/// transition happens and is recorded as itself, and this is the account of the actions it did not
+/// execute: which rule muted them, which state they were configured for, and which ARNs they were.
+/// Without it a muted transition is indistinguishable, in the only record an operator has, from an
+/// action that was executed and failed.
+pub fn muted_actions_history_item(
+    alarm_name: &str,
+    alarm_type: &str,
+    rule_name: &str,
+    new_state_value: &str,
+    actions: &[String],
+    now_secs: f64,
+) -> AlarmHistoryItem {
+    let mut document = Map::new();
+    document.insert(
+        "version".to_string(),
+        Value::from(super::HISTORY_DATA_VERSION),
+    );
+    document.insert(
+        "actionState".to_string(),
+        Value::from(MUTED_ACTION_STATE),
+    );
+    document.insert("muteRuleName".to_string(), Value::from(rule_name));
+    document.insert("stateValue".to_string(), Value::from(new_state_value));
+    let muted = Value::from(
+        actions
+            .iter()
+            .map(|action| Value::from(action.as_str()))
+            .collect::<Vec<Value>>(),
+    );
+    let mut with_actions = document.clone();
+    with_actions.insert("mutedActions".to_string(), muted);
+    AlarmHistoryItem {
+        alarm_name: Some(alarm_name.to_string()),
+        alarm_contributor_id: None,
+        // The item belongs to the kind of alarm whose actions were muted, so a reader that asks
+        // for one kind of alarm's history sees it.
+        alarm_type: Some(alarm_type.to_string()),
+        timestamp: Some(super::to_timestamp(now_secs)),
+        history_item_type: Some(MUTED_HISTORY_ITEM_TYPE.to_string()),
+        // A rule's `Name` is `@length 1..255`, so a summary naming one need not fit the summary's
+        // own bound: it is cut at it by the one reading of that bound this store shares.
+        history_summary: Some(super::alarm_actions::bounded(format!(
+            "Alarm actions muted by alarm mute rule {rule_name}"
+        ))),
+        // An action ARN is `@length 1..1024` and a state may carry five of them, so the list of
+        // muted ARNs is the part of this document that need not fit the modelled `HistoryData`
+        // length: it is dropped rather than truncated, because a document is parsed rather than
+        // read, and what identifies the mute — the rule's own name — is in both renderings.
+        history_data: Some(super::bounded_history_data(&[
+            Value::Object(with_actions),
+            Value::Object(document),
+        ])),
+        alarm_contributor_attributes: None,
     }
 }
 

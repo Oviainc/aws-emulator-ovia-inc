@@ -1156,8 +1156,10 @@ fn insert(document: &mut Map<String, Value>, member: &str, value: Option<Value>)
 ///
 /// An action ARN is `@length 1..1024`, so a summary naming one need not fit: the ARN is the
 /// variable part, and a summary that does not fit is cut at the bound rather than dropped,
-/// because the item's own `HistoryData` carries the whole ARN.
-fn bounded(summary: String) -> String {
+/// because the item's own `HistoryData` carries the whole ARN. The same holds for every other
+/// summary this store writes whose variable part is longer than the bound, which is why the one
+/// reading of that bound is shared.
+pub(super) fn bounded(summary: String) -> String {
     /// The modelled maximum length of `AlarmHistoryItem$HistorySummary`.
     const MAX_HISTORY_SUMMARY_LEN: usize = 255;
 

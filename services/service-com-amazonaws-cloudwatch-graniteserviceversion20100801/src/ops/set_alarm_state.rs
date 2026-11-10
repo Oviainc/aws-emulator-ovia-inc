@@ -248,7 +248,7 @@ fn force_state(
             .flatten();
         let updated = crate::state::AlarmStateSnapshot::of_metric_alarm(&stored.alarm);
         if let Some(notification) = notification {
-            store.enqueue_notification(notification);
+            store.enqueue_notification(notification, now);
         }
         Some((crate::state::ALARM_TYPE_METRIC, previous, updated))
     } else {
@@ -292,7 +292,7 @@ fn force_state(
                 .flatten();
             let updated = crate::state::AlarmStateSnapshot::of_composite_alarm(&stored.alarm);
             if let Some(notification) = notification {
-                store.enqueue_notification(notification);
+                store.enqueue_notification(notification, now);
             }
             Some((crate::state::ALARM_TYPE_COMPOSITE, previous, updated))
         } else {
