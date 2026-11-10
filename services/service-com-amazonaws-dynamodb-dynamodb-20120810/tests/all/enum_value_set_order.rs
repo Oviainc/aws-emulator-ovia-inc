@@ -91,6 +91,32 @@ const SELECT_SET: &[&str] = &[
 const PROJECTION_TYPE_SET: &[&str] = &["ALL", "KEYS_ONLY", "INCLUDE"];
 const TABLE_CLASS_SET: &[&str] = &["STANDARD", "STANDARD_INFREQUENT_ACCESS"];
 
+/// The order DynamoDB states `IncrementalExportSpecification$ExportViewType`'s admissible
+/// set in — the SERVICE's order again: the model declares the two values as
+/// `NEW_IMAGE NEW_AND_OLD_IMAGES`
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ExportViewType")`), while
+/// the service's refusals state them in this one.
+const EXPORT_VIEW_TYPE_SET: &[&str] = &["NEW_AND_OLD_IMAGES", "NEW_IMAGE"];
+
+/// `ExportTableToPointInTime$ExportFormat`, stated in its model-declared order
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ExportFormat")` gives
+/// `DYNAMODB_JSON ION`) — the boundary for the rule: an enum the service is not observed
+/// to reorder keeps the order the model declares.
+const EXPORT_FORMAT_SET: &[&str] = &["DYNAMODB_JSON", "ION"];
+
+/// An `ExportTableToPointInTime` body carrying both members the model makes required, with
+/// `extra` merged in: a constraint on an enumerated member is reported before the export's
+/// own handler runs, so no row needs a recoverable table behind it.
+fn export_body(extra: Value) -> Value {
+    let mut body = json!({"TableArn": "Music", "S3Bucket": "exports"});
+    if let Some(members) = extra.as_object() {
+        for (name, value) in members {
+            body[name] = value.clone();
+        }
+    }
+    body
+}
+
 /// The table of refusals. The `Music` table exists and is active before any row runs, so
 /// no row is answered by a missing table instead of by the constraint.
 const ROWS: &[Row] = &[
@@ -210,6 +236,51 @@ const ROWS: &[Row] = &[
         value: "EVERY_ATTRIBUTE",
         path: "globalSecondaryIndexes.1.member.projection.projectionType",
         set: PROJECTION_TYPE_SET,
+    },
+    Row {
+        case: "an enumerated member of a nested structure, misspelled",
+        operation: "ExportTableToPointInTime",
+        request: || {
+            export_body(json!({
+                "ExportType": "INCREMENTAL_EXPORT",
+                "IncrementalExportSpecification": {"ExportViewType": "NEW_AND_OLD_IMAGE"},
+            }))
+        },
+        value: "NEW_AND_OLD_IMAGE",
+        path: "incrementalExportSpecification.exportViewType",
+        set: EXPORT_VIEW_TYPE_SET,
+    },
+    Row {
+        case: "the same member with a declared value in the wrong case",
+        operation: "ExportTableToPointInTime",
+        request: || {
+            export_body(json!({
+                "IncrementalExportSpecification": {"ExportViewType": "new_image"},
+            }))
+        },
+        value: "new_image",
+        path: "incrementalExportSpecification.exportViewType",
+        set: EXPORT_VIEW_TYPE_SET,
+    },
+    Row {
+        case: "the same member carrying a value that belongs to the stream view enum",
+        operation: "ExportTableToPointInTime",
+        request: || {
+            export_body(json!({
+                "IncrementalExportSpecification": {"ExportViewType": "KEYS_ONLY"},
+            }))
+        },
+        value: "KEYS_ONLY",
+        path: "incrementalExportSpecification.exportViewType",
+        set: EXPORT_VIEW_TYPE_SET,
+    },
+    Row {
+        case: "an enumerated member the service states in the model's own order",
+        operation: "ExportTableToPointInTime",
+        request: || export_body(json!({"ExportFormat": "PARQUET"})),
+        value: "PARQUET",
+        path: "exportFormat",
+        set: EXPORT_FORMAT_SET,
     },
 ];
 

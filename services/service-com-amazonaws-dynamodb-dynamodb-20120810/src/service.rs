@@ -286,6 +286,10 @@ const PUBLISHED_ENUM_ORDERS: &[&[&str]] = &[
     // `NEW_IMAGE OLD_IMAGE NEW_AND_OLD_IMAGES KEYS_ONLY`
     // (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#StreamViewType")`).
     &["OLD_IMAGE", "KEYS_ONLY", "NEW_AND_OLD_IMAGES", "NEW_IMAGE"],
+    // `IncrementalExportSpecification$ExportViewType`, which the model declares as
+    // `NEW_IMAGE NEW_AND_OLD_IMAGES`
+    // (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ExportViewType")`).
+    &["NEW_AND_OLD_IMAGES", "NEW_IMAGE"],
 ];
 
 /// The admissible set `allowed` is STATED in: the order this service publishes for that

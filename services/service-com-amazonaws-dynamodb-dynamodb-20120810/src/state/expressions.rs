@@ -136,13 +136,23 @@ fn is_expression_word_char(character: char) -> bool {
 }
 
 /// The refusal for an expression member past [`MAX_EXPRESSION_BYTES`]: the member it
-/// was sent as and the rule it broke, inside the same validation envelope every other
-/// request refusal of this service renders. One wording for one rule, whichever
-/// expression member a request oversized.
+/// was sent as and the rule it broke. One wording for one rule, whichever expression
+/// member a request oversized.
+///
+/// Whether it carries the `<N> validation error(s) detected: ` envelope follows the
+/// MEMBER, like every other refusal this service raises about a request's expressions
+/// ([`envelopes_expression_refusals`]): the members a write states its intent through are
+/// refused inside it, and the members a read narrows its result with are refused with the
+/// sentence alone. The size ceiling is checked by this service's own expression code
+/// rather than by a bound the model declares — the expression shapes carry no `@length`
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ProjectionExpression")`,
+/// and the same for `ConditionExpression`, `UpdateExpression` and `KeyExpression`, give a
+/// plain string) — so it is worded by that one rule and not as a constraint clause.
 pub fn expression_size_exceeded(member: &str) -> RequestError {
-    refused(format!(
-        "Invalid {member}: Expression size has exceeded the maximum allowed size;"
-    ))
+    expression_refusal(
+        envelopes_expression_refusals(member),
+        format!("Invalid {member}: Expression size has exceeded the maximum allowed size;"),
+    )
 }
 
 /// One clause of the validation envelope for a refusal the EXPRESSION language raises:
@@ -2893,9 +2903,9 @@ impl<'a> ExprParser<'a> {
 /// parameter. Use ConditionExpression instead"). The message names both members, the
 /// way the service's own refusal does, so the caller knows which pair to drop.
 ///
-/// Stated on its own rather than inside the `<N> validation error(s) detected: `
-/// envelope: it is not a constraint on one member's value but a contradiction between
-/// two of them, and AWS states it as its own sentence.
+/// Whether it is stated inside the `<N> validation error(s) detected: ` envelope follows
+/// the MEMBERS the request held in both generations, the same split
+/// [`envelopes_expression_refusals`] states ([`conflict_is_enveloped`]).
 pub fn expression_conflict(legacy: &str, expression: &str) -> RequestError {
     expression_conflict_between(&[legacy], &[expression])
 }
@@ -2915,13 +2925,50 @@ pub fn expression_conflict(legacy: &str, expression: &str) -> RequestError {
 /// its own members in its own declared order and this renderer keeps that order; neither
 /// side is sorted here, and the request's own order never reaches it, because what is
 /// walked is the handler's list.
+///
+/// The ENVELOPE follows the two sides' MEMBERS, the one rule this module states for every
+/// refusal about a request's two generations of parameters
+/// ([`conflict_is_enveloped`]): a contradiction between the members a WRITE states its
+/// intent through carries the `<N> validation error(s) detected: ` envelope, and one
+/// between the members a READ narrows its result with is stated on its own.
 pub fn expression_conflict_between(legacy: &[&str], expression: &[&str]) -> RequestError {
-    RequestError::Validation(format!(
-        "Can not use both expression and non-expression parameters in the same request: \
-         Non-expression parameters: {{{}}} Expression parameters: {{{}}}",
-        legacy.join(", "),
-        expression.join(", ")
-    ))
+    expression_refusal(
+        conflict_is_enveloped(legacy, expression),
+        format!(
+            "Can not use both expression and non-expression parameters in the same request: \
+             Non-expression parameters: {{{}}} Expression parameters: {{{}}}",
+            legacy.join(", "),
+            expression.join(", ")
+        ),
+    )
+}
+
+/// Whether a refusal naming these two sides is stated inside the
+/// `<N> validation error(s) detected: ` envelope: it is exactly when either side names a
+/// member a WRITE states its intent through ([`ENVELOPED_EXPRESSION_MEMBERS`],
+/// [`ENVELOPED_LEGACY_MEMBERS`]).
+///
+/// The same split [`envelopes_expression_refusals`] answers for a refusal about one
+/// expression member's content, read over a refusal that is about TWO members at once: a
+/// write's `UpdateExpression` beside `AttributeUpdates`, or its `ConditionExpression`
+/// beside `Expected`, is refused inside the envelope, while a read stating its projection
+/// or its filter in both generations is refused with the sentence alone.
+fn conflict_is_enveloped(legacy: &[&str], expression: &[&str]) -> bool {
+    legacy
+        .iter()
+        .chain(expression.iter())
+        .any(|member| states_write_intent(member))
+}
+
+/// Whether `member` is one a WRITE states its intent through — the members whose refusals
+/// this service carries inside the validation envelope, stated once for both generations.
+///
+/// The legacy `AttributeUpdates` map needs no entry of its own: a request is refused for
+/// stating one thing twice only when it also carries the member that REPLACED it
+/// ([`check_expression_parameter_mix`]), so the `UpdateExpression` beside it already
+/// answers for the pair.
+fn states_write_intent(member: &str) -> bool {
+    ENVELOPED_EXPRESSION_MEMBERS.contains(&member) || ENVELOPED_LEGACY_MEMBERS.contains(&member)
 }
 
 /// One non-expression member of a request, as a caller states it: its name, whether the

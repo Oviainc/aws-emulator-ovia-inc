@@ -231,6 +231,22 @@ impl Substitutions<'_> {
     }
 }
 
+/// One refusal the expressions of ONE ELEMENT of a multi-item request earn when they are
+/// PARSED, APPLIED or EVALUATED, as that element states it: outside the
+/// `<N> validation error(s) detected: ` envelope.
+///
+/// The same rule [`Substitutions::check_all_referenced_in_element`] states, over the
+/// refusals that come after that check — an expression past the documented size ceiling,
+/// one the grammar cannot complete, an operand of the wrong type, two actions writing one
+/// location: the envelope reports violations of the REQUEST's own members, and the
+/// expression members of one `TransactItems` action are members of that element, so an
+/// element's refusal is stated on its own whichever member it names. The members a READ
+/// narrows its result with are already stated on their own wherever they sit
+/// (`crate::state`'s enveloped-members rule), so this changes nothing for them.
+pub fn refused_in_element(error: RequestError) -> RequestError {
+    stated_outside_the_envelope(error)
+}
+
 /// One refusal, stated outside the `<N> validation error(s) detected: ` envelope.
 ///
 /// The envelope over an EMPTY clause is exactly the text it puts in front of a clause, so

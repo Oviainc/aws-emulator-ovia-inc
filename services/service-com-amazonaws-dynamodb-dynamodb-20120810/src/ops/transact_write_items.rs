@@ -435,11 +435,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
                 Requested::Update(update) => {
+                    // Every refusal this element's own expressions earn is stated
+                    // outside the request envelope, like the refusals its substitution
+                    // tables earn above
+                    // ([`crate::state::refused_in_element`]).
                     let applied = crate::state::ParsedUpdate::parse(
                         "UpdateExpression",
                         &update.update_expression,
                         substitutions,
                     )
+                    .map_err(crate::state::refused_in_element)
                     .map_err(lift)?;
                     let table = store.active_table(&region, &name, now).map_err(lift)?;
                     deny(&caller, table, action, now)?;
@@ -453,7 +458,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .get(&key)
                         .cloned()
                         .unwrap_or_else(|| update.key.clone());
-                    let touched = applied.apply(&mut item).map_err(lift)?;
+                    let touched = applied
+                        .apply(&mut item)
+                        .map_err(crate::state::refused_in_element)
+                        .map_err(lift)?;
                     for attribute in touched.attributes() {
                         if attribute.as_str() == partition_key.as_str()
                             || Some(attribute.as_str()) == sort_key.as_deref()
@@ -503,6 +511,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .items
                 .get(&prepared.key)
                 .cloned();
+            // The element's `ConditionExpression` is this element's member too, so what it
+            // is refused for is stated outside the request envelope
+            // ([`crate::state::refused_in_element`]).
             let satisfied = crate::state::write_condition_satisfied(
                 action.condition_expression(),
                 None,
@@ -510,6 +521,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 substitutions,
                 before.as_ref(),
             )
+            .map_err(crate::state::refused_in_element)
             .map_err(lift)?;
             planned.push(Planned {
                 table: name,
@@ -878,13 +890,17 @@ fn check_element_shape(
         )));
     }
     // The grammar of the update an `Update` applies is a fact of the request too, so a
-    // malformed one is refused here rather than when the element is prepared.
+    // malformed one is refused here rather than when the element is prepared. It is the
+    // ELEMENT's own expression, so what it is refused for is stated outside the request
+    // envelope, like the refusals its substitution tables earn above
+    // ([`crate::state::refused_in_element`]).
     if let Requested::Update(update) = action {
         crate::state::ParsedUpdate::parse(
             "UpdateExpression",
             &update.update_expression,
             substitutions,
         )
+        .map_err(crate::state::refused_in_element)
         .map_err(lift)?;
     }
     // Every value the map this element ADDRESSES carries — the item a `Put` writes, the

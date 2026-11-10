@@ -806,7 +806,12 @@ async fn the_mixed_parameter_message_names_each_side_in_declared_order() {
     // `…"Query"`), never the order the request sent them in. The rows vary the reader,
     // which pair collides, how many members each side carries, and the ORDER THE REQUEST
     // states them in, which the message is indifferent to.
-    let rows: Vec<(&str, &str, Value, &str, &str)> = vec![
+    // The last field is whether the refusal carries the `1 validation error detected: `
+    // envelope: it follows the MEMBERS the two sides name, so a READ stating its
+    // projection, its filter or its key condition in both generations is refused with the
+    // sentence alone, and a WRITE stating its condition in both is refused inside the
+    // envelope.
+    let rows: Vec<(&str, &str, Value, &str, &str, bool)> = vec![
         (
             "a Scan carrying every parameter of both generations",
             "Scan",
@@ -821,6 +826,7 @@ async fn the_mixed_parameter_message_names_each_side_in_declared_order() {
             }),
             "AttributesToGet, ScanFilter, ConditionalOperator",
             "ProjectionExpression, FilterExpression",
+            false,
         ),
         (
             "a Scan carrying one legacy member and both expression members",
@@ -834,6 +840,7 @@ async fn the_mixed_parameter_message_names_each_side_in_declared_order() {
             }),
             "ScanFilter",
             "ProjectionExpression, FilterExpression",
+            false,
         ),
         // This row pins the RULE applied uniformly — both sides in the order
         // `smithy_query(query="operation", operation="Query")` declares them. For a
@@ -859,6 +866,7 @@ async fn the_mixed_parameter_message_names_each_side_in_declared_order() {
             }),
             "AttributesToGet, KeyConditions, QueryFilter, ConditionalOperator",
             "ProjectionExpression, FilterExpression, KeyConditionExpression",
+            false,
         ),
         (
             "a Query carrying every parameter but the legacy key condition",
@@ -875,6 +883,7 @@ async fn the_mixed_parameter_message_names_each_side_in_declared_order() {
             }),
             "AttributesToGet, QueryFilter, ConditionalOperator",
             "ProjectionExpression, FilterExpression, KeyConditionExpression",
+            false,
         ),
         (
             "a Query stating only its key condition both ways",
@@ -889,6 +898,7 @@ async fn the_mixed_parameter_message_names_each_side_in_declared_order() {
             }),
             "KeyConditions",
             "KeyConditionExpression",
+            false,
         ),
         (
             "a Query carrying ConditionalOperator beside a key condition expression",
@@ -901,6 +911,7 @@ async fn the_mixed_parameter_message_names_each_side_in_declared_order() {
             }),
             "ConditionalOperator",
             "KeyConditionExpression",
+            false,
         ),
         (
             "a Query carrying the key members of both generations and a filter expression",
@@ -916,6 +927,7 @@ async fn the_mixed_parameter_message_names_each_side_in_declared_order() {
             }),
             "KeyConditions",
             "FilterExpression, KeyConditionExpression",
+            false,
         ),
         (
             "a Scan carrying ConditionalOperator beside a projection expression",
@@ -927,6 +939,7 @@ async fn the_mixed_parameter_message_names_each_side_in_declared_order() {
             }),
             "ConditionalOperator",
             "ProjectionExpression",
+            false,
         ),
         (
             "a write stating its condition both ways",
@@ -940,13 +953,20 @@ async fn the_mixed_parameter_message_names_each_side_in_declared_order() {
             }),
             "Expected, ConditionalOperator",
             "ConditionExpression",
+            true,
         ),
     ];
 
-    for (case, operation, request, legacy, expression) in rows {
+    for (case, operation, request, legacy, expression, enveloped) in rows {
+        let envelope = if enveloped {
+            "1 validation error detected: "
+        } else {
+            ""
+        };
         let expected = format!(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {{{legacy}}} Expression parameters: {{{expression}}}"
+            "{envelope}Can not use both expression and non-expression parameters in the same \
+             request: Non-expression parameters: {{{legacy}}} Expression parameters: \
+             {{{expression}}}"
         );
         let (status, answered) = call(&router, operation, request).await;
         assert_eq!(

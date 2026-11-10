@@ -1111,16 +1111,20 @@ async fn a_request_states_its_intent_one_way() {
     let router = emulator();
     table(&router, "Generations").await;
 
-    // Each row: the operation, the request, the non-expression member it carries and the
-    // expression member that REPLACED that member. A request that states one thing both
-    // ways is refused, naming both whole sides.
-    let rows: Vec<(&str, Value, &str, &str)> = vec![
+    // Each row: the operation, the request, the non-expression member it carries, the
+    // expression member that REPLACED that member, and whether the refusal carries the
+    // validation envelope. A request that states one thing both ways is refused, naming
+    // both whole sides; the envelope follows the members, so a WRITE stating its update
+    // or its condition twice is refused inside it and a READ stating its projection, its
+    // filter or its key condition twice is refused with the sentence alone.
+    let rows: Vec<(&str, Value, &str, &str, bool)> = vec![
         (
             "Scan",
             json!({"TableName": "Generations", "AttributesToGet": ["a"],
                    "ProjectionExpression": "a"}),
             "AttributesToGet",
             "ProjectionExpression",
+            false,
         ),
         (
             "Scan",
@@ -1129,6 +1133,7 @@ async fn a_request_states_its_intent_one_way() {
                    "FilterExpression": "attribute_exists(a)"}),
             "ScanFilter",
             "FilterExpression",
+            false,
         ),
         (
             "Query",
@@ -1139,6 +1144,7 @@ async fn a_request_states_its_intent_one_way() {
                    "ExpressionAttributeValues": {":k": {"S": "one"}}}),
             "KeyConditions",
             "KeyConditionExpression",
+            false,
         ),
         (
             "GetItem",
@@ -1146,6 +1152,7 @@ async fn a_request_states_its_intent_one_way() {
                    "AttributesToGet": ["a"], "ProjectionExpression": "a"}),
             "AttributesToGet",
             "ProjectionExpression",
+            false,
         ),
         (
             "PutItem",
@@ -1154,6 +1161,7 @@ async fn a_request_states_its_intent_one_way() {
                    "ConditionExpression": "attribute_not_exists(a)"}),
             "Expected",
             "ConditionExpression",
+            true,
         ),
         (
             "UpdateItem",
@@ -1163,6 +1171,7 @@ async fn a_request_states_its_intent_one_way() {
                    "ExpressionAttributeValues": {":v": {"S": "x"}}}),
             "AttributeUpdates",
             "UpdateExpression",
+            true,
         ),
         (
             "DeleteItem",
@@ -1171,17 +1180,24 @@ async fn a_request_states_its_intent_one_way() {
                    "ConditionExpression": "attribute_not_exists(a)"}),
             "Expected",
             "ConditionExpression",
+            true,
         ),
     ];
 
-    for (operation, request, legacy, expression) in rows {
+    for (operation, request, legacy, expression, enveloped) in rows {
         let case = format!("{operation} carrying {legacy} and {expression}");
         let stated = refusal(&router, &case, operation, request).await;
+        let envelope = if enveloped {
+            "1 validation error detected: "
+        } else {
+            ""
+        };
         assert_eq!(
             stated,
             format!(
-                "Can not use both expression and non-expression parameters in the same request: \
-                 Non-expression parameters: {{{legacy}}} Expression parameters: {{{expression}}}"
+                "{envelope}Can not use both expression and non-expression parameters in the same \
+                 request: Non-expression parameters: {{{legacy}}} Expression parameters: \
+                 {{{expression}}}"
             ),
             "case {case:?}: expected both sides to be named, got {stated:?}"
         );

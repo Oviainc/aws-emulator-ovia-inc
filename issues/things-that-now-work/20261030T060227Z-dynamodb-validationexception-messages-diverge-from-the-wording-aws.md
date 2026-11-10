@@ -18,6 +18,29 @@ Issue-Commit: 78d5907a1724d3304a3021142ffd4f12ae7136a6
 
 # DynamoDB ValidationException messages diverge from the wording AWS serves
 
+## Resolution
+
+Causes 1, 2, 3, 7 and 8 are fixed: a refusal about a request's expressions — the 4 KB
+expression ceiling and the conflict between the two generations of parameters alike — now
+carries the validation envelope exactly when it is about a member a write states its intent
+through, an element of a multi-item request states its expression refusals on its own,
+`UpdateTable`'s no-change refusal is the fixed sentence the service serves, and
+`ExportViewType`'s value set is stated in the order the service publishes.
+`tests/all/expression_refusal_families.rs` and `tests/all/enum_value_set_order.rs` pin all
+of it over the wire.
+
+Causes 4, 5 and 6 — the `BatchWriteItem` / `TransactGetItems` / `TransactWriteItems`
+over-cap messages — are NOT fixed and remain divergent. Their recorded messages echo the
+rejected member value in AWS's internal object rendering, over members no public contract
+declares (`AttributeValue(s=…, n=null, b=null, iNT=null, dECIMAL…)`,
+`PutRequest(item=…, workloadProfileName=null)`, while
+`smithy_query(query="shape", shape="com.amazonaws.dynamodb#AttributeValue")` gives exactly
+`S N B SS NS BS M L NULL BOOL`), so no rule reachable from the model or the docs renders
+that text; the same violation class is recorded in the no-value, wire-path form for
+`BatchGetItem`'s key cap, which this service serves (see "WHICH FORM A CONSTRAINT CLAUSE
+TAKES" in `src/service.rs` and the `quoted_map` note in `src/state/multi_item.rs`). Those
+three keys still fail replay.
+
 > _Note: this issue was identified against the code base at commit `78d5907a1724d3304a3021142ffd4f12ae7136a6`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

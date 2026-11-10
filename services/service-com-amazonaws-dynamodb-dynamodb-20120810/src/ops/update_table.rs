@@ -322,7 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // succeed.
         if !names_an_update(&input) {
             return Err(crate::scaffolded::Scaffolded::validation(
-                empty_update_message(),
+                EMPTY_UPDATE_MESSAGE.to_string(),
             ));
         }
         let index_updates = validated_index_updates(&input).map_err(lift)?;
@@ -820,7 +820,7 @@ fn requested_stream_change(
 /// request names it.
 type UpdatableMember = (&'static str, fn(&UpdateTableInput) -> bool);
 
-/// Every input member that asks for a change, in the order the refusal below lists them.
+/// Every input member that asks for a change.
 ///
 /// These are the members of the operation's input shape
 /// (`smithy_query(query="operation",operation="UpdateTable")`) except `TableName`,
@@ -828,10 +828,11 @@ type UpdatableMember = (&'static str, fn(&UpdateTableInput) -> bool);
 /// attributes another member's key schema uses and changes nothing on its own. A
 /// request naming none of these asks for nothing and is refused.
 ///
-/// ONE list drives both the emptiness test and the message, so a member added to the
-/// model cannot end up in the message but not in the test, or the other way round. A
-/// list member asks for a change only when it carries an entry: an empty list requests
+/// A list member asks for a change only when it carries an entry: an empty list requests
 /// no index, no replica and no witness update.
+///
+/// This list drives the EMPTINESS TEST only. The sentence such a request is refused with
+/// is fixed text ([`EMPTY_UPDATE_MESSAGE`]) and is not assembled from these names.
 const UPDATABLE_MEMBERS: &[UpdatableMember] = &[
     ("ProvisionedThroughput", |input| {
         input.provisioned_throughput.is_some()
@@ -891,15 +892,27 @@ fn names_an_update(input: &UpdateTableInput) -> bool {
     UPDATABLE_MEMBERS.iter().any(|(_, named)| named(input))
 }
 
-/// The refusal for a request that names no updatable member: it lists the alternatives,
-/// so the caller can fix the request from the message alone.
-fn empty_update_message() -> String {
-    let names: Vec<&str> = UPDATABLE_MEMBERS.iter().map(|(name, _)| *name).collect();
-    match names.split_last() {
-        Some((last, rest)) => format!("At least one of {} or {last} is required", rest.join(", ")),
-        None => "At least one updatable member is required".to_string(),
-    }
-}
+/// The refusal for a request that names no updatable member: the FIXED sentence the
+/// service serves for that case, listing the members it accepts in the order it lists
+/// them, so the caller can fix the request from the message alone.
+///
+/// The sentence carries nothing of the request, and its list is the SERVICE's rather
+/// than this model's: it names members the model does not declare on this input
+/// (`UpdateStreamEnabled` for the stream specification, `MultiAccountReplicaReady`,
+/// `ReplicaTransitRoleArn`) and leaves out ones it does
+/// (`smithy_query(query="operation",operation="UpdateTable")` also declares
+/// `TableThroughputMode`, `GlobalSecondaryIndexUpdates`' siblings
+/// `GlobalTableWitnessUpdates` and `VectorIndexUpdates`,
+/// `GlobalTableSettingsReplicationMode` and `DisassociationProtectionEnabled`). Nothing
+/// in the model derives that list, so the sentence is held here as the one text the
+/// service states, and the members a request may actually ask a change through stay
+/// [`UPDATABLE_MEMBERS`] — a caller reading the message gets the service's own
+/// documentation of the alternatives, which is what a client matching on it reads from
+/// DynamoDB.
+const EMPTY_UPDATE_MESSAGE: &str = "At least one of ProvisionedThroughput, BillingMode, \
+     UpdateStreamEnabled, GlobalSecondaryIndexUpdates, SSESpecification, ReplicaUpdates, \
+     MultiAccountReplicaReady, ReplicaTransitRoleArn, MultiRegionConsistency, \
+     DeletionProtectionEnabled, OnDemandThroughput, WarmThroughput or TableClass is required";
 
 /// Whether this request asks DynamoDB for work that OUTLIVES the call, which is the
 /// part of an `UpdateTable` the clock has to finish ("while it's executing, the table
