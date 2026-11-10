@@ -17,6 +17,8 @@ mod arn_minting;
 mod audit_records;
 #[path = "all/concurrent_execution_idempotency.rs"]
 mod concurrent_execution_idempotency;
+#[path = "all/constrained_text_grammars.rs"]
+mod constrained_text_grammars;
 #[path = "all/create_report_client_token.rs"]
 mod create_report_client_token;
 #[path = "all/create_report_conflict_message.rs"]

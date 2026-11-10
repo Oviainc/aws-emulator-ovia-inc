@@ -1677,6 +1677,10 @@ pub const WIDGET_TITLE_PATTERN: &str =
 /// compile ([`text_pattern_refusal`]), before the handler writes anything. The `@length`
 /// bounds on the same members compile and are already enforced at the boundary, so they
 /// are not repeated — which is also what bounds the value a clause echoes.
+///
+/// What is applied is the modelled expression itself, compiled by a look-around-capable
+/// engine ([`COMPILED_PATTERNS`]), so each rule is stated once: the text a refusal quotes
+/// is the text that judged the value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstrainedText {
     /// A resource name: [`RESOURCE_NAME_PATTERN`].
@@ -1687,63 +1691,54 @@ pub enum ConstrainedText {
     WidgetTitle,
 }
 
-/// The characters `[a-zA-Z0-9_-]`, which every one of the three grammars admits in the
-/// interior of a value and two of them require at its end.
-fn is_word_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || character == '_' || character == '-'
-}
+/// The step budget one match of a [`ConstrainedText`] grammar may spend.
+///
+/// The engine these expressions need is a BACKTRACKING one, so a match has no
+/// linear-time guarantee in general and the work one match may do is bounded explicitly
+/// here rather than left to the shape of an expression. Two properties of the inputs put
+/// this budget out of reach: the expressions are MODEL CONSTANTS, never built from a
+/// request, and the matched value is at most its member's `@length` maximum (200
+/// characters for a description, 50 for a name or a title), which the boundary validator
+/// enforces before any handler runs.
+const PATTERN_BACKTRACK_LIMIT: usize = 1_000_000;
 
-/// The characters [`DESCRIPTION_PATTERN`]'s one class lists.
-fn is_description_character(character: char) -> bool {
-    matches!(
-        character,
-        ' ' | 'a'..='z'
-            | 'A'..='Z'
-            | '0'..='9'
-            | '.'
-            | ','
-            | '!'
-            | '?'
-            | ';'
-            | ':'
-            | '@'
-            | '#'
-            | '$'
-            | '%'
-            | '&'
-            | '-'
-            | '_'
-            | '/'
-            | '\\'
-    )
-}
-
-/// Whether `value` satisfies a grammar of the form "one character the `first` class
-/// admits, then at most `max_interior` characters the `interior` class admits, then one
-/// the `last` class admits" — the shape both of the two-ended grammars here take, so the
-/// reading of their quantifiers lives in one place.
-fn admits_bounded_run(
-    value: &str,
-    first: fn(char) -> bool,
-    interior: fn(char) -> bool,
-    last: fn(char) -> bool,
-    max_interior: Option<usize>,
-) -> bool {
-    let characters: Vec<char> = value.chars().collect();
-    // Two characters at least: the expression spells a first and a last one.
-    let Some((first_character, rest)) = characters.split_first() else {
-        return false;
-    };
-    let Some((last_character, interior_characters)) = rest.split_last() else {
-        return false;
-    };
-    first(*first_character)
-        && last(*last_character)
-        && interior_characters.iter().copied().all(interior)
-        && max_interior.is_none_or(|max| interior_characters.len() <= max)
-}
+/// Each [`ConstrainedText`] grammar's modelled expression, compiled once and paired with
+/// the grammar it belongs to — paired rather than indexed, so no ordering has to be kept
+/// in step and a lookup cannot reach another grammar's expression.
+///
+/// The expression itself is what judges a value ([`ConstrainedText::admits`]), read from
+/// the one place this crate states it ([`ConstrainedText::pattern`]) — the same text the
+/// refusal publishes ([`text_pattern_refusal`]) — so the constraint this service applies
+/// and the constraint it reports cannot drift apart: a model revision to a constant moves
+/// both. Compilation is fallible and its input is a compile-time constant, but a pattern
+/// that failed to compile is dropped rather than unwrapped: nothing here panics, on any
+/// input.
+static COMPILED_PATTERNS: ::std::sync::LazyLock<
+    [(ConstrainedText, Option<::fancy_regex::Regex>); ConstrainedText::ALL.len()],
+> = ::std::sync::LazyLock::new(|| {
+    ConstrainedText::ALL.map(|text| {
+        let compiled = ::fancy_regex::RegexBuilder::new(text.pattern())
+            .backtrack_limit(PATTERN_BACKTRACK_LIMIT)
+            .build()
+            .ok();
+        (text, compiled)
+    })
+});
 
 impl ConstrainedText {
+    /// Every variant, which is what [`COMPILED_PATTERNS`] holds a compiled expression for.
+    const ALL: [Self; 3] = [Self::ResourceName, Self::Description, Self::WidgetTitle];
+
+    /// This grammar's modelled expression, compiled; `None` for an expression no engine
+    /// here could compile.
+    fn compiled(self) -> Option<&'static ::fancy_regex::Regex> {
+        COMPILED_PATTERNS
+            .iter()
+            .find(|(text, _)| *text == self)?
+            .1
+            .as_ref()
+    }
+
     /// The modelled `@pattern` this grammar is, anchors included.
     pub fn pattern(self) -> &'static str {
         match self {
@@ -1754,35 +1749,20 @@ impl ConstrainedText {
     }
 
     /// Whether `value` satisfies this grammar — the whole expression, lookahead included.
+    ///
+    /// The modelled expression is matched as written ([`Self::compiled`]), which is why
+    /// the lookahead the boundary validator cannot compile is applied here.
+    ///
+    /// A value this crate cannot PROVE satisfies the expression it publishes does not
+    /// satisfy it: a match that exhausts [`PATTERN_BACKTRACK_LIMIT`], and an expression
+    /// that did not compile, both count as not admitted, so nothing is ever stored
+    /// unchecked against a constraint the refusal advertises. Neither is reachable for
+    /// these members — the expressions are constants that compile (every value the crate's
+    /// tests submit under them is admitted) and the budget is out of reach of a value the
+    /// `@length` bounds already cap.
     pub fn admits(self, value: &str) -> bool {
-        // The lookahead `(?!.* {2})`, which is what the boundary cannot apply: two
-        // consecutive spaces anywhere in the value, wherever the rest of the expression
-        // would otherwise admit them.
-        if value.contains("  ") {
-            return false;
-        }
-        match self {
-            // `[a-zA-Z][a-zA-Z0-9 _-]{0,48}[a-zA-Z0-9_-]`.
-            Self::ResourceName => admits_bounded_run(
-                value,
-                |character| character.is_ascii_alphabetic(),
-                |character| character == ' ' || is_word_character(character),
-                is_word_character,
-                Some(48),
-            ),
-            // `[ a-zA-Z0-9.,!?;:@#$%&\-_/\\]*` — one class, any number of characters.
-            Self::Description => value.chars().all(is_description_character),
-            // `[a-zA-Z0-9_-][ a-zA-Z0-9_-]*[a-zA-Z0-9_-]`: the same two-ended shape as a
-            // resource name, with a digit or `_`/`-` admitted at the start and no bound
-            // on the interior of its own (`@length` 2..50 bounds it).
-            Self::WidgetTitle => admits_bounded_run(
-                value,
-                is_word_character,
-                |character| character == ' ' || is_word_character(character),
-                is_word_character,
-                None,
-            ),
-        }
+        self.compiled()
+            .is_some_and(|compiled| compiled.is_match(value).unwrap_or(false))
     }
 }
 

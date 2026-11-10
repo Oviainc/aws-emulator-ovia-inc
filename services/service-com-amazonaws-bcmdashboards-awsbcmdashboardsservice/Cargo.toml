@@ -41,6 +41,10 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # the report executes AS that role, so whether the account's IAM still lets this service
 # assume it is half of the report's health (`state::execution_role`).
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# Evaluates the modelled `@pattern` of this service's constrained strings, which are
+# written with the negative look-ahead the `regex` crate behind `@pattern` cannot compile
+# (`state::ConstrainedText`).
+fancy-regex = "0.16"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -9318,6 +9318,7 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "chrono",
+ "fancy-regex",
  "hex",
  "http",
  "serde_json",
