@@ -29,7 +29,9 @@
 //!
 //! This suite also owns the helper every other suite in this binary builds its
 //! writes with ([`with_staked_version`]), so a setup that writes a value names the
-//! version it creates.
+//! version it creates, and the small wire harness ([`emulator`], [`call`], [`ok`],
+//! [`refusal`], [`text`], [`staging_map`], [`value_member`]) the suites about
+//! version staking share with it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -115,7 +117,7 @@ pub fn with_staked_version(operation: &str, body: &Value) -> Value {
 }
 
 /// A fresh emulator holding only this service, over its own engine.
-fn emulator() -> MultiServiceRouter {
+pub fn emulator() -> MultiServiceRouter {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(EmulatedService::new(engine));
@@ -125,7 +127,7 @@ fn emulator() -> MultiServiceRouter {
 /// Send one `awsJson1_1` request EXACTLY as the case states it — no token is
 /// injected here, since the token is what this suite is about — and return its
 /// status and JSON body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -147,7 +149,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// Send one request that must succeed, and return its body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value, case: &str) -> Value {
+pub async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value, case: &str) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -158,7 +160,7 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value, case: &s
 
 /// The `__type` and `Message` of an error body, as the awsJson error envelope
 /// carries them.
-fn refusal(parsed: &Value) -> (String, String) {
+pub fn refusal(parsed: &Value) -> (String, String) {
     let code = parsed
         .get("__type")
         .and_then(Value::as_str)
@@ -177,7 +179,7 @@ fn refusal(parsed: &Value) -> (String, String) {
 }
 
 /// A required string member of a response body.
-fn text(parsed: &Value, member: &str, case: &str) -> String {
+pub fn text(parsed: &Value, member: &str, case: &str) -> String {
     parsed
         .get(member)
         .and_then(Value::as_str)
@@ -188,7 +190,7 @@ fn text(parsed: &Value, member: &str, case: &str) -> String {
 /// The `VersionIdsToStages` map `DescribeSecret` reports, as version id to the
 /// labels attached to it; empty when the secret holds no labelled version, which
 /// is how the response omits the member.
-async fn staging_map(
+pub async fn staging_map(
     router: &MultiServiceRouter,
     secret_id: &str,
     case: &str,
@@ -204,7 +206,7 @@ async fn staging_map(
 /// The value a write of `value` carries under `member`: `SecretBinary` is base64
 /// on the wire ("The binary data to encrypt and store in the new version of the
 /// secret", `PutSecretValueRequest$SecretBinary`).
-fn value_member(member: &str, value: &str) -> Value {
+pub fn value_member(member: &str, value: &str) -> Value {
     match member {
         "SecretBinary" => json!(base64::engine::general_purpose::STANDARD.encode(value.as_bytes())),
         _ => json!(value),
