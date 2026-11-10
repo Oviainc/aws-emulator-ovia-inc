@@ -832,10 +832,12 @@ async fn an_address_that_is_no_address_is_refused() {
     );
 }
 
-/// RULE: a member belongs to an address list, so an `AddressListId` nothing created is a
-/// `ResourceNotFoundException` (404) from every member operation.
+/// RULE: a member belongs to an address list, so an `AddressListId` nothing created is
+/// refused by every member operation at the status this service answers an id it cannot
+/// resolve with (400), carrying the `ResourceNotFoundException` code and a message naming
+/// that id.
 #[tokio::test]
-async fn member_operations_on_an_unknown_address_list_are_not_found() {
+async fn member_operations_on_an_unknown_address_list_are_refused() {
     let harness = Harness::new();
     let live = harness.create_list("present").await;
     harness.register(&live, "user@example.com").await;
@@ -869,13 +871,18 @@ async fn member_operations_on_an_unknown_address_list_are_not_found() {
         ] {
             let (status, out) = harness.call(operation, body).await;
             assert_eq!(
-                status, 404,
-                "case {id:?}: expected {operation} to answer 404, got {status} {out:?}"
+                status, 400,
+                "case {id:?}: expected {operation} to answer 400, got {status} {out:?}"
             );
             assert_eq!(
                 error_code(&out),
                 "ResourceNotFoundException",
                 "case {id:?}: unexpected error code from {operation}, got {out:?}"
+            );
+            assert_eq!(
+                out["Message"].as_str(),
+                Some(format!("Could not find AddressList with id {id}").as_str()),
+                "case {id:?}: unexpected refusal message from {operation}, got {out:?}"
             );
         }
     }

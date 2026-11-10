@@ -4,7 +4,7 @@
 //! Implemented: reports the stored import job the request names — its status, the upload
 //! target it was created with, the address list it imports into and the instants and counts
 //! of the import, as far as it has got. A `JobId` that names no stored job is refused with
-//! the modelled `ResourceNotFoundException`.
+//! the modelled `ValidationException` (`crate::state::IMPORT_JOB_ID_INVALID`).
 //!
 //! `@readonly`: it writes nothing.
 //!
@@ -176,13 +176,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owes one here.
         let store = state.lock();
 
+        // Resolving the `JobId` is part of validating the request, so an id naming no
+        // stored job is a parameter violation — the modelled `ValidationException` — and
+        // not a resource the caller addressed and did not find. The refusal states that
+        // the member is unacceptable and echoes no id back.
         let Some(record) = store.import_jobs.get(&input.job_id) else {
             return Err(
-                GetAddressListImportJobErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!("Import job {} not found.", input.job_id)),
-                    },
-                )
+                GetAddressListImportJobErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::IMPORT_JOB_ID_INVALID.to_string()),
+                })
                 .into(),
             );
         };

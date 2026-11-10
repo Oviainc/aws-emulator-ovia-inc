@@ -5,7 +5,9 @@
 //! stored (`crate::state::member_address_key`) and the instant it was added. The lookup is
 //! by that same stored key, so an address whose DOMAIN differs only in letter case names
 //! the same member and one whose LOCAL PART does names another; a member the list does not
-//! hold is the modelled `ResourceNotFoundException`.
+//! hold is the modelled `ResourceNotFoundException`, and so is an `AddressListId` that
+//! names no stored list — that one at the status this service answers an unresolvable
+//! address-list id with (`crate::state::ADDRESS_LIST_LOOKUP_STATUS`).
 //!
 //! ## Shape of an operation
 //!
@@ -174,16 +176,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // state the clock owes a transition to.
         let store = state.lock();
 
+        // The modelled `ResourceNotFoundException` says the named list does not exist, at
+        // the status and in the wording every address-list lookup miss carries — this
+        // service reads an id it cannot resolve as a fault in the request.
         let Some(record) = store.address_lists.get(&input.address_list_id) else {
-            return Err(GetMemberOfAddressListErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Address list {} not found.",
-                        input.address_list_id
-                    )),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                GetMemberOfAddressListErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::address_list_not_found_message(
+                            &input.address_list_id,
+                        )),
+                    },
+                ),
+                crate::state::ADDRESS_LIST_LOOKUP_STATUS,
+            ));
         };
 
         let address = crate::state::member_address_key(&input.address);

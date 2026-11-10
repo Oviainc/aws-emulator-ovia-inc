@@ -4,9 +4,10 @@
 //! Implemented: mints a `JobId`, stores an import job for the address list the request
 //! names — in the one `ImportJobStatus` a job that has imported nothing carries — and
 //! answers with that id and the URL its input file is uploaded to. An `AddressListId` that
-//! names no stored address list is refused with the modelled `ResourceNotFoundException`,
-//! and `ClientToken` (`@idempotencyToken`) makes a retry return the id the first call
-//! minted.
+//! names no stored address list is refused with the modelled `ResourceNotFoundException`
+//! at the status this service answers an unresolvable address-list id with
+//! (`crate::state::ADDRESS_LIST_LOOKUP_STATUS`), and `ClientToken` (`@idempotencyToken`)
+//! makes a retry return the id the first call minted.
 //!
 //! The upload target it hands out is served by this service itself (see
 //! `crate::service`): a client can really write the input file to it.
@@ -204,19 +205,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An import job imports INTO an address list, so the list has to exist: the
         // modelled `ResourceNotFoundException` ("Occurs when a requested resource is not
-        // found") is what says the named one does not.
+        // found") is what says the named one does not. This service answers an id it
+        // cannot resolve as a fault in the request, so the status is the one every
+        // address-list lookup miss carries rather than the shape's modelled 404.
         if !store.address_lists.contains_key(&input.address_list_id) {
-            return Err(
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                 CreateAddressListImportJobErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Address list {} not found.",
-                            input.address_list_id
+                        message: Some(crate::state::address_list_not_found_message(
+                            &input.address_list_id,
                         )),
                     },
-                )
-                .into(),
-            );
+                ),
+                crate::state::ADDRESS_LIST_LOOKUP_STATUS,
+            ));
         }
 
         // The emulator's own ceiling on retained import jobs, checked AFTER the

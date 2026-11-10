@@ -162,6 +162,36 @@ pub fn is_registrable_address(address: &str) -> bool {
 /// states no value — the same half a boundary refusal drops for such a member.
 pub const ADDRESS_NOT_AN_ADDRESS: &str = "Address must be an email address or a domain name.";
 
+/// How every address-list operation words the refusal of an `AddressListId` that resolves
+/// to no stored address list.
+///
+/// The fixed text is "Could not find AddressList with id " and the one variable part is the
+/// id the request named, copied verbatim — the same answer whichever address-list operation
+/// did the resolving. See [`ADDRESS_LIST_LOOKUP_STATUS`] for the status it is answered
+/// with.
+pub fn address_list_not_found_message(address_list_id: &str) -> String {
+    format!("Could not find AddressList with id {address_list_id}")
+}
+
+/// The HTTP status this service answers a request naming an address-list resource it cannot
+/// resolve with.
+///
+/// This service classifies an id that resolves to nothing as a fault in the REQUEST, so the
+/// status line is the one a caller-input failure carries even where the error shape it
+/// carries is modelled `@httpError 404`: the error code names the condition, the status says
+/// whose fault it is. Returned through `crate::scaffolded::Scaffolded::modeled_with_status`,
+/// which keeps the modelled shape, its `Message` member and its wire error code and changes
+/// only the status.
+pub const ADDRESS_LIST_LOOKUP_STATUS: u16 = 400;
+
+/// How every address-list import-job operation words the refusal of a `JobId` that
+/// resolves to no stored import job.
+///
+/// The text is entirely fixed: it states that the `JobId` member is not acceptable and
+/// echoes no id back, which is why this is the modelled `ValidationException` (already
+/// `@httpError 400`) rather than the address-list answer above.
+pub const IMPORT_JOB_ID_INVALID: &str = "Invalid JobId";
+
 /// The `ImportJobStatus` a created address-list import job carries.
 ///
 /// `CreateAddressListImportJob` creates the job and hands back the URL its input file is

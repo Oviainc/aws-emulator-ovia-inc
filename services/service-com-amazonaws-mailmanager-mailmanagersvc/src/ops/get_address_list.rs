@@ -2,7 +2,9 @@
 
 //! @op GetAddressList
 //! Implemented: reports the address list `CreateAddressList` stored under the requested
-//! `AddressListId`, or the modelled `ResourceNotFoundException` when no such list exists.
+//! `AddressListId`, or the modelled `ResourceNotFoundException` — at the status this
+//! service answers an unresolvable address-list id with
+//! (`crate::state::ADDRESS_LIST_LOOKUP_STATUS`) — when no such list exists.
 //! A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
@@ -159,16 +161,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no state the clock owes a transition to.
         let store = state.lock();
 
+        // The modelled `ResourceNotFoundException` says the named list does not exist, at
+        // the status this service answers an id it cannot resolve with — it reads such an
+        // id as a fault in the request — and in the wording every address-list lookup miss
+        // carries.
         let Some(record) = store.address_lists.get(&input.address_list_id) else {
-            return Err(GetAddressListErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Address list {} not found.",
-                        input.address_list_id
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                GetAddressListErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::address_list_not_found_message(
+                        &input.address_list_id,
                     )),
-                },
-            )
-            .into());
+                }),
+                crate::state::ADDRESS_LIST_LOOKUP_STATUS,
+            ));
         };
 
         Ok(GetAddressListOutput {

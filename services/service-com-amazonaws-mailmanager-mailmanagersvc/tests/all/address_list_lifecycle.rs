@@ -345,10 +345,11 @@ async fn names_differing_only_in_case_are_distinct_address_lists() {
     }
 }
 
-/// An `AddressListId` nothing created is a `ResourceNotFoundException` (404), and the
-/// refusal creates nothing.
+/// An `AddressListId` nothing created is refused at the status this service answers an id
+/// it cannot resolve with (400), carrying the `ResourceNotFoundException` code and a message
+/// naming the id the request asked for, and the refusal creates nothing.
 #[tokio::test]
-async fn get_address_list_on_an_unknown_id_is_not_found() {
+async fn get_address_list_on_an_unknown_id_is_refused() {
     let harness = Harness::new();
     let live = harness.create(json!({ "AddressListName": "present" })).await;
 
@@ -368,13 +369,18 @@ async fn get_address_list_on_an_unknown_id_is_not_found() {
             .call("GetAddressList", json!({ "AddressListId": id }))
             .await;
         assert_eq!(
-            status, 404,
-            "case {id:?}: expected an unknown AddressListId to answer 404, got {status} {out:?}"
+            status, 400,
+            "case {id:?}: expected an unknown AddressListId to answer 400, got {status} {out:?}"
         );
         assert_eq!(
             error_code(&out),
             "ResourceNotFoundException",
             "case {id:?}: unexpected error code, got {out:?}"
+        );
+        assert_eq!(
+            out["Message"].as_str(),
+            Some(format!("Could not find AddressList with id {id}").as_str()),
+            "case {id:?}: unexpected refusal message, got {out:?}"
         );
     }
 

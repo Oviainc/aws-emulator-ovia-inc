@@ -5,7 +5,9 @@
 //! address, ascending), a page at a time, optionally scoped to the members whose stored
 //! address starts with `Filter.AddressPrefix`. `NextToken` is this store's own opaque,
 //! authenticated token naming the address to resume at, so every member is reported
-//! exactly once across a walk; a token this store did not mint is refused.
+//! exactly once across a walk; a token this store did not mint is refused, and so is an
+//! `AddressListId` that names no stored list (the modelled `ResourceNotFoundException` at
+//! `crate::state::ADDRESS_LIST_LOOKUP_STATUS`).
 //!
 //! ## Shape of an operation
 //!
@@ -198,16 +200,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // state the clock owes a transition to.
         let store = state.lock();
 
+        // The modelled `ResourceNotFoundException` says the named list does not exist, at
+        // the status and in the wording every address-list lookup miss carries — this
+        // service reads an id it cannot resolve as a fault in the request.
         let Some(record) = store.address_lists.get(&input.address_list_id) else {
-            return Err(ListMembersOfAddressListErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Address list {} not found.",
-                        input.address_list_id
-                    )),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                ListMembersOfAddressListErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::address_list_not_found_message(
+                            &input.address_list_id,
+                        )),
+                    },
+                ),
+                crate::state::ADDRESS_LIST_LOOKUP_STATUS,
+            ));
         };
 
         // "Filter to limit the results to addresses having the provided prefix"

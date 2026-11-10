@@ -6,7 +6,8 @@
 //! folded to lower case, the local part kept as spelled). `@idempotent`, so registering an
 //! address that is already a member changes nothing — not even the instant it was first
 //! added — and an address list nothing created is refused with the modelled
-//! `ResourceNotFoundException`.
+//! `ResourceNotFoundException` at the status this service answers an unresolvable
+//! address-list id with (`crate::state::ADDRESS_LIST_LOOKUP_STATUS`).
 //!
 //! ## Shape of an operation
 //!
@@ -176,19 +177,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A member is a member OF a list, so the list has to exist: the modelled
         // `ResourceNotFoundException` ("Occurs when a requested resource is not found") is
-        // what says the named one does not.
+        // what says the named one does not, at the status and in the wording every
+        // address-list lookup miss carries — this service reads an id it cannot resolve as
+        // a fault in the request.
         let Some(record) = store.address_lists.get_mut(&input.address_list_id) else {
-            return Err(
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                 RegisterMemberToAddressListErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Address list {} not found.",
-                            input.address_list_id
+                        message: Some(crate::state::address_list_not_found_message(
+                            &input.address_list_id,
                         )),
                     },
-                )
-                .into(),
-            );
+                ),
+                crate::state::ADDRESS_LIST_LOOKUP_STATUS,
+            ));
         };
 
         let address = crate::state::member_address_key(&input.address);

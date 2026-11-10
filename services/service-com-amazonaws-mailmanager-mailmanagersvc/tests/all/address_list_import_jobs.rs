@@ -296,10 +296,13 @@ async fn create_then_get_round_trips_every_job_shape() {
     );
 }
 
-/// An `AddressListId` that names no stored address list is a `ResourceNotFoundException`
-/// (404) and creates nothing; so is a `JobId` that names no stored job.
+/// An `AddressListId` that names no stored address list, and a `JobId` that names no stored
+/// import job, are both refused at the status this service answers an id it cannot resolve
+/// with (400) and create nothing — the address-list miss with the
+/// `ResourceNotFoundException` code and the id it was handed, the job miss with the
+/// `ValidationException` code and no id at all.
 #[tokio::test]
-async fn ids_that_name_nothing_are_not_found() {
+async fn ids_that_name_nothing_are_refused() {
     let harness = Harness::new();
     let address_list_id = harness.create_address_list("present").await;
     let (job_id, _) = harness
@@ -336,14 +339,19 @@ async fn ids_that_name_nothing_are_not_found() {
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case {id:?}: an import job for an unknown address list must answer 404, got \
+            status, 400,
+            "case {id:?}: an import job for an unknown address list must answer 400, got \
              {status} {out:?}"
         );
         assert_eq!(
             error_code(&out),
             "ResourceNotFoundException",
             "case {id:?}: unexpected error code, got {out:?}"
+        );
+        assert_eq!(
+            out["Message"].as_str(),
+            Some(format!("Could not find AddressList with id {id}").as_str()),
+            "case {id:?}: unexpected refusal message, got {out:?}"
         );
 
         if id == &job_id {
@@ -353,13 +361,18 @@ async fn ids_that_name_nothing_are_not_found() {
             .call("GetAddressListImportJob", json!({ "JobId": id }))
             .await;
         assert_eq!(
-            status, 404,
-            "case {id:?}: an unknown JobId must answer 404, got {status} {out:?}"
+            status, 400,
+            "case {id:?}: an unknown JobId must answer 400, got {status} {out:?}"
         );
         assert_eq!(
             error_code(&out),
-            "ResourceNotFoundException",
+            "ValidationException",
             "case {id:?}: unexpected error code, got {out:?}"
+        );
+        assert_eq!(
+            out["Message"].as_str(),
+            Some("Invalid JobId"),
+            "case {id:?}: unexpected refusal message, got {out:?}"
         );
     }
 

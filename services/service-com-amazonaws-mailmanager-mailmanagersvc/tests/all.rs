@@ -17,6 +17,8 @@ mod address_list_import_jobs;
 mod address_list_lifecycle;
 #[path = "all/address_list_members.rs"]
 mod address_list_members;
+#[path = "all/address_list_resolution.rs"]
+mod address_list_resolution;
 #[path = "all/archive_lifecycle.rs"]
 mod archive_lifecycle;
 #[path = "all/state_roundtrip.rs"]
