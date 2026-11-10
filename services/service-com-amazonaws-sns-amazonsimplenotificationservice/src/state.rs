@@ -15,6 +15,10 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{MessageAttributeValue, Subscription};
 
 pub mod filter_policy;
+/// Whether IAM lets a signed request perform the action it asks for on the topic it
+/// addresses: the caller's identity-based policies read together with the topic's own
+/// access policy.
+pub mod authorization;
 /// The address-matching condition of a filter policy (`cidr`), which
 /// [`filter_policy`] reads beside the conditions that compare values.
 pub mod message_filter;

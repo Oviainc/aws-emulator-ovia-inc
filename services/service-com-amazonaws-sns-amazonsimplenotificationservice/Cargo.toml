@@ -35,8 +35,14 @@ hex = { workspace = true }
 # digest of its body (`state::delivery_status`).
 md-5 = "0.10"
 # `arn`: the ONE parse of a caller-supplied resource ARN, shared with every other service —
-# a subscription's SQS endpoint ARN is read through it rather than split here.
+# a subscription's SQS endpoint ARN is read through it rather than split here. It also carries
+# the ONE evaluation of IAM policy documents, which authorizes a call against the caller's
+# identity policies and the topic's own access policy (`state::authorization`).
 service-common = { path = "../common" }
+# The IAM store the calling principal and its identity-based policies are read from, through
+# IAM's own accessors: that service owns the collection rule, so this one sees exactly what
+# IAM's own authorizer sees (`state::authorization`).
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # The AWS SDK for SQS, driven over the in-process callback
 # (`OperationContext::callback`): `Publish` delivers a message to the queues subscribed to
 # the topic with `SendMessage` (`ops::publish::deliver_to_endpoints`). Only the generated
@@ -73,9 +79,9 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # where that service holds it: on the function's asynchronous queue, and in what the
 # function's own handler did.
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
-# And the two services a delivery-status record needs: the IAM store the feedback role is
-# resolved in, and the CloudWatch Logs store the record is read back from.
-service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The CloudWatch Logs store a delivery-status record is read back from. (The IAM store the
+# feedback role is resolved in, and the principals an authorization test creates, is a
+# dependency of this crate itself.)
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # A deployment package the delivery tests upload is a .zip archive they write in memory, as
 # `FunctionCode$ZipFile` carries it: base64 of a .zip.

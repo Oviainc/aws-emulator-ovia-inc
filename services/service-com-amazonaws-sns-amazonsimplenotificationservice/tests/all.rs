@@ -181,6 +181,9 @@ mod topic_archive_window;
 #[path = "all/topic_attributes.rs"]
 mod topic_attributes;
 
+#[path = "all/topic_policy_authorization.rs"]
+mod topic_policy_authorization;
+
 #[path = "all/topics_subscriptions_publish.rs"]
 mod topics_subscriptions_publish;
 

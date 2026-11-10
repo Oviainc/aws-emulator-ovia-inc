@@ -323,6 +323,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(message));
         }
 
+        // Authorization, ahead of every rule about the message and ahead of the store:
+        // AWS decides whether the caller may perform the action on the topic before the
+        // service looks at what was published, so an unauthorized call publishes nothing
+        // and is told it is not authorized rather than told what was wrong with its
+        // message — or whether the topic it named exists.
+        if let Some(message) = state::authorization::topic_refusal(
+            &*self.engine,
+            ctx,
+            state::authorization::PUBLISH,
+            &destination,
+        ) {
+            return Err(PublishErrorModeled::AuthorizationErrorException(
+                AuthorizationErrorException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // Every per-message rule, judged before any record is read — the same rules
         // `PublishBatch` applies to each of its entries.
         let request = MessageRequest {

@@ -342,7 +342,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // replay that write started owes are performed afterwards, because a delivery is
         // an in-process call into another service, which must not run under this store's
         // lock.
-        let (output, replay) = self.subscribe_into_store(input, &crate::state::request_region(ctx.parts()))?;
+        let (output, replay) = self.subscribe_into_store(input, ctx)?;
         super::publish::deliver_to_endpoints(ctx, &replay).await;
         Ok(output)
     }
@@ -356,20 +356,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> Subscribe<Eng> {
     /// The whole store-touching half of the operation, so the store's lock is taken and
     /// released here and the caller performs the deliveries with it released.
     ///
-    /// `region` is the one the request is addressed to, which the ARN it names has to
-    /// belong to.
+    /// The region the request is addressed to — read from `ctx`, which the ARN it names has
+    /// to belong to — is also what the authorization decision below is taken through.
     fn subscribe_into_store(
         &self,
         input: SubscribeInput,
-        region: &str,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<(SubscribeOutput, super::publish::Deliveries), SubscribeError> {
+        let region = crate::state::request_region(ctx.parts());
         // Argument validation, BEFORE the store is consulted: a `TopicArn` that is
         // not an ARN at all — or one naming another region, which this endpoint does
         // not serve — is bad input, not a topic that does not exist. The ENDPOINT is
         // held to no such rule: a subscriber is reached in the region its own ARN
         // names, which need not be the topic's.
         if let Some(message) =
-            crate::state::regional_arn_refusal("TopicArn", &input.topic_arn, region)
+            crate::state::regional_arn_refusal("TopicArn", &input.topic_arn, &region)
         {
             return Err(SubscribeErrorModeled::InvalidParameterException(
                 InvalidParameterException {
@@ -410,6 +411,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> Subscribe<Eng> {
                         "Invalid parameter: {}",
                         endpoint_requirement(&protocol)
                     )),
+                },
+            )
+            .into());
+        }
+
+        // Authorization, before the store is consulted: AWS decides whether the caller may
+        // perform the action on the topic ahead of the service resolving it, so a refused
+        // call creates no subscription.
+        if let Some(message) = crate::state::authorization::topic_refusal(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::SUBSCRIBE,
+            &input.topic_arn,
+        ) {
+            return Err(SubscribeErrorModeled::AuthorizationErrorException(
+                AuthorizationErrorException {
+                    message: Some(message),
                 },
             )
             .into());

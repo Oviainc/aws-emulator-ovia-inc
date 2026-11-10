@@ -163,6 +163,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Authorization, before the store is consulted: AWS decides whether the caller may
+        // perform the action on the topic ahead of the service resolving it, so a refused
+        // read reports nothing about what the account holds.
+        if let Some(message) = crate::state::authorization::topic_refusal(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::GET_TOPIC_ATTRIBUTES,
+            &input.topic_arn,
+        ) {
+            return Err(GetTopicAttributesErrorModeled::AuthorizationErrorException(
+                AuthorizationErrorException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(GetTopicAttributesErrorModeled::InternalErrorException(
                 InternalErrorException {

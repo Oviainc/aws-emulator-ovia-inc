@@ -180,6 +180,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Authorization, before the store is consulted: AWS decides whether the caller may
+        // perform the action on the topic ahead of the service resolving it, so a refused
+        // delete removes nothing — and the documented idempotence of a delete does not reach
+        // a caller that may not delete at all.
+        if let Some(message) = crate::state::authorization::topic_refusal(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::DELETE_TOPIC,
+            &input.topic_arn,
+        ) {
+            return Err(DeleteTopicErrorModeled::AuthorizationErrorException(
+                AuthorizationErrorException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteTopicErrorModeled::InternalErrorException(
                 InternalErrorException {

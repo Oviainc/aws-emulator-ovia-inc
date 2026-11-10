@@ -307,6 +307,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // Authorization, ahead of every rule about the entries and ahead of the store: AWS
+        // decides whether the caller may perform the action on the topic before the service
+        // looks at what was published, so an unauthorized call publishes nothing. The action
+        // is the one a single `Publish` performs: the SNS action namespace publishes none of
+        // its own for the batch call.
+        if let Some(message) = state::authorization::topic_refusal(
+            &*self.engine,
+            ctx,
+            state::authorization::PUBLISH,
+            &input.topic_arn,
+        ) {
+            return Err(PublishBatchErrorModeled::AuthorizationErrorException(
+                AuthorizationErrorException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let entries = input.publish_batch_request_entries;
         if entries.is_empty() {
             return Err(PublishBatchErrorModeled::EmptyBatchRequestException(
