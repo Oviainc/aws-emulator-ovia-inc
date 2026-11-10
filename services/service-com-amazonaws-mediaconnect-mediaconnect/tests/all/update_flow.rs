@@ -649,18 +649,32 @@ async fn enabling_ndi_is_accepted_only_on_an_ndi_capable_flow_size() {
              {code:?}: {answered}"
         );
 
-        // Accepted or refused, the store and the answer agree.
+        // Accepted or refused, the store and the answer agree. An accepted update stores
+        // the state it named PLUS the prefix the service assigns a config that named none
+        // (asserted as a rule, over a span of inputs, in `crate::flow_ndi_machine_name`).
         let (_, _, described) = emulator.describe_flow(&flow_arn).await;
-        let expected_ndi = if expected_status == 202 {
-            json!({ "ndiState": "ENABLED" })
+        let stored = described["flow"]["ndiConfig"].clone();
+        if expected_status == 202 {
+            assert_eq!(
+                stored["ndiState"],
+                json!("ENABLED"),
+                "case {case:?}: stored NdiConfig state, got {stored:?}"
+            );
+            assert!(
+                crate::flow_ndi_machine_name::generated_id_rejection(
+                    stored["machineName"].as_str().unwrap_or_default()
+                )
+                .is_none(),
+                "case {case:?}: a stored NdiConfig carries the generated prefix the service \
+                 assigns a config that named none, got {stored:?}"
+            );
         } else {
-            Value::Null
-        };
-        assert_eq!(
-            described["flow"]["ndiConfig"], expected_ndi,
-            "case {case:?}: stored NdiConfig, got {:?}",
-            described["flow"]["ndiConfig"]
-        );
+            assert_eq!(
+                stored,
+                Value::Null,
+                "case {case:?}: a refused update stores no NdiConfig, got {stored:?}"
+            );
+        }
     }
 }
 

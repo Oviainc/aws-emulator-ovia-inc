@@ -294,10 +294,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .source_monitoring_config
             .clone()
             .or_else(|| flow.source_monitoring_config.clone());
-        let ndi_config = input
-            .ndi_config
-            .clone()
-            .or_else(|| flow.ndi_config.clone());
+        // A config this request REPLACES the stored one with is stored carrying every
+        // member the SERVICE assigns on it, exactly as the create path stores one: a
+        // replacement that names no `MachineName` is stored with the prefix minted for this
+        // flow, read from the one place this crate resolves a flow's NDI config
+        // (`crate::state::resolved_ndi_config`). The prefix is derived from the flow's own
+        // identity, so a flow that keeps its generated prefix keeps the SAME one across
+        // every update.
+        let ndi_config = crate::state::resolved_ndi_config(
+            input
+                .ndi_config
+                .clone()
+                .or_else(|| flow.ndi_config.clone()),
+            &input.flow_arn,
+        );
         let encoding_config = input
             .encoding_config
             .clone()

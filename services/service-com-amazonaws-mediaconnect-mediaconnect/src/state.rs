@@ -1263,6 +1263,70 @@ pub fn ndi_discovery_servers_rejection(member: &str, config: Option<&NdiConfig>)
     ))
 }
 
+/// How many characters the NDI® source-name prefix this service generates has:
+/// `NdiConfig$MachineName` is "a prefix for the names of the NDI sources that the flow
+/// creates. If a custom name isn't specified, MediaConnect generates a unique 12-character
+/// ID as the prefix" (`smithy_query(query="doc",shape="NdiConfig",member="MachineName")`).
+pub const NDI_MACHINE_NAME_LEN: usize = 12;
+
+/// The index of the resource-id segment of an ARN this service mints
+/// (`arn:<partition>:mediaconnect:<region>:<account>:<type>:<id>:<name>`), the segment
+/// [`flow_resource_fragment`] fills with the per-flow generated id.
+const ARN_RESOURCE_ID_SEGMENT: usize = 6;
+
+/// The NDI® machine name this service generates for the flow `flow_arn`: the "unique
+/// 12-character ID" [`NDI_MACHINE_NAME_LEN`] quotes, derived from the flow's OWN identity.
+///
+/// The id comes from the per-flow generated id the flow's ARN carries
+/// ([`flow_resource_fragment`] mints it from the store's counter), with the separator
+/// dropped and the result left-padded to the published width — so it is unique per flow,
+/// and it is the SAME value every time it is derived, which is what lets a flow keep one
+/// prefix for its whole life however many times its config is rewritten. The last
+/// [`NDI_MACHINE_NAME_LEN`] alphanumerics are what is kept, so the answer is exactly that
+/// many characters for any ARN, including one whose segments this service did not mint.
+pub fn generated_ndi_machine_name(flow_arn: &str) -> String {
+    let flow_id = flow_arn
+        .split(':')
+        .nth(ARN_RESOURCE_ID_SEGMENT)
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(flow_arn);
+    let characters: Vec<char> = flow_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    let tail: String = characters[characters.len().saturating_sub(NDI_MACHINE_NAME_LEN)..]
+        .iter()
+        .collect();
+    format!("{tail:0>width$}", width = NDI_MACHINE_NAME_LEN)
+}
+
+/// The `NdiConfig` the flow `flow_arn` STORES for the config `requested` (the one the
+/// request writes, or the one the flow already holds where the request writes none), with
+/// every member the SERVICE assigns materialised on it.
+///
+/// `MachineName` is such a member: "a prefix for the names of the NDI sources that the flow
+/// creates. If a custom name isn't specified, MediaConnect generates a unique 12-character
+/// ID as the prefix" — so a config whose request named no custom prefix is stored carrying
+/// the one [`generated_ndi_machine_name`] mints for the flow, exactly as a source whose
+/// request named no name is stored under the one [`resolve_source_name`] mints. A prefix the
+/// caller DID name is kept as given.
+///
+/// Every operation that writes a flow's `NdiConfig` resolves it HERE (CreateFlow and
+/// UpdateFlow), so the record every later read reports carries the prefix whichever call
+/// wrote it.
+pub fn resolved_ndi_config(requested: Option<NdiConfig>, flow_arn: &str) -> Option<NdiConfig> {
+    let mut config = requested?;
+    if config
+        .machine_name
+        .as_deref()
+        .is_none_or(|name| name.is_empty())
+    {
+        config.machine_name = Some(generated_ndi_machine_name(flow_arn));
+    }
+    Some(config)
+}
+
 /// Whether `hour` is a maintenance start hour: "UTC time when the maintenance will happen.
 /// Use 24-hour HH:MM format. Minutes must be 00. Example: 13:00."
 /// (`smithy_query(query="doc",shape="AddMaintenance",member="MaintenanceStartHour")`, the

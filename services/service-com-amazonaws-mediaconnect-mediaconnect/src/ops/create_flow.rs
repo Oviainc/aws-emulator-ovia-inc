@@ -687,7 +687,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .clone()
                 .map(crate::state::resolved_failover_config),
             source_monitoring_config: input.source_monitoring_config.clone(),
-            ndi_config: input.ndi_config.clone(),
+            // The NDI config is stored with every member the SERVICE assigns on it:
+            // `MachineName` is "a prefix for the names of the NDI sources that the flow
+            // creates. If a custom name isn't specified, MediaConnect generates a unique
+            // 12-character ID as the prefix", so a request that named no prefix stores the
+            // one minted for this flow — resolved through the one place this crate resolves
+            // a flow's NDI config (`crate::state::resolved_ndi_config`), which UpdateFlow
+            // writes a replacement config through too.
+            ndi_config: crate::state::resolved_ndi_config(input.ndi_config.clone(), &flow_arn),
             encoding_config: input.encoding_config.clone(),
             sources,
             outputs,

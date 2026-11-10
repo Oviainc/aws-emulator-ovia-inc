@@ -257,3 +257,5 @@ mod published_offering_form;
 mod flow_label_not_found_wording;
 #[path = "all/router_filter_limits.rs"]
 mod router_filter_limits;
+#[path = "all/flow_ndi_machine_name.rs"]
+mod flow_ndi_machine_name;
