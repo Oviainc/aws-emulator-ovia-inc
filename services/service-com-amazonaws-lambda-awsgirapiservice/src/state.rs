@@ -3059,6 +3059,16 @@ pub use event_source_mapping::{
 };
 pub use event_source_mapping::{EventSourceMappingRecord, ShardCursor, ShardSource};
 
+/// WHICH destinations such a mapping may hand a record of a failed batch to lives in
+/// [`event_source_mapping_destination`], beside the slice above, and is re-exported here for
+/// the same reason: the two calls that state a mapping's destinations name it as
+/// `crate::state::…`.
+pub mod event_source_mapping_destination;
+pub use event_source_mapping_destination::{
+    is_supported_mapping_destination, unsupported_mapping_destination,
+    UNSUPPORTED_MAPPING_DESTINATION_MESSAGE,
+};
+
 /// Which functions Lambda SnapStart can be applied to, and the refusals for asking for it
 /// where it does not hold.
 ///

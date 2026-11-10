@@ -28,6 +28,12 @@
 //! `InvalidParameterValueException` and changes nothing (see
 //! [`crate::state::metrics_config_refusal`]).
 //!
+//! A `DestinationConfig` the update states is held to the same rule the create's is too:
+//! each destination it names has to be one of the resources Lambda writes a record of a
+//! failed batch to — the kinds `OnFailure$Destination` enumerates — and one of any other
+//! service is refused with that same modelled 400 and changes nothing (see
+//! [`crate::state::unsupported_mapping_destination`]).
+//!
 //! The operation answers 202 Accepted, so the change is NOT in effect when the call
 //! returns: the mapping moves into `Updating` — one of the states
 //! `EventSourceMappingConfiguration$State` enumerates — and the move to the state its
@@ -435,6 +441,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .and_then(crate::state::event_source_vendor),
             self_managed,
         ) {
+            return Err(invalid_parameter(message));
+        }
+
+        // A `DestinationConfig` this update states is held to exactly what the create's is:
+        // every destination it names has to be one of the resources Lambda writes a record
+        // of a failed batch to (see [`crate::state::unsupported_mapping_destination`]). One
+        // of any other service changes nothing.
+        if let Some(message) =
+            crate::state::unsupported_mapping_destination(input.destination_config.as_ref())
+        {
             return Err(invalid_parameter(message));
         }
 

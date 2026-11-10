@@ -31,6 +31,13 @@
 //! so anything else is refused with that same modelled 400, naming the values the source does
 //! expect, and no mapping is created (see [`crate::state::metrics_config_refusal`]).
 //!
+//! Where a record of a failed batch is handed to is held to the same source: a destination
+//! of `DestinationConfig` is a resource Lambda WRITES that record to, and the kinds
+//! `OnFailure$Destination` enumerates are the ones it writes to, so a destination naming a
+//! resource of any other service is refused with that same modelled 400 and no mapping is
+//! created (see [`crate::state::unsupported_mapping_destination`]) rather than stored as a
+//! dead-letter path nothing could ever write to.
+//!
 //! A mapping on a QUEUE is also held to the queue's own configuration: a queue hands a
 //! message to one consumer for the length of its `VisibilityTimeout` and makes it visible
 //! again once that lapses, so a queue whose timeout is below the invoked function's
@@ -485,6 +492,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vendor,
             self_managed,
         ) {
+            return Err(invalid_parameter(message));
+        }
+
+        // A destination of the mapping is a resource LAMBDA WRITES a record of a failed
+        // batch to, and only the kinds `OnFailure$Destination` enumerates are such a
+        // resource: a destination naming any other service is a dead-letter path nothing
+        // could ever write to, so it is refused here rather than stored as one (see
+        // [`crate::state::unsupported_mapping_destination`]).
+        if let Some(message) =
+            crate::state::unsupported_mapping_destination(input.destination_config.as_ref())
+        {
             return Err(invalid_parameter(message));
         }
 

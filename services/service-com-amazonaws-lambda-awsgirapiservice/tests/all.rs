@@ -105,6 +105,8 @@ mod event_source_mapping_batch_item_failures;
 mod event_source_mapping_batching_window;
 #[path = "all/event_source_mapping_delete_in_use.rs"]
 mod event_source_mapping_delete_in_use;
+#[path = "all/event_source_mapping_destination_service.rs"]
+mod event_source_mapping_destination_service;
 #[path = "all/event_source_mapping_deletion.rs"]
 mod event_source_mapping_deletion;
 #[path = "all/event_source_mapping_duplicate_source.rs"]
