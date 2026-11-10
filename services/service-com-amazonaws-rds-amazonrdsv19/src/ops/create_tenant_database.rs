@@ -216,7 +216,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal is answered.
         let manage_master_user_password = input.manage_master_user_password == Some(true);
         if manage_master_user_password && input.master_user_password.is_some() {
-            return Err(CreateTenantDatabaseError::invalid_parameter_combination(
+            // Mutually exclusive members, answered the way every front door of this service
+            // answers that pair: `InvalidParameterValue` with the one sentence.
+            return Err(CreateTenantDatabaseError::invalid_parameter_value(
                 crate::state::manage_master_user_password_conflict_message("MasterUserPassword"),
             ));
         }

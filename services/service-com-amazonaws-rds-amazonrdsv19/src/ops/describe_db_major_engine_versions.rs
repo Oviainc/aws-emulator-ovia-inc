@@ -586,4 +586,15 @@ const LIFECYCLE_CALENDAR: &[MajorVersionLifecycle] = &[
         "2029-11-30T00:00:00Z",
         Some("2032-11-30T00:00:00Z"),
     ),
+    // PostgreSQL 18: standard support closes with the community end of life of that major
+    // version (the PostgreSQL versioning policy retires a major version five years after
+    // its first release), and Extended Support runs the three years past it this calendar
+    // gives every other open-source family.
+    lifecycle(
+        "postgres",
+        "18",
+        "2025-11-20T00:00:00Z",
+        "2030-11-30T00:00:00Z",
+        Some("2033-11-30T00:00:00Z"),
+    ),
 ];

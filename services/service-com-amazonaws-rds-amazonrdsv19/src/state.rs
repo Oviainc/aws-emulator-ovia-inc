@@ -237,6 +237,9 @@ pub mod data_plane;
 // The subnets a request NAMES, resolved against the service that owns them: a subnet's
 // Availability Zone is Amazon EC2's fact, and this is the one place this crate asks for it.
 pub mod ec2_subnets;
+// The account's `default` DB subnet group: the group RDS provides with the account's
+// default VPC, and the default-VPC network it reports, read from the owner of subnets.
+pub mod default_subnet_group;
 // The VPC security groups a request NAMES, resolved against the service that owns them:
 // whether a group exists is Amazon EC2's fact, asked here and nowhere else.
 mod ec2_security_groups;
@@ -280,6 +283,7 @@ pub use data_plane::{
     ServedEndpoint,
 };
 pub use ec2_subnets::{invalid_subnets_message, subnet_zones, SubnetZones};
+pub use default_subnet_group::{default_vpc_network, DefaultSubnetGroupNetwork};
 pub use ec2_security_groups::{invalid_security_group_message, unresolved_vpc_security_groups};
 
 /// Per-service state for com-amazonaws-rds-amazonrdsv19. A handler reaches it through [`service_state`].
@@ -347,6 +351,12 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// against, so a name no group was created under is a not-found rather than a
     /// silently accepted reference.
     pub db_subnet_groups: BTreeMap<RegionalKey, DbSubnetGroupRecord>,
+    /// What the owner of subnets answered about the DEFAULT VPC of a region, by region:
+    /// the network the account's `default` DB subnet group covers
+    /// ([`default_subnet_group`]). No request creates that group, so this is not a group
+    /// record — it is the EC2 facts the derived group reports, kept so every read of it
+    /// reports one answer. At most one entry per region, which [`MAX_REGIONS`] bounds.
+    pub default_subnet_group_networks: BTreeMap<String, DefaultSubnetGroupNetwork>,
     /// DB security groups by `(region, DBSecurityGroupName)` — the name always stored
     /// lowercased, as `CreateDBSecurityGroup$DBSecurityGroupName` documents ("This value
     /// is stored as a lowercase string"). Ordered, so `DescribeDBSecurityGroups` pages
@@ -1462,7 +1472,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             return Some(stored.clone());
         }
         (name == DEFAULT_DB_SUBNET_GROUP)
-            .then(|| DbSubnetGroupRecord::account_default(region))
+            .then(|| self.account_default_db_subnet_group(region))
     }
 
     /// Every DB subnet group a request signed for `region` can see, in name order: the
@@ -1473,7 +1483,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .into_iter()
             .cloned()
             .collect();
-        groups.push(DbSubnetGroupRecord::account_default(region));
+        groups.push(self.account_default_db_subnet_group(region));
         groups.sort_by(|left, right| left.name.cmp(&right.name));
         groups
     }
@@ -1877,8 +1887,13 @@ pub struct DbSubnetGroupRecord {
 impl DbSubnetGroupRecord {
     /// The account's `default` DB subnet group in `region`: the group the real service
     /// provides with the account's default VPC, which no request creates and which
-    /// therefore is not stored. Its subnets are the default VPC's subnets — EC2 facts
-    /// this service does not hold — so it names none rather than inventing any.
+    /// therefore is not stored.
+    ///
+    /// The group's NETWORK — the default VPC and its default subnets — belongs to the
+    /// service that owns subnets, so this bare group names none, and
+    /// [`ComAmazonawsRdsAmazonrdsv19State::account_default_db_subnet_group`] is what fills
+    /// it in from what EC2 answered ([`default_subnet_group`]). Every read of the group
+    /// goes through that store method; this constructor is the shape they share.
     pub fn account_default(region: &str) -> Self {
         Self {
             name: DEFAULT_DB_SUBNET_GROUP.to_string(),

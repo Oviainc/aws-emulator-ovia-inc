@@ -877,9 +877,9 @@ async fn an_omitted_member_takes_its_documented_default() {
     // engines; here they pin that an instance created with nothing optional still
     // reports them.
     let resolved = [
-        ("EngineVersion", "17.2"),
-        ("DBParameterGroupName", "default.postgres17"),
-        ("OptionGroupName", "default:postgres-17"),
+        ("EngineVersion", "18.3"),
+        ("DBParameterGroupName", "default.postgres18"),
+        ("OptionGroupName", "default:postgres-18"),
         ("PreferredBackupWindow", "07:00-07:30"),
         ("PreferredMaintenanceWindow", "mon:08:00-mon:08:30"),
         ("CACertificateIdentifier", "rds-ca-rsa2048-g1"),

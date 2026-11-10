@@ -2,6 +2,11 @@
 
 use super::*;
 
+/// What a master user password is reported AS wherever Amazon RDS reports that one is
+/// pending: the member is `@sensitive` (`PendingModifiedValues$MasterUserPassword`), so
+/// the credential itself is never published and the value stands in for it.
+pub const MASKED_PENDING_MASTER_USER_PASSWORD: &str = "****";
+
 /// A stored DB instance: everything the service persists about it.
 ///
 /// The ARN, the endpoint DNS name and the hosted zone id are NOT stored as text:
@@ -255,6 +260,28 @@ impl DbInstanceRecord {
         )
     }
 
+    /// `PendingModifiedValues`: what this service has accepted for the instance and not
+    /// finished applying.
+    ///
+    /// Every change `ModifyDBInstance` accepts is written to the stored record at once, so
+    /// the only change still in flight is the one the CREATE is still applying: an
+    /// instance being provisioned with a master credential has that credential pending
+    /// until it is up, which is what `PendingModifiedValues$MasterUserPassword` ("the
+    /// master credentials for the DB instance") reports, masked because the member is
+    /// `@sensitive` ([`MASKED_PENDING_MASTER_USER_PASSWORD`]).
+    ///
+    /// `None` once nothing is pending — the structure "is returned only when there are
+    /// pending changes" — so an EMPTY element never claims there are changes whose
+    /// subelements this answer does not identify.
+    pub fn pending_modified_values(&self) -> Option<PendingModifiedValues> {
+        let password_pending =
+            self.status == DB_INSTANCE_STATUS_CREATING && self.master_user_password.is_some();
+        password_pending.then(|| PendingModifiedValues {
+            master_user_password: Some(MASKED_PENDING_MASTER_USER_PASSWORD.to_string()),
+            ..PendingModifiedValues::default()
+        })
+    }
+
     /// `DbInstancePort`: "The port that the DB instance listens on. If the DB instance
     /// is part of a DB cluster, this can be a different port than the DB cluster port."
     ///
@@ -403,10 +430,10 @@ impl DbInstanceRecord {
             // `DescribeDBSubnetGroups` reports for the same group.
             db_subnet_group: db_subnet_group.map(DbSubnetGroupRecord::to_wire),
             preferred_maintenance_window: self.preferred_maintenance_window.clone(),
-            // Every change `ModifyDBInstance` accepts is applied to the stored record
-            // at once, so no change is ever pending: the element is reported EMPTY,
-            // which says exactly that, rather than omitted.
-            pending_modified_values: Some(PendingModifiedValues::default()),
+            // `PendingModifiedValues` is "returned only when there are pending changes":
+            // what this instance still has pending, and nothing at all once it has none
+            // ([`Self::pending_modified_values`]).
+            pending_modified_values: self.pending_modified_values(),
             upgrade_rollout_order: Some(DEFAULT_UPGRADE_ROLLOUT_ORDER.to_string()),
             multi_az: Some(self.multi_az),
             engine_version: self.engine_version.clone(),

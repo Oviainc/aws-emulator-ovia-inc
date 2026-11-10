@@ -487,7 +487,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // itself is minted below, once every value is validated.
         let manage_master_user_password = input.manage_master_user_password == Some(true);
         if manage_master_user_password && input.master_user_password.is_some() {
-            return Err(CreateDBClusterError::invalid_parameter_combination(
+            // Mutually exclusive members: Amazon RDS answers this as a value the parameter
+            // does not accept (`InvalidParameterValue`), not as a combination refusal, and
+            // it answers it BEFORE any provisioning or Secrets Manager work.
+            return Err(CreateDBClusterError::invalid_parameter_value(
                 crate::state::manage_master_user_password_conflict_message("MasterUserPassword"),
             ));
         }
@@ -1354,6 +1357,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
         record.served_endpoint = endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone());
+
+        // A cluster placed in the account's `default` DB subnet group reports that group,
+        // and the members created in it report the group's own record: the default VPC's
+        // subnets, which belong to the service that OWNS subnets. They are asked for here —
+        // with the state guard released, as every in-process hop is — and kept on the store,
+        // so the group reports the one answer EC2 gave whichever create materialised it
+        // ([`crate::state::default_subnet_group`]), and a region whose network this store
+        // already holds is not asked again.
+        if record.db_subnet_group_name.as_deref() == Some(crate::state::DEFAULT_DB_SUBNET_GROUP)
+            && !state.lock().knows_default_subnet_group_network(&region)
+        {
+            if let Some(network) = crate::state::default_vpc_network(ctx, &region).await {
+                state
+                    .lock()
+                    .record_default_subnet_group_network(&region, network);
+            }
+        }
 
         // The ARN of the secret this call minted, if any, kept here so a conflict below can
         // delete it once the record that carries it has moved into the store.

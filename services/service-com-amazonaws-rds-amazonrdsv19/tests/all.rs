@@ -37,6 +37,8 @@ mod cluster_role_and_export_key_refusals;
 mod control_plane_operations;
 #[path = "all/create_path_refusal_wording.rs"]
 mod create_path_refusal_wording;
+#[path = "all/create_resolved_defaults.rs"]
+mod create_resolved_defaults;
 #[path = "all/custom_db_engine_versions.rs"]
 mod custom_db_engine_versions;
 #[path = "all/custom_engine_version_engine_availability.rs"]

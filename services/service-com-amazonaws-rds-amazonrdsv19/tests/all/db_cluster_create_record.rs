@@ -216,9 +216,16 @@ fn assert_named(case: &str, label: &str, cluster: &str, row: &RecordCase) {
 /// restored to" AS OF the moment of the read, so it differs between any two reads of one
 /// record — exactly as `Status` does while the transition the create owes is still
 /// outstanding, which is why this comparison already splits at that member.
+/// `PendingModifiedValues` is the same kind of member: a cluster still being provisioned
+/// with a master credential has that credential pending, and the clock clears it when the
+/// cluster comes up.
 fn without_clock_derived_members(cluster: &str) -> String {
     let mut stripped = cluster.to_string();
-    for member in ["EarliestRestorableTime", "LatestRestorableTime"] {
+    for member in [
+        "EarliestRestorableTime",
+        "LatestRestorableTime",
+        "PendingModifiedValues",
+    ] {
         let close = format!("</{member}>");
         while let Some(start) = stripped.find(&format!("<{member}>")) {
             let Some(end) = stripped[start..]

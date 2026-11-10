@@ -75,9 +75,10 @@
 //! * `InvalidDBInstanceStateFault` (HTTP 400) — The DB instance isn't in a valid state.
 //! * `ResourceNotFoundFault` (HTTP 404) — The specified resource ID was not found.
 //!
-//! `ResourceIdentifier` names the resource this call ACTS ON, and `ResourceNotFoundFault`
-//! is what the operation models for an identifier that names none — so that is the answer
-//! (see the handler), not a parameter error. The two state faults need a maintenance
+//! `ResourceIdentifier` carries the ARN of the resource this call ACTS ON, and Amazon RDS
+//! answers an ARN that resolves to no resource of the account on the MEMBER rather than with
+//! the modelled `ResourceNotFoundFault`: HTTP 400 `InvalidParameterValue` (see
+//! [`unknown_resource_message`] and the handler). The two state faults need a maintenance
 //! action to be pending, and nothing in this service schedules one.
 
 #[allow(unused_imports)]
@@ -146,18 +147,16 @@ fn check_value(member: &str, value: &str, allowed: &[&str]) -> Result<(), String
     ))
 }
 
-/// The message Amazon RDS refuses a `ResourceIdentifier` that names no resource with: the
-/// fixed text, then the RESOURCE the identifier names.
+/// The message Amazon RDS refuses a `ResourceIdentifier` that resolves to no resource with:
+/// the fixed text `Unknown resource: `, then the identifier THE REQUEST SUPPLIED, as it
+/// supplied it.
 ///
-/// The resource is the identifier segment of an RDS ARN
-/// ([`crate::state::parse_rds_resource_arn`]) — the recorded answers of this front door
-/// name the resource that way rather than echoing the whole ARN back — and the value the
-/// request carried as it stands for anything that is no such ARN, so the caller recognises
-/// what it sent either way.
-fn resource_not_found_message(resource_identifier: &str) -> String {
-    let named = crate::state::parse_rds_resource_arn(resource_identifier)
-        .map_or(resource_identifier, |arn| arn.identifier);
-    format!("Resource not found: {named}")
+/// The whole value is echoed rather than a segment of it: the member takes "the RDS Amazon
+/// Resource Name (ARN) of the resource that the pending maintenance action applies to", so
+/// what the caller has to correct is that value, and a value that is no ARN at all is
+/// reported the same way.
+fn unknown_resource_message(resource_identifier: &str) -> String {
+    format!("Unknown resource: {resource_identifier}")
 }
 
 /// The `ApplyPendingMaintenanceAction` operation.
@@ -227,20 +226,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|record| record.arn()),
             )
             .find(|arn| *arn == resource);
-        // An identifier that resolves to no resource of this account is answered with the
-        // fault this operation MODELS for it — `ResourceNotFoundFault`, "the specified
-        // resource ID was not found", HTTP 404: `ResourceIdentifier` names the resource the
-        // call acts on, so a value naming nothing (an identifier that is no ARN at all, an
-        // ARN of another region or of a resource that was never created) is a resource that
-        // is not there, which is the answer a client branches on, rather than a complaint
-        // about the parameter's form.
+        // An identifier that resolves to no resource of this account is refused on the
+        // MEMBER that carried it: HTTP 400 with the Query API's `InvalidParameterValue` and
+        // the `Unknown resource: <identifier>` sentence. `ResourceIdentifier` is an ARN the
+        // caller composes, so a value naming nothing (one that is no ARN at all, an ARN of
+        // another region, or one of a resource that was never created) is a value this
+        // parameter does not accept — a 4xx a client treats as "fix the request" — and not
+        // the modelled `ResourceNotFoundFault`, whose 404 an SDK retry policy reads as a
+        // resource that may yet appear.
         let Some(resource_arn) = resolved else {
-            return Err(ApplyPendingMaintenanceActionErrorModeled::ResourceNotFoundFault(
-                ResourceNotFoundFault {
-                    message: Some(resource_not_found_message(&resource)),
-                },
-            )
-            .into());
+            return Err(ApplyPendingMaintenanceActionError::invalid_parameter_value(
+                unknown_resource_message(&input.resource_identifier),
+            ));
         };
 
         // Only once the resource is resolved: `ApplyAction` and `OptInType` say what to do

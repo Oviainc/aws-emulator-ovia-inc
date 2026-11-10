@@ -636,15 +636,17 @@ pub(super) fn kms_client(
 }
 
 /// What a request that turns master-password management on is refused with when it also
-/// carries the password itself: "Can't manage the master user password with Amazon Web
-/// Services Secrets Manager if `MasterUserPassword` is specified."
+/// carries the password itself — the constraint `ManageMasterUserPassword` documents
+/// ("Can't manage the master user password with Amazon Web Services Secrets Manager if
+/// `MasterUserPassword` is specified"), worded as Amazon RDS answers it: the two members
+/// named as mutually exclusive, then the instruction to specify one of them.
 ///
 /// One sentence for every operation that publishes both members, naming the password
-/// member the request carried, since that is the one to drop.
+/// member the request carried, since that is the one the operation publishes.
 pub fn manage_master_user_password_conflict_message(password_member: &str) -> String {
     format!(
-        "You can't manage the master user password with Amazon Web Services Secrets Manager if \
-         {password_member} is specified."
+        "{password_member} and ManageMasterUserPassword are mutually exclusive. Specify only \
+         one of these parameters."
     )
 }
 

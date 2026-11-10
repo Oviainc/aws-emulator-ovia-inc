@@ -344,10 +344,10 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                     expected_body_excludes: &[],
                 },
                 Call {
-                    // The identifier names the resource the action is applied to, and the
-                    // operation MODELS `ResourceNotFoundFault` for one that names none —
-                    // so an ARN resolving to no resource is that fault (404), not a
-                    // parameter refusal.
+                    // The identifier is an ARN the CALLER composes for the resource the
+                    // action is applied to, and Amazon RDS refuses one that resolves to no
+                    // resource of the account on that MEMBER — 400 `InvalidParameterValue`
+                    // — rather than with the not-found fault the operation also models.
                     case: "rds ApplyPendingMaintenanceAction on a missing resource ARN",
                     addressed: Addressed::Signed("rds"),
                     action: "ApplyPendingMaintenanceAction",
@@ -359,8 +359,8 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                         ("ApplyAction", "system-update"),
                         ("OptInType", "immediate"),
                     ],
-                    expected_status: Some(404),
-                    expected_code: Some("ResourceNotFoundFault"),
+                    expected_status: Some(400),
+                    expected_code: Some("InvalidParameterValue"),
                     expected_body_contains: &["<ErrorResponse", "<RequestId>"],
                     expected_body_excludes: &[],
                 },

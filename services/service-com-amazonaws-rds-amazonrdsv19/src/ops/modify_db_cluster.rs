@@ -474,7 +474,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is conditioned on what the cluster manages NOW, so that refusal is answered
         // below, where the record is in hand.
         if input.manage_master_user_password == Some(true) && input.master_user_password.is_some() {
-            return Err(ModifyDBClusterError::invalid_parameter_combination(
+            return Err(ModifyDBClusterError::invalid_parameter_value(
                 crate::state::manage_master_user_password_conflict_message("MasterUserPassword"),
             ));
         }

@@ -445,7 +445,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instance". The secret itself is minted below, once every refusal is answered.
         let manage_master_user_password = input.manage_master_user_password == Some(true);
         if manage_master_user_password && input.master_user_password.is_some() {
-            return Err(CreateDBInstanceError::invalid_parameter_combination(
+            // The two members are mutually exclusive, which Amazon RDS answers as a value
+            // this parameter does not accept (`InvalidParameterValue`) rather than as a
+            // combination refusal: ONE of the two names the password source, and the
+            // request named both.
+            return Err(CreateDBInstanceError::invalid_parameter_value(
                 crate::state::manage_master_user_password_conflict_message("MasterUserPassword"),
             ));
         }
@@ -563,10 +567,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reference is the only place the membership is recorded. The resolved cluster's
         // identifier is what gets stored, not the request's spelling of it, so the two
         // records agree whatever case the request used.
-        let db_cluster_identifier = match &input.db_cluster_identifier {
-            None => None,
+        let (db_cluster_identifier, cluster_db_subnet_group_name) = match &input
+            .db_cluster_identifier
+        {
+            None => (None, None),
             Some(named) => match store.resolve_db_cluster(&region, named) {
-                Some(cluster) => Some(cluster.identifier.clone()),
+                // The cluster's own DB subnet group comes back with it: an instance joins
+                // the network of the cluster it belongs to, so a member created without
+                // naming a group is placed in the cluster's (see below).
+                Some(cluster) => (
+                    Some(cluster.identifier.clone()),
+                    cluster.db_subnet_group_name.clone(),
+                ),
                 None => {
                     return Err(CreateDBInstanceErrorModeled::DBClusterNotFoundFault(
                         DBClusterNotFoundFault {
@@ -579,6 +591,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
         };
+        // `DBSubnetGroupName` is optional, and every DB instance sits in a DB subnet
+        // group all the same: "if there is no DB subnet group, then the DB instance is a
+        // non-VPC DB instance" is the legacy EC2-Classic case, which no create reaches
+        // today. So the group the instance is PLACED in is the one the request named, the
+        // group of the DB cluster it joins, or the account's `default` group — the one RDS
+        // provides with the account's default VPC — and the instance reports that group's
+        // own record (its VPC, its subnets and their zones) from then on.
+        let placed_in_db_subnet_group = db_subnet_group_name
+            .clone()
+            .or(cluster_db_subnet_group_name)
+            .unwrap_or_else(|| crate::state::DEFAULT_DB_SUBNET_GROUP.to_string());
         // What the instance RUNS and the combination it is ordered IN are resolved once the
         // DB cluster above — the resource this request REFERENCES — has been resolved: a
         // request naming a cluster that does not exist is told THAT, the obstacle it has to
@@ -776,7 +799,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
             // `DeletionProtection`: "By default, deletion protection isn't enabled."
             deletion_protection: input.deletion_protection.unwrap_or(false),
-            db_subnet_group_name,
+            db_subnet_group_name: Some(placed_in_db_subnet_group),
             db_parameter_group_name,
             option_group_name,
             vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
@@ -933,6 +956,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+        // An instance placed in the account's `default` DB subnet group reports that
+        // group's network, which belongs to the service that owns subnets: the default
+        // VPC's default subnets, asked for here — with the state lock released, as every
+        // in-process hop is — and kept on the store so every later read of the group
+        // reports the one answer EC2 gave. A deployment where EC2 answers nothing leaves
+        // the group with no subnets rather than with identifiers nobody minted, and a
+        // region whose network this store already holds is not asked again.
+        if record.db_subnet_group_name.as_deref() == Some(crate::state::DEFAULT_DB_SUBNET_GROUP)
+            && !state.lock().knows_default_subnet_group_network(&region)
+        {
+            if let Some(network) = crate::state::default_vpc_network(ctx, &region).await {
+                state
+                    .lock()
+                    .record_default_subnet_group_network(&region, network);
+            }
         }
         let mut store = state.lock();
 

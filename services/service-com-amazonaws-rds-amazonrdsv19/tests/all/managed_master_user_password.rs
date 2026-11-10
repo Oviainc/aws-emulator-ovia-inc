@@ -540,8 +540,8 @@ async fn a_resource_whose_password_the_caller_supplied_reports_no_managed_secret
 /// The sentence a request that asks RDS to manage the password AND carries one is refused
 /// with, written out here rather than read from the implementation: the wording is part of
 /// what this suite pins, so a drift away from it must fail.
-const MANAGE_CONFLICT_SENTENCE: &str = "You can't manage the master user password with \
-     Amazon Web Services Secrets Manager if MasterUserPassword is specified.";
+const MANAGE_CONFLICT_SENTENCE: &str = "MasterUserPassword and ManageMasterUserPassword \
+     are mutually exclusive. Specify only one of these parameters.";
 
 /// The sentence a request naming a key for a secret it manages none of is refused with.
 const KEY_WITHOUT_MANAGEMENT_SENTENCE: &str = "You can't specify MasterUserSecretKmsKeyId \
@@ -566,13 +566,17 @@ struct RefusalCase {
     case: &'static str,
     action: &'static str,
     params: &'static [(&'static str, &'static str)],
+    /// The Query API error code the refusal carries: `InvalidParameterValue` for a value
+    /// the parameter does not accept, `InvalidParameterCombination` for members that
+    /// cannot hold together.
+    code: &'static str,
     /// The sentence the refusal carries.
     message: &'static str,
 }
 
 /// The refusals the documented constraints state — every one an HTTP 400 with the Query
-/// API code for parameters that cannot hold together, never a 501 and never an error code
-/// RDS does not answer.
+/// API code AWS answers that cause with, never a 501 and never an error code RDS does not
+/// answer.
 const REFUSAL_CASES: &[RefusalCase] = &[
     RefusalCase {
         case: "a cluster create that manages the password AND carries one",
@@ -584,6 +588,7 @@ const REFUSAL_CASES: &[RefusalCase] = &[
             ("MasterUserPassword", "a-strong-password"),
             ("ManageMasterUserPassword", "true"),
         ],
+        code: "InvalidParameterValue",
         message: MANAGE_CONFLICT_SENTENCE,
     },
     RefusalCase {
@@ -597,6 +602,7 @@ const REFUSAL_CASES: &[RefusalCase] = &[
             ("MasterUserPassword", "a-strong-password"),
             ("ManageMasterUserPassword", "true"),
         ],
+        code: "InvalidParameterValue",
         message: MANAGE_CONFLICT_SENTENCE,
     },
     RefusalCase {
@@ -609,6 +615,7 @@ const REFUSAL_CASES: &[RefusalCase] = &[
             ("MasterUserPassword", "a-strong-password"),
             ("MasterUserSecretKmsKeyId", "alias/aws/secretsmanager"),
         ],
+        code: "InvalidParameterCombination",
         message: KEY_WITHOUT_MANAGEMENT_SENTENCE,
     },
     RefusalCase {
@@ -622,6 +629,7 @@ const REFUSAL_CASES: &[RefusalCase] = &[
             ("MasterUserPassword", "a-strong-password"),
             ("MasterUserSecretKmsKeyId", "alias/aws/secretsmanager"),
         ],
+        code: "InvalidParameterCombination",
         message: KEY_WITHOUT_MANAGEMENT_SENTENCE,
     },
 ];
@@ -634,7 +642,7 @@ async fn the_documented_constraints_are_the_only_refusals() {
             row.case,
             call(&router, row.action, row.params).await,
             400,
-            "InvalidParameterCombination",
+            row.code,
         );
         let message = text(&body, "Message");
         assert_eq!(
@@ -1145,7 +1153,7 @@ async fn a_tenant_database_that_manages_its_password_reports_its_own_secret() {
         )
         .await,
         400,
-        "InvalidParameterCombination",
+        "InvalidParameterValue",
     );
     assert_eq!(
         text(&refused, "Message"),

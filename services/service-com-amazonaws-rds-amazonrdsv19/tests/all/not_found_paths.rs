@@ -13,8 +13,9 @@
 //! "nothing named" and "nothing stored" are different answers.
 //!
 //! `ApplyPendingMaintenanceAction` is here for one part of that rule — a resource is
-//! addressable only in its own region — while the shapes its `ResourceIdentifier` can take
-//! are covered by the sibling suite `all/maintenance_action_resource_guard.rs`.
+//! addressable only in its own region, which for that operation is a refusal of the
+//! `ResourceIdentifier` it carries — while the shapes that identifier can take are covered
+//! by the sibling suite `all/maintenance_action_resource_guard.rs`.
 //!
 //! the certificate catalog `DescribeCertificates` publishes is covered by the sibling
 //! suite `all/query_catalog_reads.rs`; what this one adds for that operation is the row
@@ -348,11 +349,11 @@ async fn a_name_that_resolves_to_nothing_answers_that_resources_not_found_fault(
             404,
             "DBClusterNotFoundFault",
         ),
-        // `ApplyPendingMaintenanceAction` is NOT in this table only because its
-        // `ResourceIdentifier` is an ARN rather than a bare name: it answers the same class
-        // of not-found fault, which the sibling suite
-        // `all/maintenance_action_resource_guard.rs` asserts over the shapes such an
-        // identifier can take.
+        // `ApplyPendingMaintenanceAction` is NOT in this table: its `ResourceIdentifier` is
+        // an ARN the caller composes, and Amazon RDS refuses one that resolves to nothing
+        // on that member (400 `InvalidParameterValue`) rather than with a not-found fault.
+        // The sibling suite `all/maintenance_action_resource_guard.rs` asserts that rule
+        // over the shapes such an identifier can take.
         (
             "DescribeGlobalClusters for a global cluster that was never created",
             "DescribeGlobalClusters",
@@ -479,7 +480,7 @@ async fn a_resource_is_addressable_only_in_the_region_it_was_created_in() {
     }
 
     // And the instance's own ARN resolves to no resource in the other region either: the
-    // maintenance-action front door answers its modelled not-found fault there (see
+    // maintenance-action front door refuses the identifier on its own member there (see
     // `all/maintenance_action_resource_guard.rs` for the rule), which is still a statement
     // about the REGION and not about the name.
     expect_error(
@@ -498,8 +499,8 @@ async fn a_resource_is_addressable_only_in_the_region_it_was_created_in() {
             ],
         )
         .await,
-        404,
-        "ResourceNotFoundFault",
+        400,
+        "InvalidParameterValue",
     );
 
     // In its own region the same name resolves, which is what makes the rows above a

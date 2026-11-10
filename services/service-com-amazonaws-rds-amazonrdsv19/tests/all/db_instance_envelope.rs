@@ -282,8 +282,10 @@ const ENGINE_CASES: &[EngineCase] = &[
 
 /// Every member the projection reports for an instance whatever the request named: a
 /// scalar the record always holds, or a list that is EMPTY when the instance has no
-/// such association. `DBSubnetGroup` is NOT among them — only an instance whose
-/// request named a subnet group has one.
+/// such association. `DBSubnetGroup` is among them: every DB instance is placed in a DB
+/// subnet group — the one the request named, or the account's `default` group — so every
+/// envelope reports one. `PendingModifiedValues` is NOT: the model returns it "only when
+/// there are pending changes", and these instances have none.
 const ALWAYS_PROJECTED: &[&str] = &[
     "DBInstanceIdentifier",
     "DBInstanceClass",
@@ -298,8 +300,8 @@ const ALWAYS_PROJECTED: &[&str] = &[
     "DBParameterGroups",
     "OptionGroupMemberships",
     "AvailabilityZone",
+    "DBSubnetGroup",
     "PreferredMaintenanceWindow",
-    "PendingModifiedValues",
     "UpgradeRolloutOrder",
     "MultiAZ",
     "EngineVersion",
@@ -387,12 +389,22 @@ async fn every_db_instance_envelope_projects_the_whole_stored_record() {
             for member in ALWAYS_PROJECTED {
                 assert_element_present(row.case, envelope, instance, member);
             }
-            // A DB subnet group is reported only for an instance whose request named
-            // one, which none of these did.
+            // An instance created without naming a DB subnet group is placed in the
+            // account's `default` group, and reports THAT group.
+            assert_member(
+                row.case,
+                envelope,
+                instance,
+                "DBSubnetGroupName",
+                "default",
+            );
+            // `PendingModifiedValues` is "returned only when there are pending changes",
+            // and nothing is pending for an instance nothing has modified: an EMPTY
+            // element would claim there are changes whose subelements are not reported.
             assert!(
-                subtrees(instance, "DBSubnetGroup").is_empty(),
-                "case {:?}: the {envelope} envelope must report no DBSubnetGroup for an \
-                 instance created without one, got {instance}",
+                subtrees(instance, "PendingModifiedValues").is_empty(),
+                "case {:?}: the {envelope} envelope must report no PendingModifiedValues \
+                 for an instance with no pending change, got {instance}",
                 row.case
             );
 

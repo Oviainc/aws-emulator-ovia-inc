@@ -638,10 +638,19 @@ impl DbClusterRecord {
             // different Amazon Web Services account": nothing here clones one.
             cross_account_clone: Some(false),
             tag_list: Some(self.tags.clone()),
-            // Every change this service accepts for a cluster is applied to the stored
-            // record at once, so no change is ever pending: the element is reported EMPTY,
-            // which says exactly that, rather than omitted.
-            pending_modified_values: Some(ClusterPendingModifiedValues::default()),
+            // `PendingModifiedValues` is "returned only when there are pending changes".
+            // Every change this service accepts for a cluster is written to the stored
+            // record at once, so the only change still in flight is the one the CREATE is
+            // applying: a cluster being provisioned with a master credential has that
+            // credential pending until it is up, masked because the member is
+            // `@sensitive` — the same reading the DB instance envelope follows
+            // ([`DbInstanceRecord::pending_modified_values`]).
+            pending_modified_values: (self.status == DB_CLUSTER_STATUS_CREATING
+                && self.master_user_password.is_some())
+            .then(|| ClusterPendingModifiedValues {
+                master_user_password: Some(MASKED_PENDING_MASTER_USER_PASSWORD.to_string()),
+                ..ClusterPendingModifiedValues::default()
+            }),
             ..DBCluster::default()
         }
     }

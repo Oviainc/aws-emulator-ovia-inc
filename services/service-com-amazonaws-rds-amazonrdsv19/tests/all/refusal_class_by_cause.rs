@@ -541,8 +541,8 @@ async fn a_refusal_of_what_the_request_carries_is_a_query_api_parameter_error() 
             code: INVALID_PARAMETER_VALUE,
             wording: Wording::Says("OptInType"),
         },
-        // Rule 2: the required identifier names no resource, so the answer is the fault
-        // the operation MODELS for that — whichever shape the identifier takes.
+        // Rule 2: the required identifier resolves to no resource, which Amazon RDS refuses
+        // on the MEMBER that carried it — whichever shape the identifier takes.
         Row {
             case: "ApplyPendingMaintenanceAction over an ARN of a resource never created",
             action: "ApplyPendingMaintenanceAction",
@@ -551,9 +551,12 @@ async fn a_refusal_of_what_the_request_carries_is_a_query_api_parameter_error() 
                 "ApplyAction" => "system-update",
                 "OptInType" => "immediate",
             ],
-            status: 404,
-            code: "ResourceNotFoundFault",
-            wording: Wording::Exact("Resource not found: emu-rcls-absent".to_string()),
+            status: 400,
+            code: INVALID_PARAMETER_VALUE,
+            wording: Wording::Exact(format!(
+                "Unknown resource: {}",
+                instance_arn("emu-rcls-absent")
+            )),
         },
         Row {
             case: "ApplyPendingMaintenanceAction over a value that is no ARN at all",
@@ -563,9 +566,9 @@ async fn a_refusal_of_what_the_request_carries_is_a_query_api_parameter_error() 
                 "ApplyAction" => "system-update",
                 "OptInType" => "immediate",
             ],
-            status: 404,
-            code: "ResourceNotFoundFault",
-            wording: Wording::Exact("Resource not found: emu-rcls-live-inst".to_string()),
+            status: 400,
+            code: INVALID_PARAMETER_VALUE,
+            wording: Wording::Exact("Unknown resource: emu-rcls-live-inst".to_string()),
         },
     ];
 
