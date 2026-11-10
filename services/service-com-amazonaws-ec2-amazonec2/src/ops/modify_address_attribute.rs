@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyAddressAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyAddressAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: starts an update of the reverse DNS (PTR) record of the Elastic IP address
+//! the request names to the domain name it carries, through the one seam this crate changes
+//! that record through
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::start_address_ptr_record_update`]) — so
+//! this operation, the `ResetAddressAttribute` that takes a record away and the describe that
+//! reports one cannot disagree about an address's attribute. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyAddressAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The record in effect is left alone: the update is reported as outstanding
+//! (`AddressAttribute$PtrRecordUpdate`) and reaches the record one
+//! [`crate::state::TRANSITION_DELAY`] later, whether or not anybody calls again.
+//!
+//! What it refuses, and why:
+//!
+//! * `MissingParameter` (400) — no domain name, so the request asks for no modification at
+//!   all; taking the record AWAY is `ResetAddressAttribute`'s job.
+//! * `InvalidParameterValue` (400) — a value that is not a domain name
+//!   ([`crate::state::domain_name_is_well_formed`]).
+//! * `InvalidAllocationID.Malformed` (400) — a value that is not an allocation id at all, so
+//!   there is nothing to look up.
+//! * `InvalidElasticIpID.NotFound` (400) — a well-formed allocation id the account holds no
+//!   address for: the code this operation's recorded refusal carries
+//!   ([`crate::state::invalid_elastic_ip_id_not_found`]).
+//! * `PendingRequestAlreadyExists` (400) — one outstanding request per record, so a second
+//!   cannot be started while the first has not been applied.
+//! * `DryRunOperation` (412) — `DryRun`, answered once the request's own members have been
+//!   read and before the address it names is: this operation's recorded dry run answers the
+//!   permission question even for a request its own checks would have refused.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +154,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyAddressAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyAddressAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            ADDRESS_ATTRIBUTE_DOMAIN_NAME, allocation_id_is_well_formed, domain_name_is_well_formed,
+            dry_run_operation, internal_error, invalid_elastic_ip_id_not_found,
+            invalid_allocation_id_malformed, pending_request_already_exists, require_service_state,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The domain name to modify for the IP address" (`DomainName`): the modification IS
+        // that name, so a request carrying none asks for nothing — taking an address's record
+        // away is `ResetAddressAttribute`, not a modify with the member left out. The member
+        // is a plain `String` in the model with no `@length` and no `@pattern`, and the value
+        // is RETAINED on the address's record, so the handler is the only place its form and
+        // its size can be read: it is held to the one reading of a domain name this crate has,
+        // which bounds it at a fully qualified name's 253 bytes.
+        let Some(domain_name) = input
+            .domain_name
+            .as_deref()
+            .filter(|domain_name| !domain_name.is_empty())
+        else {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter DomainName",
+            ));
+        };
+        // A reverse DNS record is a fully qualified name, which a caller may spell with or
+        // without the root label's trailing dot; both name the same record, so the dot is not
+        // part of what is read as a domain name here.
+        let requested = domain_name.strip_suffix('.').unwrap_or(domain_name);
+        if !domain_name_is_well_formed(requested) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{domain_name}' for domainName. It must be a domain name"
+            )));
+        }
+        // An id that is not an allocation id at all is refused before the store is asked
+        // about it, the way the service orders the two: there is nothing to look up.
+        let allocation_id = input.allocation_id.clone();
+        if !allocation_id_is_well_formed(&allocation_id) {
+            return Err(invalid_allocation_id_malformed(&allocation_id));
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST … If you have the required permissions, the error response is
+        // DryRunOperation" (`DryRun`): the question is about the CALLER's permission for this
+        // operation, which nothing the store holds can answer. This operation's recorded
+        // contract puts the flag BEFORE the address the request names is read — its recorded
+        // dry run of an address whose record already carries an outstanding update is answered
+        // `DryRunOperation` rather than with that refusal — so it is answered once the
+        // request's own members have been read and before the store is opened at all, and
+        // nothing is read or written for a request that gets this answer.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyAddressAttribute"))
+        // WHERE the flag sits relative to an operation's own checks is a fact of that
+        // operation, recorded by its caller: the RESET of this same attribute is recorded
+        // answering its own refusals first, and neither placement is generalised to the other.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // An update already owed on this address's record fell due at its own instant whether
+        // or not anybody called, so it is applied before the record is read: a request made
+        // after the previous one came due is not refused as though that one were still
+        // outstanding.
+        store.materialize_due_transitions();
+
+        // "[EC2-VPC] The allocation ID" (`AllocationId`): an id that names no address of the
+        // account has no attribute to modify. The code is the one THIS operation's recorded
+        // refusal carries, which is not the one the release and the reset of an address answer
+        // (`crate::state::invalid_elastic_ip_id_not_found`).
+        if !store.addresses.contains_key(&allocation_id) {
+            return Err(invalid_elastic_ip_id_not_found(&allocation_id));
+        }
+
+        // A reverse DNS change is not immediate, and one record carries at most one
+        // outstanding request: while the previous one has not been applied, another cannot be
+        // started on it, so this one is refused rather than queued or silently dropped. The
+        // same rule, in the same words, as the reset of this attribute.
+        if store.address_ptr_update_is_pending(&allocation_id) {
+            return Err(pending_request_already_exists());
+        }
+
+        // "Modifies an attribute of the specified Elastic IP address": the name becomes the
+        // address's record at once and the change is reported as outstanding beside it until
+        // it comes due, which is what a caller reading the attribute straight after this call
+        // sees. The record is the name as a REVERSE DNS record spells it — fully qualified,
+        // with the root label's trailing dot — whichever of the two forms the request sent,
+        // so one address cannot hold the same name under two spellings.
+        let address = store
+            .start_address_ptr_record_update(&allocation_id, Some(format!("{requested}.")))
+            .ok_or_else(|| {
+                internal_error(format!(
+                    "the address '{allocation_id}' could not be read back after its \
+                     {ADDRESS_ATTRIBUTE_DOMAIN_NAME} attribute was modified"
+                ))
+            })?;
+        Ok(ModifyAddressAttributeOutput {
+            address: Some(address),
+        })
     }
 }

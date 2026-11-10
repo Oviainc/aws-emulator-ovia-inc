@@ -1882,30 +1882,58 @@ pub fn require_windows_image<E>(
     Ok(())
 }
 
+/// Which VERSION of a launch template a request names: a number, or one of the two aliases.
+///
+/// The REQUEST-ONLY half of [`resolve_launch_template_version`]: "Valid values are $Latest,
+/// $Default, and numbers" (`DescribeLaunchTemplateVersionsRequest$Versions`) is a rule about
+/// the WORD the request sent, which asks nothing of the store — so an operation that has to
+/// refuse an unreadable one before it answers a `DryRun` can read the word here and resolve it
+/// against the template later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchTemplateVersionRequest {
+    /// `$Latest`: whichever version the template most recently gained.
+    Latest,
+    /// `$Default`: the version the template records as its default.
+    Default,
+    /// A version number, which the template must hold.
+    Numbered(i64),
+}
+
+/// The version a request named, or the refusal for a word that is neither an alias nor a
+/// number.
+///
+/// The ONE reading of that member, so every operation that takes a launch template version
+/// refuses the same word the same way.
+pub fn launch_template_version_request<E>(
+    version: &str,
+) -> Result<LaunchTemplateVersionRequest, Scaffolded<E>> {
+    match version {
+        LAUNCH_TEMPLATE_VERSION_LATEST => Ok(LaunchTemplateVersionRequest::Latest),
+        LAUNCH_TEMPLATE_VERSION_DEFAULT => Ok(LaunchTemplateVersionRequest::Default),
+        other => match other.parse::<i64>() {
+            Ok(number) => Ok(LaunchTemplateVersionRequest::Numbered(number)),
+            Err(_) => Err(invalid_parameter_value(format!(
+                "Invalid value '{version}' for version. Valid values are \
+                 {LAUNCH_TEMPLATE_VERSION_LATEST}, {LAUNCH_TEMPLATE_VERSION_DEFAULT}, \
+                 and version numbers"
+            ))),
+        },
+    }
+}
+
 /// Resolve the launch template version a request names against the template that holds it.
 ///
-/// "Valid values are $Latest, $Default, and numbers"
-/// (`DescribeLaunchTemplateVersionsRequest$Versions`): an alias resolves to the number the
-/// template records for it, and a number has to be a version the template holds — a
-/// version that does not exist is `InvalidLaunchTemplateId.VersionNotFound`, while
-/// something that is neither an alias nor a number is a bad parameter value.
+/// The word itself is read first ([`launch_template_version_request`]): an alias resolves to
+/// the number the template records for it, and a number has to be a version the template
+/// holds — a version that does not exist is `InvalidLaunchTemplateId.VersionNotFound`.
 pub fn resolve_launch_template_version<E>(
     record: &LaunchTemplateRecord,
     version: &str,
 ) -> Result<i64, Scaffolded<E>> {
-    let numbered = match version {
-        LAUNCH_TEMPLATE_VERSION_LATEST => record.template.latest_version_number,
-        LAUNCH_TEMPLATE_VERSION_DEFAULT => record.template.default_version_number,
-        other => match other.parse::<i64>() {
-            Ok(number) => Some(number),
-            Err(_) => {
-                return Err(invalid_parameter_value(format!(
-                    "Invalid value '{version}' for version. Valid values are \
-                     {LAUNCH_TEMPLATE_VERSION_LATEST}, {LAUNCH_TEMPLATE_VERSION_DEFAULT}, \
-                     and version numbers"
-                )));
-            }
-        },
+    let numbered = match launch_template_version_request(version)? {
+        LaunchTemplateVersionRequest::Latest => record.template.latest_version_number,
+        LaunchTemplateVersionRequest::Default => record.template.default_version_number,
+        LaunchTemplateVersionRequest::Numbered(number) => Some(number),
     };
     numbered
         .filter(|number| record.versions.contains_key(number))
@@ -1978,6 +2006,20 @@ pub const INVALID_ALLOCATION_ID_NOT_FOUND: &str = "InvalidAllocationID.NotFound"
 /// `InvalidAllocationID.Malformed` (HTTP 400): the request named something that is not an
 /// allocation id at all, so there is nothing to look up.
 pub const INVALID_ALLOCATION_ID_MALFORMED: &str = "InvalidAllocationID.Malformed";
+
+/// `InvalidElasticIpID.NotFound` (HTTP 400): the request named an Elastic IP address id this
+/// account holds no address for.
+///
+/// The SAME failure [`INVALID_ALLOCATION_ID_NOT_FOUND`] names, under the other of the two
+/// codes EC2 publishes for it — the one that names the Elastic IP address id rather than the
+/// allocation id. EC2's per-operation validators do not agree about which they answer, the
+/// way they do not agree about an unresolvable instance id
+/// ([`crate::scaffolded::Scaffolded::instance_id_is_malformed`]), so WHICH one an operation
+/// answers is a fact of that operation, recorded by its caller:
+/// `ModifyAddressAttribute` is recorded answering THIS one for a well-formed allocation id the
+/// account holds no address for, while the release, the transfer and the attribute RESET of an
+/// address keep [`INVALID_ALLOCATION_ID_NOT_FOUND`]. It is therefore not generalised to them.
+pub const INVALID_ELASTIC_IP_ID_NOT_FOUND: &str = "InvalidElasticIpID.NotFound";
 
 /// `Resource.AlreadyAssociated` (HTTP 400): the request asked for an association the
 /// resource already has with something else, and did not allow that one to be replaced
@@ -2670,6 +2712,24 @@ pub fn invalid_allocation_id_not_found<E>(allocation_id: &str) -> Scaffolded<E> 
     )
 }
 
+/// Refuse a request that named an allocation id no address of the account has, under the
+/// other of the two codes EC2 publishes for that failure: HTTP 400
+/// [`INVALID_ELASTIC_IP_ID_NOT_FOUND`].
+///
+/// A second named constructor rather than a literal at the call site, for the reason
+/// [`invalid_allocation_id_not_found`] is one and the reason given on the code itself: which
+/// of the two an operation answers is a fact of that operation. The sentence is the one
+/// recorded for that code, naming the id the REQUEST sent as the `elasticIp` id the code is
+/// about — EC2's own spelling of the resource there, which is not how the sentence beside it
+/// names an allocation id.
+pub fn invalid_elastic_ip_id_not_found<E>(allocation_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ELASTIC_IP_ID_NOT_FOUND,
+        400,
+        format!("The elasticIp ID '{allocation_id}' does not exist"),
+    )
+}
+
 /// Refuse a request that named an Elastic IP address this account holds no allocation
 /// for: HTTP 400 `InvalidAddress.NotFound`.
 ///
@@ -2725,8 +2785,8 @@ pub struct AddressPtrRecord {
     pub pending_update: Option<PendingPtrRecordUpdate>,
 }
 
-/// A PTR record update the clock has not applied yet: what it will leave in effect, and
-/// when it falls due.
+/// A PTR record update the clock has not finished yet: what it leaves in effect, and when it
+/// falls due.
 #[derive(Debug, Clone)]
 pub struct PendingPtrRecordUpdate {
     /// The PTR record this update leaves in effect. `None` is a RESET, which takes the
@@ -2756,19 +2816,20 @@ impl ComAmazonawsEc2Amazonec2State {
     /// record away, which is what a reset asks for — and answer the attribute as it now
     /// reads.
     ///
-    /// The record in effect is left ALONE: an update is reported as outstanding
-    /// (`AddressAttribute$PtrRecordUpdate`) beside the record it has not replaced yet, and
-    /// reaches that record [`TRANSITION_DELAY`] later through
-    /// [`Self::apply_due_ptr_record_updates`] — recorded rather than slept for, like every
-    /// other clock-owed move of this store. The caller has already resolved
-    /// `allocation_id` to an address of the account and asked
-    /// [`Self::address_ptr_update_is_pending`].
+    /// The value becomes the address's record AT ONCE and the update is reported as
+    /// OUTSTANDING beside it until it falls due: `AddressAttribute$PtrRecord` is the record
+    /// the attribute now carries, while "the updated PTR record for the IP address"
+    /// (`$PtrRecordUpdate`) is the change itself, which a modify's recorded answer reports
+    /// `PENDING` beside the record it has just set. It comes due one [`TRANSITION_DELAY`]
+    /// later through [`Self::apply_due_ptr_record_updates`] — recorded rather than slept for,
+    /// like every other clock-owed move of this store — and until then no second update can
+    /// be started on the record ([`Self::address_ptr_update_is_pending`]). The caller has
+    /// already resolved `allocation_id` to an address of the account and asked that question.
     ///
     /// No byte charge is made for the entry: it is keyed by an id of [`Self::addresses`],
-    /// so there can be no more of them than there are stored addresses, and a reset — the
-    /// one caller that reaches this today — names no value at all. A writer that DOES name
-    /// one has to bound it before it gets here, the way every other caller-supplied value
-    /// of this store is bounded.
+    /// so there can be no more of them than there are stored addresses, and the one writer
+    /// that names a value bounds it before it gets here, the way every other caller-supplied
+    /// value of this store is bounded.
     pub fn start_address_ptr_record_update(
         &mut self,
         allocation_id: &str,
@@ -2778,6 +2839,7 @@ impl ComAmazonawsEc2Amazonec2State {
             .address_ptr_records
             .entry(allocation_id.to_string())
             .or_default();
+        entry.ptr_record = value.clone();
         entry.pending_update = Some(PendingPtrRecordUpdate {
             value,
             due_at: Instant::now() + TRANSITION_DELAY,
@@ -2789,9 +2851,11 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// Reached through [`Self::materialize_due_transitions`], so a reporting operation may
     /// apply it: each update was already owed at `now` whether or not anybody called, and
-    /// applying it is what makes the record the caller asked for the record in effect. An
-    /// entry left with neither a record nor an owed update is dropped, an address with no
-    /// reverse DNS record being one this store holds nothing about.
+    /// applying it is what stops the change being reported as outstanding. The record it
+    /// names is written again here rather than only where the update is started, so one
+    /// definition of what an applied update leaves in effect serves both ends. An entry left
+    /// with neither a record nor an owed update is dropped, an address with no reverse DNS
+    /// record being one this store holds nothing about.
     pub fn apply_due_ptr_record_updates(&mut self, now: Instant) {
         self.address_ptr_records.retain(|_allocation_id, record| {
             let due = record

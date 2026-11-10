@@ -1793,14 +1793,14 @@ async fn run_instances_refuses_an_unservable_request() {
             code: "NotImplemented",
         },
         Case {
-            label: "a launch template, which no implemented operation creates",
+            label: "a launch template id no template of the account was created under",
             params: vec![
                 p("MinCount", "1"),
                 p("MaxCount", "1"),
                 p("LaunchTemplate.LaunchTemplateId", "lt-0123456789abcdef0"),
             ],
-            status: 501,
-            code: "NotImplemented",
+            status: 400,
+            code: "InvalidLaunchTemplateId.NotFound",
         },
     ];
 

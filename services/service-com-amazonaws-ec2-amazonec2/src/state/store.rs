@@ -3061,6 +3061,20 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// two that change it cannot disagree. PRIVATE, like the settings above, so those
     /// accessors are the only way in.
     pub(super) serial_console_access_enabled: bool,
+    /// Whether Reachability Analyzer has a trust relationship with Organizations.
+    ///
+    /// ONE value for the whole organization rather than a map keyed by Region, because the
+    /// relationship is between Reachability Analyzer and the organization itself:
+    /// "establishes a trust relationship between Reachability Analyzer and Organizations"
+    /// (`EnableReachabilityAnalyzerOrganizationSharing`), whose doc names no Region. A single
+    /// `bool` therefore also needs no storage ceiling: nothing a caller sends can grow it.
+    ///
+    /// Starts `false`: an organization has no trust relationship until one is established.
+    /// Read it through [`Self::reachability_analyzer_organization_sharing`] and write it
+    /// through [`Self::set_reachability_analyzer_organization_sharing`], so the operation
+    /// that establishes it and anything that reads it cannot disagree. PRIVATE, like the
+    /// settings above, so those accessors are the only way in.
+    pub(super) reachability_analyzer_organization_sharing: bool,
     /// The default credit option this account has SET for each burstable instance family,
     /// by Region and then by instance family.
     ///
@@ -3497,6 +3511,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // (`GetSerialConsoleAccessStatus`), so a fresh account has it off until
             // `EnableSerialConsoleAccess` turns it on.
             serial_console_access_enabled: false,
+            // An organization that has never called
+            // `EnableReachabilityAnalyzerOrganizationSharing` has no trust relationship
+            // between Reachability Analyzer and Organizations.
+            reachability_analyzer_organization_sharing: false,
             // An account that has never called `ModifyDefaultCreditSpecification` has set
             // no family's default anywhere, so every family is reported at AWS's own
             // default for it and the map starts empty.

@@ -172,8 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             FAST_LAUNCH_RESOURCE_TYPE_SNAPSHOT, FAST_LAUNCH_STATE_DISABLING,
             FAST_LAUNCH_STATE_ENABLING, FastLaunchMove, FastLaunchRecord, FastLaunchTransition,
             MIN_FAST_LAUNCH_MAX_PARALLEL_LAUNCHES, MIN_FAST_LAUNCH_TARGET_RESOURCE_COUNT,
-            incorrect_state, require_service_state, require_windows_image,
-            resolve_launch_template_id, resolve_launch_template_version, system_time_to_date_time,
+            image_id_is_well_formed, incorrect_state, invalid_ami_id_malformed,
+            launch_template_key, launch_template_version_request, require_service_state,
+            require_windows_image, resolve_launch_template_id, resolve_launch_template_version,
+            system_time_to_date_time,
         };
 
         // `ctx` carries request metadata only; this operation reads none of it. The store
@@ -231,14 +233,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // An id that is not an AMI id at all names no image that could ever exist, so it is
+        // refused before anything is looked up under it — and BEFORE the `DryRun` arm below,
+        // whatever the caller may do: the FORM of a value is a fact of the request, not of
+        // the permission check. The same reading, in the same order, as the discontinuation of
+        // this setting (`crate::ops::disable_fast_launch`).
+        if !image_id_is_well_formed(&input.image_id) {
+            return Err(invalid_ami_id_malformed(&input.image_id));
+        }
+        // "The launch template to use when launching Windows instances from
+        // pre-provisioned snapshots. Launch template parameters can include either the name
+        // or ID of the launch template, but not both" (`LaunchTemplate`): which KEY a
+        // request names the template by, and whether the version it asks for is a number or
+        // one of the two aliases, are facts of the request too, so both are read here —
+        // before the flag — and the template itself is resolved below.
+        if let Some(requested) = input.launch_template.as_ref() {
+            launch_template_key(
+                requested.launch_template_id.as_deref(),
+                requested.launch_template_name.as_deref(),
+            )?;
+            launch_template_version_request(&requested.version)?;
+        }
+
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
         store.materialize_due_transitions();
 
+        // DryRun sits AFTER every parameter the REQUEST carries has been read and BEFORE the
+        // resources it names are resolved, which is where the recorded contract of this
+        // surface puts it (`crate::ops::disable_fast_launch`, whose recorded dry run of a
+        // well-formed AMI id the account can see no image for is answered `DryRunOperation`):
+        // the flag asks whether the CALLER may make the request, which nothing the store
+        // holds can answer. A request that gets this answer leaves the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
         // "You can only change these settings for Windows AMIs that you own or that have
-        // been shared with you": an id that is not an AMI id is malformed, one the account
-        // can see no image for does not exist, and an image that is not a Windows AMI
-        // cannot carry this setting at all.
+        // been shared with you": an id the account can see no image for does not exist, and
+        // an image that is not a Windows AMI cannot carry this setting at all.
         require_windows_image(&store, &input.image_id)?;
 
         // "The launch template to use when launching Windows instances from
@@ -285,14 +318,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  enabled again",
                 input.image_id
             )));
-        }
-
-        // DryRun sits AFTER every parameter has been validated and every named resource
-        // resolved, and BEFORE the first write: the flag asks whether the request WOULD
-        // have succeeded, so one that would have been refused is refused with that reason
-        // instead, and one that would have succeeded leaves the store untouched.
-        if input.dry_run == Some(true) {
-            return Err(Scaffolded::dry_run_operation());
         }
 
         // The configuration enters the non-terminal `enabling` state: "Amazon EC2 launches

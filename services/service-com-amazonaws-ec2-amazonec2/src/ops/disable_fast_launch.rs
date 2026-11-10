@@ -8,6 +8,11 @@
 //! answers the configuration as it stood when the disable was asked for. A MUTATION: the
 //! call is what starts the discontinuation.
 //!
+//! `DryRun` is answered after the request's own members have been read — an id that is not an
+//! AMI id at all is `InvalidAMIID.Malformed` whatever the flag says — and BEFORE the image is
+//! resolved, which is where this operation's recorded contract puts it: a dry run naming a
+//! well-formed AMI id the account can see no image for is answered `DryRunOperation`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -160,8 +165,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             FAST_LAUNCH_STATE_DISABLING, FastLaunchMove, FastLaunchRecord, FastLaunchTransition,
-            incorrect_state, require_service_state, require_visible_image,
-            system_time_to_date_time,
+            image_id_is_well_formed, incorrect_state, invalid_ami_id_malformed,
+            require_service_state, require_visible_image, system_time_to_date_time,
         };
 
         // `ctx` carries request metadata only; this operation reads none of it. The store
@@ -174,6 +179,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the pre-provisioned snapshots are the stored configuration itself — so there is
         // no error for the flag to override and a disable behaves the same either way.
         let _ = input.force;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST … If you have the required permissions, the error response is
+        // DryRunOperation" (`DryRun`): the question is about the CALLER's permission for this
+        // operation, which nothing the store holds can answer. This operation's recorded
+        // contract puts the flag BEFORE the image the request names is resolved — a dry run
+        // naming a well-formed AMI id the account can see no image for is answered
+        // `DryRunOperation` — so it is answered here, once the request's own members have
+        // been read and before the store is opened at all, and nothing is read or written for
+        // a request that gets this answer. The id's FORM is still read first: a value that is
+        // no AMI id names an image that could never exist, whatever the caller may do.
+        if !image_id_is_well_formed(&input.image_id) {
+            return Err(invalid_ami_id_malformed(&input.image_id));
+        }
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
 
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
@@ -191,14 +213,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "Image '{}' does not have Windows fast launch enabled",
                 input.image_id
             )));
-        }
-
-        // DryRun sits AFTER every parameter has been validated and the named image
-        // resolved, and BEFORE the first write: the flag asks whether the request WOULD
-        // have succeeded, so one that would have been refused is refused with that reason
-        // instead, and one that would have succeeded leaves the store untouched.
-        if input.dry_run == Some(true) {
-            return Err(Scaffolded::dry_run_operation());
         }
 
         let now = ::std::time::SystemTime::now();

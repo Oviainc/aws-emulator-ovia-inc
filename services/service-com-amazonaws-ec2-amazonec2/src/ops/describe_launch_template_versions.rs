@@ -393,7 +393,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let record = store
                     .launch_templates
                     .get(id)
-                    .ok_or_else(|| invalid_launch_template_id_not_found(id))?;
+                    .ok_or_else(invalid_launch_template_id_not_found)?;
                 vec![record]
             }
             TemplateSelector::Name(name) => {

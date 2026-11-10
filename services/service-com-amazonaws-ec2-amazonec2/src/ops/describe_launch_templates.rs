@@ -168,6 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
+            LAUNCH_TEMPLATE_ID_PREFIX, invalid_launch_template_id_not_found,
             invalid_launch_template_name_not_found, launch_template_ids_malformed,
             require_service_state,
         };
@@ -270,14 +271,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than reporting a resource that is merely absent. That screen subsumes the
         // id grammar: an id the grammar rejects is one no mint could have produced, so it is
         // not held either.
+        //
+        // An id the mint HAS reached is a different matter, and is looked up
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::id_was_issued`]): the template an
+        // issued id named may since have been deleted, and EC2 answers THAT
+        // `InvalidLaunchTemplateId.NotFound` — a caller that deleted a template and reads it
+        // back is told the template is gone, not that the id it was given is unreadable.
         let wanted_ids: HashSet<&str> = requested_ids.iter().map(String::as_str).collect();
         let malformed: Vec<&str> = requested_ids
             .iter()
             .map(String::as_str)
-            .filter(|id| !store.launch_templates.contains_key(*id))
+            .filter(|id| !store.id_was_issued(LAUNCH_TEMPLATE_ID_PREFIX, id))
             .collect();
         if !malformed.is_empty() {
             return Err(launch_template_ids_malformed(&malformed));
+        }
+        if requested_ids
+            .iter()
+            .any(|id| !store.launch_templates.contains_key(id.as_str()))
+        {
+            return Err(invalid_launch_template_id_not_found());
         }
         let wanted_names: HashSet<&str> = requested_names.iter().map(String::as_str).collect();
         if !wanted_names.is_empty() {

@@ -343,7 +343,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let launch_template_id = match replayed {
             Some(launch_template_id) => launch_template_id,
             None => {
-                let launch_template_id = store.insert_launch_template(spec);
+                // The store enforces both of the ceilings asked above as well, so a template
+                // it would not take is refused rather than reported as created: the two
+                // checks above have already told the caller which ceiling it is, and this is
+                // the same refusal for a store that filled up in between.
+                let launch_template_id = store.insert_launch_template(spec).ok_or_else(|| {
+                    launch_template_limit_exceeded(format!(
+                        "This emulator holds {} launch templates and {} of at most \
+                         {MAX_STORED_BYTES} bytes of caller-supplied data, so it cannot \
+                         store another launch template",
+                        store.launch_templates.len(),
+                        store.stored_bytes()
+                    ))
+                })?;
                 if let Some(token) = input.client_token.clone() {
                     store
                         .launch_template_client_tokens

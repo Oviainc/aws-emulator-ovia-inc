@@ -171,9 +171,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// which is how re-enabling an instance with different credentials reads — and the bytes
     /// the first was charged are given back.
     ///
-    /// Its only caller today is this crate's tests, because
-    /// `EnableInstanceSqlHaStandbyDetections` is still a scaffold: this is the seam that
-    /// operation must write through, not dead code.
+    /// `EnableInstanceSqlHaStandbyDetections` is the operation that writes through here, and
+    /// [`Self::deregister_instance_sql_ha`] is what takes a registration back out.
     pub fn register_instance_sql_ha(
         &mut self,
         instance_id: &str,
@@ -195,6 +194,28 @@ impl ComAmazonawsEc2Amazonec2State {
         self.sql_ha_registrations
             .insert(instance_id.to_string(), record);
         true
+    }
+
+    /// Take the SQL Server High Availability registration of `instance_id` back out of the
+    /// store, and answer the instance as it read the instant before — `None` when that
+    /// instance held no registration at all.
+    ///
+    /// The one way a registration is removed, the mirror of [`Self::register_instance_sql_ha`]:
+    /// the bytes that registration was charged are given back, so a pair of enable and
+    /// disable calls leaves the store's budget exactly where it started. "Once disabled,
+    /// Amazon Web Services no longer monitors the metadata for the instances"
+    /// (`DisableInstanceSqlHaStandbyDetections`) — there is no longer a registration to
+    /// derive a status from, which is why the row is projected BEFORE the record is dropped:
+    /// what a disable reports is the state monitoring had reached for that node.
+    pub fn deregister_instance_sql_ha(
+        &mut self,
+        instance_id: &str,
+        now: SystemTime,
+    ) -> Option<crate::ops::types::RegisteredInstance> {
+        let reported = self.sql_ha_instance_view(instance_id, now);
+        let removed = self.sql_ha_registrations.remove(instance_id)?;
+        self.release_stored_bytes(sql_ha_registration_payload_bytes(&removed));
+        reported
     }
 
     /// Every SQL Server High Availability state the instance `instance_id` HAS HELD as of
@@ -318,6 +339,38 @@ pub fn sql_server_license_usage_of(ha_status: &str) -> &'static str {
         SQL_SERVER_LICENSE_USAGE_FULL
     }
 }
+
+/// What monitoring determines about a node this emulator registers, and when that
+/// determination falls due.
+///
+/// "Once enabled, Amazon Web Services monitors the metadata for the instances to determine
+/// whether they are active or standby nodes in the SQL Server High Availability cluster"
+/// (`EnableInstanceSqlHaStandbyDetections`), reading that metadata off the SQL Server the
+/// instance runs through the Systems Manager agent on it. NOTHING RUNS INSIDE AN INSTANCE OF
+/// THIS EMULATOR, so there is no cluster metadata to read and no node role to find: the
+/// determination monitoring reaches is therefore [`HA_STATUS_INVALID`], the member of
+/// `HaStatus` for exactly that outcome — "an error occurred due to misconfigured
+/// permissions, or unable to dertemine SQL Server High Availability status"
+/// (`RegisteredInstance$HaStatus`) — and never a role nothing determined, which would put a
+/// licensing-fee waiver on an instance on no evidence at all.
+///
+/// It falls due one [`TRANSITION_DELAY`] after the enablement, like every other move this
+/// store records rather than sleeps for, so a caller reading straight after the enable still
+/// sees the [`HA_STATUS_PROCESSING`] the registration starts in.
+pub fn undetermined_sql_ha_status(enabled_at: SystemTime) -> SqlHaDetermination {
+    SqlHaDetermination {
+        due_at: enabled_at + TRANSITION_DELAY,
+        ha_status: HA_STATUS_INVALID.to_string(),
+        processing_status: Some(SQL_HA_STATUS_UNDETERMINED_DETAIL.to_string()),
+    }
+}
+
+/// "A brief description of the SQL Server High Availability status. If the instance is in the
+/// `invalid` High Availability status, this parameter includes the error message"
+/// (`RegisteredInstance$ProcessingStatus`) — the one this emulator's monitoring has, for the
+/// reason [`undetermined_sql_ha_status`] gives.
+pub const SQL_HA_STATUS_UNDETERMINED_DETAIL: &str =
+    "Unable to determine the SQL Server High Availability status";
 
 /// Refuse the `InstanceIds` entries that name no instance registered for SQL Server High
 /// Availability monitoring: HTTP 400 `InvalidInstanceID.NotFound`, in the wording the SQL

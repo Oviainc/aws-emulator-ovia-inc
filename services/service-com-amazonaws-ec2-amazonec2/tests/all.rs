@@ -15,6 +15,27 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// `RunInstances` driven from a LAUNCH TEMPLATE: the version's parameters overlaid with the
+// request's own, which version a request names, and what a template the account does not hold
+// refuses. Declared beside `prefix_lists` for the reason the note above gives: the sorted
+// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/run_instances_from_launch_template.rs"]
+mod run_instances_from_launch_template;
+// The SQL Server High Availability REGISTRATIONS the account holds: what an enable writes and
+// a describe reads back, what a disable takes out and reports, and the order both refuse in.
+// Declared beside `prefix_lists` for the reason the note above gives.
+#[path = "all/instance_sql_ha_registrations.rs"]
+mod instance_sql_ha_registrations;
+// Where `DryRun` is answered relative to an operation's own checks, for the operations whose
+// recorded contract puts the flag before the resource the request names is looked up.
+// Declared beside `prefix_lists` for the reason the note above gives.
+#[path = "all/dry_run_before_resource_lookup.rs"]
+mod dry_run_before_resource_lookup;
+// Setting the reverse DNS (PTR) record of an Elastic IP address: what the modify writes and
+// reports, the one outstanding request per record, and what it refuses. Declared beside
+// `prefix_lists` for the reason the note above gives.
+#[path = "all/address_attribute_modify.rs"]
+mod address_attribute_modify;
 // The account's KEY PAIRS: the key `CreateKeyPair` generates for each type and format, the
 // public half the store keeps and `DescribeKeyPairs` reports, the fingerprint each type is
 // fingerprinted with, what each call refuses, and what the published filters select.

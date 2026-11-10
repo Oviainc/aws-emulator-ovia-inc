@@ -30,9 +30,13 @@
 //! which is per Availability Zone.
 //!
 //! A repeat of the same request under one `ClientToken` returns the reservation that
-//! token already minted instead of launching again. A `LaunchTemplate` is answered
-//! with a 501: it names a resource no implemented operation creates, so there is
-//! nothing to resolve the launch parameters against.
+//! token already minted instead of launching again. A `LaunchTemplate` names the version
+//! whose launch parameters the launch runs from: the version is resolved against the
+//! account's stored templates and OVERLAID with the members the request itself carries —
+//! "any additional parameters that you specify for the new instance overwrite the
+//! corresponding parameters included in the launch template" — before anything else is read,
+//! so a template-driven launch and the equivalent spelled-out one take the same path through
+//! this handler and cannot be served differently.
 //!
 //! ## Shape of an operation
 //!
@@ -359,17 +363,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             TRANSITION_DELAY,
         };
 
-        // A launch template carries the launch parameters this handler would have to
-        // resolve, merge with the ones the request carries and then report on the
-        // instances it mints. `CreateLaunchTemplate` stores a template, but resolving a
-        // stored version into a launch is work this slice has not done, so a launch that
-        // names one is refused rather than answered with an instance whose parameters
-        // came from somewhere else.
-        if input.launch_template.is_some() {
-            return Err(Scaffolded::not_implemented(
-                "RunInstances with a LaunchTemplate",
-            ));
-        }
+        // A launch template carries the launch parameters this handler resolves, so a launch
+        // that names one is answered from the template VERSION it names, overlaid with the
+        // members the request itself carries — "any additional parameters that you specify
+        // for the new instance overwrite the corresponding parameters included in the launch
+        // template" (`RunInstancesRequest$LaunchTemplate`). The overlay happens HERE, before
+        // anything else is read, so every check, ceiling, refusal and write below sees ONE
+        // launch: a template-driven launch and the equivalent spelled-out one cannot be
+        // served differently.
+        let input = match input.launch_template.clone() {
+            None => input,
+            Some(specification) => {
+                let state = require_service_state(&*self.engine)?;
+                // The template is read under its own lock and the version's data CLONED out of
+                // it: nothing below holds a borrow of the store across the rest of the launch,
+                // and the launch runs from the parameters as they stood when it resolved them.
+                let data = {
+                    let store = state.lock();
+                    // The template is resolved the way every reader of one resolves it, which
+                    // is what settles the key combination (both, or neither), the id's
+                    // grammar and a name's lookup. Only its NOT-FOUND verdict is re-worded
+                    // here, in this operation's own recorded sentence
+                    // (`crate::state::specified_launch_template_id_not_found`): a caller that
+                    // deleted a template and launched from it is told that the template it
+                    // specified does not exist, where the describes of a template say that at
+                    // least one of the templates named is absent.
+                    let resolved = crate::state::resolve_launch_template_id(
+                        &store,
+                        specification.launch_template_id.as_deref(),
+                        specification.launch_template_name.as_deref(),
+                    );
+                    let launch_template_id = match resolved {
+                        Ok(launch_template_id) => launch_template_id,
+                        Err(crate::scaffolded::Scaffolded::ServiceError(refusal))
+                            if refusal.code
+                                == crate::state::INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND =>
+                        {
+                            return Err(crate::state::specified_launch_template_id_not_found(
+                                specification.launch_template_id.as_deref().unwrap_or_default(),
+                            ));
+                        }
+                        Err(refusal) => return Err(refusal),
+                    };
+                    let record =
+                        store.launch_templates.get(&launch_template_id).ok_or_else(|| {
+                            Scaffolded::internal_error(format!(
+                                "launch template '{launch_template_id}' resolved but is not \
+                                 stored"
+                            ))
+                        })?;
+                    // "A value of $Latest uses the latest version of the launch template. A
+                    // value of $Default uses the default version of the launch template.
+                    // Default: The default version of the launch template"
+                    // (`LaunchTemplateSpecification$Version`), resolved through the one
+                    // reading of that member this crate has.
+                    let requested_version = specification
+                        .version
+                        .as_deref()
+                        .filter(|version| !version.is_empty())
+                        .unwrap_or(crate::state::LAUNCH_TEMPLATE_VERSION_DEFAULT);
+                    let version =
+                        crate::state::resolve_launch_template_version(record, requested_version)?;
+                    record
+                        .versions
+                        .get(&version)
+                        .ok_or_else(|| {
+                            Scaffolded::internal_error(format!(
+                                "launch template '{launch_template_id}' version '{version}' \
+                                 resolved but is not stored"
+                            ))
+                        })?
+                        .data
+                        .clone()
+                };
+                launch_overlaid_with_template(input, &data)?
+            }
+        };
         // Network interfaces are a resource this slice does not model, and these
         // members CONTRADICT ones it does: a launch that names its subnet, groups or
         // private address only through an interface specification must not be
@@ -998,6 +1067,335 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .whole_reservation_view(&reservation_id)
             .ok_or_else(|| Scaffolded::internal_error("the launched reservation was not stored"))
     }
+}
+
+/// The launch `request` asks for, overlaid with the launch template version `data` it named.
+///
+/// "Any additional parameters that you specify for the new instance overwrite the
+/// corresponding parameters included in the launch template"
+/// (`RunInstancesRequest$LaunchTemplate`), so EVERY member here is the request's own when the
+/// request carried one and the template version's otherwise — one rule, applied member by
+/// member, never a branch on what the recorded template happened to hold. A list member counts
+/// as carried when the request named at least one entry: a launch that names its own security
+/// groups replaces the template's rather than adding to them, the groups of an instance being
+/// one set.
+///
+/// The members whose request and template shapes differ only in the shape's NAME are rebuilt
+/// member by member ([`template_placement`] and the rest below), so nothing a template holds is
+/// dropped on the way into the launch.
+///
+/// Two members are NOT overlaid, because the launch path reads neither from a request either,
+/// so taking them from a template would claim something the launch does not do: the block
+/// device mappings (this slice stores no volume for a launch) and the retired elastic
+/// graphics and inference accelerators ("Amazon Elastic Graphics reached end of life on
+/// January 8, 2024", "Amazon Elastic Inference is no longer available"). A template whose
+/// version names the network interfaces of its instance is read through
+/// [`template_primary_interface`].
+fn launch_overlaid_with_template(
+    request: RunInstancesInput,
+    data: &RequestLaunchTemplateData,
+) -> Result<RunInstancesInput, RunInstancesError> {
+    use crate::scaffolded::Scaffolded;
+
+    // "If you specify InstanceRequirements, you can't specify InstanceType … attribute-based
+    // instance type selection is only supported when using Auto Scaling groups, EC2 Fleet, and
+    // Spot Fleet to launch instances" (`RequestLaunchTemplateData$InstanceRequirements`): a
+    // version that describes the instance type by ATTRIBUTES names no instance type for a
+    // launch to run, and this operation is not one of the three that can select one from them
+    // — so a launch whose type would have to come from them is refused rather than placed on
+    // an instance type nothing chose. A request that names its own `InstanceType` decides it
+    // itself, and the attributes are moot.
+    if data.instance_requirements.is_some()
+        && request.instance_type.is_none()
+        && data.instance_type.is_none()
+    {
+        return Err(Scaffolded::invalid_parameter_value(
+            "Invalid value 'InstanceRequirements' for launchTemplate. Attribute-based \
+             instance type selection is only supported when using Auto Scaling groups, EC2 \
+             Fleet, and Spot Fleet to launch instances",
+        ));
+    }
+
+    let mut merged = request;
+    merged.image_id = merged.image_id.or_else(|| data.image_id.clone());
+    merged.instance_type = merged.instance_type.or_else(|| data.instance_type.clone());
+    merged.key_name = merged.key_name.or_else(|| data.key_name.clone());
+    merged.user_data = merged.user_data.or_else(|| data.user_data.clone());
+    merged.kernel_id = merged.kernel_id.or_else(|| data.kernel_id.clone());
+    // The template spells the RAM disk `RamDiskId` where the launch spells it `RamdiskId`;
+    // both name the same thing.
+    merged.ramdisk_id = merged.ramdisk_id.or_else(|| data.ram_disk_id.clone());
+    merged.ebs_optimized = merged.ebs_optimized.or(data.ebs_optimized);
+    merged.disable_api_termination = merged
+        .disable_api_termination
+        .or(data.disable_api_termination);
+    merged.disable_api_stop = merged.disable_api_stop.or(data.disable_api_stop);
+    merged.instance_initiated_shutdown_behavior = merged
+        .instance_initiated_shutdown_behavior
+        .or_else(|| data.instance_initiated_shutdown_behavior.clone());
+    merged.credit_specification = merged
+        .credit_specification
+        .or_else(|| data.credit_specification.clone());
+    merged.monitoring = merged.monitoring.or_else(|| {
+        data.monitoring
+            .as_ref()
+            .map(|monitoring| RunInstancesMonitoringEnabled {
+                // "Specifies whether detailed monitoring is enabled for the instance"
+                // (`RunInstancesMonitoringEnabled$Enabled`) is required of a launch and
+                // optional on a template, so a template that holds the option without
+                // answering it is not asking for detailed monitoring.
+                enabled: monitoring.enabled.unwrap_or(false),
+            })
+    });
+    merged.placement = merged
+        .placement
+        .or_else(|| data.placement.as_ref().map(template_placement));
+    merged.iam_instance_profile = merged.iam_instance_profile.or_else(|| {
+        data.iam_instance_profile
+            .as_ref()
+            .map(|profile| IamInstanceProfileSpecification {
+                arn: profile.arn.clone(),
+                name: profile.name.clone(),
+            })
+    });
+    merged.hibernation_options = merged.hibernation_options.or_else(|| {
+        data.hibernation_options
+            .as_ref()
+            .map(|options| HibernationOptionsRequest {
+                configured: options.configured,
+            })
+    });
+    merged.metadata_options = merged.metadata_options.or_else(|| {
+        data.metadata_options
+            .as_ref()
+            .map(|options| InstanceMetadataOptionsRequest {
+                http_tokens: options.http_tokens.clone(),
+                http_put_response_hop_limit: options.http_put_response_hop_limit,
+                http_endpoint: options.http_endpoint.clone(),
+                http_protocol_ipv6: options.http_protocol_ipv6.clone(),
+                instance_metadata_tags: options.instance_metadata_tags.clone(),
+            })
+    });
+    merged.enclave_options = merged.enclave_options.or_else(|| {
+        data.enclave_options
+            .as_ref()
+            .map(|options| EnclaveOptionsRequest {
+                enabled: options.enabled,
+            })
+    });
+    merged.maintenance_options = merged.maintenance_options.or_else(|| {
+        data.maintenance_options
+            .as_ref()
+            .map(|options| InstanceMaintenanceOptionsRequest {
+                auto_recovery: options.auto_recovery.clone(),
+            })
+    });
+    merged.network_performance_options = merged.network_performance_options.or_else(|| {
+        data.network_performance_options
+            .as_ref()
+            .map(|options| InstanceNetworkPerformanceOptionsRequest {
+                bandwidth_weighting: options.bandwidth_weighting.clone(),
+            })
+    });
+    merged.private_dns_name_options = merged.private_dns_name_options.or_else(|| {
+        data.private_dns_name_options
+            .as_ref()
+            .map(|options| PrivateDnsNameOptionsRequest {
+                hostname_type: options.hostname_type.clone(),
+                enable_resource_name_dns_a_record: options.enable_resource_name_dns_a_record,
+                enable_resource_name_dns_aaaa_record: options.enable_resource_name_dns_aaaa_record,
+            })
+    });
+    merged.capacity_reservation_specification =
+        merged.capacity_reservation_specification.or_else(|| {
+            data.capacity_reservation_specification
+                .as_ref()
+                .map(|specification| CapacityReservationSpecification {
+                    capacity_reservation_preference: specification
+                        .capacity_reservation_preference
+                        .clone(),
+                    capacity_reservation_target: specification.capacity_reservation_target.clone(),
+                })
+        });
+    merged.cpu_options = merged.cpu_options.or_else(|| {
+        data.cpu_options.as_ref().map(|options| CpuOptionsRequest {
+            core_count: options.core_count,
+            threads_per_core: options.threads_per_core,
+            amd_sev_snp: options.amd_sev_snp.clone(),
+            nested_virtualization: options.nested_virtualization.clone(),
+        })
+    });
+    merged.instance_market_options = merged.instance_market_options.or_else(|| {
+        data.instance_market_options
+            .as_ref()
+            .map(|options| InstanceMarketOptionsRequest {
+                market_type: options.market_type.clone(),
+                spot_options: options.spot_options.as_ref().map(|spot| SpotMarketOptions {
+                    max_price: spot.max_price.clone(),
+                    spot_instance_type: spot.spot_instance_type.clone(),
+                    block_duration_minutes: spot.block_duration_minutes,
+                    valid_until: spot.valid_until,
+                    instance_interruption_behavior: spot.instance_interruption_behavior.clone(),
+                }),
+            })
+    });
+    if merged
+        .license_specifications
+        .as_ref()
+        .is_none_or(Vec::is_empty)
+    {
+        merged.license_specifications = data.license_specifications.as_ref().map(|entries| {
+            entries
+                .iter()
+                .map(|entry| LicenseConfigurationRequest {
+                    license_configuration_arn: entry.license_configuration_arn.clone(),
+                })
+                .collect()
+        });
+    }
+    if merged.tag_specifications.as_ref().is_none_or(Vec::is_empty) {
+        // "The tags to apply to the resources that are created during instance launch. These
+        // tags are not applied to the launch template"
+        // (`RequestLaunchTemplateData$TagSpecifications`) — the same member a launch carries,
+        // so which resource type each entry tags is decided where a request's own entries are.
+        merged.tag_specifications = data.tag_specifications.as_ref().map(|entries| {
+            entries
+                .iter()
+                .map(|entry| TagSpecification {
+                    resource_type: entry.resource_type.clone(),
+                    tags: entry.tags.clone(),
+                })
+                .collect()
+        });
+    }
+    if merged.security_group_ids.as_ref().is_none_or(Vec::is_empty) {
+        merged.security_group_ids = data.security_group_ids.clone();
+    }
+    if merged.security_groups.as_ref().is_none_or(Vec::is_empty) {
+        merged.security_groups = data.security_groups.clone();
+    }
+
+    // "The network interfaces for the instance" (`RequestLaunchTemplateData$NetworkInterfaces`)
+    // is how a template names the subnet, the groups and the primary address of the instance
+    // it launches, so it is read into the launch's own members rather than refused outright.
+    if merged
+        .network_interfaces
+        .as_ref()
+        .is_none_or(Vec::is_empty)
+        && merged
+            .secondary_interfaces
+            .as_ref()
+            .is_none_or(Vec::is_empty)
+    {
+        template_primary_interface(data, &mut merged)?;
+    }
+    Ok(merged)
+}
+
+/// The `Placement` a launch template version's placement describes.
+///
+/// Member by member rather than a conversion written once: the two shapes differ only in the
+/// name of the shape, so the launch is placed exactly where the template says — a partition, a
+/// Dedicated Host, a host resource group, a spread domain and a tenancy included — and a member
+/// added to either shape later shows up here as a compile error rather than as a silently
+/// dropped placement.
+fn template_placement(placement: &LaunchTemplatePlacementRequest) -> Placement {
+    Placement {
+        availability_zone: placement.availability_zone.clone(),
+        availability_zone_id: placement.availability_zone_id.clone(),
+        affinity: placement.affinity.clone(),
+        group_name: placement.group_name.clone(),
+        group_id: placement.group_id.clone(),
+        partition_number: placement.partition_number,
+        host_id: placement.host_id.clone(),
+        tenancy: placement.tenancy.clone(),
+        spread_domain: placement.spread_domain.clone(),
+        host_resource_group_arn: placement.host_resource_group_arn.clone(),
+    }
+}
+
+/// Read the launch template version's PRIMARY network interface into the launch's own members:
+/// the subnet it sits in, the groups applied to it and its primary private address.
+///
+/// "All instances have a network interface with a primary private IPv4 address"
+/// (`RunInstances`), and that interface is what a template's `NetworkInterfaces` with device
+/// index 0 describes — the same facts the launch carries as `SubnetId`, `SecurityGroupIds` and
+/// `PrivateIpAddress`, which is why they are read into those members and then take exactly the
+/// path a spelled-out launch takes. A member the request itself carried wins, as everywhere
+/// else in the overlay.
+///
+/// Everything BEYOND that primary interface is refused rather than accepted and dropped, for
+/// the reason the request's own interface specification is: a second interface, an existing
+/// interface attached by id, extra private addresses or prefixes, and an IPv6 address or
+/// count, are all resources or facts this slice does not model, so an instance it minted could
+/// not report them. A template naming one is answered the same way a request naming one is.
+fn template_primary_interface(
+    data: &RequestLaunchTemplateData,
+    merged: &mut RunInstancesInput,
+) -> Result<(), RunInstancesError> {
+    use crate::scaffolded::Scaffolded;
+
+    let interfaces = data.network_interfaces.as_deref().unwrap_or_default();
+    let unmodelled = || {
+        Scaffolded::not_implemented("RunInstances with a network interface specification")
+    };
+    if interfaces.len() > 1
+        || data
+            .secondary_interfaces
+            .as_ref()
+            .is_some_and(|secondary| !secondary.is_empty())
+    {
+        return Err(unmodelled());
+    }
+    let Some(interface) = interfaces.first() else {
+        return Ok(());
+    };
+    if interface.device_index.unwrap_or(0) != 0
+        || interface.network_interface_id.is_some()
+        || interface
+            .private_ip_addresses
+            .as_ref()
+            .is_some_and(|addresses| !addresses.is_empty())
+        || interface
+            .secondary_private_ip_address_count
+            .is_some_and(|count| count > 0)
+        || interface
+            .ipv4_prefixes
+            .as_ref()
+            .is_some_and(|prefixes| !prefixes.is_empty())
+        || interface.ipv4_prefix_count.is_some_and(|count| count > 0)
+        || interface
+            .ipv6_prefixes
+            .as_ref()
+            .is_some_and(|prefixes| !prefixes.is_empty())
+        || interface.ipv6_prefix_count.is_some_and(|count| count > 0)
+    {
+        return Err(unmodelled());
+    }
+    // An IPv6 address comes from the subnet's IPv6 range, which this slice does not model, so
+    // a template that asks for one is answered exactly as a request that asks for one is.
+    merged.ipv6_address_count = merged.ipv6_address_count.or(interface.ipv6_address_count);
+    if merged.ipv6_addresses.as_ref().is_none_or(Vec::is_empty) {
+        merged.ipv6_addresses = interface.ipv6_addresses.as_ref().map(|addresses| {
+            addresses
+                .iter()
+                .map(|address| InstanceIpv6Address {
+                    ipv6_address: address.ipv6_address.clone(),
+                    is_primary_ipv6: None,
+                })
+                .collect()
+        });
+    }
+    if merged.subnet_id.is_none() {
+        merged.subnet_id = interface.subnet_id.clone();
+    }
+    if merged.private_ip_address.is_none() {
+        merged.private_ip_address = interface.private_ip_address.clone();
+    }
+    if merged.security_group_ids.as_ref().is_none_or(Vec::is_empty) {
+        merged.security_group_ids = interface.groups.clone();
+    }
+    Ok(())
 }
 
 /// Refuse a launch whose security groups cannot be applied in the subnet it is placed in.

@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableInstanceSqlHaStandbyDetections
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableInstanceSqlHaStandbyDetections`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes the SQL Server High Availability registration of each instance the
+//! request names back out of [`crate::state`] — through the store's one removal seam
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::deregister_instance_sql_ha`]) — so nothing
+//! monitors that node any more and the SQL Server High Availability describes report it no
+//! longer, and reports the state monitoring had reached for each instance it disabled. This
+//! is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableInstanceSqlHaStandbyDetections::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it refuses, and in which order — the order this operation's recorded contract puts
+//! the two questions in:
+//!
+//! * `InvalidInstanceID.Malformed` (400) — an id outside the form EC2 issues
+//!   ([`crate::state::instance_id_is_well_formed`]), answered even under `DryRun`;
+//! * `DryRunOperation` (412) — the permission question, answered before the instances the
+//!   request names are resolved;
+//! * `InvalidInstanceID.NotFound` (400) — a well-formed id the account holds no instance for.
+//!
+//! An instance the account holds that nothing had enabled has no monitoring to disable, so it
+//! contributes no row to the answer rather than a row describing a registration that never
+//! existed.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +148,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableInstanceSqlHaStandbyDetections` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableInstanceSqlHaStandbyDetectionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableInstanceSqlHaStandbyDetections"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            deduplicate_ids, dry_run_operation, instance_id_is_well_formed, require_service_state,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — a
+        // registration is a fact of the instance rather than of the Region the request was
+        // signed for, exactly as the enablement and the describes read it. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The IDs of the instances to disable from SQL Server High Availability standby
+        // detection monitoring" (`InstanceIds`). One instance gets one answer however many
+        // times the batch names it: a repeat is the same instruction, not a second
+        // registration to remove. The model's `@length` on the list (1..30) is refused by the
+        // boundary validator before this handler runs, so what is left to read is each id's
+        // FORM.
+        let instance_ids = deduplicate_ids(&input.instance_ids);
+
+        // Malformed before the permission question, the order this operation's recorded
+        // contract puts the two in — the same order its enabling counterpart takes, the two
+        // being one surface.
+        for instance_id in &instance_ids {
+            if !instance_id_is_well_formed(instance_id) {
+                return Err(Scaffolded::instance_id_is_malformed(instance_id));
+            }
+        }
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The whole batch is resolved before the first registration is removed, so a request
+        // naming one id this account holds no instance for disables nothing at all.
+        for instance_id in &instance_ids {
+            if !store.instances.contains_key(instance_id) {
+                return Err(Scaffolded::invalid_instance_id_not_found(instance_id));
+            }
+        }
+
+        // "Once disabled, Amazon Web Services no longer monitors the metadata for the
+        // instances to determine whether they are active or standby nodes": the registration
+        // goes, and with it every status derived from it — so a later describe reports the
+        // instance no longer, and the bytes the enablement was charged go back to the store's
+        // budget. What each disabled instance is reported AS is the state monitoring had
+        // reached for it the instant before, read through the one projection of a registration
+        // this crate has, so this answer and a describe made a moment earlier cannot differ.
+        let now = ::std::time::SystemTime::now();
+        let mut disabled: Vec<RegisteredInstance> = Vec::new();
+        for instance_id in &instance_ids {
+            if let Some(view) = store.deregister_instance_sql_ha(instance_id, now) {
+                disabled.push(view);
+            }
+        }
+
+        Ok(DisableInstanceSqlHaStandbyDetectionsOutput {
+            instances: Some(disabled),
+        })
     }
 }

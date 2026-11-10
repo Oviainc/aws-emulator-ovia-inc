@@ -2018,6 +2018,12 @@ pub use classic_link::*;
 /// them on the store itself like every other accessor here.
 mod serial_console_access;
 
+/// The trust relationship between Reachability Analyzer and Organizations — the one fact
+/// `EnableReachabilityAnalyzerOrganizationSharing` establishes. Everything it holds is
+/// inherent methods of [`ComAmazonawsEc2Amazonec2State`], so there is nothing to re-export:
+/// a handler reaches them on the store itself like every other accessor here.
+mod reachability_analyzer_sharing;
+
 /// The Reserved Instances the account holds and the modifications of them — the two stores,
 /// the form of their ids, their ceilings, their refusals and the clock-owed
 /// `processing` -> `fulfilled` move of a modification — in a module of its own, re-exported

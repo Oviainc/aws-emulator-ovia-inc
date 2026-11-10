@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableInstanceSqlHaStandbyDetections
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableInstanceSqlHaStandbyDetections`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: registers each instance the request names for SQL Server High Availability
+//! standby detection monitoring — through the store's one writer seam
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::register_instance_sql_ha`]) — with the
+//! secret the request named, and reports each registration as the SQL Server High
+//! Availability describes report it. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableInstanceSqlHaStandbyDetections::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A registration starts in `processing` with the determination monitoring owes the node
+//! recorded against the clock ([`crate::state::undetermined_sql_ha_status`]), so a caller
+//! that describes the instance immediately still sees the transient status.
+//!
+//! What it refuses, and in which order — the order this operation's recorded contract puts
+//! the two questions in:
+//!
+//! * `InvalidInstanceID.Malformed` (400) — an id outside the form EC2 issues
+//!   ([`crate::state::instance_id_is_well_formed`]), answered even under `DryRun`;
+//! * `DryRunOperation` (412) — the permission question, answered before the instances the
+//!   request names are resolved;
+//! * `InvalidInstanceID.NotFound` (400) — a well-formed id the account holds no instance for.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +161,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableInstanceSqlHaStandbyDetections` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableInstanceSqlHaStandbyDetectionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableInstanceSqlHaStandbyDetections"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            SqlHaRegistrationRecord, deduplicate_ids, dry_run_operation,
+            instance_id_is_well_formed, require_service_state, sql_ha_registration_payload_bytes,
+            undetermined_sql_ha_status,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — a
+        // registration is a fact of the instance rather than of the Region the request was
+        // signed for, exactly as the SQL Server High Availability describes read it. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The IDs of the instances to enable for SQL Server High Availability standby
+        // detection monitoring" (`InstanceIds`). One instance gets one registration however
+        // many times the batch names it: a repeat is the same instruction, not a second
+        // enablement. The model's `@length` on the list (1..30) is refused by the boundary
+        // validator before this handler runs, so what is left to read is each id's FORM.
+        let instance_ids = deduplicate_ids(&input.instance_ids);
+
+        // An id outside the form EC2 issues names no instance that could ever exist, so it is
+        // refused before anything is looked up under it — and BEFORE the `DryRun` arm below,
+        // which is where this operation's recorded contract puts the two: a dry run naming an
+        // unreadable instance id is answered `InvalidInstanceID.Malformed`, not
+        // `DryRunOperation` (`crate::state::instance_id_is_well_formed`, whose doc cites the
+        // recorded units for each clause of the form).
+        for instance_id in &instance_ids {
+            if !instance_id_is_well_formed(instance_id) {
+                return Err(Scaffolded::instance_id_is_malformed(instance_id));
+            }
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST … If you have the required permissions, the error response is
+        // DryRunOperation" (`DryRun`): the question is about the CALLER's permission for this
+        // operation, which nothing the store holds can answer, so it is answered once the
+        // request has been read and before the instances it names are resolved — and nothing
+        // is read or written for a request that gets this answer.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The whole batch is resolved before the first registration is written, so a request
+        // naming one id this account holds no instance for enables nothing at all.
+        for instance_id in &instance_ids {
+            if !store.instances.contains_key(instance_id) {
+                return Err(Scaffolded::invalid_instance_id_not_found(instance_id));
+            }
+        }
+
+        // "The ARN of the Secrets Manager secret containing the SQL Server access
+        // credentials … If not specified, deafult local user credentials will be used by the
+        // Amazon Web Services Systems Manager agent" (`SqlServerCredentials`): the secret is
+        // the one caller-chosen value a registration retains, and the model's own `pattern`
+        // bounds it (20..2048) before this handler runs. Every instance of one request is
+        // enabled with the same secret — "to enable instances with different credentials, you
+        // must make separate requests" — so the record is the same for each, and the bytes the
+        // batch would retain are asked for ONCE, before the first write: a batch that does not
+        // fit leaves nothing behind.
+        let now = ::std::time::SystemTime::now();
+        let record = SqlHaRegistrationRecord {
+            registered_at: now,
+            sql_server_credentials: input.sql_server_credentials.clone(),
+            // What monitoring determines for the node, and when: the one determination this
+            // emulator can reach (`crate::state::undetermined_sql_ha_status`).
+            determination: Some(undetermined_sql_ha_status(now)),
+        };
+        let batch_bytes = sql_ha_registration_payload_bytes(&record).saturating_mul(instance_ids.len());
+        if store.would_exceed_stored_bytes(batch_bytes) {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {} bytes of caller-supplied data, so it cannot store \
+                 {batch_bytes} more for these registrations",
+                store.stored_bytes()
+            )));
+        }
+
+        // Each instance is registered through the store's one writer seam
+        // (`crate::state::ComAmazonawsEc2Amazonec2State::register_instance_sql_ha`), so a
+        // registration this operation reports is one a describe of the same instant reports
+        // identically — the row is read back out of the store rather than composed here.
+        let mut registered: Vec<RegisteredInstance> = Vec::new();
+        for instance_id in &instance_ids {
+            if !store.register_instance_sql_ha(instance_id, record.clone()) {
+                return Err(Scaffolded::internal_error(format!(
+                    "the SQL Server High Availability registration of instance \
+                     '{instance_id}' was not stored"
+                )));
+            }
+            let Some(view) = store.sql_ha_instance_view(instance_id, now) else {
+                return Err(Scaffolded::internal_error(format!(
+                    "the SQL Server High Availability registration of instance \
+                     '{instance_id}' could not be read back"
+                )));
+            };
+            registered.push(view);
+        }
+
+        // "Information about the instances that were enabled for SQL Server High Availability
+        // standby detection monitoring" (`Instances`): every instance this call registered,
+        // each in the `processing` status a registration starts in — "Once enabled, Amazon Web
+        // Services monitors the metadata for the instances to determine whether they are
+        // active or standby nodes" — with the determination owed by the clock rather than by a
+        // later caller.
+        Ok(EnableInstanceSqlHaStandbyDetectionsOutput {
+            instances: Some(registered),
+        })
     }
 }

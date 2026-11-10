@@ -179,10 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Resets the attribute of the specified IP address": the reset names no new record,
-        // so the update it starts takes the record away rather than replacing it with
-        // another. Until that update falls due the record in effect is untouched and the
-        // update is reported beside it, which is what a caller reading the attribute straight
-        // after this call sees.
+        // so what it leaves in effect is no record at all — reported at once, with the change
+        // itself outstanding beside it until it comes due, which is what a caller reading the
+        // attribute straight after this call sees.
         let address = store
             .start_address_ptr_record_update(&allocation_id, None)
             .ok_or_else(|| {

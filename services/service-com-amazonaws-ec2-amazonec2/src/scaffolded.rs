@@ -353,6 +353,10 @@ impl<E> Scaffolded<E> {
     ///   well-formed id that names nothing — it answers
     ///   [`Self::invalid_instance_id_not_found`] for the second — and words the first half
     ///   this way, which is what the recorded response for its malformed-id call carries.
+    /// * `crate::ops::enable_instance_sql_ha_standby_detections` and
+    ///   `crate::ops::disable_instance_sql_ha_standby_detections` draw the same distinction
+    ///   and word the malformed half this way too, which is what their recorded refusals
+    ///   carry — including under `DryRun`, which they answer AFTER this one.
     ///
     /// So an operation that draws the distinction and has no recorded wording of its own
     /// keeps using [`crate::state::require_known_instance`], which answers the constructor

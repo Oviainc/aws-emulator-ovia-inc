@@ -1411,9 +1411,21 @@ impl ComAmazonawsEc2Amazonec2State {
     /// the only version, so it is both — so two writers cannot report the same template
     /// differently. The bytes the record retains are counted into the store's budget here
     /// as well, and [`Self::remove_launch_template`] is what gives them back.
-    pub fn insert_launch_template(&mut self, spec: LaunchTemplateSpec) -> String {
-        let launch_template_id = self.next_id("lt");
+    ///
+    /// `None` means NOTHING was written and the caller must refuse the request rather than
+    /// report a template that does not exist: the account already holds
+    /// [`MAX_LAUNCH_TEMPLATES`] of them, or the record's caller-chosen bytes do not fit the
+    /// store's byte budget ([`Self::would_exceed_stored_bytes`]). Both ceilings are enforced
+    /// HERE as well as in the handler, so a writer that forgets to ask cannot grow the store
+    /// without bound — and neither an id nor a byte is spent on a refusal.
+    pub fn insert_launch_template(&mut self, spec: LaunchTemplateSpec) -> Option<String> {
         let payload_bytes = launch_template_payload_bytes(&spec);
+        if self.launch_templates.len() >= MAX_LAUNCH_TEMPLATES
+            || self.would_exceed_stored_bytes(payload_bytes)
+        {
+            return None;
+        }
+        let launch_template_id = self.next_id(LAUNCH_TEMPLATE_ID_PREFIX);
         let template = LaunchTemplate {
             launch_template_id: Some(launch_template_id.clone()),
             launch_template_name: Some(spec.name),
@@ -1451,11 +1463,11 @@ impl ComAmazonawsEc2Amazonec2State {
             },
         );
         self.add_stored_bytes(payload_bytes);
-        launch_template_id
+        Some(launch_template_id)
     }
 
     /// Store a new version of the launch template `launch_template_id` names, and answer the
-    /// version number it was given — `None` when the account holds no such template.
+    /// version number it was given.
     ///
     /// Everything the service itself owns is derived here rather than taken from the caller:
     /// "launch template versions are numbered in the order in which they are created"
@@ -1464,12 +1476,27 @@ impl ComAmazonawsEc2Amazonec2State {
     /// version is left where it is: a new version is not the default one until something
     /// makes it so. The bytes the version retains are counted into the store's budget here as
     /// well, on the record a delete of the template gives back in one piece.
+    ///
+    /// `None` means NOTHING was written and the caller must refuse the request rather than
+    /// report a version that does not exist: the account holds no such template, that template
+    /// already holds [`MAX_LAUNCH_TEMPLATE_VERSIONS`] versions, or the version's
+    /// caller-chosen bytes do not fit the store's byte budget
+    /// ([`Self::would_exceed_stored_bytes`]). Both ceilings are enforced HERE as well as in
+    /// the handler, for the reason [`Self::insert_launch_template`] gives.
     pub fn insert_launch_template_version(
         &mut self,
         launch_template_id: &str,
         spec: LaunchTemplateVersionSpec,
     ) -> Option<i64> {
         let payload_bytes = launch_template_version_payload_bytes(&spec);
+        // Asked before the record is borrowed mutably, so the budget is read off the whole
+        // store rather than through the record this call is about to grow.
+        if self.would_exceed_stored_bytes(payload_bytes)
+            || self.launch_templates.get(launch_template_id)?.versions.len()
+                >= MAX_LAUNCH_TEMPLATE_VERSIONS
+        {
+            return None;
+        }
         let record = self.launch_templates.get_mut(launch_template_id)?;
         // The version AFTER every version the template holds, so a number is never reused
         // even if the latest version has since been deleted — and a record holding no version
@@ -2724,6 +2751,10 @@ pub fn launch_template_version_payload_bytes(spec: &LaunchTemplateVersionSpec) -
     spec.version_description.as_ref().map_or(0, String::len) + format!("{:?}", spec.data).len()
 }
 
+/// The id prefix every launch template id carries, which is also what
+/// [`ComAmazonawsEc2Amazonec2State::insert_launch_template`] mints one under.
+pub const LAUNCH_TEMPLATE_ID_PREFIX: &str = "lt";
+
 /// Whether `id` is a well-formed launch template id.
 ///
 /// A launch template id is `lt-` followed by 8 or 17 lowercase hexadecimal digits — the
@@ -2761,39 +2792,68 @@ pub fn launch_template_name_is_well_formed(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || LAUNCH_TEMPLATE_NAME_PUNCTUATION.contains(c))
 }
 
-/// Resolve the one launch template a request names, by id or by name.
+/// Which KEY a request names a launch template by.
+///
+/// The REQUEST-ONLY half of [`resolve_launch_template_id`]: reading it asks nothing of the
+/// store, so an operation that has to refuse a bad key combination before it answers a
+/// `DryRun` — the permission question being about the caller rather than about what the
+/// account holds — can read the key here and resolve it later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchTemplateKey<'request> {
+    /// The template was named by its id.
+    Id(&'request str),
+    /// The template was named by its name.
+    Name(&'request str),
+}
+
+/// The key a request names a launch template by, or the refusal for naming both or neither.
 ///
 /// "You must specify either the launch template ID or the launch template name, but not
-/// both" (`DeleteLaunchTemplate$LaunchTemplateId`), so naming both is refused as a
-/// parameter combination and naming neither as a missing parameter — before either is
-/// looked up. An id is checked for shape first, the way EC2 orders a malformed id ahead of
-/// an unknown one; a name has no shape to be wrong, so an unknown name is simply not found.
-pub fn resolve_launch_template_id<E>(
-    store: &ComAmazonawsEc2Amazonec2State,
-    launch_template_id: Option<&str>,
-    launch_template_name: Option<&str>,
-) -> Result<String, crate::scaffolded::Scaffolded<E>> {
+/// both" (`DeleteLaunchTemplate$LaunchTemplateId`), so naming both is refused as a parameter
+/// combination and naming neither as a missing parameter. The ONE place that rule lives, so
+/// every operation that takes a launch template reference refuses the same two mistakes the
+/// same way.
+pub fn launch_template_key<'request, E>(
+    launch_template_id: Option<&'request str>,
+    launch_template_name: Option<&'request str>,
+) -> Result<LaunchTemplateKey<'request>, crate::scaffolded::Scaffolded<E>> {
     match (launch_template_id, launch_template_name) {
         (Some(_), Some(_)) => Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
             "Either the launch template ID or the launch template name may be specified, \
              but not both",
         )),
-        (Some(id), None) => {
-            if !launch_template_id_is_well_formed(id) {
-                return Err(invalid_launch_template_id_malformed(id));
-            }
-            if !store.launch_templates.contains_key(id) {
-                return Err(invalid_launch_template_id_not_found(id));
-            }
-            Ok(id.to_string())
-        }
-        (None, Some(name)) => store
-            .launch_template_id_for_name(name)
-            .ok_or_else(invalid_launch_template_name_not_found),
+        (Some(id), None) => Ok(LaunchTemplateKey::Id(id)),
+        (None, Some(name)) => Ok(LaunchTemplateKey::Name(name)),
         (None, None) => Err(crate::scaffolded::Scaffolded::missing_parameter(
             "The request must contain either the parameter LaunchTemplateId or the \
              parameter LaunchTemplateName",
         )),
+    }
+}
+
+/// Resolve the one launch template a request names, by id or by name.
+///
+/// The key is read first ([`launch_template_key`]), before either half is looked up. An id is
+/// checked for shape next, the way EC2 orders a malformed id ahead of an unknown one; a name
+/// has no shape to be wrong, so an unknown name is simply not found.
+pub fn resolve_launch_template_id<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    launch_template_id: Option<&str>,
+    launch_template_name: Option<&str>,
+) -> Result<String, crate::scaffolded::Scaffolded<E>> {
+    match launch_template_key(launch_template_id, launch_template_name)? {
+        LaunchTemplateKey::Id(id) => {
+            if !launch_template_id_is_well_formed(id) {
+                return Err(invalid_launch_template_id_malformed(id));
+            }
+            if !store.launch_templates.contains_key(id) {
+                return Err(invalid_launch_template_id_not_found());
+            }
+            Ok(id.to_string())
+        }
+        LaunchTemplateKey::Name(name) => store
+            .launch_template_id_for_name(name)
+            .ok_or_else(invalid_launch_template_name_not_found),
     }
 }
 
@@ -2807,13 +2867,20 @@ pub fn launch_template_limit_exceeded<E>(
 
 /// Refuse a request that named a launch template id no launch template of the account has:
 /// HTTP 400 `InvalidLaunchTemplateId.NotFound`.
-pub fn invalid_launch_template_id_not_found<E>(
-    launch_template_id: &str,
-) -> crate::scaffolded::Scaffolded<E> {
+///
+/// The sentence is EC2's, and it is FIXED: `At least one of the launch templates specified in
+/// the request does not exist.` names neither the request's values nor how many of them could
+/// not be resolved — a request may name several, and the service reports that at least one of
+/// them is absent rather than which. It is the SAME sentence
+/// [`invalid_launch_template_name_not_found`] carries under the name code, a template a caller
+/// named by either key being absent in exactly one way. Recorded by the corpus unit
+/// `ec2.ec2-run-from-launch-template`, which deletes a launch template and then reads and
+/// launches from it.
+pub fn invalid_launch_template_id_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND,
         400,
-        format!("The launch template ID '{launch_template_id}' does not exist"),
+        "At least one of the launch templates specified in the request does not exist.",
     )
 }
 
@@ -2851,6 +2918,33 @@ pub fn specified_launch_template_id_is_malformed<E>(
         400,
         format!(
             "The specified launch template ID '{}' is malformed.",
+            echoed_resource_id(launch_template_id)
+        ),
+    )
+}
+
+/// Refuse a launch template id an operation that LAUNCHES from the template could not
+/// resolve, in the wording that names the template as "specified": HTTP 400
+/// [`INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND`], `The specified launch template, with template ID
+/// <id>, does not exist.`
+///
+/// A SECOND wording of that code beside [`invalid_launch_template_id_not_found`] (which states
+/// that at least one of the templates a request named is absent, naming none of them), and a
+/// named constructor rather than a literal at a call site for the reason
+/// [`specified_launch_template_id_is_malformed`] is one: EC2's per-operation validators do not
+/// agree about an id they cannot resolve, and WHICH wording an operation answers is a fact of
+/// that operation, recorded by its caller — `ec2.ec2-run-from-launch-template` pins this
+/// sentence for a `RunInstances` naming a launch template the account no longer holds. The one
+/// variable part is the id the request sent, cut to length by [`echoed_resource_id`] the way
+/// every refusal of this crate bounds a value it repeats back.
+pub fn specified_launch_template_id_not_found<E>(
+    launch_template_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND,
+        400,
+        format!(
+            "The specified launch template, with template ID {}, does not exist.",
             echoed_resource_id(launch_template_id)
         ),
     )

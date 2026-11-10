@@ -6,12 +6,14 @@
 //!
 //! The rules under test are:
 //!
-//! 1. `ResetAddressAttribute` STARTS AN UPDATE OF THE NAMED ADDRESS'S PTR RECORD rather
-//!    than changing it there and then: the attribute it answers is the stored address's own
-//!    (its public address and allocation id), carries that update as outstanding
-//!    (`ptrRecordUpdate/status`) beside the record still in effect, and the update reaches
-//!    the record one [`TRANSITION_DELAY`] later whether or not anybody calls again — after
-//!    which the address carries neither a record nor an outstanding update;
+//! 1. `ResetAddressAttribute` TAKES THE NAMED ADDRESS'S PTR RECORD AWAY and reports the
+//!    change as outstanding until it comes due: the attribute it answers is the stored
+//!    address's own (its public address and allocation id) with no record in effect and the
+//!    change carried beside it (`ptrRecordUpdate/status`), and that change comes due one
+//!    [`TRANSITION_DELAY`] later whether or not anybody calls again — after which the address
+//!    carries neither a record nor an outstanding change. What an applied change leaves in
+//!    effect is the one seam both writers of this attribute go through, so a reset over an
+//!    address that HELD a record is [`super::address_attribute_modify`]'s subject;
 //! 2. ONE OUTSTANDING REQUEST PER RECORD: while an update on an address has not come due, a
 //!    further request to change that address's record is refused with EC2's own
 //!    `PendingRequestAlreadyExists`, the refusal neither consumes nor replaces the

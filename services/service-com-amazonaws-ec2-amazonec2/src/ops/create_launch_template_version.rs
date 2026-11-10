@@ -318,8 +318,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let version_number = store
                     .insert_launch_template_version(&launch_template_id, spec)
                     .ok_or_else(|| {
-                        Scaffolded::internal_error(format!(
-                            "launch template '{launch_template_id}' is not stored"
+                        // The store enforces the per-template version ceiling and the byte
+                        // budget as well, so a version it would not take is refused rather
+                        // than reported as created; the two checks above have already told
+                        // the caller which ceiling it is.
+                        launch_template_limit_exceeded(format!(
+                            "Launch template '{launch_template_id}' holds \
+                             {MAX_LAUNCH_TEMPLATE_VERSIONS} versions at most, and this \
+                             emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                             caller-supplied data, so it cannot store another version",
+                            store.stored_bytes()
                         ))
                     })?;
                 if let Some(token) = input.client_token.clone() {

@@ -476,9 +476,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 specification.launch_template_name.as_deref(),
             )?;
             let Some(record) = store.launch_templates.get(&template_id) else {
-                return Err(crate::state::invalid_launch_template_id_not_found(
-                    &template_id,
-                ));
+                return Err(crate::state::invalid_launch_template_id_not_found());
             };
             // "The launch template version number, `$Latest`, or `$Default`"
             // (`FleetLaunchTemplateSpecification$Version`): a configuration that names none

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableReachabilityAnalyzerOrganizationSharing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableReachabilityAnalyzerOrganizationSharing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: records the trust relationship between Reachability Analyzer and
+//! Organizations in [`crate::state`] — through the store's one writer seam
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::set_reachability_analyzer_organization_sharing`])
+//! — and answers with the relationship as it then stands. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableReachabilityAnalyzerOrganizationSharing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The relationship is a fact of the ORGANIZATION rather than of a Region or a resource, so
+//! the request names nothing but the `DryRun` flag and the one refusal there is to make is
+//! that flag's: `DryRunOperation` (412), answered before the relationship is written.
+//! Establishing one that already holds changes nothing and answers the same value.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +138,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableReachabilityAnalyzerOrganizationSharing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableReachabilityAnalyzerOrganizationSharingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableReachabilityAnalyzerOrganizationSharing"))
+        use crate::state::{dry_run_operation, require_service_state};
+
+        // `ctx` carries request metadata only, and this operation reads none of it: the trust
+        // relationship is between Reachability Analyzer and the ORGANIZATION — its doc names
+        // no Region — so nothing here is scoped to the Region the request was signed for. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST … If you have the required permissions, the error response is
+        // DryRunOperation" (`DryRun`): the request names no resource to resolve and no
+        // parameter to refuse, so the permission question is the whole of what this operation
+        // can answer before the one write — and a request that gets this answer leaves the
+        // relationship exactly as it was.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let established = state
+            .lock()
+            .set_reachability_analyzer_organization_sharing(true);
+
+        // "Returns true if the request succeeds; otherwise, returns an error" (`ReturnValue`),
+        // read back off the store rather than written as a literal here, so the answer is the
+        // relationship the store now holds.
+        Ok(EnableReachabilityAnalyzerOrganizationSharingOutput {
+            return_value: Some(established),
+        })
     }
 }
