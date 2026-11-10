@@ -49,6 +49,8 @@ mod knowledge_base_document_listing;
 mod knowledge_base_documents;
 #[path = "all/knowledge_base_lifecycle.rs"]
 mod knowledge_base_lifecycle;
+#[path = "all/knowledge_base_listing.rs"]
+mod knowledge_base_listing;
 #[path = "all/managed_connector_defaults.rs"]
 mod managed_connector_defaults;
 #[path = "all/state_roundtrip.rs"]

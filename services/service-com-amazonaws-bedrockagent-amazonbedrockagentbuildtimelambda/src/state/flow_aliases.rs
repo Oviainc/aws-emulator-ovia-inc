@@ -146,7 +146,7 @@ pub const TEST_ALIAS_ID: &str = "TSTALIASID";
 /// addressed flow does not hold — from a bad request.
 pub fn flow_alias_from_identifier(identifier: &str) -> Option<(Option<&str>, &str)> {
     let Some(rest) = identifier.strip_prefix("arn:") else {
-        let bare = identifier == TEST_ALIAS_ID || is_flow_id(identifier);
+        let bare = identifier == TEST_ALIAS_ID || is_minted_id(identifier);
         return bare.then_some((None, identifier));
     };
     // partition: aws | service | region | account | flow/<flowId>/alias/<aliasId>
@@ -167,7 +167,7 @@ pub fn flow_alias_from_identifier(identifier: &str) -> Option<(Option<&str>, &st
         return None;
     }
     let (flow_id, alias_id) = resource.strip_prefix("flow/")?.split_once("/alias/")?;
-    (is_flow_id(flow_id) && is_flow_id(alias_id)).then_some((Some(flow_id), alias_id))
+    (is_minted_id(flow_id) && is_minted_id(alias_id)).then_some((Some(flow_id), alias_id))
 }
 
 /// The `ResourceNotFoundException` message an operation answers when the alias
@@ -201,10 +201,7 @@ impl FlowAliasPageCursor {
     /// the aliases already reported, so nothing else names a position in this
     /// listing.
     pub fn parse(token: &str) -> Option<Self> {
-        if token.is_empty()
-            || token.starts_with('0')
-            || !token.bytes().all(|byte| byte.is_ascii_digit())
-        {
+        if !is_counted_token_position(token) {
             return None;
         }
         token.parse().ok().map(|reported| Self { reported })

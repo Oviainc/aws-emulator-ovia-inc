@@ -481,7 +481,24 @@ async fn list_agents_refuses_a_token_it_did_not_issue() {
         .create_agent(json!({ "agentName": "token-agent" }))
         .await;
 
-    for token in ["not-a-cursor", "0", "123456789", "-AAAAAAAAAA"] {
+    // Rows: strings no page of this listing handed out. A token names a
+    // position as the one spelling `format!` renders — the creation instant in
+    // nanoseconds, then the 10-character id of the agent the page stopped at —
+    // so another spelling of the same number, or an id no agent could be
+    // minted, names no position.
+    for token in [
+        "not-a-cursor",
+        "0",
+        "123456789",
+        "-AAAAAAAAAA",
+        "1700000000000000000-",
+        "+1-AAAAAAAAAA",
+        "0001-AAAAAAAAAA",
+        "0x10-AAAAAAAAAA",
+        "1.5-AAAAAAAAAA",
+        "1700000000000000000-AAAA",
+        "1700000000000000000-AAAA:AAAAA",
+    ] {
         let answer = emulator.list_agents(json!({ "nextToken": token })).await;
         assert_eq!(
             answer.status, 400,

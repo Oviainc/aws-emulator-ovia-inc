@@ -522,9 +522,47 @@ impl FlowRecord {
 pub const FLOW_IDENTIFIER_PATTERN: &str =
     "^(arn:aws:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:flow/[0-9a-zA-Z]{10})|([0-9a-zA-Z]{10})$";
 
-/// Whether `value` is a modelled `FlowId` (`^[0-9a-zA-Z]{10}$`).
-fn is_flow_id(value: &str) -> bool {
+/// Whether `value` is shaped as an id this service MINTS: the modelled `Id`
+/// pattern `^[0-9a-zA-Z]{10}$`, which every resource id in this slice carries —
+/// a `flowId`, an `agentId` and a `knowledgeBaseId` alike.
+fn is_minted_id(value: &str) -> bool {
     value.len() == ID_LEN && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// Whether `position` is the one spelling a pagination token this service hands
+/// out writes a number in: plain decimal digits, with no sign and no padding —
+/// what `format!("{n}")` renders and nothing else.
+///
+/// A listing reports a position only in that form, so another spelling of the
+/// same number is a token this service never handed out rather than a position
+/// in the listing.
+fn is_canonical_token_position(position: &str) -> bool {
+    !position.is_empty()
+        && (position.len() == 1 || !position.starts_with('0'))
+        && position.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether `position` is a position a listing that counts what it has already
+/// reported hands out: [`is_canonical_token_position`], and at least one.
+///
+/// Such a listing starts at the position an absent `nextToken` already names, so
+/// no page of one ever hands out a token for nothing reported.
+fn is_counted_token_position(position: &str) -> bool {
+    is_canonical_token_position(position) && position != "0"
+}
+
+/// Split a composite `nextToken` — the creation instant in nanoseconds of the
+/// resource a page stopped at, then that resource's id — back into its two
+/// halves, or `None` when the string is not one such a page hands out.
+///
+/// A creation instant is counted from the epoch, so no page ever stops at
+/// position zero.
+fn parse_composite_cursor(token: &str) -> Option<(u128, &str)> {
+    let (position, resource_id) = token.split_once('-')?;
+    if !is_counted_token_position(position) || !is_minted_id(resource_id) {
+        return None;
+    }
+    Some((position.parse().ok()?, resource_id))
 }
 
 /// The `ValidationException` message a flow operation answers when
@@ -568,7 +606,7 @@ pub fn flow_id_from_identifier(identifier: &str) -> Option<&str> {
             resource.strip_prefix("flow/")?
         }
     };
-    is_flow_id(id).then_some(id)
+    is_minted_id(id).then_some(id)
 }
 
 /// The `ResourceNotFoundException` message an operation answers when a resource
@@ -768,8 +806,7 @@ impl FlowVersionCursor {
             return Some(Self::Draft);
         }
         let numeric = (1..=NUMERICAL_VERSION_DIGITS).contains(&token.len())
-            && !token.starts_with('0')
-            && token.bytes().all(|byte| byte.is_ascii_digit());
+            && is_counted_token_position(token);
         numeric
             .then(|| token.parse::<u32>().ok())
             .flatten()
@@ -1065,14 +1102,12 @@ pub struct KnowledgeBasePageCursor {
 
 impl KnowledgeBasePageCursor {
     /// Decode a `nextToken` a previous page handed out. `None` when the token
-    /// was not produced by [`KnowledgeBaseRecord::page_cursor`].
+    /// was not produced by [`KnowledgeBaseRecord::page_cursor`] — only the one
+    /// spelling that function writes names a position.
     pub fn parse(token: &str) -> Option<Self> {
-        let (nanos, knowledge_base_id) = token.split_once('-')?;
-        if knowledge_base_id.is_empty() {
-            return None;
-        }
+        let (created_at_nanos, knowledge_base_id) = parse_composite_cursor(token)?;
         Some(Self {
-            created_at_nanos: nanos.parse().ok()?,
+            created_at_nanos,
             knowledge_base_id: knowledge_base_id.to_string(),
         })
     }
@@ -2233,10 +2268,7 @@ impl DocumentPageCursor {
     /// the documents already reported, so nothing else names a position in this
     /// listing.
     pub fn parse(token: &str) -> Option<Self> {
-        if token.is_empty()
-            || token.starts_with('0')
-            || !token.bytes().all(|byte| byte.is_ascii_digit())
-        {
+        if !is_counted_token_position(token) {
             return None;
         }
         token.parse().ok().map(|reported| Self { reported })
@@ -2270,14 +2302,12 @@ pub struct PageCursor {
 
 impl PageCursor {
     /// Decode a `nextToken` a previous page handed out. `None` when the token was
-    /// not produced by [`AgentRecord::page_cursor`].
+    /// not produced by [`AgentRecord::page_cursor`] — only the one spelling that
+    /// function writes names a position.
     pub fn parse(token: &str) -> Option<Self> {
-        let (nanos, agent_id) = token.split_once('-')?;
-        if agent_id.is_empty() {
-            return None;
-        }
+        let (created_at_nanos, agent_id) = parse_composite_cursor(token)?;
         Some(Self {
-            created_at_nanos: nanos.parse().ok()?,
+            created_at_nanos,
             agent_id: agent_id.to_string(),
         })
     }

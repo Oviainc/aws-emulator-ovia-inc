@@ -1465,7 +1465,8 @@ fn run_sql(
 ) -> Execution {
     // This execution's own bound is installed on the connection for the duration
     // of this execution, replacing the previous one: a bound is never shared
-    // between statements, so abandoning one cannot abandon another.
+    // between statements, so abandoning one cannot abandon another. A statement
+    // whose bound could not be installed does NOT run: it would run unbounded.
     let guard = std::sync::Arc::clone(&bound.0);
     let handler_guard = std::sync::Arc::clone(&guard);
     if let Err(error) = database.connection.progress_handler(
