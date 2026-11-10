@@ -6,8 +6,11 @@
 //! registry this emulator serves, reported as a single `authorizationData` entry whose
 //! `authorizationToken` is the base64 of `AWS:<freshly minted password>`, whose
 //! `expiresAt` is the call's instant plus the documented 12-hour validity, and whose
-//! `proxyEndpoint` is `https://<registry id>.dkr.ecr.<region>.amazonaws.com` for the
-//! Region the request was signed for. `registryIds` is `@deprecated` — "specifying a
+//! `proxyEndpoint` is the registry endpoint THIS EMULATOR serves, at the address the
+//! caller reached it on — `proxyEndpoint` is where `docker login` and every pull after it
+//! go, and this emulator is what answers the registry API (`service/registry_v2.rs`), so
+//! an address naming AWS's own `<account>.dkr.ecr.<region>.amazonaws.com` host would send
+//! the next client out of the emulator entirely. `registryIds` is `@deprecated` — "specifying a
 //! registry ID doesn't change the permissions scope of the authorization token" — so it
 //! selects nothing: a request carrying any accepted value for it is answered exactly like
 //! one carrying none.
@@ -48,11 +51,12 @@ const MEMBER_PROXY: &str = "proxyEndpoint";
 /// An account id that is NOT this emulator's registry.
 const OTHER_REGISTRY_ID: &str = "123456789012";
 
-/// `AuthorizationData$proxyEndpoint` documents the format itself: "The registry URL to
-/// use for this authorization token in a `docker login` command. The Amazon ECR registry
-/// URL format is `https://aws_account_id.dkr.ecr.region.amazonaws.com`."
+/// The registry URL an issued token must name: the endpoint the CALLER reached this
+/// emulator on, because that is the registry endpoint this emulator serves (see the module
+/// docs). `crate::wire`'s calls are addressed to `api.ecr.<region>.amazonaws.com`, so each
+/// row's answer must name the endpoint that row was addressed to.
 fn expected_proxy_endpoint(region: &str) -> String {
-    format!("https://{REGISTRY_ID}.dkr.ecr.{region}.amazonaws.com")
+    format!("https://api.ecr.{region}.amazonaws.com")
 }
 
 /// Ten distinct 12-digit account ids — the modelled maximum of
@@ -156,7 +160,7 @@ async fn issue(
     assert_eq!(
         proxy_endpoint,
         expected_proxy_endpoint(region),
-        "case {case:?}: expected the registry URL for {region}, got {proxy_endpoint:?}"
+        "case {case:?}: expected the registry endpoint this call reached, got {proxy_endpoint:?}"
     );
 
     token
@@ -166,7 +170,7 @@ async fn issue(
 async fn every_call_mints_one_aws_user_token_for_this_registry() {
     // (case, request body, Region the call is signed for). The rows differ along the
     // `registryIds` value — the only member the operation models — and along the Region,
-    // which is what `proxyEndpoint` is built for.
+    // whose endpoint host is what `proxyEndpoint` names.
     let rows: [(&str, Value, &str); 7] = [
         ("no registryIds", json!({}), REGION),
         ("no registryIds, another Region", json!({}), "us-east-1"),
@@ -316,11 +320,12 @@ async fn two_independent_registries_issue_different_tokens() {
     );
 }
 
-/// The Region the request is signed for is what the endpoint is built for, so an
-/// unsigned-for-nothing call still has to answer a well-formed registry URL: this pins
-/// the host shape across the published Region naming forms, not one recorded Region.
+/// The endpoint a call reached this emulator on is what the issued token's registry URL
+/// names, so a call addressed to any endpoint still answers a well-formed registry URL
+/// leading back here: this pins the host shape across the published Region naming forms,
+/// not one recorded Region.
 #[tokio::test]
-async fn the_proxy_endpoint_is_this_registry_in_the_signed_region() {
+async fn the_proxy_endpoint_names_the_registry_endpoint_the_caller_reached() {
     // Regions spanning the naming forms AWS publishes: a classic three-part name, a
     // numbered one, a four-part one, and a non-`aws` partition's.
     let regions = ["us-east-1", "ap-southeast-2", "us-gov-west-1", "cn-north-1"];
@@ -340,7 +345,7 @@ async fn the_proxy_endpoint_is_this_registry_in_the_signed_region() {
         assert_eq!(
             endpoint,
             expected_proxy_endpoint(region),
-            "case {region:?}: expected this registry's URL in that Region, got {endpoint:?}"
+            "case {region:?}: expected the registry endpoint this call reached, got {endpoint:?}"
         );
     }
 }

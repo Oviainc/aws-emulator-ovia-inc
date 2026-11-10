@@ -246,7 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // emulator is what serves the download; read off the request before the store is
         // locked, since it is request metadata rather than state. Its signature is scoped
         // to the Region the call was made against, as every SigV4 credential scope is.
-        let host = crate::state::layer_download_url_host(ctx.parts());
+        let host = crate::state::caller_endpoint_host(ctx.parts());
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 

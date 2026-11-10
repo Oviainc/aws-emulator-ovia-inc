@@ -40,6 +40,11 @@ service-common = { path = "../common" }
 # services' OWN state accessors rather than keeping a second copy of either fact.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The CloudWatch store holds the `AWS/ECR` series this registry publishes about the pulls
+# its data plane serves (`state::pull_metrics`): the datapoints are appended to the very
+# store `GetMetricStatistics` reads, because CloudWatch refuses a publish into an `AWS/`
+# namespace over `PutMetricData`.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 # Whether a signing job a push creates can sign at all is AWS Signer's judgement about its
 # own resource: `state::signing` resolves the signing profile a signing rule names through
 # Signer's OWN store (`profile_region_and_name_in_arn`, `profile`, `can_sign`) rather than

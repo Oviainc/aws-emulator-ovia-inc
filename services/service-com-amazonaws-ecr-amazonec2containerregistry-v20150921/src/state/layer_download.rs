@@ -2,13 +2,14 @@
 
 use super::*;
 
-/// The endpoint the request reached this emulator on, as the layer download URL this
-/// registry announces names it: the request's own `Host`, else the authority its URI
-/// carries, else [`LOOPBACK_HOST`].
+/// The endpoint the request reached this emulator on, as every address this registry
+/// ANNOUNCES names it — a layer download URL and the registry endpoint a `docker login` is
+/// pointed at alike: the request's own `Host`, else the authority its URI carries, else
+/// [`LOOPBACK_HOST`].
 ///
 /// Read from the request rather than built from this registry's own
-/// `<account>.dkr.ecr.<region>.amazonaws.com` host ([`registry_host`]), because the URL
-/// has to resolve for whoever was handed it: that host is AWS's, and a URL naming it
+/// `<account>.dkr.ecr.<region>.amazonaws.com` host ([`registry_host`]), because the address
+/// has to resolve for whoever was handed it: that host is AWS's, and an address naming it
 /// would send the next client out of the emulator entirely, while a client addressing
 /// the emulator by socket is handed that socket.
 ///
@@ -25,7 +26,7 @@ use super::*;
 /// Each source is tested on its own, in that order, and the FIRST one carrying a bare
 /// authority is what the URL names: a `Host` this registry cannot honour leaves the
 /// authority the URI carries still to be read, rather than standing in for it.
-pub fn layer_download_url_host(parts: &::http::request::Parts) -> String {
+pub fn caller_endpoint_host(parts: &::http::request::Parts) -> String {
     [
         parts
             .headers
@@ -43,6 +44,20 @@ pub fn layer_download_url_host(parts: &::http::request::Parts) -> String {
     .to_string()
 }
 
+/// `candidate` when it is an endpoint this emulator may announce itself at — a bare
+/// authority — and the loopback literal when it is not.
+///
+/// The one filter behind every address this service announces: the value is a CALLER's and
+/// it is interpolated into a URL or a header, so anything that is not an endpoint is
+/// replaced by the literal rather than reflected.
+pub fn honoured_endpoint_host(candidate: &str) -> &str {
+    if is_bare_authority(candidate) {
+        candidate
+    } else {
+        LOOPBACK_HOST
+    }
+}
+
 /// True when `value` is a bare authority: a host with an optional port and nothing else.
 ///
 /// A path, query, fragment, userinfo or space makes it something other than an endpoint —
@@ -56,7 +71,7 @@ pub(super) fn is_bare_authority(value: &str) -> bool {
 }
 
 /// The URL one layer download grant is served at, addressed to `host` (the endpoint the
-/// caller reached this emulator on — see [`layer_download_url_host`]) and scoped to
+/// caller reached this emulator on — see [`caller_endpoint_host`]) and scoped to
 /// `region` (the Region the call asking for it was made against).
 ///
 /// The path carries the grant's token, which is the capability a fetch resolves through,

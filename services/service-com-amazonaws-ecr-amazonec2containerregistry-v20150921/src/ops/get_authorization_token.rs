@@ -12,9 +12,17 @@
 //! (`AuthorizationData$authorizationToken`: "When the string is decoded, it is presented
 //! in the format `user:password` for private registry authentication using `docker
 //! login`"), it expires [`AUTHORIZATION_TOKEN_LIFETIME`] after this call, and it is
-//! reported beside the registry URL a `docker login` points at
-//! ([`crate::state::registry_proxy_endpoint`], built for the Region the request was
-//! signed for).
+//! reported beside the registry URL a `docker login` points at.
+//!
+//! That URL is the endpoint the CALLER reached this emulator on
+//! ([`crate::state::caller_endpoint_host`]), not the
+//! `<account>.dkr.ecr.<region>.amazonaws.com` host AWS publishes
+//! ([`crate::state::registry_host`]): `proxyEndpoint` is an address the client is expected
+//! to FETCH from next — it is where `docker login` and every pull after it go — and this
+//! emulator is what serves that registry endpoint (`crate::service`'s registry data
+//! plane), so an address naming AWS's host would send the next client out of the emulator
+//! entirely. The same resolution, from the same request, as the layer download URL
+//! `GetDownloadUrlForLayer` announces.
 //!
 //! `registryIds` selects nothing. The model marks the member `@deprecated` with the
 //! reason spelled out — "This field is deprecated. The returned authorization token can
@@ -26,11 +34,14 @@
 //! The member's modelled `@length(1..10)` and the 12-digit shape of its entries are
 //! still refused centrally, before this handler runs.
 //!
-//! Nothing is written to the store: a token is a secret handed to the caller, no
-//! operation of this service accepts one back, so there is nothing about an issued token
-//! that a later call could read. The password is therefore minted by the emulator's
-//! credential store (never constructed here) and removed from it again: the caller gets a
-//! secret, and the emulator keeps no credential it would accept as SigV4.
+//! What is written to the store is the ISSUE, never the secret: the password is minted by
+//! the emulator's credential store (never constructed here), removed from that store again
+//! so the emulator does not go on accepting it as SigV4, and this registry records only
+//! the content DIGEST of it with the window it was issued for and the principal it was
+//! issued to (`crate::state::registry_v2`). That record is what lets this registry's
+//! Docker Registry v2 data plane (`crate::service`) recognise the credential a `docker
+//! pull` presents as one of its own: a token nothing recorded would reach no repository,
+//! and the password itself is held nowhere.
 //!
 //! ## Shape of an operation
 //!
@@ -176,11 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token authorizes `docker login` against the registry this store holds, so
         // an unreachable store means there is no registry to authorize access to. The
         // router builds the one engine that carries the store, so this is unreachable
-        // there. Nothing is read out of the store and nothing is written to it: see the
-        // module docs for why an issued token leaves no record behind.
-        if crate::state::service_state(&*self.engine).is_none() {
+        // there.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(server_error());
-        }
+        };
 
         let Some(password) = mint_registry_password(ctx.credential_store()) else {
             // The credential store minted no secret, and this operation will not invent
@@ -192,11 +202,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same alphabet a client's base64 decoder expects.
         let token =
             ::aws_smithy_types::base64::encode(format!("{AUTHORIZATION_TOKEN_USER}:{password}"));
-        let expires_at = ::std::time::SystemTime::now() + AUTHORIZATION_TOKEN_LIFETIME;
-        // The registry is regional, so the endpoint a `docker login` is pointed at is the
-        // one in the Region this request was signed for.
-        let proxy_endpoint =
-            crate::state::registry_proxy_endpoint(&crate::state::request_region(ctx.parts()));
+        let issued_at = ::std::time::SystemTime::now();
+        let expires_at = issued_at + AUTHORIZATION_TOKEN_LIFETIME;
+        // The ISSUE is recorded — never the password (see the module docs and
+        // `crate::state::registry_v2`) — because this registry's data plane has to
+        // recognise the credential when the pull arrives: a `docker pull` presents this
+        // very pair as Basic authorization, and a credential nothing recorded would reach
+        // no repository. The principal the token speaks for is recorded with it, so the
+        // pull time of an image pulled with it is withheld exactly when that principal is
+        // excluded from pull time recording.
+        let principal_arn = crate::state::authorization::caller(&*self.engine, ctx).arn;
+        state.lock().record_registry_credential(
+            &password,
+            issued_at,
+            expires_at,
+            &principal_arn,
+        );
+        // The registry endpoint a `docker login` is pointed at: the one this emulator
+        // serves, at the address this caller reached it on (see the module docs).
+        let proxy_endpoint = format!(
+            "https://{}",
+            crate::state::caller_endpoint_host(ctx.parts())
+        );
 
         // Issuing a registry credential is the security-relevant event of this
         // operation, so it is attributable in the emulator's log: which operation, the

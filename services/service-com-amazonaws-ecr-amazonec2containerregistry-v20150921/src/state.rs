@@ -690,6 +690,11 @@ pub struct ImageRecord {
     /// When the `ACTIVATING` -> `ACTIVE` transition a restore started falls due, or `None`
     /// when no restore is in flight. See [`IMAGE_RESTORE_DELAY`].
     pub activate_due_at: Option<SystemTime>,
+    /// `lastRecordedPullTime`: when this registry last recorded a pull of this image over
+    /// its Docker Registry v2 data plane, or `None` while it has recorded none — an image
+    /// nobody has pulled, and an image pulled only by a principal the registry's pull time
+    /// update exclusion list names. See `state/registry_v2.rs`.
+    pub last_recorded_pull_time: Option<SystemTime>,
     /// The copies of this image the push that stored it started, one per destination the
     /// registry's replication configuration sent this repository's images to at that
     /// instant — what `DescribeImageReplicationStatus` reports. Empty for an image pushed
@@ -725,6 +730,8 @@ impl ImageRecord {
             last_archived_at: None,
             last_activated_at: None,
             activate_due_at: None,
+            // A pull is what records a pull time; a freshly pushed image has had none.
+            last_recorded_pull_time: None,
             // The copies a push starts are decided by the registry's replication
             // configuration, which this record knows nothing about: `PutImage` reads the
             // rules and sets them (see
@@ -771,6 +778,9 @@ impl ImageRecord {
             last_archived_at: self.last_archived_at.map(::aws_smithy_types::DateTime::from),
             last_activated_at: self
                 .last_activated_at
+                .map(::aws_smithy_types::DateTime::from),
+            last_recorded_pull_time: self
+                .last_recorded_pull_time
                 .map(::aws_smithy_types::DateTime::from),
             ..ImageDetail::default()
         }
@@ -2654,6 +2664,13 @@ pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// the state the documented default describes — see
     /// [`registry_scanning_configuration`](ComAmazonawsEcrAmazonec2containerregistryV20150921State::registry_scanning_configuration).
     pub registry_scanning: Option<crate::ops::types::RegistryScanningConfiguration>,
+    /// The `docker login` credentials `GetAuthorizationToken` has issued, by the content
+    /// digest of each password: what the Docker Registry v2 data plane authenticates a
+    /// pull against. Registry-wide, because such a credential reaches every repository
+    /// the registry holds, and a `BTreeMap` for the same deterministic order as the maps
+    /// above; bounded by [`MAX_REGISTRY_CREDENTIALS`]. See `state/registry_v2.rs` for why
+    /// the password itself is not here.
+    pub registry_credentials: BTreeMap<String, RegistryCredential>,
 }
 
 impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
@@ -3396,16 +3413,6 @@ pub fn registry_host(region: &str) -> String {
 /// `<registry id>.dkr.ecr.<region>.amazonaws.com/<name>` — the URI a docker client pushes to.
 pub fn repository_uri(region: &str, name: &str) -> String {
     format!("{}/{name}", registry_host(region))
-}
-
-/// `https://<registry id>.dkr.ecr.<region>.amazonaws.com` — the registry URL a
-/// `docker login` is pointed at.
-///
-/// `AuthorizationData$proxyEndpoint` states the format itself: "The registry URL to use
-/// for this authorization token in a `docker login` command. The Amazon ECR registry URL
-/// format is `https://aws_account_id.dkr.ecr.region.amazonaws.com`."
-pub fn registry_proxy_endpoint(region: &str) -> String {
-    format!("https://{}", registry_host(region))
 }
 
 /// How many bytes of a minted id a layer download token carries: 32, the full width of
@@ -4223,6 +4230,11 @@ pub mod image_events;
 /// re-exported, so a handler names the gate it consults) here, so a handler reaches it as
 /// `crate::state::authorization::…` like every other part of this store.
 pub mod authorization;
+/// The `AWS/ECR` metric this registry publishes about the pulls its data plane serves, in
+/// `state/pull_metrics.rs`. Declared (and not glob re-exported, so a caller names the
+/// publication it makes) here, so it is reached as `crate::state::pull_metrics::…` like
+/// every other part of this store.
+pub mod pull_metrics;
 /// The signing jobs a push starts under the registry's signing configuration, and the
 /// status each one reports, in `state/signing.rs`. Declared (and not glob re-exported, so a
 /// handler names the part of the store it reads) here, so a handler reaches it as
@@ -4230,6 +4242,10 @@ pub mod authorization;
 pub mod signing;
 mod image_scan;
 mod layer_download;
+/// The `docker login` credentials this registry has issued, and the pull bookkeeping a
+/// registry pull leaves behind, in `state/registry_v2.rs`.
+mod registry_v2;
+pub use registry_v2::*;
 pub use layer_download::*;
 pub use image_scan::*;
 pub use scanning::*;

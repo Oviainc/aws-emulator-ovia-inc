@@ -72,6 +72,23 @@
 //! whose grant this registry no longer holds resolves to no download, a grant whose
 //! window has closed is refused as an expired request, and a grant whose layer or
 //! repository this registry no longer holds has nothing to serve.
+//!
+//! ## The Docker Registry v2 data plane
+//!
+//! The other data plane this service carries is the registry API itself — the endpoint a
+//! `docker pull` talks to — served by `service/registry_v2.rs` through the SAME pair of
+//! seams, for the same reason: its paths (`/v2/<name>/manifests/<reference>`,
+//! `/v2/<name>/blobs/<digest>`) name no modelled operation, and a request to one presents a
+//! Basic credential rather than a SigV4 signature, so without [`Service::can_handle`]
+//! claiming that path space the front door can attribute it to no service at all. What
+//! authorises it is the credential `GetAuthorizationToken` minted, and what it answers is
+//! what the repository holds. See that module's own docs.
+
+/// The Docker Registry v2 data plane this registry serves beside its API, in
+/// `service/registry_v2.rs`: the endpoint a `docker pull` talks to, claimed by
+/// [`Service::can_handle`] and served by [`Service::override_routing_error`] the same way
+/// the layer download plane is.
+mod registry_v2;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
@@ -503,7 +520,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // a URL this service announced. Every method is claimed, not only the two that
         // are served: a `POST` to a path this service publishes is this service's to
         // refuse as a method. See the module docs.
-        crate::state::parse_layer_download_path(parts.uri.path()).is_some()
+        if crate::state::parse_layer_download_path(parts.uri.path()).is_some() {
+            return true;
+        }
+        // A Docker Registry v2 request — a `docker pull` — carries a Basic credential and
+        // no `X-Amz-Target`, so nothing in it resolves a route key and the registry
+        // endpoint it addresses is what identifies it. Without this the router answers
+        // `UnknownService` for the one endpoint every container client pulls through. See
+        // `service/registry_v2.rs` for how narrowly the claim is drawn.
+        registry_v2::claims_registry_v2(parts)
     }
 
     fn override_operation(
@@ -579,9 +604,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // A request to a layer download URL this registry handed out is exactly that
         // case by construction — the path is not in the model — so this is where such a
         // URL is served. Anything else keeps the framework's default.
-        let target =
-            crate::state::parse_layer_download_path(::service_common::request_path(req.uri()))?;
-        Some(self.serve_layer_download(req, &target))
+        let path = ::service_common::request_path(req.uri());
+        if let Some(target) = crate::state::parse_layer_download_path(path) {
+            return Some(self.serve_layer_download(req, &target));
+        }
+        // A registry request names no modelled operation either — the registry API's paths
+        // are not in the model — so this is where a `docker pull` is served.
+        let target = registry_v2::registry_v2_target(path)?;
+        Some(self.serve_registry_v2(req, &target))
     }
 
     fn override_framework_error(
