@@ -61,15 +61,15 @@ fn job_uri(workspace: &str, job_id: &str) -> String {
 
 /// An S3 URI of the form `S3Uri`'s pattern admits
 /// (`^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/.+$`).
-const DESTINATION: &str = "s3://sitewise-exports/clips/";
+pub(crate) const DESTINATION: &str = "s3://sitewise-exports/clips/";
 
 /// The same member's error-report form, so a response reporting one in place of
 /// the other cannot pass.
-const ERROR_REPORT: &str = "s3://sitewise-exports/errors/";
+pub(crate) const ERROR_REPORT: &str = "s3://sitewise-exports/errors/";
 
 /// The destination a RETRY names, so a replay that reported the retry's request
 /// instead of the job's own cannot pass.
-const OTHER_DESTINATION: &str = "s3://sitewise-exports/other-clips/";
+pub(crate) const OTHER_DESTINATION: &str = "s3://sitewise-exports/other-clips/";
 
 /// The error report location a RETRY names, for the same reason.
 const OTHER_ERROR_REPORT: &str = "s3://sitewise-exports/other-errors/";
@@ -94,12 +94,12 @@ const SLACK: Duration = Duration::from_millis(250);
 
 /// A `TimeSeriesId` of the associated form, which this service builds as
 /// `<assetId>.<propertyId>` — the longest the modelled length (36..73) admits.
-const ASSOCIATED_SERIES: &str =
+pub(crate) const ASSOCIATED_SERIES: &str =
     "11111111-2222-3333-4444-555555555555.66666666-7777-8888-9999-aaaaaaaaaaaa";
 
 /// A `TimeSeriesId` of the shortest form that length admits: a single id, which
 /// is how this service names a stream no asset property owns.
-const DISASSOCIATED_SERIES: &str = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+pub(crate) const DISASSOCIATED_SERIES: &str = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
 
 /// A `TimeInNanos`, as the two members the shape declares.
 fn nanos(seconds: i64, offset: i64) -> Value {
@@ -117,25 +117,33 @@ fn trim(start: Value, end: Value) -> Value {
 /// workspace registry, so this helper opens the workspace it is pointed at first.
 /// A suite that is about an unopened workspace addresses the route directly
 /// instead.
-async fn create(router: &MultiServiceRouter, workspace: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn create(
+    router: &MultiServiceRouter,
+    workspace: &str,
+    body: Value,
+) -> (u16, Value) {
     crate::support::ensure_workspace(router, workspace).await;
     call(router, "POST", &jobs_uri(workspace), Some(body)).await
 }
 
 /// `DescribeDatasetExportJob`.
-async fn describe(router: &MultiServiceRouter, workspace: &str, job_id: &str) -> (u16, Value) {
+pub(crate) async fn describe(
+    router: &MultiServiceRouter,
+    workspace: &str,
+    job_id: &str,
+) -> (u16, Value) {
     call(router, "GET", &job_uri(workspace, job_id), None).await
 }
 
 /// The body a create sends: the destination, the error report location, the
 /// processing input, and `clientToken` only when the row carries one.
-fn create_body(input: &Value, token: Option<&str>) -> Value {
+pub(crate) fn create_body(input: &Value, token: Option<&str>) -> Value {
     create_body_from(DESTINATION, ERROR_REPORT, input, token)
 }
 
 /// The same, with every member a row may vary spelled out, so a retry can send a
 /// request that differs from the one it retries.
-fn create_body_from(
+pub(crate) fn create_body_from(
     destination: &str,
     error_report: &str,
     input: &Value,
@@ -157,7 +165,7 @@ fn create_body_from(
 /// How many jobs the store holds, across every workspace — the only way to
 /// observe that a refused or replayed create wrote nothing, since no reader
 /// enumerates a workspace's jobs yet.
-fn jobs_held(engine: &engine::InMemoryEngine) -> usize {
+pub(crate) fn jobs_held(engine: &engine::InMemoryEngine) -> usize {
     let state = service_state(engine).expect("the service store");
     let store = state.lock();
     store.dataset_export_jobs.len()
@@ -165,7 +173,7 @@ fn jobs_held(engine: &engine::InMemoryEngine) -> usize {
 
 /// Create a dataset through `CreateDataset` and answer its id, so the rows whose
 /// `ProcessingInput` names a dataset name one the store really holds.
-async fn create_dataset(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_dataset(router: &MultiServiceRouter, name: &str) -> String {
     let (status, body) = call(
         router,
         "POST",
