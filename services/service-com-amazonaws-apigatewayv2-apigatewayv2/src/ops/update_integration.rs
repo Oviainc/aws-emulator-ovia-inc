@@ -367,7 +367,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_ref()
                     .is_some_and(|templates| !templates.is_empty()),
             ),
-            crate::state::ProtocolRestrictedMember::websocket_only(
+            // A selection expression selects a WebSocket resource, so its refusal takes
+            // the "is not necessary" sentence `CreateIntegration` answers
+            // (`crate::state::ProtocolRefusal`).
+            crate::state::ProtocolRestrictedMember::websocket_only_selection_expression(
                 "TemplateSelectionExpression",
                 input.template_selection_expression.is_some(),
             ),

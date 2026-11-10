@@ -374,8 +374,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             // "The template selection expression for the integration. Supported only
             // for WebSocket APIs" (`Integration$TemplateSelectionExpression`, the shape
-            // every reader of the integration reports).
-            crate::state::ProtocolRestrictedMember::websocket_only(
+            // every reader of the integration reports). A selection expression selects a
+            // WebSocket resource, so its refusal takes the "is not necessary" sentence
+            // rather than the "is not permitted" one (`crate::state::ProtocolRefusal`).
+            crate::state::ProtocolRestrictedMember::websocket_only_selection_expression(
                 "TemplateSelectionExpression",
                 input.template_selection_expression.is_some(),
             ),

@@ -219,7 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "ApiKeyRequired",
                 input.api_key_required == Some(true),
             ),
-            crate::state::ProtocolRestrictedMember::websocket_only(
+            // A selection expression selects a WebSocket resource, so its refusal takes
+            // the "is not necessary" sentence rather than the "is not permitted" one
+            // (`crate::state::ProtocolRefusal`), the same words `CreateRoute` answers.
+            crate::state::ProtocolRestrictedMember::websocket_only_selection_expression(
                 "ModelSelectionExpression",
                 input.model_selection_expression.is_some(),
             ),
@@ -237,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_ref()
                     .is_some_and(|parameters| !parameters.is_empty()),
             ),
-            crate::state::ProtocolRestrictedMember::websocket_only(
+            crate::state::ProtocolRestrictedMember::websocket_only_selection_expression(
                 "RouteResponseSelectionExpression",
                 input.route_response_selection_expression.is_some(),
             ),

@@ -268,6 +268,87 @@ fn rows() -> Vec<Row> {
     ]
 }
 
+/// The exact sentence the refusing api answers each row with.
+///
+/// The words belong to the restricted THING, not to the operation that received it: a
+/// whole child resource is named in the plural, a member that configures behaviour the
+/// other protocol does not implement is named as the request spells it and "is not
+/// permitted", and a selection expression — a member that only selects a resource of the
+/// other protocol — is named as a feature in prose that "is not necessary". Every row is
+/// listed, so a row added without its sentence fails here rather than going unchecked.
+fn expected_message(case: &str) -> &'static str {
+    match case {
+        "a Model, a resource only a WebSocket api holds" => {
+            "Currently, Models are not permitted for APIs with a protocol type of HTTP"
+        }
+        "CreateRoute$RouteResponseSelectionExpression, a string member" => {
+            "Currently, a route response selection expression is not necessary for APIs \
+             with  a protocol type of HTTP"
+        }
+        "CreateRoute$ApiKeyRequired, a flag, set to true" => {
+            "Currently, ApiKeyRequired is not permitted for APIs with a protocol type of \
+             HTTP"
+        }
+        "CreateRoute$ModelSelectionExpression, a string member" => {
+            "Currently, a model selection expression is not necessary for APIs with  a \
+             protocol type of HTTP"
+        }
+        "CreateRoute$RequestModels, a non-empty map" => {
+            "Currently, RequestModels is not permitted for APIs with a protocol type of \
+             HTTP"
+        }
+        "CreateRoute$RequestParameters, a non-empty map of structures" => {
+            "Currently, RequestParameters is not permitted for APIs with a protocol type \
+             of HTTP"
+        }
+        "CreateIntegration$ContentHandlingStrategy, an enum member" => {
+            "Currently, ContentHandlingStrategy is not permitted for APIs with a protocol \
+             type of HTTP"
+        }
+        "CreateIntegration$PassthroughBehavior, an enum member" => {
+            "Currently, PassthroughBehavior is not permitted for APIs with a protocol type \
+             of HTTP"
+        }
+        "CreateIntegration$RequestTemplates, a non-empty map" => {
+            "Currently, RequestTemplates is not permitted for APIs with a protocol type of \
+             HTTP"
+        }
+        "Integration$TemplateSelectionExpression, a string member" => {
+            "Currently, a template selection expression is not necessary for APIs with  a \
+             protocol type of HTTP"
+        }
+        "CreateIntegration$ConnectionId, supported only for HTTP APIs" => {
+            "Currently, ConnectionId is not permitted for APIs with a protocol type of \
+             WEBSOCKET"
+        }
+        "CreateIntegration$IntegrationSubtype, supported only for HTTP APIs" => {
+            "Currently, IntegrationSubtype is not permitted for APIs with a protocol type \
+             of WEBSOCKET"
+        }
+        "CreateIntegration$ResponseParameters, a non-empty nested map" => {
+            "Currently, ResponseParameters is not permitted for APIs with a protocol type \
+             of WEBSOCKET"
+        }
+        "CreateIntegration$TlsConfig, a structure member" => {
+            "Currently, TlsConfig is not permitted for APIs with a protocol type of \
+             WEBSOCKET"
+        }
+        "CreateStage$ClientCertificateId, a string member" => {
+            "Currently, ClientCertificateId is not permitted for APIs with a protocol type \
+             of HTTP"
+        }
+        "RouteSettings$DataTraceEnabled, nested under DefaultRouteSettings" => {
+            "Currently, RouteSettings DataTraceEnabled is not permitted for APIs with a \
+             protocol type of HTTP"
+        }
+        "RouteSettings$LoggingLevel, nested under one RouteSettings entry" => {
+            "Currently, RouteSettings LoggingLevel is not permitted for APIs with a \
+             protocol type of HTTP"
+        }
+        other => panic!("case {other:?} carries no expected refusal sentence"),
+    }
+}
+
 /// The `ProtocolType` an api of `protocol_type` is NOT: the enum is `HTTP | WEBSOCKET`.
 fn other_protocol(protocol_type: &str) -> &'static str {
     if protocol_type == WEBSOCKET_PROTOCOL_TYPE {
@@ -374,18 +455,13 @@ async fn a_protocol_restricted_request_is_accepted_only_on_an_api_of_its_own_pro
             row.case
         );
         // The message is built from the request: it names what the request configured
-        // and the protocol type of the api it was aimed at, in the sentence API Gateway
-        // answers a protocol-restricted request with ("Currently, Models are not
-        // permitted for APIs with a protocol type of HTTP").
+        // and the protocol type of the api it was aimed at, in the sentence the
+        // restricted thing itself carries (see `expected_message`).
         let message = as_str(&body, "message");
-        let tail = format!(
-            "not permitted for APIs with a protocol type of {}",
-            other_protocol(row.supported_by)
-        );
-        assert!(
-            message.starts_with("Currently, ") && message.ends_with(&tail),
-            "case {:?}: expected a refusal of the form \"Currently, <what> is not \
-             permitted for APIs with a protocol type of <ProtocolType>\", got {message:?}",
+        assert_eq!(
+            message,
+            expected_message(row.case),
+            "case {:?}: expected the restricted thing's own sentence, got {message:?}",
             row.case
         );
 

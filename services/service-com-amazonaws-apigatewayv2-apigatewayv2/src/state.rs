@@ -1978,7 +1978,7 @@ pub const CORS_WILDCARD: &str = "*";
 /// configures one on an api of another protocol asks for a setting that protocol has no
 /// behaviour for. API Gateway words THIS member's refusal in the member's own terms,
 /// naming the CORS feature and the protocol type that does not support it, rather than
-/// with the generic sentence [`validate_protocol_restricted_members`] builds for a
+/// with either of the sentences [`validate_protocol_restricted_members`] builds for a
 /// restricted member: the refusal a WEBSOCKET create carrying a CORS configuration is
 /// answered with is `Cors is not supported for WEBSOCKET protocolType ` — the fixed text
 /// `Cors is not supported for `, the protocol type the request asked for, then the fixed
@@ -2571,99 +2571,6 @@ pub fn target_names_a_function(target: &str) -> bool {
             .strip_prefix(LAMBDA_FUNCTION_RESOURCE_PREFIX)
             .is_some_and(|name| !name.is_empty())
     })
-}
-
-/// One request member the model restricts to APIs of a single `ProtocolType`.
-///
-/// API Gateway v2 serves two protocols from one control plane, and a member's own
-/// documentation is what says which of them supports it ("Supported only for WebSocket
-/// APIs", "Supported only for HTTP APIs"). A request that configures such a member on an
-/// api of the OTHER protocol asks for a resource that protocol has no behaviour for, so
-/// the service refuses it rather than storing a setting nothing could ever apply.
-#[derive(Debug, Clone, Copy)]
-pub struct ProtocolRestrictedMember<'a> {
-    /// The member's name as a request spells it, for the refusal message.
-    pub member: &'a str,
-    /// The one `ProtocolType` whose APIs support the member, from
-    /// `PROTOCOL_TYPE_VALUES`.
-    pub supported_by: &'a str,
-    /// Does THIS request configure the member? A member the request left out asks for
-    /// nothing, and neither does one set to the value it would carry anyway — an empty
-    /// map or list, or a `false` flag whose documented default is `false` — so a caller
-    /// may send those to an api of either protocol.
-    pub configured: bool,
-}
-
-impl<'a> ProtocolRestrictedMember<'a> {
-    /// A member whose documentation reads "Supported only for WebSocket APIs".
-    pub fn websocket_only(member: &'a str, configured: bool) -> Self {
-        Self {
-            member,
-            supported_by: WEBSOCKET_PROTOCOL_TYPE,
-            configured,
-        }
-    }
-
-    /// A member whose documentation reads "Supported only for HTTP APIs".
-    pub fn http_only(member: &'a str, configured: bool) -> Self {
-        Self {
-            member,
-            supported_by: HTTP_PROTOCOL_TYPE,
-            configured,
-        }
-    }
-}
-
-/// Refuse a request that configures a [`ProtocolRestrictedMember`] on an api of another
-/// protocol.
-///
-/// Every writer of a protocol-restricted member routes through here, so the gate cannot
-/// differ between the operations that share a member, and an api of the supporting
-/// protocol is never refused. The FIRST offending member is the one reported — a request
-/// fixing it is checked again.
-///
-/// `Ok(())` or the message for the operation's `BadRequestException`, built from the
-/// request in the sentence API Gateway answers a protocol-restricted request with
-/// ("Currently, Models are not permitted for APIs with a protocol type of HTTP"): the
-/// member the request carried, and the protocol type of the api it was aimed at.
-pub fn validate_protocol_restricted_members(
-    protocol_type: &str,
-    members: &[ProtocolRestrictedMember<'_>],
-) -> Result<(), String> {
-    for restricted in members {
-        if restricted.configured && protocol_type != restricted.supported_by {
-            return Err(format!(
-                "Currently, {} is not permitted for APIs with a protocol type of \
-                 {protocol_type}",
-                restricted.member
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Refuse a child resource one protocol's APIs have no behaviour for, on an api of
-/// another protocol — the whole-resource form of
-/// [`validate_protocol_restricted_members`], for a create whose every member is moot
-/// once the parent's protocol is wrong.
-///
-/// `resource_plural` names the resource as the service's own messages do (`Models`,
-/// `Route responses`), and the message is the sentence API Gateway answers such a
-/// request with, built from the parent api's protocol type: "Currently, Models are not
-/// permitted for APIs with a protocol type of HTTP". `Ok(())` or the message for the
-/// operation's `BadRequestException`.
-pub fn validate_protocol_restricted_resource(
-    protocol_type: &str,
-    resource_plural: &str,
-    supported_by: &str,
-) -> Result<(), String> {
-    if protocol_type == supported_by {
-        return Ok(());
-    }
-    Err(format!(
-        "Currently, {resource_plural} are not permitted for APIs with a protocol type \
-         of {protocol_type}"
-    ))
 }
 
 /// Is `name` a `Model$Name` the service accepts?
@@ -3364,6 +3271,8 @@ pub use rest_endpoint::*;
 /// order the account's portals are reported in — lives in [`portal`], re-exported in full
 /// like every other part of this module.
 mod portal;
+mod protocol_restriction;
+pub use protocol_restriction::*;
 
 pub use portal::*;
 

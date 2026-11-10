@@ -181,6 +181,8 @@ mod product_rest_endpoint_page_generation;
 mod product_rest_endpoint_page_lifecycle;
 #[path = "all/product_rest_endpoint_page_update.rs"]
 mod product_rest_endpoint_page_update;
+#[path = "all/protocol_restricted_member_message.rs"]
+mod protocol_restricted_member_message;
 #[path = "all/protocol_type_gating.rs"]
 mod protocol_type_gating;
 #[path = "all/quick_create_is_http_only.rs"]
