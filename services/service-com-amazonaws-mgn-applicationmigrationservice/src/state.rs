@@ -31,13 +31,20 @@ pub use waves::*;
 mod launch_configuration_templates;
 pub use launch_configuration_templates::*;
 
+/// The REPLICATION CONFIGURATION TEMPLATE concern: the templates an account holds,
+/// which `DescribeReplicationConfigurationTemplates` reports. Re-exported like every
+/// other part of this state.
+mod replication_configuration_templates;
+pub use replication_configuration_templates::*;
+
 use crate::ops::types::{
     ApplicationAggregatedStatus, CidrMapping, ConflictException, ConnectorSsmCommandConfig,
     CreateApplicationOutput, CreateConnectorOutput, CreateNetworkMigrationDefinitionOutput,
-    CreateWaveOutput, DataReplicationInfo, InternalServerException, LaunchedInstance, LifeCycle,
+    CreateReplicationConfigurationTemplateOutput, CreateWaveOutput, DataReplicationInfo,
+    InternalServerException, LaunchedInstance, LifeCycle,
     NetworkMigrationExecution as NetworkMigrationExecutionShape, ResourceNotFoundException,
     ServiceQuotaExceededException, SourceConfiguration, SourceProperties,
-    SourceServerConnectorAction, TargetNetwork, TargetS3Configuration,
+    SourceServerConnectorAction, StorageConfiguration, TargetNetwork, TargetS3Configuration,
     UninitializedAccountException, UpdateSourceServerOutput, ValidationException,
     ValidationExceptionField, WaveAggregatedStatus,
 };
@@ -218,6 +225,13 @@ pub struct ComAmazonawsMgnApplicationmigrationserviceState {
     /// The `launchConfigurationTemplateID`s in creation order, so a listing reports
     /// them in a stable order.
     pub launch_configuration_template_order: Vec<String>,
+    /// Every replication configuration template, by
+    /// `replicationConfigurationTemplateID`.
+    pub replication_configuration_templates: HashMap<String, ReplicationConfigurationTemplate>,
+    /// The `replicationConfigurationTemplateID`s in creation order, so
+    /// `DescribeReplicationConfigurationTemplates` pages in a stable order and a
+    /// `nextToken` resumes where the previous page stopped.
+    pub replication_configuration_template_order: Vec<String>,
 }
 
 impl ComAmazonawsMgnApplicationmigrationserviceState {
