@@ -168,10 +168,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // framework's generic refusal body, which carries a message alone. See
         // [`request_validation`] for why that cannot be done from inside `handle` or
         // from `override_refusal`. The validator delegates to the operation the routing
-        // table names, so a request with nothing to fault is served exactly as before;
-        // a request the table cannot serve at all is left to the framework's own
-        // routing refusal.
-        request_validation::RequestValidation::serves(&self.entry, req)
+        // table names, so a request with nothing to fault is served exactly as before.
+        //
+        // It also claims the request the routing table names NO operation for although
+        // the model binds its method and path to one: the REST router reads an
+        // operation's `@required` query/header bindings as route discriminators and
+        // withholds the route of a request that leaves one out, which for a model that
+        // overloads no route can only turn a refusable request into an "operation not
+        // implemented" answer. Such a request is served by the operation whose own
+        // `@http` route it addresses, which refuses it on its own values — the modelled
+        // `ValidationException` naming the absent member, exactly as an absent body or
+        // path member of that same operation is already refused. A request addressing no
+        // route of this service is left to the framework's own routing refusal.
+        self.request_validation
+            .serves(&self.entry, req)
             .then_some(&self.request_validation as &dyn ErasedOperation)
     }
 

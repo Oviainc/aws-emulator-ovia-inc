@@ -123,7 +123,10 @@ pub(crate) fn expected(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 /// the rules below hold whichever kind the ARN names, so every table runs over
 /// this list. (Ingestion destinations are not in it because the operation that
 /// mints them is still scaffolded, so no such record can exist yet.)
-async fn taggable_resources(emulator: &Emulator, create_tags: Value) -> Vec<(&'static str, String)> {
+pub(crate) async fn taggable_resources(
+    emulator: &Emulator,
+    create_tags: Value,
+) -> Vec<(&'static str, String)> {
     let bundle = arn_of(
         &emulator
             .create_app_bundle(json!({"tags": create_tags.clone()}))

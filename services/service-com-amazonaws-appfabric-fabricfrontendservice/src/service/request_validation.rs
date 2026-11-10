@@ -31,6 +31,14 @@
 //! the restatement is single-homed here rather than repeated per operation, and a
 //! refusal of any of them carries the same members.
 //!
+//! Because every operation is here, this is also where the request that reaches no
+//! operation at all is resolved ([`RequestValidation::serving_key`]): the REST router
+//! reads an operation's `@required` query/header bindings as route DISCRIMINATORS and
+//! matches no route for a request that leaves one out, so a request whose method and
+//! path address a route of this service — but which the router could not match — is
+//! served by the operation the model binds to that route, and refused on its own values
+//! here, rather than reported as an operation nobody implemented.
+//!
 //! Authentication is unaffected: the router verifies the request against the schemes of
 //! the operation the model's routing key names before it runs anything, and this
 //! wrapper declares no schemes of its own, so it cannot weaken them.
@@ -38,10 +46,11 @@
 use std::collections::HashMap;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::ProtocolError;
 use smithy_server_runtime::{
-    BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
-    ServerHttpProtocol, Service, Violation,
+    BoxFuture, DeserializableStruct, ErasedOperation, ErasedServiceDefinition, Operation,
+    OperationContext, Refusal, ServerHttpProtocol, Service, Violation,
 };
 
 use crate::ops::types::{ValidationException, ValidationExceptionField, SCHEMA_VALIDATION_EXCEPTION};
@@ -135,18 +144,36 @@ fn input_refusal<O: Operation>(
     }
 }
 
-/// One table entry: the routing key the model names `O` by, and the check that reads
-/// and faults ITS input. The key is read off the operation rather than spelled out, so
-/// an entry cannot name a key the routing table does not use.
-fn check<O: Operation>() -> (&'static str, InputCheck) {
-    (O::NAME, input_refusal::<O> as InputCheck)
+/// One operation of this service, as this module needs it: the check that reads and
+/// faults ITS input, and the input schema that carries the `@http` route the model binds
+/// it to.
+struct Checked {
+    /// That operation's own `Operation::INPUT_SCHEMA`, so the METHOD and the URI pattern
+    /// of its route are read off the model rather than copied into a literal here.
+    input: &'static Schema,
+    /// How a request is read and faulted as that operation's input.
+    refuse: InputCheck,
+}
+
+/// One table entry: the routing key the model names `O` by, and what this module needs
+/// of `O`. Both halves are read off the operation rather than spelled out, so an entry
+/// cannot name a key the routing table does not use, nor a route the model does not bind
+/// to it.
+fn check<O: Operation>() -> (&'static str, Checked) {
+    (
+        O::NAME,
+        Checked {
+            input: O::INPUT_SCHEMA,
+            refuse: input_refusal::<O> as InputCheck,
+        },
+    )
 }
 
 /// Every modelled operation of this service, by the routing key the model names it by.
 ///
 /// All 26 are here because all 26 share the seam this module exists for: an operation
 /// left out would answer its boundary refusals without the `reason` the model requires.
-fn checks<Eng: Send + Sync + 'static>() -> HashMap<&'static str, InputCheck> {
+fn checks<Eng: Send + Sync + 'static>() -> HashMap<&'static str, Checked> {
     HashMap::from([
         check::<crate::ops::batch_get_user_access_tasks::BatchGetUserAccessTasks<Eng>>(),
         check::<crate::ops::connect_app_authorization::ConnectAppAuthorization<Eng>>(),
@@ -186,7 +213,7 @@ fn checks<Eng: Send + Sync + 'static>() -> HashMap<&'static str, InputCheck> {
 /// every answer a request that IS valid gets; this wrapper owns only the shape of a
 /// refusal of the request.
 pub struct RequestValidation {
-    checks: HashMap<&'static str, InputCheck>,
+    checks: HashMap<&'static str, Checked>,
 }
 
 impl RequestValidation {
@@ -199,19 +226,65 @@ impl RequestValidation {
         }
     }
 
-    /// Whether this service's generated routing table can serve `req` — the condition
-    /// under which the service claims it for this wrapper, so a request that names no
-    /// modelled operation keeps the framework's own routing refusal.
-    pub fn serves<Eng: Send + Sync + 'static>(
-        entry: &crate::ServiceDefinition<Eng>,
-        req: &RtRequest,
-    ) -> bool {
-        entry
-            .protocol()
-            .routing_key(req)
-            .ok()
-            .and_then(|key| entry.routing_table().get(key))
+    /// Whether one of this service's modelled operations serves `req` — the condition
+    /// under which the service claims it for this wrapper, so a request that addresses
+    /// no operation of this service at all keeps the framework's own routing refusal.
+    pub fn serves(&self, definition: &dyn ErasedServiceDefinition, req: &RtRequest) -> bool {
+        self.serving_key(definition, req).is_some()
+    }
+
+    /// The routing key of the operation that serves `req`: the one the model's own
+    /// routing table names for it, or — for a request the REST router could match to no
+    /// route — the one whose modelled route `req` ADDRESSES.
+    ///
+    /// The second case exists because the REST router rejects a candidate route whose
+    /// `@required` header/query bindings are absent from the request
+    /// (`required_binding_score`, `vendor/smithy-schema-server/src/rest_xml.rs`), which is
+    /// how a model that overloads ONE method + URI template across several operations
+    /// tells them apart by the shape of the request. That discrimination picks BETWEEN
+    /// operations; it cannot un-name the only operation a route has. So for a model that
+    /// binds a method + URI template to exactly one operation, a request leaving such a
+    /// parameter out matches no route and would be answered as an operation nobody
+    /// implemented, although the operation is implemented and the request is simply one
+    /// its own values refuse. Naming the addressed operation here hands the request to it,
+    /// so it is answered from the request's own values — through this module, so an absent
+    /// member is stated in the modelled `ValidationException` exactly as an absent body or
+    /// path member of the same operation already is.
+    ///
+    /// Which route a request addresses is read off each operation's OWN `@http` binding,
+    /// through the shared reader (`service_common::addresses_modeled_http_route`), so no
+    /// method, URI template or parameter name is written out here and an operation can
+    /// only ever serve the route the model binds to it. A request addressing more than one
+    /// operation's route is left to the framework: choosing between overloaded routes is
+    /// the router's own job, and this model overloads none.
+    fn serving_key<'r>(
+        &self,
+        definition: &dyn ErasedServiceDefinition,
+        req: &'r RtRequest,
+    ) -> Option<&'r str> {
+        if let Ok(key) = definition.protocol().routing_key(req) {
+            if definition.routing_table().get(key).is_some() {
+                return Some(key);
+            }
+        }
+        let addressed = self.route_addressed(req)?;
+        definition
+            .routing_table()
+            .get(addressed)
             .is_some()
+            .then_some(addressed)
+    }
+
+    /// The one operation of this service whose modelled route `req` addresses, or `None`
+    /// when it addresses none of them — or more than one.
+    fn route_addressed(&self, req: &RtRequest) -> Option<&'static str> {
+        let mut addressing = self
+            .checks
+            .iter()
+            .filter(|(_, checked)| service_common::addresses_modeled_http_route(req, checked.input))
+            .map(|(operation, _)| *operation);
+        let addressed = addressing.next()?;
+        addressing.next().is_none().then_some(addressed)
     }
 }
 
@@ -223,17 +296,18 @@ impl ErasedOperation for RequestValidation {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            let protocol = svc.definition().protocol();
-            let Ok(key) = protocol.routing_key(req) else {
+            let definition = svc.definition();
+            let protocol = definition.protocol();
+            let Some(key) = self.serving_key(definition, req) else {
                 // Unreachable through `Service::override_operation`, which claims a
-                // request only when the routing table holds its key; answered as the
-                // framework answers an unroutable request rather than guessed at.
-                return svc.definition().routing_error_response(req);
+                // request only when an operation serves it; answered as the framework
+                // answers an unroutable request rather than guessed at.
+                return definition.routing_error_response(req);
             };
             let refused = self
                 .checks
                 .get(key)
-                .and_then(|check| check(protocol, req))
+                .and_then(|checked| (checked.refuse)(protocol, req))
                 .and_then(|refusal| refusal.exception());
             if let Some(exception) = refused {
                 return protocol
@@ -243,14 +317,14 @@ impl ErasedOperation for RequestValidation {
                         super::VALIDATION_EXCEPTION,
                         VALIDATION_STATUS,
                     )
-                    .unwrap_or_else(|e| svc.definition().framework_error_response(e, req));
+                    .unwrap_or_else(|e| definition.framework_error_response(e, req));
             }
             // Nothing to restate: run the generated deserialize -> validate -> handle
             // -> serialize walk. Reached through the routing table rather than through
             // `override_operation`, which would route straight back here.
-            match svc.definition().routing_table().get(key) {
+            match definition.routing_table().get(key) {
                 Some(op) => op.run(svc, req, ctx).await,
-                None => svc.definition().routing_error_response(req),
+                None => definition.routing_error_response(req),
             }
         })
     }
@@ -283,5 +357,33 @@ mod tests {
                 "case {key:?}: the routing table must serve every checked operation"
             );
         }
+    }
+
+    /// No two operations of this model bind the same method + URI template.
+    ///
+    /// What [`RequestValidation::serving_key`] rests on: where exactly one operation is
+    /// bound to a route, a request the router matched to no route addresses that one
+    /// operation and nothing else, so handing it there cannot take a request off an
+    /// operation the router would have chosen. A model that did overload a route would
+    /// make this fail here rather than let the fallback pick between the two (it picks
+    /// neither — it declines, and the framework answers).
+    #[test]
+    fn every_checked_operation_binds_its_own_method_and_uri_template() {
+        let mut bound: Vec<(String, &'static str)> = Vec::new();
+        for (operation, checked) in &checks::<()>() {
+            let Some(http) = checked.input.http() else {
+                continue;
+            };
+            let route = format!("{} {}", http.method(), http.uri());
+            if let Some((_, other)) = bound.iter().find(|(seen, _)| *seen == route) {
+                panic!("case {route:?}: bound to both {other:?} and {operation:?}");
+            }
+            bound.push((route, operation));
+        }
+        assert_eq!(
+            bound.len(),
+            checks::<()>().len(),
+            "case {bound:?}: every operation of this model binds a route"
+        );
     }
 }

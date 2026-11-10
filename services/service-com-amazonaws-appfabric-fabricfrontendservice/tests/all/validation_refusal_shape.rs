@@ -71,7 +71,7 @@ struct Refusal {
 }
 
 /// The `reason` of a refusal, or `""`.
-fn reason(answer: &Answer) -> String {
+pub(crate) fn reason(answer: &Answer) -> String {
     answer
         .body
         .get("reason")
@@ -82,7 +82,7 @@ fn reason(answer: &Answer) -> String {
 
 /// The `name`/`message` pairs of a refusal's `fieldList`, in the order it states
 /// them.
-fn field_list(answer: &Answer) -> Vec<(String, String)> {
+pub(crate) fn field_list(answer: &Answer) -> Vec<(String, String)> {
     answer
         .body
         .get("fieldList")
