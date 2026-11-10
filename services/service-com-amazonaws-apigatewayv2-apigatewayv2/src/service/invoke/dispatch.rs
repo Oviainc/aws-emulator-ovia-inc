@@ -342,7 +342,9 @@ async fn lambda_proxy(
             return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
         }
     };
-    let ran = match lambda::invoke_function(ctx, &target, payload, deadline(integration)).await {
+    let ran = match lambda::invoke_function(ctx.callback(), &target, payload, deadline(integration))
+        .await
+    {
         Ok(ran) => ran,
         Err(unreached) => return unanswered(dispatch, unreached),
     };

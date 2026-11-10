@@ -24,30 +24,37 @@
 //!    while an HTTP method is read as it stands. So ONE announced address serves both the
 //!    `wss://` a client of AWS dials and the `ws://` a client that does not verify a
 //!    self-signed certificate dials, and the service never touches a key or a certificate.
-//! 2. The HANDSHAKE, by the maintained RFC 6455 implementation (`tokio-tungstenite`): it
-//!    reads the opening handshake, derives `Sec-WebSocket-Accept` and writes either
-//!    `101 Switching Protocols` or the refusal this module decided ([`admission`]). Nothing
-//!    about the protocol is hand-written here.
+//! 2. The HANDSHAKE's own bytes, read here before the WebSocket implementation sees them:
+//!    the decision this connection needs is AWAITED — the `$connect` route's integration
+//!    and the authorizer in front of it are each a Lambda invocation — while that
+//!    implementation's handshake callback is synchronous, so the request head is read and
+//!    parsed first ([`Offer`], by the maintained `httparse`), the decision is made, and
+//!    every byte read is then REPLAYED to the implementation ([`Prefixed`]), which derives
+//!    `Sec-WebSocket-Accept` and writes either `101 Switching Protocols` or the refusal that
+//!    decision carries ([`admission`]). Nothing about the protocol is hand-written here.
 //! 3. The FRAMES, each dispatched to the route the api's `RouteSelectionExpression` selects
-//!    and answered by that route's integration ([`super::dispatch`]), and each frame pushed
-//!    TO the connection written back over the same socket.
-//! 4. The CLOSE, which ends the connection's record: from then on its `ConnectionId`
-//!    addresses a connection that no longer exists.
+//!    and answered by that route's integration PERFORMED ([`super::integration`]), and each
+//!    frame pushed TO the connection written back over the same socket.
+//! 4. The CLOSE, which invokes the `$disconnect` route's integration and ends the
+//!    connection's record: from then on its `ConnectionId` addresses a connection that no
+//!    longer exists.
 //!
 //! Every answer is computed from this service's own records — the api, its stage, the
 //! configuration that stage's deployment froze — read under the one shared store lock, and
-//! the authorization the connection request's route carries is applied by the SAME rule the
-//! service endpoint applies it by ([`super::connect_authorization_refusal`]).
+//! never while an integration is awaited; the authorization the connection request's route
+//! carries is applied by the SAME rule the service endpoint applies it by
+//! ([`super::connect_authorization`]).
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::SystemTime;
 
 use ::emulator_server::{ListenerConn, NativeHandler, TlsUpgrader};
 use ::futures_util::{SinkExt, StreamExt};
 use ::service_com_amazonaws_apigatewaymanagementapi_apigatewaymanagementapi::state as connections;
+use ::smithy_server_runtime::EmbeddedEmulator;
 use ::tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use ::tokio::sync::mpsc::{channel, Receiver, Sender};
 use ::tokio_tungstenite::tungstenite::handshake::server::{
@@ -55,7 +62,8 @@ use ::tokio_tungstenite::tungstenite::handshake::server::{
 };
 use ::tokio_tungstenite::tungstenite::Message;
 
-use super::dispatch;
+use super::event::{Call, Connection};
+use super::{dispatch, event, integration};
 use crate::state::ComAmazonawsApigatewayv2Apigatewayv2State as ServiceStore;
 
 /// The first byte of a TLS record, which is what a client that dialled `wss://` opens with:
@@ -78,8 +86,14 @@ const FRAME_REQUEST_ID_MEMBER: &str = "requestId";
 /// the port open for as long as the api exists. `Err` when this service was mounted on an
 /// engine with no listener surface, or when the core could not bind: the caller then answers
 /// that rather than announcing an address nothing serves.
+///
+/// `callback` is the in-process transport this api's routes are performed over — the handle
+/// the operation that mints the api is given (`OperationContext::callback`), kept for the
+/// socket's whole life because a frame arriving on it has no request and no context of its
+/// own, and a route's integration is a call into the service that owns the backend.
 pub async fn open_for_api<Eng: Send + Sync + 'static>(
     engine: &Eng,
+    callback: EmbeddedEmulator,
     api_id: &str,
 ) -> Result<String, String> {
     let shared = (engine as &dyn ::std::any::Any)
@@ -95,6 +109,7 @@ pub async fn open_for_api<Eng: Send + Sync + 'static>(
         state: state.clone(),
         registry,
         api_id: api_id.to_string(),
+        callback,
         // The core's own TLS server, for a client that dialled `wss://`. A core that cannot
         // prepare it leaves this `None`, and such a client is then refused at the first byte
         // rather than being answered in the clear.
@@ -123,6 +138,7 @@ struct StageSocket {
     state: ::engine::ServiceState<ServiceStore>,
     registry: ::engine::ServiceState<connections::ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState>,
     api_id: String,
+    callback: EmbeddedEmulator,
     upgrader: Option<TlsUpgrader>,
 }
 
@@ -133,15 +149,16 @@ impl NativeHandler for StageSocket {
         let state = self.state.clone();
         let registry = self.registry.clone();
         let api_id = self.api_id.clone();
+        let callback = self.callback.clone();
         let upgrader = self.upgrader.clone();
         Box::pin(async move {
-            serve_connection(state, registry, api_id, upgrader, conn).await;
+            serve_connection(state, registry, api_id, callback, upgrader, conn).await;
         })
     }
 }
 
-/// Serve one accepted connection: negotiate encryption, complete (or refuse) the handshake,
-/// then carry frames until either side closes.
+/// Serve one accepted connection: negotiate encryption, decide the handshake, complete (or
+/// refuse) it, then carry frames until either side closes.
 // The handshake callback's `Err` is the REFUSAL RESPONSE the WebSocket implementation writes
 // (`http::Response<Option<String>>`), which is that dependency's own signature and is large
 // by the `http` crate's measure. Boxing it is not available: the callback's type is the one
@@ -151,30 +168,38 @@ async fn serve_connection(
     state: ::engine::ServiceState<ServiceStore>,
     registry: ::engine::ServiceState<connections::ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState>,
     api_id: String,
+    callback: EmbeddedEmulator,
     upgrader: Option<TlsUpgrader>,
     conn: ListenerConn,
 ) {
-    let Some(conn) = negotiated(conn, upgrader).await else {
+    let Some(mut conn) = negotiated(conn, upgrader).await else {
         return;
     };
-    // Decided inside the handshake callback, which is where the request's path and headers
-    // are, and read back here once the handshake has been written.
-    let admitted: Arc<Mutex<Option<Admitted>>> = Arc::new(Mutex::new(None));
-    let decide = {
-        let state = state.clone();
-        let api_id = api_id.clone();
-        let admitted = Arc::clone(&admitted);
-        move |request: &HandshakeRequest,
-              response: HandshakeResponse|
-              -> Result<HandshakeResponse, ErrorResponse> {
-            match admission(&state, &api_id, request) {
-                Ok(accepted) => {
-                    *admitted.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                        Some(accepted);
-                    Ok(response)
-                }
-                Err(refusal) => Err(refusal.rendered()),
-            }
+    // The request head is read HERE, before the WebSocket implementation sees it, because
+    // the decision below is AWAITED; every byte read is replayed to that implementation, so
+    // the handshake it completes is the one the client sent. See the module docs.
+    let Some(head) = request_head(&mut conn).await else {
+        return;
+    };
+    let Some(offer) = Offer::of(&head) else {
+        tracing::debug!(%api_id, "a connection opened with no readable HTTP request head");
+        return;
+    };
+    let (admitted, refusal) = match admission(&state, &callback, &api_id, &offer).await {
+        Ok(admitted) => (Some(admitted), None),
+        Err(refusal) => (None, Some(refusal)),
+    };
+    let conn: ListenerConn = Box::new(Prefixed {
+        prefix: head,
+        read: 0,
+        inner: conn,
+    });
+    let decide = move |_request: &HandshakeRequest,
+                       response: HandshakeResponse|
+     -> Result<HandshakeResponse, ErrorResponse> {
+        match &refusal {
+            None => Ok(response),
+            Some(refusal) => Err(refusal.rendered()),
         }
     };
     let socket = match ::tokio_tungstenite::accept_hdr_async_with_config(
@@ -192,14 +217,112 @@ async fn serve_connection(
             return;
         }
     };
-    let Some(accepted) = admitted
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-    else {
+    let Some(accepted) = admitted else {
         return;
     };
-    carry_frames(state, registry, api_id, accepted, socket).await;
+    carry_frames(state, registry, callback, accepted, socket).await;
+}
+
+/// The bytes of one HTTP request HEAD, read up to and including the blank line that ends it,
+/// or `None` for a client that sent none within [`MAX_HEAD_BYTES`].
+///
+/// Reading stops at the end of the head, and whatever arrived in the same chunk is kept in
+/// the answer: the caller replays every byte read, so a client that sent more behind its
+/// handshake loses none of it.
+async fn request_head(conn: &mut ListenerConn) -> Option<Vec<u8>> {
+    /// The blank line that ends an HTTP request head (RFC 9112 §2.1).
+    const HEAD_TERMINATOR: &[u8] = b"\r\n\r\n";
+    let mut head: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while head.len() < MAX_HEAD_BYTES {
+        match conn.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(read) => head.extend_from_slice(&chunk[..read]),
+        }
+        if head
+            .windows(HEAD_TERMINATOR.len())
+            .any(|window| window == HEAD_TERMINATOR)
+        {
+            return Some(head);
+        }
+    }
+    None
+}
+
+/// How many bytes of request head this data plane reads before giving up on a client.
+///
+/// Stated here rather than left to a default, so the bound a caller's bytes are buffered
+/// under is citable: it is what stands between one local caller and the host's memory, since
+/// the head is read into a buffer sized by what that caller sent. It is far above the few
+/// hundred bytes of an RFC 6455 opening handshake, and above the 8 KiB of request line and
+/// fields a server is conventionally held to.
+const MAX_HEAD_BYTES: usize = 16 * 1024;
+
+/// How many header fields of one opening handshake are read. Well above the handful a
+/// WebSocket client sends; a client that sends more is not served at all, rather than served
+/// from a part of what it said.
+const MAX_HEADER_FIELDS: usize = 96;
+
+/// The OPENING HANDSHAKE as this data plane reads it: what it addressed, and what it said.
+///
+/// Parsed by the maintained HTTP/1 parser (`httparse`, the one the WebSocket implementation
+/// itself reads a handshake with), so no request grammar is written here.
+#[derive(Debug, Clone)]
+struct Offer {
+    /// The request target as written: the path, and any query string after it.
+    target: String,
+    /// Every header field, under the name the client sent it with; a field that appeared
+    /// more than once is one comma-separated value (RFC 9110 §5.3). The spelling is KEPT
+    /// because it is what the event reports (`super::event`), and every lookup here is
+    /// case-insensitive instead.
+    headers: BTreeMap<String, String>,
+}
+
+impl Offer {
+    /// The handshake `head` states, or `None` when those bytes are no complete HTTP request.
+    fn of(head: &[u8]) -> Option<Self> {
+        let mut fields = [::httparse::EMPTY_HEADER; MAX_HEADER_FIELDS];
+        let mut request = ::httparse::Request::new(&mut fields);
+        if !matches!(
+            request.parse(head),
+            Ok(::httparse::Status::Complete(_consumed))
+        ) {
+            return None;
+        }
+        let target = request.path?.to_string();
+        let mut headers: BTreeMap<String, String> = BTreeMap::new();
+        for field in request.headers.iter() {
+            let Ok(value) = std::str::from_utf8(field.value) else {
+                continue;
+            };
+            // A field the client repeated is one comma-separated value, under the spelling
+            // it first used.
+            match headers
+                .iter_mut()
+                .find(|(name, _)| name.eq_ignore_ascii_case(field.name))
+            {
+                Some((_, held)) => {
+                    held.push(',');
+                    held.push_str(value.trim());
+                }
+                None => {
+                    headers.insert(field.name.to_string(), value.trim().to_string());
+                }
+            }
+        }
+        Some(Self { target, headers })
+    }
+
+    /// The value this handshake carries for the header `name`, read case-insensitively as a
+    /// header name is.
+    fn header(&self, name: &str) -> Option<String> {
+        event::field(&self.headers, name).map(str::to_string)
+    }
+
+    /// The path the handshake addressed, with its query string removed.
+    fn path(&self) -> &str {
+        super::super::data_plane::path_of(&self.target)
+    }
 }
 
 /// The largest MESSAGE this data plane reads from a client, in bytes: the 128 KiB a frame of
@@ -314,42 +437,82 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
     }
 }
 
-/// What the handshake resolved: the stage of this api the connection reached, and what the
-/// connection is attributed to.
+/// What the handshake resolved: the CONNECTION it offered, as every event of that
+/// connection reports it.
 #[derive(Debug, Clone)]
 struct Admitted {
-    stage_name: String,
-    user_agent: Option<String>,
+    connection: Connection,
 }
 
-/// How a handshake this endpoint does not complete is answered: an HTTP status and the
-/// `{"message": …}` body API Gateway's own endpoint answers it with.
+/// How a handshake this endpoint does not complete is answered: an HTTP status, and the
+/// body the client reads with it.
 #[derive(Debug, Clone)]
 struct Refusal {
     status: u16,
-    message: String,
+    /// What the client reads: `Gateway` for a refusal the GATEWAY states, which carries the
+    /// `{"message": …}` body API Gateway's own endpoint answers with, and `Backend` for one
+    /// the connection request's own integration decided, which carries that integration's
+    /// own body — "the response body is the $connect integration's own body bytes".
+    body: RefusalBody,
+}
+
+/// The two bodies a refused handshake can carry; see [`Refusal::body`].
+#[derive(Debug, Clone)]
+enum RefusalBody {
+    Gateway(String),
+    Backend(Option<String>),
 }
 
 impl Refusal {
-    /// The handshake refusal as the RFC 6455 implementation writes it: the status, the JSON
-    /// media type and the body. A status the `http` crate does not build is answered as the
-    /// internal failure it is.
+    /// A refusal the GATEWAY states, with the sentence it words it in.
+    fn gateway(status: u16, message: &str) -> Self {
+        Self {
+            status,
+            body: RefusalBody::Gateway(message.to_string()),
+        }
+    }
+
+    /// A refusal the CONNECTION REQUEST's own integration decided: its status, and its own
+    /// body relayed to the client.
+    ///
+    /// The body travels only when the integration's bytes are text, which is what an HTTP
+    /// refusal body is and what the handshake implementation writes; a reply that is not
+    /// text is answered with the status alone rather than with bytes altered to fit.
+    fn from_backend(status: u16, body: Option<Vec<u8>>) -> Self {
+        Self {
+            status,
+            body: RefusalBody::Backend(body.and_then(|bytes| String::from_utf8(bytes).ok())),
+        }
+    }
+
+    /// The handshake refusal as the RFC 6455 implementation writes it: the status, and the
+    /// body with the media type that body is. A status the `http` crate does not build is
+    /// answered as the internal failure it is.
     fn rendered(&self) -> ErrorResponse {
-        let body = ::serde_json::json!({ FRAME_MESSAGE_MEMBER: self.message }).to_string();
-        ::http::Response::builder()
-            .status(self.status)
-            .header("content-type", super::super::data_plane::JSON_CONTENT_TYPE)
-            .body(Some(body))
-            .unwrap_or_else(|_| {
-                ::http::Response::builder()
-                    .status(super::super::data_plane::UNPLACEABLE_STATUS)
-                    .body(None)
-                    .expect("500 with no body builds")
-            })
+        let mut response = ::http::Response::builder().status(self.status);
+        let body = match &self.body {
+            RefusalBody::Gateway(message) => {
+                response = response.header(
+                    "content-type",
+                    super::super::data_plane::JSON_CONTENT_TYPE,
+                );
+                Some(::serde_json::json!({ FRAME_MESSAGE_MEMBER: message }).to_string())
+            }
+            // The integration's own bytes, relayed as it returned them: nothing here says
+            // what they are, so no media type is stated for them.
+            RefusalBody::Backend(body) => body.clone(),
+        };
+        response.body(body).unwrap_or_else(|_| {
+            ::http::Response::builder()
+                .status(super::super::data_plane::UNPLACEABLE_STATUS)
+                .body(None)
+                .expect("500 with no body builds")
+        })
     }
 }
 
-/// Whether this opening handshake is completed, from the api's own records.
+/// Whether this opening handshake is completed, from the api's own records and from what the
+/// connection request's own backend answered.
 ///
 /// The steps, in the order API Gateway applies them, with the core's own browser check in
 /// front of them:
@@ -362,94 +525,78 @@ impl Refusal {
 ///    a step that resolves nothing is `403` `{"message":"Forbidden"}`, which is what the
 ///    `execute-api` endpoint answers for a stage it does not serve;
 /// 2. the AUTHORIZATION the `$connect` route carries is applied before anything that route
-///    fronts, by the same rule the service endpoint applies it by
-///    ([`super::connect_authorization_refusal`]);
-/// 3. the CONNECTION REQUEST is served by the `$connect` route's integration, and the
-///    handshake completes only on a successful reply ([`dispatch::connection_request`]): a
-///    reply the configuration cannot produce is `500`, the answer a gateway gives for an
-///    integration it cannot answer the connection request from.
-fn admission(
+///    fronts ([`super::connect_authorization`]): a handshake missing an identity source is
+///    `401` `{"message":"Unauthorized"}` with the authorizer never invoked, and past that
+///    precondition the authorizer's own function decides — a DENY is `403`
+///    ([`super::connect_authorizer`]), and what it ALLOWS travels with the connection into
+///    every later call's event;
+/// 3. the CONNECTION REQUEST is served by the `$connect` route's integration, PERFORMED
+///    ([`super::integration`]), and the handshake completes only on a `2xx` reply. A reply
+///    OUTSIDE `2xx` refuses the handshake with the status that integration answered and the
+///    body it answered, because `$connect` is where a backend admits or refuses a client; a
+///    reply naming no status, or none at all, is the gateway's own `500`.
+///
+/// The connection's own id is minted BEFORE the connection request is served, because the
+/// event that request is served with carries it: `$connect` is where a handler learns the
+/// id it will later address the client by.
+///
+/// Nothing holds the store lock while a backend is awaited: every record the decision needs
+/// is read under one lock and owned from then on.
+async fn admission(
     state: &::engine::ServiceState<ServiceStore>,
+    callback: &EmbeddedEmulator,
     api_id: &str,
-    request: &HandshakeRequest,
+    offer: &Offer,
 ) -> Result<Admitted, Refusal> {
-    if let Some(refusal) = browser_refusal(request) {
+    if let Some(refusal) = browser_refusal(offer) {
         return Err(refusal);
     }
-    let path = request.uri().path().to_string();
-    let stage_name = super::super::data_plane::first_segment(&path)
+    let stage_name = super::super::data_plane::first_segment(offer.path())
         .unwrap_or_default()
         .to_string();
-    let user_agent = request
-        .headers()
-        .get(::http::header::USER_AGENT)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let store = state.lock();
-    let Some(api) = store.apis.get(api_id) else {
-        // The api was deleted between the handshake arriving and now; its socket is closing.
-        return Err(forbidden());
-    };
-    let Some(stage) = api.stages.get(&stage_name) else {
-        tracing::debug!(%api_id, stage = %stage_name, "a handshake named no stage of this api");
-        return Err(forbidden());
-    };
-    let deployment = stage
-        .deployment_id
-        .as_deref()
-        .and_then(|deployment_id| api.deployments.get(deployment_id));
-    let Some(deployment) = deployment else {
-        tracing::debug!(
-            %api_id,
-            stage = %stage_name,
-            "a handshake named a stage with no deployment released to it"
-        );
-        return Err(forbidden());
-    };
-    if let Some((status, message)) = super::connect_authorization_refusal(
-        api,
-        stage,
-        &deployment.configuration,
-        |name: &str| {
-            request
-                .headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-        },
-        &request
-            .uri()
-            .path_and_query()
-            .map(|both| both.as_str().to_string())
-            .unwrap_or_else(|| path.clone()),
-    ) {
-        return Err(Refusal {
-            status,
-            message: message.to_string(),
-        });
+    let offered = offered(state, api_id, &stage_name, offer)?;
+    let mut connection = offered.connection;
+    if let Some((authorizer, identity)) = offered.authorizer {
+        let decided = super::connect_authorizer::decided(
+            callback,
+            &connection,
+            &authorizer,
+            &identity,
+        )
+        .await
+        .map_err(|(status, message)| Refusal::gateway(status, message))?;
+        connection.authorizer_context = decided.context;
+        connection.authorizer_principal = decided.principal_id;
     }
-    match dispatch::connection_request(&deployment.configuration) {
+    let Some(connect) = offered.connect else {
         // No `$connect` route: there is nothing to refuse the connection.
-        Ok(None) => Ok(Admitted {
-            stage_name,
-            user_agent,
-        }),
-        Ok(Some(reply)) if dispatch::is_success_status(reply.status_code.as_deref()) => {
-            Ok(Admitted {
-                stage_name,
-                user_agent,
-            })
+        return Ok(Admitted { connection });
+    };
+    match integration::perform(callback, &connection, &connect, &Call::Connect).await {
+        Ok(answered) if dispatch::is_success_status(answered.status_code.as_deref()) => {
+            Ok(Admitted { connection })
         }
-        Ok(Some(reply)) => {
+        Ok(answered) => {
+            // The STATUS the integration answered is what the handshake is refused with, and
+            // the body it answered is what the client reads: a `$connect` route is where a
+            // backend admits or refuses a client, so its own answer is the refusal rather
+            // than a status this gateway chose. A reply naming no status at all names no
+            // decision, which is the gateway's own `500`.
+            let status = answered
+                .status_code
+                .as_deref()
+                .and_then(|status| status.trim().parse::<u16>().ok());
             tracing::info!(
                 %api_id,
                 stage = %stage_name,
-                status = ?reply.status_code,
-                selected = %reply.selected_key,
+                status = ?answered.status_code,
                 "refusing a WebSocket handshake: the connection request's integration did \
                  not reply successfully"
             );
-            Err(internal_server_error())
+            match status {
+                Some(status) => Err(Refusal::from_backend(status, answered.payload)),
+                None => Err(internal_server_error()),
+            }
         }
         Err(unserved) => {
             tracing::info!(
@@ -464,13 +611,72 @@ fn admission(
     }
 }
 
+/// What the handshake OFFERED, read out of the store under one lock: the connection it would
+/// establish, the authorizer decision its `$connect` route still owes, and that route's
+/// integration to perform.
+#[derive(Debug, Clone)]
+struct Offered {
+    connection: Connection,
+    authorizer: Option<super::OwedDecision>,
+    connect: Option<integration::Selected>,
+}
+
+/// Read everything the decision needs out of the store, or the refusal a step that resolves
+/// nothing owes.
+fn offered(
+    state: &::engine::ServiceState<ServiceStore>,
+    api_id: &str,
+    stage_name: &str,
+    offer: &Offer,
+) -> Result<Offered, Refusal> {
+    let mut store = state.lock();
+    // One id per connection, minted from the transport's own counter and never reused.
+    let connection_id = store.websocket_transport.mint_connection_id();
+    let Some((api, stage, deployed)) = integration::deployed(&store, api_id, stage_name) else {
+        // The api was deleted between the handshake arriving and now (its socket is
+        // closing), or the path named no stage of it, or that stage has no deployment
+        // released to it: an endpoint that serves nothing.
+        tracing::debug!(
+            %api_id,
+            stage = %stage_name,
+            "a handshake named no deployed stage of this api"
+        );
+        return Err(forbidden());
+    };
+    let authorizer = super::connect_authorization(
+        api,
+        stage,
+        deployed,
+        |name: &str| offer.header(name),
+        &offer.target,
+    )
+    .map_err(|(status, message)| Refusal::gateway(status, message))?;
+    Ok(Offered {
+        connection: Connection {
+            api_id: api_id.to_string(),
+            stage_name: stage_name.to_string(),
+            connection_id,
+            region: api.region.clone(),
+            connected_at: SystemTime::now(),
+            headers: offer.headers.clone(),
+            query_parameters: super::super::data_plane::joined_query_parameters(&offer.target),
+            stage_variables: stage.stage_variables.clone(),
+            // Filled in by the authorizer's own decision, when a route names one.
+            authorizer_context: None,
+            authorizer_principal: None,
+        },
+        authorizer,
+        connect: integration::select_route_key(deployed, dispatch::CONNECT_ROUTE_KEY),
+    })
+}
+
 /// `403` `{"message":"Forbidden"}`, the answer an `execute-api` endpoint gives for a stage it
 /// does not serve.
 fn forbidden() -> Refusal {
-    Refusal {
-        status: super::super::data_plane::FORBIDDEN_STATUS,
-        message: super::super::data_plane::FORBIDDEN_MESSAGE.to_string(),
-    }
+    Refusal::gateway(
+        super::super::data_plane::FORBIDDEN_STATUS,
+        super::super::data_plane::FORBIDDEN_MESSAGE,
+    )
 }
 
 /// The refusal a handshake a BROWSER made from ANOTHER SITE owes, or `None` for every other
@@ -485,16 +691,10 @@ fn forbidden() -> Refusal {
 /// `403` before any record of the api is read. The policy is the default one — same-origin
 /// only, and no remote origin reaches a data plane — because nothing here is an operator
 /// knob.
-fn browser_refusal(request: &HandshakeRequest) -> Option<Refusal> {
-    let field = |name: ::http::HeaderName| {
-        request
-            .headers()
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-    };
+fn browser_refusal(offer: &Offer) -> Option<Refusal> {
     let verdict = ::emulator_server::classify_browser_request(
-        field(::http::header::ORIGIN),
-        field(::http::HeaderName::from_static("sec-fetch-site")),
+        offer.header(::http::header::ORIGIN.as_str()).as_deref(),
+        offer.header("sec-fetch-site").as_deref(),
         &::emulator_server::RemoteOrigins::SameOriginOnly,
         false,
     );
@@ -510,21 +710,19 @@ fn browser_refusal(request: &HandshakeRequest) -> Option<Refusal> {
 /// `500` `{"message":"Internal server error"}`, the answer a gateway gives for a call its
 /// api's own configuration cannot be served from.
 fn internal_server_error() -> Refusal {
-    Refusal {
-        status: super::super::data_plane::UNPLACEABLE_STATUS,
-        message: INTERNAL_MESSAGE.to_string(),
-    }
+    Refusal::gateway(super::super::data_plane::UNPLACEABLE_STATUS, INTERNAL_MESSAGE)
 }
 
 /// The sentence a `500` carries, as API Gateway words it.
 const INTERNAL_MESSAGE: &str = "Internal server error";
 
 /// Carry one established connection: register it, dispatch every frame the client sends,
-/// write every payload posted to it, and forget it when it closes.
+/// write every payload posted to it, invoke the `$disconnect` route when it ends, and forget
+/// it.
 async fn carry_frames<S>(
     state: ::engine::ServiceState<ServiceStore>,
     registry: ::engine::ServiceState<connections::ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState>,
-    api_id: String,
+    callback: EmbeddedEmulator,
     accepted: Admitted,
     socket: ::tokio_tungstenite::WebSocketStream<S>,
 ) where
@@ -532,7 +730,11 @@ async fn carry_frames<S>(
 {
     let (pushes, mut pushed): (Sender<Vec<u8>>, Receiver<Vec<u8>>) =
         channel(connections::CONNECTION_PUSH_DEPTH);
-    let connection_id = state.lock().websocket_transport.mint_connection_id();
+    let connection = accepted.connection;
+    let api_id = connection.api_id.clone();
+    // The id this connection was minted when the handshake was decided, which is the id the
+    // `$connect` route's own event already reported.
+    let connection_id = connection.connection_id.clone();
     // The connection EXISTS from here: it is registered in the registry the `@connections`
     // management API serves, with the channel that makes a `PostToConnection` to it a real
     // delivery over this socket. The registry holds the only sender, so a `DeleteConnection`
@@ -542,7 +744,10 @@ async fn carry_frames<S>(
         connection_id.clone(),
         connections::Identity {
             source_ip: LOOPBACK_SOURCE_IP.to_string(),
-            user_agent: accepted.user_agent.clone().unwrap_or_default(),
+            user_agent: connection
+                .user_agent()
+                .unwrap_or_default()
+                .to_string(),
         },
         SystemTime::now(),
         Some(pushes),
@@ -553,11 +758,13 @@ async fn carry_frames<S>(
     }
     tracing::info!(
         %api_id,
-        stage = %accepted.stage_name,
+        stage = %connection.stage_name,
         %connection_id,
         "a WebSocket connection is open"
     );
     let (mut outgoing, mut incoming) = socket.split();
+    // How the client ended the connection, for the `$disconnect` route's own event.
+    let mut closed: Option<(Option<u16>, Option<String>)> = None;
     loop {
         ::tokio::select! {
             push = pushed.recv() => {
@@ -575,24 +782,83 @@ async fn carry_frames<S>(
                     Message::Binary(bytes) => {
                         String::from_utf8(bytes.to_vec()).unwrap_or_default()
                     }
-                    Message::Close(_) => break,
+                    Message::Close(frame) => {
+                        closed = Some(match frame {
+                            Some(frame) => (
+                                Some(u16::from(frame.code)),
+                                Some(frame.reason.as_str().to_string()),
+                            ),
+                            None => (None, None),
+                        });
+                        break;
+                    }
                     // Ping, Pong and Frame are the protocol's own: the implementation answers
                     // a ping itself and nothing of the api serves them.
                     _ => continue,
                 };
-                if let Some(reply) = served_frame(&state, &api_id, &accepted.stage_name, &connection_id, &body) {
-                    if outgoing.send(Message::Text(reply.into())).await.is_err() {
+                if let Some(reply) = served_frame(&state, &callback, &connection, &body).await {
+                    if outgoing.send(frame_of(reply)).await.is_err() {
                         break;
                     }
                 }
             }
         }
     }
+    // The CLOSE is a call of this connection too: the `$disconnect` route's own integration
+    // is invoked with it, before the connection's record goes, so a handler that reads the
+    // registry still sees the connection it is being told about.
+    let (status_code, reason) = closed.unwrap_or((None, None));
+    disconnected(
+        &state,
+        &callback,
+        &connection,
+        Call::Disconnect {
+            status_code,
+            reason,
+        },
+    )
+    .await;
     // The connection has ended: its record goes, so its id addresses a connection that no
     // longer exists — which is `GoneException` from each of the three `@connections`
     // operations. The id stays ISSUED, so it is never refused as one that never existed.
     connections::close_connection(&registry, &connection_id);
     tracing::info!(%api_id, %connection_id, "a WebSocket connection is closed");
+}
+
+/// Invoke the `$disconnect` route's integration for a connection that has ended, if the
+/// serving deployment holds such a route.
+///
+/// "API Gateway invokes [the `$disconnect` route] when a client disconnects from your API",
+/// and the close is a one-way call: nothing can be sent back over a socket that has ended, so
+/// what the integration replied is logged and never answered.
+async fn disconnected(
+    state: &::engine::ServiceState<ServiceStore>,
+    callback: &EmbeddedEmulator,
+    connection: &Connection,
+    call: Call,
+) {
+    let selected = {
+        let store = state.lock();
+        let Some((_api, _stage, deployed)) = integration::deployed(
+            &store,
+            &connection.api_id,
+            &connection.stage_name,
+        ) else {
+            return;
+        };
+        integration::select_route_key(deployed, dispatch::DISCONNECT_ROUTE_KEY)
+    };
+    let Some(selected) = selected else {
+        return;
+    };
+    if let Err(unserved) = integration::perform(callback, connection, &selected, &call).await {
+        tracing::info!(
+            api_id = %connection.api_id,
+            connection_id = %connection.connection_id,
+            ?unserved,
+            "the $disconnect route's integration produced no reply"
+        );
+    }
 }
 
 /// The address a connection on a core-owned loopback listener comes from. The core does not
@@ -611,47 +877,58 @@ fn frame_of(frame: Vec<u8>) -> Message {
 
 /// What one frame is answered with, or `None` when the api sends nothing back for it.
 ///
-/// Three answers, all computed from the configuration the stage deployed
-/// ([`dispatch::message`]):
+/// Three answers, all from the configuration the stage deployed and from what the serving
+/// route's integration replied ([`integration::perform`]):
 ///
 /// * a message the api routes nowhere — no route's key is selected and there is no `$default`
 ///   route — is answered with the gateway's `Forbidden` frame;
 /// * a message whose route's integration produced no reply is answered with the gateway's
 ///   `Internal server error` frame;
 /// * a message served by a TWO-WAY route (one that declares a `RouteResponse`) is answered
-///   with what the selected integration response rendered. A route that declares none is
-///   one-way: its integration still runs, and nothing is sent back.
-fn served_frame(
+///   with the payload that integration replied — the body a function returned, or what a
+///   `MOCK` integration's selected response rendered. A route that declares none is one-way:
+///   its integration still runs, and nothing is sent back.
+///
+/// The store is read under one lock and released before the integration is performed: one
+/// connection's backend must not stall another connection's frame.
+async fn served_frame(
     state: &::engine::ServiceState<ServiceStore>,
-    api_id: &str,
-    stage_name: &str,
-    connection_id: &str,
+    callback: &EmbeddedEmulator,
+    connection: &Connection,
     body: &str,
-) -> Option<String> {
-    let store = state.lock();
-    let api = store.apis.get(api_id)?;
-    let stage = api.stages.get(stage_name)?;
-    let deployment = api.deployments.get(stage.deployment_id.as_deref()?)?;
-    match dispatch::message(api, &deployment.configuration, connection_id, body) {
-        Ok(None) => {
-            tracing::info!(%api_id, %connection_id, "a WebSocket message selected no route");
-            Some(gateway_frame(
-                super::super::data_plane::FORBIDDEN_MESSAGE,
-                connection_id,
-            ))
-        }
-        Ok(Some(served)) => {
+) -> Option<Vec<u8>> {
+    let api_id = connection.api_id.as_str();
+    let connection_id = connection.connection_id.as_str();
+    let selected = {
+        let store = state.lock();
+        let (api, _stage, deployed) =
+            integration::deployed(&store, api_id, &connection.stage_name)?;
+        integration::select_message(api, deployed, body)
+    };
+    let Some(selected) = selected else {
+        tracing::info!(%api_id, %connection_id, "a WebSocket message selected no route");
+        return Some(
+            gateway_frame(super::super::data_plane::FORBIDDEN_MESSAGE, connection_id)
+                .into_bytes(),
+        );
+    };
+    match integration::perform(
+        callback,
+        connection,
+        &selected,
+        &Call::Message(body.to_string()),
+    )
+    .await
+    {
+        Ok(answered) => {
             tracing::debug!(
                 %api_id,
                 %connection_id,
-                route_key = %served.route_key,
-                two_way = served.two_way,
+                route_key = %selected.route_key,
+                two_way = selected.two_way,
                 "a WebSocket message was served"
             );
-            served
-                .two_way
-                .then_some(served.reply.payload)
-                .flatten()
+            selected.two_way.then_some(answered.payload).flatten()
         }
         Err(unserved) => {
             tracing::info!(
@@ -660,7 +937,7 @@ fn served_frame(
                 ?unserved,
                 "a WebSocket message's route produced no reply"
             );
-            Some(gateway_frame(INTERNAL_MESSAGE, connection_id))
+            Some(gateway_frame(INTERNAL_MESSAGE, connection_id).into_bytes())
         }
     }
 }

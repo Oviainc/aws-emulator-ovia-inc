@@ -8586,6 +8586,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "httparse",
  "regex",
  "serde_json",
  "service-com-amazonaws-apigateway-backplanecontrolservice",

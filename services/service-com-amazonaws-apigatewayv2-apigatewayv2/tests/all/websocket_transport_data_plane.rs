@@ -206,7 +206,7 @@ async fn create_stage(
 }
 
 /// The socket a client gets from a completed handshake.
-type ClientSocket = tokio_tungstenite::WebSocketStream<TcpStream>;
+pub(crate) type ClientSocket = tokio_tungstenite::WebSocketStream<TcpStream>;
 
 /// The loopback host the core binds a resource listener on by default, and so the only
 /// address these cases ever dial: a case connects to the emulator's own listener on this
@@ -229,7 +229,7 @@ fn loopback_port(case: &str, authority: &str) -> u16 {
 }
 
 /// Dial the api's own announced socket on the loopback address above.
-async fn dial_loopback(case: &str, authority: &str) -> std::io::Result<TcpStream> {
+pub(crate) async fn dial_loopback(case: &str, authority: &str) -> std::io::Result<TcpStream> {
     let port = loopback_port(case, authority);
     TcpStream::connect(("127.0.0.1", port)).await
 }
@@ -241,13 +241,23 @@ async fn handshake(
     authority: &str,
     stage: &str,
 ) -> Result<ClientSocket, u16> {
+    handshake_at(case, authority, &format!("/{stage}")).await
+}
+
+/// [`handshake`] against any `path` of the announced socket — a stage, and whatever query
+/// string the client carries, which is what an identity source and a `$connect` event read.
+pub(crate) async fn handshake_at(
+    case: &str,
+    authority: &str,
+    path: &str,
+) -> Result<ClientSocket, u16> {
     let stream = dial_loopback(case, authority).await.unwrap_or_else(|error| {
         panic!(
             "case {case:?}: the announced socket {authority:?} must accept a connection, \
              got {error}"
         )
     });
-    let url = format!("ws://{authority}/{stage}");
+    let url = format!("ws://{authority}{path}");
     match tokio_tungstenite::client_async(&url, stream).await {
         Ok((socket, response)) => {
             assert_eq!(
@@ -266,7 +276,11 @@ async fn handshake(
 
 /// Send one message and read the frame the api answers with, or `None` when it answers
 /// nothing within [`FRAME_DEADLINE`].
-async fn exchange(case: &str, socket: &mut ClientSocket, message: &str) -> Option<String> {
+pub(crate) async fn exchange(
+    case: &str,
+    socket: &mut ClientSocket,
+    message: &str,
+) -> Option<String> {
     socket
         .send(Message::Text(message.to_string().into()))
         .await
@@ -344,11 +358,14 @@ async fn the_announced_socket_answers_the_handshake_from_the_apis_records() {
             expected: Err(INTERNAL_SERVER_ERROR),
         },
         Row {
-            // A $connect route whose integration DOES reach a backend: the backend is the
-            // one that would admit or refuse the client, and this data plane calls none for
-            // a WebSocket route, so it says so rather than admitting the connection on a
-            // decision nothing made.
-            case: "a $connect route fronting a backend this data plane does not call fails \
+            // A $connect route whose integration fronts a FUNCTION this emulator does not
+            // hold: the backend is the one that would admit or refuse the client, and an
+            // invocation that reaches no function gives the connection request no decision,
+            // so the handshake is refused rather than admitted on a decision nothing made.
+            // (A $connect route whose function DOES answer is driven in
+            // `websocket_lambda_routes.rs`, where AWS Lambda is mounted beside this
+            // service.)
+            case: "a $connect route fronting a function this emulator cannot reach fails \
                    the handshake",
             connect_integration: Some(json!({
                 "integrationType": "AWS_PROXY",

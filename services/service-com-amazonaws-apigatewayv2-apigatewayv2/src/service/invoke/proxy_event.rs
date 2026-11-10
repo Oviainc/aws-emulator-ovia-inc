@@ -439,7 +439,7 @@ fn request_context_1_0(
 /// the shape a REST proxy event carries, which this format is — and, for a JWT-authorized
 /// route, the `claims` and `scopes` of the accepted token, the two members the documented
 /// `1.0` event of an HTTP api carries there.
-fn authorizer_1_0(invocation: &Invocation) -> Option<Value> {
+pub(crate) fn authorizer_1_0(invocation: &Invocation) -> Option<Value> {
     let context = invocation.authorizer_context.clone();
     let principal = invocation.authorizer_principal.clone();
     if context.is_none() && principal.is_none() && invocation.admitted_jwt.is_none() {
@@ -508,13 +508,13 @@ pub fn authorizer_event(
 }
 
 /// A single-valued JSON map of `values`, always present (a `1.0` event's `headers`).
-fn single_valued(values: &BTreeMap<String, String>) -> Value {
+pub(crate) fn single_valued(values: &BTreeMap<String, String>) -> Value {
     json!(values)
 }
 
 /// The multi-valued form of `values`: each name against the list its comma-joined value
 /// splits into, which is how a `1.0` event reports a header that appeared more than once.
-fn multi_valued(values: &BTreeMap<String, String>) -> Value {
+pub(crate) fn multi_valued(values: &BTreeMap<String, String>) -> Value {
     let multi: BTreeMap<String, Vec<String>> = values
         .iter()
         .map(|(name, value)| {
@@ -533,7 +533,7 @@ fn multi_valued(values: &BTreeMap<String, String>) -> Value {
 
 /// `values` as a JSON map, or JSON null for an empty one: a `1.0` event reports an absent
 /// collection as `null` rather than as an empty object.
-fn optional_map(values: &BTreeMap<String, String>) -> Value {
+pub(crate) fn optional_map(values: &BTreeMap<String, String>) -> Value {
     if values.is_empty() {
         return Value::Null;
     }
@@ -541,7 +541,7 @@ fn optional_map(values: &BTreeMap<String, String>) -> Value {
 }
 
 /// [`optional_map`] in the multi-valued form.
-fn optional_multi_map(values: &BTreeMap<String, String>) -> Value {
+pub(crate) fn optional_multi_map(values: &BTreeMap<String, String>) -> Value {
     if values.is_empty() {
         return Value::Null;
     }
@@ -564,7 +564,7 @@ fn domain_prefix(domain_name: &str) -> String {
 /// The calendar conversion is the maintained library's
 /// (`aws_smithy_types::DateTime`), so month lengths and leap years are not re-derived here;
 /// only the field ORDER of the format is applied.
-fn common_log_time(received: SystemTime) -> String {
+pub(crate) fn common_log_time(received: SystemTime) -> String {
     let rendered = ::aws_smithy_types::DateTime::from(received)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_default();
@@ -603,7 +603,7 @@ const MONTH_NAMES: [&str; 12] = [
 /// `received` as whole milliseconds since the epoch, which `timeEpoch` /
 /// `requestTimeEpoch` state it in. An instant before the epoch reads as the epoch, so the
 /// value is always the millisecond count of an instant.
-fn epoch_millis(received: SystemTime) -> i64 {
+pub(crate) fn epoch_millis(received: SystemTime) -> i64 {
     received
         .duration_since(UNIX_EPOCH)
         .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))

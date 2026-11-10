@@ -54,10 +54,14 @@
 //! - [`websocket`] — a WEBSOCKET api, whose data plane is a SOCKET: the core opens one per
 //!   api ([`websocket::transport`], reached from the operation that mints the api), that
 //!   socket completes the RFC 6455 handshake and carries the frames each route serves
-//!   ([`websocket::dispatch`]), and the address it landed on is what the api announces as its
-//!   `ApiEndpoint`. The same handshake arriving at this emulator's own SERVICE endpoint is
-//!   claimed ([`websocket::claims_parts`]) and answered from the api's records there too
-//!   ([`websocket::serve`], reached from [`Service::override_routing_error`]);
+//!   ([`websocket::dispatch`], [`websocket::integration`]), and the address it landed on is
+//!   what the api announces as its `ApiEndpoint`. The same handshake arriving at this
+//!   emulator's own SERVICE endpoint is claimed ([`websocket::claims_parts`]) and answered
+//!   from the api's records there too — as an OPERATION
+//!   ([`websocket::serve_with_transport`], which performs the authorizer and the `$connect`
+//!   route the handshake's refusals come from), and from
+//!   [`Service::override_routing_error`] ([`websocket::serve`]) for the one handshake the
+//!   front door would refuse before naming an operation;
 //! - [`invoke`] — an ordinary HTTP request to a route of a deployed HTTP api stage: the
 //!   claim ([`invoke::claims_parts`]), and the serving ([`invoke::serve`]) as an OPERATION
 //!   of this service's own ([`Service::override_operation`]), which is how the router hands
@@ -306,6 +310,13 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for HttpApiDataPlane<Eng> {
             if invoke::claims_request(&*self.engine, req) {
                 return invoke::serve(&*self.engine, req, ctx).await;
             }
+            // A WebSocket opening handshake arriving at this emulator's own endpoint: the
+            // two steps API Gateway decides BEFORE it answers one — the `$connect` route's
+            // authorizer and that route's own integration — are performed over this same
+            // transport, and only the `101` an admitted handshake earns is beyond this seam.
+            if websocket::claims_request(&*self.engine, req) {
+                return websocket::serve_with_transport(&*self.engine, req, ctx).await;
+            }
             // Unreachable: `override_operation` names this only for a request the data
             // plane claims.
             svc.definition().routing_error_response(req)
@@ -512,7 +523,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if front_door_refuses_as_cross_site(req) {
             return None;
         }
-        invoke::claims_request(&*self.engine, req)
+        (invoke::claims_request(&*self.engine, req)
+            || websocket::claims_request(&*self.engine, req))
             .then_some(&self.data_plane as &dyn ErasedOperation)
     }
 
@@ -566,11 +578,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // word that routing failure in your own envelope instead.
         //
         // A WebSocket opening handshake IS such a request: it names no modelled operation
-        // (its path is a stage's, not a `/v2/…` route's), so this pre-authentication seam
-        // is where this service's WebSocket data plane answers it. It is served here
-        // rather than named as an operation because a handshake carries no credential
-        // whose verification could change the answer — the refusals below are computed
-        // from the api's and the stage's stored state alone.
+        // (its path is a stage's, not a `/v2/…` route's). It is NAMED as an operation above,
+        // so the two steps a handshake's answer needs an in-process transport for — the
+        // `$connect` route's authorizer and that route's own integration — are performed;
+        // this seam answers the one handshake the front door would otherwise refuse itself
+        // (a cross-site one), from the api's records alone.
         //
         // So is an invoke of an HTTP api's stage, whatever credential it carries: reaching
         // it BEFORE authentication is what lets a client holding only a bearer token, or

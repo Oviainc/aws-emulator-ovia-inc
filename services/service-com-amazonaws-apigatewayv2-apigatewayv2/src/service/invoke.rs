@@ -138,13 +138,21 @@
 //! `crate::service`'s own docs state that rule.
 
 mod dispatch;
-mod lambda;
-// `pub(crate)` for the ONE id minting the WebSocket data plane shares with this one
-// (`proxy_event::mint_request_id`): the gateway mints a `requestId` per call on either
-// protocol, so both planes mint it the same way rather than each writing its own.
+// `pub(crate)` for the three steps BOTH data planes of this service perform, so the rule
+// each states is written once and the two protocols cannot drift apart:
+//
+// * `lambda` — the one in-process hop to AWS Lambda, which an `AWS_PROXY` route and a
+//   `REQUEST` authorizer of EITHER protocol is answered by;
+// * `proxy_event::mint_request_id` and the renderings of a header or query map an event
+//   states, which the WebSocket event states the same way;
+// * `proxy_response` — how a function's answer is read back, read as the structured
+//   response for a WebSocket route ([`proxy_response::websocket_reply`]);
+// * `request_authorizer` — the cache, the invocation and the two response formats a
+//   `REQUEST` authorizer's decision is read in.
+pub(crate) mod lambda;
 pub(crate) mod proxy_event;
-mod proxy_response;
-mod request_authorizer;
+pub(crate) mod proxy_response;
+pub(crate) mod request_authorizer;
 mod service_action;
 
 use std::collections::BTreeMap;

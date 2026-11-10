@@ -56,8 +56,9 @@
 //!
 //! 5. the CONNECTION REQUEST itself is served by the `$connect` route's integration, and the
 //!    handshake completes only on a successful reply ([`dispatch::connection_request`]), so
-//!    a reply the api's own configuration cannot produce is `500`
-//!    `{"message":"Internal server error"}` here exactly as it is on the api's own socket.
+//!    a reply the api's own records alone cannot produce is `500`
+//!    `{"message":"Internal server error"}` — which is what a `$connect` route with no
+//!    integration at all, or one bound to a `MOCK`, is answered on the api's own socket too.
 //!
 //! A handshake that every step above let through would be answered `101 Switching
 //! Protocols` — and is, on the api's own socket ([`transport`]). On THIS endpoint it is
@@ -79,15 +80,22 @@
 //! emulator's "not implemented" channel (`crate::scaffolded`), and it is not a retryable
 //! 5xx: a client learns to dial the announced socket rather than retrying for ever.
 //!
-//! Nor is an authorizer's own ALLOW/DENY decision computed: a `REQUEST` authorizer's
-//! decision is the answer of the Lambda function its `AuthorizerUri` names, and no
-//! deployment package runs in this emulator (`Invoke` itself refuses to run one), so a
-//! policy document invented here would be indistinguishable from the function's. What step
-//! 4 above applies is the part of the authorization that is the SERVICE's own and is
-//! computed from stored records — the identity-source precondition the authorizer is only
-//! invoked past, and a route whose authorizer the api does not hold.
+//! Nor is an authorizer's own ALLOW/DENY decision obtained HERE, and neither is the
+//! connection request's own backend called: both are an invocation of a Lambda function,
+//! which is awaited, while `Service::override_routing_error` is a SYNCHRONOUS seam handed a
+//! buffered request. Neither changes what this endpoint answers — the handshake made here is
+//! refused whatever they would decide — so what step 4 above applies is the part of the
+//! authorization that is the SERVICE's own and is computed from stored records: the
+//! identity-source precondition the authorizer is only invoked past, and a route whose
+//! authorizer the api does not hold. On the api's OWN socket, where the handshake is
+//! completed, both are performed: the authorizer's function decides the connection
+//! ([`connect_authorizer`]) and the `$connect` route's integration serves the connection
+//! request ([`integration`]).
 
+pub mod connect_authorizer;
 pub mod dispatch;
+pub mod event;
+pub mod integration;
 pub mod transport;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
@@ -110,8 +118,8 @@ use crate::state::{Api, ComAmazonawsApigatewayv2Apigatewayv2State, Stage};
 /// enumerates (`RouteKey` is an unconstrained string): AWS documents `$connect` as the
 /// route "API Gateway invokes when a client connects to your API", which is why the
 /// authorization configured on it is what decides a handshake. The other two reserved keys
-/// (`$disconnect`, `$default`) are reached over an established socket, which this emulator
-/// has none of.
+/// (`$disconnect`, `$default`) are reached over an ESTABLISHED socket, which this endpoint
+/// never establishes — the api's own socket does ([`transport`]).
 const CONNECT_ROUTE_KEY: &str = "$connect";
 
 /// The `Connection` field token that asks for a protocol upgrade (RFC 6455 §4.1).
@@ -350,10 +358,17 @@ fn claims<Eng: Send + Sync + 'static>(engine: &Eng, handshake: &Handshake<'_>) -
 }
 
 /// Serve one RFC 6455 opening handshake addressed to a WebSocket api's stage, from this
-/// service's own records.
+/// service's own records ALONE — the answer a seam carrying no in-process transport can give
+/// it.
 ///
 /// Free-standing and reached with the ONE shared engine, the way the REST data plane's
 /// `serve` is, so the claim above and this answer read the same store.
+///
+/// What it cannot do is PERFORM the connection request's integration or obtain the
+/// authorizer's own decision, both of which are an awaited invocation: a handshake this
+/// reading lets through is answered by [`serve_with_transport`] when the router named this
+/// request an operation, and here only when it did not (a request the front door would
+/// refuse as cross-site, which is the one case left to the routing-error seam).
 pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
     let handshake = Handshake::of_request(req);
     let Some(state) = crate::state::service_state(engine) else {
@@ -436,6 +451,196 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
     )
 }
 
+/// Serve one opening handshake addressed at this emulator's own SERVICE endpoint WITH the
+/// in-process transport the router hands an operation — so every refusal that is decided
+/// before the upgrade is the one AWS answers, and not a status this endpoint chose because
+/// it could not ask.
+///
+/// Two steps of [`serve`] become the real ones here, and they are the two a buffered request
+/// is enough for, because API Gateway decides both BEFORE it answers the handshake:
+///
+/// * the `$connect` route's AUTHORIZER decides the connection ([`connect_authorizer`]), so a
+///   policy that denies is `403` `{"message":"Forbidden"}` rather than a status chosen for
+///   lack of a decision;
+/// * the CONNECTION REQUEST's own integration is performed ([`integration`]), so a
+///   `$connect` route whose function refuses the client is answered with the status and the
+///   body that function returned.
+///
+/// Only the ADMITTED handshake still cannot be served here: that one needs the `101` and the
+/// socket behind it, which this seam cannot give (see the module docs), so it is refused
+/// [`NOT_IMPLEMENTED_STATUS`] naming the address the api IS reached at.
+pub async fn serve_with_transport<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    req: &RtRequest,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> RtResponse {
+    let handshake = Handshake::of_request(req);
+    let Some(state) = crate::state::service_state(engine) else {
+        return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
+    };
+    // Everything the two steps below need, read out of the store under ONE lock and owned
+    // from then on: performing an integration is awaited, and no state guard may be held
+    // across an await.
+    let offered = {
+        let mut store = state.lock();
+        // One id per connection request, minted before the request is served because the
+        // event that serves it carries the id — the connection AWS mints for a handshake it
+        // then refuses is minted too.
+        let connection_id = store.websocket_transport.mint_connection_id();
+        let Some(resolved) = resolve(&store, &handshake) else {
+            return forbidden();
+        };
+        let Some(stage) = resolved.stage else {
+            tracing::debug!(
+                api_id = %resolved.api.api_id,
+                stage = %resolved.stage_name,
+                "the WebSocket handshake names no stage of this api"
+            );
+            return forbidden();
+        };
+        let served = stage
+            .deployment_id
+            .as_deref()
+            .and_then(|deployment_id| resolved.api.deployments.get(deployment_id));
+        let Some(deployment) = served else {
+            tracing::debug!(
+                api_id = %resolved.api.api_id,
+                stage = %stage.stage_name,
+                "the WebSocket handshake names a stage with no deployment released to it"
+            );
+            return forbidden();
+        };
+        let authorization = connect_authorization(
+            resolved.api,
+            stage,
+            &deployment.configuration,
+            |name: &str| req.headers().get(name).map(str::to_string),
+            req.uri(),
+        );
+        let authorizer = match authorization {
+            Ok(authorizer) => authorizer,
+            Err((status, message)) => return json_response(status, message, None),
+        };
+        OfferedHandshake {
+            connection: event::Connection {
+                api_id: resolved.api.api_id.clone(),
+                stage_name: stage.stage_name.clone(),
+                connection_id,
+                region: resolved.api.region.clone(),
+                connected_at: ::std::time::SystemTime::now(),
+                headers: req
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect(),
+                query_parameters: super::data_plane::joined_query_parameters(req.uri()),
+                stage_variables: stage.stage_variables.clone(),
+                authorizer_context: None,
+                authorizer_principal: None,
+            },
+            authorizer,
+            connect: integration::select_route_key(
+                &deployment.configuration,
+                dispatch::CONNECT_ROUTE_KEY,
+            ),
+            announced: resolved.api.api_endpoint.clone(),
+        }
+    };
+    let mut connection = offered.connection;
+    if let Some((authorizer, identity)) = offered.authorizer {
+        match connect_authorizer::decided(ctx.callback(), &connection, &authorizer, &identity).await
+        {
+            Ok(decided) => {
+                connection.authorizer_context = decided.context;
+                connection.authorizer_principal = decided.principal_id;
+            }
+            Err((status, message)) => return json_response(status, message, None),
+        }
+    }
+    if let Some(connect) = offered.connect {
+        match integration::perform(
+            ctx.callback(),
+            &connection,
+            &connect,
+            &event::Call::Connect,
+        )
+        .await
+        {
+            Ok(answered) if dispatch::is_success_status(answered.status_code.as_deref()) => {}
+            Ok(answered) => {
+                // The status the integration answered, and the body it answered with it.
+                tracing::info!(
+                    api_id = %connection.api_id,
+                    stage = %connection.stage_name,
+                    status = ?answered.status_code,
+                    "refusing a WebSocket opening handshake: the connection request's \
+                     integration did not reply successfully"
+                );
+                return refused_by_the_connection_request(&answered);
+            }
+            Err(unserved) => {
+                tracing::info!(
+                    api_id = %connection.api_id,
+                    stage = %connection.stage_name,
+                    ?unserved,
+                    "refusing a WebSocket opening handshake: the connection request's \
+                     integration produced no reply"
+                );
+                return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
+            }
+        }
+    }
+    tracing::info!(
+        api_id = %connection.api_id,
+        stage = %connection.stage_name,
+        announced = %offered.announced,
+        "refusing a WebSocket opening handshake on the service endpoint: this api's socket \
+         is the one its ApiEndpoint announces"
+    );
+    json_response(
+        NOT_IMPLEMENTED_STATUS,
+        &wrong_endpoint_message(&offered.announced),
+        Some(NOT_IMPLEMENTED_CODE),
+    )
+}
+
+/// What a handshake at the service endpoint OFFERED, read out of the store under one lock;
+/// see [`serve_with_transport`].
+struct OfferedHandshake {
+    connection: event::Connection,
+    authorizer: Option<OwedDecision>,
+    connect: Option<integration::Selected>,
+    /// The address this api IS reached at, for the refusal an admitted handshake earns here.
+    announced: String,
+}
+
+/// The answer a handshake the CONNECTION REQUEST refused earns: the status its integration
+/// answered, and that integration's own body — "the response body is the $connect
+/// integration's own body bytes" — relayed as the bytes it returned.
+fn refused_by_the_connection_request(
+    answered: &integration::Answered,
+) -> RtResponse {
+    let Some(status) = answered
+        .status_code
+        .as_deref()
+        .and_then(|status| status.trim().parse::<u16>().ok())
+    else {
+        // A reply naming no status names no decision at all.
+        return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
+    };
+    let body = answered.payload.clone().unwrap_or_default();
+    let length = body.len().to_string();
+    let mut response = RtResponse::new(
+        ::aws_smithy_runtime_api::http::StatusCode::try_from(status).unwrap_or(
+            ::aws_smithy_runtime_api::http::StatusCode::try_from(UNPLACEABLE_STATUS)
+                .expect("500 is a valid status code"),
+        ),
+        ::aws_smithy_types::body::SdkBody::from(body),
+    );
+    let _ = response.headers_mut().try_insert("content-length", length);
+    response
+}
+
 /// The refusal the CONNECTION REQUEST's authorization owes this handshake, or `None` when
 /// the route that serves it lets the handshake through to the next step.
 ///
@@ -457,9 +662,12 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
 ///   invoke the authorizer Lambda function. Otherwise, it returns a 401 Unauthorized
 ///   response without calling the Lambda function" (`Authorizer$IdentitySource`).
 ///
-/// An authorizer whose identity sources ARE satisfied is one this emulator would have to
-/// INVOKE to decide, which it cannot (see the module docs), so the handshake falls through
-/// to the transport refusal rather than being allowed or denied here.
+/// An authorizer whose identity sources ARE satisfied is one whose own function has yet to
+/// decide, which is an invocation: [`connect_authorization`] answers that authorizer and the
+/// identity its decision is about, and a caller holding the in-process transport obtains the
+/// decision ([`connect_authorizer`]). A caller without one — the service endpoint, whose seam
+/// is synchronous — lets the handshake through this step, which changes nothing about what it
+/// answers.
 ///
 /// The route read is the one the stage's DEPLOYMENT froze
 /// ([`crate::state::Deployment::configuration`]), so a stage pinned to an older deployment
@@ -482,10 +690,43 @@ pub(crate) fn connect_authorization_refusal<H>(
 where
     H: Fn(&str) -> Option<String>,
 {
-    let route = deployed
+    connect_authorization(api, stage, deployed, header, uri).err()
+}
+
+/// The AUTHORIZER a connection request's own route still owes a decision from, and the
+/// identity-source VALUES that decision is about and is keyed by.
+pub(crate) type OwedDecision = (crate::state::Authorizer, Vec<String>);
+
+/// The refusal a step of the handshake owes by itself: a status and the sentence it carries.
+pub(crate) type HandshakeRefusal = (u16, &'static str);
+
+/// The DECISION the connection request's authorization is still owed, or the refusal its
+/// precondition already owes.
+///
+/// `Ok(None)` is a handshake no authorizer decides — the `$connect` route's
+/// `AuthorizationType` names none, or the deployment holds no such route at all. `Ok(Some)`
+/// is the authorizer whose function has yet to run and the identity-source VALUES its
+/// decision is about ("API Gateway uses the identity sources as the cache key"), which is
+/// what a caller holding the in-process transport then obtains
+/// ([`connect_authorizer::decided`]). `Err` is the refusal this step owes by itself; see
+/// [`connect_authorization_refusal`] for the rule each carries.
+pub(crate) fn connect_authorization<H>(
+    api: &Api,
+    stage: &Stage,
+    deployed: &crate::state::DeployedConfiguration,
+    header: H,
+    uri: &str,
+) -> Result<Option<OwedDecision>, HandshakeRefusal>
+where
+    H: Fn(&str) -> Option<String>,
+{
+    let Some(route) = deployed
         .routes
         .values()
-        .find(|route| route.route_key == CONNECT_ROUTE_KEY)?;
+        .find(|route| route.route_key == CONNECT_ROUTE_KEY)
+    else {
+        return Ok(None);
+    };
     if !crate::state::AUTHORIZER_BACKED_AUTHORIZATION_TYPES
         .contains(&route.authorization_type.as_str())
     {
@@ -495,7 +736,7 @@ where
         // authorizer is "supported only for HTTP APIs" and `validate_authorizer_config`
         // refuses one on a WEBSOCKET api, so the identity-source rule below is only ever
         // applied to the `REQUEST` authorizers it is the rule for.
-        return None;
+        return Ok(None);
     }
     let Some(authorizer) = route
         .authorizer_id
@@ -510,7 +751,7 @@ where
             "the connection request's route is authorized by an authorizer this api does \
              not hold"
         );
-        return Some((UNPLACEABLE_STATUS, INTERNAL_MESSAGE));
+        return Err((UNPLACEABLE_STATUS, INTERNAL_MESSAGE));
     };
     let query_parameters = query_parameters(uri);
     let absent: Vec<&str> = authorizer
@@ -526,18 +767,60 @@ where
         })
         .map(String::as_str)
         .collect();
-    if absent.is_empty() {
-        return None;
+    if !absent.is_empty() {
+        tracing::info!(
+            api_id = %api.api_id,
+            stage = %stage.stage_name,
+            authorizer_id = %authorizer.authorizer_id,
+            absent = ?absent,
+            "refusing a WebSocket opening handshake: an identity source of the connection \
+             request's authorizer is absent, so the authorizer is not invoked"
+        );
+        return Err((UNAUTHORIZED_STATUS, UNAUTHORIZED_MESSAGE));
     }
-    tracing::info!(
-        api_id = %api.api_id,
-        stage = %stage.stage_name,
-        authorizer_id = %authorizer.authorizer_id,
-        absent = ?absent,
-        "refusing a WebSocket opening handshake: an identity source of the connection \
-         request's authorizer is absent, so the authorizer is not invoked"
-    );
-    Some((UNAUTHORIZED_STATUS, UNAUTHORIZED_MESSAGE))
+    // Every identity source is there, so the authorizer's own function decides. The VALUES
+    // travel with the decision, which is what it is cached under.
+    let identity = authorizer
+        .identity_source
+        .iter()
+        .map(|identity_source| {
+            presented_identity(
+                identity_source,
+                &header,
+                &query_parameters,
+                &stage.stage_variables,
+            )
+        })
+        .collect();
+    Ok(Some((authorizer.clone(), identity)))
+}
+
+/// The VALUE the handshake presents for one identity source, as the cache key carries it.
+///
+/// The three request-bound spellings are read — a header, a query string parameter and a
+/// stage variable, the parts `Authorizer$IdentitySource` names — and anything else presents
+/// the empty value, which is what the precondition above already admitted it as (a context
+/// parameter, which every call has).
+fn presented_identity<H>(
+    identity_source: &str,
+    header: H,
+    query_parameters: &std::collections::BTreeMap<String, String>,
+    stage_variables: &std::collections::BTreeMap<String, String>,
+) -> String
+where
+    H: Fn(&str) -> Option<String>,
+{
+    if let Some(value) =
+        super::data_plane::identity_source_value(identity_source, header, query_parameters)
+    {
+        return value;
+    }
+    super::data_plane::parameter_name(
+        identity_source.trim(),
+        super::data_plane::STAGE_VARIABLE_IDENTITY_SOURCES,
+    )
+    .and_then(|name| stage_variables.get(name).cloned())
+    .unwrap_or_default()
 }
 
 /// Whether a comma-separated HTTP field value carries `token`, compared

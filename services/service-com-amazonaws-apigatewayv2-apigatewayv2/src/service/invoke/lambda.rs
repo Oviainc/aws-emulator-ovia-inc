@@ -4,16 +4,22 @@
 //! `AWS_PROXY` route or a `REQUEST` authorizer names is RUN, and how what came back is
 //! told from the call never reaching a function at all.
 //!
-//! An HTTP api's two Lambda-backed steps — the integration of an `AWS_PROXY` route ("for
+//! An api's two Lambda-backed steps — the integration of an `AWS_PROXY` route ("for
 //! integrating the route or method request with the Lambda function-invoking action with
 //! the client request passed through as-is", `Integration$IntegrationType`) and the
 //! decision of a `REQUEST` authorizer ("For REQUEST authorizers, this must be a
 //! well-formed Lambda function URI", `Authorizer$AuthorizerUri`) — are both one synchronous
 //! invocation of a function this emulator holds. The invocation is made THROUGH THE
-//! EMULATOR this service runs within, over the in-process transport
-//! `OperationContext::callback` hands a handler: nothing is invented and no connection is
-//! opened, so what the route answers is what the function itself returned for the event it
-//! was given.
+//! EMULATOR this service runs within, over the in-process transport the emulator hands this
+//! crate (`OperationContext::callback` for a request served through the front door, the
+//! clone of it a WEBSOCKET api's socket was opened with for a frame served on that socket):
+//! nothing is invented and no connection is opened, so what the route answers is what the
+//! function itself returned for the event it was given.
+//!
+//! Both halves of this service reach it the same way, which is why the transport is taken as
+//! the in-process handle itself rather than as a request's context: a WebSocket api's data
+//! plane is carried on a socket the core owns, where there is no request and no
+//! `OperationContext` at all.
 //!
 //! Three outcomes are told apart here, because the api answers each differently:
 //!
@@ -42,7 +48,7 @@
 use std::time::Duration;
 
 use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
-use smithy_server_runtime::OperationContext;
+use smithy_server_runtime::EmbeddedEmulator;
 
 /// The `aws.api#service$arnNamespace` a function ARN carries, which is what
 /// [`::service_common::arn::region_of`] matches an integration's or an authorizer's URI
@@ -155,12 +161,12 @@ pub fn function_target(uri: &str) -> Option<FunctionTarget> {
 /// out" — because the route's answer IS the function's answer, so there is nothing to serve
 /// until the run ends.
 pub async fn invoke_function(
-    ctx: &OperationContext<'_>,
+    callback: &EmbeddedEmulator,
     target: &FunctionTarget,
     payload: Vec<u8>,
     timeout: Duration,
 ) -> Result<Ran, Unreached> {
-    let call = client(ctx, &target.region)
+    let call = client(callback, &target.region)
         .invoke()
         .function_name(&target.arn)
         .payload(::aws_smithy_types::Blob::new(payload))
@@ -206,11 +212,11 @@ pub async fn invoke_function(
 /// the callback hands over, which sign this call and are never reported or logged. The
 /// Region only selects the endpoint the client is configured for — the transport serves it
 /// in process whatever that label says.
-fn client(ctx: &OperationContext<'_>, region: &str) -> ::aws_sdk_lambda::Client {
+fn client(callback: &EmbeddedEmulator, region: &str) -> ::aws_sdk_lambda::Client {
     let config = ::aws_sdk_lambda::Config::builder()
         .behavior_version(::aws_sdk_lambda::config::BehaviorVersion::latest())
-        .http_client(ctx.callback().http_client())
-        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(callback.http_client())
+        .credentials_provider(callback.aws_credentials_provider())
         .region(::aws_sdk_lambda::config::Region::new(region.to_string()))
         .endpoint_url(format!("https://lambda.{region}.amazonaws.com"))
         // The transport is in-process: there is nothing to retry, time out or watch for a

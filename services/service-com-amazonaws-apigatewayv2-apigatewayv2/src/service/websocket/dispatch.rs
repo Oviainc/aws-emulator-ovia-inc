@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a WEBSOCKET api's stage ANSWERS: which route serves a message, and what the route's
-//! integration replies with.
+//! What a WEBSOCKET api's stage ANSWERS: which route serves a message, and what an
+//! integration that reaches no backend replies with.
 //!
-//! A WebSocket api serves two kinds of call over one socket, and both are decided here from
-//! the configuration the stage's deployment froze:
+//! A WebSocket api serves two kinds of call over one socket, and the route each is served by
+//! is decided here from the configuration the stage's deployment froze:
 //!
 //! * the CONNECTION REQUEST, the opening handshake itself, served by the `$connect` route
 //!   when the api has one ([`connection_request`]);
 //! * each MESSAGE the client then sends, served by the route the api's
-//!   `RouteSelectionExpression` selects ([`message`]).
+//!   `RouteSelectionExpression` selects ([`message_route`]).
 //!
 //! Everything in this module is a PURE function of the api's records and the bytes the
 //! client sent: nothing here touches the socket, the store or the clock, so the rule each
-//! answer follows can be read — and tested — without a connection.
+//! answer follows can be read — and tested — without a connection. The BACKEND a route
+//! fronts is performed by [`super::integration`], which holds the in-process transport; what
+//! is decided here is what an integration answers without one, which is the `MOCK` type's
+//! whole rule ([`mock_reply`]) and is also what a reading of the records can say about a
+//! connection request before any socket exists ([`super::serve`]).
 //!
 //! # The rule a `MOCK` integration's reply follows
 //!
@@ -117,7 +121,8 @@ pub fn targeted_integration<'d>(
     deployed.integrations.get(integration_id)
 }
 
-/// What the CONNECTION REQUEST is answered with, from the configuration the stage deployed.
+/// What the CONNECTION REQUEST is answered with, from the configuration the stage deployed,
+/// WITHOUT reaching a backend.
 ///
 /// The handshake completes only when the route that serves the connection request produced a
 /// SUCCESSFUL reply: the `$connect` route's integration is called before the socket exists,
@@ -135,12 +140,10 @@ pub fn targeted_integration<'d>(
 /// to one therefore fails the handshake, which is the recorded behaviour of API Gateway for
 /// that configuration — the client reads `500` and no connection is established.
 ///
-/// Where the rule stands today: EVERY `$connect` route refuses the handshake, because the
-/// other integration types reach a backend this data plane does not call for a WebSocket
-/// route ([`integration_reply`]) — so only an api with no `$connect` route reaches `101`.
-/// The successful branch is written as the rule rather than as the current state, because
-/// what admits the connection is the reply, and the day a `$connect` route's backend IS
-/// called the status it answers is what decides the handshake.
+/// A `$connect` route fronting a BACKEND is decided by that backend's own reply, which this
+/// reading cannot obtain: a caller with no in-process transport reads `Unserved` for it,
+/// while the api's own socket performs the integration ([`super::integration`]) and is
+/// admitted by the status the function answered.
 pub fn connection_request(deployed: &DeployedConfiguration) -> Result<Option<Reply>, Unserved> {
     let Some(route) = deployed_route(deployed, CONNECT_ROUTE_KEY) else {
         return Ok(None);
@@ -148,13 +151,28 @@ pub fn connection_request(deployed: &DeployedConfiguration) -> Result<Option<Rep
     if targeted_integration(deployed, route)
         .is_some_and(|integration| integration.integration_type == MOCK_INTEGRATION_TYPE)
     {
-        return Err(Unserved::Unperformable(format!(
-            "a {MOCK_INTEGRATION_TYPE} integration answers from the integration's own \
-             records and reaches no backend, so it gives the connection request no decision"
-        )));
+        return Err(no_connection_decision());
     }
     let reply = integration_reply(deployed, route, None)?;
     Ok(Some(reply))
+}
+
+/// Why a `MOCK` integration gives the CONNECTION REQUEST no decision at all.
+///
+/// A connection request is precisely a call whose answer the BACKEND has to give — which is
+/// why `$connect` is the route an authorizer and a handler admit or refuse a client at — and
+/// a `MOCK` integration "lets API Gateway return a response without sending the request
+/// further to the backend". A `$connect` route bound to one therefore fails the handshake,
+/// whatever status its templates render, which is the recorded behaviour of API Gateway for
+/// that configuration: the client reads `500` and no connection is established.
+///
+/// Stated here, as the one owner of the rule, because both the reading of the records and
+/// the performing of the integration apply it ([`super::integration::perform`]).
+pub fn no_connection_decision() -> Unserved {
+    Unserved::Unperformable(format!(
+        "a {MOCK_INTEGRATION_TYPE} integration answers from the integration's own records \
+         and reaches no backend, so it gives the connection request no decision"
+    ))
 }
 
 /// Whether a status a reply carries is a SUCCESS — the `2xx` class, which is what admits a
@@ -197,52 +215,45 @@ pub fn selected_route_key(api: &Api, body: &str) -> Option<String> {
     }
 }
 
-/// What one MESSAGE is answered with: the route that served it and its integration's reply.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Served {
-    /// The `RouteKey` of the route that served the message — the selected key, or
-    /// `$default`.
-    pub route_key: String,
-    /// Whether that route declares a `RouteResponse`, which is what makes the route
-    /// TWO-WAY: "To define a two-way route, create a route response" — a route with none
-    /// gets no reply sent back to it however the integration replied.
-    pub two_way: bool,
-    /// The integration's reply.
-    pub reply: Reply,
-}
-
-/// What the message `body` is answered with, from the configuration the stage deployed.
+/// The route of this deployment that serves the message `body`: the one whose `RouteKey` the
+/// api's `RouteSelectionExpression` selected, then the `$default` route, and `None` when the
+/// api holds neither — a message it routes nowhere.
 ///
-/// `Ok(None)` is a message the api routes NOWHERE: no route's key is selected and the api
-/// has no `$default` route, which is what API Gateway answers its `Forbidden` frame for.
-pub fn message(
+/// The ONE selection both callers make, so what a reading of the records says a message is
+/// routed to and what the socket actually invokes cannot disagree.
+pub fn message_route<'d>(
     api: &Api,
-    deployed: &DeployedConfiguration,
-    connection_id: &str,
+    deployed: &'d DeployedConfiguration,
     body: &str,
-) -> Result<Option<Served>, Unserved> {
-    let selected = selected_route_key(api, body);
-    let route = selected
+) -> Option<&'d Route> {
+    selected_route_key(api, body)
         .as_deref()
         .and_then(|key| deployed_route(deployed, key))
-        .or_else(|| deployed_route(deployed, DEFAULT_ROUTE_KEY));
-    let Some(route) = route else {
-        return Ok(None);
-    };
-    let reply = integration_reply(deployed, route, Some(MessageCall { connection_id, body }))?;
-    Ok(Some(Served {
-        route_key: route.route_key.clone(),
-        two_way: !route.route_responses.is_empty(),
-        reply,
-    }))
+        .or_else(|| deployed_route(deployed, DEFAULT_ROUTE_KEY))
+}
+
+/// Whether `route` is TWO-WAY: "To define a two-way route, create a route response" — a
+/// route with none gets no reply sent back to it however its integration replied.
+pub fn is_two_way(route: &Route) -> bool {
+    !route.route_responses.is_empty()
 }
 
 /// The message a template is rendered against, when there is one: a connection request
 /// carries no message of its own.
 #[derive(Debug, Clone, Copy)]
-struct MessageCall<'c> {
+pub struct MessageCall<'c> {
     connection_id: &'c str,
     body: &'c str,
+}
+
+impl<'c> MessageCall<'c> {
+    /// The call one frame of `connection_id` is, as a template reads it.
+    pub fn new(connection_id: &'c str, body: &'c str) -> Self {
+        Self {
+            connection_id,
+            body,
+        }
+    }
 }
 
 impl MessageCall<'_> {
@@ -263,8 +274,12 @@ impl MessageCall<'_> {
 /// `$context.connectionId` is "the connection ID" of the call's own socket.
 const CONTEXT_CONNECTION_ID: &str = "connectionId";
 
-/// The reply `route`'s integration produces for this call; see the module docs for the rule
-/// a `MOCK` integration's follows.
+/// The reply `route`'s integration produces for this call WITHOUT reaching a backend; see
+/// the module docs for the rule a `MOCK` integration's follows.
+///
+/// Every other integration type is answered by a backend, which this reading does not call:
+/// it is reported as unperformable, and the caller that HAS the in-process transport
+/// performs it instead ([`super::integration`]).
 fn integration_reply(
     deployed: &DeployedConfiguration,
     route: &Route,
@@ -273,14 +288,23 @@ fn integration_reply(
     let integration = targeted_integration(deployed, route).ok_or(Unserved::NoIntegration)?;
     if integration.integration_type != MOCK_INTEGRATION_TYPE {
         // Every other integration type REACHES a backend — a function to invoke, an HTTP
-        // endpoint to call, an AWS service action to perform — which is not this module's to
-        // decide: it says so rather than answering as if the backend had replied.
+        // endpoint to call, an AWS service action to perform — which is not this reading's
+        // to decide: it says so rather than answering as if the backend had replied.
         return Err(Unserved::Unperformable(format!(
-            "an integration of type {} is performed by its backend, which this data plane \
-             does not call for a WebSocket route",
+            "an integration of type {} is performed by its backend, which this reading of \
+             the api's records does not call",
             integration.integration_type
         )));
     }
+    mock_reply(integration, call)
+}
+
+/// The reply a `MOCK` integration computes for this call, from the integration's own
+/// records: the rule the module docs state, in the order API Gateway computes it.
+pub fn mock_reply(
+    integration: &Integration,
+    call: Option<MessageCall<'_>>,
+) -> Result<Reply, Unserved> {
     let status = match keyed_template(&integration.request_templates) {
         Some(template) => {
             let rendered = rendered_template(template, call)?;

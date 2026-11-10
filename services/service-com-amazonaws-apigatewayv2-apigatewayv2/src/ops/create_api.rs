@@ -393,7 +393,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // client can reach. A socket that could not be opened leaves the api UNCREATED rather
         // than announcing an address nothing serves.
         let announced_socket = if is_websocket {
-            match crate::service::websocket::transport::open_for_api(&*self.engine, &api_id).await
+            // The in-process transport this api's routes are performed over is handed to the
+            // socket: a frame arriving on it carries no request of its own, and an
+            // `AWS_PROXY` route's answer is the answer of a function another service holds.
+            match crate::service::websocket::transport::open_for_api(
+                &*self.engine,
+                ctx.callback().clone(),
+                &api_id,
+            )
+            .await
             {
                 Ok(authority) => Some(authority),
                 Err(reason) => {

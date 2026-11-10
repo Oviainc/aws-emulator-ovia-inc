@@ -263,5 +263,7 @@ mod vpc_link_update;
 mod websocket_connect_authorization;
 #[path = "all/websocket_handshake_data_plane.rs"]
 mod websocket_handshake_data_plane;
+#[path = "all/websocket_lambda_routes.rs"]
+mod websocket_lambda_routes;
 #[path = "all/websocket_transport_data_plane.rs"]
 mod websocket_transport_data_plane;

@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use aws_smithy_runtime_api::http::Response as RtResponse;
 use serde_json::Value;
-use smithy_server_runtime::OperationContext;
+use smithy_server_runtime::{EmbeddedEmulator, OperationContext};
 
 use super::super::data_plane::{forbidden, json_response, UNPLACEABLE_STATUS};
 use super::lambda;
@@ -84,8 +84,136 @@ pub enum Outcome {
     Refused(Box<RtResponse>),
 }
 
-/// Decide one invoke with `authorizer`, re-using a cached decision while one is live and
-/// invoking the function otherwise.
+/// Why a call the authorizer decided is not served, for the caller to word in the envelope
+/// its own data plane answers in.
+///
+/// The two are different answers at AWS, so they are different values here: a DENY is the
+/// authorizer running and saying no, while an authorizer whose decision could not be
+/// obtained at all is a fault of the api's configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// The authorizer ran and did not authorize the call.
+    Denied,
+    /// No decision could be obtained: the authorizer names no function, the function could
+    /// not be invoked, it raised, or it answered something this authorizer's configuration
+    /// cannot be read as. The reason is logged rather than told to the caller.
+    Unplaceable,
+}
+
+/// Which decision one call asks for: the authorizer that decides it, where it is cached,
+/// and the resource the policy document is evaluated against.
+///
+/// One struct for BOTH data planes — an HTTP api's route and a WebSocket api's connection
+/// request — so the cache key, the payload format and the ARN a policy is matched against
+/// are read the same way for each.
+pub struct About<'a> {
+    /// The authorizer whose function decides the call.
+    pub authorizer: &'a Authorizer,
+    /// The api and the stage the call addressed, which the decision is cached per.
+    pub api_id: &'a str,
+    pub stage_name: &'a str,
+    /// The identity-source values the decision is about — the cache key AWS uses ("API
+    /// Gateway uses the identity sources as the cache key").
+    pub identity: &'a [String],
+    /// The ARN of the resource the call addressed, which the event names and the policy
+    /// document's `Resource` is matched against.
+    pub route_arn: &'a str,
+    /// Which member of the function's answer states its decision ([`Reading`]).
+    pub reading: Reading,
+}
+
+/// The decision `about` for the call `event` states, obtained from the authorizer's own
+/// function and cached for the TTL the authorizer declares.
+///
+/// This is the whole of the rule both data planes share: the cache, the one invocation, the
+/// reading of the two response formats, and the policy evaluation. What differs between them
+/// — the EVENT the function is called with, and how a refusal is worded on the wire — is the
+/// caller's.
+///
+/// `state` is this service's own store, where the decision is cached; it is taken as the
+/// store rather than as the engine because the WebSocket data plane reaches this from a
+/// socket the core owns, where there is no handler and no engine reference at all. A caller
+/// with no store caches nothing and invokes the function for every call.
+pub async fn decided(
+    state: Option<&::engine::ServiceState<crate::state::ComAmazonawsApigatewayv2Apigatewayv2State>>,
+    callback: &EmbeddedEmulator,
+    about: &About<'_>,
+    event: &Value,
+) -> Result<Decided, Refused> {
+    let authorizer = about.authorizer;
+    let decided = crate::state::authorizer_cache::Decided {
+        api_id: about.api_id,
+        stage_name: about.stage_name,
+        authorizer_id: &authorizer.authorizer_id,
+        identity: about.identity,
+    };
+    // A decision already made for this identity, while the TTL the authorizer declared has
+    // not passed: AWS does not invoke the function again for it, so neither does this.
+    if let Some(state) = state {
+        let cached = state.lock().authorizer_cache.live(decided, Instant::now());
+        if let Some(cached) = cached {
+            ::tracing::debug!(
+                api_id = %about.api_id,
+                stage = %about.stage_name,
+                authorizer_id = %authorizer.authorizer_id,
+                authorized = cached.authorized,
+                "serving a call from the authorizer decision already cached for this identity"
+            );
+            return decision_of(&cached);
+        }
+    }
+
+    let payload_format = payload_format(authorizer);
+    let Some(target) = authorizer
+        .authorizer_uri
+        .as_deref()
+        .and_then(lambda::function_target)
+    else {
+        return Err(unplaceable(
+            authorizer,
+            "the authorizer's AuthorizerUri names no Lambda function to invoke",
+        ));
+    };
+    let payload = serde_json::to_vec(event).unwrap_or_default();
+    let ran = match lambda::invoke_function(callback, &target, payload, AUTHORIZER_TIMEOUT).await {
+        Ok(ran) => ran,
+        Err(unreached) => return Err(unplaceable(authorizer, &unreached.reason())),
+    };
+    if ran.failed() {
+        // "An unhandled error is still HTTP 200" to Lambda's caller, so the run is told
+        // from a decision by the signal rather than by the status: a function that raised
+        // returned no decision at all.
+        return Err(unplaceable(
+            authorizer,
+            "the authorizer's function ended in an unhandled error, so it returned no \
+             decision",
+        ));
+    }
+    let decision = match read_decision(
+        &ran.payload,
+        &payload_format,
+        authorizer,
+        about.route_arn,
+        about.reading,
+    ) {
+        Ok(decision) => decision,
+        Err(reason) => return Err(unplaceable(authorizer, &reason)),
+    };
+    // The decision is kept for the TTL the authorizer declares, so a later request
+    // presenting the same identity is served by it without the function running again.
+    if let Some(state) = state {
+        state.lock().authorizer_cache.store(
+            decided,
+            decision.clone(),
+            result_ttl(authorizer.authorizer_result_ttl_in_seconds),
+            Instant::now(),
+        );
+    }
+    decision_of(&decision)
+}
+
+/// Decide one invoke of an HTTP api's route with `authorizer`, in the event that api's
+/// payload format states, and answer it in the envelope that data plane answers in.
 ///
 /// `identity` is the identity-source values the decision is about — the cache key AWS uses
 /// ("API Gateway uses the identity sources as the cache key") and the `identitySource` the
@@ -100,120 +228,74 @@ pub async fn decide<Eng: Send + Sync + 'static>(
     identity: &[String],
     method: &str,
 ) -> Outcome {
-    let api_id = request.api_id.as_str();
-    let stage = request.stage_name.as_str();
-    let decided = crate::state::authorizer_cache::Decided {
-        api_id,
-        stage_name: stage,
-        authorizer_id: &authorizer.authorizer_id,
-        identity,
-    };
-    // A decision already made for this identity, while the TTL the authorizer declared has
-    // not passed: AWS does not invoke the function again for it, so neither does this.
-    if let Some(state) = crate::state::service_state(engine) {
-        let cached = state.lock().authorizer_cache.live(decided, Instant::now());
-        if let Some(cached) = cached {
-            ::tracing::debug!(
-                api_id = %api_id,
-                stage = %stage,
-                authorizer_id = %authorizer.authorizer_id,
-                authorized = cached.authorized,
-                "serving an invoke from the authorizer decision already cached for this \
-                 identity"
-            );
-            return outcome_of(&cached);
-        }
-    }
-
-    let payload_format = payload_format(authorizer);
-    let Some(target) = authorizer
-        .authorizer_uri
-        .as_deref()
-        .and_then(lambda::function_target)
-    else {
-        return unplaceable(
-            authorizer,
-            "the authorizer's AuthorizerUri names no Lambda function to invoke",
-        );
-    };
     let route_arn = route_arn(request, method);
     let event = proxy_event::authorizer_event(
         request,
         invocation,
-        &payload_format,
+        &payload_format(authorizer),
         identity,
         &route_arn,
     );
-    let payload = serde_json::to_vec(&event).unwrap_or_default();
-    let ran = match lambda::invoke_function(ctx, &target, payload, AUTHORIZER_TIMEOUT).await {
-        Ok(ran) => ran,
-        Err(unreached) => return unplaceable(authorizer, &unreached.reason()),
+    let about = About {
+        authorizer,
+        api_id: &request.api_id,
+        stage_name: &request.stage_name,
+        identity,
+        route_arn: &route_arn,
+        // An HTTP api's authorizer: its own configuration declares the format.
+        reading: Reading::AsConfigured,
     };
-    if ran.failed() {
-        // "An unhandled error is still HTTP 200" to Lambda's caller, so the run is told
-        // from a decision by the signal rather than by the status: a function that raised
-        // returned no decision at all.
-        return unplaceable(
-            authorizer,
-            "the authorizer's function ended in an unhandled error, so it returned no \
-             decision",
-        );
+    match decided(
+        crate::state::service_state(engine).as_ref(),
+        ctx.callback(),
+        &about,
+        &event,
+    )
+    .await
+    {
+        Ok(decided) => Outcome::Allowed(decided),
+        Err(Refused::Denied) => Outcome::Refused(Box::new(forbidden())),
+        Err(Refused::Unplaceable) => Outcome::Refused(Box::new(json_response(
+            UNPLACEABLE_STATUS,
+            super::INTERNAL_MESSAGE,
+            None,
+        ))),
     }
-    let decision = match read_decision(&ran.payload, &payload_format, authorizer, &route_arn) {
-        Ok(decision) => decision,
-        Err(reason) => return unplaceable(authorizer, &reason),
-    };
-    // The decision is kept for the TTL the authorizer declares, so a later request
-    // presenting the same identity is served by it without the function running again.
-    if let Some(state) = crate::state::service_state(engine) {
-        state.lock().authorizer_cache.store(
-            decided,
-            decision.clone(),
-            result_ttl(authorizer.authorizer_result_ttl_in_seconds),
-            Instant::now(),
-        );
-    }
-    outcome_of(&decision)
 }
 
-/// The answer a decision owes the caller: the integration for an authorized request, and
-/// `403` `{"message":"Forbidden"}` for one the authorizer refused — the authorizer ran and
-/// said no, which is not the `401` of a request whose identity sources were not all there.
-fn outcome_of(decision: &CachedDecision) -> Outcome {
-    if decision.authorized {
-        return Outcome::Allowed(Decided {
-            context: decision
-                .context
-                .as_deref()
-                .and_then(|context| serde_json::from_str(context).ok()),
-            principal_id: decision.principal_id.clone(),
-        });
+/// What a decision owes the caller: what the function returned for a call it authorized,
+/// and [`Refused::Denied`] for one it refused — the authorizer ran and said no, which is not
+/// the `401` of a request whose identity sources were not all there.
+fn decision_of(decision: &CachedDecision) -> Result<Decided, Refused> {
+    if !decision.authorized {
+        return Err(Refused::Denied);
     }
-    Outcome::Refused(Box::new(forbidden()))
+    Ok(Decided {
+        context: decision
+            .context
+            .as_deref()
+            .and_then(|context| serde_json::from_str(context).ok()),
+        principal_id: decision.principal_id.clone(),
+    })
 }
 
-/// The refusal for an authorizer whose decision could not be obtained at all: the gateway's
-/// own `500`, with the reason logged rather than told to the caller. An allow here would be
-/// a decision no authorizer made.
-fn unplaceable(authorizer: &Authorizer, reason: &str) -> Outcome {
+/// [`Refused::Unplaceable`] with the reason logged rather than told to the caller. An allow
+/// here would be a decision no authorizer made.
+fn unplaceable(authorizer: &Authorizer, reason: &str) -> Refused {
     ::tracing::warn!(
         authorizer_id = %authorizer.authorizer_id,
         authorizer_uri = ?authorizer.authorizer_uri,
         reason = %reason,
-        "refusing an invoke: this route's Lambda authorizer returned no decision"
+        "refusing a call: this route's Lambda authorizer returned no decision"
     );
-    Outcome::Refused(Box::new(json_response(
-        UNPLACEABLE_STATUS,
-        super::INTERNAL_MESSAGE,
-        None,
-    )))
+    Refused::Unplaceable
 }
 
 /// The payload format the authorizer's function is called in: its own
 /// `AuthorizerPayloadFormatVersion`, and `1.0` for one that declares none — the format a
 /// `REQUEST` authorizer predates the `2.0` event with, and the one whose response is a
 /// policy document.
-fn payload_format(authorizer: &Authorizer) -> String {
+pub fn payload_format(authorizer: &Authorizer) -> String {
     authorizer
         .authorizer_payload_format_version
         .as_deref()
@@ -231,6 +313,27 @@ fn reads_simple_response(authorizer: &Authorizer, payload_format: &str) -> bool 
     authorizer.enable_simple_responses == Some(true) && payload_format == PAYLOAD_FORMAT_2_0
 }
 
+/// WHICH member of the function's answer states the decision.
+///
+/// The two data planes read it differently because the two members that describe the format
+/// — `EnableSimpleResponses` and `AuthorizerPayloadFormatVersion` — are an HTTP api's:
+/// "Specifies whether a Lambda authorizer returns a response in a simple format … Supported
+/// only for HTTP API Lambda authorizers" (`Authorizer$EnableSimpleResponses`) and "Specifies
+/// the format of the payload sent to an HTTP API Lambda authorizer"
+/// (`Authorizer$AuthorizerPayloadFormatVersion`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    /// The format the authorizer's own CONFIGURATION declares — an HTTP api's rule, where
+    /// both members above are configuration the caller set on this authorizer.
+    AsConfigured,
+    /// The format the ANSWER itself states: the boolean when the function returned one, and
+    /// the IAM policy otherwise. This is what a WEBSOCKET api's connection request reads,
+    /// where neither member is applicable to its authorizer at all, so nothing about the
+    /// configuration says which format its function answers in — and a clear answer is
+    /// never read as no decision.
+    AsAnswered,
+}
+
 /// The decision the function's `payload` states, or the reason it states none this
 /// authorizer can read.
 fn read_decision(
@@ -238,6 +341,7 @@ fn read_decision(
     payload_format: &str,
     authorizer: &Authorizer,
     route_arn: &str,
+    reading: Reading,
 ) -> Result<CachedDecision, String> {
     let document: Value = serde_json::from_slice(payload)
         .map_err(|error| format!("the authorizer's response is not valid JSON: {error}"))?;
@@ -245,7 +349,11 @@ fn read_decision(
         .get("context")
         .filter(|context| !context.is_null())
         .map(|context| context.to_string());
-    if reads_simple_response(authorizer, payload_format) {
+    let simple = match reading {
+        Reading::AsConfigured => reads_simple_response(authorizer, payload_format),
+        Reading::AsAnswered => document.get("isAuthorized").is_some(),
+    };
+    if simple {
         // "the Lambda authorizer can return a boolean value instead of an IAM policy": the
         // member that carries it is `isAuthorized`, and a response naming none states no
         // decision in this format.
@@ -253,8 +361,8 @@ fn read_decision(
             .get("isAuthorized")
             .and_then(Value::as_bool)
             .ok_or_else(|| {
-                "the authorizer enables simple responses and its function returned no \
-                 isAuthorized member, so it stated no decision"
+                "the authorizer's function returned no readable isAuthorized member, so it \
+                 stated no decision"
                     .to_string()
             })?;
         return Ok(CachedDecision {
@@ -310,6 +418,19 @@ pub fn route_arn(request: &ProxyRequest, method: &str) -> String {
             api = request.api_id,
             stage = request.stage_name
         ),
+    )
+}
+
+/// The ARN of a WEBSOCKET api's route, in the same `execute-api` form: a WebSocket route is
+/// named by its `RouteKey` where an HTTP route is named by its method and path, so the ARN
+/// is `arn:aws:execute-api:{region}:{account}:{api-id}/{stage}/{route-key}` — which is the
+/// `methodArn` the connection request's authorizer event names and the resource its policy
+/// document is matched against.
+pub fn websocket_route_arn(region: &str, api_id: &str, stage_name: &str, route_key: &str) -> String {
+    ::emulator_server::emulator_arn(
+        EXECUTE_API_SERVICE,
+        region,
+        &format!("{api_id}/{stage_name}/{route_key}"),
     )
 }
 
@@ -394,6 +515,7 @@ mod tests {
                 format,
                 &authorizer(format, simple_responses),
                 ARN,
+                Reading::AsConfigured,
             );
             let actual = read.as_ref().ok().map(|decision| decision.authorized);
             assert_eq!(
@@ -444,12 +566,65 @@ mod tests {
                 PAYLOAD_FORMAT_1_0,
                 &authorizer(PAYLOAD_FORMAT_1_0, false),
                 ARN,
+                Reading::AsConfigured,
             );
             let actual = read.as_ref().map(|decision| decision.authorized);
             assert_eq!(
                 actual.ok(),
                 Some(expected),
                 "case {case:?}: expected authorized {expected}, got {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_answer_read_as_answered_states_its_own_format() {
+        // A WebSocket api's authorizer carries neither member that would declare a format,
+        // so the ANSWER states which it is. The rows span what a function can answer:
+        // either format, either decision, and an answer that states neither.
+        let allow = format!(
+            r#"{{"principalId":"user","policyDocument":{{"Version":"2012-10-17",
+                "Statement":[{{"Action":"execute-api:Invoke","Effect":"Allow",
+                "Resource":"{ARN}"}}]}}}}"#
+        );
+        let deny = format!(
+            r#"{{"principalId":"user","policyDocument":{{"Version":"2012-10-17",
+                "Statement":[{{"Action":"execute-api:Invoke","Effect":"Deny",
+                "Resource":"{ARN}"}}]}}}}"#
+        );
+        let cases: [(&str, &str, Option<bool>); 6] = [
+            ("a policy document that allows", allow.as_str(), Some(true)),
+            ("a policy document that denies", deny.as_str(), Some(false)),
+            (
+                "the boolean, authorizing",
+                r#"{"isAuthorized":true,"context":{"tier":"gold"}}"#,
+                Some(true),
+            ),
+            (
+                "the boolean, refusing",
+                r#"{"isAuthorized":false}"#,
+                Some(false),
+            ),
+            (
+                "an isAuthorized member that is no boolean, which states no decision",
+                r#"{"isAuthorized":"yes"}"#,
+                None,
+            ),
+            ("an answer stating neither", r#"{"ok":true}"#, None),
+        ];
+        for (case, response, expected) in cases {
+            // The configuration says nothing either way: each row is read from its answer.
+            let read = read_decision(
+                response.as_bytes(),
+                PAYLOAD_FORMAT_1_0,
+                &authorizer(PAYLOAD_FORMAT_1_0, false),
+                ARN,
+                Reading::AsAnswered,
+            );
+            let actual = read.as_ref().ok().map(|decision| decision.authorized);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
             );
         }
     }

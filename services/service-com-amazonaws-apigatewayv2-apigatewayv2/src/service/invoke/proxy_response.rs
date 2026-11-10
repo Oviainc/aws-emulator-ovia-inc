@@ -274,6 +274,20 @@ fn render(mapped: Mapped) -> Result<RtResponse, Malformed> {
     Ok(response)
 }
 
+/// The status and the bytes a WEBSOCKET route's Lambda proxy integration answered, read as
+/// the STRUCTURED response.
+///
+/// A WebSocket api's integration declares no `PayloadFormatVersion` at all — "Required for
+/// HTTP APIs" (`Integration$PayloadFormatVersion`) — and the event its function is given is
+/// the one `1.0` states, so its answer is read the same way: the structured response, with
+/// nothing inferred for a function that named no `statusCode`. The status is what decides
+/// the call (a `2xx` admits a connection request), and the bytes are what a TWO-WAY route
+/// sends back to the client.
+pub fn websocket_reply(payload: &[u8]) -> Result<(u16, Vec<u8>), Malformed> {
+    let mapped = mapped_1_0(payload)?;
+    Ok((mapped.status, mapped.body))
+}
+
 /// Whether `payload_format` is one this mapping reads. An integration carrying any other
 /// value names a format this emulator cannot interpret a response in, which the caller
 /// states rather than guessing at.

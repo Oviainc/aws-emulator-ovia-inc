@@ -55,6 +55,11 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 # The `Stream`/`Sink` halves of that socket, so a frame arriving and a frame pushed to the
 # connection are awaited together.
 futures-util = { version = "0.3", default-features = false }
+# The HTTP/1 request parser (the one that WebSocket implementation reads a handshake with):
+# a WEBSOCKET api's socket reads the opening handshake's own head before the handshake is
+# completed, because the decision it needs — the `$connect` route's integration and the
+# authorizer in front of it — is awaited.
+httparse = "1"
 # Matches an `IntegrationResponseKey` written as a regular expression (`/2\d\d/`), which is
 # how a WebSocket integration's responses are selected by the status a call produced.
 regex = "1"
