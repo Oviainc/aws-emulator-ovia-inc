@@ -938,13 +938,14 @@ pub const JOB_CANCELLED_REASON: &str = "The job was stopped by a StopJob request
 /// reached a terminal status.
 ///
 /// The operation "stops a job that is in progress"
-/// (`smithy_query(query="doc",shape="StopJob")`), and this job has no progress left, so
-/// the sentence states that precondition and names the job the request addressed —
-/// built FROM THE REQUEST, in the one-sentence form every other refusal in this crate
-/// is built in ([`not_found_message`]).
-pub fn job_not_in_progress_message(job_id: &str) -> String {
-    format!("Job {job_id} is not in progress.")
-}
+/// (`smithy_query(query="doc",shape="StopJob")`), and this job has no progress left.
+/// Unlike [`not_found_message`], which answers a request that NAMED something absent and
+/// so quotes the identifier back, this refusal is about the addressed job's STATE: the
+/// text Amplify answers it with is fixed for the whole error class and carries no
+/// identifier, status or branch from the request or from state, so a client can match on
+/// it. Hence a constant and not a template.
+pub const JOB_ALREADY_TERMINAL_MESSAGE: &str =
+    "Unable to cancel job. The given job is already in a terminal state.";
 
 /// The `message` a `CreateDeployment` `BadRequestException` carries for a branch whose
 /// last job has not finished.

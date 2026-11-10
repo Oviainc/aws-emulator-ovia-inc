@@ -14,8 +14,10 @@
 //!    to `CANCELLED`, and every later read agrees — whatever kind of job it is (a build
 //!    `StartJob` started, a deployment `StartDeployment` started).
 //! 2. A job that has already reached a terminal status has no progress left to stop, so
-//!    it is refused with the modelled `BadRequestException` (HTTP 400) and is left
-//!    exactly as it ended — including a job that was already stopped.
+//!    it is refused with the modelled `BadRequestException` (HTTP 400), carrying that
+//!    error class's fixed message, and is left exactly as it ended — including a job that
+//!    was already stopped. The wording itself is spanned in
+//!    `job_stop_terminal_wording.rs`.
 //! 3. A job is stopped THROUGH its branch and its app, so an unknown app, an unknown
 //!    branch, or a job id belonging to another branch is the modelled 404, and nothing
 //!    is stopped on the way.
@@ -26,7 +28,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use service_com_amazonaws_amplify_amplify::state::{
-    JOB_CANCELLED_REASON, JOB_SETTLE_MILLIS,
+    JOB_ALREADY_TERMINAL_MESSAGE, JOB_CANCELLED_REASON, JOB_SETTLE_MILLIS,
 };
 
 use crate::app_branch_lifecycle::{list_member, string_member, Emulator, Reply};
@@ -239,9 +241,10 @@ async fn a_job_that_is_not_in_progress_is_refused() {
             "case {case:?}: expected the modelled BadRequestException, got {refused:?}"
         );
         let message = refused.message().unwrap_or_default();
-        assert!(
-            message.contains(&job_id),
-            "case {case:?}: the refusal names the job it is about, got {message:?}"
+        assert_eq!(
+            message, JOB_ALREADY_TERMINAL_MESSAGE,
+            "case {case:?}: the refusal carries this error class's fixed text, \
+             got {message:?}"
         );
 
         // The refused call left the job exactly as it had ended.

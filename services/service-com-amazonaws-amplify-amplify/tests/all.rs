@@ -53,6 +53,10 @@ mod hosted_site_access_control;
 mod hosted_site_custom_headers;
 #[path = "all/hosted_site_custom_rules.rs"]
 mod hosted_site_custom_rules;
+#[path = "all/job_deletion.rs"]
+mod job_deletion;
+#[path = "all/job_stop_terminal_wording.rs"]
+mod job_stop_terminal_wording;
 #[path = "all/manual_deployment_preconditions.rs"]
 mod manual_deployment_preconditions;
 #[path = "all/request_refusal_wording.rs"]

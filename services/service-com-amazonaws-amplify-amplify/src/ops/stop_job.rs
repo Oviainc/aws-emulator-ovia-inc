@@ -185,10 +185,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Stops a job that is in progress": a job that has already reached a terminal
         // status has no progress left to stop, so the request is refused with the
-        // modelled 400 and the job is left exactly as it ended.
+        // modelled 400 and the job is left exactly as it ended. The message is the fixed
+        // text of this error class — `BadRequestException` is the catch-all for every 400
+        // on this surface, so the message is the only thing that discriminates them —
+        // and it names neither the job, the branch nor the status.
         if crate::state::is_terminal_job_status(&job.job.summary.status) {
             return Err(StopJobErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::job_not_in_progress_message(&input.job_id)),
+                message: Some(crate::state::JOB_ALREADY_TERMINAL_MESSAGE.to_string()),
             })
             .into());
         }
