@@ -17,6 +17,8 @@ mod arn_addressed_tag_refusals;
 mod attribute_value_admission_rules;
 #[path = "all/authentication_refusal_wording.rs"]
 mod authentication_refusal_wording;
+#[path = "all/backup_feature_snapshot_statuses.rs"]
+mod backup_feature_snapshot_statuses;
 #[path = "all/backup_path_table_state.rs"]
 mod backup_path_table_state;
 #[path = "all/batch_and_transact_items.rs"]

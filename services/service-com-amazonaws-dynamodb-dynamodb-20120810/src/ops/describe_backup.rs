@@ -147,7 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let backup = store.backup(&region, &input.backup_arn).map_err(lift)?;
 
         Ok(DescribeBackupOutput {
-            backup_description: Some(backup.describe(backup.status(now))),
+            backup_description: Some(backup.describe(backup.status(now), now)),
         })
     }
 }

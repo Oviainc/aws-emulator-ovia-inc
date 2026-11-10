@@ -316,9 +316,19 @@ pub struct SourceTableSnapshot {
     pub vector_indexes: Vec<VectorIndexInfo>,
     /// The table's stream configuration, for a table that had a stream.
     pub stream_specification: Option<StreamSpecification>,
-    /// The table's Time to Live setting as it stood then, which is what
-    /// `SourceTableFeatureDetails$TimeToLiveDescription` reports for this backup.
-    pub time_to_live_description: TimeToLiveDescription,
+    /// The table's Time to Live SETTING as it stood then — what the last accepted
+    /// `UpdateTimeToLive` had asked for, and when the clock owes that change its move out
+    /// of the transient status — which is what
+    /// `SourceTableFeatureDetails$TimeToLiveDescription` is projected from for this backup.
+    ///
+    /// The setting is copied rather than the DESCRIPTION it projected at that instant: a
+    /// transient status (`ENABLING` / `DISABLING`) is not a state a record can be frozen
+    /// in, because it is the half-finished half of a change the clock still owes, and that
+    /// change settles on its own clock whether or not anything reads it. So this snapshot
+    /// holds the setting and the status is derived at every read, exactly as the source
+    /// table's own reader derives it — the copy is still frozen, since a later change to
+    /// the table's TTL is a change to the table's own setting and not to this one.
+    pub time_to_live: TimeToLive,
 }
 
 impl Backup {
@@ -341,7 +351,7 @@ impl Backup {
             available_at: now + STATUS_TRANSITION,
             expires_at: None,
             restored_until: None,
-            source: table.backup_snapshot(now),
+            source: table.backup_snapshot(),
             items: table.items.clone(),
         }
     }
@@ -419,8 +429,9 @@ impl Backup {
     }
 
     /// Project this backup into the `BackupDescription` the two single-backup operations
-    /// report: the backup itself, plus the source table as this backup recorded it.
-    pub fn describe(&self, status: &str) -> BackupDescription {
+    /// report: the backup itself, plus the source table as this backup recorded it, as the
+    /// recorded setting stands at `now`.
+    pub fn describe(&self, status: &str, now: SystemTime) -> BackupDescription {
         BackupDescription {
             backup_details: Some(self.details(status)),
             source_table_details: Some(SourceTableDetails {
@@ -447,7 +458,10 @@ impl Backup {
                 vector_indexes: (!self.source.vector_indexes.is_empty())
                     .then(|| self.source.vector_indexes.clone()),
                 stream_description: self.source.stream_specification.clone(),
-                time_to_live_description: Some(self.source.time_to_live_description.clone()),
+                // The recorded setting, projected exactly as the table's own TTL reader
+                // projects it, so a status the clock has settled is reported settled here
+                // too.
+                time_to_live_description: Some(self.source.time_to_live.describe(now)),
                 ..SourceTableFeatureDetails::default()
             }),
         }

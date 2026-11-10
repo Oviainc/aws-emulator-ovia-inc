@@ -190,7 +190,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The record as it stood, in the status this call left it in: the backup is
             // gone from the catalogue, so the only status it can be reported in is
             // `DELETED`.
-            backup_description: Some(removed.describe(crate::state::BACKUP_STATUS_DELETED)),
+            backup_description: Some(
+                removed.describe(crate::state::BACKUP_STATUS_DELETED, now),
+            ),
         })
     }
 }

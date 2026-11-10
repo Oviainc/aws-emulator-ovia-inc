@@ -1767,7 +1767,7 @@ impl Table {
     /// committed up to its own time marker (the `CreateBackup` doc), so what it reports
     /// is what the table held then — and the table itself may be changed or gone by the
     /// time the backup is read.
-    pub fn backup_snapshot(&self, now: SystemTime) -> SourceTableSnapshot {
+    pub fn backup_snapshot(&self) -> SourceTableSnapshot {
         SourceTableSnapshot {
             key_schema: self.key_schema.clone(),
             attribute_definitions: self.attribute_definitions.clone(),
@@ -1815,9 +1815,11 @@ impl Table {
             // rule its own description reports them: a stream that was OFF then is no
             // setting to carry, so the member is absent.
             stream_specification: self.stream.as_ref().and_then(TableStream::specification),
-            // The TTL setting in force at this instant, projected exactly as the TTL
-            // reader projects it, so the backup records what the table reported then.
-            time_to_live_description: self.time_to_live.describe(now),
+            // The TTL SETTING in force at this instant, copied as the setting it is
+            // ([`SourceTableSnapshot::time_to_live`]): the status it is reported in is
+            // derived when the backup is read, by the same rule the table's own TTL reader
+            // follows, so a change the clock had not settled yet is not frozen half-done.
+            time_to_live: self.time_to_live.clone(),
         }
     }
 }
