@@ -448,9 +448,10 @@ async fn the_lens_ceiling_bounds_a_workloads_lens_list() {
     }
 }
 
-/// Both creates refuse a lens that exists and has no published version, with a 400 naming
-/// `Lenses`, and record nothing. Asserted for a review template and a workload, since both
-/// apply lenses by the same rule.
+/// Both creates refuse a lens that exists and has no published version, with the 400 they
+/// refuse a lens the caller cannot reach AT ALL with — the service does not disclose which
+/// of the two it is — and record nothing. Asserted for a review template and a workload,
+/// since both apply lenses by the same rule.
 async fn refuse_unpublished(client: &Client, case: &str, lens: &str) {
     let templates_before = stored_templates(client);
     let workloads_before = stored_workloads(client);
@@ -487,14 +488,23 @@ async fn refuse_unpublished(client: &Client, case: &str, lens: &str) {
             "case {case:?}: {operation} expected ValidationException, got {answer:?}"
         );
         assert_eq!(
+            member(&answer, "Message"),
+            format!(
+                "[Validation] Failed to get lenses {lens}. User might be not authorized to \
+                 access lens."
+            ),
+            "case {case:?}: {operation} must word the refusal as a lens it could not get, \
+             got {answer:?}"
+        );
+        assert_eq!(
             member(&answer, "Reason"),
-            "FIELD_VALIDATION_FAILED",
-            "case {case:?}: {operation} expected Reason FIELD_VALIDATION_FAILED, got {answer:?}"
+            "",
+            "case {case:?}: {operation} carries Reason unclassified, got {answer:?}"
         );
         assert_eq!(
             field_names(&answer),
-            vec![state::LENSES_MEMBER.to_string()],
-            "case {case:?}: {operation} must report the offending member, got {answer:?}"
+            Vec::<String>::new(),
+            "case {case:?}: {operation} reports no per-member finding, got {answer:?}"
         );
     }
 

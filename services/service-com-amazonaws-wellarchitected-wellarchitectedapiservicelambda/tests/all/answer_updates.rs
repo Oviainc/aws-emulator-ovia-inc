@@ -196,16 +196,16 @@ fn choice_answers(answer: &Value) -> BTreeMap<String, (String, Option<String>, O
 }
 
 /// The `Risk` a question carries, derived the way the Well-Architected Tool rates one:
-/// a question that does not apply is `NOT_APPLICABLE`, one answered with no best practice
-/// in place is `HIGH`, one with every best practice in place is `NONE`, and one in between
-/// is `MEDIUM`. `UNANSWERED` is what a question with no answer at all reports, so it is
-/// not reachable here. The five members are what
+/// a question that does not apply is `NOT_APPLICABLE`, one whose answer selects none of
+/// its best practices is still `UNANSWERED` — the selection is what answers it, so
+/// clearing it unanswers the question again — one with every best practice in place is
+/// `NONE`, and one in between is `MEDIUM`. The five members are what
 /// `smithy_query(query="shape", shape="Risk")` publishes.
 fn expected_risk(selected: usize, asks: usize, is_applicable: bool) -> &'static str {
     if !is_applicable {
         "NOT_APPLICABLE"
     } else if selected == 0 {
-        "HIGH"
+        "UNANSWERED"
     } else if selected == asks {
         "NONE"
     } else {
@@ -426,7 +426,15 @@ async fn a_choice_update_records_the_status_reason_and_notes_of_its_choice() {
                 expected_selection,
                 "case {case:?}: the selected choices must be the ones recorded SELECTED, got {answer:?}"
             );
-            let risk = expected_risk(expected_selection.len(), asks.len(), true);
+            // The rating follows what the answer records about the question's choices: a
+            // choice recorded SELECTED leaves that best practice in place, one recorded
+            // NOT_APPLICABLE answers the question with none in place (HIGH), and one
+            // recorded UNSELECTED says nothing about it, so a question whose answer
+            // records nothing but UNSELECTED choices is still UNANSWERED.
+            let risk = match status {
+                "NOT_APPLICABLE" => "HIGH",
+                _ => expected_risk(expected_selection.len(), asks.len(), true),
+            };
             assert_eq!(
                 text(&answer, "Risk").as_deref(),
                 Some(risk),
@@ -675,7 +683,10 @@ async fn an_update_naming_nothing_the_review_holds_is_refused() {
             body: json!({ "Reason": "PERHAPS" }),
             status: 400,
             code: "ValidationException",
-            member: Some("Reason"),
+            // A value outside an enumerated type's set is reported as the schema finding
+            // that quotes the value and the set and names no member at all; the whole
+            // message of that class is pinned by `super::enum_refusal_wording`.
+            member: None,
         },
         Refusal {
             case: "choice-status-the-enum-does-not-publish",
@@ -685,7 +696,8 @@ async fn an_update_naming_nothing_the_review_holds_is_refused() {
             body: json!({ "ChoiceUpdates": { asks[0].clone(): { "Status": "PERHAPS" } } }),
             status: 400,
             code: "ValidationException",
-            member: Some("ChoiceUpdates"),
+            // As the row above: the enum class states the finding, not the member.
+            member: None,
         },
         Refusal {
             case: "choice-update-without-the-required-status",
@@ -884,7 +896,9 @@ async fn a_recorded_answer_is_what_every_read_of_the_review_reports() {
     );
 
     for (case, milestone_number, expected_selection, risk) in [
-        ("live", None, Vec::new(), "HIGH"),
+        // Clearing the selection unanswers the question again, while the milestone keeps
+        // the answer — and the rating — it recorded.
+        ("live", None, Vec::new(), "UNANSWERED"),
         ("milestone", Some(number), asks.clone(), "NONE"),
     ] {
         let read = get_answer(

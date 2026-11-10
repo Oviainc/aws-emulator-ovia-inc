@@ -68,8 +68,8 @@ async fn list_templates(client: &Client) -> Vec<Value> {
 
 /// The refusal a duplicate name gets: 409 `ConflictException`, `ResourceType`
 /// `REVIEW_TEMPLATE`, the `ResourceId` of the template already holding the name, and the
-/// fixed message naming that STORED name.
-fn assert_name_conflict(case: &str, answer: &Answer, stored_name: &str, stored_arn: &str) {
+/// fixed message quoting the name AS SUBMITTED by the refused request.
+fn assert_name_conflict(case: &str, answer: &Answer, submitted_name: &str, stored_arn: &str) {
     assert_eq!(
         answer.status, 409,
         "case {case:?}: expected HTTP 409, got {answer:?}"
@@ -90,8 +90,8 @@ fn assert_name_conflict(case: &str, answer: &Answer, stored_name: &str, stored_a
     );
     assert_eq!(
         member(answer, "Message"),
-        format!("[Conflict] A review template with name {stored_name} already exists."),
-        "case {case:?}: the refusal must name the stored template's name, got {answer:?}"
+        format!("[Conflict] A review template with name {submitted_name} already exists."),
+        "case {case:?}: the refusal must quote the submitted name, got {answer:?}"
     );
 }
 
@@ -124,7 +124,7 @@ async fn a_review_template_name_is_unique_in_the_account_ignoring_case_and_white
                     &format!("tok-dup-{index}-{spelling}"),
                 ))
                 .await;
-            assert_name_conflict(&case, &refused, stored_name, &stored_arn);
+            assert_name_conflict(&case, &refused, &submitted, &stored_arn);
         }
 
         // A genuinely different name is still accepted, so the rows above were refused on
@@ -180,7 +180,7 @@ async fn a_rename_may_not_take_a_name_another_review_template_holds() {
             let refused = client
                 .update_review_template(&other_arn, json!({ "TemplateName": submitted }))
                 .await;
-            assert_name_conflict(&case, &refused, stored_name, &stored_arn);
+            assert_name_conflict(&case, &refused, &submitted, &stored_arn);
         }
 
         // Renaming a template to its OWN name, in any spelling the comparison treats as

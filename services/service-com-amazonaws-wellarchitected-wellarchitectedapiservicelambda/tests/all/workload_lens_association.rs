@@ -767,7 +767,8 @@ fn assert_refused(case: &str, answer: &Answer) {
 }
 
 /// An association naming a custom lens that exists and has no published version is refused
-/// with a 400 naming `LensAliases`, and records nothing.
+/// with the 400 an association naming a lens the caller cannot reach AT ALL gets — the
+/// service does not disclose which of the two it is — and records nothing.
 async fn refuse_unpublished(client: &Client, workload_id: &str, case: &str, lens: &str) {
     age_workload(client, workload_id, AGE);
     let (before, updated_before) = stored_lenses(client, workload_id, case).await;
@@ -782,14 +783,22 @@ async fn refuse_unpublished(client: &Client, workload_id: &str, case: &str, lens
         "case {case:?}: expected ValidationException, got {answer:?}"
     );
     assert_eq!(
+        member(&answer, "Message"),
+        format!(
+            "[Validation] Failed to get lenses {lens}. User might be not authorized to \
+             access lens."
+        ),
+        "case {case:?}: the refusal must be worded as a lens it could not get, got {answer:?}"
+    );
+    assert_eq!(
         member(&answer, "Reason"),
-        "FIELD_VALIDATION_FAILED",
-        "case {case:?}: expected Reason FIELD_VALIDATION_FAILED, got {answer:?}"
+        "",
+        "case {case:?}: the refusal carries Reason unclassified, got {answer:?}"
     );
     assert_eq!(
         field_names(&answer),
-        vec![state::LENS_ALIASES_MEMBER.to_string()],
-        "case {case:?}: the refusal must name the offending member, got {answer:?}"
+        Vec::<String>::new(),
+        "case {case:?}: the refusal reports no per-member finding, got {answer:?}"
     );
 
     let (after, updated_after) = stored_lenses(client, workload_id, case).await;

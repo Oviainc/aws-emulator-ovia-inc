@@ -431,8 +431,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with the original request's result, and over a list the lens quota above has
         // already bounded, so the work it costs is bounded too.
         let now = std::time::SystemTime::now();
-        if let Some(refusal) = store.unapplicable_lenses_refusal(&lenses, crate::state::LENSES_MEMBER)
-        {
+        if let Some(refusal) = store.unapplicable_lenses_refusal(&lenses) {
             return Err(CreateWorkloadErrorModeled::ValidationException(
                 crate::service::lens_content_validation::unapplicable_lenses(refusal),
             )
@@ -440,12 +439,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The name must be unique within an account within an Amazon Web Services Region.
-        // Spaces and capitalization are ignored when checking for uniqueness."
-        if let Some((existing_name, existing_id)) =
-            store.workload_holding_name(&input.workload_name)
-        {
+        // Spaces and capitalization are ignored when checking for uniqueness." The refusal
+        // quotes the name AS SUBMITTED and points at the workload already holding it.
+        if let Some((_, existing_id)) = store.workload_holding_name(&input.workload_name) {
             return Err(CreateWorkloadErrorModeled::ConflictException(
-                crate::state::workload_name_conflict(existing_name, existing_id),
+                crate::state::workload_name_conflict(&input.workload_name, existing_id),
             )
             .into());
         }

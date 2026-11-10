@@ -227,11 +227,11 @@ async fn an_unrecorded_milestone_is_a_not_found_naming_the_composite_id() {
     }
 }
 
-/// Rule 2 for a collision: the 409 names the resource already holding the value — the
-/// workload's name AS STORED, not the caller's spelling of it — and its `ResourceId`
-/// identifies that resource. Rows differ along the spelling submitted (the uniqueness
-/// check ignores spaces and capitalization) and along which operation submits it, so
-/// every row must report the one stored name.
+/// Rule 2 for a collision: the 409 identifies the resource already holding the value
+/// through its `ResourceId`, and its message quotes the name AS SUBMITTED by the refused
+/// request, not the stored spelling of it. Rows differ along the spelling submitted (the
+/// uniqueness check ignores spaces and capitalization) and along which operation submits
+/// it, so every row must read back its own spelling.
 #[tokio::test]
 async fn a_name_collision_is_a_conflict_naming_the_workload_that_holds_the_name() {
     let client = Client::new();
@@ -286,8 +286,8 @@ async fn a_name_collision_is_a_conflict_naming_the_workload_that_holds_the_name(
             );
             assert_eq!(
                 member(&answer, "Message"),
-                format!("[Conflict] A workload with name {STORED_NAME} already exists."),
-                "case {case:?}/{operation}: the message must name the STORED name, got {answer:?}"
+                format!("[Conflict] A workload with name {submitted} already exists."),
+                "case {case:?}/{operation}: the message must quote the SUBMITTED name, got {answer:?}"
             );
         }
     }
@@ -296,7 +296,7 @@ async fn a_name_collision_is_a_conflict_naming_the_workload_that_holds_the_name(
     // same way — with the composite id of the milestone already holding the name, the
     // workload the uniqueness is scoped to, and the comparison rule. The comparison is
     // the service's loose one, so every spelling that differs only in capitalization or
-    // whitespace is the same 409 naming the STORED name.
+    // whitespace is the same 409, each quoting the spelling THAT request submitted.
     let host = created_id(
         &client.create(minimal_create("milestone-conflict-host", "tok-mc")).await,
         "milestone-host",
@@ -347,10 +347,10 @@ async fn a_name_collision_is_a_conflict_naming_the_workload_that_holds_the_name(
             assert_eq!(
                 member(&again, "Message"),
                 format!(
-                    "[Conflict] Milestone with name {name} already exists under workload \
+                    "[Conflict] Milestone with name {submitted} already exists under workload \
                      {host}. Capitalization and whitespace are ignored in milestone names."
                 ),
-                "case {case:?}/{spelling}: the message must name the stored name and the \
+                "case {case:?}/{spelling}: the message must quote the submitted name and the \
                  workload it is unique within, got {again:?}"
             );
         }

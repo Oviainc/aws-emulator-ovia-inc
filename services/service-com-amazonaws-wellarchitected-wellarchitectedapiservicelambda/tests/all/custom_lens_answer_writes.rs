@@ -88,13 +88,14 @@ const SELECTIONS: [Selection; 4] = [
     Selection::AllButLast,
 ];
 
-/// The `Risk` the service derives from an applicable answer: a question with no best
-/// practice in place is `HIGH`, one with some choice still unselected is `MEDIUM`, and one
-/// with nothing left unselected is `NONE` (`smithy_query(query="shape", shape="Risk")`
-/// publishes the value set).
+/// The `Risk` the service derives from an applicable answer: a question whose answer
+/// selects none of its best practices is still `UNANSWERED` — the selection is what
+/// answers it — one with some choice still unselected is `MEDIUM`, and one with nothing
+/// left unselected is `NONE` (`smithy_query(query="shape", shape="Risk")` publishes the
+/// value set).
 fn expected_risk(choices: usize, selected: usize) -> &'static str {
     if selected == 0 {
-        "HIGH"
+        "UNANSWERED"
     } else if selected < choices {
         "MEDIUM"
     } else {
@@ -427,13 +428,21 @@ async fn every_question_an_imported_lens_defines_can_be_answered() {
             );
         }
 
-        // The review's own answer list moves with the writes: no question of it is
-        // UNANSWERED any more.
-        for summary in listed_answers(&client, case, &workload_id, lens_arn).await {
-            assert_ne!(
-                summary.get("Risk").and_then(Value::as_str),
-                Some("UNANSWERED"),
-                "case {case:?}: every question of the review was answered, got {summary:?}"
+        // The review's own answer list moves with the writes: every question whose row
+        // selected a best practice is rated by it, and the rows that selected NONE leave
+        // their question unanswered — the selection is what answers a question.
+        for (position, summary) in listed_answers(&client, case, &workload_id, lens_arn)
+            .await
+            .iter()
+            .enumerate()
+        {
+            let selection = SELECTIONS[position % SELECTIONS.len()];
+            let expected_unanswered = selection.of(&choice_ids(summary)).is_empty();
+            assert_eq!(
+                summary.get("Risk").and_then(Value::as_str) == Some("UNANSWERED"),
+                expected_unanswered,
+                "case {case:?}: a question is UNANSWERED exactly while its answer selects \
+                 nothing ({selection:?}), got {summary:?}"
             );
         }
     }

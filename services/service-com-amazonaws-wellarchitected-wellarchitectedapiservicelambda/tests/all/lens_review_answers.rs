@@ -184,7 +184,8 @@ async fn risk_counts(client: &Client, workload_id: &str) -> BTreeMap<String, i64
 }
 
 /// The roll-up expected when `answered` questions of the framework lens carry the named
-/// risks and the rest are outstanding.
+/// risks and the rest are outstanding. A question whose answer leaves it unanswered counts
+/// in that same bucket, so `answered` may name `UNANSWERED` too.
 fn expected_counts(answered: &[(&str, i64)]) -> BTreeMap<String, i64> {
     let mut counts: BTreeMap<String, i64> = ["UNANSWERED", "HIGH", "MEDIUM", "NONE", "NOT_APPLICABLE"]
         .iter()
@@ -195,7 +196,7 @@ fn expected_counts(answered: &[(&str, i64)]) -> BTreeMap<String, i64> {
         *counts.entry((*risk).to_string()).or_default() += count;
         outstanding -= count;
     }
-    counts.insert("UNANSWERED".to_string(), outstanding);
+    *counts.entry("UNANSWERED".to_string()).or_default() += outstanding;
     counts
 }
 
@@ -679,10 +680,11 @@ struct RatedAnswer {
 }
 
 /// A stored answer is what the summary reports, and the question's `Risk` is DERIVED
-/// from it: a question that does not apply is `NOT_APPLICABLE`, one with no best
-/// practice in place is `HIGH`, one with a choice still unselected is `MEDIUM` and one
-/// with nothing unselected is `NONE`. The same derivation moves the workload's risk
-/// roll-up, so the rows check both. Rows differ along what the answer records.
+/// from it: a question that does not apply is `NOT_APPLICABLE`, one whose answer records
+/// nothing but unselected choices is still `UNANSWERED`, one with a choice still
+/// unselected is `MEDIUM` and one with nothing unselected is `NONE`. The same derivation
+/// moves the workload's risk roll-up, so the rows check both. Rows differ along what the
+/// answer records.
 #[tokio::test]
 async fn a_stored_answer_is_reported_and_rated() {
     // The question answered is the same in every row; what varies is the answer. Its
@@ -731,6 +733,20 @@ async fn a_stored_answer_is_reported_and_rated() {
         RatedAnswer {
             case: "nothing-in-place",
             statuses: statuses(&every_choice_unselected),
+            is_applicable: true,
+            reason: None,
+            risk: "UNANSWERED",
+        },
+        // One choice recorded NOT_APPLICABLE is something the answer DOES say about the
+        // question, so it is rated — with no best practice in place, at HIGH.
+        RatedAnswer {
+            case: "only-a-choice-that-does-not-apply",
+            statuses: {
+                let mut planned = every_choice_unselected.clone();
+                planned.retain(|(choice_id, _)| *choice_id != last.as_str());
+                planned.push((last.as_str(), "NOT_APPLICABLE"));
+                statuses(&planned)
+            },
             is_applicable: true,
             reason: None,
             risk: "HIGH",
@@ -831,16 +847,20 @@ async fn a_stored_answer_is_reported_and_rated() {
         );
 
         // Every other question is still outstanding, and the workload's roll-up has
-        // moved the answered one out of UNANSWERED into its risk.
+        // moved the answered one into its risk — which is the outstanding bucket itself
+        // for a row whose answer says nothing about any choice.
         let outstanding = summaries
             .iter()
             .filter(|summary| summary.get("Risk").and_then(Value::as_str) == Some("UNANSWERED"))
             .count();
-        assert_eq!(
-            outstanding,
-            FRAMEWORK_QUESTIONS - 1,
-            "case {case:?}: one question is answered, so {} must be outstanding, got {outstanding}",
+        let expected_outstanding = if risk == "UNANSWERED" {
+            FRAMEWORK_QUESTIONS
+        } else {
             FRAMEWORK_QUESTIONS - 1
+        };
+        assert_eq!(
+            outstanding, expected_outstanding,
+            "case {case:?}: {expected_outstanding} question(s) must be outstanding, got {outstanding}"
         );
         let expected = expected_counts(&[(risk, 1)]);
         let actual = risk_counts(&client, &workload_id).await;
@@ -859,14 +879,19 @@ async fn a_milestone_freezes_the_answers_it_recorded() {
     let client = Client::new();
     let workload_id = framework_workload(&client, "frozen-host").await;
 
-    // Before the milestone: one question answered with nothing in place.
+    // Before the milestone: one question answered with one best practice still missing.
     let frozen_question_choices = framework_choice_ids("manage-service-quotas");
     let later_question_choices = framework_choice_ids("govern-usage");
+    let frozen_partial: Vec<&str> = frozen_question_choices
+        .iter()
+        .map(String::as_str)
+        .take(frozen_question_choices.len().saturating_sub(1))
+        .collect();
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
         "manage-service-quotas",
-        answered_over(&frozen_question_choices, &[], true, None),
+        answered_over(&frozen_question_choices, &frozen_partial, true, None),
     );
     let recorded = client
         .send(
@@ -922,7 +947,7 @@ async fn a_milestone_freezes_the_answers_it_recorded() {
     for (case, summaries, question, expected) in [
         ("live/changed-answer", &live, "manage-service-quotas", "NONE"),
         ("live/new-answer", &live, "govern-usage", "NONE"),
-        ("milestone/changed-answer", &frozen, "manage-service-quotas", "HIGH"),
+        ("milestone/changed-answer", &frozen, "manage-service-quotas", "MEDIUM"),
         ("milestone/new-answer", &frozen, "govern-usage", "UNANSWERED"),
     ] {
         let actual = risk_of(summaries, question);
@@ -983,7 +1008,7 @@ async fn a_milestone_freezes_the_answers_it_recorded() {
                 .collect()
         })
         .unwrap_or_default();
-    let expected_frozen = expected_counts(&[("HIGH", 1)]);
+    let expected_frozen = expected_counts(&[("MEDIUM", 1)]);
     assert_eq!(
         frozen_counts, expected_frozen,
         "the recorded workload must keep its roll-up, expected {expected_frozen:?}, got {milestone:?}"

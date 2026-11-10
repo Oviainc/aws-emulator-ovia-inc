@@ -248,8 +248,8 @@ async fn a_workload_created_from_a_template_starts_with_the_templates_answers() 
 
     // Answer every question of the template's lens, each in a different way, and remember
     // the `Risk` the answer earns: a question that does not apply is NOT_APPLICABLE, one
-    // with nothing in place is HIGH, one with something left out is MEDIUM, one with
-    // nothing left out is NONE.
+    // whose answer selects nothing is still UNANSWERED, one with something left out is
+    // MEDIUM, one with nothing left out is NONE.
     let mut expected_risks: BTreeMap<String, &'static str> = BTreeMap::new();
     for (index, question_id) in question_ids.iter().enumerate() {
         let case = format!("answer-{question_id}");
@@ -280,7 +280,7 @@ async fn a_workload_created_from_a_template_starts_with_the_templates_answers() 
         let risk = if !applicable {
             "NOT_APPLICABLE"
         } else if selected.is_empty() {
-            "HIGH"
+            "UNANSWERED"
         } else if selected.len() < choices.len() {
             "MEDIUM"
         } else {

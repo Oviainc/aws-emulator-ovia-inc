@@ -447,14 +447,19 @@ fn modelled_refusal<Op: Operation>(
 ///
 /// A value outside a modelled numeric `@range` is a service LIMIT the caller can act
 /// on, so it is classified: `Reason` `FIELD_VALIDATION_FAILED` plus one `Fields` entry
-/// naming the member and its published bounds. Every other constraint (a string's
-/// `@length`, `@pattern` or enum value set) is refused while the request is still being
+/// naming the member and its published bounds. A value outside the set an enumerated type
+/// admits is stated as the schema finding the front door reports for the BODY it read
+/// ([`enum_findings`]), with the required `Message` alone. Every other constraint (a
+/// string's `@length` or `@pattern`) is refused while the request is still being
 /// validated as a shape, and is stated with the required `Message` alone — the same
 /// facts the framework's envelope carried, in the modelled shape.
 fn constraint_refusal(
     violations: &[Violation],
     input_schema: &Schema,
 ) -> crate::ops::types::ValidationException {
+    if let Some(findings) = enum_findings(violations, input_schema) {
+        return crate::state::unclassified_exception(findings);
+    }
     let bounded: Vec<(String, String)> = violations
         .iter()
         .filter_map(|violation| bounded_member(violation, input_schema))
@@ -469,6 +474,49 @@ fn constraint_refusal(
     } else {
         crate::state::field_validation_exception(&bounded)
     }
+}
+
+/// The whole message this service states for a request whose only fault is a value
+/// outside the set an enumerated type admits: the schema findings a JSON-schema layer
+/// lists, one per offending value, in the order the validating walk found them.
+///
+/// The service reads a request BODY through such a layer, and that layer reports what it
+/// found rather than naming the member: the finding quotes the value the request carried
+/// and the values the MODEL declares for that member's type, in the declared order the
+/// walk carries them. Both halves therefore come from the request and the model, never
+/// from a table here.
+///
+/// ALL OR NOTHING, for the reason the shared renderer's own report gives: `None` when a
+/// violation is of another class, when it is about a value bound to the URI or a header
+/// rather than to the body — those travel outside the layer that words findings this way —
+/// or when the value is withheld (a `@sensitive` member), so a message is never half in
+/// one voice and half in the framework's.
+fn enum_findings(violations: &[Violation], input_schema: &Schema) -> Option<String> {
+    if violations.is_empty() {
+        return None;
+    }
+    let findings: Vec<String> = violations
+        .iter()
+        .map(|violation| enum_finding(violation, input_schema))
+        .collect::<Option<Vec<_>>>()?;
+    Some(service_common::validation_message::bracketed_findings(
+        &findings,
+    ))
+}
+
+/// One finding of [`enum_findings`], or `None` when `violation` is not a body member's
+/// value outside its enumerated type's set.
+fn enum_finding(violation: &Violation, input_schema: &Schema) -> Option<String> {
+    let ViolationKind::EnumValue(permitted) = &violation.kind else {
+        return None;
+    };
+    if !service_common::front_door::binds_to_body(input_schema, &violation.path) {
+        return None;
+    }
+    Some(service_common::validation_message::enum_value_not_found(
+        violation.value.as_deref()?,
+        permitted,
+    ))
 }
 
 /// The `(member, message)` finding for a value outside a modelled numeric `@range`, or

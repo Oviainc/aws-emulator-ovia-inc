@@ -203,8 +203,9 @@ impl WorkloadRecord {
     /// a caller that reads a bucket to report review progress always finds it.
     ///
     /// `UNANSWERED` counts the questions of every lens attached to the workload that
-    /// carries no answer yet; each other bucket counts the stored answers that carry
-    /// that risk ([`AnswerRecord::risk`]). The map is DERIVED from the attached lenses
+    /// carries no answer yet, and those whose stored answer says nothing about any of the
+    /// question's choices ([`AnswerRecord::risk`]); each other bucket counts the stored
+    /// answers that carry that risk. The map is DERIVED from the attached lenses
     /// and the stored answers on every read and never stored, so it moves when either
     /// does.
     ///

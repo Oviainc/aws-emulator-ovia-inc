@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::AnswerRecord;
 
 use super::workload_harness::{
-    answered, assert_field_validation, created_id, encode_path_segment, framework_answer,
+    assert_field_validation, created_id, encode_path_segment, framework_answer,
     framework_answer_that_does_not_apply, minimal_create, official_lens_arn, Answer, Client,
     InPlace,
 };
@@ -302,13 +302,19 @@ async fn an_answer_moves_the_counts_of_its_pillar_and_of_the_whole_review() {
 
     // The risk a stored answer carries: a question that does not apply is NOT_APPLICABLE,
     // one answered with no best practice in place is HIGH, one with a best practice still
-    // unselected is MEDIUM, and one with nothing left unselected is NONE.
+    // unselected is MEDIUM, and one with nothing left unselected is NONE. "No best practice
+    // in place" is an ANSWER, so the row that records one marks the last choice
+    // NOT_APPLICABLE rather than leaving every choice unselected — which would leave the
+    // question unanswered.
     let rows: [(&str, &str, &str, AnswerRecord, &str); 5] = [
         (
             "no-best-practice-in-place",
             "reliability",
             "manage-service-quotas",
-            framework_answer("manage-service-quotas", InPlace::Nothing),
+            framework_answer(
+                "manage-service-quotas",
+                InPlace::NothingAndTheLastDoesNotApply,
+            ),
             "HIGH",
         ),
         (
@@ -336,7 +342,7 @@ async fn an_answer_moves_the_counts_of_its_pillar_and_of_the_whole_review() {
             "second-answer-in-the-same-pillar",
             "reliability",
             "network-topology",
-            framework_answer("network-topology", InPlace::Nothing),
+            framework_answer("network-topology", InPlace::NothingAndTheLastDoesNotApply),
             "HIGH",
         ),
     ];
@@ -398,7 +404,10 @@ async fn every_spelling_of_the_lens_reaches_the_same_review() {
         &workload_id,
         FRAMEWORK_LENS,
         "cloud-financial-management",
-        answered(&[], true, None),
+        framework_answer(
+            "cloud-financial-management",
+            InPlace::NothingAndTheLastDoesNotApply,
+        ),
     );
 
     for (case, lens) in [
@@ -447,14 +456,15 @@ async fn a_milestone_scoped_read_reports_the_review_that_milestone_recorded() {
         "milestoned",
     );
 
-    // Milestone <n> is recorded with exactly <n> questions answered HIGH.
+    // Milestone <n> is recorded with exactly <n> questions answered HIGH — each one
+    // answered with no best practice in place.
     let questions = ["manage-service-quotas", "network-topology", "service-architecture"];
     for (index, question_id) in questions.iter().enumerate() {
         client.record_answer(
             &workload_id,
             FRAMEWORK_LENS,
             question_id,
-            answered(&[], true, None),
+            framework_answer(question_id, InPlace::NothingAndTheLastDoesNotApply),
         );
         let number = i64::try_from(index + 1).unwrap_or(0);
         let recorded = create_milestone(
@@ -475,7 +485,7 @@ async fn a_milestone_scoped_read_reports_the_review_that_milestone_recorded() {
         &workload_id,
         FRAMEWORK_LENS,
         "securely-operate",
-        answered(&[], true, None),
+        framework_answer("securely-operate", InPlace::NothingAndTheLastDoesNotApply),
     );
 
     for number in 1..=i64::try_from(questions.len()).unwrap_or(0) {

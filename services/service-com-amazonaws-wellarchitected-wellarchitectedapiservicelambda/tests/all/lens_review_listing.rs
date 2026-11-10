@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 
 use super::workload_harness::{
-    answered, created_id, encode_path_segment, framework_answer,
+    created_id, encode_path_segment, framework_answer,
     framework_answer_that_does_not_apply, minimal_create, official_lens_arn, Answer, Client,
     InPlace,
 };
@@ -544,12 +544,17 @@ async fn the_roll_up_of_each_review_counts_only_that_lens_s_answers() {
 
     // The risk a stored answer carries: a question that does not apply is NOT_APPLICABLE,
     // one answered with no best practice in place is HIGH, one with a best practice still
-    // unselected is MEDIUM, and one with nothing left unselected is NONE.
+    // unselected is MEDIUM, and one with nothing left unselected is NONE. "No best practice
+    // in place" is an ANSWER, so those rows mark the last choice NOT_APPLICABLE rather than
+    // leaving every choice unselected, which would leave the question unanswered.
     let rows: [(&str, &str, _, &str); 5] = [
         (
             "no-best-practice-in-place",
             "manage-service-quotas",
-            framework_answer("manage-service-quotas", InPlace::Nothing),
+            framework_answer(
+                "manage-service-quotas",
+                InPlace::NothingAndTheLastDoesNotApply,
+            ),
             "HIGH",
         ),
         (
@@ -573,7 +578,7 @@ async fn the_roll_up_of_each_review_counts_only_that_lens_s_answers() {
         (
             "second-answer-of-the-same-review",
             "network-topology",
-            framework_answer("network-topology", InPlace::Nothing),
+            framework_answer("network-topology", InPlace::NothingAndTheLastDoesNotApply),
             "HIGH",
         ),
     ];
@@ -618,14 +623,15 @@ async fn a_milestone_scoped_listing_reports_the_reviews_that_milestone_recorded(
     // The question set of the review under test, as its own answer list enumerates it.
     let framework_questions = question_count(&client, &workload_id, FRAMEWORK_LENS).await;
 
-    // Milestone <n> is recorded with exactly <n> questions answered HIGH.
+    // Milestone <n> is recorded with exactly <n> questions answered HIGH — each one
+    // answered with no best practice in place.
     let questions = ["manage-service-quotas", "network-topology", "service-architecture"];
     for (index, question_id) in questions.iter().enumerate() {
         client.record_answer(
             &workload_id,
             FRAMEWORK_LENS,
             question_id,
-            answered(&[], true, None),
+            framework_answer(question_id, InPlace::NothingAndTheLastDoesNotApply),
         );
         let number = index + 1;
         let recorded = create_milestone(
@@ -646,7 +652,7 @@ async fn a_milestone_scoped_listing_reports_the_reviews_that_milestone_recorded(
         &workload_id,
         FRAMEWORK_LENS,
         "securely-operate",
-        answered(&[], true, None),
+        framework_answer("securely-operate", InPlace::NothingAndTheLastDoesNotApply),
     );
 
     for number in 1..=questions.len() {

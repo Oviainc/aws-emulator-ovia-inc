@@ -502,11 +502,13 @@ async fn a_milestone_scoped_read_reports_the_review_the_milestone_recorded() {
 
     for (case, question_id, milestone_number, expected_selected, expected_risk) in [
         (
+            // Dropping the selection unanswers the question again, while the milestone
+            // keeps the answer it recorded.
             "answered-before-and-changed-after-live",
             before_the_milestone.question_id,
             None,
             Vec::new(),
-            state::RISK_HIGH,
+            state::RISK_UNANSWERED,
         ),
         (
             "answered-before-and-changed-after-milestone",

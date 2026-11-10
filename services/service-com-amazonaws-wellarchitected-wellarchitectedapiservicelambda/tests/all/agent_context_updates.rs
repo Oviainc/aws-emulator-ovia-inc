@@ -652,32 +652,38 @@ async fn a_member_outside_its_modelled_clause_is_refused_and_the_context_is_unto
     let profile_arn = profile_arn_of(&client, "context-update-validation", 1).await;
     let (id, created) = stored_context(&client, &profile_arn, "validation").await;
 
-    let rows: Vec<(&str, &str, Value)> = vec![
-        ("empty-title", "title", json!({ "title": "" })),
+    // The second column is the text the refusal must state: the member the value was sent
+    // for, except for a value outside an enumerated type's set, which is reported as the
+    // schema finding that quotes the value and the set and names no member.
+    let rows: Vec<(&str, String, Value)> = vec![
+        ("empty-title", "title".to_string(), json!({ "title": "" })),
         (
             "title-past-the-bound",
-            "title",
+            "title".to_string(),
             json!({ "title": "t".repeat(TITLE_MAX + 1) }),
         ),
         (
             "application-type-outside-the-enum",
-            "applicationType",
+            r#"instance value ("MAINFRAME") not found in enum"#.to_string(),
             json!({ "content": { "applicationType": "MAINFRAME" } }),
         ),
         (
             "criticality-outside-the-enum",
-            "criticality",
+            r#"instance value ("SOMEWHAT_CRITICAL") not found in enum"#.to_string(),
             json!({ "content": { "criticality": "SOMEWHAT_CRITICAL" } }),
         ),
         (
             "lowercased-published-application-type",
-            "applicationType",
+            format!(
+                "instance value (\"{}\") not found in enum",
+                APPLICATION_TYPES[0].to_lowercase()
+            ),
             json!({ "content": { "applicationType": APPLICATION_TYPES[0].to_lowercase() } }),
         ),
     ];
 
     let before = stored_contexts_by_profile(&client);
-    for (case, refused_member, patch) in rows {
+    for (case, expected, patch) in rows {
         let answer = update_context(&client, &profile_arn, &id, patch).await;
         assert_eq!(
             answer.status, 400,
@@ -688,8 +694,8 @@ async fn a_member_outside_its_modelled_clause_is_refused_and_the_context_is_unto
             "case {case:?}: expected ValidationException, got {answer:?}"
         );
         assert!(
-            member(&answer, "Message").contains(refused_member),
-            "case {case:?}: the refusal must name {refused_member}, got {answer:?}"
+            member(&answer, "Message").contains(&expected),
+            "case {case:?}: the refusal must state {expected:?}, got {answer:?}"
         );
 
         let fetched = get_context(&client, &profile_arn, &id).await;

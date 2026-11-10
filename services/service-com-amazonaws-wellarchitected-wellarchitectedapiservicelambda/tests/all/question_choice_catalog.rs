@@ -397,7 +397,9 @@ async fn a_discovered_choice_id_round_trips_through_the_stored_answer() {
             ("first-choice-only", vec![ids[0].clone()], "MEDIUM"),
             ("last-choice-only", vec![last.clone()], "MEDIUM"),
             ("every-choice", ids.clone(), "NONE"),
-            ("no-choice", Vec::new(), "HIGH"),
+            // Naming no choice at all answers nothing, so the question is back to
+            // UNANSWERED whatever it recorded before.
+            ("no-choice", Vec::new(), "UNANSWERED"),
         ];
 
         for (row, selected, expected_risk) in rows {

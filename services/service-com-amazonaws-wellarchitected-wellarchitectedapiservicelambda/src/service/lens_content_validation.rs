@@ -52,11 +52,11 @@ fn tagged(sentence: &str) -> String {
 /// The refusal for a list of lenses a request asks to APPLY that the store will not
 /// apply ([`state::LensesRefusal`]).
 ///
-/// A lens is applied BY NAME, and the name is a value of the request: a name that
-/// resolves to no lens is refused as that member's value rather than reported as a
-/// missing resource, so a caller is told the same way whether the name is unknown or
-/// names a lens no version has been published from (the refusal the store already words
-/// as a field validation, passed through unchanged).
+/// A lens is applied BY NAME, and the name is a value of the request: a name the caller
+/// cannot reach a lens through is refused as that member's value rather than reported as a
+/// missing resource, and the two ways it can fail — a name that resolves to no lens at all
+/// and one that names a custom lens no version has been published from — are worded
+/// IDENTICALLY, because the service does not tell the caller which of them it is.
 pub fn unapplicable_lenses(refusal: state::LensesRefusal) -> ValidationException {
     match refusal {
         state::LensesRefusal::NotFound(unresolved) => ValidationException {
@@ -73,7 +73,6 @@ pub fn unapplicable_lenses(refusal: state::LensesRefusal) -> ValidationException
             reason: Some(String::new()),
             fields: None,
         },
-        state::LensesRefusal::Unapplicable(exception) => exception,
     }
 }
 

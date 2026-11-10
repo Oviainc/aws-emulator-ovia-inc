@@ -212,9 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and find nothing for. A lens is applied BY NAME, so an entry that resolves to no
         // lens is a value of `LensAliases` this service refuses rather than a resource it
         // could not find — the rule in `crate::service::lens_content_validation`.
-        if let Some(refusal) =
-            store.unapplicable_lenses_refusal(&named, crate::state::LENS_ALIASES_MEMBER)
-        {
+        if let Some(refusal) = store.unapplicable_lenses_refusal(&named) {
             return Err(AssociateLensesErrorModeled::ValidationException(
                 crate::service::lens_content_validation::unapplicable_lenses(refusal),
             )

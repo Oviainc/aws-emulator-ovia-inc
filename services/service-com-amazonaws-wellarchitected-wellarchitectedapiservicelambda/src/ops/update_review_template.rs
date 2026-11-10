@@ -268,9 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for. It runs over the whole list the request named rather than only the fresh
         // ones, so a name that resolves to nothing is refused whether or not the template
         // already applies that lens.
-        if let Some(refusal) =
-            store.unapplicable_lenses_refusal(&to_associate, LENSES_TO_ASSOCIATE_MEMBER)
-        {
+        if let Some(refusal) = store.unapplicable_lenses_refusal(&to_associate) {
             return Err(UpdateReviewTemplateErrorModeled::ValidationException(
                 crate::service::lens_content_validation::unapplicable_lenses(refusal),
             )
@@ -313,7 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(existing) = store.review_template_holding_name(new_name) {
                 if existing.template_arn != input.template_arn {
                     let collision = crate::state::review_template_name_conflict(
-                        &existing.template_name,
+                        new_name,
                         &existing.template_arn,
                     );
                     return Err(
@@ -396,11 +394,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The member a refused `LensesToAssociate` value is reported under: the lens resolution
-/// this operation shares with every other that applies lenses names the member that carried
-/// them, so a caller is told WHICH list to fix.
-const LENSES_TO_ASSOCIATE_MEMBER: &str = "LensesToAssociate";
 
 /// The member a refused `LensesToDisassociate` value is reported under.
 const LENSES_TO_DISASSOCIATE_MEMBER: &str = "LensesToDisassociate";

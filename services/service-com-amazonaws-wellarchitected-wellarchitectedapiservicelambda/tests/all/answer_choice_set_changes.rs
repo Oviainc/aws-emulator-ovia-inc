@@ -39,11 +39,13 @@ use super::workload_harness::{
 const PILLAR_ID: &str = "governance";
 const QUESTION_ID: &str = "governance_q1";
 
-/// The `Risk` members an answered question can be rated at
-/// (`smithy_query(query="shape", shape="Risk")` publishes these beside `UNANSWERED`).
-const RISK_HIGH: &str = "HIGH";
+/// The `Risk` members a question an answer speaks about can be rated at
+/// (`smithy_query(query="shape", shape="Risk")` publishes these beside `UNANSWERED`),
+/// and `UNANSWERED` itself — which a question whose answer says nothing about any choice
+/// the new version asks about is back to.
 const RISK_MEDIUM: &str = "MEDIUM";
 const RISK_NONE: &str = "NONE";
+const RISK_UNANSWERED: &str = "UNANSWERED";
 
 /// Two of the `ChoiceStatus` members
 /// (`smithy_query(query="shape", shape="ChoiceStatus")`).
@@ -414,14 +416,15 @@ const CHANGES: &[ChoiceSetChange] = &[
         second_version: &["c1"],
         risk_after: RISK_NONE,
     },
-    // Dropping the one choice that WAS in place leaves nothing in place at all.
+    // Dropping the one choice that WAS in place leaves the answer saying nothing about any
+    // choice the new version asks about, so the question is unanswered against it again.
     ChoiceSetChange {
         case: "drops-the-selected-choice",
         first_version: &["c1", "c2"],
         in_place: &["c1"],
         risk_before: RISK_MEDIUM,
         second_version: &["c2"],
-        risk_after: RISK_HIGH,
+        risk_after: RISK_UNANSWERED,
     },
     ChoiceSetChange {
         case: "replaces-every-choice",
@@ -429,7 +432,7 @@ const CHANGES: &[ChoiceSetChange] = &[
         in_place: &["c1", "c2"],
         risk_before: RISK_NONE,
         second_version: &["d1", "d2"],
-        risk_after: RISK_HIGH,
+        risk_after: RISK_UNANSWERED,
     },
     // The same best practices in another order are the same best practices: the rating
     // does not move, and the choices are reported in the new version's order.
@@ -595,11 +598,14 @@ async fn a_lens_version_that_changes_a_questions_choices_re_rates_the_stored_ans
             "case {case:?}: the roll-up must count the question as {risk_after}, got {counts:?}"
         );
         let plan = improvement_plan(&client, case, &workload_id, &lens_arn).await;
-        let expected_plan: Vec<(String, String)> = if *risk_after == RISK_NONE {
-            Vec::new()
-        } else {
-            vec![(QUESTION_ID.to_string(), (*risk_after).to_string())]
-        };
+        // Only an IDENTIFIED risk leaves something to improve: a question rated NONE has
+        // nothing outstanding, and one the new version left unanswered is not yet rated.
+        let expected_plan: Vec<(String, String)> =
+            if *risk_after == RISK_NONE || *risk_after == RISK_UNANSWERED {
+                Vec::new()
+            } else {
+                vec![(QUESTION_ID.to_string(), (*risk_after).to_string())]
+            };
         assert_eq!(
             plan, expected_plan,
             "case {case:?}: expected the improvement plan {expected_plan:?}, got {plan:?}"

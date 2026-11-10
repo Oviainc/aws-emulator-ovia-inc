@@ -542,9 +542,17 @@ async fn a_member_outside_its_modelled_clause_is_refused_and_the_goal_is_untouch
             answer.error_code, "ValidationException",
             "case {case:?}: expected ValidationException, got {answer:?}"
         );
+        // A value outside an enumerated type's set is reported as the schema finding that
+        // quotes the value and the set, which names no member; every other clause here
+        // names the member the request sent the value for.
+        let expected = if case == "pillar-outside-the-enum" {
+            r#"instance value ("SUSTAINABILITY") not found in enum"#
+        } else {
+            refused_member
+        };
         assert!(
-            member(&answer, "Message").contains(refused_member),
-            "case {case:?}: the refusal must name {refused_member}, got {answer:?}"
+            member(&answer, "Message").contains(expected),
+            "case {case:?}: the refusal must state {expected:?}, got {answer:?}"
         );
 
         let fetched = get_goal(&client, &profile_arn, &id).await;

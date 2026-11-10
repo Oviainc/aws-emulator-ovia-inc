@@ -194,13 +194,15 @@ pub const DEFAULT_IMPROVEMENT_STATUS: &str = "NOT_APPLICABLE";
 
 /// The `Risk` member every unanswered question of an attached lens counts under —
 /// `smithy_query(query="shape", shape="Risk")` lists `UNANSWERED` beside the four
-/// answered risks. Named here because the roll-up below fills it from the lens
-/// question set rather than from an answer.
+/// answered risks. A question is unanswered while nothing has answered it AND while its
+/// stored answer says nothing about any of its choices ([`AnswerRecord::risk`]), so the
+/// roll-up below fills this bucket from the lens question set and from such an answer
+/// alike.
 pub const RISK_UNANSWERED: &str = "UNANSWERED";
 
-/// The four `Risk` members an ANSWERED question can carry
+/// The four `Risk` members a question an answer SPEAKS ABOUT can carry
 /// (`smithy_query(query="shape", shape="Risk")`), named here because
-/// [`AnswerRecord::risk`] derives one of them from every stored answer.
+/// [`AnswerRecord::risk`] derives one of them from such a stored answer.
 pub const RISK_HIGH: &str = "HIGH";
 /// See [`RISK_HIGH`].
 pub const RISK_MEDIUM: &str = "MEDIUM";
@@ -1112,12 +1114,15 @@ impl AnswerRecord {
     /// The `Risk` this answer carries for the question it answers, derived from what it
     /// records for that question's own choices.
     ///
-    /// The Well-Architected Tool rates a question by how many of its best practices are
-    /// in place: a question that does not apply is `NOT_APPLICABLE`, one answered with
-    /// no best practice selected is `HIGH` risk, one where some choice is still
-    /// unselected is `MEDIUM`, and one with nothing left unselected is `NONE`.
-    /// `UNANSWERED` is not reachable here — it is what a question with NO stored answer
-    /// reports ([`RISK_UNANSWERED`]), which is why this takes an answer.
+    /// The Well-Architected Tool rates a question by what its answer says about that
+    /// question's best practices, and a question is answered only while its answer says
+    /// something about one of them: an answer that records NO choice of the question —
+    /// because it selected none, or because a later update cleared the selection it had —
+    /// leaves the question unanswered, so it rates [`RISK_UNANSWERED`], the same rating a
+    /// question with no stored answer at all carries. Beyond that: a question that does not
+    /// apply is `NOT_APPLICABLE`, an answered question with no best practice in place is
+    /// `HIGH`, one where some choice is still unselected is `MEDIUM`, and one with nothing
+    /// left unselected is `NONE`.
     ///
     /// The best practices rated are the ones `question` asks about — the rating is of that
     /// question, so it moves with the choice set the review's lens version defines for it
@@ -1129,12 +1134,23 @@ impl AnswerRecord {
         }
         let mut any_in_place = false;
         let mut any_left_out = false;
+        // Whether the answer says anything at all about one of the question's choices: a
+        // choice it records as in place, or one it records as not applying to this review.
+        // A choice left UNSELECTED is what every choice of a question starts out as, so it
+        // is not something an answer says.
+        let mut answers_a_choice = false;
         for choice in self.reported_choice_answers(question) {
             if choice.status == CHOICE_STATUS_SELECTED {
                 any_in_place = true;
+                answers_a_choice = true;
             } else if choice.status == CHOICE_STATUS_UNSELECTED {
                 any_left_out = true;
+            } else {
+                answers_a_choice = true;
             }
+        }
+        if !answers_a_choice {
+            return RISK_UNANSWERED;
         }
         if !any_in_place {
             return RISK_HIGH;
@@ -3337,20 +3353,13 @@ pub enum LensResolution {
 /// exception for the case, for the calling operation to lift into its own error enum.
 #[derive(Debug, Clone)]
 pub enum LensesRefusal {
-    /// An entry that names no lens at all. A lens is a named resource, so a name that
-    /// resolves to none is a `ResourceNotFoundException` (HTTP 404) over the `LENS`
-    /// resource type.
+    /// An entry the caller cannot reach a lens through: one that names no lens at all, and
+    /// one that names a custom lens no version has been published from — the two are
+    /// refused identically, because the service does not tell a caller which of them it
+    /// is. The exception carries the entry AS SENT as its `ResourceId`, which is what the
+    /// refusal the calling operation words names.
     NotFound(ResourceNotFoundException),
-    /// An entry that names a lens which exists and cannot be applied yet. The lens
-    /// resolved, so what the request got wrong is the member value — a
-    /// `ValidationException` (HTTP 400) naming the member, the way `ExportLens` refuses
-    /// an official lens that exists and cannot be exported.
-    Unapplicable(crate::ops::types::ValidationException),
 }
-
-/// The member a lens-list refusal names (`CreateWorkloadInput$Lenses`,
-/// `CreateReviewTemplateInput$Lenses`).
-pub const LENSES_MEMBER: &str = "Lenses";
 
 /// The member a lens-list refusal of an ASSOCIATION names
 /// (`AssociateLensesInput$LensAliases` / `DisassociateLensesInput$LensAliases`). A refusal

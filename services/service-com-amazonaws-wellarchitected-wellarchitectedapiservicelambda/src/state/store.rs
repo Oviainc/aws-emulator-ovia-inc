@@ -1245,40 +1245,28 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// How a list of lenses a request asks to APPLY is refused, or `None` when every entry
     /// names a lens that can be applied.
     ///
-    /// A lens is applied by name, and the name has to resolve: "Each lens is identified by
-    /// its `LensSummary$LensAlias`" (`WorkloadLenses` doc), and a custom lens "cannot be
-    /// applied to workloads … until it's published with CreateLensVersion" (`ImportLens`
-    /// doc). Every operation that attaches lenses to a resource resolves them through here,
-    /// so none of them can record a lens another operation would then report a review of
-    /// and find nothing for.
+    /// A lens is applied by name, and the name has to resolve to a lens the caller can
+    /// reach: "Each lens is identified by its `LensSummary$LensAlias`" (`WorkloadLenses`
+    /// doc), and a custom lens "cannot be applied to workloads … until it's published with
+    /// CreateLensVersion" (`ImportLens` doc). Every operation that attaches lenses to a
+    /// resource resolves them through here, so none of them can record a lens another
+    /// operation would then report a review of and find nothing for.
+    ///
+    /// An entry naming NO lens and one naming a lens no version has been published from
+    /// are refused IDENTICALLY ([`LensesRefusal`]): both name something the caller cannot
+    /// get a lens through, and the service does not disclose which of the two it was — the
+    /// same refusal a caller gets for a lens another account holds and has not shared.
     ///
     /// The walk stops at the FIRST entry it refuses and allocates nothing per entry it
     /// accepts, so the work this costs is one map lookup and one scan of the fixed
     /// [`AWS_OFFICIAL_LENS_ALIASES`] catalog per entry and NOTHING that grows with the
     /// caller's list beyond that — the list length itself is bounded by the calling
     /// operation's own lens quota before it gets here.
-    pub fn unapplicable_lenses_refusal(
-        &self,
-        lenses: &[String],
-        member: &str,
-    ) -> Option<LensesRefusal> {
+    pub fn unapplicable_lenses_refusal(&self, lenses: &[String]) -> Option<LensesRefusal> {
         for lens in lenses {
             match self.resolve_lens(lens) {
-                // An entry naming NO lens is answered as a lookup miss, and one naming a
-                // lens that exists and is merely unpublished as a bad member value: told
-                // its lens is a draft, a caller would publish a lens this service never
-                // found.
-                LensResolution::Unknown => {
+                LensResolution::Unknown | LensResolution::DraftCustom => {
                     return Some(LensesRefusal::NotFound(unknown_lens_not_found(lens)));
-                }
-                LensResolution::DraftCustom => {
-                    return Some(LensesRefusal::Unapplicable(member_constraint_exception(
-                        member,
-                        &format!(
-                            "member must name a lens with a published version; lens {lens} \
-                             has none until one is published with CreateLensVersion"
-                        ),
-                    )));
                 }
                 LensResolution::Official | LensResolution::PublishedCustom => {}
             }
@@ -1478,9 +1466,10 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     }
 
     /// The workload already holding `name` under the service's own loose comparison
-    /// ("spaces and capitalization are ignored"): its name AS STORED and its id, in the
-    /// order [`workload_name_conflict`] takes them. The stored name is what a collision
-    /// reports, rather than the caller's spelling of it.
+    /// ("spaces and capitalization are ignored"): its name AS STORED and its id. The id
+    /// is what a collision points the caller at ([`workload_name_conflict`], whose
+    /// sentence quotes the name the REQUEST submitted); the stored name is what a caller
+    /// comparing the two spellings reads.
     pub fn workload_holding_name(&self, name: &str) -> Option<(&str, &str)> {
         let workload_id = self.workload_name_index.get(&normalize_unique_name(name))?;
         let record = self.workloads.get(workload_id)?;
@@ -1496,9 +1485,10 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// and a spelling differing only in capitalization or whitespace finds the same
     /// template.
     ///
-    /// The record it answers with is the template AS STORED, which is what
-    /// [`review_template_name_conflict`] reports rather than the caller's spelling of the
-    /// name. The scan is over a store bounded by [`MAX_REVIEW_TEMPLATES`], exactly as
+    /// The record it answers with is the template AS STORED, whose ARN is what
+    /// [`review_template_name_conflict`] points the caller at; the name that refusal
+    /// quotes is the one the request submitted. The scan is over a store bounded by
+    /// [`MAX_REVIEW_TEMPLATES`], exactly as
     /// [`Self::milestone_holding_name`] scans the milestones of one workload.
     pub fn review_template_holding_name(&self, name: &str) -> Option<&ReviewTemplateRecord> {
         let normalized = normalize_unique_name(name);
@@ -1518,8 +1508,9 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// shape="MilestoneName")`), so the scope of the lookup is ONE workload and a
     /// spelling differing only in capitalization or whitespace finds the same milestone.
     ///
-    /// The record it answers with is the milestone AS STORED, which is what
-    /// [`milestone_name_conflict`] reports rather than the caller's spelling of the name.
+    /// The record it answers with is the milestone AS STORED, whose NUMBER is what
+    /// [`milestone_name_conflict`] points the caller at; the name that refusal quotes is
+    /// the one the request submitted.
     pub fn milestone_holding_name(
         &self,
         workload_id: &str,
@@ -1569,10 +1560,11 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             return Err(MilestoneRefusal::NotFound(workload_not_found(workload_id)));
         }
         if let Some(existing) = self.milestone_holding_name(workload_id, &milestone_name) {
+            let existing_number = existing.milestone_number;
             return Err(MilestoneRefusal::NameTaken(milestone_name_conflict(
-                &existing.milestone_name,
+                &milestone_name,
                 workload_id,
-                existing.milestone_number,
+                existing_number,
             )));
         }
         let milestone_number = self.next_milestone_number(workload_id);

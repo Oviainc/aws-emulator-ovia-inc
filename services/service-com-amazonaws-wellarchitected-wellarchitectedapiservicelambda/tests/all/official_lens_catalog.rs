@@ -27,8 +27,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 
 use super::workload_harness::{
-    answered_over, created_id, encode_path_segment, minimal_create, official_lens_arn, Answer,
-    Client,
+    answered, answered_over, created_id, encode_path_segment, minimal_create, official_lens_arn,
+    Answer, Client,
 };
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
@@ -110,8 +110,12 @@ const UNANSWERED: &str = "UNANSWERED";
 /// question's OWN choice set: the plans span the risk an applicable answer is rated at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Selection {
-    /// None of them, so no best practice is in place.
+    /// None of them, with every choice left unselected: the answer says nothing about any
+    /// best practice, so the question is still unanswered.
     Nothing,
+    /// None of them in place, with the last recorded `NOT_APPLICABLE`: the answer speaks
+    /// about that choice, so the question is rated with no best practice in place.
+    NothingAndTheLastDoesNotApply,
     /// All but the last, so one best practice is still unselected.
     AllButLast,
     /// Every one of them, so nothing is left unselected.
@@ -671,10 +675,21 @@ async fn an_answer_recorded_against_a_specialised_lens_moves_its_roll_up() {
     let answered_lens = "serverless";
     let untouched_lens = "iot";
 
-    let cases: [(&str, Selection, bool, &str); 4] = [
+    let cases: [(&str, Selection, bool, &str); 5] = [
         // (case, which of the question's best practices are in place, whether the question
         // applies, the risk that rates)
-        ("no-best-practice-selected", Selection::Nothing, true, "HIGH"),
+        (
+            "nothing-selected-at-all",
+            Selection::Nothing,
+            true,
+            UNANSWERED,
+        ),
+        (
+            "no-best-practice-selected",
+            Selection::NothingAndTheLastDoesNotApply,
+            true,
+            "HIGH",
+        ),
         (
             "some-choice-unselected",
             Selection::AllButLast,
@@ -716,7 +731,7 @@ async fn an_answer_recorded_against_a_specialised_lens_moves_its_roll_up() {
         // The best practices in place, out of the question's OWN choice set: every other
         // choice of the question is left unselected, which is what rates the answer.
         let selected: Vec<&str> = match selection {
-            Selection::Nothing => Vec::new(),
+            Selection::Nothing | Selection::NothingAndTheLastDoesNotApply => Vec::new(),
             Selection::AllButLast => choices
                 .iter()
                 .take(choices.len().saturating_sub(1))
@@ -724,12 +739,26 @@ async fn an_answer_recorded_against_a_specialised_lens_moves_its_roll_up() {
                 .collect(),
             Selection::Every => choices.iter().map(String::as_str).collect(),
         };
-        client.record_answer(
-            &workload_id,
-            answered_lens,
-            &question_id,
-            answered_over(&choices, &selected, is_applicable, None),
-        );
+        let record = if selection == Selection::NothingAndTheLastDoesNotApply {
+            // The last choice is recorded NOT_APPLICABLE, so the answer SPEAKS about the
+            // question while leaving no best practice in place.
+            let statuses: Vec<(&str, &str)> = choices
+                .iter()
+                .enumerate()
+                .map(|(position, choice_id)| {
+                    let status = if position + 1 == choices.len() {
+                        "NOT_APPLICABLE"
+                    } else {
+                        "UNSELECTED"
+                    };
+                    (choice_id.as_str(), status)
+                })
+                .collect();
+            answered(&statuses, is_applicable, None)
+        } else {
+            answered_over(&choices, &selected, is_applicable, None)
+        };
+        client.record_answer(&workload_id, answered_lens, &question_id, record);
 
         let before_total = i64::try_from(answers.len()).unwrap_or(-1);
         let review = get_lens_review(&client, &workload_id, answered_lens).await;
@@ -740,14 +769,25 @@ async fn an_answer_recorded_against_a_specialised_lens_moves_its_roll_up() {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
+        // A question whose answer leaves it unanswered stays in that bucket, so the row
+        // that records one expects the whole question set there.
+        let expected_unanswered = if risk == UNANSWERED {
+            before_total
+        } else {
+            before_total - 1
+        };
         assert_eq!(
             counts.get(UNANSWERED).and_then(Value::as_i64),
-            Some(before_total - 1),
-            "case {case:?}: the answered question leaves the UNANSWERED bucket, got {review:?}"
+            Some(expected_unanswered),
+            "case {case:?}: expected {expected_unanswered} question(s) unanswered, got {review:?}"
         );
         assert_eq!(
             counts.get(risk).and_then(Value::as_i64),
-            Some(1),
+            Some(if risk == UNANSWERED {
+                before_total
+            } else {
+                1
+            }),
             "case {case:?}: the stored answer must rate {risk}, got {review:?}"
         );
 
@@ -769,7 +809,11 @@ async fn an_answer_recorded_against_a_specialised_lens_moves_its_roll_up() {
         );
         assert_eq!(
             untouched_counts.get(risk).and_then(Value::as_i64),
-            Some(0),
+            Some(if risk == UNANSWERED {
+                i64::try_from(untouched_answers).unwrap_or(-1)
+            } else {
+                0
+            }),
             "case {case:?}: the answer belongs to one lens only, got {untouched:?}"
         );
 

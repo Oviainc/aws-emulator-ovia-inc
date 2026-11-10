@@ -284,8 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // handler has already bounded, and before the template quota below, so a caller
         // learns that its request named no lens rather than that the account is full.
         let now = std::time::SystemTime::now();
-        if let Some(refusal) = store.unapplicable_lenses_refusal(&lenses, crate::state::LENSES_MEMBER)
-        {
+        if let Some(refusal) = store.unapplicable_lenses_refusal(&lenses) {
             return Err(CreateReviewTemplateErrorModeled::ValidationException(
                 crate::service::lens_content_validation::unapplicable_lenses(refusal),
             )
@@ -306,7 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // template that retry itself created.
         if let Some(existing) = store.review_template_holding_name(&input.template_name) {
             let collision = crate::state::review_template_name_conflict(
-                &existing.template_name,
+                &input.template_name,
                 &existing.template_arn,
             );
             return Err(CreateReviewTemplateErrorModeled::ConflictException(collision).into());

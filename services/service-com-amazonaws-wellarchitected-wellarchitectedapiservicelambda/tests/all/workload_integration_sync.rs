@@ -612,13 +612,21 @@ async fn reads_of_a_synced_question_report_the_same_sync() {
     let case = "reports";
     let lens = state::FRAMEWORK_LENS_ALIAS;
     let workload_id = workload_reviewing(&client, case, &[lens]).await;
-    let question_id = state::lens_questions(lens)
+    let question = state::lens_questions(lens)
         .first()
-        .expect("the framework lens must ask a question")
-        .question_id;
+        .expect("the framework lens must ask a question");
+    let question_id = question.question_id;
 
-    // An answer that selects no best practice is at `HIGH` risk, which is what puts the
-    // question on the improvement plan.
+    // An answer that leaves one best practice of several unselected is at `MEDIUM` risk,
+    // which is what puts the question on the improvement plan: an answer that selects
+    // nothing at all would leave the question unanswered, and so unrated.
+    let in_place: Vec<String> = (0..question.best_practices.len().saturating_sub(1))
+        .map(|position| question.choice_id(position))
+        .collect();
+    assert!(
+        !in_place.is_empty(),
+        "case {case:?}: the question under test must offer more than one best practice"
+    );
     let answered = client
         .send(
             "PATCH",
@@ -628,7 +636,10 @@ async fn reads_of_a_synced_question_report_the_same_sync() {
                 encode_path_segment(lens),
                 encode_path_segment(question_id)
             ),
-            Some(json!({ "Notes": "an answer under test" })),
+            Some(json!({
+                "Notes": "an answer under test",
+                "SelectedChoices": in_place,
+            })),
         )
         .await;
     assert_eq!(

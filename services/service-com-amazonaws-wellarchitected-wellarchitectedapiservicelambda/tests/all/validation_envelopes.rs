@@ -136,7 +136,8 @@ async fn out_of_range_page_size_names_the_member_and_its_bounds() {
 
 /// A value that fails a string shape's constraint (`@length`, `@pattern`, an enum value
 /// set) is refused while the request is still being read as a shape: the modelled
-/// `Message` names the member and what it violated, and nothing is classified — no
+/// `Message` states what was violated — the member for a `@length` or `@pattern`, the
+/// schema finding for a value outside an enumerated set — and nothing is classified: no
 /// `Reason`, no `Fields`.
 ///
 /// Rows differ along the constraint class, the operation (one of the four is still
@@ -209,11 +210,15 @@ async fn string_constraint_refusals_carry_the_message_alone() {
             "templateName",
         ),
         (
+            // A value outside an enumerated type's set is reported as the schema finding
+            // that quotes the value and the set rather than as a sentence naming the
+            // member, so this row states the finding; `super::enum_refusal_wording` pins
+            // the whole message of that class.
             "answer-reason-outside-the-enum",
             "PATCH",
             format!("/workloads/{WORKLOAD_ID}/lensReviews/wellarchitected/answers/q1"),
             json!({ "Reason": "NOT_AN_ANSWER_REASON" }),
-            "reason",
+            "not found in enum",
         ),
     ];
 
@@ -227,7 +232,7 @@ async fn string_constraint_refusals_carry_the_message_alone() {
             .unwrap_or_default();
         assert!(
             message.to_lowercase().contains(&member.to_lowercase()),
-            "case {case:?}: Message must name the member {member:?}, got {message:?}"
+            "case {case:?}: Message must state {member:?}, got {message:?}"
         );
         assert_eq!(
             body.get("Reason"),

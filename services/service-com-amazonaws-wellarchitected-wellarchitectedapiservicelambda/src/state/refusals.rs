@@ -1637,12 +1637,13 @@ pub fn lens_version_conflict(lens_arn: &str, version: &str) -> ConflictException
 /// A modelled `ConflictException` (HTTP 409) for a request that collides with a
 /// resource that already exists.
 ///
-/// The message names the resource that is in the way AS STORED, and `resource_id`
-/// identifies it, so a caller can fetch it. It is deliberately the stored value rather
-/// than the spelling the request submitted: the two differ wherever the uniqueness rule
-/// compares loosely (a workload name and a milestone name both ignore spaces and
-/// capitalization — [`normalize_unique_name`]), and what the caller needs named is the
-/// resource it collided with.
+/// `resource_id` identifies the resource that is IN THE WAY, so a caller can fetch it,
+/// while a sentence that quotes a name quotes it as the REFUSED REQUEST SUBMITTED it: the
+/// two spellings differ wherever the uniqueness rule compares loosely (a workload name, a
+/// review template's and a milestone name all ignore spaces and capitalization —
+/// [`normalize_unique_name`]), and the name a refusal echoes is the one the caller can
+/// match against what it sent. Normalization stays confined to the COMPARISON that found
+/// the collision.
 pub fn conflict(resource_type: &str, resource_id: String, sentence: &str) -> ConflictException {
     ConflictException {
         message: tagged_message("Conflict", sentence),
@@ -1655,13 +1656,14 @@ pub fn conflict(resource_type: &str, resource_id: String, sentence: &str) -> Con
 /// within an account within an Amazon Web Services Region. Spaces and capitalization
 /// are ignored when checking for uniqueness" (`CreateWorkloadInput$WorkloadName` doc).
 ///
-/// `existing_name` / `existing_id` are the stored name and id of the workload already
-/// holding the name, not the request's spelling of it.
-pub fn workload_name_conflict(existing_name: &str, existing_id: &str) -> ConflictException {
+/// `submitted_name` is the `WorkloadName` the refused request carried, echoed as sent
+/// (see [`conflict`]); `existing_id` is the id of the workload already holding the name,
+/// which is what `ResourceId` points the caller at.
+pub fn workload_name_conflict(submitted_name: &str, existing_id: &str) -> ConflictException {
     conflict(
         WORKLOAD_RESOURCE_TYPE,
         existing_id.to_string(),
-        &format!("A workload with name {existing_name} already exists."),
+        &format!("A workload with name {submitted_name} already exists."),
     )
 }
 
@@ -1671,24 +1673,26 @@ pub fn workload_name_conflict(existing_name: &str, existing_id: &str) -> Conflic
 ///
 /// Worded as AWS words this failure for a review template, and decided by the comparison
 /// this service applies to every name it meters for uniqueness
-/// ([`normalize_unique_name`]). `existing_name` / `existing_arn` are the stored name and
-/// ARN of the template already holding the name, so the caller is told which template to
-/// fetch rather than its own spelling of the name.
+/// ([`normalize_unique_name`]). `submitted_name` is the `TemplateName` the refused request
+/// carried, echoed as sent (see [`conflict`]); `existing_arn` is the ARN of the template
+/// already holding the name, so the caller is still told which template to fetch.
 pub fn review_template_name_conflict(
-    existing_name: &str,
+    submitted_name: &str,
     existing_arn: &str,
 ) -> ConflictException {
     conflict(
         REVIEW_TEMPLATE_RESOURCE_TYPE,
         existing_arn.to_string(),
-        &format!("A review template with name {existing_name} already exists."),
+        &format!("A review template with name {submitted_name} already exists."),
     )
 }
 
 /// [`conflict`] for a milestone name that is already taken within its workload:
 /// "Milestone names must be unique within a workload"
-/// (`smithy_query(query="shape", shape="MilestoneName")`). `existing_name` /
-/// `existing_number` are the stored name and number of the milestone already holding it.
+/// (`smithy_query(query="shape", shape="MilestoneName")`). `submitted_name` is the
+/// `MilestoneName` the refused request carried, echoed as sent — padding and
+/// capitalization included (see [`conflict`]) — and `existing_number` is the number of
+/// the milestone already holding it, which `ResourceId` points the caller at.
 ///
 /// The sentence names the WORKLOAD the uniqueness is scoped to — a milestone name is
 /// unique within one workload, not across the account, so the refusal has to say which
@@ -1696,7 +1700,7 @@ pub fn review_template_name_conflict(
 /// ([`normalize_unique_name`]), so a caller whose spelling differs only in
 /// capitalization or whitespace can tell why it was refused.
 pub fn milestone_name_conflict(
-    existing_name: &str,
+    submitted_name: &str,
     workload_id: &str,
     existing_number: i32,
 ) -> ConflictException {
@@ -1704,7 +1708,7 @@ pub fn milestone_name_conflict(
         MILESTONE_RESOURCE_TYPE,
         milestone_resource_id(workload_id, existing_number),
         &format!(
-            "Milestone with name {existing_name} already exists under workload \
+            "Milestone with name {submitted_name} already exists under workload \
              {workload_id}. Capitalization and whitespace are ignored in milestone names."
         ),
     )

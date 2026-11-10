@@ -255,17 +255,24 @@ fn spread_answer(question_id: &str, index: usize) -> (AnswerRecord, &'static str
     match index % 4 {
         // Nothing left out: no risk.
         0 => (framework_answer(question_id, InPlace::Every), "NONE"),
-        // No best practice in place at all.
-        1 => (framework_answer(question_id, InPlace::Nothing), "HIGH"),
+        // No best practice in place at all: the last choice is recorded NOT_APPLICABLE, so
+        // the answer speaks about the question and is rated, with nothing in place.
+        1 => (
+            framework_answer(question_id, InPlace::NothingAndTheLastDoesNotApply),
+            "HIGH",
+        ),
         // Some in place, one still out — unless the question offers a single best
-        // practice, where "all but the last" leaves nothing in place at all.
+        // practice, where "all but the last" would select nothing and leave the question
+        // unanswered, so that one records none in place with its one choice not applying.
         2 => {
-            let risk = if framework_choice_ids(question_id).len() > 1 {
-                "MEDIUM"
+            if framework_choice_ids(question_id).len() > 1 {
+                (framework_answer(question_id, InPlace::AllButLast), "MEDIUM")
             } else {
-                "HIGH"
-            };
-            (framework_answer(question_id, InPlace::AllButLast), risk)
+                (
+                    framework_answer(question_id, InPlace::NothingAndTheLastDoesNotApply),
+                    "HIGH",
+                )
+            }
         }
         // The question does not apply to this workload.
         _ => (
@@ -330,7 +337,10 @@ async fn only_identified_risks_appear_in_the_improvement_plan() {
         Rated {
             case: "nothing-in-place",
             question_id: "organization-structure",
-            record: Some(framework_answer("organization-structure", InPlace::Nothing)),
+            record: Some(framework_answer(
+                "organization-structure",
+                InPlace::NothingAndTheLastDoesNotApply,
+            )),
             plan_risk: Some("HIGH"),
         },
         Rated {
@@ -361,6 +371,12 @@ async fn only_identified_risks_appear_in_the_improvement_plan() {
                 "resource-type-size-number",
                 "OUT_OF_SCOPE",
             )),
+            plan_risk: None,
+        },
+        Rated {
+            case: "nothing-selected-at-all",
+            question_id: "test-reliability",
+            record: Some(framework_answer("test-reliability", InPlace::Nothing)),
             plan_risk: None,
         },
         Rated {
@@ -728,8 +744,7 @@ async fn paging_enumerates_every_improvement_exactly_once() {
     // Every question answered at an identified risk, so the plan is the whole question
     // set: HIGH where nothing is in place, MEDIUM where something still is not.
     for (index, (_, question_id)) in catalog().into_iter().enumerate() {
-        let (record, risk) =
-            spread_answer(&question_id, if index % 2 == 0 { 1 } else { 2 });
+        let (record, risk) = spread_answer(&question_id, if index % 2 == 0 { 1 } else { 2 });
         assert!(
             is_identified_risk(risk),
             "case {question_id:?}: the seed must leave an identified risk, got {risk}"
@@ -1006,12 +1021,16 @@ async fn a_milestone_freezes_the_improvement_plan_it_recorded() {
     let client = Client::new();
     let workload_id = framework_workload(&client, "frozen-plan-host").await;
 
-    // Before the milestone: one question at HIGH risk, nothing else answered.
+    // Before the milestone: one question at HIGH risk (its last best practice recorded as
+    // not applicable, with none in place), nothing else answered.
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
         "manage-service-quotas",
-        framework_answer("manage-service-quotas", InPlace::Nothing),
+        framework_answer(
+            "manage-service-quotas",
+            InPlace::NothingAndTheLastDoesNotApply,
+        ),
     );
     let recorded = client
         .send(

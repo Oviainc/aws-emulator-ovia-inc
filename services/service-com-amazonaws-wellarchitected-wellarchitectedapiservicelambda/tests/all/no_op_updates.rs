@@ -280,8 +280,10 @@ async fn an_answer_update_that_supplies_no_member_writes_nothing() {
 }
 
 /// The other side of the rule: a member the request DOES supply is a write even when the
-/// value it carries is empty, so each row records an answer — the question leaves
-/// `UNANSWERED` for the `Risk` its record derives — and moves the workload's `UpdatedAt`.
+/// value it carries is empty, so each row records an answer — observable in the workload's
+/// `UpdatedAt` and in the record the read reports — and the `Risk` that record derives
+/// follows what it says about the question's choices, which for a row that selects nothing
+/// is still `UNANSWERED`.
 #[tokio::test]
 async fn a_supplied_answer_member_writes_even_when_its_value_is_empty() {
     // Each row supplies exactly ONE of the five writable members, at the emptiest value the
@@ -289,16 +291,28 @@ async fn a_supplied_answer_member_writes_even_when_its_value_is_empty() {
     // entry, `Notes` as the empty string (`@length(max: 2084)` sets no minimum),
     // `IsApplicable` either way and `Reason` at the `NONE` member `AnswerReason` publishes.
     let rows: [(&str, Value, &str); 6] = [
-        ("selected-choices-empty", json!({ "SelectedChoices": [] }), "HIGH"),
-        ("choice-updates-empty", json!({ "ChoiceUpdates": {} }), "HIGH"),
-        ("notes-empty", json!({ "Notes": "" }), "HIGH"),
-        ("is-applicable-true", json!({ "IsApplicable": true }), "HIGH"),
+        (
+            "selected-choices-empty",
+            json!({ "SelectedChoices": [] }),
+            "UNANSWERED",
+        ),
+        (
+            "choice-updates-empty",
+            json!({ "ChoiceUpdates": {} }),
+            "UNANSWERED",
+        ),
+        ("notes-empty", json!({ "Notes": "" }), "UNANSWERED"),
+        (
+            "is-applicable-true",
+            json!({ "IsApplicable": true }),
+            "UNANSWERED",
+        ),
         (
             "is-applicable-false",
             json!({ "IsApplicable": false }),
             "NOT_APPLICABLE",
         ),
-        ("reason-none", json!({ "Reason": "NONE" }), "HIGH"),
+        ("reason-none", json!({ "Reason": "NONE" }), "UNANSWERED"),
     ];
 
     for (row, body, expected_risk) in rows {

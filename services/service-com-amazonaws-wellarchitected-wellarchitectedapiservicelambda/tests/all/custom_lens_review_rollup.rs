@@ -226,7 +226,8 @@ fn question_counts(owner: &Value, case: &str) -> BTreeMap<String, i64> {
 
 /// The roll-up expected over a question set of `total` questions, of which `recorded` names
 /// the risk of each question that carries an answer: every other question is `UNANSWERED`,
-/// and every bucket the enum publishes is present.
+/// and every bucket the enum publishes is present. A question whose answer leaves it
+/// unanswered counts in that same bucket, so `recorded` may name `UNANSWERED` too.
 fn expected_risk_counts(total: usize, recorded: &[&str]) -> BTreeMap<String, i64> {
     let mut counts: BTreeMap<String, i64> =
         RISKS.iter().map(|risk| ((*risk).to_string(), 0)).collect();
@@ -235,7 +236,7 @@ fn expected_risk_counts(total: usize, recorded: &[&str]) -> BTreeMap<String, i64
     }
     let total = i64::try_from(total).unwrap_or(i64::MAX);
     let answered = i64::try_from(recorded.len()).unwrap_or(i64::MAX);
-    counts.insert("UNANSWERED".to_string(), total - answered);
+    *counts.entry("UNANSWERED".to_string()).or_default() += total - answered;
     counts
 }
 
@@ -425,11 +426,12 @@ async fn an_answer_to_an_imported_lenss_question_moves_the_rollups_of_its_review
     let asked = question_count(shape);
 
     // What an answer records, and the `Risk` the service derives from it: a question that
-    // does not apply is NOT_APPLICABLE, one with no best practice selected is HIGH, one with
-    // some choice still unselected is MEDIUM and one with nothing left unselected is NONE
-    // (`smithy_query(query="shape", shape="Risk")` publishes the value set).
+    // does not apply is NOT_APPLICABLE, one whose answer selects no best practice is still
+    // UNANSWERED, one with some choice still unselected is MEDIUM and one with nothing left
+    // unselected is NONE (`smithy_query(query="shape", shape="Risk")` publishes the value
+    // set).
     let cases: [(&str, usize, bool, &str); 4] = [
-        ("nothing-selected", 0, true, "HIGH"),
+        ("nothing-selected", 0, true, "UNANSWERED"),
         ("one-of-two-selected", 1, true, "MEDIUM"),
         ("every-choice-selected", 2, true, "NONE"),
         ("not-applicable", 0, false, "NOT_APPLICABLE"),

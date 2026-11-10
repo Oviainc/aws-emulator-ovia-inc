@@ -529,12 +529,14 @@ async fn the_document_follows_what_is_written_to_the_review() {
     );
 
     // An answer recorded against one question moves that question out of UNANSWERED and
-    // into the bucket its answer carries, in the document exactly as in the review.
+    // into the bucket its answer carries, in the document exactly as in the review. The
+    // answer records no best practice in place (its last choice does not apply), which is
+    // what rates it HIGH.
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
         "identities",
-        framework_answer("identities", InPlace::Nothing),
+        framework_answer("identities", InPlace::NothingAndTheLastDoesNotApply),
     );
     let answered = report_of(
         &get_report(&client, &workload_id, FRAMEWORK_LENS, None).await,
@@ -596,12 +598,12 @@ async fn a_milestone_is_reported_as_the_review_it_froze() {
         "frozen",
     );
 
-    // A write the milestone did not record.
+    // A write the milestone did not record: an answer with no best practice in place.
     client.record_answer(
         &workload_id,
         FRAMEWORK_LENS,
         "identities",
-        framework_answer("identities", InPlace::Nothing),
+        framework_answer("identities", InPlace::NothingAndTheLastDoesNotApply),
     );
 
     let live = report_of(

@@ -66,12 +66,12 @@ async fn workload(client: &Client, name: &str) -> String {
 
 /// The refusal a duplicate name gets: 409 `ConflictException`, `ResourceType`
 /// `MILESTONE`, the `ResourceId` of the milestone already holding the name, and a message
-/// naming that STORED name, the workload the uniqueness is scoped to and the comparison
-/// rule.
+/// naming the name AS SUBMITTED by the refused request, the workload the uniqueness is
+/// scoped to and the comparison rule.
 fn assert_name_conflict(
     case: &str,
     answer: &Answer,
-    stored_name: &str,
+    submitted_name: &str,
     workload_id: &str,
     stored_number: i64,
 ) {
@@ -96,11 +96,11 @@ fn assert_name_conflict(
     assert_eq!(
         member(answer, "Message"),
         format!(
-            "[Conflict] Milestone with name {stored_name} already exists under workload \
+            "[Conflict] Milestone with name {submitted_name} already exists under workload \
              {workload_id}. Capitalization and whitespace are ignored in milestone names."
         ),
-        "case {case:?}: the refusal must name the stored milestone, its workload and the \
-         comparison rule, got {answer:?}"
+        "case {case:?}: the refusal must quote the submitted name, name its workload and \
+         the comparison rule, got {answer:?}"
     );
 }
 
@@ -158,7 +158,7 @@ async fn a_milestone_name_is_unique_within_its_workload_ignoring_case_and_whites
                 &format!("tok-dup-{index}-{spelling}"),
             )
             .await;
-            assert_name_conflict(&case, &refused, stored_name, &workload_id, 1);
+            assert_name_conflict(&case, &refused, &submitted, &workload_id, 1);
         }
 
         // A refused create records nothing, so the number it would have taken is still
@@ -233,7 +233,8 @@ async fn the_same_milestone_name_is_free_in_another_workload() {
             "case {spelling:?}: it is this workload's first milestone, got {accepted:?}"
         );
 
-        // …and inside THAT workload it is now taken, by the spelling it was stored under.
+        // …and inside THAT workload it is now taken, whichever spelling it was stored
+        // under: the refusal quotes the name THIS request submitted.
         let refused = create_milestone(
             &client,
             &other,
@@ -244,7 +245,7 @@ async fn the_same_milestone_name_is_free_in_another_workload() {
         assert_name_conflict(
             &format!("{spelling}/repeat"),
             &refused,
-            &submitted,
+            STORED_NAME,
             &other,
             1,
         );

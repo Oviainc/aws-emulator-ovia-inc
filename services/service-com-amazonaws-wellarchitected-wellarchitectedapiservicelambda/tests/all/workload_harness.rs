@@ -792,7 +792,8 @@ pub(crate) enum InPlace {
     /// Every best practice the question asks about: nothing is left unselected, so the
     /// question is rated `NONE`.
     Every,
-    /// None of them: no best practice is in place, so the question is rated `HIGH`.
+    /// None of them, with every choice left unselected: the answer says nothing about any
+    /// of the question's best practices, so the question is back to `UNANSWERED`.
     Nothing,
     /// All but the last: one best practice is still unselected, so the question is rated
     /// `MEDIUM` (for a question offering more than one choice).
@@ -800,6 +801,10 @@ pub(crate) enum InPlace {
     /// All but the last, which is recorded `NOT_APPLICABLE` rather than unselected:
     /// nothing is left unselected, so the question is rated `NONE`.
     AllButLastWhichDoesNotApply,
+    /// None of them in place, with the last recorded `NOT_APPLICABLE` rather than
+    /// unselected: the answer DOES speak about that choice, so the question is rated —
+    /// with no best practice in place, at `HIGH`.
+    NothingAndTheLastDoesNotApply,
 }
 
 /// A seeded answer to one question of the framework lens that records `in_place` out of
@@ -822,6 +827,20 @@ pub(crate) fn framework_answer(question_id: &str, in_place: InPlace) -> AnswerRe
                 .map(|choice_id| {
                     let status = if all_but_last.contains(choice_id) {
                         state::CHOICE_STATUS_SELECTED
+                    } else {
+                        "NOT_APPLICABLE"
+                    };
+                    (*choice_id, status)
+                })
+                .collect();
+            answered(&statuses, true, None)
+        }
+        InPlace::NothingAndTheLastDoesNotApply => {
+            let statuses: Vec<(&str, &str)> = ids
+                .iter()
+                .map(|choice_id| {
+                    let status = if all_but_last.contains(choice_id) {
+                        state::CHOICE_STATUS_UNSELECTED
                     } else {
                         "NOT_APPLICABLE"
                     };

@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `service.rs`: the shared refusal sentences this service's front door words a schema
+# finding with, and the schema reading that tells a BODY member from one bound to the URI.
+service-common = { path = "../common" }
 # Mints the 32-hex WorkloadId and fingerprints idempotent request parameters.
 sha2 = { workspace = true }
 # Hex codec for the minted ids and the opaque paging NextToken.
