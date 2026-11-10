@@ -258,7 +258,10 @@ const MODULUS_BITS: usize = 2048;
 /// sixteen lowercase-hex octets separated by colons — the MD5 digest of the
 /// DER-encoded public key, which is what `KeyPair$fingerprint` ("The RSA
 /// fingerprint of the key pair") carries.
-fn is_md5_colon_hex(value: &str) -> bool {
+///
+/// `pub(crate)` so a sibling suite in this test target checks a published
+/// fingerprint the same way.
+pub(crate) fn is_md5_colon_hex(value: &str) -> bool {
     let octets: Vec<&str> = value.split(':').collect();
     octets.len() == 16
         && octets.iter().all(|octet| {
@@ -276,7 +279,9 @@ fn is_md5_colon_hex(value: &str) -> bool {
 /// Built by the DER crates rather than by the handler's own call, so the
 /// fingerprint assertion below checks the published RULE — the MD5 digest of the
 /// DER public key — rather than repeating whatever the implementation computed.
-fn public_key_der(case: &str, public: &::ssh_key::public::KeyData) -> Vec<u8> {
+///
+/// `pub(crate)` so a sibling suite in this test target rebuilds it the same way.
+pub(crate) fn public_key_der(case: &str, public: &::ssh_key::public::KeyData) -> Vec<u8> {
     use ::der::Encode;
 
     let rsa = public

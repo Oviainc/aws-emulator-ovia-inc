@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DownloadDefaultKeyPair
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DownloadDefaultKeyPair`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Downloading the account's default key pair reports the halves of the ONE key
+//! pair the service holds under [`crate::state::DEFAULT_SSH_KEY_NAME`], minting
+//! that pair — a real RSA key pair, held with its material — when the account
+//! holds none, which is why this call both reads and writes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DownloadDefaultKeyPair::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +155,213 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DownloadDefaultKeyPair` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DownloadDefaultKeyPairErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DownloadDefaultKeyPair"))
+        // The request carries no member at all (`DownloadDefaultKeyPairRequest`
+        // is an empty structure), so everything this call needs comes from the
+        // store and from the Region of the request's SigV4 credential scope —
+        // the same Region a key pair created here is recorded in, because
+        // `KeyPair$location` is "the region and Availability Zone where the key
+        // pair was created" and a key pair is not zonal.
+        let _ = input;
+        let region = crate::state::request_region(ctx.parts());
+        let location = crate::state::StoredLocation::regional(&region);
+        let now = crate::state::now_ms();
+
+        // The pair the account ALREADY holds is reported without minting or
+        // writing anything: this call creates the default pair only "if a
+        // default key pair does not currently exist", so a second download
+        // answers the first one's halves and its creation instant rather than
+        // rolling the key every instance launched with that pair is reachable
+        // through.
+        match crate::state::with_state(&*self.engine, |store| held(store))
+            .ok_or_else(unavailable)?
+        {
+            Held::Reported(output) => return Ok(output),
+            Held::WithoutMaterial => return Err(no_material_held()),
+            Held::Absent => {}
+        }
+
+        // Generating an RSA key pair is hundreds of milliseconds of CPU, so it
+        // runs on the blocking pool rather than on the worker serving this
+        // request, for the reason `CreateKeyPair`'s does, and BEFORE the store
+        // is reached for writing: no other request waits on the store while a
+        // key is generated, and a call that loses the race below discards the
+        // material it minted, which was never reported or held.
+        let minted = match ::tokio::task::spawn_blocking(
+            crate::state::MintedKeyPairMaterial::mint,
+        )
+        .await
+        {
+            Ok(Some(minted)) => minted,
+            // The key did not generate or did not encode: there is no key pair
+            // to hold or to hand back.
+            Ok(None) => return Err(no_key_material()),
+            // The blocking generation did not run to completion — it panicked
+            // or was cancelled. The caller is answered the same way, because
+            // there is still no key pair; the cause is traced so the two are
+            // told apart from the outside. The key material itself is never
+            // traced.
+            Err(error) => {
+                ::tracing::warn!(
+                    error = %error,
+                    "the default key pair generation task did not run to completion"
+                );
+                return Err(no_key_material());
+            }
+        };
+
+        crate::state::with_state(&*self.engine, |store| {
+            // The default pair is held under ONE name, so the check and the
+            // insert run under one exclusive hold on the store: a download that
+            // raced another one reports the pair that IS held rather than
+            // replacing it, so concurrent first downloads all answer the same
+            // key pair.
+            match held(store) {
+                Held::Reported(output) => return Ok(output),
+                Held::WithoutMaterial => return Err(no_material_held()),
+                Held::Absent => {}
+            }
+            if store.key_pairs.len() >= crate::state::MAX_KEY_PAIRS {
+                // Nothing in the request is wrong — it carries no member at
+                // all — so the refusal is the one for a call that cannot be
+                // carried out: this emulator holds no more key pairs.
+                return Err(cannot_execute(format!(
+                    "creating the Lightsail default key pair would take this account past \
+                     the {} key pairs this emulator holds",
+                    crate::state::MAX_KEY_PAIRS
+                )));
+            }
+
+            let id = store.mint_uuid();
+            // The pair is a key pair of the account like any other — the name
+            // `DEFAULT_SSH_KEY_NAME` is how every Lightsail operation addresses
+            // it, so `GetKeyPair`, `GetKeyPairs` and `DeleteKeyPair` all reach
+            // this one record — and it carries no tags, because nothing in this
+            // request asks for any.
+            store.insert_key_pair(crate::state::StoredKeyPair {
+                name: crate::state::DEFAULT_SSH_KEY_NAME.to_string(),
+                arn: crate::state::key_pair_arn(&region, &id),
+                support_code: crate::state::support_code(&id),
+                created_at_ms: now,
+                location: location.clone(),
+                tags: Vec::new(),
+                fingerprint: minted.fingerprint.clone(),
+            });
+            // Unlike every other key pair, the default pair's PRIVATE half is
+            // held: this call hands it back on every download, not only on the
+            // one that minted it.
+            store.hold_default_key_pair_material(crate::state::HeldDefaultKeyPairMaterial {
+                public_key: minted.public_key.clone(),
+                private_key: minted.private_key.clone(),
+                fingerprint: minted.fingerprint.clone(),
+            });
+            // A key pair was created, and every mutating call of this service
+            // appends what it did to the operation log — so the creation is
+            // auditable through `GetOperations` and `GetOperationsForResource`,
+            // exactly as `CreateKeyPair`'s is. The entry is terminal: the pair
+            // exists as this call returns, and a `KeyPair` carries no status
+            // member for the clock to settle. A download that minted nothing
+            // writes no entry, so repeating this call leaves the log as it was.
+            store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DOWNLOAD_DEFAULT_KEY_PAIR,
+                crate::state::RESOURCE_TYPE_KEY_PAIR,
+                crate::state::DEFAULT_SSH_KEY_NAME,
+                &location,
+                None,
+            );
+            // Read back through the one projection every download answers
+            // with, so the call that minted the pair and every later one report
+            // it identically.
+            match held(store) {
+                Held::Reported(output) => Ok(output),
+                // Unreachable: the record and its material were just stored
+                // under this same hold. Answered rather than asserted, because
+                // a handler never panics on a request.
+                Held::WithoutMaterial | Held::Absent => Err(no_key_material()),
+            }
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// What the store holds for the account's default key pair.
+enum Held {
+    /// The pair and its material are held: this is what a download reports.
+    Reported(DownloadDefaultKeyPairOutput),
+    /// The account holds a key pair under the default name that this service
+    /// has no key material for — one a caller created itself, whose private
+    /// half was reported to that call and never stored.
+    WithoutMaterial,
+    /// The account holds no default key pair, so a download mints one.
+    Absent,
+}
+
+/// What the store holds for the default key pair, as the answer this call makes
+/// of it: the halves and "the timestamp when the default key pair was created"
+/// (`DownloadDefaultKeyPairResult$createdAt`), which is the stored record's own
+/// creation instant.
+fn held(store: &crate::state::ComAmazonawsLightsailLightsail20161128State) -> Held {
+    if let Some((record, material)) = store.default_key_pair_material() {
+        return Held::Reported(DownloadDefaultKeyPairOutput {
+            public_key_base64: Some(material.public_key.clone()),
+            private_key_base64: Some(material.private_key.clone()),
+            created_at: Some(crate::state::timestamp(record.created_at_ms)),
+        });
+    }
+    if store.key_pair(crate::state::DEFAULT_SSH_KEY_NAME).is_some() {
+        return Held::WithoutMaterial;
+    }
+    Held::Absent
+}
+
+/// This operation cannot be carried out: the modelled
+/// `OperationFailureException` — "Lightsail throws this exception when an
+/// operation fails to execute" — whose message says what stopped it. The
+/// request itself is never at fault here, because it carries no member at all.
+fn cannot_execute(message: String) -> DownloadDefaultKeyPairError {
+    DownloadDefaultKeyPairErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The key material did not encode, so there is no default key pair to hold or
+/// to hand back: the modelled `OperationFailureException` — "Lightsail throws
+/// this exception when an operation fails to execute" — rather than a record
+/// with no key behind it.
+fn no_key_material() -> DownloadDefaultKeyPairError {
+    DownloadDefaultKeyPairErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some("the default key pair's key material could not be generated".to_string()),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The account holds a key pair under the default name whose private half this
+/// service never stored — a pair a caller created itself, which `CreateKeyPair`
+/// reported the private half of once. There is no default pair of this
+/// service's own to download, and none can be created while that name is taken,
+/// so the call cannot execute: the modelled `OperationFailureException`, whose
+/// message names the key pair.
+fn no_material_held() -> DownloadDefaultKeyPairError {
+    DownloadDefaultKeyPairErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(format!(
+            "the key pair named '{}' was not created by Lightsail, so its private key \
+             cannot be downloaded",
+            crate::state::DEFAULT_SSH_KEY_NAME
+        )),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DownloadDefaultKeyPairError {
+    DownloadDefaultKeyPairErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail key pair store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

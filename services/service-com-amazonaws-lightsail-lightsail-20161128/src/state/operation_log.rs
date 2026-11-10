@@ -234,6 +234,11 @@ pub const OPERATION_TYPE_EXPORT_SNAPSHOT: &str = "ExportSnapshot";
 pub const OPERATION_TYPE_CREATE_KEY_PAIR: &str = "CreateKeyPair";
 /// See [`OPERATION_TYPE_COPY_SNAPSHOT`].
 pub const OPERATION_TYPE_DELETE_KEY_PAIR: &str = "DeleteKeyPair";
+/// See [`OPERATION_TYPE_COPY_SNAPSHOT`]: the entry the call that CREATES the
+/// account's default key pair writes names that call, because the modelled
+/// `OperationType` enum declares no member for it and no member it carries says
+/// a default key pair was created.
+pub const OPERATION_TYPE_DOWNLOAD_DEFAULT_KEY_PAIR: &str = "DownloadDefaultKeyPair";
 /// See [`OPERATION_TYPE_COPY_SNAPSHOT`].
 pub const OPERATION_TYPE_PEER_VPC: &str = "PeerVpc";
 /// See [`OPERATION_TYPE_COPY_SNAPSHOT`].

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The stored SSH key pair: the public half this service holds for the account,
-//! under the name an instance's key pair member names it by.
+//! under the name an instance's key pair member names it by — and, for the
+//! account's DEFAULT key pair alone, the material of the pair this service
+//! minted itself, which is downloaded again on every call.
 
 use super::*;
 
@@ -136,6 +138,73 @@ impl MintedKeyPairMaterial {
             private_key,
             fingerprint: colon_hex(&::md5::Md5::digest(&public_key_der)),
         })
+    }
+}
+
+/// The key material this service HOLDS for the account's Lightsail default key
+/// pair: the pair the service minted itself.
+///
+/// It exists because the default pair is the ONE pair whose halves the service
+/// hands back on every call rather than once: `DownloadDefaultKeyPair`
+/// "downloads the regional Amazon Lightsail default key pair", so the private
+/// half of a pair the service generated for the account has to still be there
+/// on the second download. A pair the CALLER brought or asked for is not held
+/// this way — `CreateKeyPair` reports its private half once and
+/// [`StoredKeyPair`] keeps the public half alone.
+///
+/// Not `Clone`: one copy of the private half is what the store holds, and a
+/// caller is answered a copy built where it is reported.
+pub struct HeldDefaultKeyPairMaterial {
+    /// The public half, in the OpenSSH `ssh-rsa` form
+    /// [`MintedKeyPairMaterial::public_key`] documents.
+    pub public_key: String,
+    /// The private half, in the PKCS#1 PEM form
+    /// [`MintedKeyPairMaterial::private_key`] documents.
+    pub private_key: String,
+    /// The fingerprint of the key pair this material IS — the same value the
+    /// stored record carries.
+    ///
+    /// It ties the material to the record: material is reported only for a
+    /// stored default pair whose own `fingerprint` it matches, so a default
+    /// pair that some other call put in the store is never answered with
+    /// another key's halves.
+    pub fingerprint: String,
+}
+
+/// Redacts the private half, for the reason [`MintedKeyPairMaterial`]'s own
+/// `Debug` redacts it: the store derives `Debug`, so a derived one here would
+/// carry the held private key into any formatter.
+impl std::fmt::Debug for HeldDefaultKeyPairMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldDefaultKeyPairMaterial")
+            .field("public_key", &self.public_key)
+            .field("fingerprint", &self.fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ComAmazonawsLightsailLightsail20161128State {
+    /// The account's Lightsail default key pair and the material this service
+    /// holds for it, for the call that downloads it.
+    ///
+    /// `None` when the account holds no pair under [`DEFAULT_SSH_KEY_NAME`], and
+    /// also when it holds one this service has no material for — a pair whose
+    /// private half was reported to the call that created it and never stored —
+    /// because the halves answered have to be THAT pair's. The record's own
+    /// `fingerprint` is what decides, so material left from a pair that has
+    /// since been replaced is never reported for its successor.
+    pub fn default_key_pair_material(
+        &self,
+    ) -> Option<(&StoredKeyPair, &HeldDefaultKeyPairMaterial)> {
+        let record = self.key_pair(DEFAULT_SSH_KEY_NAME)?;
+        let material = self.default_key_pair_material.as_ref()?;
+        (material.fingerprint == record.fingerprint).then_some((record, material))
+    }
+
+    /// Hold `material` as the key material of the account's default key pair,
+    /// which the call that just minted that pair stored the record of.
+    pub fn hold_default_key_pair_material(&mut self, material: HeldDefaultKeyPairMaterial) {
+        self.default_key_pair_material = Some(material);
     }
 }
 

@@ -336,6 +336,17 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// Region-scoped listing, once the calls that create a key pair are
     /// implemented.
     pub key_pairs: BTreeMap<String, StoredKeyPair>,
+    /// The key material this service holds for the account's Lightsail DEFAULT
+    /// key pair — the pair `DownloadDefaultKeyPair` mints when the account
+    /// holds none and hands back on every later call, which is why that one
+    /// pair's private half is held at all (see
+    /// [`HeldDefaultKeyPairMaterial`]).
+    ///
+    /// Not a second copy of the key pair: the RESOURCE is the record in
+    /// [`Self::key_pairs`] under [`DEFAULT_SSH_KEY_NAME`], this is only the
+    /// material of it, reported through [`Self::default_key_pair_material`] and
+    /// dropped by [`Self::remove_key_pair`] when that record goes.
+    pub default_key_pair_material: Option<HeldDefaultKeyPairMaterial>,
     /// Every alarm, keyed by its name — the identifier every alarm operation
     /// takes, and the one `PutAlarm` creates or updates a record under. A
     /// `BTreeMap` so `GetAlarms` walks a stable, total order and a page token can
@@ -1827,7 +1838,15 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// instance launched with that pair keeps the `sshKeyName` its own record
     /// carries, because the pair is named there rather than referenced.
     pub fn remove_key_pair(&mut self, name: &str) -> Option<StoredKeyPair> {
-        self.key_pairs.remove(name)
+        let removed = self.key_pairs.remove(name)?;
+        // The held material belongs to the record that is going, so it goes
+        // with it: the account holds no default key pair after this, and the
+        // next download mints a fresh one rather than handing out the halves of
+        // a pair the service no longer holds.
+        if removed.is_default() {
+            self.default_key_pair_material = None;
+        }
+        Some(removed)
     }
 
     /// How many alarms other than `excluding` already watch `metric` on the

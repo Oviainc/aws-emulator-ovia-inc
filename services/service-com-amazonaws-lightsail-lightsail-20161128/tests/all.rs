@@ -253,6 +253,8 @@ mod instance_start_addresses;
 mod inverted_time_window;
 #[path = "all/key_pair_create.rs"]
 mod key_pair_create;
+#[path = "all/key_pair_default_download.rs"]
+mod key_pair_default_download;
 #[path = "all/key_pair_delete.rs"]
 mod key_pair_delete;
 #[path = "all/key_pair_listing.rs"]
