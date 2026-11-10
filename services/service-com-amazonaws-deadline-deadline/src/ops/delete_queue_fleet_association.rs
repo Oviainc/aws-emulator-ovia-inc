@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteQueueFleetAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteQueueFleetAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes a queue-fleet association from this service's store, once it has stopped.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteQueueFleetAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The association hangs off its queue, keyed by `fleetId`, exactly as the model's path
+//! (`/2023-10-12/farms/{farmId}/queue-fleet-associations/{queueId}/{fleetId}`) reaches it,
+//! so a delete naming an unheld farm, an unheld queue of that farm or a pair that queue is
+//! not associated with removes nothing and answers a 404 naming the level that is missing.
+//!
+//! An association that is not `STOPPED` is still holding the queue's work on the fleet, so
+//! this operation refuses the delete with the modeled `ConflictException` (HTTP 409) and
+//! leaves the association exactly as it was: it is taken away only from the one status that
+//! neither schedules the queue's work onto the fleet nor is still draining it
+//! ([`crate::state::QueueFleetAssociation::stopped`]).
+//!
+//! Taking the association away changes what the queue can schedule onto, so the jobs the
+//! queue holds are settled against the associations that held while their reconciliation
+//! was owed BEFORE this one is removed (`crate::state::settle_jobs`), exactly as
+//! `CreateQueueFleetAssociation` settles them before storing one.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +157,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteQueueFleetAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteQueueFleetAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteQueueFleetAssociation"))
+        // The deletion is driven entirely by the path's ids and by the stored association,
+        // so nothing is read off the request's metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteQueueFleetAssociationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // An association is reached only through its own farm and queue, so each missing
+        // level is a 404 naming that level and nothing is removed.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(
+                DeleteQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+                )
+                .into(),
+            );
+        }
+        if store.queue(&input.farm_id, &input.queue_id).is_none() {
+            return Err(
+                DeleteQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+                )
+                .into(),
+            );
+        }
+        // Every level the path names is reported as itself: a fleetId no fleet of this farm
+        // carries is the FLEET that can't be found, because an association exists only where
+        // that fleet does.
+        if store.fleet(&input.farm_id, &input.fleet_id).is_none() {
+            return Err(
+                DeleteQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_FLEET, &input.fleet_id),
+                )
+                .into(),
+            );
+        }
+        // Past that, the association is identified by the three ids of its path, so a held
+        // fleet this queue is not associated with is the association that can't be found.
+        // The drain the clock already finished is materialised before the status is read, so
+        // a delete asked for after it is due is not refused for a status nothing holds.
+        let Some(association) = store.settled_queue_fleet_association(
+            &input.farm_id,
+            &input.queue_id,
+            &input.fleet_id,
+        ) else {
+            return Err(
+                DeleteQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::queue_fleet_association_not_found(
+                        &input.farm_id,
+                        &input.queue_id,
+                        &input.fleet_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+        // Still scheduling the queue's work onto the fleet, or still draining it: the
+        // association can't be taken out from under that work.
+        if !association.stopped() {
+            let status = association.status.clone();
+            return Err(DeleteQueueFleetAssociationErrorModeled::ConflictException(
+                crate::state::queue_fleet_association_not_stopped(
+                    &input.farm_id,
+                    &input.queue_id,
+                    &input.fleet_id,
+                    &status,
+                ),
+            )
+            .into());
+        }
+
+        // What each job of this queue was owed while the queue still had the associations
+        // it has now.
+        store.settle_jobs(&input.farm_id, &input.queue_id);
+
+        let Some(queue) = store.queue_mut(&input.farm_id, &input.queue_id) else {
+            return Err(
+                DeleteQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+                )
+                .into(),
+            );
+        };
+        queue.fleet_associations.remove(&input.fleet_id);
+
+        Ok(DeleteQueueFleetAssociationOutput {})
     }
 }

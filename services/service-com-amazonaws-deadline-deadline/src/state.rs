@@ -120,6 +120,26 @@ pub const JOB_RECONCILE_AFTER: Duration = Duration::from_secs(15);
 /// the clock.
 pub const QUEUE_FLEET_ASSOCIATION_STATUS_ACTIVE: &str = "ACTIVE";
 
+/// How long after `UpdateQueueFleetAssociation` asks an association to stop scheduling the
+/// queue's work the `STOP_SCHEDULING_AND_* -> STOPPED` move comes due.
+///
+/// Those two statuses are the association DRAINING: the update answers with it in a
+/// non-terminal status, so reaching [`QUEUE_FLEET_ASSOCIATION_STATUS_STOPPED`] is owed by
+/// the clock rather than by any later call. AWS documents no duration for it, so this is
+/// the emulator's chosen span: a caller that reads the association straight back still
+/// observes it draining — and a delete asked for then is still refused — and nothing ever
+/// sleeps for it, because the due instant is stored and compared on read.
+pub const QUEUE_FLEET_ASSOCIATION_STOPPED_AFTER: Duration = Duration::from_secs(3);
+
+/// The `QueueFleetAssociationStatus` an association has stopped scheduling the queue's
+/// work onto the fleet in.
+///
+/// The one TERMINAL value of that enum: the two `STOP_SCHEDULING_AND_*` statuses are the
+/// association on its way here, and `ACTIVE` is it scheduling. An association is detached
+/// from the fleet's work only in this status, which is what makes it the one status a
+/// delete of the association is allowed in.
+pub const QUEUE_FLEET_ASSOCIATION_STATUS_STOPPED: &str = "STOPPED";
+
 /// `BudgetStatus` a freshly created budget carries.
 ///
 /// From `smithy_query(query="shape", shape="BudgetStatus")`: `ACTIVE`, `INACTIVE`. A
@@ -147,9 +167,9 @@ pub const RESOURCE_TYPE_JOB: &str = "job";
 /// `resourceType` this service reports for a queue-fleet association in
 /// `ResourceNotFoundException`. The model documents the member only as "the type of the
 /// resource that couldn't be found" and enumerates no values, so a resource type is
-/// spelled the way the model spells that resource everywhere else — the shape
-/// `QueueFleetAssociation` names it `queueFleetAssociation`.
-pub const RESOURCE_TYPE_QUEUE_FLEET_ASSOCIATION: &str = "queueFleetAssociation";
+/// spelled the way the API path spells that resource — the segment
+/// `/queue-fleet-associations/` names it `queue-fleet-association`.
+pub const RESOURCE_TYPE_QUEUE_FLEET_ASSOCIATION: &str = "queue-fleet-association";
 /// `resourceType` this service reports for a budget in `ResourceNotFoundException`.
 pub const RESOURCE_TYPE_BUDGET: &str = "budget";
 /// `resourceType` this service reports for a limit in `ResourceNotFoundException`. The
@@ -535,6 +555,58 @@ pub struct QueueFleetAssociation {
     pub created_by: String,
     pub updated_at: Option<SystemTime>,
     pub updated_by: Option<String>,
+    /// When the clock-owed `STOP_SCHEDULING_AND_* -> STOPPED` move comes due; `None` while
+    /// no drain is underway, and again once it has been materialised. See
+    /// [`QUEUE_FLEET_ASSOCIATION_STOPPED_AFTER`].
+    pub stopped_due_at: Option<Instant>,
+}
+
+impl QueueFleetAssociation {
+    /// Whether this association has stopped holding the queue's work on the fleet.
+    ///
+    /// [`QUEUE_FLEET_ASSOCIATION_STATUS_STOPPED`] is the one status in which neither
+    /// scheduling nor a drain of the queue's tasks is still attached to the fleet, so it is
+    /// the one status in which the association can be taken away.
+    pub fn stopped(&self) -> bool {
+        self.status == QUEUE_FLEET_ASSOCIATION_STATUS_STOPPED
+    }
+
+    /// Materialise the `STOP_SCHEDULING_AND_* -> STOPPED` move the clock already made due.
+    ///
+    /// A read calls this before answering: the drain was owed at this instant whether or
+    /// not anybody called, so applying it on read is reporting, not mutating. It writes no
+    /// timestamp — `updatedAt` stays at the update that asked for the stop, so what a read
+    /// reports does not depend on when somebody polled — exactly as the fleet's own
+    /// clock-owed transition leaves it ([`Fleet::settle_status`]).
+    pub fn settle_status(&mut self) {
+        if let Some(due) = self.stopped_due_at {
+            if Instant::now() >= due {
+                self.status = QUEUE_FLEET_ASSOCIATION_STATUS_STOPPED.to_string();
+                self.stopped_due_at = None;
+            }
+        }
+    }
+
+    /// Ask this association for `status`, as `UpdateQueueFleetAssociation` names it.
+    ///
+    /// `ACTIVE` puts the queue's work back on the fleet at once, so nothing is owed by the
+    /// clock for it; either `STOP_SCHEDULING_AND_*` is the association draining, which the
+    /// clock finishes [`QUEUE_FLEET_ASSOCIATION_STOPPED_AFTER`] later. A drain is the
+    /// service stopping the queue's work on the fleet, so an association that has already
+    /// stopped has none left to stop: asking it for either stop status leaves it
+    /// [`QUEUE_FLEET_ASSOCIATION_STATUS_STOPPED`], and asking for the status it already
+    /// carries changes nothing and does not restart a drain underway.
+    pub fn ask_for_status(&mut self, status: &str, by: &str) {
+        let stopping = status != QUEUE_FLEET_ASSOCIATION_STATUS_ACTIVE;
+        if self.status == status || (stopping && self.stopped()) {
+            return;
+        }
+        self.status = status.to_string();
+        self.stopped_due_at =
+            stopping.then(|| Instant::now() + QUEUE_FLEET_ASSOCIATION_STOPPED_AFTER);
+        self.updated_at = Some(SystemTime::now());
+        self.updated_by = Some(by.to_string());
+    }
 }
 
 /// A persisted job, as `CreateJob` stored it under its queue.
@@ -885,6 +957,31 @@ impl ComAmazonawsDeadlineDeadlineState {
             .get(fleet_id)
     }
 
+    /// Mutable form of [`queue_fleet_association`](Self::queue_fleet_association).
+    pub fn queue_fleet_association_mut(
+        &mut self,
+        farm_id: &str,
+        queue_id: &str,
+        fleet_id: &str,
+    ) -> Option<&mut QueueFleetAssociation> {
+        self.queue_mut(farm_id, queue_id)?
+            .fleet_associations
+            .get_mut(fleet_id)
+    }
+
+    /// [`queue_fleet_association`](Self::queue_fleet_association) with any clock-owed drain
+    /// already materialised: what a read of the association reports.
+    pub fn settled_queue_fleet_association(
+        &mut self,
+        farm_id: &str,
+        queue_id: &str,
+        fleet_id: &str,
+    ) -> Option<&QueueFleetAssociation> {
+        let association = self.queue_fleet_association_mut(farm_id, queue_id, fleet_id)?;
+        association.settle_status();
+        Some(association)
+    }
+
     /// The queue of `farm_id` that still has `fleet_id` associated with it, lowest id
     /// first so the answer does not depend on map order. `None` when no queue does.
     pub fn queue_associated_with_fleet(&self, farm_id: &str, fleet_id: &str) -> Option<&str> {
@@ -917,16 +1014,45 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 }
 
 /// The 404 this service answers for a resource it does not hold.
+///
+/// One sentence serves every resource type this service refuses, with the type and the id
+/// the request named filled in; the trailing period is part of it. This is how the service
+/// itself words a missing resource, as the responses recorded from it show for each of the
+/// types below.
 pub fn not_found(
     resource_type: &str,
     resource_id: &str,
 ) -> crate::ops::types::ResourceNotFoundException {
     crate::ops::types::ResourceNotFoundException {
-        message: format!("The {resource_type} {resource_id} can't be found."),
+        message: format!("Resource of type {resource_type} with id {resource_id} does not exist."),
         resource_id: resource_id.to_string(),
         resource_type: resource_type.to_string(),
         context: None,
     }
+}
+
+/// The id this service reports for a queue-fleet association.
+///
+/// The association carries none of its own — the model mints no id for it and reaches it by
+/// the three ids of its path — so it is named by all three, joined the way this service
+/// names a composite resource: the first two separated by a comma and the last by `and`.
+pub fn queue_fleet_association_id(farm_id: &str, queue_id: &str, fleet_id: &str) -> String {
+    format!("{farm_id}, {queue_id} and {fleet_id}")
+}
+
+/// The 404 this service answers for a queue-fleet association it does not hold.
+///
+/// The resource reported missing is the association, named by
+/// [`queue_fleet_association_id`], and its type is spelled the way the API path spells it.
+pub fn queue_fleet_association_not_found(
+    farm_id: &str,
+    queue_id: &str,
+    fleet_id: &str,
+) -> crate::ops::types::ResourceNotFoundException {
+    not_found(
+        RESOURCE_TYPE_QUEUE_FLEET_ASSOCIATION,
+        &queue_fleet_association_id(farm_id, queue_id, fleet_id),
+    )
 }
 
 /// The 402 this service answers for a create that would pass one of this emulator's
@@ -995,6 +1121,34 @@ pub fn fleet_associated_with_queue(
         reason: "RESOURCE_IN_USE".to_string(),
         resource_id: fleet_id.to_string(),
         resource_type: RESOURCE_TYPE_FLEET.to_string(),
+        context: None,
+    }
+}
+
+/// The 409 this service answers when a queue-fleet association is deleted before it has
+/// stopped.
+///
+/// An association that is not [`QUEUE_FLEET_ASSOCIATION_STATUS_STOPPED`] is still holding
+/// the queue's work on the fleet — scheduling it (`ACTIVE`) or draining it (the two
+/// `STOP_SCHEDULING_AND_*` statuses) — so the association itself is the resource in
+/// conflict and the status it is in is the one value the message varies on; it is read from
+/// the store, never from the request.
+pub fn queue_fleet_association_not_stopped(
+    farm_id: &str,
+    queue_id: &str,
+    fleet_id: &str,
+    status: &str,
+) -> crate::ops::types::ConflictException {
+    let resource_id = queue_fleet_association_id(farm_id, queue_id, fleet_id);
+    crate::ops::types::ConflictException {
+        message: format!("QueueFleetAssociation is in {status} status and cannot be deleted."),
+        // From `smithy_query(query="shape", shape="ConflictExceptionReason")`:
+        // CONFLICT_EXCEPTION, CONCURRENT_MODIFICATION, RESOURCE_ALREADY_EXISTS,
+        // RESOURCE_IN_USE, STATUS_CONFLICT. What conflicts is the status the association
+        // is in, not another caller's hold on it.
+        reason: "STATUS_CONFLICT".to_string(),
+        resource_id,
+        resource_type: RESOURCE_TYPE_QUEUE_FLEET_ASSOCIATION.to_string(),
         context: None,
     }
 }

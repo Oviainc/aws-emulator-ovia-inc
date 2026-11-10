@@ -453,9 +453,12 @@ async fn get_queue_fleet_association_reports_an_unassociated_pair_as_missing() {
     let no_queue = absent_id("queue", "0000000000000000000000000000000b");
     let no_fleet = absent_id("fleet", "0000000000000000000000000000000c");
 
-    // An association is reached only through its own farm and queue, so each level that is
-    // missing is reported as that level, and a pair that is simply not associated is the
-    // association that can't be found.
+    // An association is reached only through its own farm and queue and joins them to a
+    // fleet of that farm, so each level that is missing is reported as that level, and a
+    // held fleet the queue is simply not associated with is the association that can't be
+    // found — which the three ids of its path name, since the model mints it no id of its
+    // own.
+    let other_queues_association = format!("{farm_id}, {other_queue_id} and {fleet_id}");
     let cases: Vec<(&str, String, &str, String)> = vec![
         (
             "an unheld farm",
@@ -470,16 +473,16 @@ async fn get_queue_fleet_association_reports_an_unassociated_pair_as_missing() {
             no_queue.clone(),
         ),
         (
-            "an unheld fleet, so no association",
+            "an unheld fleet",
             get_association_path(&farm_id, &queue_id, &no_fleet),
-            "queueFleetAssociation",
+            "fleet",
             no_fleet.clone(),
         ),
         (
             "a held fleet this queue is not associated with",
             get_association_path(&farm_id, &other_queue_id, &fleet_id),
-            "queueFleetAssociation",
-            fleet_id.clone(),
+            "queue-fleet-association",
+            other_queues_association.clone(),
         ),
     ];
 
@@ -494,7 +497,8 @@ async fn get_queue_fleet_association_reports_an_unassociated_pair_as_missing() {
             "ResourceNotFoundException",
             "case {case:?}: expected the missing-resource code, got {body}"
         );
-        let expected = format!("The {resource_type} {resource_id} can't be found.");
+        let expected =
+            format!("Resource of type {resource_type} with id {resource_id} does not exist.");
         assert_eq!(
             string_at(&body, "message"),
             expected,

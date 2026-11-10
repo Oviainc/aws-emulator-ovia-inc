@@ -114,7 +114,8 @@ async fn assert_batch(emulator: &Emulator, case: &str, rows: &[(Value, Expect)])
                     "case {case:?}: expected the missing-resource code at index \
                      {next_error}, got {entry}"
                 );
-                let expected = format!("The {resource_type} {resource_id} can't be found.");
+                let expected =
+                    format!("Resource of type {resource_type} with id {resource_id} does not exist.");
                 assert_eq!(
                     string_at(entry, "message"),
                     expected,

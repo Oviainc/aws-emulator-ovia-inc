@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateQueueFleetAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateQueueFleetAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Puts the status the request asks for on a queue-fleet association in this service's
+//! store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateQueueFleetAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The association hangs off its queue, keyed by `fleetId`, exactly as the model's path
+//! (`/2023-10-12/farms/{farmId}/queue-fleet-associations/{queueId}/{fleetId}`) reaches it,
+//! so an update naming an unheld farm, an unheld queue of that farm or a pair that queue is
+//! not associated with changes nothing and answers a 404 naming the level that is missing.
+//!
+//! `ACTIVE` puts the queue's work back on the fleet at once; either
+//! `STOP_SCHEDULING_AND_*` status is the association DRAINING, which the service finishes
+//! by moving it to `STOPPED` once the drain comes due — a move owed by the clock, not by
+//! any later call ([`crate::state::QueueFleetAssociation::ask_for_status`]). A drain is the
+//! queue's work being stopped on the fleet, so an association that has already stopped has
+//! none left to stop: asking it to stop again leaves it `STOPPED`. Asking for the status an
+//! association already carries likewise changes nothing, so a retry answers the same
+//! success and leaves the stored association — its status, its pending drain and its
+//! `updatedAt` — exactly as the first call left it.
+//!
+//! Which fleets a queue can schedule onto is what its jobs are reconciled against, so the
+//! jobs the queue holds are settled against the associations that held while their
+//! reconciliation was owed BEFORE this status is written (`crate::state::settle_jobs`),
+//! exactly as `CreateQueueFleetAssociation` settles them before storing one.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +158,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateQueueFleetAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateQueueFleetAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateQueueFleetAssociation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateQueueFleetAssociationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // An association is reached only through its own farm and queue, so each missing
+        // level is a 404 naming that level and nothing is written.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(
+                UpdateQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+                )
+                .into(),
+            );
+        }
+        if store.queue(&input.farm_id, &input.queue_id).is_none() {
+            return Err(
+                UpdateQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+                )
+                .into(),
+            );
+        }
+        // Every level the path names is reported as itself: a fleetId no fleet of this farm
+        // carries is the FLEET that can't be found, because an association exists only where
+        // that fleet does.
+        if store.fleet(&input.farm_id, &input.fleet_id).is_none() {
+            return Err(
+                UpdateQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_FLEET, &input.fleet_id),
+                )
+                .into(),
+            );
+        }
+        // Past that, the association is identified by the three ids of its path, so a held
+        // fleet this queue is not associated with is the association that can't be found.
+        if store
+            .queue_fleet_association(&input.farm_id, &input.queue_id, &input.fleet_id)
+            .is_none()
+        {
+            return Err(
+                UpdateQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::queue_fleet_association_not_found(
+                        &input.farm_id,
+                        &input.queue_id,
+                        &input.fleet_id,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let updated_by = crate::state::caller_principal(ctx);
+        // What each job of this queue was owed while the queue still had the associations
+        // it has now.
+        store.settle_jobs(&input.farm_id, &input.queue_id);
+
+        let Some(association) =
+            store.queue_fleet_association_mut(&input.farm_id, &input.queue_id, &input.fleet_id)
+        else {
+            return Err(
+                UpdateQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::queue_fleet_association_not_found(
+                        &input.farm_id,
+                        &input.queue_id,
+                        &input.fleet_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+        // The drain the clock already finished is materialised first, so a request asking
+        // again for the stop that drain came from is recognized as the retry it is.
+        association.settle_status();
+        association.ask_for_status(&input.status, &updated_by);
+
+        Ok(UpdateQueueFleetAssociationOutput {})
     }
 }

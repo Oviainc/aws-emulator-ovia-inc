@@ -4,6 +4,10 @@
 //! Reports the association between `queueId` and `fleetId` under `farmId` from this
 //! service's store.
 //!
+//! The one thing the read writes is the `STOP_SCHEDULING_AND_* -> STOPPED` move the clock
+//! already made due ([`crate::state::QueueFleetAssociation::settle_status`]): it was owed at
+//! this instant whether or not anybody called, so materialising it here is reporting.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -152,8 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read: it writes nothing, so a later caller sees exactly what it would have
-        // seen had this call never happened.
+        // A read: the only thing it writes is the `STOP_SCHEDULING_AND_* -> STOPPED` move
+        // the clock already made due, which was owed at this instant whether or not anybody
+        // called, so a later caller sees exactly what it would have seen anyway.
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetQueueFleetAssociationErrorModeled::InternalServerErrorException(
@@ -161,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let store = state.lock();
+        let mut store = state.lock();
 
         if store.farm(&input.farm_id).is_none() {
             return Err(GetQueueFleetAssociationErrorModeled::ResourceNotFoundException(
@@ -175,15 +180,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // The association is identified by the pair of ids, so an unassociated pair is the
-        // association that can't be found: the resource reported missing is the
-        // association, named by the fleet the queue is not associated with.
-        let Some(association) =
-            store.queue_fleet_association(&input.farm_id, &input.queue_id, &input.fleet_id)
-        else {
+        // Every level the path names is reported as itself: a fleetId no fleet of this farm
+        // carries is the FLEET that can't be found, because an association exists only where
+        // that fleet does.
+        if store.fleet(&input.farm_id, &input.fleet_id).is_none() {
             return Err(GetQueueFleetAssociationErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(
-                    crate::state::RESOURCE_TYPE_QUEUE_FLEET_ASSOCIATION,
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FLEET, &input.fleet_id),
+            )
+            .into());
+        }
+        // Past that, the association is identified by the three ids of its path, so a held
+        // fleet this queue is not associated with is the association that can't be found.
+        let Some(association) = store.settled_queue_fleet_association(
+            &input.farm_id,
+            &input.queue_id,
+            &input.fleet_id,
+        ) else {
+            return Err(GetQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                crate::state::queue_fleet_association_not_found(
+                    &input.farm_id,
+                    &input.queue_id,
                     &input.fleet_id,
                 ),
             )

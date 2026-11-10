@@ -214,6 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 created_by,
                 updated_at: None,
                 updated_by: None,
+                stopped_due_at: None,
             });
 
         Ok(CreateQueueFleetAssociationOutput {})

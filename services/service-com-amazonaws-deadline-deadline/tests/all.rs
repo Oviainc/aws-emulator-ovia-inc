@@ -25,6 +25,8 @@ mod fleet;
 mod job_run_status;
 #[path = "all/limit.rs"]
 mod limit;
+#[path = "all/queue_fleet_association.rs"]
+mod queue_fleet_association;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/storage_profile.rs"]
