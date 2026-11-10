@@ -63,11 +63,13 @@ use crate::ops::types::{
 };
 mod arns;
 mod offerings;
+mod router_filters;
 mod routers;
 mod gateways;
 mod flows;
 pub use flows::*;
 pub use gateways::*;
+pub use router_filters::*;
 pub use routers::*;
 pub use offerings::*;
 pub use arns::*;

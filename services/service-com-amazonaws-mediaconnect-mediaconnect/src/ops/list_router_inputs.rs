@@ -94,27 +94,10 @@ const MAX_PAGE_SIZE: i32 = 100;
 /// operation's states none.
 const DEFAULT_PAGE_SIZE: i32 = MAX_PAGE_SIZE;
 
-/// How many `Filters` entries one request may carry.
-///
-/// `RouterInputFilterList` is a plain list and its members are plain lists of values, so the
-/// model bounds neither how many criteria a request states nor how many values any one of
-/// them names. Every stored router input is tested against every filter and every filter
-/// value, so these two ceilings are what bound that work: the comparisons are at most
-/// `MAX_FILTERS` x [`MAX_VALUES_PER_FILTER`] x [`crate::state::MAX_ROUTER_INPUTS`], whatever
-/// a request asks for. A filter beyond them is a request this operation refuses rather than
-/// one it spends the store's lock on.
-///
-/// Both ceilings, and the wording of the refusal they produce, are this emulator's own: AWS
-/// publishes no limit on either count for this operation, so a request past them is refused
-/// here with the client-input error the model does declare (`BadRequestException`, "thrown
-/// if the request contains a semantic error") rather than with an error the model does not.
-/// They are set far above any listing a client writes by hand, so a request a MediaConnect
-/// client would send is answered, not refused. The router OUTPUT listing bounds its own
-/// filters the same way (`list_router_outputs.rs`).
-const MAX_FILTERS: usize = 10;
-
-/// How many values one `Filters` entry may name. See [`MAX_FILTERS`].
-const MAX_VALUES_PER_FILTER: usize = 100;
+/// The resource this operation lists, as the model's own sentence for it names it
+/// ("Retrieves a list of router inputs"): the one per-operation part of the refusal the
+/// shared `Filters` size rule produces ([`crate::state::check_router_filters`]).
+const LISTING: &str = "router inputs";
 
 /// The values `filter` names — the list the union member carries, whichever member it is.
 fn filter_values(filter: &RouterInputFilter) -> &[String] {
@@ -253,28 +236,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request carrying several is narrowed by all of them and one carrying none lists
         // every router input of the account.
         //
-        // The two size checks run BEFORE the store is reached, so the comparisons the scan
-        // below performs are bounded by `MAX_FILTERS` x `MAX_VALUES_PER_FILTER` x
+        // The size rule every router listing applies to its `Filters`
+        // ([`crate::state::check_router_filters`]) is judged BEFORE the store is reached, so
+        // the comparisons the scan below performs are bounded by
+        // `crate::state::MAX_ROUTER_FILTERS` x `crate::state::MAX_ROUTER_FILTER_VALUES` x
         // `crate::state::MAX_ROUTER_INPUTS` and a request past either ceiling is refused
         // without taking the store's guard.
         let filters = input.filters.unwrap_or_default();
-        if filters.len() > MAX_FILTERS {
-            return Err(bad_request(format!(
-                "A list router inputs request may apply at most {MAX_FILTERS} Filters \
-                 entries; this one has {}.",
-                filters.len()
-            )));
-        }
-        for filter in &filters {
-            let values = filter_values(filter);
-            if values.len() > MAX_VALUES_PER_FILTER {
-                return Err(bad_request(format!(
-                    "A Filters entry may name at most {MAX_VALUES_PER_FILTER} values; this one \
-                     names {}.",
-                    values.len()
-                )));
-            }
-        }
+        let value_counts: Vec<usize> = filters
+            .iter()
+            .map(|filter| filter_values(filter).len())
+            .collect();
+        crate::state::check_router_filters(LISTING, &value_counts).map_err(bad_request)?;
 
         // `NextToken` is the router input ARN this listing resumes at, so a token the service
         // never minted is a semantic error, not a key to page from — the same rule the other
