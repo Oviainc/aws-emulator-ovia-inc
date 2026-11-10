@@ -89,6 +89,8 @@ mod resource_policies;
 mod resource_tags;
 #[path = "all/run_command.rs"]
 mod run_command;
+#[path = "all/secretsmanager_reference.rs"]
+mod secretsmanager_reference;
 #[path = "all/secure_string_decryption.rs"]
 mod secure_string_decryption;
 #[path = "all/secure_string_encryption_at_rest.rs"]

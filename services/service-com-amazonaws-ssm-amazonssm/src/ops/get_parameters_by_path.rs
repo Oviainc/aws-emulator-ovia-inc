@@ -20,6 +20,14 @@
 //! ascending name order, so filtering, paging and the resume cursor are the same for
 //! either.
 //!
+//! One hierarchy of that AWS-owned namespace is the reserved path a single read serves an
+//! Amazon Web Services Secrets Manager secret through
+//! ([`crate::state::secretsmanager_reference`]). A hierarchy read never enumerates it: what
+//! lies under it are SECRETS, which the published catalog holds none of and this account's
+//! store cannot hold at all, so a listing of that path — or of any level above it — reports
+//! nothing for them. A secret is reached by naming its reference, not by walking a hierarchy
+//! the account owns none of.
+//!
 //! ## Filters
 //!
 //! `ParameterFilters` accepts the three keys this operation publishes — `Type`, `KeyId`

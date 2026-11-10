@@ -18517,6 +18517,7 @@ dependencies = [
  "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-kms-trentservice",
+ "service-com-amazonaws-secretsmanager-secretsmanager",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",
  "sha2 0.10.9",

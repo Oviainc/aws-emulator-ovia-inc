@@ -143,6 +143,10 @@ pub mod secure_string;
 /// read resolves beside the parameters this account wrote.
 pub mod public_parameters;
 
+/// The reserved hierarchy of that same `/aws` namespace through which a read of Parameter
+/// Store serves an Amazon Web Services Secrets Manager secret.
+pub mod secretsmanager_reference;
+
 /// A command a caller sent to the managed nodes of one Region, and the invocation each of
 /// those nodes holds of it.
 pub mod commands;

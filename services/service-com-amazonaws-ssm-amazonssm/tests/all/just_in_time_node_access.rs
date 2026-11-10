@@ -64,9 +64,9 @@ const CREDENTIAL_LIFETIME: Duration =
 
 /// A principal a call is signed as: the access key id it presents, and the ARN a refusal must
 /// blame it by — what `sts:GetCallerIdentity` reports for that key.
-struct Principal {
-    access_key_id: String,
-    arn: String,
+pub(crate) struct Principal {
+    pub(crate) access_key_id: String,
+    pub(crate) arn: String,
 }
 
 /// A router with this service beside the IAM and STS services the principals and their
@@ -93,7 +93,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// One call to this service, signed for `region` with `access_key_id` in the credential
 /// scope, returning `(status, body)`.
-async fn call_as(
+pub(crate) async fn call_as(
     router: &MultiServiceRouter,
     access_key_id: &str,
     region: &str,
@@ -254,7 +254,7 @@ async fn user(router: &MultiServiceRouter, user_name: &str, policy: Option<&str>
 
 /// Create an IAM role carrying `policy` as its inline policy (when one is given), assume it
 /// through STS, and answer the session's access key id with the session ARN.
-async fn assumed_role(
+pub(crate) async fn assumed_role(
     router: &MultiServiceRouter,
     role_name: &str,
     policy: Option<&str>,

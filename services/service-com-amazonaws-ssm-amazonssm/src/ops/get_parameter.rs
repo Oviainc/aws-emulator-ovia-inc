@@ -42,6 +42,19 @@
 //! AMI under, and the id of that image — so the value a read reports is the id of an image
 //! this account can really launch rather than an invented one.
 //!
+//! ## Secrets, read through Parameter Store
+//!
+//! One hierarchy of that same AWS-owned namespace is reserved for Amazon Web Services
+//! Secrets Manager: a name under `/aws/reference/secretsmanager` names a SECRET, so this
+//! read resolves it against Secrets Manager — that service's own authorization gate, the
+//! staging labels its versions carry and its own envelope — and reports it as a
+//! `SecureString` parameter of the secret's identity. A `name:selector` suffix selects by
+//! staging label there, so it serves that label's version's own bytes rather than a
+//! parameter version. `WithDecryption` is what asks for those bytes: this service holds no
+//! ciphertext of its own for a reference, so a read that asks for no decryption is served
+//! the reference's identity without its value. See
+//! [`crate::state::secretsmanager_reference`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -257,6 +270,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found().into());
         }
 
+        // A name in the hierarchy reserved for Secrets Manager references names a SECRET
+        // rather than a parameter, so it is resolved against that service — its
+        // authorization gate, its staging labels and its envelope — and never against this
+        // store, which no caller can write that hierarchy into. Resolved before the store
+        // is read, because nothing in it could hold such a name.
+        if let Some(secret_id) =
+            crate::state::secretsmanager_reference::referenced_secret(query.name)
+        {
+            let parameter = crate::state::secretsmanager_reference::resolve(
+                &*self.engine,
+                ctx,
+                &region,
+                query.path,
+                secret_id,
+                query.selector,
+                input.with_decryption.unwrap_or(false),
+            )
+            .await
+            .map_err(reference_refusal)?;
+            return Ok(GetParameterOutput {
+                parameter: Some(parameter),
+            });
+        }
+
         // The store guard is released before the key is asked, so no state of this
         // service is held while KMS's decision is made.
         let published = crate::state::public_parameters::published(
@@ -324,5 +361,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetParameterOutput {
             parameter: Some(parameter),
         })
+    }
+}
+
+/// How a read of the reserved Secrets Manager hierarchy that reported no value is refused.
+///
+/// A reference nothing resolves is the same miss as a name this Region holds no parameter
+/// for, carrying NO message (see the module docs). A read the service this one DEPENDS ON
+/// would not serve — it refused the caller, or the value could not be opened under the
+/// secret's key — is refused as that dependency failing
+/// ([`crate::state::secretsmanager_reference::DEPENDENCY_FAILURE_MESSAGE`]) rather than
+/// relayed as the other service's own refusal, which this operation models no error for and
+/// states nothing of. An emulator that answered with no Secrets Manager at all resolved
+/// nothing, which is a server-side fault.
+fn reference_refusal(refusal: crate::state::secretsmanager_reference::Refusal) -> GetParameterError {
+    use crate::state::secretsmanager_reference::Refusal;
+    match refusal {
+        Refusal::NotFound => {
+            GetParameterErrorModeled::ParameterNotFound(ParameterNotFound { message: None }).into()
+        }
+        Refusal::Dependency => crate::scaffolded::Scaffolded::validation(
+            crate::state::secretsmanager_reference::DEPENDENCY_FAILURE_MESSAGE,
+        ),
+        Refusal::Unavailable(message) => {
+            GetParameterErrorModeled::InternalServerError(InternalServerError {
+                message: Some(message),
+            })
+            .into()
+        }
     }
 }

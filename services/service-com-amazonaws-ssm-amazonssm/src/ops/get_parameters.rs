@@ -31,6 +31,11 @@
 //! A name in the hierarchy AWS publishes its own parameters in is resolved against THAT
 //! catalog ([`crate::state::public_parameters`]), which no account's store holds anything
 //! of, so only a name neither the store nor the catalog holds is reported as unresolvable.
+//! A name in the hierarchy of that namespace reserved for Amazon Web Services Secrets
+//! Manager references is resolved against THAT service, secret, staging label and all
+//! ([`crate::state::secretsmanager_reference`]); a reference that resolves to nothing is
+//! reported among the unresolvable names, and one the service it depends on would not serve
+//! refuses the whole call, exactly as a refused decrypt does.
 //!
 //! The parameters are reported in alphabetical order of their names ("The results for
 //! GetParameters requests are listed in alphabetical order in query responses",
@@ -253,6 +258,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let published =
             crate::state::public_parameters::published_among(&*self.engine, &region, &asked);
 
+        // A name in the hierarchy reserved for Secrets Manager references names a SECRET
+        // rather than a parameter, so each such name is resolved against that service, its
+        // staging labels and its envelope ([`crate::state::secretsmanager_reference`]) —
+        // ahead of this store's guard, because resolving one reads Secrets Manager's own
+        // store and opens a value under the secret's key. A reference that resolves to
+        // nothing is reported among the unresolvable names, the way every other name this
+        // batch cannot resolve is; one the service it depends on would not serve refuses the
+        // whole call, exactly as a refused decrypt does.
+        let mut referenced: Vec<(&str, Parameter)> = Vec::new();
+        for name in asked.iter().copied() {
+            let Some(query) = crate::state::parse_parameter_query(name)
+                .filter(|query| query.selector != Some(""))
+            else {
+                continue;
+            };
+            let Some(secret_id) =
+                crate::state::secretsmanager_reference::referenced_secret(query.name)
+            else {
+                continue;
+            };
+            match crate::state::secretsmanager_reference::resolve(
+                &*self.engine,
+                ctx,
+                &region,
+                query.path,
+                secret_id,
+                query.selector,
+                input.with_decryption.unwrap_or(false),
+            )
+            .await
+            {
+                Ok(parameter) => referenced.push((name, parameter)),
+                // Nothing resolved it, so the name is one this read reports rather than
+                // refuses — the arm the loop below takes for it.
+                Err(crate::state::secretsmanager_reference::Refusal::NotFound) => {}
+                Err(refusal) => return Err(reference_refusal(refusal)),
+            }
+        }
+
         // The store guard is released before the keys are asked, so no state of this
         // service is held while KMS's decision is made.
         let (mut parameters, invalid_parameters, to_open) = {
@@ -276,6 +320,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     || query.region.is_some_and(|named| named != region)
                 {
                     invalid.push(name.to_string());
+                    continue;
+                }
+                // A reserved-path name was resolved against Secrets Manager above, so what
+                // it reports is that resolution's parameter; one that resolved to nothing
+                // is not in this store either and falls to the miss below.
+                if let Some((_, parameter)) =
+                    referenced.iter().find(|(resolved, _)| *resolved == name)
+                {
+                    parameters.push(parameter.clone());
                     continue;
                 }
                 let Some(record) = store
@@ -346,5 +399,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // batch read that resolved every name it was given.
             invalid_parameters: Some(invalid_parameters),
         })
+    }
+}
+
+/// How a read of the reserved Secrets Manager hierarchy that the source would not serve
+/// refuses this whole batch — the same classes the single read words
+/// ([`crate::ops::get_parameter`]), minus the miss, which a batch reports among the
+/// unresolvable names instead of refusing.
+fn reference_refusal(
+    refusal: crate::state::secretsmanager_reference::Refusal,
+) -> GetParametersError {
+    use crate::state::secretsmanager_reference::Refusal;
+    match refusal {
+        Refusal::Dependency => crate::scaffolded::Scaffolded::validation(
+            crate::state::secretsmanager_reference::DEPENDENCY_FAILURE_MESSAGE,
+        ),
+        Refusal::Unavailable(message) => {
+            GetParametersErrorModeled::InternalServerError(InternalServerError {
+                message: Some(message),
+            })
+            .into()
+        }
+        // A miss never reaches here: the caller reports it among the unresolvable names.
+        Refusal::NotFound => GetParametersErrorModeled::InternalServerError(InternalServerError {
+            message: Some("a secret reference resolved to nothing".to_string()),
+        })
+        .into(),
     }
 }

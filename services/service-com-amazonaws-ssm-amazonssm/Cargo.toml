@@ -35,6 +35,11 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 # hierarchy resolve to the ids of the images that service holds, which is the one place
 # this emulator records which AMI a public parameter names.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# The secrets Secrets Manager holds: a read of the reserved `/aws/reference/secretsmanager`
+# hierarchy is a read of that service's own secret — its authorization gate, its versions'
+# staging labels and its envelope — rather than of any parameter this service stores
+# (`state::secretsmanager_reference`).
+service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 # `CreateDocument`'s content is "in JSON or YAML format", and the document's schema
 # version, description and parameters are read out of it. yaml-rust2 is a pure-Rust
 # YAML 1.2 implementation, and YAML 1.2 is a superset of JSON, so one parser reads
