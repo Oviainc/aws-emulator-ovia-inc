@@ -613,6 +613,66 @@ pub fn not_authorized_by_resource_policy(principal: &str, action: &str, resource
     )
 }
 
+/// The sentence AWS refuses a request with when the CALLING PRINCIPAL's own identity-based
+/// documents do not allow it: the principal that signed, the action it asked for, the
+/// resource it asked for, and `reason` — which of IAM's rules withheld the grant.
+///
+/// The counterpart of [`not_authorized_by_resource_policy`] for the identity-based half of
+/// the decision, and stated here for the same reason: the sentence is one rule, so two
+/// services that reach the same decision must word it the same way. The four reasons a
+/// decision can rest on are the four this module names beside it
+/// ([`IDENTITY_POLICY_EXPLICIT_DENY`], [`no_identity_policy_allows`],
+/// [`PERMISSIONS_BOUNDARY_EXPLICIT_DENY`], [`no_permissions_boundary_allows`]), so a caller
+/// states none of them itself. Every value comes from the request and from the stored
+/// policies, and nothing about the resource is looked up — which is why the refusal can be
+/// stated before the resource is resolved.
+///
+/// `action` is the fully qualified IAM action (`<service action namespace>:<ApiName>`): the
+/// namespace is the caller's to supply, because only the service knows the namespace its own
+/// actions are published under. `resource` is the ARN the request addressed; a call that
+/// addresses no single resource of its own is outside this sentence, since there is nothing
+/// to name in it.
+///
+/// Every gate that decides the identity-based question inlined this sentence before it lived
+/// here — `grep -rln 'because no identity-based policy allows' services/*/src` lists them —
+/// and they are to be migrated onto this one rather than copied again.
+#[must_use]
+pub fn not_authorized_by_identity_policy(
+    principal: &str,
+    action: &str,
+    resource: &str,
+    reason: &str,
+) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {resource} {reason}"
+    )
+}
+
+/// The reason clause for a request an explicit `Deny` in one of the principal's own
+/// identity-based documents refuses: a fact about that document, so the sentence names it
+/// rather than the action.
+pub const IDENTITY_POLICY_EXPLICIT_DENY: &str = "with an explicit deny in an identity-based policy";
+
+/// The reason clause for a request an explicit `Deny` in the principal's PERMISSIONS BOUNDARY
+/// refuses.
+pub const PERMISSIONS_BOUNDARY_EXPLICIT_DENY: &str =
+    "with an explicit deny in a permissions boundary";
+
+/// The reason clause for a request no readable identity-based document allows — IAM's default
+/// deny, which names the action nothing granted.
+#[must_use]
+pub fn no_identity_policy_allows(action: &str) -> String {
+    format!("because no identity-based policy allows the {action} action")
+}
+
+/// The reason clause for a grant the principal's permissions boundary does not also allow:
+/// "a permissions boundary sets the maximum permissions that an identity-based policy can
+/// grant" (IAM, permissions boundaries).
+#[must_use]
+pub fn no_permissions_boundary_allows(action: &str) -> String {
+    format!("because no permissions boundary allows the {action} action")
+}
+
 /// The sentence AWS refuses a request with when the caller may not reach the named resource
 /// AT ALL: the calling principal, and nothing else.
 ///

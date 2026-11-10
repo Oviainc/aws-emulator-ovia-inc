@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDelivery
-//! Implemented: pairs one stored delivery source with one stored delivery destination,
+//! Implemented: decides the caller's identity-based IAM policies for `logs:CreateDelivery`
+//! on the delivery source and the delivery destination the request pairs, refusing an
+//! unauthorized call with `AccessDeniedException` before anything is read or written, then
+//! pairs one stored delivery source with one stored delivery destination,
 //! minting the delivery `DescribeDeliveries` and `GetDelivery` then report. The pair
 //! identifies the delivery, so a create naming a pair the account already holds is
 //! idempotent: it answers the stored delivery, with its existing id and configuration,
@@ -186,6 +189,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for, so it is read off the request's credential scope.
         let region = crate::state::request_region(ctx.parts());
 
+        // AUTHORIZATION FIRST: a signed call is decided against the calling principal's
+        // identity-based IAM policies before this service looks at anything, so a caller
+        // holding no grant learns nothing about what the account holds, and a refused create
+        // stores nothing. This call "create[s] a delivery by pairing exactly one delivery
+        // source and one delivery destination", so it acts on BOTH of those resources and is
+        // decided against each of them, in the order the request names them. Each ARN is
+        // built from the request rather than resolved out of the store, so the decision does
+        // not depend on whether the resource exists.
+        for resource in [
+            crate::state::delivery_source_arn(&region, &input.delivery_source_name),
+            input.delivery_destination_arn.clone(),
+        ] {
+            if let Some(message) = crate::state::identity_authorization::refusal(
+                &*self.engine,
+                ctx,
+                Self::NAME,
+                &resource,
+            ) {
+                return Err(CreateDeliveryErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateDeliveryError::from(CreateDeliveryErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -221,22 +251,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A delivery pairs "a logical delivery source and a logical delivery destination that
         // you have already created", so BOTH have to be in the account before this call can
         // connect them. Both are regional resources, so both are looked for in the Region this
-        // create was signed for. The source is checked first, in the order the request names
-        // them.
-        if store
-            .delivery_source(&region, &input.delivery_source_name)
-            .is_none()
-        {
-            return Err(not_found(
-                crate::state::DELIVERY_SOURCE_NOT_FOUND_MESSAGE,
-            ));
-        }
+        // create was signed for. The DESTINATION is resolved first, which is the order the
+        // recordings show: a recorded create naming a source no put ever created, with a
+        // destination the account HELD, is refused for the source, while the recorded create
+        // naming NEITHER is refused for the destination — so the source refusal is reached
+        // only once the destination the request named is one this account holds.
         if store
             .delivery_destination_by_arn(&region, &input.delivery_destination_arn)
             .is_none()
         {
             return Err(not_found(
                 crate::state::DELIVERY_DESTINATION_NOT_FOUND_MESSAGE,
+            ));
+        }
+        if store
+            .delivery_source(&region, &input.delivery_source_name)
+            .is_none()
+        {
+            return Err(not_found(
+                crate::state::DELIVERY_SOURCE_NOT_FOUND_MESSAGE,
             ));
         }
         // "Displays whether the delivery destination associated with this delivery is

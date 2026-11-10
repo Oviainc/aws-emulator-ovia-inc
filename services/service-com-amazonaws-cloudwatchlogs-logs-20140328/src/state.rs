@@ -233,6 +233,10 @@ pub use deliveries::*;
 /// checks across two members.
 pub mod parameter_pairs;
 
+/// Whether the CALLER's own identity-based IAM policies allow the action an operation whose
+/// model declares `AccessDeniedException` asks to perform.
+pub mod identity_authorization;
+
 /// Per-service state for com-amazonaws-cloudwatchlogs-logs-20140328. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchlogsLogs20140328State {

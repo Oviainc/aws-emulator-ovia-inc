@@ -475,7 +475,8 @@ async fn a_delivery_is_held_only_by_the_region_that_created_it() {
         let id = member(&case, &delivery, "id");
 
         // A create in the away Region cannot reach the source or the destination of the home
-        // one: both are resolved among that endpoint's own resources.
+        // one: both are resolved among that endpoint's own resources, and the destination is
+        // the one the create resolves first.
         refused_as_absent(
             &logs,
             &case,
@@ -485,7 +486,7 @@ async fn a_delivery_is_held_only_by_the_region_that_created_it() {
                 "deliverySourceName": source_name,
                 "deliveryDestinationArn": destination_arn,
             }),
-            SOURCE_NOT_FOUND,
+            DESTINATION_NOT_FOUND,
         )
         .await;
 

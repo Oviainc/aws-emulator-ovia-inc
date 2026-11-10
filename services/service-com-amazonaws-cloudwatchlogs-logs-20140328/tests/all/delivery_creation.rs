@@ -306,7 +306,9 @@ async fn a_create_naming_a_resource_this_account_does_not_hold_is_refused() {
                 "deliveryDestinationArn": format!("{destination}-missing"),
             }),
             NOT_FOUND,
-            SOURCE_NOT_FOUND,
+            // The DESTINATION is the resource this create resolves first, so a request naming
+            // neither is refused for the destination.
+            DESTINATION_NOT_FOUND,
         ),
     ];
     for (case, body, expected_code, expected_message) in cases {

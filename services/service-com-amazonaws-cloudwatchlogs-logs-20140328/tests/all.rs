@@ -55,6 +55,8 @@ mod delivery_destination_policy_removal;
 mod delivery_destinations;
 #[path = "all/delivery_idempotence.rs"]
 mod delivery_idempotence;
+#[path = "all/delivery_identity_authorization.rs"]
+mod delivery_identity_authorization;
 #[path = "all/delivery_region_isolation.rs"]
 mod delivery_region_isolation;
 #[path = "all/delivery_resource_in_use_refusals.rs"]

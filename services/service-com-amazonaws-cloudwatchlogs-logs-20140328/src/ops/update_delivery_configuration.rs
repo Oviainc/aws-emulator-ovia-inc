@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDeliveryConfiguration
-//! Implemented: changes the configuration members of the one stored delivery the request's
+//! Implemented: decides the caller's identity-based IAM policies for
+//! `logs:UpdateDeliveryConfiguration` on the delivery the request names, refusing an
+//! unauthorized call with `AccessDeniedException` before anything is read or written, then
+//! changes the configuration members of the one stored delivery the request's
 //! `id` names, leaving its source and destination as they are. This is the ONLY file to
 //! touch for this operation.
 //!
@@ -155,6 +158,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A delivery is a regional resource, so the delivery this call reconfigures is the one
         // the Region the request was signed for holds under that id.
         let region = crate::state::request_region(ctx.parts());
+
+        // AUTHORIZATION FIRST, as in `CreateDelivery`: the call is decided against the
+        // calling principal's identity-based IAM policies before this service resolves the
+        // id, so a caller holding no grant is not told whether that delivery exists and a
+        // refused update changes nothing. This operation acts on the DELIVERY the request
+        // names ("the configuration of a delivery"), whose ARN is built from the id the
+        // request carried rather than read off a stored record.
+        if let Some(message) = crate::state::identity_authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::delivery_arn(&region, &input.id),
+        ) {
+            return Err(
+                UpdateDeliveryConfigurationErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateDeliveryConfigurationError::from(
