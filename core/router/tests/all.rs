@@ -610,6 +610,11 @@ mod sfn_lambda_task_invocation;
 mod sfn_integration_error_names;
 #[path = "all/sfn_parallel_branch_cancellation.rs"]
 mod sfn_parallel_branch_cancellation;
+// Declared beside the other Step Functions suites, for the reason the lines above give:
+// the execution role the calls of a run-a-job task are made as, which spans Step
+// Functions, IAM and Athena.
+#[path = "all/sfn_athena_run_a_job_sync.rs"]
+mod sfn_athena_run_a_job_sync;
 #[path = "all/cloudformation_sfn_fifo_queue_stack.rs"]
 mod cloudformation_sfn_fifo_queue_stack;
 // Declared beside the other Step Functions suites, for the reason the lines above give.

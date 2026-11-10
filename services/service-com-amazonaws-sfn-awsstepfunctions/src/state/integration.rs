@@ -150,6 +150,14 @@
 //! started for it, and the task fails with the invoked service's own access-denied
 //! refusal.
 //!
+//! That holds for EVERY call the integration makes, not only the one the walk asks
+//! for: the call that REPORTS a run-a-job pattern's job is made as the same role, and
+//! one it may not make leaves the task's outcome unknowable — the job was already
+//! submitted, so the task fails with ASL's own [`TASK_FAILED_ERROR`] carrying that
+//! refusal, rather than with a status nothing reported. Its access request is over the
+//! resource the job BELONGS to, which the request that started the job named
+//! ([`JobTarget`]), because the reporting call's own request names the job instead.
+//!
 //! What a request-response call answers is reported to the state as the literal SDK
 //! response an OPTIMIZED integration returns: the operation's own members under the
 //! integration's convention, beside the SDK's response envelope
@@ -1372,6 +1380,17 @@ impl Call {
             false => format!("the '{}' call of {}", self.operation, self.api.sdk_id),
         }
     }
+
+    /// The IAM action this call is taken under: the invoked service's action namespace
+    /// and the operation's own name.
+    ///
+    /// That is the action for every operation that publishes its permission under its
+    /// own name, which is the usual case; an operation that publishes another is
+    /// carried by its [`TARGET_RESOURCES`] entry ([`TargetResource::action`]).
+    #[must_use]
+    pub fn action(&self) -> String {
+        format!("{}:{}", self.api.namespace, self.operation)
+    }
 }
 
 /// Where an integration's request names the resource its call acts ON, which IAM
@@ -1397,6 +1416,12 @@ pub struct TargetResource {
     /// The member of the integration's request that names the resource the call acts
     /// on, named in the integration's own PascalCase.
     pub member: &'static str,
+    /// The resource that member names when the request OMITS it, for an operation
+    /// that documents a default for it; `None` where it documents none, and a request
+    /// omitting the member then names no resource at all — which is a request the
+    /// invoked operation answers for itself rather than an authorization decision
+    /// ([`access_request`]).
+    pub default: Option<&'static str>,
     /// How that member spells the resource it names ([`TargetNaming`]).
     pub named: TargetNaming,
 }
@@ -1566,6 +1591,7 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
         integration: "states:startExecution",
         action: None,
         member: "StateMachineArn",
+        default: None,
         named: TargetNaming::Arn,
     },
     // DynamoDB's item-level integrations each act on ONE table, the one their
@@ -1585,24 +1611,28 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
         integration: "dynamodb:putItem",
         action: None,
         member: "TableName",
+        default: None,
         named: DYNAMODB_TABLE,
     },
     TargetResource {
         integration: "dynamodb:getItem",
         action: None,
         member: "TableName",
+        default: None,
         named: DYNAMODB_TABLE,
     },
     TargetResource {
         integration: "dynamodb:updateItem",
         action: None,
         member: "TableName",
+        default: None,
         named: DYNAMODB_TABLE,
     },
     TargetResource {
         integration: "dynamodb:deleteItem",
         action: None,
         member: "TableName",
+        default: None,
         named: DYNAMODB_TABLE,
     },
     // `arn:aws:states:::sqs:sendMessage` sends to the queue its `QueueUrl` parameter
@@ -1617,6 +1647,7 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
         integration: "sqs:sendMessage",
         action: None,
         member: "QueueUrl",
+        default: None,
         named: TargetNaming::QueueUrl,
     },
     // `arn:aws:states:::lambda:invoke` invokes the function its `FunctionName`
@@ -1631,9 +1662,61 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
         integration: "lambda:invoke",
         action: Some("lambda:InvokeFunction"),
         member: "FunctionName",
+        default: None,
         named: TargetNaming::FunctionName,
     },
+    // `arn:aws:states:::athena:startQueryExecution` runs its query IN a workgroup —
+    // `WorkGroup` is "the name of the workgroup in which the query is being started"
+    // (`smithy_query(query="operation",operation="StartQueryExecution",
+    // model_path="services/service-com-amazonaws-athena-amazonathena/smithy-model/
+    // com-amazonaws-athena-amazonathena.json")`) — and a query's actions are taken on
+    // that workgroup, which Athena writes under the `workgroup` resource type. A
+    // request naming none runs in the account's own default workgroup: "if a workgroup
+    // is not specified, [...] the primary workgroup"
+    // (`ListQueryExecutionsInput$WorkGroup` of the same model), which is the name the
+    // access request is then over. Athena models no access-denied error on these
+    // operations, so a refusal of one is reported under that service's base SDK
+    // exception.
+    TargetResource {
+        integration: "athena:startQueryExecution",
+        action: None,
+        member: "WorkGroup",
+        default: Some(ATHENA_DEFAULT_WORK_GROUP),
+        named: ATHENA_WORK_GROUP,
+    },
+    // `arn:aws:states:::glue:startJobRun` runs the job its `JobName` parameter names —
+    // "the name of the job definition to use", `@required`
+    // (`smithy_query(query="operation",operation="StartJobRun",model_path="services/
+    // service-com-amazonaws-glue-awsglue/smithy-model/com-amazonaws-glue-awsglue.json")`)
+    // — and a run's actions are taken on that job, which Glue writes under the `job`
+    // resource type. Glue models no access-denied error on these operations either.
+    TargetResource {
+        integration: "glue:startJobRun",
+        action: None,
+        member: "JobName",
+        default: None,
+        named: GLUE_JOB,
+    },
 ];
+
+/// An Athena workgroup, named by the `WorkGroup` one of that service's query
+/// operations takes.
+const ATHENA_WORK_GROUP: TargetNaming = TargetNaming::Named {
+    service: "athena",
+    prefix: "workgroup/",
+};
+
+/// The workgroup a query runs in when the request names none: "if a workgroup is not
+/// specified, a list of available query execution IDs for the queries in the primary
+/// workgroup is returned" (`ListQueryExecutionsInput$WorkGroup`), the default
+/// workgroup every account carries.
+const ATHENA_DEFAULT_WORK_GROUP: &str = "primary";
+
+/// A Glue job, named by the `JobName` one of that service's run operations takes.
+const GLUE_JOB: TargetNaming = TargetNaming::Named {
+    service: "glue",
+    prefix: "job/",
+};
 
 /// A DynamoDB table, named by the table name one of its item-level operations takes.
 const DYNAMODB_TABLE: TargetNaming = TargetNaming::Named {
@@ -1653,11 +1736,28 @@ impl TargetResource {
     /// or one of a service's own shorter forms is read the way that service addresses
     /// the resource.
     fn resource_of(&self, request: &Value, region: &str) -> Option<String> {
-        let named = [MemberCase::Pascal, MemberCase::LowerCamel]
+        self.named.arn_of(&self.named_in(request)?, region)
+    }
+
+    /// How `request` ADDRESSES that resource: the member's own value, and the default
+    /// the invoked operation documents for a request that OMITS it.
+    ///
+    /// A member the request carries as something other than text addresses no resource
+    /// of any name, and the default does not stand in for it: the request named
+    /// something, so what to answer for it is the invoked operation's own refusal
+    /// rather than an access request over a resource nothing named.
+    ///
+    /// Public because the calls a run-a-job pattern makes for ITSELF are over the
+    /// resource the STARTING request named, which those calls do not carry
+    /// ([`RunAJob::acts_on_named`]).
+    pub fn named_in(&self, request: &Value) -> Option<String> {
+        match [MemberCase::Pascal, MemberCase::LowerCamel]
             .into_iter()
             .find_map(|case| request.get(case.spell(self.member)))
-            .and_then(Value::as_str)?;
-        self.named.arn_of(named, region)
+        {
+            Some(named) => named.as_str().map(str::to_string),
+            None => self.default.map(str::to_string),
+        }
     }
 }
 
@@ -1680,10 +1780,7 @@ pub fn access_request(call: &Call, request: &Value, region: &str) -> Option<(Str
     let resource = targets.resource_of(&call.operation_input(request), region)?;
     // The action is the invoked service's namespace and the operation's own name,
     // unless the entry states the permission that operation PUBLISHES instead.
-    let action = targets.action.map_or_else(
-        || format!("{}:{}", call.api.namespace, call.operation),
-        str::to_string,
-    );
+    let action = targets.action.map_or_else(|| call.action(), str::to_string);
     Some((action, resource))
 }
 
@@ -1823,6 +1920,29 @@ pub struct RunAJob {
     /// rather than of the run the identifier names. Named in the integration's own
     /// PascalCase, and empty for a job its identifier names on its own.
     pub names_job_with: &'static [&'static str],
+    /// Where the resource the pattern's OWN calls are taken on is named, for the
+    /// access request each is subject to ([`JobTarget`]); `None` for an integration
+    /// whose target resource is not stated, whose calls are then made as before.
+    pub acts_on: Option<JobTarget>,
+}
+
+/// Where the resource the calls that REPORT and STOP a job are taken on is named.
+///
+/// Those calls are made as the execution role too, so each is subject to an access
+/// request — and the resource that request is over is not in the call's own request:
+/// a reporting operation names the JOB by its identifier, while IAM takes the action
+/// on the resource the job belongs to. Which resource that is, is the integration's
+/// own fact, so it is stated per entry.
+#[derive(Debug, Clone, Copy)]
+pub enum JobTarget {
+    /// The job's own identifier IS the resource's ARN, so the pattern's calls are
+    /// taken on the thing the starting call minted (a nested execution).
+    Identifier,
+    /// The job belongs to the resource the STARTING integration acts on, named by the
+    /// `<namespace>:<action>` of that integration: its [`TARGET_RESOURCES`] entry says
+    /// which member of the starting request names it and how (a query's workgroup, a
+    /// run's job).
+    Started(&'static str),
 }
 
 /// The members of the starting request that name the job, beside its own identifier
@@ -1851,6 +1971,37 @@ impl RunAJob {
             }
         }
         naming
+    }
+
+    /// How the request that STARTED the job addresses the resource the pattern's own
+    /// calls are taken on ([`JobTarget`]), and `None` for an integration that states
+    /// none or a request that named none.
+    ///
+    /// Read where the job is STARTED, because that request is where the resource is
+    /// named: the calls that report and stop the job carry the job's identifier
+    /// instead, so what they are authorized over is carried with the parked job
+    /// ([`crate::state::JobTask::acts_on`]).
+    pub fn acts_on_named(&self, request: &Value, job_id: &str) -> Option<String> {
+        match self.acts_on? {
+            JobTarget::Identifier => Some(job_id.to_string()),
+            JobTarget::Started(integration) => TARGET_RESOURCES
+                .iter()
+                .find(|entry| entry.integration == integration)?
+                .named_in(request),
+        }
+    }
+
+    /// The ARN of that resource, as addressed in the Region `region` the pattern's
+    /// calls are made in ([`TargetNaming::arn_of`]).
+    pub fn acts_on_arn(&self, named: &str, region: &str) -> Option<String> {
+        match self.acts_on? {
+            JobTarget::Identifier => TargetNaming::Arn.arn_of(named, region),
+            JobTarget::Started(integration) => TARGET_RESOURCES
+                .iter()
+                .find(|entry| entry.integration == integration)?
+                .named
+                .arn_of(named, region),
+        }
     }
 
     /// Whether `status` is one the job ENDED on, and whether it ended having done its
@@ -1990,6 +2141,9 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         // `DescribeExecution` and `StopExecution` each name the execution by its own
         // ARN alone.
         names_job_with: &[],
+        // Both of those calls are taken on the EXECUTION the start minted, whose ARN
+        // is the identifier it answered.
+        acts_on: Some(JobTarget::Identifier),
     },
     // An Athena query: `StartQueryExecution` answers `QueryExecutionId`,
     // `GetQueryExecution` reports `QueryExecution.Status.State`
@@ -2018,6 +2172,9 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         // `GetQueryExecution` and `StopQueryExecution` each name the query by its own
         // id alone.
         names_job_with: &[],
+        // Both of those calls are taken on the WORKGROUP the query runs in, which the
+        // starting request named ([`TARGET_RESOURCES`]).
+        acts_on: Some(JobTarget::Started("athena:startQueryExecution")),
     },
     // A Glue job run: `StartJobRun` answers `JobRunId`, `GetJobRun` reports
     // `JobRun.JobRunState` (`JobRunState`: STARTING, RUNNING, STOPPING, STOPPED,
@@ -2050,6 +2207,9 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         stop_member: "JobRunIds",
         stops_in_batch: true,
         names_job_with: &["JobName"],
+        // Both of those calls are taken on the JOB the run belongs to, which the
+        // starting request named ([`TARGET_RESOURCES`]).
+        acts_on: Some(JobTarget::Started("glue:startJobRun")),
     },
 ];
 

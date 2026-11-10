@@ -1278,6 +1278,10 @@ pub struct ParkedJob {
     /// integration whose reporting and stopping calls do not name it by its
     /// identifier alone ([`super::integration::RunAJob::naming`]).
     pub naming: super::integration::JobNaming,
+    /// How that request ADDRESSED the resource the pattern's own calls are taken on,
+    /// which is what those calls are authorized over
+    /// ([`super::integration::RunAJob::acts_on_named`]).
+    pub acts_on: Option<String>,
     /// The document that call answered, which is what the task reports as its
     /// SUBMISSION.
     pub submitted: Value,

@@ -1407,6 +1407,12 @@ pub struct JobTask {
     /// that identifier does not name on its own
     /// ([`integration::RunAJob::names_job_with`]).
     pub naming: integration::JobNaming,
+    /// The ARN of the resource the job BELONGS to, which the calls that report and
+    /// stop it are authorized over ([`integration::RunAJob::acts_on_arn`]): those
+    /// calls name the job by its own identifier, so what they are taken ON is carried
+    /// here, read from the request that started it. `None` for an integration whose
+    /// target resource is not stated, or a starting request that named none.
+    pub acts_on: Option<String>,
     /// The Region the calls that report and stop the job are made in: the
     /// execution's own, which is the Region its state machine's ARN names.
     pub region: String,
@@ -1481,6 +1487,10 @@ pub struct PlannedJob {
     pub parsed_output: bool,
     pub job_id: String,
     pub naming: integration::JobNaming,
+    /// How the starting request ADDRESSED the resource the job belongs to; see
+    /// [`JobTask::acts_on`], whose ARN is minted from it once the Region the job's own
+    /// calls are made in is known.
+    pub acts_on: Option<String>,
     pub parked_at: SystemTime,
     pub timeout_seconds: Option<u64>,
     /// See [`JobTask::frames`].
@@ -1497,6 +1507,14 @@ impl PlannedJob {
             + self.state_input.len()
             + self.job_id.len()
             + naming_bytes(&self.naming)
+            // The ARN of the resource the job's own calls are taken on, for a job that
+            // names one, bounded by what any ARN this emulator mints is
+            // ([`JobTask::acts_on`], which is held to that bound where it is minted).
+            + if self.acts_on.is_some() {
+                MAX_ARN_BYTES
+            } else {
+                0
+            }
             + frames_bytes(&self.frames)
             // The two history events resolving the job appends to the execution
             // waiting at it: the one that reports the job's outcome and the one the

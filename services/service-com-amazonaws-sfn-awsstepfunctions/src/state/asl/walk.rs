@@ -2054,6 +2054,11 @@ impl Interpreter<'_> {
                         // the request that STARTED it beside the identifier that call
                         // answered.
                         naming: job.naming(&request),
+                        // And the resource the job BELONGS to, as that request
+                        // addressed it: the calls that report and stop the job are
+                        // authorized over it, and carry the job's identifier rather
+                        // than naming it themselves.
+                        acts_on: job.acts_on_named(&request, &job_id),
                         submitted: result.clone(),
                         at,
                         timeout_seconds: within.map(|within| within.as_secs()),

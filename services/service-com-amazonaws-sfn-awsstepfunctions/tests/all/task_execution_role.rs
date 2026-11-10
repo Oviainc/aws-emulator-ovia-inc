@@ -21,6 +21,10 @@
 //! `Resource` asks for (the fire-and-forget `states:startExecution` and the run-a-job
 //! `states:startExecution.sync:2`), and the TARGET the request names.
 //!
+//! The run-a-job pattern makes two further calls of its own — it REPORTS the job it
+//! started and STOPS it — as the same role, so the role here grants those two actions
+//! and every row varies only in what the policies say about STARTING the child.
+//!
 //! A wildcard grant lets the call be made, which the last test pins. Whether the role
 //! can be ASSUMED at all is the question before this one, and
 //! `tests/all/execution_role_assumption.rs` holds it.
@@ -290,6 +294,17 @@ fn statement(effect: &str, resource: &str) -> Value {
     })
 }
 
+/// The statement the run-a-job (`.sync`) pattern's OWN calls need: the pattern reports
+/// the child execution it started and stops it, both as the execution role, so a role
+/// that runs the pattern grants those two actions over the executions it starts.
+fn poll_statement() -> Value {
+    json!({
+        "Effect": "Allow",
+        "Action": ["states:DescribeExecution", "states:StopExecution"],
+        "Resource": "*"
+    })
+}
+
 /// Which child a row targets, the `Resource` its `Task` names, and what the role's
 /// policy says about starting it.
 type AuthorizationRow = (&'static str, usize, &'static str, bool);
@@ -326,6 +341,12 @@ async fn a_tasks_call_is_made_only_when_the_execution_role_allows_it() {
             statement("Allow", &children[0]),
             statement("Allow", &children[2]),
             statement("Deny", &children[2]),
+            // The run-a-job rows poll the child execution their task started, which
+            // is a call of the execution's own: the pattern reports the job through
+            // `DescribeExecution` and stops it through `StopExecution`, so a role that
+            // may run the pattern at all carries both. What each row below varies is
+            // the grant on starting the child, which is the rule under test.
+            poll_statement(),
         ]
     });
     let role_arn = chain.role("StepFunctionsRole", &policy).await;

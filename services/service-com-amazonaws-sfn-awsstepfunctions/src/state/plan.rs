@@ -768,6 +768,7 @@ fn planned_job(parked: asl::ParkedJob, start: SystemTime) -> PlannedJob {
         parsed_output: parked.parsed_output,
         job_id: parked.job_id,
         naming: parked.naming,
+        acts_on: parked.acts_on,
         parked_at: after(start, parked.at),
         timeout_seconds: parked.timeout_seconds,
         frames: parked.frames,

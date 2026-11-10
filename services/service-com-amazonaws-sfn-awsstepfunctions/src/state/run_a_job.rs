@@ -34,6 +34,14 @@
 //! ([`super::plan_job_reply`]), so the states after the task run, their own
 //! integration calls are made, and a second parked job is watched exactly as the first
 //! was.
+//!
+//! ## Who it polls as
+//!
+//! The execution role, as the starting call was made as: the reporting call is the
+//! execution's own call, so the policies in force on that role decide whether it is
+//! made ([`super::task_authorization::job_report_denial`]). A role that may not report
+//! the job leaves nothing to read about it, and the task was already submitted, so it
+//! fails with that refusal rather than with a status nothing answered.
 
 use std::sync::Arc;
 
@@ -85,10 +93,19 @@ async fn poll<Eng: Send + Sync + 'static>(
         // The job this execution is parked at, read under ONE lock that settles
         // first: a job whose execution was stopped, or whose task ran out of its
         // time, is gone by the time it is read, and there is then nothing to poll.
-        let task = {
+        // The execution role is read with it, because the call that reports the job is
+        // made as that role — the role of the configuration this execution RAN, read
+        // at the moment of the call, exactly as the starting call's was.
+        let (task, role_arn) = {
             let mut store = state.lock();
             store.settle(super::now());
-            store.job_tasks.get(execution_arn).cloned()
+            let task = store.job_tasks.get(execution_arn).cloned();
+            let role_arn = store
+                .executions
+                .get(execution_arn)
+                .and_then(|execution| store.state_machines.get(&execution.state_machine_arn))
+                .map_or_else(String::new, |machine| machine.role_arn.clone());
+            (task, role_arn)
         };
         let Some(task) = task else {
             return;
@@ -96,6 +113,30 @@ async fn poll<Eng: Send + Sync + 'static>(
 
         let (call, request) =
             integration::describing(task.api, task.job, &task.job_id, &task.naming);
+        // The poll is one of the execution's own calls, so the policies in force on
+        // its role decide whether it is made: a role that may not report the job
+        // cannot be told what the job did, and the task it belongs to has already been
+        // submitted — so the task fails with that refusal instead of with a status
+        // nothing answered. Decided with no store of this service locked.
+        let denied = task
+            .acts_on
+            .as_deref()
+            .and_then(|resource| {
+                super::task_authorization::job_report_denial(
+                    &**engine,
+                    &role_arn,
+                    &call,
+                    resource,
+                )
+            })
+            .map(|refused| asl::Failure {
+                error: Some(refused.error),
+                cause: Some(refused.cause),
+            });
+        if let Some(refusal) = denied {
+            resolve(engine, callback, depth, execution_arn, &task, Err(refusal)).await;
+            continue;
+        }
         let reported = integration::call_api(callback, &task.region, &call, &request).await;
         let outcome = match reported {
             Ok(report) => match task.job.outcome_of(&report, task.parsed_output) {

@@ -839,6 +839,18 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             parsed_output: planned.parsed_output,
             job_id: planned.job_id,
             naming: planned.naming,
+            // The resource the calls that report and stop the job are taken on, in the
+            // Region those calls are made in: a resource the starting request named by
+            // NAME lives in that Region, so its ARN is minted here rather than where
+            // the walk read the name. A minted ARN longer than any ARN this emulator
+            // mints ([`MAX_ARN_BYTES`], which the store is admitted against) names no
+            // resource of this account, so no access request is formed over it and the
+            // invoked operation answers for such a request itself.
+            acts_on: planned
+                .acts_on
+                .as_deref()
+                .and_then(|named| planned.job.acts_on_arn(named, region))
+                .filter(|arn| arn.len() <= MAX_ARN_BYTES),
             region: region.to_string(),
             parked_at: planned.parked_at,
             timeout_seconds: planned.timeout_seconds,
@@ -851,6 +863,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             + task.state_input.len()
             + task.job_id.len()
             + naming_bytes(&task.naming)
+            + task.acts_on.as_ref().map_or(0, String::len)
             + frames_bytes(&task.frames)
             + task.region.len();
         self.retained_bytes = self.retained_bytes.saturating_add(task.retained_bytes);

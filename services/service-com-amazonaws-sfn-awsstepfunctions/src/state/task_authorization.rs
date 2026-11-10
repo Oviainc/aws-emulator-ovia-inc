@@ -43,6 +43,10 @@
 //! under — and the metadata tail names the service, the status and the error code the
 //! answer came back with, and nothing it did not carry.
 //!
+//! A run-a-job (`.sync`) task's pattern makes a further call of its own, the one that
+//! REPORTS the job, and it is the execution's call too: [`job_report_denial`] decides
+//! it against the same documents, over the resource the job belongs to.
+//!
 //! Nothing is refused on evidence this emulator does not have. Each of these shows
 //! nothing about the role and lets the call be made: an engine carrying no IAM store,
 //! a `roleArn` the store holds no role for (it may belong to another account), a role
@@ -308,6 +312,43 @@ pub fn role_denial<Eng: Send + Sync + 'static>(
     let iam = iam_state(engine)?;
     let denial = refusal(&iam.lock(), role_arn, action, resource, service);
     denial
+}
+
+/// What the task a run-a-job (`.sync`) pattern is parked at fails with when the
+/// execution role `role_arn` may not make `call` — the call that REPORTS its job — on
+/// `resource`, the ARN of the resource that job belongs to; `None` when nothing of the
+/// kind can be shown (see the module docs).
+///
+/// The pattern's own calls are the execution's too: Step Functions polls the job acting
+/// as the same role the starting call was made as, so a role whose policies do not
+/// allow the reporting call makes that poll not happen. The task was already submitted
+/// and the job is really running, so what the failure says is not a status — nothing
+/// reported one — but that the task's own work failed: ASL's
+/// [`TASK_FAILED_ERROR`], carrying the refusal the invoked service answers an
+/// unauthorized call with, exactly as the starting call's refusal carries it.
+///
+/// Call it with no store of this service locked: it takes the IAM store's own.
+pub fn job_report_denial<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    role_arn: &str,
+    call: &Call,
+    resource: &str,
+) -> Option<Failed> {
+    if role_arn.is_empty() {
+        return None;
+    }
+    let iam = iam_state(engine)?;
+    let cause = refusal(
+        &iam.lock(),
+        role_arn,
+        &call.action(),
+        resource,
+        call.api.sdk_client,
+    )?;
+    Some(Failed {
+        error: TASK_FAILED_ERROR.to_string(),
+        cause,
+    })
 }
 
 /// Whether this account HOLDS a role under `role_arn`, which is what makes a decision

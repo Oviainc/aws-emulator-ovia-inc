@@ -167,6 +167,8 @@ mod response_request_id;
 mod role_log_and_key_authorization;
 #[path = "all/run_a_job_pattern_calls.rs"]
 mod run_a_job_pattern_calls;
+#[path = "all/run_a_job_target_authorization.rs"]
+mod run_a_job_target_authorization;
 #[path = "all/running_execution_history.rs"]
 mod running_execution_history;
 #[path = "all/s3_sdk_task_integration.rs"]
