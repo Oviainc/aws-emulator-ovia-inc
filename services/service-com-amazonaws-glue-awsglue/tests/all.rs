@@ -235,6 +235,8 @@ mod lake_formation_authorization;
 mod metadata_catalog_reads;
 #[path = "all/ml_task_run_reads.rs"]
 mod ml_task_run_reads;
+#[path = "all/ml_task_run_timeout.rs"]
+mod ml_task_run_timeout;
 #[path = "all/ml_task_runs.rs"]
 mod ml_task_runs;
 #[path = "all/ml_transform_deletion.rs"]

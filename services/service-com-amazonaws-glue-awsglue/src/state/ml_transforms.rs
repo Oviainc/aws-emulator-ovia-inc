@@ -207,8 +207,8 @@ pub struct MlTransformEntry {
     /// ([`JobEntry::runs`]): every operation that addresses a task run
     /// (`GetMLTaskRun`, `CancelMLTaskRun`) names the parent `TransformId` and then the
     /// `TaskRunId` the start minted, so a run of one transform is unreachable through
-    /// another. Kept in start order, so a listing that names no sort criteria still has
-    /// one deterministic order to page over, and bounded by
+    /// another. Kept in start order, so the history has one deterministic order to walk
+    /// whichever direction a listing reports it in, and bounded by
     /// [`MAX_TASK_RUNS_PER_TRANSFORM`].
     pub task_runs: Vec<MlTaskRunEntry>,
 }
@@ -432,9 +432,15 @@ impl MlTransformEntry {
     /// is for a job run: a run's next status was due at [`MlTaskRunEntry::settles_at`]
     /// whether or not anybody called, so materialising it on read reports the status the
     /// clock had already reached. It never moves a run because something was read.
+    ///
+    /// The budget every run of THIS transform is terminated at is the transform's own
+    /// `Timeout` ([`ml_task_run_budget`]), read here rather than copied onto each run, so a
+    /// transform whose timeout has been tuned bounds the runs already in flight by the
+    /// timeout it carries now.
     pub fn settle_due_task_runs(&mut self, now: SystemTime) {
+        let budget = ml_task_run_budget(self.timeout);
         for run in &mut self.task_runs {
-            run.settle_if_due(now);
+            run.settle_if_due(now, budget);
         }
     }
 
@@ -482,7 +488,7 @@ impl MlTransformEntry {
             .map(|run| (run.ordering_key(column), run))
             .collect();
         ordered.sort_by(|left, right| left.0.cmp(&right.0));
-        if sort.is_some_and(|criteria| criteria.sort_direction == SORT_DIRECTION_DESCENDING) {
+        if task_runs_sorted_descending(sort) {
             // The ordering key is unique per run, so reversing the ascending order is
             // exactly the descending one.
             ordered.reverse();
@@ -576,9 +582,10 @@ pub const ML_TASK_TYPE_LABELING_SET_GENERATION: &str = "LABELING_SET_GENERATION"
 /// TIMEOUT`), the one that says the run has been accepted and no task has begun yet.
 pub const ML_TASK_RUN_STATUS_STARTING: &str = "STARTING";
 
-/// See [`ML_TASK_RUN_STATUS_STARTING`]: the status a run that did not run comes to rest
-/// in.
-pub const ML_TASK_RUN_STATUS_FAILED: &str = "FAILED";
+/// See [`ML_TASK_RUN_STATUS_STARTING`]: the terminal status of a run that was "terminated
+/// and enters `TIMEOUT` status" (`CreateMLTransform$Timeout`) — the end of a run that spent
+/// the resource budget its transform allows without finishing its task.
+pub const ML_TASK_RUN_STATUS_TIMEOUT: &str = "TIMEOUT";
 
 /// How long a task run stays in the status the call that started it put it in before the
 /// clock owes it the next one.
@@ -588,18 +595,43 @@ pub const ML_TASK_RUN_STATUS_FAILED: &str = "FAILED";
 /// ([`JOB_RUN_SETTLES_AFTER`]) — deliberately not zero, so a caller that lists the runs
 /// straight after a start still observes the run in flight. The due instant is stored on
 /// the run and materialised by whichever later call reads it; nothing sleeps.
+///
+/// It is also the CEILING on how long a run is reported in flight here: the budget
+/// `Timeout` grants a task run is at least a minute and 48 hours by default
+/// ([`ml_task_run_budget`]), and a caller cannot be made to wait that out, so the span a run
+/// is terminated after is the shorter of the two — the same clamp a job run's script is
+/// bounded by ([`job_script_budget`]).
 pub const ML_TASK_RUN_SETTLES_AFTER: Duration = JOB_RUN_SETTLES_AFTER;
+
+/// The resource budget ONE task run of a transform whose `Timeout` is `timeout_minutes`
+/// may spend before it is terminated: "the maximum time that a task run for this transform
+/// can consume resources before it is terminated and enters `TIMEOUT` status. The default
+/// is 2,880 minutes (48 hours)" (`CreateMLTransform$Timeout`), as a duration.
+///
+/// Read through the one conversion this service holds a timeout in minutes with
+/// ([`timeout_minutes_as_duration`]), so a stored value below the range the model allows
+/// (`Timeout`'s `@range(min: 1)`) bounds nothing. This member publishes no MAXIMUM, so
+/// nothing caps it here — what keeps a caller from waiting out a 48-hour budget is the span
+/// the clock owes the transition at ([`ML_TASK_RUN_SETTLES_AFTER`]).
+#[must_use]
+pub fn ml_task_run_budget(timeout_minutes: i32) -> Duration {
+    timeout_minutes_as_duration(timeout_minutes, i32::MAX)
+}
 
 /// `TaskRun$ErrorString` for the terminal status the clock owes every machine learning
 /// task run.
 ///
 /// This emulator is the Glue control plane: it records a task run faithfully, but it runs
-/// no machine learning task over the transform's data, so a run can never reach
-/// `SUCCEEDED` — it comes to rest in the modelled failure status carrying a reason that
-/// says exactly that, rather than reporting a labelling set or a metric nothing produced.
-pub const ML_TASK_RUN_NOT_EXECUTED_MESSAGE: &str =
+/// no machine learning task over the transform's data, so no run ever completes work of its
+/// own — it consumes the resource budget its transform's `Timeout` grants
+/// ([`ml_task_run_budget`]) and is terminated there, in the status that budget's expiry puts
+/// a run in ([`ML_TASK_RUN_STATUS_TIMEOUT`]), rather than reporting a labelling set or a
+/// metric nothing produced. The modelled `FAILED` is NOT that end: it is where a run Glue
+/// rejects on its own input comes to rest, which a client answers by fixing the input rather
+/// than by retrying or raising the transform's timeout.
+pub const ML_TASK_RUN_TIMED_OUT_MESSAGE: &str =
     "This emulator records machine learning task runs but runs no machine learning task, \
-     so the task run ended without running.";
+     so the task run consumed its transform's timeout without finishing and was terminated.";
 
 /// The `TaskRunSortColumnType` that orders a transform's task runs by their task type. One
 /// of the modelled values the generated
@@ -610,6 +642,22 @@ pub const ML_TASK_RUN_SORT_COLUMN_TASK_RUN_TYPE: &str = "TASK_RUN_TYPE";
 pub const ML_TASK_RUN_SORT_COLUMN_STATUS: &str = "STATUS";
 /// See [`ML_TASK_RUN_SORT_COLUMN_TASK_RUN_TYPE`]: orders by the instant each run started.
 pub const ML_TASK_RUN_SORT_COLUMN_STARTED: &str = "STARTED";
+
+/// Whether a listing of one transform's task runs walks its ordering key backwards.
+///
+/// A `Sort` the request carries decides it, in the direction that criteria names. A request
+/// that carries NO sort criteria gets the run history newest first — "a list of historic
+/// runs" (`GetMLTaskRuns`), ordered over the instant each run started
+/// ([`MlTaskRunEntry::ordering_key`]) so the run started most recently is the first element
+/// of the first page, which is the order every other run history of this service is served
+/// in ([`history_page_cursor`]).
+///
+/// ONE reading, shared by the listing's order and by the continuation token that resumes it,
+/// so the cursor cannot be compared in a direction the page was not ordered in.
+#[must_use]
+pub fn task_runs_sorted_descending(sort: Option<&TaskRunSortCriteria>) -> bool {
+    sort.is_none_or(|criteria| criteria.sort_direction == SORT_DIRECTION_DESCENDING)
+}
 
 /// How many machine learning task run ids this process has minted. A nonce source for
 /// [`new_ml_task_run_id`], exactly as [`MINTED_JOB_RUN_IDS`] is for a job run id.
@@ -708,18 +756,30 @@ impl MlTaskRunEntry {
     /// Move this run into the status the clock owed it at `now`, if it owed one.
     ///
     /// The run was due to leave [`ML_TASK_RUN_STATUS_STARTING`] at [`Self::settles_at`]
-    /// whether or not anybody called, and the instants recorded are that DUE instant, not
-    /// the instant somebody read it — so two reads of a settled run report the same run.
-    pub fn settle_if_due(&mut self, now: SystemTime) {
-        let Some(due) = self.settles_at else {
+    /// whether or not anybody called, and `budget` is the resource budget its transform's
+    /// `Timeout` grants it ([`ml_task_run_budget`]), which terminates a run still consuming
+    /// resources when it elapses — so the run ends at whichever of the two comes FIRST, and
+    /// no run is ever reported in flight past its own budget. The instants recorded are that
+    /// DUE instant, not the instant somebody read it, so two reads of a settled run report
+    /// the same run.
+    ///
+    /// Nothing here performs the task the run names, so a run never finishes work of its
+    /// own: the end it reaches is the one its budget running out puts it in
+    /// ([`ML_TASK_RUN_STATUS_TIMEOUT`]).
+    pub fn settle_if_due(&mut self, now: SystemTime, budget: Duration) {
+        let Some(owed) = self.settles_at else {
             return;
         };
+        let due = self
+            .started_on
+            .checked_add(budget)
+            .map_or(owed, |terminated_at| owed.min(terminated_at));
         if due > now {
             return;
         }
         self.settles_at = None;
-        self.status = ML_TASK_RUN_STATUS_FAILED.to_string();
-        self.error_string = Some(ML_TASK_RUN_NOT_EXECUTED_MESSAGE.to_string());
+        self.status = ML_TASK_RUN_STATUS_TIMEOUT.to_string();
+        self.error_string = Some(ML_TASK_RUN_TIMED_OUT_MESSAGE.to_string());
         self.completed_on = Some(due);
         self.last_modified_on = due;
     }
@@ -782,12 +842,12 @@ impl MlTaskRunEntry {
     /// renders it: the sorted value, then the run's own id so that two runs sharing that
     /// value still have one total order to page over.
     ///
-    /// `None` is the order a request that names no sort criteria gets, which is the same
-    /// key [`ML_TASK_RUN_SORT_COLUMN_STARTED`] names: the operation documents no default
-    /// order for "a list of historic runs" (`GetMLTaskRuns`), so the listing falls back on
-    /// the order the runs were started in rather than on however the store happens to hold
-    /// them. A column outside the modelled list cannot reach here — the request layer
-    /// validates `Sort$Column` against it — and is ordered the same way.
+    /// `None` is the key a request that names no sort criteria orders by, which is the same
+    /// key [`ML_TASK_RUN_SORT_COLUMN_STARTED`] names: "a list of historic runs"
+    /// (`GetMLTaskRuns`) is ordered over the instant each run started, walked newest first
+    /// absent criteria of the request's own ([`task_runs_sorted_descending`]). A column
+    /// outside the modelled list cannot reach here — the request layer validates
+    /// `Sort$Column` against it — and is ordered the same way.
     pub fn ordering_key(&self, column: Option<&str>) -> String {
         let sorted = match column {
             Some(ML_TASK_RUN_SORT_COLUMN_TASK_RUN_TYPE) => self.task_type().to_string(),

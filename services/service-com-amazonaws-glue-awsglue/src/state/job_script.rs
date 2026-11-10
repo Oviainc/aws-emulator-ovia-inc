@@ -380,12 +380,13 @@ pub fn job_script_budget(timeout_minutes: i32) -> python::Budget {
     }
 }
 
-/// The run's own `Timeout` as a duration: "The `JobRun` timeout in minutes", held inside the
-/// range the model allows for it (`Timeout`'s `@range(min: 1)` and the documented ceiling of
-/// [`MAX_TIMEOUT_MINUTES`]) so a stored value outside that range bounds nothing.
+/// The run's own `Timeout` as a duration: "The `JobRun` timeout in minutes", through the one
+/// conversion this service holds a timeout in minutes with
+/// ([`timeout_minutes_as_duration`]), inside the range the model allows for it (`Timeout`'s
+/// `@range(min: 1)` and the documented ceiling of [`MAX_TIMEOUT_MINUTES`]) so a stored value
+/// outside that range bounds nothing.
 fn configured_timeout(timeout_minutes: i32) -> Duration {
-    let minutes = timeout_minutes.clamp(1, MAX_TIMEOUT_MINUTES);
-    Duration::from_secs(u64::from(minutes.unsigned_abs()) * 60)
+    timeout_minutes_as_duration(timeout_minutes, MAX_TIMEOUT_MINUTES)
 }
 
 /// Perform the script of every run of `job_names` that is still awaiting one, and record

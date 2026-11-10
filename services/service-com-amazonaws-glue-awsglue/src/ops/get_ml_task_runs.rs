@@ -8,7 +8,8 @@
 //! parent transform's TransformID and other optional parameters… This operation returns a
 //! list of historic runs and must be paginated." The `Filter` criteria narrow the listing
 //! to the runs that satisfy every criterion they name, the `Sort` criteria order it by one
-//! of the run's own properties, and each element is the whole stored run, so a client that
+//! of the run's own properties, and absent those criteria the history comes back newest
+//! first, and each element is the whole stored run, so a client that
 //! works from the listing is never less informed than one that re-reads each run.
 //!
 //! This is the ONLY file to touch for this operation.
@@ -210,10 +211,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which runs the filter admits and what order they come in is the transform's own
         // selection, so every listing of its runs agrees about both.
         let ordered = transform.task_runs_in_order(input.filter.as_ref(), input.sort.as_ref());
-        let descending = input
-            .sort
-            .as_ref()
-            .is_some_and(|sort| sort.sort_direction == crate::state::SORT_DIRECTION_DESCENDING);
+        // Which direction that order runs in is answered ONCE, by the same reading the
+        // selection itself used, so the cursor below is never compared in a direction the
+        // page was not ordered in: a request's own `Sort` decides it, and a request carrying
+        // none gets "a list of historic runs" newest first.
+        let descending = crate::state::task_runs_sorted_descending(input.sort.as_ref());
 
         // The token is the ordering key of the last run of the previous page, so this page
         // resumes at the first run ordered strictly after it — which stays correct across

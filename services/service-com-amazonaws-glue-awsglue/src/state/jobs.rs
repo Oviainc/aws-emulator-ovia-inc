@@ -174,6 +174,21 @@ pub fn default_timeout_minutes(glue_version: &str) -> i32 {
     }
 }
 
+/// A stored `Timeout` in MINUTES as a duration, held inside the range the member it was
+/// stored from allows: at least one minute (a Glue `Timeout` member's `@range(min: 1)`) and
+/// at most `ceiling_minutes`, so a stored value outside that range bounds nothing.
+///
+/// ONE conversion, shared by every budget this service holds in minutes (a job run's script
+/// budget, [`job_script_budget`], and a machine learning task run's resource budget,
+/// [`ml_task_run_budget`]), so two callers cannot disagree about what a minute is or about
+/// what a value outside the range means. A member the model publishes no maximum for passes
+/// `i32::MAX` as the ceiling.
+#[must_use]
+pub fn timeout_minutes_as_duration(timeout_minutes: i32, ceiling_minutes: i32) -> Duration {
+    let minutes = timeout_minutes.clamp(1, ceiling_minutes.max(1));
+    Duration::from_secs(u64::from(minutes.unsigned_abs()) * 60)
+}
+
 /// A stored job definition, plus the runs `StartJobRun` has started of it.
 ///
 /// Every member of the modelled `Job` shape a create can fill is held here, so a later

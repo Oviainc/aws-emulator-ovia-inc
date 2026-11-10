@@ -31,7 +31,7 @@ use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    ML_TASK_RUN_NOT_EXECUTED_MESSAGE, ML_TASK_RUN_STATUS_FAILED, ML_TASK_RUN_STATUS_STARTING,
+    ML_TASK_RUN_STATUS_STARTING, ML_TASK_RUN_STATUS_TIMEOUT, ML_TASK_RUN_TIMED_OUT_MESSAGE,
     ML_TASK_TYPE_LABELING_SET_GENERATION,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -200,7 +200,7 @@ async fn the_status_a_read_reports_is_the_one_the_clock_has_reached() {
     //  whether the run has finished by then)
     let rows: &[StatusRow<'_>] = &[
         ("the owed transition is still ahead", far_future, ML_TASK_RUN_STATUS_STARTING, false),
-        ("the owed transition is already due", already_past, ML_TASK_RUN_STATUS_FAILED, true),
+        ("the owed transition is already due", already_past, ML_TASK_RUN_STATUS_TIMEOUT, true),
     ];
 
     for (case, due, expected_status, finished) in rows {
@@ -226,13 +226,14 @@ async fn the_status_a_read_reports_is_the_one_the_clock_has_reached() {
             );
             assert_eq!(
                 read["ErrorString"].as_str(),
-                Some(ML_TASK_RUN_NOT_EXECUTED_MESSAGE),
-                "case {case:?}: a failed run must report why it failed, got {read}"
+                Some(ML_TASK_RUN_TIMED_OUT_MESSAGE),
+                "case {case:?}: a terminated run must report why it ended, got {read}"
             );
         } else {
             assert!(
                 read.get("CompletedOn").is_none() && read.get("ErrorString").is_none(),
-                "case {case:?}: a run in flight has neither finished nor failed, got {read}"
+                "case {case:?}: a run in flight has neither finished nor been terminated, got \
+                 {read}"
             );
         }
 

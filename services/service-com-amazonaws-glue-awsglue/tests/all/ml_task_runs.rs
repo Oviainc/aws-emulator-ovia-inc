@@ -7,7 +7,8 @@
 //! sortable, filterable list of machine learning task runs… with their parent transform's
 //! TransformID" — it reports every task run started of the transform the request
 //! addresses and no other transform's, narrowed to the runs satisfying EVERY criterion the
-//! `Filter` names, ordered by the property and direction the `Sort` names, one
+//! `Filter` names, ordered by the property and direction the `Sort` names and, absent a
+//! `Sort` of the request's own, newest-started first, one
 //! `MaxResults`-sized page at a time with a `NextToken` that resumes that same order. Each
 //! element is the whole stored run: the minted `TaskRunId`, the transform it belongs to,
 //! the properties of the task its start described, the status it stands in and the
@@ -42,8 +43,9 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    ComAmazonawsGlueAwsglueState, ML_TASK_RUN_NOT_EXECUTED_MESSAGE, ML_TASK_RUN_SETTLES_AFTER,
-    ML_TASK_RUN_STATUS_FAILED, ML_TASK_RUN_STATUS_STARTING, ML_TASK_TYPE_LABELING_SET_GENERATION,
+    ComAmazonawsGlueAwsglueState, ML_TASK_RUN_SETTLES_AFTER, ML_TASK_RUN_STATUS_STARTING,
+    ML_TASK_RUN_STATUS_TIMEOUT, ML_TASK_RUN_TIMED_OUT_MESSAGE,
+    ML_TASK_TYPE_LABELING_SET_GENERATION,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -130,6 +132,14 @@ async fn start_runs(router: &MultiServiceRouter, transform_id: &str, count: usiz
         );
     }
     ids
+}
+
+/// The ids `started` holds, newest-started first: the order a listing that names no `Sort`
+/// of its own reports a transform's run history in.
+pub(crate) fn newest_first(started: &[String]) -> Vec<String> {
+    let mut order = started.to_vec();
+    order.reverse();
+    order
 }
 
 /// List the task runs of `transform_id`, with whatever `extra` adds to the request.
@@ -249,16 +259,20 @@ async fn every_started_run_reads_back_in_its_transforms_listing() {
 
         let walked = walk_pages(&router, case, &transform, *page_size, json!({})).await;
         assert_eq!(
-            &walked, &started,
-            "case {case:?}: the listing must report every started run, in the order they were \
-             started, got {walked:?} for {started:?}"
+            walked,
+            newest_first(&started),
+            "case {case:?}: the listing must report every started run, newest started first, \
+             got {walked:?} for {started:?}"
         );
 
         // Each element is the whole stored run: the properties its own start described,
         // the transform it belongs to and a status of the modelled enum.
         let single = list_runs(&router, &transform, json!({})).await;
         let entries = listed(&single);
-        for (index, run) in entries.iter().enumerate() {
+        for (position, run) in entries.iter().enumerate() {
+            // The listing runs newest first, so the element at `position` is the run
+            // started that many places from the END of the start order.
+            let index = count.saturating_sub(position + 1);
             assert_eq!(
                 run["TransformId"].as_str(),
                 Some(transform.as_str()),
@@ -289,6 +303,75 @@ async fn every_started_run_reads_back_in_its_transforms_listing() {
             *count,
             "case {case:?}: expected {count} runs in one page, got {single}"
         );
+    }
+}
+
+/// A request that names no `Sort` of its own gets the run history newest-started first, so
+/// the head of the first page is the run started most recently however many runs the
+/// transform holds and however small the page is; a `Sort` the request does carry decides
+/// the order instead, and the continuation token follows whichever order is in force.
+#[tokio::test]
+async fn the_run_history_reports_the_most_recently_started_run_first() {
+    // (case, how many runs are started, the page size asked for)
+    let rows: &[PageRow<'_>] = &[
+        ("one run, no page size", 1, None),
+        ("two runs, no page size", 2, None),
+        ("two runs, one per page", 2, Some(1)),
+        ("three runs, no page size", 3, None),
+        ("three runs, two per page", 3, Some(2)),
+        ("five runs, one per page", 5, Some(1)),
+    ];
+
+    for (case, count, page_size) in rows {
+        let router = emulator();
+        let transform = given_transform(&router, "recent-first", Value::Null).await;
+        let started = start_runs(&router, &transform, *count).await;
+        let expected = newest_first(&started);
+
+        // The head of the FIRST page is the run started last, whatever page size is asked
+        // for — which is what a client polling the head of the listing for the run it just
+        // started reads.
+        let mut head_body = json!({});
+        if let Some(size) = page_size {
+            head_body["MaxResults"] = json!(size);
+        }
+        let head = ids(&listed(&list_runs(&router, &transform, head_body).await));
+        assert_eq!(
+            head.first().map(String::as_str),
+            started.last().map(String::as_str),
+            "case {case:?}: the first element must be the run started most recently, got \
+             {head:?} for {started:?}"
+        );
+
+        // And the whole paged walk follows that same order, page after page.
+        let walked = walk_pages(&router, case, &transform, *page_size, json!({})).await;
+        assert_eq!(
+            walked, expected,
+            "case {case:?}: an unsorted listing must report the runs newest started first, got \
+             {walked:?} for {started:?}"
+        );
+
+        // A `Sort` the request carries decides the order instead: ascending over the
+        // instant a run started is the start order, and descending is the order a request
+        // naming no criteria already gets.
+        for (direction, wanted) in [
+            ("ASCENDING", started.clone()),
+            ("DESCENDING", expected.clone()),
+        ] {
+            let sorted = walk_pages(
+                &router,
+                case,
+                &transform,
+                *page_size,
+                json!({ "Sort": { "Column": "STARTED", "SortDirection": direction } }),
+            )
+            .await;
+            assert_eq!(
+                sorted, wanted,
+                "case {case:?}: sorted by STARTED {direction}, expected {wanted:?}, got \
+                 {sorted:?}"
+            );
+        }
     }
 }
 
@@ -397,7 +480,7 @@ async fn a_filter_narrows_the_listing_to_the_runs_it_admits() {
         let page = list_runs(&router, &transform, json!({ "Filter": filter })).await;
         let got = ids(&listed(&page));
         let expected: Vec<String> = if *admitted {
-            started.clone()
+            newest_first(&started)
         } else {
             Vec::new()
         };
@@ -434,11 +517,12 @@ async fn a_sort_criteria_orders_the_listing_and_its_pages() {
     // still starting. The listing that follows is what materialises it.
     set_run_due_instant(&engine, &started[1], already_past());
 
-    // Absent a sort, the listing falls back on the order the runs were started in.
+    // Absent a sort, the listing reports the run history newest started first.
     let unsorted = ids(&listed(&list_runs(&router, &transform, json!({})).await));
     assert_eq!(
-        unsorted, started,
-        "case {:?}: a listing with no sort criteria reports the runs in start order, got \
+        unsorted,
+        newest_first(&started),
+        "case {:?}: a listing with no sort criteria reports the runs newest started first, got \
          {unsorted:?}",
         "no sort criteria"
     );
@@ -498,21 +582,21 @@ async fn a_sort_criteria_orders_the_listing_and_its_pages() {
             );
         }
         if column == "STATUS" {
-            // The one run the clock has finished stands in `FAILED`, which orders before
-            // the `STARTING` the other two stand in, so ordering by status puts it first
-            // ascending and last descending. The two runs sharing a status are separated
+            // The one run the clock has terminated stands in `TIMEOUT`, which orders after
+            // the `STARTING` the other two stand in, so ordering by status puts it last
+            // ascending and first descending. The two runs sharing a status are separated
             // by the key's own tie-break, which is what makes the order total.
             assert_eq!(
-                ascending.first().map(String::as_str),
+                ascending.last().map(String::as_str),
                 Some(started[1].as_str()),
-                "case {:?}: the run standing in {ML_TASK_RUN_STATUS_FAILED} orders before \
+                "case {:?}: the run standing in {ML_TASK_RUN_STATUS_TIMEOUT} orders after \
                  the ones standing in {ML_TASK_RUN_STATUS_STARTING}, got {ascending:?}",
                 "sorted by STATUS ASCENDING"
             );
             assert_eq!(
-                descending.last().map(String::as_str),
+                descending.first().map(String::as_str),
                 Some(started[1].as_str()),
-                "case {:?}: the run standing in {ML_TASK_RUN_STATUS_FAILED} orders last \
+                "case {:?}: the run standing in {ML_TASK_RUN_STATUS_TIMEOUT} orders first \
                  descending, got {descending:?}",
                 "sorted by STATUS DESCENDING"
             );
@@ -565,8 +649,8 @@ async fn the_status_the_listing_reports_is_the_one_the_clock_owes() {
         "in flight"
     );
 
-    // Due: the status the clock owed it, carrying the reason nothing ran, and the instant
-    // it completed.
+    // Due: the status the clock owed it, carrying the reason nothing ran it to completion,
+    // and the instant it completed.
     set_due_instant(&engine, already_past());
     let settled = listed(&list_runs(&router, &transform, json!({})).await)
         .first()
@@ -574,13 +658,13 @@ async fn the_status_the_listing_reports_is_the_one_the_clock_owes() {
         .unwrap_or_else(|| panic!("the settled run must be listed"));
     assert_eq!(
         settled["Status"].as_str(),
-        Some(ML_TASK_RUN_STATUS_FAILED),
+        Some(ML_TASK_RUN_STATUS_TIMEOUT),
         "case {:?}: the status the clock owed must be reported, got {settled}",
         "owed status due"
     );
     assert_eq!(
         settled["ErrorString"].as_str(),
-        Some(ML_TASK_RUN_NOT_EXECUTED_MESSAGE),
+        Some(ML_TASK_RUN_TIMED_OUT_MESSAGE),
         "case {:?}: a run that ran no task says so, got {settled}",
         "owed status due"
     );
@@ -602,7 +686,7 @@ async fn the_status_the_listing_reports_is_the_one_the_clock_owes() {
     // The filter selects on the status the run really stands in, not the one it was
     // started in.
     for (case, status, admitted) in [
-        ("the status the clock moved it to", ML_TASK_RUN_STATUS_FAILED, true),
+        ("the status the clock moved it to", ML_TASK_RUN_STATUS_TIMEOUT, true),
         ("the status it was started in", ML_TASK_RUN_STATUS_STARTING, false),
     ] {
         let page = list_runs(&router, &transform, json!({ "Filter": { "Status": status } })).await;
@@ -631,7 +715,7 @@ async fn the_wall_clock_settles_a_run_nobody_listed() {
         .unwrap_or_else(|| panic!("run {run_id} must be listed"));
     assert_eq!(
         run["Status"].as_str(),
-        Some(ML_TASK_RUN_STATUS_FAILED),
+        Some(ML_TASK_RUN_STATUS_TIMEOUT),
         "case {:?}: the wall clock alone makes the owed status due, got {run}",
         "slept past the span"
     );
@@ -709,12 +793,12 @@ async fn each_transform_reports_only_its_own_runs() {
     let second_runs = start_runs(&router, &second, 1).await;
 
     for (case, transform, expected) in [
-        ("the transform with two runs", &first, &first_runs),
-        ("the transform with one run", &second, &second_runs),
+        ("the transform with two runs", &first, newest_first(&first_runs)),
+        ("the transform with one run", &second, newest_first(&second_runs)),
     ] {
         let page = list_runs(&router, transform, json!({})).await;
         assert_eq!(
-            &ids(&listed(&page)),
+            ids(&listed(&page)),
             expected,
             "case {case:?}: a transform reports its own runs and no sibling's, got {page}"
         );
