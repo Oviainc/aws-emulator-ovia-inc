@@ -184,6 +184,12 @@ pub(super) fn select_path(expression: &str, root: &Value) -> Result<Option<Value
             expression.len()
         )));
     }
+    // Parsing the path and following its segments is work the definition asked for, and
+    // a reference path identifies one node, so what it costs is the length of the path
+    // itself ([`work_meter`]).
+    if !spend_work(u64::try_from(expression.len()).unwrap_or(u64::MAX)) {
+        return Err(out_of_work());
+    }
     let segments = reference_segments(expression).map_err(|why| {
         runtime(format!(
             "'{expression}' is not a reference path this service evaluates: {why}"
@@ -673,6 +679,16 @@ pub(super) fn glob_matches(pattern: &str, text: &str) -> Result<bool, Failure> {
              service matches",
             pattern.chars().count()
         )));
+    }
+    // Matching backtracks over the last wildcard, so the match costs at most the
+    // pattern's length times the text's: the PRODUCT of a pattern a definition wrote
+    // and a value its data carries, which is what this walk is charged for
+    // ([`work_meter`]) before the match is made.
+    let cost = u64::try_from(pattern.chars().count())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(text.chars().count()).unwrap_or(u64::MAX));
+    if !spend_work(cost) {
+        return Err(out_of_work());
     }
     let mut tokens: Vec<Glob> = Vec::new();
     let mut characters = pattern.chars();

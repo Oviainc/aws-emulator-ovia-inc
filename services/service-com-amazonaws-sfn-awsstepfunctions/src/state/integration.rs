@@ -181,9 +181,11 @@
 //!   waiting: a call that has not answered inside it fails the task instead of
 //!   pinning the thread, which is also what clamps a target that holds its answer on
 //!   purpose (`GetActivityTask` is a long poll);
-//! * [`super::asl::MAX_INTERPRET_DURATION`] bounds the whole interpretation, and the
-//!   walk now consults it BEFORE each call as well as at each transition, so a run
-//!   that is past its deadline makes no further call;
+//! * [`super::asl::MAX_CALL_WAIT_DURATION`] bounds what ONE run may spend waiting for
+//!   its calls together, by clamping what each further call may wait for to what is
+//!   left of it, and [`super::asl::MAX_INTERPRET_WORK`] bounds the work the
+//!   interpretation itself does, which the walk consults BEFORE each call as well as
+//!   at each transition, so a run that has spent it makes no further call;
 //! * [`MAX_CALL_CHAIN_DEPTH`] bounds how deep a chain of in-process calls may still
 //!   make one, which is what bounds the PRODUCT: a chain that re-enters this service
 //!   — a task that starts another execution, or one that publishes an event a rule
@@ -227,19 +229,18 @@ pub const MAX_CALL_CHAIN_DEPTH: u8 = 3;
 /// The longest the walk waits for ONE integration call to answer.
 ///
 /// Emulator bound: the call is served in THIS process, so a call that only reads or
-/// writes another service's store answers in microseconds, and the walk's own deadline
-/// cannot bound the time spent inside a call because the walk is blocked there rather
-/// than transitioning. A call that has not answered inside this fails the task with
-/// ASL's own timeout error instead of holding the blocking thread the walk runs on,
-/// which also clamps a target that holds its answer on purpose: `GetActivityTask` is a
-/// long poll, and this is what stops one from pinning a thread for its hold.
+/// writes another service's store answers in microseconds, and the work one
+/// interpretation may do cannot bound the time spent inside a call because the walk is
+/// blocked there rather than interpreting. A call that has not answered inside this
+/// fails the task with ASL's own timeout error instead of holding the blocking thread
+/// the walk runs on, which also clamps a target that holds its answer on purpose:
+/// `GetActivityTask` is a long poll, and this is what stops one from pinning a thread
+/// for its hold.
 ///
-/// It is WIDER than the interpretation's own deadline, because one call is not
-/// interpretation: a `lambda:invoke` task's call RUNS the caller's own function, which
-/// Lambda bounds by that function's `Timeout` and not by anything of this service's —
-/// so a ceiling at the interpreter's deadline would decide a slow function's outcome
-/// HERE, reporting the state's own timeout for a run the function's timeout ended.
-/// What bounds the thread a run holds across every call it makes is
+/// It bounds ONE call and nothing about the interpretation around it, because a call is
+/// not interpretation: a `lambda:invoke` task's call RUNS the caller's own function,
+/// which Lambda bounds by that function's `Timeout` and not by anything of this
+/// service's. What bounds the thread a run holds across every call it makes is
 /// [`super::asl::MAX_CALL_WAIT_DURATION`], which this stays well inside.
 pub const MAX_CALL_DURATION: Duration = Duration::from_secs(10);
 
@@ -2163,7 +2164,8 @@ pub trait Tasks: Send + Sync {
     /// `within` is the state's own `TimeoutSeconds` when it declares one — "if the
     /// task runs longer than the specified seconds, this state fails with a
     /// States.Timeout error name" — so the member bounds the span it documents
-    /// rather than only being compared with it afterwards. `None` leaves the
+    /// rather than only being compared with it afterwards, clamped by what the run may
+    /// still spend waiting ([`super::asl::MAX_CALL_WAIT_DURATION`]). `None` leaves the
     /// emulator's own ceiling ([`MAX_CALL_DURATION`]) as the only bound, and a
     /// declared timeout longer than that ceiling does not lift it.
     fn perform(&self, call: &Call, request: &Value, within: Option<Duration>) -> Answer;
@@ -2847,9 +2849,11 @@ fn too_deep(call: &Call) -> Failed {
 /// (`waited`): ASL's own timeout error, which the state's `Retry` and `Catch` may
 /// match, rather than a thread held until the call feels like answering.
 ///
-/// `waited` is the state's own `TimeoutSeconds` when it declares one no longer than
-/// [`MAX_CALL_DURATION`], and that ceiling otherwise, so the cause states the bound
-/// that actually expired.
+/// `waited` is the SHORTEST of the spans that bound this call: the state's own
+/// `TimeoutSeconds` where it declares one, what is left of the waiting the run may do
+/// ([`super::asl::MAX_CALL_WAIT_DURATION`], which the walk clamps the state's figure
+/// to before handing the call over) and [`MAX_CALL_DURATION`] — so the cause states
+/// the bound that actually expired.
 fn timed_out(call: &Call, waited: Duration) -> Failed {
     Failed {
         error: super::asl::TIMEOUT_ERROR.to_string(),

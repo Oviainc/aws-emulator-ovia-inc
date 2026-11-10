@@ -121,9 +121,11 @@
 //! * [`MAX_CHOICE_RULES`] and [`MAX_TEMPLATE_PATHS`] — how many expressions ONE
 //!   visit to a state may evaluate, and [`MAX_GLOB_CHARS`] what one `StringMatches`
 //!   may cost;
-//! * [`MAX_INTERPRET_DURATION`] — the wall clock, checked at every transition and
-//!   every `Map` item, which bounds the PRODUCT of all of the above; the walk runs on
-//!   a blocking thread, so a run that reaches it never held an async worker;
+//! * [`MAX_INTERPRET_WORK`] — the WORK the run may do, checked at every transition
+//!   and every `Map` item and charged by the primitives that spend it, which bounds
+//!   the PRODUCT of all of the above without putting a clock between a definition and
+//!   its own outcome ([`work_meter`]); the walk runs on a blocking thread, so a run
+//!   that reaches it never held an async worker;
 //! * [`MAX_STATE_NAME_CHARS`] — a state's name, which every history event of that
 //!   state carries, enforced by [`validate`] over every state list the definition
 //!   declares (nested processors and branches included) and again in the walk.
@@ -173,7 +175,13 @@ mod intrinsics;
 mod jsonpath;
 mod walk;
 mod work_events;
+mod work_meter;
 pub use diagnose::*;
+// The ceiling on the PRODUCT the ceilings below bound factor by factor, and the
+// primitives that spend it: one concern in a file of its own, whose names stay
+// reachable unqualified from here and from the walk, and which the OTHER query
+// language's evaluator charges its expressions to ([`super::jsonata`]).
+pub use work_meter::*;
 // The OTHER query language's own evaluation — one path, one payload template, one
 // `Choice` comparator — is this module's too, in a file of its own, and its names stay
 // reachable unqualified from here and from the walk ([`jsonpath`]), exactly as the two
@@ -550,45 +558,25 @@ pub const MAX_TEMPLATE_PATHS: usize = 64;
 /// the value's, and the value is bounded by [`MAX_PAYLOAD_BYTES`].
 pub const MAX_GLOB_CHARS: usize = 256;
 
-/// The longest this emulator INTERPRETS one definition for.
-///
-/// Emulator deadline, NOT an AWS duration: it bounds the PRODUCT the other ceilings
-/// bound factor by factor (transitions x evaluations per visit x the work of one
-/// evaluation), and it is what makes the walk interruptible — it is checked at every
-/// transition and at every `Map` item, and a run past it ends `FAILED` with
-/// [`RUNTIME_ERROR`] rather than holding the thread it runs on. The walk itself runs
-/// on a blocking thread (`StartExecution` and `RedriveExecution` hand it to
-/// `spawn_blocking`), so an over-budget interpretation never occupies an async
-/// worker.
-///
-/// It bounds the INTERPRETER's own work and nothing else. The span a `Task` state spends
-/// waiting for the call that IS its work is not interpretation — the walk is blocked in
-/// another service's handler, which for a Lambda invocation RUNS a caller's own code —
-/// so that span is credited back to this deadline as it is spent and bounded on its own
-/// by [`super::integration::MAX_CALL_DURATION`] per call and by
-/// [`MAX_CALL_WAIT_DURATION`] across the run ([`Interpreter::spent_calling`]). Were it
-/// charged here instead, the ceiling on the emulator's own work would decide the outcome
-/// of every definition that asks for more than a couple of calls, which is not an
-/// outcome any definition can reach on the real service.
-pub const MAX_INTERPRET_DURATION: Duration = Duration::from_secs(2);
-
 /// The longest ONE interpretation spends WAITING for the service-integration calls its
 /// `Task` states' work is made of, across the whole walk.
 ///
-/// Emulator bound, NOT an AWS duration, and the companion of
-/// [`MAX_INTERPRET_DURATION`]: one interpretation holds one blocking thread for its
-/// whole duration, including while a call it asked for is in flight, so what has to be
-/// bounded is the time that thread can be held. [`super::integration::MAX_CALL_DURATION`]
-/// bounds ONE call and [`MAX_STATE_TRANSITIONS`] bounds how many a run may make; this
-/// bounds their product, so the thread a run holds is held for at most this plus the
-/// interpreter's own deadline however many calls the definition asks for.
+/// Emulator bound, NOT an AWS duration: one interpretation holds one blocking thread
+/// for its whole duration, including while a call it asked for is in flight, so what
+/// has to be bounded is the time that thread can be held.
+/// [`super::integration::MAX_CALL_DURATION`] bounds ONE call and
+/// [`MAX_STATE_TRANSITIONS`] bounds how many a run may make; this bounds their product,
+/// by CLAMPING what each call may still wait for to what is left of it
+/// ([`Interpreter::call_within`]), so the thread a run holds is held for at most this
+/// however many calls the definition asks for.
 ///
-/// It is wide enough for the calls a real workload makes — a poll loop whose every
-/// revisit invokes a function, each invocation running that function's own code — and far
-/// narrower than the span a client waits for a reply in: a definition whose loop never
-/// terminates holds its thread for at most this, and whoever started the execution (a
-/// client, or an EventBridge rule firing on its own schedule) is answered inside it.
-pub const MAX_CALL_WAIT_DURATION: Duration = Duration::from_secs(30);
+/// What it bounds is the WAITING, never the execution: a call that does not answer
+/// inside the span it was given is the task's own timeout — ASL's
+/// [`TIMEOUT_ERROR`], which the state's `Retry` and `Catch` may answer for — so the
+/// outcome stays the definition's. It is wide enough for the calls a real workload
+/// makes, a poll loop whose every revisit invokes a function that runs a caller's own
+/// code included.
+pub const MAX_CALL_WAIT_DURATION: Duration = Duration::from_secs(120);
 
 /// The most values `States.ArrayRange` builds: its published limit of "1000 items",
 /// past which the function fails rather than returning an oversized array.
@@ -2306,6 +2294,11 @@ fn interpret(
     settle: Duration,
     tasks: &dyn Tasks,
 ) -> (Run, bool) {
+    // The work this walk may do, installed for the thread it runs on and restored when
+    // it ends: every primitive the walk reaches charges what it spends to this, and
+    // what runs on this thread afterwards is metered by its own allowance
+    // ([`work_meter`]).
+    let _allowance = WorkAllowance::of(MAX_INTERPRET_WORK);
     let document: Value = match serde_json::from_str(definition) {
         Ok(document) => document,
         Err(why) => {
@@ -2427,10 +2420,6 @@ fn interpret(
     let mut interpreter = Interpreter {
         budget: MAX_STATE_TRANSITIONS,
         depth: 0,
-        // The deadline is measured from NOW, not from the execution's own start: it
-        // bounds how long this call spends interpreting, which is what makes the
-        // walk interruptible.
-        deadline: super::after(super::now(), MAX_INTERPRET_DURATION),
         call_wait_left: MAX_CALL_WAIT_DURATION,
         // What is left of a definition-level `TimeoutSeconds` for this walk: the span
         // the execution had already spent counts towards it, so what remains is what
@@ -2827,6 +2816,12 @@ fn measure_payload(value: &Value, built_by: &str) -> Result<usize, Failure> {
             return Err(too_large(pending.len()));
         }
     }
+    // Measuring a document is itself work the definition asked for, and the one
+    // document every state produces goes through here: the bytes it carries are what
+    // that walk is charged for ([`work_meter`]).
+    if !spend_work(u64::try_from(bytes).unwrap_or(u64::MAX)) {
+        return Err(out_of_work());
+    }
     Ok(bytes)
 }
 
@@ -2840,15 +2835,10 @@ struct Interpreter<'tasks> {
     /// against [`MAX_NESTING_DEPTH`]: each level is an interpreter frame, so the
     /// nesting a definition can ask for is capped rather than left to the stack.
     depth: usize,
-    /// When this interpretation must stop, whatever it is doing: see
-    /// [`MAX_INTERPRET_DURATION`]. Pushed forward by the span each
-    /// service-integration call the walk waited for took, which is time the walk was
-    /// blocked in another service rather than interpreting
-    /// ([`Interpreter::spent_calling`]).
-    deadline: SystemTime,
     /// What is LEFT of [`MAX_CALL_WAIT_DURATION`]: the span this walk may still spend
     /// waiting for the calls its `Task` states' work is made of. Spent as each call
-    /// answers, and what bounds the thread one run can hold.
+    /// answers, and what bounds the thread one run can hold
+    /// ([`Interpreter::call_within`]).
     call_wait_left: Duration,
     /// What is left of the definition-level `TimeoutSeconds` for THIS walk — the
     /// timeout less the span the execution had already spent — for a definition that
@@ -3025,9 +3015,9 @@ struct Resumed {
 
 /// How the items of ONE `Map` attempt turned out, counted as they are run.
 ///
-/// A `Map` attempt can end at any item (a budget, a deadline, a document past what a
-/// state may carry), so the counts are kept here rather than derived from the
-/// attempt's result: however the attempt ended, what its items did is what this
+/// A `Map` attempt can end at any item (a step budget, a work allowance, a document
+/// past what a state may carry), so the counts are kept here rather than derived from
+/// the attempt's result: however the attempt ended, what its items did is what this
 /// holds.
 #[derive(Debug, Default)]
 struct MapTally {
@@ -3878,6 +3868,9 @@ pub struct StateTest<'a> {
 /// answered by the request's `mock`, and without one the state fails with ASL's own
 /// [`RUNTIME_ERROR`] rather than with a fabricated result.
 pub fn test_state(test: &StateTest<'_>) -> Trial {
+    // The trial is a caller-sized walk too, so it runs under the same work allowance an
+    // execution's does ([`work_meter`]).
+    let _allowance = WorkAllowance::of(MAX_INTERPRET_WORK);
     let inspection = Inspection {
         input: Some(test.input.to_string()),
         ..Inspection::default()
@@ -3909,7 +3902,6 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
     let mut interpreter = Interpreter {
         budget: MAX_STATE_TRANSITIONS,
         depth: 0,
-        deadline: super::after(super::now(), MAX_INTERPRET_DURATION),
         call_wait_left: MAX_CALL_WAIT_DURATION,
         // `TestState` tests ONE state, with no execution and so no definition-level
         // `TimeoutSeconds` around it: nothing here bounds the span the state runs in.

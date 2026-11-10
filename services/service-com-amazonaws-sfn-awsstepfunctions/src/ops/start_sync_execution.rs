@@ -383,7 +383,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Phase 2, OUTSIDE the lock: the definition is INTERPRETED here, on a blocking
         // thread, exactly as `StartExecution` interprets it — same walk, same budgets,
-        // same deadline. The one difference is that this call answers the outcome
+        // same work allowance. The one difference is that this call answers the outcome
         // itself, so it settles with NO delay: the response carries the terminal
         // `status`, `stopDate` and payload.
         let context = crate::state::asl::Context {

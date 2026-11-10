@@ -60,13 +60,14 @@
 //! each is a separate document the state builds. How many of those one visit can ask
 //! for is fixed by the state's TYPE, and for a `Choice` by its rule count, which is
 //! itself bounded ([`super::asl::MAX_CHOICE_RULES`]); each is built and spent in turn.
-//! Every evaluation is also handed what is left of the interpretation's own deadline
-//! ([`super::asl::MAX_INTERPRET_DURATION`]) rather than a span of its own, so the
-//! blocking thread one walk can occupy is still the span that walk is allowed however
-//! many expressions its states carry.
+//! Every evaluation is also CHARGED to the work allowance of the interpretation
+//! around it ([`super::asl::MAX_INTERPRET_WORK`]): the span an expression runs for is
+//! the caller's own code running inside the engine, so the engine's per-expression
+//! ceiling bounds one of them and that allowance bounds what they cost together,
+//! leaving no clock between a definition and the outcome of its execution.
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 
@@ -89,10 +90,10 @@ pub const CLOSE: &str = "%}";
 /// The longest ONE expression of a state is evaluated for, in milliseconds.
 ///
 /// Emulator bound, NOT an AWS limit: a state evaluates several expressions and the
-/// walk runs on a blocking thread, so one of them is bounded well inside the
-/// interpretation's own deadline — and what is LEFT of that deadline clamps it further
-/// ([`Budget::charge`]), so the expressions of one state cannot hold the thread past
-/// the span the whole run is allowed.
+/// walk runs on a blocking thread, so one of them is bounded here — and what each one
+/// TOOK is charged to the interpretation's own work allowance
+/// ([`Budget::charge`], [`super::asl::WORK_PER_EVALUATED_MILLISECOND`]), so the
+/// expressions of one run cannot hold the thread past what the whole run may spend.
 pub const EVALUATION_TIME_LIMIT_MS: usize = 250;
 
 /// What one expression of a state is evaluated with: the reserved terms the language
@@ -164,25 +165,29 @@ impl From<engine::Refused> for Refusal {
 /// one allowance as the members are built rather than measured once they are whole. A
 /// state's `Assign` and the `Output` it feeds share one allowance; every other member
 /// a state can carry is a document of its own and is given its own, as the module
-/// header states. The deadline is the interpretation's own: every evaluation is
-/// clamped to what is left of it, so a state's expressions cannot hold the blocking
-/// thread the walk runs on past the span the whole run is allowed.
+/// header states. What each evaluation COSTS is charged to the work allowance of the
+/// interpretation around it, so a state's expressions cannot hold the blocking thread
+/// the walk runs on past what the whole run may spend.
 #[derive(Debug)]
 pub struct Budget {
     bytes: usize,
     expressions: usize,
-    deadline: SystemTime,
 }
 
-impl Budget {
-    /// The allowance one template or field gets, against the interpretation deadline
-    /// `until`.
-    pub fn new(until: SystemTime) -> Self {
+impl Default for Budget {
+    /// The allowance one template or field gets.
+    fn default() -> Self {
         Self {
             bytes: super::asl::MAX_PAYLOAD_BYTES,
             expressions: super::asl::MAX_TEMPLATE_PATHS,
-            deadline: until,
         }
+    }
+}
+
+impl Budget {
+    /// The allowance one template or field gets.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Spend `bytes` of what this visit may still build.
@@ -199,9 +204,11 @@ impl Budget {
         }
     }
 
-    /// Charge ONE evaluation, and answer how many milliseconds it may run for: what
-    /// is left of the interpretation's deadline, and never more than one expression
-    /// is allowed on its own.
+    /// Charge ONE evaluation, and answer how many milliseconds it may run for: the
+    /// ceiling one expression is allowed on its own.
+    ///
+    /// A visit whose interpretation has already spent the work it may do evaluates
+    /// nothing further, exactly as it makes no further transition.
     fn charge(&mut self) -> Result<usize, Refusal> {
         let Some(left) = self.expressions.checked_sub(1) else {
             return Err(Refusal::NotEvaluated(format!(
@@ -210,19 +217,14 @@ impl Budget {
             )));
         };
         self.expressions = left;
-        let remaining = self
-            .deadline
-            .duration_since(SystemTime::now())
-            .map(|left| usize::try_from(left.as_millis()).unwrap_or(usize::MAX))
-            .unwrap_or(0);
-        if remaining == 0 {
+        if super::asl::work_spent() {
             return Err(Refusal::NotEvaluated(format!(
-                "the execution was interpreted for longer than the {} seconds this emulator \
-                 interprets one definition for, so its expressions were not evaluated",
-                super::asl::MAX_INTERPRET_DURATION.as_secs()
+                "the execution asked for more than the {} units of interpretation work this \
+                 emulator does for one definition, so its expressions were not evaluated",
+                super::asl::MAX_INTERPRET_WORK
             )));
         }
-        Ok(remaining.min(EVALUATION_TIME_LIMIT_MS))
+        Ok(EVALUATION_TIME_LIMIT_MS)
     }
 }
 
@@ -268,13 +270,25 @@ fn evaluate(
     for (name, value) in bindings.variables {
         variables.push((name.as_str(), value));
     }
+    let began = Instant::now();
     let answered = engine::evaluate(&engine::Expression {
         text: expression,
         input: bindings.input,
         variables: &variables,
         allowed_ms,
         allowance: budget.bytes,
-    })?;
+    });
+    // An expression is a caller's own code running inside the engine, so what it costs
+    // the interpretation around it is the span it RAN for: charged whether it produced
+    // a value or was refused, at the rate one millisecond of evaluation costs.
+    let spent = u64::try_from(began.elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(super::asl::WORK_PER_EVALUATED_MILLISECOND)
+        // The text of the expression is work of its own, so an evaluation that took
+        // less than a millisecond still costs what parsing it did.
+        .max(u64::try_from(expression.len()).unwrap_or(u64::MAX));
+    super::asl::spend_work(spent);
+    let answered = answered?;
     let Some((value, built)) = answered else {
         return Ok(None);
     };

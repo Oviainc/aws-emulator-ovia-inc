@@ -28,34 +28,48 @@ impl Interpreter<'_> {
         echoed_payload(value, &self.supplied)
     }
 
-    /// Whether this interpretation has run out of wall-clock time.
+    /// Whether this interpretation has run out of the WORK it may do.
     ///
     /// The ceilings on steps, payloads, paths and nesting bound each factor of the
-    /// work a definition can ask for; this bounds their PRODUCT, and it is what a
-    /// run that is simply taking too long ends on.
-    pub(super) fn out_of_time(&self) -> Option<Failure> {
-        (super::super::now() > self.deadline).then(|| {
-            runtime(format!(
-                "the execution was interpreted for longer than the {} seconds this emulator \
-                 interprets one definition for, so it was stopped",
-                MAX_INTERPRET_DURATION.as_secs()
-            ))
-        })
+    /// work a definition can ask for; this answers for their PRODUCT
+    /// ([`MAX_INTERPRET_WORK`]), and it is what a run that asks for more work than one
+    /// definition is interpreted for ends on. It is the work itself that is counted
+    /// and never the clock, so what an execution ends as is decided by its definition
+    /// and its input alone.
+    pub(super) fn out_of_work(&self) -> Option<Failure> {
+        work_spent().then(out_of_work)
     }
 
-    /// Credit the `waited` a service-integration call took back to the deadline above.
+    /// Record that a service-integration call this walk waited for took `waited`.
     ///
     /// The walk is BLOCKED while a call it asked for is in flight — in another
     /// service's handler, which for a Lambda invocation runs a caller's own code — so
-    /// that span is not interpretation and is not charged to the interpreter's own
-    /// deadline. It is charged instead to what is left of [`MAX_CALL_WAIT_DURATION`],
-    /// which bounds it across the whole walk: once that is spent, the time a further
-    /// call takes falls on the deadline again, so the thread one run holds is bounded
-    /// whatever its definition asks for.
+    /// that span is not interpretation and is charged to nothing the interpretation is
+    /// judged by. What it IS charged to is the allowance that bounds the waiting one
+    /// run may do ([`MAX_CALL_WAIT_DURATION`]), which the next call's own wait is
+    /// clamped to what is left of ([`Interpreter::call_within`]): the thread one run
+    /// holds is bounded, and a call that does not answer inside the span it was given
+    /// is the task's own timeout rather than the execution's end.
     pub(super) fn spent_calling(&mut self, waited: Duration) {
-        let credited = waited.min(self.call_wait_left);
-        self.call_wait_left -= credited;
-        self.deadline = super::super::after(self.deadline, credited);
+        self.call_wait_left = self.call_wait_left.saturating_sub(waited);
+    }
+
+    /// The span the next service-integration call of this walk may wait for: the
+    /// state's own `TimeoutSeconds` where it declares one, clamped to what is left of
+    /// the waiting this run may do.
+    ///
+    /// "TimeoutSeconds […] If the task runs longer than the specified seconds, this
+    /// state fails with a States.Timeout error name": a state that declares one asks
+    /// for no more than it, and a state that declares none is held to the allowance
+    /// alone — so the answer is always a span, and a call that outlasts it is that
+    /// task's timeout, which the state's `Retry` and `Catch` may answer for. A walk
+    /// with NO waiting left hands no call over at all, so this is never asked for a
+    /// span of zero.
+    pub(super) fn call_within(&self, declared: Option<Duration>) -> Option<Duration> {
+        Some(match declared {
+            Some(declared) => declared.min(self.call_wait_left),
+            None => self.call_wait_left,
+        })
     }
 
     /// Whether the definition's own `TimeoutSeconds` has run out by `at`, the offset
@@ -197,7 +211,7 @@ impl Interpreter<'_> {
                     suspended: false,
                 };
             }
-            if let Some(failure) = self.out_of_time() {
+            if let Some(failure) = self.out_of_work() {
                 return Branch {
                     outcome: Err(failure),
                     end: at,
@@ -556,11 +570,11 @@ impl Interpreter<'_> {
     }
 
     /// What the expressions of ONE visit to a state may build and evaluate: the
-    /// allowance is per visit, and it is spent against this interpretation's own
-    /// deadline, so neither the member count of a template nor the time its
-    /// expressions take is left to the definition.
+    /// allowance is per visit, and what each evaluation COSTS is charged to this
+    /// interpretation's own work allowance, so neither the member count of a template
+    /// nor the work its expressions do is left to the definition.
     pub(super) fn jsonata_budget(&self) -> super::super::jsonata::Budget {
-        super::super::jsonata::Budget::new(self.deadline)
+        super::super::jsonata::Budget::new()
     }
 
     /// What a state PUTS OUT, in the query language it is written in.
@@ -1927,11 +1941,28 @@ impl Interpreter<'_> {
                 return (Err(failure), at);
             }
             me.push_detailed(work.started(), name, at, work.naming());
-            // The interpretation's own deadline is consulted HERE as well as at each
-            // transition: the walk blocks inside a call rather than transitioning, so
-            // a run already past its deadline makes no further call (and a `Retry`
-            // cannot keep making them).
-            if let Some(failure) = me.out_of_time() {
+            // The interpretation's own work allowance is consulted HERE as well as at
+            // each transition: a run that has asked for more work than it may do makes
+            // no further call (and a `Retry` cannot keep making them).
+            if let Some(failure) = me.out_of_work() {
+                me.push_submit_failure(name, &work, &failure, at, &call);
+                return (Err(failure), at);
+            }
+            // And so is the waiting this run may still do: a run that has spent it does
+            // not hand this call over, because there is no span left to wait for its
+            // answer in. The task is therefore not finished, which is the task's OWN
+            // timeout — ASL's own error name, which the state's `Retry` and `Catch` may
+            // answer for — rather than an end to the execution.
+            if me.call_wait_left.is_zero() {
+                let failure = Failure {
+                    error: Some(TIMEOUT_ERROR.to_string()),
+                    cause: Some(format!(
+                        "the work of state '{name}' was not handed over: this execution has \
+                         spent the {} seconds this emulator waits for the calls its tasks are \
+                         made of",
+                        MAX_CALL_WAIT_DURATION.as_secs()
+                    )),
+                };
                 me.push_submit_failure(name, &work, &failure, at, &call);
                 return (Err(failure), at);
             }
@@ -1944,7 +1975,7 @@ impl Interpreter<'_> {
             if let Some(token) = &token {
                 me.tasks.hand_over(token, &me.execution_arn, name);
             }
-            let answered = me.tasks.perform(&call, &request, within);
+            let answered = me.tasks.perform(&call, &request, me.call_within(within));
             // The call has come back, so the handover is over: what it carries, if
             // anything answered it, is this task's own outcome.
             let replied = token
@@ -1954,8 +1985,8 @@ impl Interpreter<'_> {
                 .duration_since(began)
                 .unwrap_or_default();
             // The span the walk spent BLOCKED in that call is not interpretation, so it
-            // is credited back to the deadline and charged to the allowance that bounds
-            // the waiting one run may do ([`Interpreter::spent_calling`]).
+            // is charged to the allowance that bounds the waiting one run may do
+            // ([`Interpreter::spent_calling`]) and to nothing else.
             me.spent_calling(spent);
             // The identifier of the job a run-a-job call STARTED is read from the
             // answer as the invoked model spells it, before that answer becomes the
@@ -2883,7 +2914,7 @@ impl Interpreter<'_> {
                 // needs is done, so the per-item work (the context the iteration
                 // reads, the `ItemSelector` it is given) stops with the budget rather
                 // than being done for every remaining item of a long array.
-                if let Some(failure) = self.out_of_time() {
+                if let Some(failure) = self.out_of_work() {
                     return (Err(failure), batch_end);
                 }
                 if self.budget == 0 {

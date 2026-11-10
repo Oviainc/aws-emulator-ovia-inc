@@ -1313,7 +1313,7 @@ impl CallbackHandover {
 /// Emulator bound, NOT an AWS limit. The handover lasts exactly as long as the call that
 /// carries the token is in flight, and the walk ends it itself when that call comes back;
 /// this is the backstop for a walk that ended without ending its handover — an
-/// interpretation that ran out of its own deadline, or a thread that went away — so a
+/// interpretation that spent the work it may do, or a thread that went away — so a
 /// record of a call nobody waits for any more cannot accumulate. It is twice the ceiling
 /// on ONE integration call ([`integration::MAX_CALL_DURATION`]), so it cannot expire a
 /// handover whose call is still inside that ceiling.

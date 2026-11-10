@@ -54,8 +54,9 @@
 //! not only how many are delivered), [`MAX_DATASET_BYTES`] of one object's bytes,
 //! [`MAX_PAGES`] pages of a listing, and — for a CSV dataset, which chooses both
 //! dimensions of the members its items carry — [`MAX_COLUMNS`] columns and
-//! [`MAX_ITEM_MEMBERS`] members over all its rows together. The walk's own wall clock
-//! ([`super::asl::MAX_INTERPRET_DURATION`]) bounds the whole read on top of those.
+//! [`MAX_ITEM_MEMBERS`] members over all its rows together. The walk's own work
+//! allowance ([`super::asl::MAX_INTERPRET_WORK`]) bounds the whole read on top of
+//! those.
 //!
 //! ## What the read is subject to
 //!

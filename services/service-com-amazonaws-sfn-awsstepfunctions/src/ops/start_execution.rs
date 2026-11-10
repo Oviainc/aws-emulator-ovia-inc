@@ -483,8 +483,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             express: machine_type == crate::state::STATE_MACHINE_TYPE_EXPRESS,
         };
         // The walk is CPU work a caller's definition sizes, so it runs on a blocking
-        // thread rather than on an async worker: an interpretation that reaches its
-        // own deadline (`asl::MAX_INTERPRET_DURATION`) then ends there instead of
+        // thread rather than on an async worker: an interpretation that spends the work
+        // one run may do (`asl::MAX_INTERPRET_WORK`) then ends there instead of
         // holding a worker the runtime needs for health, timeouts and shutdown. The
         // service-integration call each `Task` state makes is asynchronous, so it is
         // made HERE, on this request's own task, with the walk waiting for its answer

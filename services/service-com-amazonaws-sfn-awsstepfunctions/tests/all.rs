@@ -49,6 +49,8 @@ mod completed_map_run_refusal;
 mod control_plane_pass_role;
 #[path = "all/control_plane_refusal_classes.rs"]
 mod control_plane_refusal_classes;
+#[path = "all/definition_decides_the_outcome.rs"]
+mod definition_decides_the_outcome;
 #[path = "all/definition_field_schema.rs"]
 mod definition_field_schema;
 #[path = "all/definition_finding_subjects.rs"]

@@ -564,8 +564,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The walk is CPU work a caller's definition sizes, so it runs on a blocking
-        // thread rather than on an async worker: a state whose evaluation reaches the
-        // interpreter's own deadline (`asl::MAX_INTERPRET_DURATION`) ends there instead
+        // thread rather than on an async worker: a state whose evaluation spends the
+        // work one interpretation may do (`asl::MAX_INTERPRET_WORK`) ends there instead
         // of holding a worker the runtime needs for health, timeouts and shutdown.
         let interpreted = {
             let name = name.to_string();
