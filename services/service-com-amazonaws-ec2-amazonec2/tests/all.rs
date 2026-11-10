@@ -172,6 +172,12 @@ mod create_route_table;
 // size narrow the report. Declared beside `prefix_lists` for the reason the note above gives.
 #[path = "all/internet_gateways.rs"]
 mod internet_gateways;
+// The other half of that report: how `InternetGatewayIds` and `Filters` narrow the internet
+// gateway store and how `MaxResults`/`NextToken` then walk exactly the narrowed set, at every
+// page size the operation publishes — and that the walk leaves the store as it was. Declared
+// beside `internet_gateways` because it reads the same store through the same describe.
+#[path = "all/describe_internet_gateways_selection.rs"]
+mod describe_internet_gateways_selection;
 // What `DescribeNatGateways` reports out of the NAT gateway store: every member a stored
 // gateway holds, how the id list, the documented filters and the page size narrow it, what it
 // refuses, and the address status the clock owes a gateway it is read through. Declared beside
