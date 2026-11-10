@@ -224,11 +224,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // A revocation is signed with the CA's own private key and published in the
             // CA's revocation information, so only a CA that holds its certificate and can
-            // still sign with it revokes one. That is a precondition on the CA, judged
-            // once the certificate the request NAMES has been resolved on it, so it is
-            // read here and answered below: a serial the CA carries no certificate for
-            // names no certificate in any status the CA rests in, and the absence reported
-            // is the one of the resource the request asked about.
+            // still sign with it revokes one. For a CA that is still IN service that is a
+            // precondition judged once the certificate the request NAMES has been resolved
+            // on it, so it is read here and answered below: a serial such a CA carries no
+            // certificate for names no certificate whatever status it rests in, and the
+            // absence reported is the one of the resource the request asked about.
             let revocable = crate::state::REVOCABLE_STATUSES.contains(&record.status.as_str());
 
             // "You cannot revoke a root CA self-signed certificate." (this operation's
@@ -243,6 +243,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if record.is_own_self_signed_serial(&input.certificate_serial) {
                 return Err(invalid_request(
                     crate::state::ROOT_SELF_SIGNED_REVOCATION_MESSAGE.to_string(),
+                ));
+            }
+
+            // A CA that was deleted is withdrawn from service: it is waiting to be restored
+            // or permanently deleted, and until it is restored nothing it holds is reached
+            // through it — which is why every other operation of this service that reaches
+            // into a deleted CA refuses for its state before it touches what the request
+            // named. So the authority is judged FIRST here, and the serial is never
+            // resolved against a CA that serves none of its certificates.
+            if record.is_deleted() {
+                return Err(invalid_state(
+                    crate::state::not_in_state_to_have_issued_message(&ca_arn),
                 ));
             }
 

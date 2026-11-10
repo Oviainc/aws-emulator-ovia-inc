@@ -26,9 +26,11 @@ use service_com_amazonaws_acmpca_acmprivateca::ops::types::{
 };
 use service_com_amazonaws_acmpca_acmprivateca::state::{
     not_in_state_to_have_issued_message, CA_NOT_FOUND_MESSAGE,
-    CERTIFICATE_ALREADY_REVOKED_MESSAGE, CERTIFICATE_NOT_FOUND_MESSAGE, INVALID_ARN_MESSAGE,
+    CERTIFICATE_ALREADY_REVOKED_MESSAGE, CERTIFICATE_NOT_FOUND_MESSAGE, DELETABLE_STATUSES,
+    INVALID_ARN_MESSAGE, MIN_PERMANENT_DELETION_TIME_IN_DAYS,
     ROOT_SELF_SIGNED_REVOCATION_MESSAGE, STATUS_ACTIVE, STATUS_CREATING, STATUS_DELETED,
     STATUS_DISABLED, STATUS_EXPIRED, STATUS_FAILED, STATUS_PENDING_CERTIFICATE,
+    UNRESTORABLE_DELETION_STATUSES,
 };
 use x509_cert::der::DecodePem;
 use x509_cert::Certificate;
@@ -443,16 +445,22 @@ async fn the_cas_arn_resolves_before_the_serial() {
 /// certificate of its own yet, cannot sign with it any more, or is waiting to be restored
 /// (the private CA lifecycle).
 ///
+/// The second flag is whether a CA resting in that status still SERVES the certificates it
+/// holds, which is what decides whether a revocation's serial is resolved before the CA's
+/// status is judged: a deleted CA is withdrawn from service until it is restored, so it
+/// reaches none of its certificates, while a CA in any other status resolves the serial
+/// first and is judged on its status only for a certificate it does hold.
+///
 /// One table, read by every suite below that drives a status, so the two cannot drift when
 /// the model gains a member.
-const REVOCATION_BY_STATUS: &[(&str, bool)] = &[
-    (STATUS_ACTIVE, true),
-    (STATUS_DISABLED, true),
-    (STATUS_CREATING, false),
-    (STATUS_PENDING_CERTIFICATE, false),
-    (STATUS_EXPIRED, false),
-    (STATUS_FAILED, false),
-    (STATUS_DELETED, false),
+const REVOCATION_BY_STATUS: &[(&str, bool, bool)] = &[
+    (STATUS_ACTIVE, true, true),
+    (STATUS_DISABLED, true, true),
+    (STATUS_CREATING, false, true),
+    (STATUS_PENDING_CERTIFICATE, false, true),
+    (STATUS_EXPIRED, false, true),
+    (STATUS_FAILED, false, true),
+    (STATUS_DELETED, false, false),
 ];
 
 /// Assert [`REVOCATION_BY_STATUS`] spans the whole enum, so a member the model gains cannot
@@ -460,7 +468,7 @@ const REVOCATION_BY_STATUS: &[(&str, bool)] = &[
 fn the_table_spans_the_status_enum() {
     let mut covered: Vec<&str> = REVOCATION_BY_STATUS
         .iter()
-        .map(|(status, _)| *status)
+        .map(|(status, _, _)| *status)
         .collect();
     covered.sort_unstable();
     let mut declared: Vec<&str> = CERTIFICATE_AUTHORITY_STATUS_VALUES.to_vec();
@@ -482,7 +490,7 @@ async fn revocation_is_allowed_only_from_the_statuses_a_ca_can_still_sign_in() {
 
     the_table_spans_the_status_enum();
 
-    for (index, (status, accepted)) in REVOCATION_BY_STATUS.iter().enumerate() {
+    for (index, (status, accepted, _serves)) in REVOCATION_BY_STATUS.iter().enumerate() {
         let case = format!("revocation from {status}");
         let (ca_arn, _certificate) = active_ca(&emulator, &format!("status-{index}")).await;
         let serial = issued_serial(&emulator, &case, &ca_arn, &csr).await;
@@ -533,9 +541,11 @@ async fn revocation_is_allowed_only_from_the_statuses_a_ca_can_still_sign_in() {
 }
 
 /// The serial a revocation names is resolved on the CA BEFORE the CA's own lifecycle
-/// status is judged: a serial the CA carries no certificate for is the certificate's
-/// not-found refusal in every status the CA can rest in, and the state refusal is reserved
-/// for a revocation of a certificate the CA does hold.
+/// status is judged, for as long as the CA still serves its certificates: a serial such a
+/// CA carries no certificate for is the certificate's not-found refusal in every status it
+/// can rest in, and the state refusal is reserved for a revocation of a certificate the CA
+/// does hold. A CA that was DELETED serves none of its certificates until it is restored,
+/// so there the state refusal naming the CA comes first and no serial is resolved at all.
 ///
 /// The rows differ along both of the things the rule generalises over: the status the CA
 /// rests in (every member `CertificateAuthorityStatus` declares) and the way the serial
@@ -543,7 +553,7 @@ async fn revocation_is_allowed_only_from_the_statuses_a_ca_can_still_sign_in() {
 /// value that is not hexadecimal, a sibling value of the one the CA holds, and another
 /// authority's certificate).
 #[tokio::test]
-async fn an_unknown_serial_is_not_found_whatever_status_the_ca_rests_in() {
+async fn an_unknown_serial_is_not_found_while_the_ca_still_serves_its_certificates() {
     let emulator = Emulator::new();
     let (ca_arn, _certificate) = active_ca(&emulator, "unknown-serial-statuses").await;
     let (other_arn, _other_certificate) = active_ca(&emulator, "another-authority").await;
@@ -552,7 +562,7 @@ async fn an_unknown_serial_is_not_found_whatever_status_the_ca_rests_in() {
 
     the_table_spans_the_status_enum();
 
-    for (status, accepted) in REVOCATION_BY_STATUS {
+    for (status, accepted, serves) in REVOCATION_BY_STATUS {
         // A certificate of this CA per row, so the row that accepts a revocation does not
         // leave the next one asking about a certificate already revoked.
         let row = format!("a revocation against a {status} CA");
@@ -585,18 +595,31 @@ async fn an_unknown_serial_is_not_found_whatever_status_the_ca_rests_in() {
 
         for (named, serial) in &unknown {
             let case = format!("{row} naming {named}");
+            // A CA still in service answers for the certificate the request named; one
+            // withdrawn from service answers for itself, before any serial is resolved.
+            let (code, expected) = if *serves {
+                (
+                    "ResourceNotFoundException",
+                    CERTIFICATE_NOT_FOUND_MESSAGE.to_string(),
+                )
+            } else {
+                (
+                    "InvalidStateException",
+                    not_in_state_to_have_issued_message(&ca_arn),
+                )
+            };
             let refused = emulator
                 .refused(
                     &case,
                     "RevokeCertificate",
                     &revocation(&ca_arn, serial, "UNSPECIFIED"),
-                    "ResourceNotFoundException",
+                    code,
                 )
                 .await;
             let message = error_message(&refused, &case);
             assert_eq!(
-                message, CERTIFICATE_NOT_FOUND_MESSAGE,
-                "case {case:?}: expected the service's certificate not-found sentence, got \
+                message, expected,
+                "case {case:?}: expected the sentence of the stage that refused, got \
                  {message:?}"
             );
         }
@@ -871,4 +894,138 @@ async fn a_root_cas_own_self_signed_certificate_is_never_revoked() {
         recorded.is_some_and(|(reason, _)| reason == "SUPERSEDED"),
         "case {case:?}: expected an end-entity certificate of the root to revoke"
     );
+}
+
+/// The status `DescribeCertificateAuthority` reports for a CA.
+async fn reported_status(emulator: &Emulator, ca_arn: &str, case: &str) -> String {
+    let described = emulator
+        .ok(
+            case,
+            "DescribeCertificateAuthority",
+            &json!({"CertificateAuthorityArn": ca_arn}),
+        )
+        .await;
+    string(&described["CertificateAuthority"], "Status", case)
+}
+
+/// A private CA that was DELETED is withdrawn from service: until it is restored it serves
+/// none of the certificates it holds, so a revocation aimed at it is refused for the CA's
+/// own state — the sentence naming the CA the request carried — before the serial the
+/// request names is resolved, and the refusal leaves the CA exactly as the delete left it.
+///
+/// The rows differ along what the rule generalises over: the status the CA was deleted FROM
+/// (every member `DeleteCertificateAuthority` documents a delete from,
+/// `state::DELETABLE_STATUSES`) and what the serial names — a value nothing was issued
+/// under, no value at all, and the serial of a certificate this CA really does hold, which
+/// is the row that shows the refusal is about the authority rather than about the
+/// certificate.
+#[tokio::test]
+async fn a_deleted_ca_refuses_a_revocation_before_it_resolves_the_serial() {
+    let emulator = Emulator::new();
+    let csr = certification_request(&emulator, "deleted authorities", "deleted-leaf").await;
+
+    for (index, status) in DELETABLE_STATUSES.iter().enumerate() {
+        let row = format!("a CA deleted from {status}");
+        let (ca_arn, _certificate) = active_ca(&emulator, &format!("deleted-{index}")).await;
+        let held = issued_serial(&emulator, &row, &ca_arn, &csr).await;
+        force_status(&emulator, &ca_arn, status, &row);
+        emulator
+            .ok(
+                &row,
+                "DeleteCertificateAuthority",
+                &json!({
+                    "CertificateAuthorityArn": ca_arn,
+                    "PermanentDeletionTimeInDays": MIN_PERMANENT_DELETION_TIME_IN_DAYS,
+                }),
+            )
+            .await;
+        let deleted = reported_status(&emulator, &ca_arn, &row).await;
+        assert_eq!(
+            deleted, STATUS_DELETED,
+            "case {row:?}: expected the delete to leave the CA deleted, got {deleted:?}"
+        );
+
+        // Every way a revocation can name a serial against a CA nothing is reached
+        // through: the last row names a certificate the CA DOES hold.
+        let serials: Vec<(&str, String)> = vec![
+            (
+                "a hexadecimal serial nothing was issued under",
+                "0a:1b:2c:3d:4e:5f:60:71".to_string(),
+            ),
+            (
+                "the empty serial the member's length allows",
+                String::new(),
+            ),
+            (
+                "the serial of a certificate the CA does hold",
+                held.clone(),
+            ),
+        ];
+        for (named, serial) in &serials {
+            let case = format!("{row}, the revocation naming {named}");
+            let refused = emulator
+                .refused(
+                    &case,
+                    "RevokeCertificate",
+                    &revocation(&ca_arn, serial, "KEY_COMPROMISE"),
+                    "InvalidStateException",
+                )
+                .await;
+            let message = error_message(&refused, &case);
+            assert_eq!(
+                message,
+                not_in_state_to_have_issued_message(&ca_arn),
+                "case {case:?}: expected the sentence naming the CA the request carried, got \
+                 {message:?}"
+            );
+        }
+
+        // None of those refusals touched anything: the certificate the CA holds carries no
+        // revocation and the CA is still as the delete left it.
+        let recorded = stored_revocation(&emulator, &ca_arn, &held, &row);
+        assert!(
+            recorded.is_none(),
+            "case {row:?}: a refused revocation must record none, got {recorded:?}"
+        );
+        let after = reported_status(&emulator, &ca_arn, &row).await;
+        assert_eq!(
+            after, STATUS_DELETED,
+            "case {row:?}: a refused revocation must leave the CA's status alone, got \
+             {after:?}"
+        );
+
+        // The positive control: the certificate was never gone, only unreachable through a
+        // withdrawn CA. A CA deleted from a status that opens a restoration window goes
+        // back through `RestoreCertificateAuthority` into the status it was deleted from;
+        // once the CA can sign again, that same serial revokes.
+        if !UNRESTORABLE_DELETION_STATUSES.contains(status) {
+            emulator
+                .ok(
+                    &row,
+                    "RestoreCertificateAuthority",
+                    &json!({"CertificateAuthorityArn": ca_arn}),
+                )
+                .await;
+            let restored = reported_status(&emulator, &ca_arn, &row).await;
+            assert_eq!(
+                &restored, status,
+                "case {row:?}: expected the restore to put the CA back into the status it \
+                 was deleted from, got {restored:?}"
+            );
+        }
+        force_status(&emulator, &ca_arn, STATUS_ACTIVE, &row);
+        emulator
+            .ok(
+                &row,
+                "RevokeCertificate",
+                &revocation(&ca_arn, &held, "KEY_COMPROMISE"),
+            )
+            .await;
+        let recorded = stored_revocation(&emulator, &ca_arn, &held, &row);
+        assert!(
+            recorded.is_some_and(|(reason, _)| reason == "KEY_COMPROMISE"),
+            "case {row:?}: expected the serial the deleted CA refused to revoke once the CA \
+             can sign again"
+        );
+    }
 }
