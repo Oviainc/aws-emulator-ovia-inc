@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/attendee_capabilities.rs"]
 mod attendee_capabilities;
+#[path = "all/batch_create_attendee.rs"]
+mod batch_create_attendee;
 #[path = "all/batch_update_attendee_capabilities_except.rs"]
 mod batch_update_attendee_capabilities_except;
 #[path = "all/capability_refusal_message.rs"]

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchCreateAttendee
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchCreateAttendee`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchCreateAttendee::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One call adds every attendee the request lists to a meeting this service already
+//! holds, so the records it answers with are the records `GetAttendee`/`ListAttendees`
+//! read back. The id and the join token of each attendee are minted here, exactly as
+//! `CreateAttendee` mints them for a single item; an item the meeting cannot admit is
+//! reported in the modelled `Errors` list instead of failing the call, since the other
+//! items of the same request are created regardless.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +162,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchCreateAttendee` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchCreateAttendeeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchCreateAttendee"))
+        // `ctx` carries request metadata only: nothing about an attendee depends on it —
+        // the meeting this request names is what every rule below is read from.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchCreateAttendeeErrorModeled::ServiceFailureException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // An attendee exists only inside a meeting, so a `MeetingId` that names none fails
+        // the WHOLE call with the modelled `NotFoundException` — there is nothing to add
+        // the items to, so nothing is minted for any of them.
+        let Some(meeting) = store.meetings.get(&input.meeting_id) else {
+            return Err(BatchCreateAttendeeErrorModeled::NotFoundException(
+                store.meeting_absent(&input.meeting_id),
+            )
+            .into());
+        };
+        // The meeting's own features decide both the capability rules and the attendee
+        // ceiling for every item, exactly as they do for a single `CreateAttendee`: they
+        // come from the STORED meeting, never from this request.
+        let features = meeting.meeting.meeting_features.clone();
+        let ceiling = crate::state::attendee_ceiling(features.as_ref());
+
+        // One request item at a time. `created` collects each attendee AS STORED, in
+        // REQUEST order — the store keys attendees by `AttendeeId`, so `ListAttendees`
+        // pages them in id order, while the answer to THIS call reports the items in the
+        // order they were asked for, the only order the caller can line its request up
+        // against.
+        let mut created: Vec<Attendee> = Vec::new();
+        let mut errors: Vec<CreateAttendeeError2> = Vec::new();
+        for item in input.attendees {
+            let capabilities = match item.capabilities {
+                Some(requested) => {
+                    match crate::state::capability_problem(&requested, features.as_ref()) {
+                        Some(problem) => {
+                            // The payload a single `CreateAttendee` would have been refused
+                            // with, read as a per-item failure: its `Code` and message,
+                            // worded in the one place this service words that refusal.
+                            let refusal = crate::state::bad_request(problem);
+                            errors.push(CreateAttendeeError2 {
+                                external_user_id: Some(item.external_user_id),
+                                error_code: refusal.code,
+                                error_message: refusal.message,
+                            });
+                            continue;
+                        }
+                        None => requested,
+                    }
+                }
+                None => crate::state::default_capabilities(features.as_ref()),
+            };
+
+            // The ceiling counts the attendees the meeting ALREADY holds, so the items of
+            // this request fill the places that are left and the ones past it are refused.
+            let admitted = store
+                .meetings
+                .get(&input.meeting_id)
+                .map_or(0, |stored| stored.attendees.len());
+            if admitted >= ceiling {
+                let refusal = crate::state::attendee_limit_reached(&input.meeting_id, ceiling);
+                errors.push(CreateAttendeeError2 {
+                    external_user_id: Some(item.external_user_id),
+                    error_code: refusal.code,
+                    error_message: refusal.message,
+                });
+                continue;
+            }
+
+            let attendee_id = store.mint_attendee_id(&input.meeting_id);
+            let join_token = store.mint_join_token(&input.meeting_id, &attendee_id);
+            let attendee = Attendee {
+                // Server-owned: the id and the join token are minted here.
+                attendee_id: Some(attendee_id.clone()),
+                join_token: Some(join_token),
+                // Caller-owned, or the documented default.
+                external_user_id: Some(item.external_user_id),
+                capabilities: Some(capabilities),
+            };
+            let Some(stored) = store.meetings.get_mut(&input.meeting_id) else {
+                return Err(BatchCreateAttendeeErrorModeled::ServiceFailureException(
+                    crate::state::store_unavailable(),
+                )
+                .into());
+            };
+            stored.attendees.insert(attendee_id.clone(), attendee);
+            // Read back what was stored, never the value handed to the store, so this
+            // response cannot report an attendee the store does not hold.
+            let Some(stored_attendee) = stored.attendees.get(&attendee_id) else {
+                return Err(BatchCreateAttendeeErrorModeled::ServiceFailureException(
+                    crate::state::store_unavailable(),
+                )
+                .into());
+            };
+            created.push(stored_attendee.clone());
+        }
+
+        Ok(BatchCreateAttendeeOutput {
+            attendees: Some(created),
+            errors: Some(errors),
+        })
     }
 }
