@@ -45,6 +45,56 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Every INPUT shape of this service, as the generated schema statics.
+///
+/// What they are read for: a constraint this service's model declares on the
+/// ELEMENTS of a collection member is reported against that MEMBER, carrying the
+/// element shape's WHOLE declared constraint set — and that set is a property of
+/// the model, not of the request, because a refusal carries only the constraints a
+/// value actually broke. Codegen attaches a collection member's element
+/// constraints to that member's own schema, so the sets are read off these shapes.
+///
+/// ALL of them, not the ones one refusal happens to name: the rule holds for every
+/// constrained collection of every operation. `grep -h 'const INPUT_SCHEMA'
+/// src/ops/*.rs` names exactly these statics; one missing from this list is not a
+/// wrong clause, only a clause stating the constraints that failed rather than the
+/// element shape's whole set.
+const INPUT_SCHEMAS: &[&::aws_smithy_schema::Schema] = &[
+    crate::ops::types::ADD_WORKLOAD_INPUT_SCHEMA,
+    crate::ops::types::CREATE_APPLICATION_INPUT_SCHEMA,
+    crate::ops::types::CREATE_COMPONENT_INPUT_SCHEMA,
+    crate::ops::types::CREATE_LOG_PATTERN_INPUT_SCHEMA,
+    crate::ops::types::DELETE_APPLICATION_INPUT_SCHEMA,
+    crate::ops::types::DELETE_COMPONENT_INPUT_SCHEMA,
+    crate::ops::types::DELETE_LOG_PATTERN_INPUT_SCHEMA,
+    crate::ops::types::DESCRIBE_APPLICATION_INPUT_SCHEMA,
+    crate::ops::types::DESCRIBE_COMPONENT_CONFIGURATION_INPUT_SCHEMA,
+    crate::ops::types::DESCRIBE_COMPONENT_CONFIGURATION_RECOMMENDATION_INPUT_SCHEMA,
+    crate::ops::types::DESCRIBE_COMPONENT_INPUT_SCHEMA,
+    crate::ops::types::DESCRIBE_LOG_PATTERN_INPUT_SCHEMA,
+    crate::ops::types::DESCRIBE_OBSERVATION_INPUT_SCHEMA,
+    crate::ops::types::DESCRIBE_PROBLEM_INPUT_SCHEMA,
+    crate::ops::types::DESCRIBE_PROBLEM_OBSERVATIONS_INPUT_SCHEMA,
+    crate::ops::types::DESCRIBE_WORKLOAD_INPUT_SCHEMA,
+    crate::ops::types::LIST_APPLICATIONS_INPUT_SCHEMA,
+    crate::ops::types::LIST_COMPONENTS_INPUT_SCHEMA,
+    crate::ops::types::LIST_CONFIGURATION_HISTORY_INPUT_SCHEMA,
+    crate::ops::types::LIST_LOG_PATTERNS_INPUT_SCHEMA,
+    crate::ops::types::LIST_LOG_PATTERN_SETS_INPUT_SCHEMA,
+    crate::ops::types::LIST_PROBLEMS_INPUT_SCHEMA,
+    crate::ops::types::LIST_TAGS_FOR_RESOURCE_INPUT_SCHEMA,
+    crate::ops::types::LIST_WORKLOADS_INPUT_SCHEMA,
+    crate::ops::types::REMOVE_WORKLOAD_INPUT_SCHEMA,
+    crate::ops::types::TAG_RESOURCE_INPUT_SCHEMA,
+    crate::ops::types::UNTAG_RESOURCE_INPUT_SCHEMA,
+    crate::ops::types::UPDATE_APPLICATION_INPUT_SCHEMA,
+    crate::ops::types::UPDATE_COMPONENT_CONFIGURATION_INPUT_SCHEMA,
+    crate::ops::types::UPDATE_COMPONENT_INPUT_SCHEMA,
+    crate::ops::types::UPDATE_LOG_PATTERN_INPUT_SCHEMA,
+    crate::ops::types::UPDATE_PROBLEM_INPUT_SCHEMA,
+    crate::ops::types::UPDATE_WORKLOAD_INPUT_SCHEMA,
+];
+
 /// The `com-amazonaws-applicationinsights-ec2windowsbarleyservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -105,8 +155,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // for the rest. Replace BOTH the code and the message: a client branches
         // on the code, so a message without its matching code is worse than
         // leaving both alone.
-        let _ = refusal;
-        None
+        //
+        // This endpoint reports a constraint its MODEL declares on the ELEMENTS of a
+        // collection member against that MEMBER: no element position, no `member`
+        // step and no element value, with every requirement the element shape
+        // declares nested inside `Member must satisfy constraint: [ … ]` — so a
+        // caller is told what every element of that member has to satisfy rather
+        // than which one element offended, and the rejected value is not read back
+        // to it. The framework reports it at the offending element instead, which is
+        // the only difference: every other clause, the envelope, the member paths and
+        // the error code stay the framework's, and `ValidationException` is also the
+        // code this awsJson1_1 service already answers a constraint refusal with.
+        //
+        // An authentication refusal is a different failure with its own code and
+        // status, and nothing about it is this service's to word.
+        ::service_common::validation_message::aws_validation_refusal_over_elements(
+            refusal,
+            INPUT_SCHEMAS,
+            // This endpoint quotes a `@pattern` requirement as the MODEL declares it,
+            // anchors and all — the framework's own rendering of the expression.
+            str::to_string,
+        )
     }
 
     fn override_routing_error(

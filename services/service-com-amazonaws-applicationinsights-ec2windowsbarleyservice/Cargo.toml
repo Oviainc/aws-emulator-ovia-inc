@@ -14,6 +14,10 @@ aws-smithy-schema-server = { workspace = true }
 smithy-server-runtime = { workspace = true }
 emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
+# AWS's own wording for a refusal the framework describes structurally, shared
+# across services: a constraint broken by a collection's elements is reported at
+# the collection member with the element shape's whole constraint set.
+service-common = { path = "../common" }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
 tokio = { workspace = true }

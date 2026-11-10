@@ -15,5 +15,7 @@
 mod admission_checks;
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
+#[path = "all/element_constraint_refusals.rs"]
+mod element_constraint_refusals;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
