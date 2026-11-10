@@ -46,9 +46,13 @@ const SOURCE: &str = "arn:aws:s3:::zetl-landing-zone";
 /// The sentence Amazon Redshift words a target data warehouse that exists but is
 /// not active with — entirely fixed text, reproduced here independently of the
 /// handler so the test pins the wording rather than reading it back.
-const NOT_ACTIVE_MESSAGE: &str = "Unable to perform create operation on the specified zero-ETL \
-                                  integration because its target Redshift data warehouse is not \
-                                  active. Wait until the data warehouse is active and try again.";
+///
+/// `pub(crate)` so the sibling suite about the ORDER the two ARNs are decided in
+/// pins the same sentence rather than keeping a second copy of it.
+pub(crate) const NOT_ACTIVE_MESSAGE: &str = "Unable to perform create operation on the specified \
+                                  zero-ETL integration because its target Redshift data \
+                                  warehouse is not active. Wait until the data warehouse is \
+                                  active and try again.";
 
 /// What a `TargetArn` resolves to, as the three refusal/acceptance classes the
 /// rule names.
@@ -103,7 +107,10 @@ async fn create_integration(
 
 /// Create a serverless namespace through the control plane that owns it, and
 /// answer the `namespaceArn` and `namespaceId` it minted.
-async fn create_namespace(emulator: &Emulator, name: &str) -> (String, String) {
+///
+/// `pub(crate)` so the sibling suite about the ORDER the two ARNs are decided in
+/// seeds its targets through this one seam rather than a second copy of it.
+pub(crate) async fn create_namespace(emulator: &Emulator, name: &str) -> (String, String) {
     let (status, body) = emulator
         .call_serverless("CreateNamespace", &serde_json::json!({ "namespaceName": name }))
         .await;
@@ -125,7 +132,7 @@ async fn create_namespace(emulator: &Emulator, name: &str) -> (String, String) {
 /// Create a serverless workgroup on `namespace` through the control plane that
 /// owns it. A new workgroup is reported `CREATING` and reaches `AVAILABLE` on its
 /// own a moment later, which is what makes the transient class observable.
-async fn create_workgroup(emulator: &Emulator, name: &str, namespace: &str) {
+pub(crate) async fn create_workgroup(emulator: &Emulator, name: &str, namespace: &str) {
     let (status, body) = emulator
         .call_serverless(
             "CreateWorkgroup",
@@ -155,7 +162,7 @@ async fn workgroup_status(emulator: &Emulator, name: &str) -> String {
 
 /// Wait until the workgroup the serverless control plane is bringing up reports
 /// itself available, polling rather than assuming any one span.
-async fn await_workgroup(emulator: &Emulator, name: &str) {
+pub(crate) async fn await_workgroup(emulator: &Emulator, name: &str) {
     for _ in 0..100 {
         if workgroup_status(emulator, name).await == "AVAILABLE" {
             return;

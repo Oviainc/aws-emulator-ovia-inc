@@ -163,3 +163,5 @@ mod zero_etl_integration_sources;
 mod zero_etl_integration_targets;
 #[path = "all/zero_etl_integrations.rs"]
 mod zero_etl_integrations;
+#[path = "all/zero_etl_source_decides_before_the_target.rs"]
+mod zero_etl_source_decides_before_the_target;

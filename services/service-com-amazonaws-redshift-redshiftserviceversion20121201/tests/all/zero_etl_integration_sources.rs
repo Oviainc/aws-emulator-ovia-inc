@@ -44,7 +44,10 @@ fn absent_target() -> String {
 }
 
 /// The DynamoDB table ARN for `name` in [`REGION`], as a caller writes it.
-fn table_arn(name: &str) -> String {
+///
+/// `pub(crate)` so the sibling suite about the ORDER the two ARNs are decided in
+/// writes the same ARN form rather than a second copy of it.
+pub(crate) fn table_arn(name: &str) -> String {
     format!(
         "arn:aws:dynamodb:{REGION}:{}:table/{name}",
         engine::emulator_account_id()
@@ -52,7 +55,7 @@ fn table_arn(name: &str) -> String {
 }
 
 /// `CreateIntegration` with just the three required members.
-async fn create_integration(
+pub(crate) async fn create_integration(
     emulator: &Emulator,
     name: &str,
     source: &str,
@@ -71,7 +74,7 @@ async fn create_integration(
 }
 
 /// Create the DynamoDB table `name` through the service that owns it.
-async fn create_table(emulator: &Emulator, case: &str, name: &str) {
+pub(crate) async fn create_table(emulator: &Emulator, case: &str, name: &str) {
     let (status, body) = emulator
         .call_dynamodb(
             "CreateTable",
@@ -92,7 +95,7 @@ async fn create_table(emulator: &Emulator, case: &str, name: &str) {
 /// Create the bucket `name` through Amazon S3's own `CreateBucket`, in [`REGION`]
 /// — a regional endpoint requires the create to state its own location
 /// constraint.
-async fn create_bucket(emulator: &Emulator, case: &str, name: &str) {
+pub(crate) async fn create_bucket(emulator: &Emulator, case: &str, name: &str) {
     emulator
         .s3()
         .create_bucket()
