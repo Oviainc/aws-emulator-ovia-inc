@@ -6,9 +6,11 @@
 //! [`advance`] is the entry point a request takes, and [`advance_pipeline`] the one the
 //! clock takes; both run the same walk. It alternates between the store (under the
 //! lock, planning the next due step) and the emulated services an action's work runs
-//! through (without the lock: S3 for artifact I/O, CodeCommit for a source revision,
-//! Lambda for an invoke action — each over the framework's in-process callback), so no
-//! step is ever reported as done without the work having been performed.
+//! through (without the lock: S3 for artifact I/O, KMS for the data key an artifact
+//! store's customer managed key encrypts an object with, CodeCommit for a source
+//! revision, Lambda for an invoke action — each over the framework's in-process
+//! callback), so no step is ever reported as done without the work having been
+//! performed.
 //!
 //! See [`super::execution`] for the data model and for why a reporting operation is
 //! allowed to run this at all (every step carries the instant the CLOCK made it due),
@@ -24,7 +26,8 @@ use std::time::SystemTime;
 use super::execution::{
     is_terminal_status, transition_held, ArtifactRef, EnvironmentOverrides, Job, JobOutcome,
     ACTION_STEP, CLAIM_TIMEOUT, FAILURE_CONFIGURATION_ERROR, FAILURE_JOB_FAILED,
-    MAX_ADVANCE_STEPS, MAX_ARCHIVE_ENTRIES, MAX_EXTRACTED_BYTES, MAX_EXTRACTED_ENTRY_BYTES,
+    FAILURE_REVISION_UNAVAILABLE, MAX_ADVANCE_STEPS, MAX_ARCHIVE_ENTRIES, MAX_EXTRACTED_BYTES,
+    MAX_EXTRACTED_ENTRY_BYTES,
     MAX_SOURCE_BYTES, MAX_SOURCE_FILES,
     STATUS_FAILED, STATUS_STOPPED, STATUS_STOPPING, STATUS_SUCCEEDED, STATUS_SUPERSEDED,
     TRANSITION_INBOUND, TRANSITION_OUTBOUND,
@@ -103,6 +106,11 @@ const CONFIG_ENVIRONMENT_VARIABLES: &str = "EnvironmentVariables";
 
 /// The configuration key carrying the text a Lambda action's event passes through.
 const CONFIG_USER_PARAMETERS: &str = "UserParameters";
+
+/// The configuration key naming the customer managed key an S3 deploy action encrypts
+/// the object it delivers under (that same action-structure reference, for the Amazon S3
+/// deploy action).
+const CONFIG_KMS_ENCRYPTION_KEY_ARN: &str = "KMSEncryptionKeyARN";
 
 /// `ActionExecutionStatus` values.
 const ACTION_IN_PROGRESS: &str = "InProgress";
@@ -935,6 +943,7 @@ fn start_action(
                         bucket: artifact_bucket.clone(),
                         key: artifact_key(&pipeline_name, name),
                         revision: None,
+                        encryption: artifact_encryption_key.clone(),
                     },
                 )
             })
@@ -964,15 +973,6 @@ fn start_action(
         // branch's tip and producing the files at it as the output artifact. Both
         // keys are what CodePipeline's CodeCommit source action declares, so a
         // declaration missing either cannot name a revision at all.
-        if let Some(key) = &artifact_encryption_key {
-            let detail = format!(
-                "the pipeline's artifact store declares the customer managed key {key}, \
-                 and this emulator cannot encrypt an artifact object with KMS, so the \
-                 artifact cannot be produced as declared"
-            );
-            fail_action(action, FAILURE_CONFIGURATION_ERROR, &detail, now);
-            return None;
-        }
         let (Some(repository), Some(branch)) = (
             config.get(CONFIG_REPOSITORY_NAME),
             config.get(CONFIG_BRANCH_NAME),
@@ -1003,6 +1003,7 @@ fn start_action(
                 bucket: artifact_bucket.clone(),
                 key: artifact_key(&pipeline_name, name),
                 revision: None,
+                encryption: artifact_encryption_key.clone(),
             })
             .collect();
         action.claimed = Some(now);
@@ -1058,6 +1059,7 @@ fn start_action(
                         bucket: artifact_bucket.clone(),
                         key: artifact_key(&pipeline_name, name),
                         revision: None,
+                        encryption: artifact_encryption_key.clone(),
                     },
                 )
             })
@@ -1081,21 +1083,6 @@ fn start_action(
     }
 
     if category == CATEGORY_SOURCE && provider == PROVIDER_S3 {
-        // "You can configure a customer managed key to encrypt the artifacts in the
-        // artifact store": the artifact object AWS writes is then encrypted with that
-        // key. This emulator's S3 holds no keys and refuses the server-side-encryption
-        // members, so an artifact it wrote would NOT be encrypted — reporting the action
-        // Succeeded would claim an encryption nothing performed, and the action fails
-        // with that reason instead.
-        if let Some(key) = &artifact_encryption_key {
-            let detail = format!(
-                "the pipeline's artifact store declares the customer managed key {key}, \
-                 and this emulator cannot encrypt an artifact object with KMS, so the \
-                 artifact cannot be produced as declared"
-            );
-            fail_action(action, FAILURE_CONFIGURATION_ERROR, &detail, now);
-            return None;
-        }
         let (Some(bucket), Some(declared_key)) = (config.get("S3Bucket"), config.get("S3ObjectKey"))
         else {
             fail_action(
@@ -1122,6 +1109,7 @@ fn start_action(
                 bucket: artifact_bucket.clone(),
                 key: artifact_key(&pipeline_name, name),
                 revision: None,
+                encryption: artifact_encryption_key.clone(),
             })
             .collect();
         // The object this run reads: the key the declaration states, under the key an
@@ -1198,6 +1186,16 @@ fn start_action(
             bucket: bucket.clone(),
             key,
             extract,
+            // "KMSEncryptionKeyARN" is the S3 deploy action's own configuration key for
+            // the customer managed key the DELIVERED object is encrypted under; an
+            // action that names none delivers under the key the pipeline's artifact
+            // store declares, which is the key every other object of this execution
+            // carries.
+            encryption_key: config
+                .get(CONFIG_KMS_ENCRYPTION_KEY_ARN)
+                .filter(|key| !key.is_empty())
+                .cloned()
+                .or_else(|| artifact_encryption_key.clone()),
         });
     }
 
@@ -1206,15 +1204,6 @@ fn start_action(
         // configuration names, at the tag it names: the work is resolving that tag to
         // the image the registry holds and producing the image's detail as the output
         // artifact, which is what a deploy action downstream reads the image URI from.
-        if let Some(key) = &artifact_encryption_key {
-            let detail = format!(
-                "the pipeline's artifact store declares the customer managed key {key}, \
-                 and this emulator cannot encrypt an artifact object with KMS, so the \
-                 artifact cannot be produced as declared"
-            );
-            fail_action(action, FAILURE_CONFIGURATION_ERROR, &detail, now);
-            return None;
-        }
         let Some(repository) = config.get(CONFIG_REPOSITORY_NAME) else {
             fail_action(
                 action,
@@ -1245,6 +1234,7 @@ fn start_action(
                 bucket: artifact_bucket.clone(),
                 key: artifact_key(&pipeline_name, name),
                 revision: None,
+                encryption: artifact_encryption_key.clone(),
             })
             .collect();
         action.claimed = Some(now);
@@ -1606,12 +1596,123 @@ fn lambda_client(
     ::aws_sdk_lambda::Client::from_conf(config)
 }
 
+/// A KMS client over the in-process callback into this same emulator.
+///
+/// Built exactly like [`s3_client`], for the same reasons.
+fn kms_client(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+) -> ::aws_sdk_kms::Client {
+    let config = ::aws_sdk_kms::Config::builder()
+        .behavior_version(::aws_sdk_kms::config::BehaviorVersion::latest())
+        .region(::aws_sdk_kms::config::Region::new(region.to_string()))
+        .endpoint_url(super::in_process_endpoint("kms"))
+        .credentials_provider(callback.aws_credentials_provider())
+        .http_client(callback.http_client())
+        .retry_config(::aws_sdk_kms::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_kms::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_kms::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_kms::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_kms::Client::from_conf(config)
+}
+
+/// Take the data key one object's server-side encryption under `key_id` needs, and
+/// answer why that key cannot be used when KMS refuses it.
+///
+/// `ArtifactStore$encryptionKey` is "the encryption key used to encrypt the data in the
+/// artifact store... for example, an AWS Key Management Service key", and encrypting an
+/// object under a customer managed key is a use of that key: KMS issues a data key for
+/// it per object. So the key is really used here — through the same `GenerateDataKey`
+/// S3 performs for SSE-KMS — and whatever KMS says about it decides the action: a key
+/// that is disabled, pending deletion or not there at all refuses the call, and an
+/// artifact that cannot be encrypted as the store declares is an artifact that cannot
+/// be produced.
+async fn artifact_data_key(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    key_id: &str,
+) -> Result<(), String> {
+    kms_client(callback, region)
+        .generate_data_key()
+        .key_id(key_id)
+        // The data key an S3 object's SSE-KMS encryption takes.
+        .key_spec(::aws_sdk_kms::types::DataKeySpec::Aes256)
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string()
+        })
+}
+
+/// One artifact write, carrying the server-side encryption the artifact store's
+/// customer managed key asks for.
+///
+/// The members are S3's own (`PutObjectRequest$ServerSideEncryption` and
+/// `$SSEKMSKeyId`), so the object a later `HeadObject`/`GetObject` reports is reported
+/// as encrypted under exactly the key the store declares. A write with no key declared
+/// names neither member and inherits whatever the bucket's own default configuration is.
+fn encrypted_put(
+    request: ::aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+    encryption: Option<&str>,
+) -> ::aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
+    match encryption {
+        Some(key_id) => request
+            .server_side_encryption(::aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+            .ssekms_key_id(key_id),
+        None => request,
+    }
+}
+
+/// CodePipeline's own detail for a failure it does not surface the cause of: the fixed
+/// text, and the reference code that names THIS occurrence of it.
+///
+/// A failure the pipeline's own work ran into inside a service CodePipeline called on
+/// the account's behalf is not a fact about the caller's declaration, and CodePipeline
+/// does not relay it: the action's `errorDetails` carry this shape, with a reference
+/// code an operator correlates against the service's own records. The cause is written
+/// to this emulator's log under the same code, which is where that correlation lands
+/// here.
+fn internal_error_detail(reference: &str) -> String {
+    format!("InternalError. Error reference code: {reference}.")
+}
+
 /// Perform one claimed job's real work.
 async fn run_job(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     job: &Job,
 ) -> JobOutcome {
+    // An artifact the pipeline's artifact store encrypts is written under a data key KMS
+    // issues for that store's key, so the key is taken BEFORE any of the job's work is
+    // performed: a key KMS will not let this account use is an artifact that cannot be
+    // produced, whichever action was about to produce it.
+    if let Some(key_id) = job.artifact_encryption() {
+        if let Err(detail) = artifact_data_key(callback, region, key_id).await {
+            // The work the action was running — producing or delivering its artifact —
+            // is what failed, so the failure is the RUN's own ([`FAILURE_JOB_FAILED`])
+            // and not a declaration that could never run: a store whose key cannot be
+            // used right now is one whose key can be used again later, as re-enabling it
+            // shows. What KMS said is not relayed to the caller (see
+            // [`internal_error_detail`]) and is logged under the reference code instead.
+            let reference = random_uuid_v4();
+            ::tracing::warn!(
+                reference = %reference,
+                key_id = %key_id,
+                detail = %detail,
+                "an artifact object could not be encrypted under the artifact store's \
+                 customer managed key"
+            );
+            return JobOutcome::Failed {
+                code: FAILURE_JOB_FAILED.to_string(),
+                message: internal_error_detail(&reference),
+                external_id: None,
+            };
+        }
+    }
     match job {
         Job::S3Source {
             bucket,
@@ -1667,6 +1768,7 @@ async fn run_job(
             bucket,
             key,
             extract,
+            encryption_key,
             ..
         } => {
             run_deploy(
@@ -1675,6 +1777,7 @@ async fn run_job(
                 bucket,
                 key.as_deref(),
                 *extract,
+                encryption_key.as_deref(),
             )
             .await
         }
@@ -1748,6 +1851,9 @@ async fn run_code_commit_source(
                 err.is_repository_does_not_exist_exception()
                     || err.is_branch_does_not_exist_exception()
             });
+            // A repository or a branch the declaration names and the service does not
+            // hold is a declaration this pipeline cannot source from at all, not a
+            // revision that is missing from a source it can.
             let code = if unreachable {
                 FAILURE_CONFIGURATION_ERROR
             } else {
@@ -1766,7 +1872,7 @@ async fn run_code_commit_source(
     };
     if commit_id.is_empty() {
         return JobOutcome::Failed {
-            code: FAILURE_CONFIGURATION_ERROR.to_string(),
+            code: FAILURE_REVISION_UNAVAILABLE.to_string(),
             message: format!(
                 "the branch {branch} of the repository {repository} reports no commit, so \
                  there is no revision to source"
@@ -1891,13 +1997,15 @@ async fn run_code_commit_source(
         }
     };
     for output in outputs {
-        if let Err(err) = s3
-            .put_object()
-            .bucket(&output.bucket)
-            .key(&output.key)
-            .body(::aws_sdk_s3::primitives::ByteStream::from(archive.clone()))
-            .send()
-            .await
+        if let Err(err) = encrypted_put(
+            s3.put_object()
+                .bucket(&output.bucket)
+                .key(&output.key)
+                .body(::aws_sdk_s3::primitives::ByteStream::from(archive.clone())),
+            output.encryption.as_deref(),
+        )
+        .send()
+        .await
         {
             return JobOutcome::Failed {
                 code: FAILURE_JOB_FAILED.to_string(),
@@ -2053,6 +2161,32 @@ fn zip_of(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
     Ok(cursor.into_inner())
 }
 
+/// The error code S3 answers when the BUCKET a request names is not there at all.
+///
+/// From S3's own error catalog, where it is the code of "the specified bucket does not
+/// exist" — the one answer to a read of an artifact's source that says the source
+/// itself, rather than the revision in it, is missing.
+const S3_NO_SUCH_BUCKET: &str = "NoSuchBucket";
+
+/// The `FailureType` a source action's failed READ of its object is reported under.
+///
+/// The OBJECT (at the version the execution pinned, or at its current version) IS the
+/// revision an S3 source action sources, so an object the bucket does not hold is a
+/// revision that is not available — [`FAILURE_REVISION_UNAVAILABLE`]. A bucket the
+/// service does not hold at all is the other fact: the declaration names a source this
+/// pipeline cannot read from, which is a configuration error, the same way a repository
+/// no registry holds is for the other source providers.
+fn source_failure_code<E, R>(error: &::aws_smithy_runtime_api::client::result::SdkError<E, R>) -> &'static str
+where
+    ::aws_smithy_runtime_api::client::result::SdkError<E, R>:
+        ::aws_smithy_types::error::metadata::ProvideErrorMetadata,
+{
+    match ::aws_smithy_types::error::metadata::ProvideErrorMetadata::code(error) {
+        Some(S3_NO_SUCH_BUCKET) => FAILURE_CONFIGURATION_ERROR,
+        _ => FAILURE_REVISION_UNAVAILABLE,
+    }
+}
+
 /// Read the source object and write it into the artifact store.
 async fn run_source(
     client: &::aws_sdk_s3::Client,
@@ -2072,7 +2206,7 @@ async fn run_source(
         Ok(object) => object,
         Err(err) => {
             return JobOutcome::Failed {
-                code: FAILURE_JOB_FAILED.to_string(),
+                code: source_failure_code(&err).to_string(),
                 message: format!(
                     "the source object s3://{bucket}/{key} could not be read: {}",
                     ::aws_smithy_types::error::display::DisplayErrorContext(&err)
@@ -2087,20 +2221,23 @@ async fn run_source(
         Ok(bytes) => bytes.into_bytes(),
         Err(err) => {
             return JobOutcome::Failed {
-                code: FAILURE_JOB_FAILED.to_string(),
+                code: FAILURE_REVISION_UNAVAILABLE.to_string(),
                 message: format!("the source object s3://{bucket}/{key} could not be read: {err}"),
                 external_id: None,
             }
         }
     };
     for output in outputs {
-        if let Err(err) = client
-            .put_object()
-            .bucket(&output.bucket)
-            .key(&output.key)
-            .body(::aws_sdk_s3::primitives::ByteStream::from(bytes.clone()))
-            .send()
-            .await
+        if let Err(err) = encrypted_put(
+            client
+                .put_object()
+                .bucket(&output.bucket)
+                .key(&output.key)
+                .body(::aws_sdk_s3::primitives::ByteStream::from(bytes.clone())),
+            output.encryption.as_deref(),
+        )
+        .send()
+        .await
         {
             return JobOutcome::Failed {
                 code: FAILURE_JOB_FAILED.to_string(),
@@ -2140,6 +2277,7 @@ async fn run_deploy(
     bucket: &str,
     key: Option<&str>,
     extract: bool,
+    encryption: Option<&str>,
 ) -> JobOutcome {
     let read = client
         .get_object()
@@ -2217,13 +2355,16 @@ async fn run_deploy(
 
     let count = entries.len();
     for (object_key, body) in entries {
-        if let Err(err) = client
-            .put_object()
-            .bucket(bucket)
-            .key(&object_key)
-            .body(::aws_sdk_s3::primitives::ByteStream::from(body))
-            .send()
-            .await
+        if let Err(err) = encrypted_put(
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(&object_key)
+                .body(::aws_sdk_s3::primitives::ByteStream::from(body)),
+            encryption,
+        )
+        .send()
+        .await
         {
             return JobOutcome::Failed {
                 code: FAILURE_JOB_FAILED.to_string(),

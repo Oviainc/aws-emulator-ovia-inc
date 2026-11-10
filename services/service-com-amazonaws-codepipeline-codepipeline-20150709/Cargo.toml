@@ -26,6 +26,15 @@ aws-sdk-lambda = { version = "1", default-features = false, features = ["rt-toki
 # The Amazon ECR client an ECR source action resolves the image it sources with, over the
 # same in-process callback (`state::driver::image_source`).
 aws-sdk-ecr = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The KMS client the execution engine takes the data key an artifact store's customer
+# managed key encrypts each artifact object with from, over the same callback: a key KMS
+# will not let this account use is an artifact that cannot be produced
+# (`state::driver::artifact_data_key`).
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The STS session registry, so the identity this service records for a request (the
+# reviewer an approval's `lastUpdatedBy` names) is the principal the credential it was
+# signed with was minted for (see `crate::state::caller_identity_arn`).
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # The CodeBuild client a Build action starts its build and reads that build with, over the
 # same in-process callback (`state::driver::build_action`).
 aws-sdk-codebuild = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
@@ -94,6 +103,10 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # action's work to reach.
 service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { workspace = true }
 service-com-amazonaws-codebuild-codebuild-20161006 = { workspace = true }
+# KMS is mounted beside codepipeline in the artifact-store-encryption suite, because the
+# key an artifact store declares is a key of that service: without it mounted there is no
+# key for an artifact's encryption to be taken from.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [lints]

@@ -166,6 +166,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused a value outside the enum, so reaching here means it is one of them.
         let approved = input.result.status == "Approved";
         let now = ::std::time::SystemTime::now();
+        // WHO answered the approval, resolved BEFORE this service's store is locked, so
+        // the STS and IAM stores the resolution reads are never reached while this
+        // service's own guard is held.
+        let reviewer = crate::state::caller_identity_arn(&*self.engine, ctx);
 
         let mut state = state.lock();
         if !state.pipelines.contains_key(&input.pipeline_name) {
@@ -254,11 +258,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if approved { "Succeeded" } else { "Failed" }.to_string(),
             );
             action.summary = Some(input.result.summary.clone());
-            // `ActionExecution$lastUpdatedBy` is the identity that answered the
-            // approval. This emulator does not resolve a caller identity, so the member
-            // stays absent rather than carrying an invented one — the same convention
-            // `ExecutionTrigger$triggerDetail` follows.
-            action.last_updated_by = None;
+            // `ActionExecution$lastUpdatedBy` is "the ARN of the user who last changed
+            // the pipeline": the identity that ANSWERED this approval, which is the
+            // principal this request speaks for.
+            action.last_updated_by = Some(reviewer.clone());
             action.last_status_change = now;
             action.token = None;
             if !approved {

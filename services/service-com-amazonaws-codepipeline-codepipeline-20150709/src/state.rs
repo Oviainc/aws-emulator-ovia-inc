@@ -25,6 +25,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
+use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_state;
+
 use crate::ops::types::{
     ActionConfiguration, ActionConfigurationProperty, ActionContext, ActionDeclaration,
     ActionExecutionDetail, ActionExecutionInput, ActionExecutionOutput, ActionExecutionResult,
@@ -3313,6 +3315,10 @@ pub struct ActionExecutionRecord {
     pub start_time: SystemTime,
     /// When this record last changed.
     pub last_update_time: SystemTime,
+    /// The ARN of the principal that last changed this run, when a caller's own call did
+    /// — the reviewer that answered an approval. `None` for a run only the execution
+    /// plane moved.
+    pub updated_by: Option<String>,
     /// The action's input, as its declaration configures it.
     pub input: ActionExecutionInput,
     /// What the action's run produced, once it has produced anything.
@@ -3336,9 +3342,8 @@ impl ActionExecutionRecord {
     /// with no `s3location`, because the location an input artifact was read at is the
     /// producing action's output rather than this action's declaration.
     ///
-    /// `updatedBy` is absent: it is the identity of the user who last changed the
-    /// execution, which this emulator does not resolve (the same reason
-    /// `ExecutionTrigger$triggerDetail` is absent).
+    /// `updatedBy` is the identity of the principal that last changed the run, which is
+    /// recorded on the run itself when a caller's own call moved it.
     fn of(
         execution: &PipelineExecutionRecord,
         action_run: &ActionRun,
@@ -3361,6 +3366,7 @@ impl ActionExecutionRecord {
                 .unwrap_or_else(|| ACTION_STATUS_IN_PROGRESS.to_string()),
             start_time: action_run.start_time.unwrap_or(execution.start_time),
             last_update_time: action_run.last_status_change,
+            updated_by: action_run.last_updated_by.clone(),
             input: ActionExecutionInput {
                 action_type_id: Some(action.action_type_id.clone()),
                 resolved_configuration: configuration
@@ -3401,9 +3407,10 @@ impl ActionExecutionRecord {
             action_name: Some(self.action_name.clone()),
             start_time: Some(to_date_time(self.start_time)),
             last_update_time: Some(to_date_time(self.last_update_time)),
-            // The ARN of the user who last changed the execution: not resolved here,
-            // so absent rather than invented.
-            updated_by: None,
+            // The ARN of the user who last changed the execution: recorded when a
+            // caller's own call moved this run (the reviewer that answered its
+            // approval), and absent for a run only the execution plane moved.
+            updated_by: self.updated_by.clone(),
             status: Some(self.status.clone()),
             input: Some(self.input.clone()),
             output: self.output.clone(),
@@ -3500,20 +3507,21 @@ pub const MAX_RESOLVED_CONFIGURATION_VALUE_BYTES: usize = 1_000 * 1_000;
 /// resolved for that variable, or `None` when a reference is left that this emulator
 /// cannot resolve here.
 ///
-/// CodePipeline's variable syntax is `#{namespace.variable}`. Two namespaces are facts
-/// about the execution itself and are substituted here: a pipeline-level variable — the
-/// kind `PipelineDeclaration$variables` declares and `StartPipelineExecution` overrides,
+/// CodePipeline's variable syntax is `#{namespace.variable}`, and every namespace of it
+/// is a fact about the EXECUTION: a pipeline-level variable — the kind
+/// `PipelineDeclaration$variables` declares and `StartPipelineExecution` overrides,
 /// which an execution record resolves ([`resolve_execution_variables`]) — under
-/// `variables`, and the service's own built-ins under
-/// [`BUILT_IN_VARIABLE_NAMESPACE`] ([`PipelineExecutionRecord::resolution_variables`]).
+/// `variables`; an action's output variables under the namespace that action declares,
+/// published as it ran; and the service's own built-ins under
+/// [`BUILT_IN_VARIABLE_NAMESPACE`]. All three are what the execution carries
+/// ([`PipelineExecutionRecord::resolution_variables`]), which is the one set the engine
+/// resolves an action's configuration against when it runs it
+/// ([`execution::resolved_configuration`]) — so what a later action RAN with is what
+/// this reader reports for it.
 ///
-/// Every other namespace is an ACTION's: its values are the output variables that
-/// action published as it ran, which the engine resolves against the execution's own
-/// variable map when it runs the action ([`execution::resolved_configuration`]). A
-/// reference in the STORED configuration that this reader cannot resolve therefore
-/// leaves the configuration with no resolved form at all, and
-/// `ActionExecutionInput$resolvedConfiguration` is reported absent rather than
-/// half-resolved. A configuration with no reference in it resolves to itself.
+/// A reference the execution carries no value for at all leaves the configuration with
+/// no resolved form, and `ActionExecutionInput$resolvedConfiguration` is reported absent
+/// rather than half-resolved. A configuration with no reference in it resolves to itself.
 ///
 /// The resolvable variables are indexed by their FULL reference name once and each value
 /// is then resolved in a single pass, so resolution is linear in the configuration's
@@ -3528,20 +3536,16 @@ fn resolved_configuration(
     configuration: &HashMap<String, String>,
     execution: &PipelineExecutionRecord,
 ) -> Option<HashMap<String, String>> {
-    let mut by_reference: HashMap<String, &str> = execution
-        .variables
+    // Every variable the EXECUTION resolves a reference against — the pipeline-level
+    // ones, the output variables its actions published as they ran, and the service's
+    // own built-ins — read through the one accessor the engine resolves a configuration
+    // with, so a value this reader reports and the value the action ran with cannot
+    // name different variables.
+    let variables = execution.resolution_variables();
+    let by_reference: HashMap<&str, &str> = variables
         .iter()
-        .filter_map(|variable| {
-            Some((
-                format!("{VARIABLES_NAMESPACE}.{}", variable.name.as_deref()?),
-                variable.resolved_value.as_deref()?,
-            ))
-        })
+        .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    by_reference.insert(
-        format!("{BUILT_IN_VARIABLE_NAMESPACE}.{BUILT_IN_PIPELINE_EXECUTION_ID}"),
-        execution.pipeline_execution_id.as_str(),
-    );
 
     let mut resolved = HashMap::with_capacity(configuration.len());
     for (key, value) in configuration {
@@ -3564,7 +3568,7 @@ const VARIABLES_NAMESPACE: &str = "variables";
 /// A replacement is never re-scanned: a variable whose value is itself `#{...}` text
 /// is substituted literally, the way a single-pass substitution does, so no chain of
 /// references can amplify one request into unbounded allocation.
-fn substitute_variables(value: &str, by_reference: &HashMap<String, &str>) -> Option<String> {
+fn substitute_variables(value: &str, by_reference: &HashMap<&str, &str>) -> Option<String> {
     let mut resolved = String::new();
     let mut rest = value;
     while let Some(start) = rest.find("#{") {
@@ -3699,6 +3703,40 @@ pub async fn role_is_absent(
             .as_service_error()
             .is_some_and(::aws_sdk_iam::operation::get_role::GetRoleError::is_no_such_entity_exception),
     }
+}
+
+/// The ARN of the principal this request speaks for — the identity a member naming WHO
+/// did something carries.
+///
+/// `ActionExecution$lastUpdatedBy` is "the ARN of the user who last changed the
+/// pipeline", so the value is the caller's own identity and never one invented here. It
+/// is resolved the way `sts:GetCallerIdentity` answers that same request: the access key
+/// the request was signed with names either a SESSION the STS store recorded — whose
+/// identity is the `assumed-role` ARN STS minted for it — or a LONG-TERM key, whose
+/// identity is the IAM user the account holds that key for, and the account's own
+/// principal for a key no IAM record names. One resolution, so a caller comparing a
+/// value this service recorded with its own identity sees one principal.
+pub fn caller_identity_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    let iam = sts_state::iam_state(engine);
+    let guard = iam.as_ref().map(|iam| iam.lock());
+    let long_term = sts_state::long_term_identity(guard.as_deref(), &access_key_id);
+    drop(guard);
+    let Some(registry) = sts_state::service_state(engine) else {
+        return long_term.arn;
+    };
+    let resolved = sts_state::resolve_request_caller(
+        &mut registry.lock(),
+        &access_key_id,
+        SystemTime::now(),
+        ctx.credential_store(),
+        long_term.clone(),
+    )
+    .map(|caller| caller.identity);
+    resolved.unwrap_or(long_term).arn
 }
 
 /// The endpoint URL an in-process call to another emulated service is addressed at.
@@ -3839,7 +3877,7 @@ pub fn start_execution(
             .iter()
             .filter_map(|variable| {
                 Some((
-                    format!("variables.{}", variable.name.clone()?),
+                    format!("{VARIABLES_NAMESPACE}.{}", variable.name.clone()?),
                     variable.resolved_value.clone()?,
                 ))
             })

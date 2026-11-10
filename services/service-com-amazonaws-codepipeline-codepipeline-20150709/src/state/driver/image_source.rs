@@ -228,13 +228,15 @@ pub(super) async fn run_ecr_source(
         }
     };
     for output in outputs {
-        if let Err(err) = s3
-            .put_object()
-            .bucket(&output.bucket)
-            .key(&output.key)
-            .body(::aws_sdk_s3::primitives::ByteStream::from(archive.clone()))
-            .send()
-            .await
+        if let Err(err) = super::encrypted_put(
+            s3.put_object()
+                .bucket(&output.bucket)
+                .key(&output.key)
+                .body(::aws_sdk_s3::primitives::ByteStream::from(archive.clone())),
+            output.encryption.as_deref(),
+        )
+        .send()
+        .await
         {
             return JobOutcome::Failed {
                 code: FAILURE_JOB_FAILED.to_string(),

@@ -79,6 +79,12 @@ impl Emulator {
         router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
             Arc::clone(&engine),
         ));
+        // The artifact store's customer managed key is a key of the KMS service: the
+        // engine takes the data key each artifact object is encrypted under from it, so
+        // without KMS mounted there is no key for that encryption to come from.
+        router.register_service(
+            service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(&engine)),
+        );
         Self { router, engine }
     }
 
@@ -196,6 +202,50 @@ impl Emulator {
             .get("x-amz-version-id")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string)
+    }
+
+    /// Call one KMS operation that must succeed.
+    ///
+    /// KMS speaks `awsJson1_1` under the `TrentService` target prefix
+    /// (`smithy_query query="service_info"` -> `service: TrentService`,
+    /// `protocols: [awsJson1_1]`).
+    pub(crate) async fn kms(&self, operation: &str, body: &Value) -> Value {
+        let authorization = "AWS4-HMAC-SHA256 \
+             Credential=AKIDEXAMPLE/20260101/us-east-1/kms/aws4_request, \
+             SignedHeaders=host;x-amz-date, Signature=0123456789abcdef";
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://kms.us-east-1.amazonaws.com/")
+            .header("host", "kms.us-east-1.amazonaws.com")
+            .header("authorization", authorization)
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("TrentService.{operation}"))
+            .body(bytes::Bytes::from(body.to_string()))
+            .expect("a valid request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let body = response.into_body();
+        let parsed: Value = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap_or_else(|error| {
+                panic!("{operation}: response body is not JSON ({error}): {body:?}")
+            })
+        };
+        assert_eq!(
+            status, 200,
+            "{operation}: expected HTTP 200, got {status} with {parsed}"
+        );
+        parsed
+    }
+
+    /// Read an object's metadata: the status and the response headers, which is where
+    /// S3 reports the server-side encryption an object carries.
+    pub(crate) async fn head_object(&self, bucket: &str, key: &str) -> (u16, http::HeaderMap) {
+        let (status, headers, _) = self
+            .s3("HEAD", &format!("/{bucket}/{key}"), &[], b"")
+            .await;
+        (status, headers)
     }
 
     /// Read an object: the status and the bytes.
@@ -1171,11 +1221,15 @@ async fn a_start_past_the_pipelines_concurrency_ceiling_is_refused() {
 }
 
 #[tokio::test]
-async fn an_artifact_store_with_a_customer_managed_key_fails_with_that_reason() {
+async fn an_artifact_store_whose_key_kms_will_not_issue_fails_with_that_reason() {
     // "You can configure a customer managed key to encrypt the artifacts in the artifact
-    // store": this emulator's S3 holds no keys, so the artifact it wrote would not be
-    // encrypted. The action fails with that reason rather than reporting a success that
-    // claims an encryption nothing performed.
+    // store": encrypting an artifact object under that key is a USE of the key, so KMS
+    // decides whether it can be used. A key the service does not hold cannot issue the
+    // data key the artifact's encryption takes, and an artifact that cannot be encrypted
+    // as the store declares is one that cannot be produced — the action fails with that
+    // reason rather than reporting a success that claims an encryption nothing performed.
+    // (The usable-key rule, and the key whose state changes under a running pipeline,
+    // are the table in `tests/all/artifact_store_encryption.rs`.)
     let emulator = Emulator::new();
     let pipeline = "cmk-pipe";
     emulator.bucket(&artifact_bucket(pipeline)).await;
@@ -1184,6 +1238,10 @@ async fn an_artifact_store_with_a_customer_managed_key_fails_with_that_reason() 
     emulator
         .put_object("source-bucket", "source.zip", b"cmk bytes")
         .await;
+    let absent_key = format!(
+        "arn:aws:kms:us-east-1:000000000000:key/{}",
+        "11111111-2222-4333-8444-555555555555"
+    );
     let mut body = declaration(
         pipeline,
         json!([
@@ -1193,7 +1251,7 @@ async fn an_artifact_store_with_a_customer_managed_key_fails_with_that_reason() 
         None,
     );
     body["pipeline"]["artifactStore"]["encryptionKey"] = json!({
-        "id": format!("arn:aws:kms:us-east-1:000000000000:key/{}", "11111111-2222-4333-8444-555555555555"),
+        "id": absent_key,
         "type": "KMS",
     });
     emulator.ok("CreatePipeline", &body).await;
@@ -1205,14 +1263,20 @@ async fn an_artifact_store_with_a_customer_managed_key_fails_with_that_reason() 
     assert_eq!(
         answer["pipelineExecution"]["status"].as_str(),
         Some("Failed"),
-        "an artifact store this emulator cannot honour fails the execution, got {answer}"
+        "an artifact store whose key cannot be used fails the execution, got {answer}"
     );
     let summary = answer["pipelineExecution"]["statusSummary"]
         .as_str()
         .unwrap_or_default();
     assert!(
-        summary.contains("KMS"),
-        "the reason says what could not be done, got {summary:?}"
+        summary.contains("InternalError. Error reference code: "),
+        "the reason is CodePipeline's internal-error shape: what KMS said about the key \
+         is not relayed to the caller, got {summary:?}"
+    );
+    let (status, _) = emulator.head_object("deploy-bucket", "cmk.zip").await;
+    assert_eq!(
+        status, 404,
+        "nothing is delivered when the artifact could not be encrypted, got {status}"
     );
 }
 

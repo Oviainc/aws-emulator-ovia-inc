@@ -193,6 +193,16 @@ pub const FAILURE_JOB_FAILED: &str = "JobFailed";
 /// The `FailureType` reported for a declaration this emulator cannot execute at all.
 pub const FAILURE_CONFIGURATION_ERROR: &str = "ConfigurationError";
 
+/// The `FailureType` reported when the REVISION a source action was asked to source
+/// cannot be obtained at all: the object, the branch tip or the image the action's
+/// configuration names is not there to be read.
+///
+/// From the same modelled enum, which carries a value for exactly that condition —
+/// the revision is unavailable — rather than for work that ran and failed
+/// ([`FAILURE_JOB_FAILED`]) or for a declaration that could never run
+/// ([`FAILURE_CONFIGURATION_ERROR`]).
+pub const FAILURE_REVISION_UNAVAILABLE: &str = "RevisionUnavailable";
+
 /// The `SourceRevisionType` whose value is the S3 object VERSION a source action reads.
 pub const SOURCE_REVISION_TYPE_S3_OBJECT_VERSION_ID: &str = "S3_OBJECT_VERSION_ID";
 
@@ -251,6 +261,14 @@ pub struct ArtifactRef {
     pub key: String,
     /// The revision the artifact was produced from, when the producing action has one.
     pub revision: Option<String>,
+    /// The customer managed key the object at this location is encrypted under, when
+    /// the pipeline's artifact store declares one (`ArtifactStore$encryptionKey`: "the
+    /// encryption key used to encrypt the data in the artifact store").
+    ///
+    /// It travels with the LOCATION because it is how the object there is written and
+    /// read: every artifact of one execution lands in that store, so the key the store
+    /// declares is the key each of its objects carries.
+    pub encryption: Option<String>,
 }
 
 /// One action of one stage of one execution, as the engine runs it.
@@ -855,6 +873,10 @@ pub enum Job {
         /// "Extract file before deploy": every entry of the artifact archive is
         /// delivered under `key` instead of the archive itself.
         extract: bool,
+        /// The customer managed key the delivered object is encrypted under, when one
+        /// applies: the key the action's own `KMSEncryptionKeyARN` names, and otherwise
+        /// the one the pipeline's artifact store declares.
+        encryption_key: Option<String>,
     },
     /// An Amazon ECR source action: resolve the image the configuration names and write
     /// the image detail of it into the artifact store.
@@ -904,6 +926,29 @@ pub enum Job {
 }
 
 impl Job {
+    /// The customer managed key the objects this job WRITES are encrypted under, when
+    /// one applies.
+    ///
+    /// Every object a job writes into the pipeline's artifact store carries the key that
+    /// store declares ([`ArtifactRef::encryption`]), and a deploy action's delivered
+    /// object carries the one the deploy itself resolved; a job that writes no object has
+    /// none. One answer per job, so the key the write uses and the key whose use is
+    /// checked with KMS first cannot drift.
+    pub fn artifact_encryption(&self) -> Option<&str> {
+        match self {
+            Self::S3Source { outputs, .. }
+            | Self::CodeCommitSource { outputs, .. }
+            | Self::EcrSource { outputs, .. } => outputs
+                .iter()
+                .find_map(|output| output.encryption.as_deref()),
+            Self::LambdaInvoke { outputs, .. } => outputs
+                .iter()
+                .find_map(|(_, output)| output.encryption.as_deref()),
+            Self::S3Deploy { encryption_key, .. } => encryption_key.as_deref(),
+            Self::CodeBuildStart { .. } | Self::CodeBuildPoll { .. } => None,
+        }
+    }
+
     /// Where in the store this job's action lives.
     pub fn target(&self) -> (&str, usize, usize) {
         match self {

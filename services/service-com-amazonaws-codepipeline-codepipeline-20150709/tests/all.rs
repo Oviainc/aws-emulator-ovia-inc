@@ -31,6 +31,10 @@ mod action_type_provider_entitlement;
 mod action_type_wire_form;
 #[path = "all/approval_result_messages.rs"]
 mod approval_result_messages;
+#[path = "all/approval_reviewer.rs"]
+mod approval_reviewer;
+#[path = "all/artifact_store_encryption.rs"]
+mod artifact_store_encryption;
 #[path = "all/built_in_execution_variables.rs"]
 mod built_in_execution_variables;
 #[path = "all/codecommit_source_actions.rs"]
@@ -79,6 +83,8 @@ mod rule_executions;
 mod run_order_concurrency;
 #[path = "all/s3_deploy_object_key.rs"]
 mod s3_deploy_object_key;
+#[path = "all/source_revision_failures.rs"]
+mod source_revision_failures;
 #[path = "all/source_revision_overrides.rs"]
 mod source_revision_overrides;
 #[path = "all/stage_condition_overrides.rs"]
