@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the named tag keys from the resource its `resourceArn` names: each key the
+//! resource carries is dropped from that resource's own stored record and the answer is
+//! the modelled empty output. A key the resource does not carry is not an error — the
+//! call states which keys must be gone, so it is idempotent — while an ARN that names no
+//! resource this account and Region holds is refused `ResourceNotFoundException`.
+//!
+//! Which record an ARN resolves to, and the tag set on it, live in the state's tag
+//! slice, shared with `TagResource` and `ListTagsForResource`.
 //!
 //! ## Shape of an operation
 //!
@@ -96,10 +96,19 @@ impl ::aws_smithy_schema::serde::SerializableStruct for UntagResourceOutput {
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.timestreaminfluxdb#UntagResource")]
+//
+// `InternalServerException` — a shape the SERVICE models and other operations declare,
+// which this operation does not list — is widened in through `extra_errors`, so an
+// unreachable shared store has a modelled server failure to answer with rather than a
+// success that removed nothing.
+#[smithy_macros::operation_error(
+    "com.amazonaws.timestreaminfluxdb#UntagResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -153,18 +162,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        use crate::state as st;
+
+        let _ = ctx;
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(tags) = store.resource_tags_mut(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                st::tagged_resource_not_found(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // A key the resource does not carry is already absent, which is what the request
+        // asks for: removing it is a no-op, not a failure.
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+
+        Ok(UntagResourceOutput)
     }
 }

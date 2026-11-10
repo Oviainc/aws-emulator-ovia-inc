@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches the request's tags to the resource its `resourceArn` names: the tags are
+//! merged into that resource's own stored record — a key the resource already carries
+//! takes the new value — and the answer is the modelled empty output. An ARN that names
+//! no resource this account and Region holds is refused `ResourceNotFoundException`, and
+//! a merge that would take the record past [`crate::state::MAX_TAGS_PER_RESOURCE`] tags
+//! is refused `ServiceQuotaExceededException` with the record left untouched.
+//!
+//! Which record an ARN resolves to, and the tag set on it, live in the state's tag
+//! slice, shared with `UntagResource` and `ListTagsForResource`.
 //!
 //! ## Shape of an operation
 //!
@@ -99,11 +100,20 @@ impl ::aws_smithy_schema::serde::SerializableStruct for TagResourceOutput {
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.timestreaminfluxdb#TagResource")]
+//
+// `InternalServerException` — a shape the SERVICE models and other operations declare,
+// which this operation does not list — is widened in through `extra_errors`, so an
+// unreachable shared store has a modelled server failure to answer with rather than a
+// success that persisted nothing.
+#[smithy_macros::operation_error(
+    "com.amazonaws.timestreaminfluxdb#TagResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -157,18 +167,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        use crate::state as st;
+
+        let _ = ctx;
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(tags) = store.resource_tags_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                st::tagged_resource_not_found(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // What the merge would leave on the record: the keys it already carries plus the
+        // ones this request introduces. Counted BEFORE anything is written, so a refused
+        // request changes nothing.
+        let merged = tags.len()
+            + input
+                .tags
+                .keys()
+                .filter(|key| !tags.contains_key(*key))
+                .count();
+        if merged > st::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: st::tag_quota_exceeded_message(&input.resource_arn, merged),
+                },
+            )
+            .into());
+        }
+
+        // A key the resource already carries takes the request's value; the rest are
+        // added. Nothing else on the record is touched.
+        for (key, value) in &input.tags {
+            tags.insert(key.clone(), value.clone());
+        }
+
+        Ok(TagResourceOutput)
     }
 }

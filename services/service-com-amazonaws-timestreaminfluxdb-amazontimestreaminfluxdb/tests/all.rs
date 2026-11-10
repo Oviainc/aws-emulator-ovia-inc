@@ -25,5 +25,7 @@ mod db_parameter_group_catalog;
 mod db_parameter_group_listing;
 #[path = "all/parameters_union_roundtrip.rs"]
 mod parameters_union_roundtrip;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

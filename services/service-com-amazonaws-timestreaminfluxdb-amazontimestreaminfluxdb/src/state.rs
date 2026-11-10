@@ -26,8 +26,13 @@ mod clusters;
 /// behind, and the refusal a create gets without one.
 mod marketplace;
 
+/// How an `Arn` resolves to one of the records above, and the tag set that record
+/// carries — the slice the three tagging operations share.
+mod tags;
+
 pub use clusters::*;
 pub use marketplace::*;
+pub use tags::*;
 
 /// `Status` values this service's records use, each one a member of
 /// `crate::ops::types::STATUS_VALUES` (the modelled `Status` enum).
