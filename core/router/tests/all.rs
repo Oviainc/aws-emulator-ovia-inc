@@ -1307,3 +1307,8 @@ mod efs_access_point_mounted_by_lambda;
 // a bucket a stack created carries, which CloudFormation stamps and Amazon S3 reports.
 #[path = "all/cloudformation_stamps_s3_bucket_stack_provenance.rs"]
 mod cloudformation_stamps_s3_bucket_stack_provenance;
+// Declared in the appended tail, which is where every new suite inserts its lines: the chain a
+// client's own PutLogEvents drives, from the log group's metric filters through the metric and
+// the alarm to the queue subscribed to the alarm's topic.
+#[path = "all/logs_metric_filter_drives_the_alarm_notification_chain.rs"]
+mod logs_metric_filter_drives_the_alarm_notification_chain;

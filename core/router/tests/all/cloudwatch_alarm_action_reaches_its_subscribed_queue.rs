@@ -56,7 +56,7 @@ pub(crate) fn router() -> MultiServiceRouter {
 /// A SigV4 `Authorization` whose credential scope names `service` in `region`, which is what
 /// routes the request. The signature is never checked: the router above runs with request
 /// authentication off.
-fn authorization(service: &str, region: &str) -> String {
+pub(crate) fn authorization(service: &str, region: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/{service}/aws4_request, \
          SignedHeaders=host, Signature=0000"
