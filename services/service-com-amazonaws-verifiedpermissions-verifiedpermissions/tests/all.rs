@@ -51,6 +51,8 @@ mod identity_source_configuration_writers;
 mod identity_source_group_entity_type;
 #[path = "all/identity_source_pool_refusal_message.rs"]
 mod identity_source_pool_refusal_message;
+#[path = "all/identity_source_pool_refusal_stages.rs"]
+mod identity_source_pool_refusal_stages;
 #[path = "all/identity_source_principal_entity_type.rs"]
 mod identity_source_principal_entity_type;
 #[path = "all/identity_source_refusal_pointers.rs"]
