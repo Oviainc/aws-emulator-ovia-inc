@@ -17,12 +17,13 @@
 //!   `ValidationException` (400): the model documents "The scheduled report must be in
 //!   ENABLED state. Calling this operation on a DISABLED scheduled report returns a
 //!   ValidationException."
-//! * `healthStatus` is DERIVED from the store and from the DELIVERY this execution makes
+//! * `healthStatus` is DERIVED from the stores and from the DELIVERY this execution makes
 //!   — `crate::state::ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::scheduled_report_health`
 //!   answers healthy exactly while the dashboard the report renders and every widget its
-//!   `widgetIds` name still resolve, and the execution is triggered only when the
-//!   configuration does resolve, so `executionTriggered` is false on a report whose
-//!   configuration does not and the report's `lastExecutionAt` does not move. A triggered
+//!   `widgetIds` name still resolve AND the account's IAM still lets this service assume the
+//!   role the report executes as (`crate::state::execution_role`), and the execution is
+//!   triggered only when the configuration does resolve, so `executionTriggered` is false on
+//!   a report whose configuration does not and the report's `lastExecutionAt` does not move. A triggered
 //!   execution then hands one notification to the account's default Amazon EventBridge
 //!   event bus (`crate::state::deliver_execution_notification`), because that delivery is
 //!   what the model defines a scheduled report by: `HealthStatus.statusCode` documents
@@ -225,6 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
 
+        // The execution roles the account's IAM shows this service cannot assume, resolved
+        // BEFORE this service's store is read so no two stores are held at once. A report
+        // whose execution role no longer admits this service has nothing it could execute
+        // as, which is what the health below reports.
+        let unassumable_roles = crate::state::UnassumableExecutionRoles::resolve(&*self.engine);
+
         // The idempotency key of THIS request: the report it names together with the
         // token it presented. A token suppresses a repeat of the request that carried it,
         // so the same token on another report is looked up under another key and decided
@@ -288,7 +295,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // reporting operations do.
             if input.dry_run == Some(true) {
                 return Ok(ExecuteScheduledReportOutput {
-                    health_status: Some(store.scheduled_report_health(&record, now)),
+                    health_status: Some(store.scheduled_report_health(
+                        &record,
+                        &unassumable_roles,
+                        now,
+                    )),
                     execution_triggered: Some(false),
                 });
             }
@@ -301,7 +312,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // and with it whether the execution could be triggered at all: a report whose
             // dashboard or widgets no longer resolve has nothing to render, so nothing is
             // triggered and nothing is delivered.
-            let configured_health = store.scheduled_report_health(&record, now);
+            let configured_health =
+                store.scheduled_report_health(&record, &unassumable_roles, now);
             let execution_triggered =
                 configured_health.status_code == crate::state::HEALTH_STATUS_HEALTHY;
 

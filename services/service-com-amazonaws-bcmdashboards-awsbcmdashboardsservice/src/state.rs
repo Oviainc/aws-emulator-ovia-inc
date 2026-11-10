@@ -20,6 +20,15 @@
 //! ([`undelivered_notification_health`]). EventBridge is reached the way any emulated
 //! service reaches another: over the in-process callback, so nothing is dialled and this
 //! crate names no other service crate.
+//!
+//! # A scheduled report executes AS a role
+//!
+//! The report also has to be able to run at all: the model documents its
+//! `scheduledReportExecutionRoleArn` as the role this service "will assume while executing
+//! the scheduled report", and `HEALTHY` as the report having "all required permissions to
+//! execute". So every resolution of a report's health asks the account's IAM records
+//! whether that role still admits this service ([`execution_role`]) and reports
+//! `EXECUTION_ROLE_ASSUME_FAILED` while it does not.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -34,6 +43,12 @@ use crate::ops::types::{
     ResourceTag, SavingsPlansCoverageQuery, ScheduleConfig, ScheduledReport,
     ScheduledReportSummary, TableDisplayConfigStruct, Widget, WidgetConfig,
 };
+
+/// Whether this service can still assume a scheduled report's execution role, which the
+/// health derivation below is one half of.
+pub mod execution_role;
+
+pub use execution_role::UnassumableExecutionRoles;
 
 /// The only `DashboardType` the model declares (`DASHBOARD_TYPE_VALUES`), and the
 /// type every dashboard a client creates through this API carries.
@@ -86,12 +101,18 @@ pub const STATUS_REASON_DASHBOARD_NOT_FOUND: &str = "DASHBOARD_NOT_FOUND";
 /// the dashboard after the report was created.
 pub const STATUS_REASON_WIDGET_ID_NOT_FOUND: &str = "WIDGET_ID_NOT_FOUND";
 
+/// The `StatusReason` (`STATUS_REASON_VALUES`) for a scheduled report whose
+/// `scheduledReportExecutionRoleArn` names a role this service can no longer assume — the
+/// role's trust policy stopped admitting this service after the report was created.
+pub const STATUS_REASON_EXECUTION_ROLE_ASSUME_FAILED: &str = "EXECUTION_ROLE_ASSUME_FAILED";
+
 /// The `StatusReason` values this store can DERIVE from the resources a scheduled
 /// report's configuration points at, so resolving a report's health re-derives them
 /// from what the store holds now instead of repeating what an earlier refresh found.
 /// Every other reason a refresh established is carried forward from the record, because
 /// nothing in the store can re-establish it.
-const DERIVED_STATUS_REASONS: [&str; 2] = [
+const DERIVED_STATUS_REASONS: [&str; 3] = [
+    STATUS_REASON_EXECUTION_ROLE_ASSUME_FAILED,
     STATUS_REASON_DASHBOARD_NOT_FOUND,
     STATUS_REASON_WIDGET_ID_NOT_FOUND,
 ];
@@ -959,24 +980,35 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
             .collect()
     }
 
-    /// The reasons the resources `report`'s stored configuration points at do not resolve
-    /// in this store, in the order the status reports them and at most once each:
+    /// The reasons the resources `report`'s stored configuration points at do not resolve,
+    /// in the order the model lists them (`smithy_query(query="shape",shape="StatusReason")`)
+    /// and at most once each:
     ///
+    /// * the execution role it names is one this service can no longer assume
+    ///   ([`STATUS_REASON_EXECUTION_ROLE_ASSUME_FAILED`], as `unassumable_roles` — the
+    ///   account's IAM records — reports it),
     /// * the dashboard its `dashboardArn` names is no longer stored
     ///   ([`STATUS_REASON_DASHBOARD_NOT_FOUND`]), and
     /// * an id in its `widgetIds` is no longer a widget of that dashboard
     ///   ([`STATUS_REASON_WIDGET_ID_NOT_FOUND`]).
     ///
-    /// Derived from what the store holds AT THE CALL, never from a request and never
-    /// from what an earlier refresh found: the dashboard and the widgets a report points
-    /// at can be deleted, replaced or repointed after any refresh, so the reasons that
-    /// name them are re-derived every time the health is resolved.
+    /// Derived from what the stores hold AT THE CALL, never from a request and never from
+    /// what an earlier refresh found: the role, the dashboard and the widgets a report
+    /// points at can be deleted, replaced, re-pointed or re-trusted after any refresh, so
+    /// the reasons that name them are re-derived every time the health is resolved.
     ///
-    /// The other `StatusReason` values name failures of resources outside this service
-    /// (the execution role, the cost data source), which this store holds nothing about
-    /// and therefore never claims.
-    fn unresolved_configuration_reasons(&self, report: &ScheduledReportRecord) -> Vec<String> {
+    /// The remaining `StatusReason` values name failures of resources neither store holds
+    /// anything about (the cost data source, the permissions the role's own policies grant),
+    /// which is why nothing here claims them.
+    fn unresolved_configuration_reasons(
+        &self,
+        report: &ScheduledReportRecord,
+        unassumable_roles: &UnassumableExecutionRoles,
+    ) -> Vec<String> {
         let mut status_reasons: Vec<String> = Vec::new();
+        if unassumable_roles.assume_failed(&report.execution_role_arn) {
+            status_reasons.push(STATUS_REASON_EXECUTION_ROLE_ASSUME_FAILED.to_string());
+        }
         match self.dashboards.get(&report.dashboard_arn) {
             None => status_reasons.push(STATUS_REASON_DASHBOARD_NOT_FOUND.to_string()),
             Some(dashboard) => {
@@ -1005,17 +1037,19 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     /// has all required permissions to execute" and `UNHEALTHY` as the report being
     /// unable to deliver, with the reasons in `statusReasons`
     /// (`smithy_query(query="shape",shape="HealthStatus")`). So the status is DERIVED
-    /// from what this store holds, never from a request: a report is healthy exactly
-    /// while every resource its configuration points at still resolves
+    /// from what the stores hold, never from a request: a report is healthy exactly
+    /// while every resource its configuration points at still resolves — the role it
+    /// executes as included
     /// ([`Self::unresolved_configuration_reasons`]).
     ///
     /// `lastRefreshedAt` is `now` because this call is the refresh.
     pub fn scheduled_report_health(
         &self,
         report: &ScheduledReportRecord,
+        unassumable_roles: &UnassumableExecutionRoles,
         now: SystemTime,
     ) -> HealthStatus {
-        let status_reasons = self.unresolved_configuration_reasons(report);
+        let status_reasons = self.unresolved_configuration_reasons(report, unassumable_roles);
         // `lastRefreshedAt` is `now`: this call IS the refresh.
         health_status(status_reasons, Some(::aws_smithy_types::DateTime::from(now)))
     }
@@ -1028,10 +1062,12 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     /// record by each view: no two views of one report can disagree about it, and none
     /// reports a status the store itself contradicts.
     ///
-    /// * The reasons that name resources this store holds are re-derived from it
+    /// * The reasons that name resources a store holds are re-derived from them
     ///   ([`Self::unresolved_configuration_reasons`]), so a report whose dashboard was
-    ///   deleted — or whose named widget was removed from it — is reported `UNHEALTHY`
-    ///   with those reasons whether or not anything has ever refreshed the record.
+    ///   deleted — or whose named widget was removed from it, or whose execution role the
+    ///   account's IAM no longer lets this service assume — is reported `UNHEALTHY` with
+    ///   those reasons whether or not anything has ever refreshed the record, and reported
+    ///   healthy again as soon as the resource resolves once more.
     /// * A reason the last refresh established that this store cannot re-derive (a
     ///   notification the account's default event bus did not take,
     ///   [`STATUS_REASON_INTERNAL_FAILURE`]) is carried forward from the record: the
@@ -1048,8 +1084,9 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     pub fn reported_scheduled_report_health(
         &self,
         report: &ScheduledReportRecord,
+        unassumable_roles: &UnassumableExecutionRoles,
     ) -> HealthStatus {
-        let mut status_reasons = self.unresolved_configuration_reasons(report);
+        let mut status_reasons = self.unresolved_configuration_reasons(report, unassumable_roles);
         let refreshed = report.health_status.as_ref();
         let refreshed_reasons = refreshed
             .and_then(|health| health.status_reasons.as_ref())
@@ -1071,8 +1108,12 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
 
     /// `report` projected onto the modelled `ScheduledReport` the detail readers answer,
     /// with the health this store resolves for it.
-    pub fn scheduled_report_detail(&self, report: &ScheduledReportRecord) -> ScheduledReport {
-        report.report(self.reported_scheduled_report_health(report))
+    pub fn scheduled_report_detail(
+        &self,
+        report: &ScheduledReportRecord,
+        unassumable_roles: &UnassumableExecutionRoles,
+    ) -> ScheduledReport {
+        report.report(self.reported_scheduled_report_health(report, unassumable_roles))
     }
 
     /// `report` projected onto the modelled `ScheduledReportSummary` the listing pages
@@ -1081,8 +1122,9 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     pub fn scheduled_report_summary(
         &self,
         report: &ScheduledReportRecord,
+        unassumable_roles: &UnassumableExecutionRoles,
     ) -> ScheduledReportSummary {
-        report.summary(self.reported_scheduled_report_health(report))
+        report.summary(self.reported_scheduled_report_health(report, unassumable_roles))
     }
 
     /// Drop every settled create claim whose scheduled report this service no longer

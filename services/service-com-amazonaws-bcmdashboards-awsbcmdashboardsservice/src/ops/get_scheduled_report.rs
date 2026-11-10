@@ -160,6 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the dashboard store is unavailable".to_string(),
             })
         })?;
+        // The execution roles the account's IAM shows this service cannot assume, resolved
+        // BEFORE this service's store is read so no two stores are held at once. The health
+        // every view reports covers the role a report executes as, so a reader resolves it
+        // from IAM at the call rather than reporting a verdict an earlier call cached.
+        let unassumable_roles = crate::state::UnassumableExecutionRoles::resolve(&*self.engine);
         // A read: it resolves the record and projects it, and writes nothing.
         let state = state.lock();
         let report = state.scheduled_reports.get(&input.arn).ok_or_else(|| {
@@ -172,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         Ok(GetScheduledReportOutput {
-            scheduled_report: state.scheduled_report_detail(report),
+            scheduled_report: state.scheduled_report_detail(report, &unassumable_roles),
         })
     }
 }

@@ -37,6 +37,10 @@ service-common = { path = "../common" }
 # ("3 years from the current time"): three years is a calendar offset, not a fixed
 # number of seconds.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# The IAM store a scheduled report's `scheduledReportExecutionRoleArn` is resolved against:
+# the report executes AS that role, so whether the account's IAM still lets this service
+# assume it is half of the report's health (`state::execution_role`).
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
