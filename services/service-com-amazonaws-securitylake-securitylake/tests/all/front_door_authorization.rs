@@ -5,9 +5,10 @@
 //! The rule under test: Security Lake decides whether the PRINCIPAL that signed a
 //! request may invoke the operation before that operation runs, so
 //!
-//! * a request from a principal this service does not admit is refused with HTTP 401 and
-//!   the front door's own `{"message": …}` body and NO `x-amzn-errortype` — whatever
-//!   operation it names, including one that is still a 501 scaffold;
+//! * a request from a principal this service does not admit is refused with HTTP 401,
+//!   the front door's own `{"message": …}` body and the error code
+//!   `UnauthorizedException` — whatever operation it names, including one that is still a
+//!   501 scaffold;
 //! * the refusal is reached from the principal alone, so it is byte-identical whether the
 //!   resource the request names exists or not, and nothing about this account's state
 //!   reaches the caller;
@@ -61,11 +62,11 @@ struct Reply {
 }
 
 impl Reply {
-    /// Whether this is the front door's authorization refusal: HTTP 401, the gateway's
-    /// `message` body and no modelled error code.
+    /// Whether this is the front door's authorization refusal: HTTP 401, the recorded
+    /// `UnauthorizedException` code and the gateway's `message` body.
     fn is_unauthorized(&self) -> bool {
         self.status == 401
-            && self.error_type.is_none()
+            && self.error_type.as_deref() == Some("UnauthorizedException")
             && self.body == json!({ "message": "Unauthorized" })
     }
 }
@@ -251,9 +252,9 @@ impl Emulator {
 // The refusal itself
 // ---------------------------------------------------------------------------
 
-/// RULE: a request from a principal this service does not admit is refused with HTTP 401
-/// and the front door's `{"message": …}` body, with no `x-amzn-errortype`, whatever
-/// operation it names — and the very same request is served once the principal is
+/// RULE: a request from a principal this service does not admit is refused with HTTP 401,
+/// the front door's `{"message": …}` body and the error code `UnauthorizedException`,
+/// whatever operation it names — and the very same request is served once the principal is
 /// admitted again.
 ///
 /// The rows span the forms a principal takes (a long-term key id, a temporary one, a
@@ -287,8 +288,8 @@ async fn an_unadmitted_principal_is_refused_401_on_every_operation() {
             let refused = emulator.send(*principal, REGION, call).await;
             assert!(
                 refused.is_unauthorized(),
-                "case {case:?}: expected 401 {{\"message\":\"Unauthorized\"}} with no \
-                 x-amzn-errortype, got {refused:?}"
+                "case {case:?}: expected 401 UnauthorizedException \
+                 {{\"message\":\"Unauthorized\"}}, got {refused:?}"
             );
 
             let released = emulator

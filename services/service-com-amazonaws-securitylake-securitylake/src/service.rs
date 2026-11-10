@@ -82,7 +82,10 @@
 //! `InternalServerException` 500, `ResourceNotFoundException` 404 and
 //! `ThrottlingException` 429, and no 401 at all), so it is rendered as the refusal the
 //! front door states rather than through the modelled error channel: HTTP 401, a JSON
-//! `message` body, and no `x-amzn-errortype` — there is no modelled error code to name.
+//! `message` body, and the RECORDED error code `UnauthorizedException` in
+//! `x-amzn-errortype` — which is where `restJson1` resolves an error from, so a client
+//! branching on that code reads the same verdict however the caller came to be refused.
+//! One refused caller therefore gets ONE answer on every route, gated or not.
 
 use aws_smithy_runtime_api::http::{Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
@@ -102,10 +105,10 @@ enum Gate {
     /// `AccessDeniedException`, which the model gives `@httpError 403`, carrying the
     /// fixed entitlement text.
     AccessDenied,
-    /// The route's authorizer refuses the call ahead of the service: HTTP 401 with the
-    /// error code `UnauthorizedException` and the message "Unauthorized". RECORDED per
-    /// route — this service's model declares no 401 shape at all, so it is rendered as
-    /// the front door's own refusal rather than through the modelled error channel.
+    /// The route's authorizer refuses the call ahead of the service: the front door's own
+    /// refusal (HTTP 401, `UnauthorizedException`, "Unauthorized"). RECORDED per route —
+    /// this service's model declares no 401 shape at all, so it is rendered as the front
+    /// door's own refusal rather than through the modelled error channel.
     Unauthorized,
 }
 
@@ -168,21 +171,27 @@ const UNAUTHORIZED_STATUS: u16 = 401;
 /// into it.
 const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
 
-/// The error code a client reads a refused route's verdict from, in `x-amzn-errortype`
-/// (which is where `restJson1` resolves an error shape from). RECORDED, not modelled:
-/// this service's model declares no 401 shape, so the code cannot come from it.
+/// The error code a client reads an authorization refusal's verdict from, in
+/// `x-amzn-errortype` (which is where `restJson1` resolves an error shape from).
+/// RECORDED, not modelled: this service's model declares no 401 shape, so the code cannot
+/// come from it.
+///
+/// It is the same code whichever way the caller came to be refused — a principal this
+/// service does not admit, or an unentitled account on a route whose authorizer refuses
+/// ahead of the service — because a client branches on the code to tell "you may not call
+/// this service" from this service's own modelled resource verdicts.
 const UNAUTHORIZED_CODE: &str = "UnauthorizedException";
 
 /// A refusal the front door states itself, as a pre-dispatch operation: one whose shape
 /// is NOT in this service's model, so it cannot be rendered through the modelled error
 /// channel.
 ///
-/// `error_type` is the code a client branches on; `None` states no code, which is what
-/// the principal-admission refusal does — it names no modelled error and reports nothing
-/// about this account.
+/// `error_type` is the code a client branches on, carried the way `restJson1` carries an
+/// error code; `message` is fixed text, so nothing from the request or from this
+/// account's state reaches a caller that may not ask for it.
 struct GatewayRefusal {
     status: u16,
-    error_type: Option<&'static str>,
+    error_type: &'static str,
     message: &'static str,
 }
 
@@ -203,9 +212,9 @@ impl ErasedOperation for GatewayRefusal {
             response
                 .headers_mut()
                 .insert("content-type", "application/json");
-            if let Some(error_type) = self.error_type {
-                response.headers_mut().insert("x-amzn-errortype", error_type);
-            }
+            response
+                .headers_mut()
+                .insert("x-amzn-errortype", self.error_type);
             response
         })
     }
@@ -265,11 +274,12 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// service's store holds BEFORE dispatch. The generated entry owns the same engine;
     /// this is the one `Arc` both share, never a second store.
     engine: Arc<Eng>,
-    /// Answers a request whose principal this service does not admit.
+    /// Answers a request this service's authorization refuses outright: one whose
+    /// principal it does not admit, and a gated request from an unentitled caller account
+    /// on a route whose authorizer refuses it ahead of the service
+    /// ([`Gate::Unauthorized`]). One refusal, so a caller reads one verdict on every
+    /// route.
     unauthorized: GatewayRefusal,
-    /// Answers a gated request from an unentitled caller account on a route whose
-    /// authorizer refuses it ahead of the service ([`Gate::Unauthorized`]).
-    unauthorized_route: GatewayRefusal,
     /// Answers a gated request from an unentitled caller account on a route the service
     /// itself denies ([`Gate::AccessDenied`]).
     not_entitled: NotEntitledAnswer,
@@ -285,12 +295,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             engine,
             unauthorized: GatewayRefusal {
                 status: UNAUTHORIZED_STATUS,
-                error_type: None,
-                message: UNAUTHORIZED_MESSAGE,
-            },
-            unauthorized_route: GatewayRefusal {
-                status: UNAUTHORIZED_STATUS,
-                error_type: Some(UNAUTHORIZED_CODE),
+                error_type: UNAUTHORIZED_CODE,
                 message: UNAUTHORIZED_MESSAGE,
             },
             not_entitled: NotEntitledAnswer,
@@ -383,7 +388,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         }
         Some(match gate {
             Gate::AccessDenied => &self.not_entitled as &dyn ErasedOperation,
-            Gate::Unauthorized => &self.unauthorized_route as &dyn ErasedOperation,
+            Gate::Unauthorized => &self.unauthorized as &dyn ErasedOperation,
         })
     }
 

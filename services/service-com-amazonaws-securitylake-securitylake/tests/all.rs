@@ -19,6 +19,8 @@ mod data_lake_and_subscriber_lifecycle;
 mod data_lake_exceptions;
 #[path = "all/front_door_authorization.rs"]
 mod front_door_authorization;
+#[path = "all/restricted_caller_refusal.rs"]
+mod restricted_caller_refusal;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/subscriber_calls_require_enablement.rs"]

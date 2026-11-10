@@ -19,6 +19,12 @@ use smithy_server_runtime::MultiServiceRouter;
 /// service mints carries it.
 const ACCOUNT_ID: &str = "000000000000";
 
+/// The SigV4 access key id every request this harness sends presents, which is the
+/// principal this service's authorization records are keyed by
+/// (`state::caller_principal`). `pub(crate)` so a suite beside this one can make this
+/// harness's caller a refused one.
+pub(crate) const CALLER_PRINCIPAL: &str = "AKIDTESTTESTTEST";
+
 /// A `RoleArn`-shaped value, matching `CreateDataLakeRequest$metaStoreManagerRoleArn`'s
 /// pattern `^arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`.
 const META_STORE_ROLE: &str = "arn:aws:iam::000000000000:role/AmazonSecurityLakeMetaStoreManager";
@@ -105,7 +111,7 @@ impl Emulator {
     ) -> Reply {
         // The SigV4 credential scope is what names both the service and the Region.
         let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDTESTTESTTEST/20260101/{region}/securitylake/aws4_request, \
+            "AWS4-HMAC-SHA256 Credential={CALLER_PRINCIPAL}/20260101/{region}/securitylake/aws4_request, \
              SignedHeaders=host, Signature=0000000000000000000000000000000000000000000000000000000000000000"
         );
         let payload = body.map_or_else(bytes::Bytes::new, |value| {
