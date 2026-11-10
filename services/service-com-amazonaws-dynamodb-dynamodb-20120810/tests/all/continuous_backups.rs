@@ -51,7 +51,10 @@ async fn settle() {
     .await;
 }
 
-/// Create one on-demand table to carry the settings under test.
+/// Create one on-demand table to carry the settings under test, and wait out the span
+/// the clock owes it: continuous-backups settings are changed on a table whose creation
+/// has FINISHED (`tests/all/backup_path_table_state.rs` pins what a table still being
+/// created answers), so every row below starts from a settled table.
 async fn create_table(router: &MultiServiceRouter, name: &str) {
     ok(
         router,
@@ -64,6 +67,7 @@ async fn create_table(router: &MultiServiceRouter, name: &str) {
         }),
     )
     .await;
+    settle().await;
 }
 
 /// The `ContinuousBackupsDescription` of a response under either operation's output

@@ -838,10 +838,11 @@ async fn a_table_that_cannot_be_backed_up_is_refused() {
     let router = emulator();
 
     // Rows differ in why the table is not one to catalogue: it was never created, it was
-    // created and deleted, and it is still being created — "A target table with the
-    // specified name is either being created or deleted" is the `TableInUseException`
-    // this operation models, while a table that is not there at all is its
-    // `TableNotFoundException`.
+    // created and deleted, and it is still being created. The backup path acts on a table
+    // whose creation has FINISHED and whose deletion has not started, so each of the three
+    // is the `TableNotFoundException` this operation models — "A source table with the
+    // name TableName does not currently exist" — and none is a conflict a caller would
+    // retry in place.
     ok(
         &router,
         "CreateTable",
@@ -872,7 +873,7 @@ async fn a_table_that_cannot_be_backed_up_is_refused() {
     for (case, table, expected) in [
         ("a table that was never created", "Absent", "TableNotFoundException"),
         ("a table that was deleted", "Removed", "TableNotFoundException"),
-        ("a table that is still being created", "Creating", "TableInUseException"),
+        ("a table that is still being created", "Creating", "TableNotFoundException"),
     ] {
         let (status, body) = call(
             &router,

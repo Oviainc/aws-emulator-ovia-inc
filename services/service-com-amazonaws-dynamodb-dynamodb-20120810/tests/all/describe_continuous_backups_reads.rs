@@ -63,6 +63,14 @@ async fn create_table(router: &MultiServiceRouter, region: &str, name: &str) {
     .await;
 }
 
+/// The same, waiting out the span the clock owes the new table: a case that WRITES the
+/// table's recovery settings starts from a table whose creation has finished
+/// (`tests/all/backup_path_table_state.rs` pins what one still being created answers).
+async fn active_table(router: &MultiServiceRouter, region: &str, name: &str) {
+    create_table(router, region, name).await;
+    settle().await;
+}
+
 /// Apply one `PointInTimeRecoverySpecification` to `name` in `region`.
 async fn set_recovery(
     router: &MultiServiceRouter,
@@ -176,7 +184,7 @@ async fn repeated_reads_report_the_stored_settings_and_store_nothing() {
 
     for (case, toggles, status, period) in cases {
         let name = format!("Read{}", case.replace([' ', ','], ""));
-        create_table(&router, REGION, &name).await;
+        active_table(&router, REGION, &name).await;
         for (enabled, days) in toggles {
             set_recovery(&router, REGION, &name, *enabled, *days).await;
         }
@@ -265,7 +273,7 @@ async fn each_region_reports_the_settings_of_its_own_table() {
     ];
 
     for (region, toggle, _, _) in &rows {
-        create_table(&router, region, name).await;
+        active_table(&router, region, name).await;
         if let Some((enabled, period)) = toggle {
             set_recovery(&router, region, name, *enabled, *period).await;
         }
@@ -366,7 +374,7 @@ async fn a_table_is_served_whatever_status_it_is_read_in() {
 async fn the_table_name_is_resolved_the_way_every_operation_resolves_it() {
     let router = emulator();
     let name = "Resolvable";
-    create_table(&router, REGION, name).await;
+    active_table(&router, REGION, name).await;
     let arn = ok_in(&router, REGION, "DescribeTable", json!({"TableName": name}))
         .await["Table"]["TableArn"]
         .as_str()

@@ -568,7 +568,7 @@ fn lift(table_name: &str, error: crate::state::RequestError) -> ExportTableToPoi
     match error {
         crate::state::RequestError::NotFound(_) => {
             ExportTableToPointInTimeErrorModeled::TableNotFoundException(TableNotFoundException {
-                message: Some(format!("Table not found: {table_name}")),
+                message: Some(crate::state::table_not_found_message(table_name)),
             })
             .into()
         }

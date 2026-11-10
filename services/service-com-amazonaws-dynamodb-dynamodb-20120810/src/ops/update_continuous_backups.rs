@@ -8,6 +8,11 @@
 //! and the clock on every read, so this operation and `DescribeContinuousBackups`
 //! report one answer.
 //!
+//! A table the backup path cannot act on — one still being created, or already being
+//! deleted — holds no continuous-backups settings to change, so it is refused as the
+//! table this endpoint has none of (`TableNotFoundException`,
+//! `crate::state::backup_path_acts_on`) and nothing is stored.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -168,6 +173,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let table = store
             .table_mut(&region, &name)
             .map_err(|error| lift(&name, error))?;
+        // A table the backup path cannot act on is reported as no table at all
+        // ([`crate::state::backup_path_acts_on`]): recovery is a setting of a table that
+        // exists, and a table that has not finished being created — or has started being
+        // deleted — is not one to configure, so the call is refused rather than accepted
+        // against a table that would never carry it. A table being UPDATED is a table,
+        // and its recovery is configured.
+        if !crate::state::backup_path_acts_on(table.status(now)) {
+            return Err(table_not_found(&name));
+        }
         table.point_in_time_recovery.apply(
             specification.point_in_time_recovery_enabled,
             specification.recovery_period_in_days,
@@ -218,14 +232,18 @@ fn store_unavailable() -> UpdateContinuousBackupsError {
 /// request: the table it asked for.
 fn lift(table_name: &str, error: crate::state::RequestError) -> UpdateContinuousBackupsError {
     match error {
-        crate::state::RequestError::NotFound(_) => {
-            UpdateContinuousBackupsErrorModeled::TableNotFoundException(TableNotFoundException {
-                message: Some(format!("Table not found: {table_name}")),
-            })
-            .into()
-        }
+        crate::state::RequestError::NotFound(_) => table_not_found(table_name),
         crate::state::RequestError::Validation(message) => {
             crate::scaffolded::Scaffolded::validation(message)
         }
     }
+}
+
+/// The refusal for a table this operation has no settings to change on: one that is not
+/// there at all, and one the backup path cannot act on yet or any more.
+fn table_not_found(table_name: &str) -> UpdateContinuousBackupsError {
+    UpdateContinuousBackupsErrorModeled::TableNotFoundException(TableNotFoundException {
+        message: Some(crate::state::table_not_found_message(table_name)),
+    })
+    .into()
 }

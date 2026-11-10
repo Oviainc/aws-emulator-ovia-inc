@@ -188,7 +188,7 @@ fn lift(table_name: &str, error: crate::state::RequestError) -> DescribeContinuo
     match error {
         crate::state::RequestError::NotFound(_) => {
             DescribeContinuousBackupsErrorModeled::TableNotFoundException(TableNotFoundException {
-                message: Some(format!("Table not found: {table_name}")),
+                message: Some(crate::state::table_not_found_message(table_name)),
             })
             .into()
         }

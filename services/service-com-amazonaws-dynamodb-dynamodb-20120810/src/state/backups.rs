@@ -74,6 +74,29 @@ pub const MAX_BACKUP_CATALOGUE_BYTES: i64 = MAX_STORE_SIZE_BYTES;
 /// it answers the modelled `LimitExceededException`.
 pub const MAX_CONCURRENT_RESTORES: usize = 50;
 
+/// Whether the backup path can ACT on a table that is in this status.
+///
+/// A table becomes one a backup operation can work on only once its creation has
+/// finished, and stops being one as soon as its deletion has started: in either
+/// transient status there is no table for the backup path to take a copy of or to hold
+/// continuous-backups settings on, so the operation reports no table under that name
+/// ([`table_not_found_message`]) instead of a conflict a caller would retry in place. A
+/// table whose configuration is being updated IS a table, and is backed up.
+pub fn backup_path_acts_on(status: TableStatus) -> bool {
+    matches!(status, TableStatus::Active | TableStatus::Updating)
+}
+
+/// How a backup-path operation refuses a table it has none of: the sentence
+/// `TableNotFoundException` carries, whose fixed text is `Table not found: ` and whose
+/// variable part is the table the request named.
+///
+/// One wording for every operation that models that error, so a table the backup path
+/// cannot address is refused in the same words whether it was never there, has gone, or
+/// has not finished being created.
+pub fn table_not_found_message(table_name: &str) -> String {
+    format!("Table not found: {table_name}")
+}
+
 /// Whether a stored `BackupType` is one a request's `BackupTypeFilter` selects.
 ///
 /// One rule for every filter value the model declares: `ALL` spans the on-demand types

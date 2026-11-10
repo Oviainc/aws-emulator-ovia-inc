@@ -528,7 +528,7 @@ fn lift(source: &str, error: crate::state::RequestError) -> RestoreTableToPointI
     match error {
         crate::state::RequestError::NotFound(_) => {
             RestoreTableToPointInTimeErrorModeled::TableNotFoundException(TableNotFoundException {
-                message: Some(format!("Table not found: {source}")),
+                message: Some(crate::state::table_not_found_message(source)),
             })
             .into()
         }

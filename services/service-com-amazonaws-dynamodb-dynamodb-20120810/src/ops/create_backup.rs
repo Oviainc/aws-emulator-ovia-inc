@@ -8,6 +8,12 @@
 //! the clock makes it `AVAILABLE`, which is what `ListBackups`, `DescribeBackup` and
 //! `DeleteBackup` then read.
 //!
+//! A table the backup path cannot act on — one still being created, or already being
+//! deleted — carries nothing to catalogue, so it is refused as the table this endpoint
+//! has none of (`TableNotFoundException`, `crate::state::backup_path_acts_on`). The
+//! modelled `TableInUseException` is the conflict a RESTORE answers for the TARGET name
+//! it is asked to create under, which this operation never creates a table for.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -187,19 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let table = store
             .table(&region, &name)
             .map_err(|error| lift(&name, error))?;
-        // "A target table with the specified name is either being created or deleted"
-        // (`TableInUseException`): there is no settled table to catalogue yet, or no
-        // longer one. A table being UPDATED is a table, and is backed up.
-        if matches!(
-            table.status(now),
-            crate::state::TableStatus::Creating | crate::state::TableStatus::Deleting
-        ) {
-            return Err(CreateBackupErrorModeled::TableInUseException(
-                TableInUseException {
-                    message: Some(format!("Table is being created or deleted: {name}")),
-                },
-            )
-            .into());
+        // A table the backup path cannot act on is reported as no table at all
+        // ([`crate::state::backup_path_acts_on`]): there is no settled table to catalogue
+        // yet, or no longer one, so this is the terminal "there is nothing there" the
+        // operation models rather than the conflict a caller retries in place. A table
+        // being UPDATED is a table, and is backed up.
+        if !crate::state::backup_path_acts_on(table.status(now)) {
+            return Err(table_not_found(&name));
         }
         // The catalogue is budgeted like every other growth site in this store: by the
         // records it holds, and by the item data they hold — a backup keeps the items its
@@ -263,14 +263,18 @@ fn store_unavailable() -> CreateBackupError {
 /// the table it asked for.
 fn lift(table_name: &str, error: crate::state::RequestError) -> CreateBackupError {
     match error {
-        crate::state::RequestError::NotFound(_) => {
-            CreateBackupErrorModeled::TableNotFoundException(TableNotFoundException {
-                message: Some(format!("Table not found: {table_name}")),
-            })
-            .into()
-        }
+        crate::state::RequestError::NotFound(_) => table_not_found(table_name),
         crate::state::RequestError::Validation(message) => {
             crate::scaffolded::Scaffolded::validation(message)
         }
     }
+}
+
+/// The refusal for a table this operation has nothing to back up under: one that is not
+/// there at all, and one the backup path cannot act on yet or any more.
+fn table_not_found(table_name: &str) -> CreateBackupError {
+    CreateBackupErrorModeled::TableNotFoundException(TableNotFoundException {
+        message: Some(crate::state::table_not_found_message(table_name)),
+    })
+    .into()
 }
