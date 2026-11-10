@@ -14,6 +14,7 @@ engine = { workspace = true }
 service-com-amazonaws-accessanalyzer-accessanalyzer = { workspace = true }
 service-com-amazonaws-account-account = { workspace = true }
 service-com-amazonaws-accountaccess-awsaccountaccess = { workspace = true }
+service-com-amazonaws-accountaccessruntime-awsaccountaccessruntime = { workspace = true }
 service-com-amazonaws-acm-certificatemanager = { workspace = true }
 service-com-amazonaws-acmpca-acmprivateca = { workspace = true }
 service-com-amazonaws-agentregistry-agentregistry = { workspace = true }

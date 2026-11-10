@@ -13,6 +13,10 @@
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/account-access/service/2018-05-10/account-access-2018-05-10.json"
     },
     {
+      "shape_id": "com.amazonaws.accountaccessruntime#AWSAccountAccessRuntime",
+      "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/account-access-runtime/service/2018-05-10/account-access-runtime-2018-05-10.json"
+    },
+    {
       "shape_id": "com.amazonaws.acm#CertificateManager",
       "spec_url": "https://raw.githubusercontent.com/aws/api-models-aws/refs/heads/main/models/acm/service/2015-12-08/acm-2015-12-08.json"
     },
