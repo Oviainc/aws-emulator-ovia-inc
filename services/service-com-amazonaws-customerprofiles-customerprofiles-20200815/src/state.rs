@@ -1703,13 +1703,14 @@ pub fn domain_not_found(domain_name: &str) -> String {
     format!("Domain {domain_name} is not found")
 }
 
-/// The `ResourceNotFoundException` message for a profile a domain does not hold, worded
-/// like every other per-domain resource this service reports absent: the resource kind,
-/// the identifier the request carried, and the domain it was looked for in. Shared by
-/// every operation addressing one profile, so the same absent id reads the same whichever
-/// of them was called.
-pub fn profile_not_found(domain_name: &str, profile_id: &str) -> String {
-    format!("The profile {profile_id} does not exist in domain {domain_name}")
+/// The `ResourceNotFoundException` message for a profile a domain does not hold, as the
+/// service words that refusal: a fixed sentence naming the resource kind and referring to
+/// the domain generically, whose ONLY variable part is the `ProfileId` the request carried
+/// — the domain's own name is not interpolated, even though the request carries it. Shared
+/// by every operation addressing one profile by id, so the same absent id reads the same
+/// whichever of them was called.
+pub fn profile_not_found(profile_id: &str) -> String {
+    format!("Profile with profileId {profile_id} is not found in the domain")
 }
 
 /// The `ResourceNotFoundException` message for a profile object the domain holds no

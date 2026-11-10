@@ -186,9 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this domain before any of them is written.
         let mut participants: Vec<(String, Profile)> = Vec::with_capacity(merge_order.len());
         for id in &merge_order {
-            let stored = domain.profiles.get(*id).ok_or_else(|| {
-                not_found(crate::state::profile_not_found(&input.domain_name, id))
-            })?;
+            let stored = domain
+                .profiles
+                .get(*id)
+                .ok_or_else(|| not_found(crate::state::profile_not_found(id)))?;
             participants.push(((*id).to_string(), stored.profile.clone()));
         }
         // The merged profile IS the main profile, so it keeps the instant that one was

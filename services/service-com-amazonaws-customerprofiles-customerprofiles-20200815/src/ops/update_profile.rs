@@ -205,12 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .profiles
             .get(&input.profile_id)
             .cloned()
-            .ok_or_else(|| {
-                not_found(crate::state::profile_not_found(
-                    &input.domain_name,
-                    &input.profile_id,
-                ))
-            })?;
+            .ok_or_else(|| not_found(crate::state::profile_not_found(&input.profile_id)))?;
 
         let mut profile = stored.profile;
         // Applied member by member, never as a wholesale replacement: a member the request
