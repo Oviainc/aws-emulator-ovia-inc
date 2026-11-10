@@ -183,7 +183,9 @@ impl From<ListObjectsErrorModeled> for ListObjectsError {
 /// The most entries one page may carry: "Sets the maximum number of keys returned in the
 /// response. By default, the action returns up to 1,000 key names. The response might
 /// contain fewer keys but will never contain more" (`MaxKeys`,
-/// `com.amazonaws.s3#ListObjectsRequest`). A larger `max-keys` is answered with this many.
+/// `com.amazonaws.s3#ListObjectsRequest`). A larger `max-keys` is answered with this many
+/// ENTRIES; the `MaxKeys` element still reports the number the request asked for, which is
+/// the only thing that tells a clamped request from the server-side default.
 const MAX_KEYS_PER_PAGE: i32 = 1000;
 
 /// The `ListObjects` operation.
@@ -274,7 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::INVALID_ARGUMENT_CODE,
                     crate::state::INVALID_ARGUMENT_STATUS,
-                    "Invalid Encoding Method specified in Request",
+                    crate::state::INVALID_ENCODING_METHOD_MESSAGE,
                 ));
             }
         }
@@ -290,10 +292,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 ))
             }
-            Some(requested) => requested.min(MAX_KEYS_PER_PAGE),
+            Some(requested) => requested,
             None => MAX_KEYS_PER_PAGE,
         };
-        let page_limit = max_keys as usize;
+        // The ceiling bounds the PAGE, not the echo: a listing asked for more entries than
+        // one page may carry is answered with [`MAX_KEYS_PER_PAGE`] of them and reports the
+        // number the caller asked for.
+        let page_limit = max_keys.min(MAX_KEYS_PER_PAGE) as usize;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::unmodeled(
@@ -490,6 +495,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // begins with, and the start of the listing — for a request that named none.
             prefix: Some(encode(input.prefix.clone().unwrap_or_default())),
             delimiter: input.delimiter.clone().map(encode),
+            // "Sets the maximum number of keys returned in the response"
+            // (`ListObjectsOutput$MaxKeys`): the number the REQUEST asked for, or the
+            // default for a request that asked for none. A page carries at most
+            // [`MAX_KEYS_PER_PAGE`] entries whatever this says, which is what `IsTruncated`
+            // and the resume marker are for.
             max_keys: Some(max_keys),
             marker: Some(encode(input.marker.clone().unwrap_or_default())),
             // Truncated exactly when an entry was left for the next page.

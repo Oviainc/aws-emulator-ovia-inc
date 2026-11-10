@@ -79,6 +79,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch;
+use ::service_common::front_door::FrontDoor;
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use smithy_server_runtime::{
     BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Service,
@@ -500,7 +501,9 @@ fn epoch_secs(at: SystemTime) -> f64 {
 /// — the reads, writes and deletes of a key, the multipart upload that writes one in parts —
 /// and the listings of what a bucket holds. The two copies, which this service already serves
 /// behind its front door for the refusal only a door can word, are wrapped where they are
-/// built ([`super::front_door`]) so that one operation is not served twice.
+/// built ([`super::front_door`]) so that one operation is not served twice; the four
+/// listings, which need a door for the same reason, are wrapped HERE
+/// ([`meter_behind_door`]) for that same reason.
 ///
 /// Not here, and why: `DeleteObjects` names the objects it deletes in its request DOCUMENT
 /// rather than in its address, so which filtered configurations its keys fall under is not a
@@ -560,29 +563,64 @@ pub fn serve_metered<Eng: Send + Sync + 'static>(
         crate::ops::abort_multipart_upload::AbortMultipartUpload::new(Arc::clone(engine)),
         RequestKind::Delete,
     );
-    meter(
+    // The four listings are served behind a door as well as counted: each binds the
+    // `encoding-type` whose refusal carries members of its own ([`super::refused_argument`]),
+    // and only a door routes a refusal the BOUNDARY makes through this service's own
+    // renderer. One entry per operation, so the door and the counting are the same served
+    // operation rather than two.
+    meter_behind_door(
         table,
         engine,
         crate::ops::list_objects_v2::ListObjectsV2::new(Arc::clone(engine)),
         RequestKind::List,
     );
-    meter(
+    meter_behind_door(
         table,
         engine,
         crate::ops::list_objects::ListObjects::new(Arc::clone(engine)),
         RequestKind::List,
     );
-    meter(
+    meter_behind_door(
         table,
         engine,
         crate::ops::list_object_versions::ListObjectVersions::new(Arc::clone(engine)),
         RequestKind::List,
     );
-    meter(
+    meter_behind_door(
         table,
         engine,
         crate::ops::list_multipart_uploads::ListMultipartUploads::new(Arc::clone(engine)),
         RequestKind::List,
+    );
+}
+
+/// Add one metered operation to `table` behind this service's FRONT DOOR, keyed by its own
+/// modelled name.
+///
+/// What the door buys, and why these operations need it: a value the BOUNDARY rejects is
+/// otherwise answered by the framework's own renderer, which cannot write the members S3's
+/// document carries beside the code and the message — the `<ArgumentName>` /
+/// `<ArgumentValue>` pair naming the refused parameter — nor the pair of request-correlation
+/// ids every other answer of this service is named by. Behind the door that refusal is worded
+/// by [`super::uri_value_wording`] and rendered by this service
+/// (`super::EmulatedService::detailed_refusal`).
+fn meter_behind_door<Eng, O>(
+    table: &mut OperationRoutingTable,
+    engine: &Arc<Eng>,
+    operation: O,
+    kind: RequestKind,
+) where
+    Eng: Send + Sync + 'static,
+    O: Operation + ErasedOperation + 'static,
+{
+    table.add_operation(
+        O::NAME,
+        Box::new(Metered::new(
+            FrontDoor::worded(operation, super::submitted_value_wording)
+                .wording_uri(super::uri_value_wording),
+            Arc::clone(engine),
+            kind,
+        )),
     );
 }
 

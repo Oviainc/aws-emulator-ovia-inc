@@ -971,10 +971,12 @@ async fn an_address_or_a_feature_this_emulator_does_not_hold_is_refused() {
             "Argument max-uploads must be an integer between 0 and 2147483647: -2147483648",
         ),
         // `encoding-type` is a modelled enum of one value, so a value outside it is
-        // refused at the BOUNDARY, before this handler runs, by the service-wide rule in
-        // `src/service.rs`: a value that failed a constraint in a query parameter is
-        // `InvalidArgument` (400) carrying the clause the validator built. The handler's own
-        // guard answers the same code for anything that gets past that enum.
+        // refused at the BOUNDARY, before this handler runs — and S3 reports that against
+        // the encoding METHOD asked for, with its own published sentence and the
+        // `<ArgumentName>` / `<ArgumentValue>` pair naming the parameter (the service-wide
+        // rule in `src/service.rs`, pinned over every listing by
+        // [`super::listing_echoed_members`]). The handler's own guard answers the same code
+        // and the same sentence for anything that gets past that enum.
         (
             "an encoding method the model does not declare",
             name,
@@ -982,8 +984,7 @@ async fn an_address_or_a_feature_this_emulator_does_not_hold_is_refused() {
             Vec::new(),
             400,
             "InvalidArgument",
-            "Value 'gzip' at 'encodingType' failed to satisfy constraint: Member must satisfy \
-             enum value set: [url]",
+            "Invalid Encoding Method specified in Request",
         ),
         (
             "x-amz-expected-bucket-owner naming another account",

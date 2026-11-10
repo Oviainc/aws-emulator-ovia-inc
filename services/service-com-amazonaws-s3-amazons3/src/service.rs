@@ -551,7 +551,9 @@ fn element_of(member_path_segment: &str) -> String {
 ///
 /// Each row's source is the AWS S3 API reference for the operation that binds the field —
 /// `CopyObject`'s two directive headers, `GetObjectAttributes`'
-/// `x-amz-object-attributes`, `CreateBucket`'s `x-amz-object-ownership`, `ListBuckets`'
+/// `x-amz-object-attributes`, the `encoding-type` the four listings share
+/// ([`crate::state::ENCODING_TYPE_PARAMETER`]), `CreateBucket`'s `x-amz-object-ownership`,
+/// `ListBuckets`'
 /// `max-buckets`, the `id` query parameter the id-addressed bucket configuration operations
 /// share ([`CONFIGURATION_ID_PARAMETER`]), and `UpdateObjectEncryption`'s `ObjectEncryption`
 /// payload, whose `InvalidRequest` messages that operation's own `@documentation` lists
@@ -599,6 +601,17 @@ fn published_refusal(violation: &Violation) -> Option<Refused> {
         "metadataDirective" => (
             crate::state::INVALID_ARGUMENT_CODE,
             "Unknown metadata directive.".to_string(),
+        ),
+        // The `encoding-type` every listing binds: the value names the encoding S3 is to
+        // write the response's key-name elements in, so a value outside the one the model
+        // declares names no encoding method at all — which S3 reports against the METHOD
+        // asked for rather than by quoting the member path the value travelled on. The
+        // sentence is the one the listings themselves answer such a value with
+        // ([`crate::state::INVALID_ENCODING_METHOD_MESSAGE`]), so the refusal reads the same
+        // whichever layer makes it.
+        "encodingType" => (
+            crate::state::INVALID_ARGUMENT_CODE,
+            crate::state::INVALID_ENCODING_METHOD_MESSAGE.to_string(),
         ),
         // `GetObjectAttributes` names the attribute that is not one, whichever element of
         // the header's list carried it.
@@ -951,15 +964,18 @@ fn configuration_id_wording(
 ///
 /// S3's `InvalidArgument` document names the field it rejected and the value that field
 /// carried (Amazon S3 API Reference, *Error responses*), which for a HEADER is the header as
-/// the API publishes it and the value as the request sent it. The two copy DIRECTIVES are
-/// that case; `x-amz-copy-source` is the one where the refusal is about the value being
+/// the API publishes it, for a QUERY PARAMETER the parameter as it publishes that, and the
+/// value as the request sent it. The two copy DIRECTIVES and the listings' `encoding-type`
+/// are that case; `x-amz-copy-source` is the one where the refusal is about the value being
 /// unreadable AS a reference, so the document names the FIELD in both halves — there is no
 /// text to echo that is not the caller's own.
 ///
-/// Only a field of an operation served behind the door is reached here ([`front_door`]),
-/// which is what the rows are: the value is put into the form the member's pattern is applied
-/// to before the pattern sees it ([`crate::state::canonical_copy_source`]), so what is left
-/// for the boundary to reject on the copies is one of these three headers.
+/// Reached for a field of EVERY operation of this service, not only the ones served behind a
+/// door ([`ErasedServiceDefinition::refusal_response`] is where the pair is attached): the
+/// rows are the fields whose value the boundary itself can reject — the value is put into the
+/// form the member's pattern is applied to before the pattern sees it
+/// ([`crate::state::canonical_copy_source`]), so what is left for the boundary to reject on
+/// the copies is one of these three headers.
 fn refused_argument(violation: &Violation) -> Option<crate::scaffolded::ErrorDetail> {
     let member = violation.path.split('.').next()?;
     let (name, value) = match member {
@@ -973,6 +989,10 @@ fn refused_argument(violation: &Violation) -> Option<crate::scaffolded::ErrorDet
         ),
         "taggingDirective" => (
             TAGGING_DIRECTIVE_HEADER,
+            violation.value.clone().unwrap_or_default(),
+        ),
+        "encodingType" => (
+            crate::state::ENCODING_TYPE_PARAMETER,
             violation.value.clone().unwrap_or_default(),
         ),
         _ => return None,
@@ -1020,6 +1040,11 @@ const TAGGING_DIRECTIVE_HEADER: &str = "x-amz-tagging-directive";
 ///   answer of this service carries, named by the pair of ids S3 mints
 ///   ([`EmulatedService::worded_refusal`]); the framework's own renderer mints ids of a
 ///   different shape, which a client, a log correlator and a support request all read.
+/// * The four listings of what a bucket holds — `ListObjects`, `ListObjectsV2`,
+///   `ListObjectVersions` and `ListMultipartUploads` — each of which binds the
+///   `encoding-type` whose refusal names the parameter and echoes its value
+///   ([`uri_value_wording`]). They are wrapped where they are COUNTED
+///   ([`request_metrics::serve_metered`]) so that one operation is not served twice.
 ///
 /// The table also holds the one operation this service serves that the model does not
 /// declare at all — the BROWSER-FORM upload ([`post_object`]) — because this is where the

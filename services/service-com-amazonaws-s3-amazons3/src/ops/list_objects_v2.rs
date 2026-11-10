@@ -227,7 +227,9 @@ impl From<ListObjectsV2ErrorModeled> for ListObjectsV2Error {
 /// The most keys one page may carry: "By default, the action returns up to 1,000 key
 /// names. The response might contain fewer keys but will never contain more"
 /// (`MaxKeys`, `com.amazonaws.s3#ListObjectsV2Request`). A larger `max-keys` is
-/// answered with this many.
+/// answered with this many ENTRIES; the `MaxKeys` element still reports the number the
+/// request asked for, which is the only thing that tells a clamped request from the
+/// server-side default.
 const MAX_KEYS_PER_PAGE: i32 = 1000;
 
 /// The marker a continuation token this service issued carries, so a token it did not
@@ -328,7 +330,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::INVALID_ARGUMENT_CODE,
                     crate::state::INVALID_ARGUMENT_STATUS,
-                    "Invalid Encoding Method specified in Request",
+                    crate::state::INVALID_ENCODING_METHOD_MESSAGE,
                 ));
             }
         }
@@ -341,19 +343,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     format!("Argument max-keys must be an integer between 0 and 2147483647: {requested}"),
                 ))
             }
-            Some(requested) => requested.min(MAX_KEYS_PER_PAGE),
+            Some(requested) => requested,
             None => MAX_KEYS_PER_PAGE,
         };
-        let page_limit = max_keys as usize;
+        // The ceiling bounds the PAGE, not the echo: a listing asked for more entries than
+        // one page may carry is answered with [`MAX_KEYS_PER_PAGE`] of them and reports the
+        // number the caller asked for.
+        let page_limit = max_keys.min(MAX_KEYS_PER_PAGE) as usize;
 
         // A continuation token wins over StartAfter: it already encodes where the
         // previous page stopped, which is at or after StartAfter.
         let resume_at = match input.continuation_token.as_deref() {
             Some(token) => Some(decode_continuation_token(token).ok_or_else(|| {
-                crate::scaffolded::Scaffolded::unmodeled(
-                    "InvalidArgument",
-                    400,
-                    "The continuation token provided is incorrect",
+                // A token no listing of this service issued names no position to resume
+                // from, which is an `InvalidArgument` naming the parameter it arrived on
+                // ([`crate::state::CONTINUATION_TOKEN_ARGUMENT`]) — the message states the
+                // rule and nothing about the token, so the field is the only part of the
+                // document that says what the caller must fix.
+                crate::scaffolded::Scaffolded::invalid_argument(
+                    crate::state::CONTINUATION_TOKEN_ARGUMENT,
+                    None,
+                    crate::state::INVALID_CONTINUATION_TOKEN_MESSAGE,
                 )
             })?),
             None => None,
@@ -541,6 +551,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // key begins with, for a request that named none.
             prefix: Some(encode(input.prefix.clone().unwrap_or_default())),
             delimiter: input.delimiter.clone().map(encode),
+            // "Sets the maximum number of keys returned in the response"
+            // (`ListObjectsV2Output$MaxKeys`): the number the REQUEST asked for, or the
+            // default for a request that asked for none. A page carries at most
+            // [`MAX_KEYS_PER_PAGE`] entries whatever this says, which is what `IsTruncated`
+            // and `NextContinuationToken` are for — a client told the ceiling instead could
+            // not tell a clamped request from that default.
             max_keys: Some(max_keys),
             // "KeyCount is the number of keys returned with this request" — the
             // entries on this page, each rolled-up prefix counting as one.

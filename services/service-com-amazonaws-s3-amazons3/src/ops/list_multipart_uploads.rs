@@ -313,7 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::INVALID_ARGUMENT_CODE,
                 crate::state::INVALID_ARGUMENT_STATUS,
-                "Invalid Encoding Method specified in Request",
+                crate::state::INVALID_ENCODING_METHOD_MESSAGE,
             ));
         }
 
@@ -532,16 +532,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The address the uploads were recorded under (no access point is held here, so
             // there is no ARN or alias to report instead).
             bucket: Some(input.bucket.clone()),
+            // "When a prefix is provided in the request, this field contains the specified
+            // prefix" and "if you don't specify a delimiter in your request, this element is
+            // absent from the response" (`ListMultipartUploadsOutput$Prefix` and
+            // `$Delimiter`): these two are reported exactly when the request stated them,
+            // which is what their own members say — unlike the markers below, and unlike the
+            // `Prefix` of the listings of a bucket's contents and versions, which is part of
+            // every answer.
             prefix: input.prefix.clone().map(encode),
             delimiter: input.delimiter.clone().map(encode),
             // "Maximum number of multipart uploads that could have been included in the
             // response" — the effective bound this page was computed under, not the raw
             // request value.
             max_uploads: Some(max_uploads),
-            // "The key at or after which the listing began" and its upload-id companion:
-            // the markers the request carried are echoed back.
-            key_marker: input.key_marker.clone().map(encode),
-            upload_id_marker: input.upload_id_marker.clone(),
+            // "The key at or after which the listing began" and its upload-id companion: the
+            // two elements that say WHERE this listing began are part of every answer, each
+            // carrying the empty value — the start of the listing — for a request that named
+            // no marker, because a client paging with them reads them out of the response.
+            key_marker: Some(encode(input.key_marker.clone().unwrap_or_default())),
+            upload_id_marker: Some(input.upload_id_marker.clone().unwrap_or_default()),
             // Truncated exactly when an entry was left for the next page; the markers name
             // the last entry reported here, which the next request resumes after.
             is_truncated: Some(truncated),

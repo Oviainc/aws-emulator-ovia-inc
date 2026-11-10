@@ -171,6 +171,21 @@ pub const COPY_SOURCE_IS_DELETE_MARKER_MESSAGE: &str =
 /// reports `MaxBuckets: {httpQuery: "max-buckets"}`).
 pub const MAX_BUCKETS_ARGUMENT: &str = "max-buckets";
 
+/// The request field a refused continuation token is reported against — the query parameter
+/// `ListObjectsV2` binds it from
+/// (`smithy_query(query="operation",operation="ListObjectsV2")` reports
+/// `ContinuationToken: {httpQuery: "continuation-token"}`), which is how S3's
+/// `InvalidArgument` document names the argument it rejected.
+pub const CONTINUATION_TOKEN_ARGUMENT: &str = "continuation-token";
+
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a `continuation-token` that is
+/// not one a listing of this service issued.
+///
+/// Fixed text, and the document echoes no value beside it: the token is "obfuscated and is
+/// not a real key" (`ListObjectsV2Output$NextContinuationToken`), so what the caller has to
+/// fix is named by the `<ArgumentName>` alone.
+pub const INVALID_CONTINUATION_TOKEN_MESSAGE: &str = "The continuation token provided is incorrect";
+
 /// The bounds a page of buckets may be asked for within: `MaxBuckets`' own published range
 /// (`range {min 1, max 10000}`, the same source).
 pub const MAX_BUCKETS_BOUNDS: ::std::ops::RangeInclusive<i32> = 1..=10_000;

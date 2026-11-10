@@ -1560,6 +1560,19 @@ impl std::fmt::Display for ObjectChecksumRejection {
 /// is also the one the AWS CLI sends on every listing.
 pub const ENCODING_TYPE_URL: &str = "url";
 
+/// The query parameter every listing binds its `EncodingType` from: `encoding-type`
+/// (`smithy_query(query="operation",operation="ListObjects,ListObjectsV2,
+/// ListObjectVersions,ListMultipartUploads")` reports `EncodingType:
+/// {httpQuery: "encoding-type"}` on each of them) — the field name S3's refusal of a value
+/// it cannot encode with reports, because that is how the API publishes it.
+pub const ENCODING_TYPE_PARAMETER: &str = "encoding-type";
+
+/// The sentence S3 refuses an `encoding-type` outside [`ENCODING_TYPE_URL`] with, stated
+/// once because every listing that binds the parameter answers the same one — and because a
+/// request the BOUNDARY refuses for it is worded from here too
+/// (`crate::service::published_refusal`), so the two cannot disagree.
+pub const INVALID_ENCODING_METHOD_MESSAGE: &str = "Invalid Encoding Method specified in Request";
+
 /// The characters percent-encoding LEAVES ALONE: RFC 3986's unreserved set,
 /// `A-Z a-z 0-9 - _ . ~`.
 ///
