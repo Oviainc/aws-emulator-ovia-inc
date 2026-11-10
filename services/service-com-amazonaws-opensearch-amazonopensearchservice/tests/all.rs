@@ -155,6 +155,8 @@ mod instance_type_catalog;
 mod instance_type_engine_refusal;
 #[path = "all/instance_type_limits.rs"]
 mod instance_type_limits;
+#[path = "all/log_publishing_destinations.rs"]
+mod log_publishing_destinations;
 #[path = "all/migration_listing.rs"]
 mod migration_listing;
 #[path = "all/migration_owner_resolution.rs"]

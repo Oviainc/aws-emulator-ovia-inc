@@ -26,7 +26,8 @@
 use serde_json::{json, Value};
 
 use super::domain_lifecycle::{
-    change_rows, create_baseline, error_code, string_member, Answer, Emulator, PREFIX, SETTLE_WAIT,
+    change_rows, create_baseline, error_code, string_member, Answer, Emulator, CHANGE_LOG_GROUP,
+    PREFIX, SETTLE_WAIT,
 };
 
 /// `POST /2021-01-01/opensearch/domain/{DomainName}/config/cancel`.
@@ -128,7 +129,10 @@ fn cancelled_ids(answer: &Answer, case: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn a_cancel_puts_back_the_configuration_the_change_was_applied_on_top_of() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_log_groups();
+    // The log-publishing row of the shared table publishes to a log group, which has to
+    // exist before an option enabling it is accepted.
+    emulator.created_log_group(CHANGE_LOG_GROUP).await;
     let rows = change_rows();
     // One domain per option container the shared change table spans, all created
     // first so ONE wait settles every one of them: the change a create starts is not

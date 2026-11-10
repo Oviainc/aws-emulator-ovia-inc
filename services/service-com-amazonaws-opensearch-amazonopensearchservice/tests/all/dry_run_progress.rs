@@ -30,7 +30,8 @@
 use serde_json::{json, Value};
 
 use super::domain_lifecycle::{
-    change_rows, create_baseline, error_code, string_member, Answer, Emulator, PREFIX, SETTLE_WAIT,
+    change_rows, create_baseline, error_code, string_member, Answer, Emulator, CHANGE_LOG_GROUP,
+    PREFIX, SETTLE_WAIT,
 };
 
 /// A well-formed `GUID` that names no dry run: the id space is 128 bits wide and the
@@ -128,7 +129,11 @@ fn assert_timestamp_text(value: &str, case: &str) {
 
 #[tokio::test]
 async fn a_verbose_dry_run_is_reported_from_the_record_the_update_minted() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_log_groups();
+    // The log-publishing row of the shared table publishes to a log group, which has to
+    // exist before an option enabling it is accepted — a dry run is judged by the same
+    // rules as the change it reports on.
+    emulator.created_log_group(CHANGE_LOG_GROUP).await;
     let rows = change_rows();
 
     // One domain per row, all created up front so a single wait settles them: a dry run

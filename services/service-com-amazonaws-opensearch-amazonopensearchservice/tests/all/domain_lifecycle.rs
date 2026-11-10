@@ -96,6 +96,21 @@ impl Emulator {
         emulator
     }
 
+    /// The same emulator with the Amazon CloudWatch Logs service mounted on the SAME
+    /// shared engine, so a suite can create the log group a domain's logs are published
+    /// to through that service's own `CreateLogGroup` — the store this service resolves
+    /// a `LogPublishingOption$CloudWatchLogsLogGroupArn` in — rather than by hand-building
+    /// a log-group record.
+    pub(crate) fn with_log_groups() -> Self {
+        let mut emulator = Self::new();
+        emulator.router.register_service(
+            service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(
+                std::sync::Arc::clone(&emulator.engine),
+            ),
+        );
+        emulator
+    }
+
     /// This emulator's store, reached exactly as a handler reaches it. A suite uses it
     /// to put the record into a state no implemented operation can reach yet — the
     /// service software a landed deployment leaves behind, say, whose deploying
@@ -218,7 +233,72 @@ impl Emulator {
         };
         self.call("GET", &uri, None).await
     }
+
+    /// Call `operation` of the Amazon CloudWatch Logs service mounted on the same router
+    /// ([`Emulator::with_log_groups`]), the way an SDK drives it: `POST /` with
+    /// `X-Amz-Target: Logs_20140328.<Op>`, signed for that service so the router can
+    /// name it.
+    async fn logs_call(&self, operation: &str, body: Value) -> Answer {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", format!("logs.{REGION}.amazonaws.com"))
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("Logs_20140328.{operation}"))
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 \
+                     Credential={DEFAULT_ACCESS_KEY_ID}/20260101/{REGION}/logs/aws4_request, \
+                     SignedHeaders=host;x-amz-target, Signature=0"
+                ),
+            )
+            .body(Bytes::from(body.to_string()))
+            .expect("the test request is well formed");
+        self.dispatch(request).await
+    }
+
+    /// Create the log group `name` through the CloudWatch Logs service's own
+    /// `CreateLogGroup`, so the destination ARN naming it resolves in the store this
+    /// service reads an enabled log-publishing option against.
+    pub(crate) async fn created_log_group(&self, name: &str) {
+        let answer = self
+            .logs_call("CreateLogGroup", json!({ "logGroupName": name }))
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case CreateLogGroup({name:?}): expected 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+    }
+
+    /// Delete the log group `name` through the CloudWatch Logs service's own
+    /// `DeleteLogGroup`, so its ARN names no group afterwards.
+    pub(crate) async fn deleted_log_group(&self, name: &str) {
+        let answer = self
+            .logs_call("DeleteLogGroup", json!({ "logGroupName": name }))
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case DeleteLogGroup({name:?}): expected 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+    }
 }
+
+/// The ARN of the CloudWatch Logs group `name` in this account and Region — the value
+/// `LogPublishingOption$CloudWatchLogsLogGroupArn` carries (`LogGroup$logGroupArn`).
+pub(crate) fn log_group_arn(name: &str) -> String {
+    format!(
+        "arn:aws:logs:{REGION}:{}:log-group:{name}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The log group the `LogPublishingOptions` row of [`change_rows`] publishes to. An
+/// enabled option's destination has to be a group that exists, so a suite driving that
+/// row creates it first ([`Emulator::created_log_group`]).
+pub(crate) const CHANGE_LOG_GROUP: &str = "/aws/opensearch/slow";
 
 /// The wire error code of a failed answer: the `x-amzn-errortype` header when the
 /// path that answered sets one, else the `__type` of the error body.
@@ -303,6 +383,10 @@ fn baseline_options() -> Vec<(&'static str, Value)> {
 /// `DryRunResults$DeploymentType` applying it is — `Blue/Green` where it changes the
 /// shape of the provisioned cluster, `DynamicUpdate` where it is a setting on the
 /// running one.
+///
+/// The log-publishing row enables publishing to [`CHANGE_LOG_GROUP`], so a suite that
+/// drives these rows mounts the CloudWatch Logs service ([`Emulator::with_log_groups`])
+/// and creates that group first.
 pub(crate) fn change_rows() -> Vec<(&'static str, Value, &'static str)> {
     vec![
         (
@@ -337,10 +421,11 @@ pub(crate) fn change_rows() -> Vec<(&'static str, Value, &'static str)> {
         (
             "LogPublishingOptions",
             json!({
+                // The destination has to be a log group that EXISTS, so a suite driving
+                // this row creates [`CHANGE_LOG_GROUP`] first.
                 "INDEX_SLOW_LOGS": {
                     "Enabled": true,
-                    "CloudWatchLogsLogGroupArn":
-                        "arn:aws:logs:us-east-1:000000000000:log-group:/aws/opensearch/slow",
+                    "CloudWatchLogsLogGroupArn": log_group_arn(CHANGE_LOG_GROUP),
                 },
             }),
             "DynamicUpdate",
@@ -792,7 +877,10 @@ async fn engine_type_is_derived_from_the_engine_version_prefix() {
 
 #[tokio::test]
 async fn an_updated_option_replaces_only_itself_and_bumps_only_its_own_revision() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_log_groups();
+    // The log-publishing row publishes to a log group, which has to exist before an
+    // option enabling it is accepted.
+    emulator.created_log_group(CHANGE_LOG_GROUP).await;
     // The domains are created first so ONE wait settles every one of them: a domain
     // that is still being provisioned has work in flight, and the update under test
     // is a further change, which such a domain refuses.
@@ -899,7 +987,11 @@ async fn an_updated_option_replaces_only_itself_and_bumps_only_its_own_revision(
 
 #[tokio::test]
 async fn a_dry_run_reports_the_change_it_would_make_and_stores_nothing() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_log_groups();
+    // The log-publishing row publishes to a log group, which has to exist before an
+    // option enabling it is accepted — a dry run is judged by the same rules as the
+    // change it reports on.
+    emulator.created_log_group(CHANGE_LOG_GROUP).await;
     let rows = change_rows();
 
     // One domain per row, all created up front so a single wait settles them: a dry

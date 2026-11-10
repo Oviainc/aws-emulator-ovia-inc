@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 use super::domain_lifecycle::{
     baseline_create, change_rows, create_baseline, error_code, string_member, Answer, Emulator,
-    PREFIX, SETTLE_WAIT,
+    CHANGE_LOG_GROUP, PREFIX, SETTLE_WAIT,
 };
 
 /// A well-formed `GUID` that names no change: the id space is 128 bits wide and the
@@ -185,7 +185,10 @@ fn created_properties(name: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn a_change_reports_the_option_it_sets_pending_then_completed() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_log_groups();
+    // The log-publishing row of the shared table publishes to a log group, which has to
+    // exist before an option enabling it is accepted.
+    emulator.created_log_group(CHANGE_LOG_GROUP).await;
     // One row per kind of option container the shared change table spans: a cluster
     // structure, an EBS structure, a policy string, a free-form map, a snapshot
     // structure, an enum, a `LogType`-keyed map and a software-update structure. The

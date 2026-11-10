@@ -52,6 +52,11 @@ percent-encoding = "2.3"
 # (`state::analysis`). Read from the store S3 itself writes, the way the IAM and Cognito
 # stores above are read.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The Amazon CloudWatch Logs store, which holds the log groups a domain's logs are
+# published to: a `LogPublishingOption` names its destination by ARN, and that group is
+# resolved in the store `logs:CreateLogGroup` writes (`state::log_destinations`) — the
+# way the IAM, Cognito and S3 stores above are read.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # UAX#29 word segmentation: the word boundaries the engine's standard tokenizer splits
 # text on (`state::analysis`), rather than a hand-written scanner here.
 unicode-segmentation = "1"

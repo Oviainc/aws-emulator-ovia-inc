@@ -565,6 +565,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
         }
 
+        // Where a domain publishes its logs has to be a destination the service can
+        // write to, whichever call sets it, and by the same rule the create path
+        // applies. It is checked on the REQUEST's map: a supplied `LogPublishingOptions`
+        // REPLACES the stored one whole, so the map the request carries IS what this
+        // change would leave the domain publishing to, and a request that carries none
+        // changes nothing about where its logs go. A dry run is refused too — it reports
+        // what applying the change would do, and this change cannot be applied.
+        if let Some(refusal) = crate::state::log_destinations::log_publishing_destination_refusal(
+            &*self.engine,
+            input.log_publishing_options.iter().flatten(),
+        ) {
+            return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
+        }
+
         let touched = merge(&mut merged, input, &placements, now);
         // A block the update INTRODUCES is completed the same way the create completes
         // one: a volume switched to `gp3` gets the baseline performance the service

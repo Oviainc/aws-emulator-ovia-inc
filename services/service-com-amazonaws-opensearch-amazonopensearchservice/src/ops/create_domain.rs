@@ -366,6 +366,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.ebs_options.as_ref(),
             ),
             crate::state::log_publishing_refusal(input.log_publishing_options.iter().flatten()),
+            // And the group that ARN names has to be one CloudWatch Logs holds: a
+            // create that enables publishing to a group nobody created configures a
+            // delivery that can never happen, so it is refused and no domain is
+            // created, by the same rule the update path applies.
+            crate::state::log_destinations::log_publishing_destination_refusal(
+                &*self.engine,
+                input.log_publishing_options.iter().flatten(),
+            ),
             crate::state::off_peak_window_refusal(input.off_peak_window_options.as_ref()),
             crate::state::cognito_authentication::cognito_options_refusal(
                 &*self.engine,

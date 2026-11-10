@@ -1485,8 +1485,13 @@ pub fn warm_storage_refusal(cluster: Option<&ClusterConfig>) -> Option<Validatio
 /// A `LogPublishingOption` is "whether the log should be published" plus "the ARN of
 /// the CloudWatch Logs group to publish logs to": an option that is enabled and names
 /// no group publishes to nowhere, so it is refused rather than stored as a
-/// configuration that silently does nothing. A disabled option publishes nothing and
-/// needs no destination.
+/// configuration that silently does nothing. Naming a group means carrying the ARN OF
+/// ONE — a value that is not a log group's ARN names no destination either
+/// ([`super::log_destinations::names_a_log_group`]). A disabled option publishes
+/// nothing and needs no destination.
+///
+/// Whether the group that ARN names exists is the next link up
+/// ([`super::log_destinations::log_publishing_destination_refusal`]).
 ///
 /// The log types are stated in order, so one request with two offending options is
 /// refused with the same sentence however the map was iterated.
@@ -1500,7 +1505,7 @@ pub fn log_publishing_refusal<'a>(
                 && option
                     .cloud_watch_logs_log_group_arn
                     .as_deref()
-                    .is_none_or(str::is_empty)
+                    .is_none_or(|arn| !super::log_destinations::names_a_log_group(arn))
         })
         .map(|(log_type, _)| log_type.as_str())
         .collect();

@@ -42,14 +42,23 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 };
 
 use super::domain_lifecycle::{
-    baseline_create, create_baseline, error_code, Answer, Emulator, PREFIX, SETTLE_WAIT,
+    baseline_create, create_baseline, error_code, log_group_arn, Answer, Emulator, PREFIX,
+    SETTLE_WAIT,
 };
+use super::log_publishing_destinations::PUBLISHED_GROUP;
 use super::service_software_update::{
     message, seed, settled_domain, start, with_update_available,
 };
 
-/// A CloudWatch Logs group ARN of the form `LogPublishingOption`'s member takes.
-const LOG_GROUP: &str = "arn:aws:logs:us-east-1:000000000000:log-group:/aws/opensearch/application";
+/// The CloudWatch Logs group the rows below publish to. An enabled option's
+/// destination has to be a group that exists, so the suites that enable one create it
+/// through the CloudWatch Logs service first ([`Emulator::created_log_group`]).
+const LOG_GROUP_NAME: &str = PUBLISHED_GROUP;
+
+/// That group's ARN — the value `LogPublishingOption$CloudWatchLogsLogGroupArn` takes.
+fn log_group() -> String {
+    log_group_arn(LOG_GROUP_NAME)
+}
 
 /// `CreateDomain` with the baseline body for `name`, with `member` replaced by
 /// `value`.
@@ -377,7 +386,8 @@ async fn each_storage_tier_rests_on_the_one_below_it() {
 
 #[tokio::test]
 async fn an_enabled_log_publishing_option_must_name_its_log_group() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_log_groups();
+    emulator.created_log_group(LOG_GROUP_NAME).await;
 
     // The catalog is the whole `LogType` enum the model declares
     // (`smithy_query(query="shape", shape="LogType")`), exposed as `LOG_TYPE_VALUES`:
@@ -394,11 +404,15 @@ async fn an_enabled_log_publishing_option_must_name_its_log_group() {
             ),
             (
                 "enabled with a log group",
-                json!({ "Enabled": true, "CloudWatchLogsLogGroupArn": LOG_GROUP }),
+                json!({ "Enabled": true, "CloudWatchLogsLogGroupArn": log_group() }),
                 true,
             ),
             ("disabled with no log group", json!({ "Enabled": false }), true),
-            ("no Enabled member", json!({ "CloudWatchLogsLogGroupArn": LOG_GROUP }), true),
+            (
+                "no Enabled member",
+                json!({ "CloudWatchLogsLogGroupArn": log_group() }),
+                true,
+            ),
         ];
         for (index, (case, option, accepted)) in rows.into_iter().enumerate() {
             let name = format!("logs-{}-{index}", log_type.to_lowercase().replace('_', "-"));
@@ -449,7 +463,7 @@ async fn an_enabled_log_publishing_option_must_name_its_log_group() {
         (
             "one configured, one not",
             json!({
-                "INDEX_SLOW_LOGS": { "Enabled": true, "CloudWatchLogsLogGroupArn": LOG_GROUP },
+                "INDEX_SLOW_LOGS": { "Enabled": true, "CloudWatchLogsLogGroupArn": log_group() },
                 "SEARCH_SLOW_LOGS": { "Enabled": true },
             }),
             Some("SEARCH_SLOW_LOGS"),
@@ -457,8 +471,8 @@ async fn an_enabled_log_publishing_option_must_name_its_log_group() {
         (
             "both configured",
             json!({
-                "INDEX_SLOW_LOGS": { "Enabled": true, "CloudWatchLogsLogGroupArn": LOG_GROUP },
-                "SEARCH_SLOW_LOGS": { "Enabled": true, "CloudWatchLogsLogGroupArn": LOG_GROUP },
+                "INDEX_SLOW_LOGS": { "Enabled": true, "CloudWatchLogsLogGroupArn": log_group() },
+                "SEARCH_SLOW_LOGS": { "Enabled": true, "CloudWatchLogsLogGroupArn": log_group() },
             }),
             None,
         ),
@@ -588,14 +602,15 @@ async fn the_off_peak_window_cannot_be_asked_for_disabled() {
 
 #[tokio::test]
 async fn a_domain_that_publishes_no_logs_omits_the_member_and_keeps_the_container() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_log_groups();
+    emulator.created_log_group(LOG_GROUP_NAME).await;
 
     // Rows differ along what the rule turns on: whether the create left the option
     // out, set it to an empty map, or put a log type in it. The first two leave the
     // domain publishing NOTHING, which is the case the descriptor omits the member
     // for; the third is the only one with something to report.
     let configured = json!({
-        "ES_APPLICATION_LOGS": { "Enabled": true, "CloudWatchLogsLogGroupArn": LOG_GROUP },
+        "ES_APPLICATION_LOGS": { "Enabled": true, "CloudWatchLogsLogGroupArn": log_group() },
     });
     let rows: Vec<(&str, Option<Value>)> = vec![
         ("never configured", None),

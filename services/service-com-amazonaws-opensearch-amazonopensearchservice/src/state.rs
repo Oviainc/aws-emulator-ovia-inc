@@ -59,6 +59,10 @@ pub mod advanced_security;
 /// path and the update path share.
 pub mod cognito_authentication;
 
+/// Whether the destination an enabled log-publishing option names is a CloudWatch Logs
+/// log group that exists — the check the create path and the update path share.
+pub mod log_destinations;
+
 /// Whether a value satisfies its member's modelled `@pattern` over its WHOLE length —
 /// the reading AWS applies, which the request boundary's find does not enforce for an
 /// unanchored expression.
