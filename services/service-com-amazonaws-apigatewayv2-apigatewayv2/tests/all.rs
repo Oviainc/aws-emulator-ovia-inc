@@ -95,10 +95,14 @@ mod http_api_cors_data_plane;
 mod http_api_event_path;
 #[path = "all/http_api_integration_fault_status.rs"]
 mod http_api_integration_fault_status;
+#[path = "all/http_api_jwt_claims_reach_the_integration.rs"]
+mod http_api_jwt_claims_reach_the_integration;
 #[path = "all/http_api_jwt_data_plane.rs"]
 mod http_api_jwt_data_plane;
 #[path = "all/http_api_payload_quota.rs"]
 mod http_api_payload_quota;
+#[path = "all/http_api_published_invoke_address.rs"]
+mod http_api_published_invoke_address;
 #[path = "all/http_api_request_authorizer.rs"]
 mod http_api_request_authorizer;
 #[path = "all/http_api_route_precedence.rs"]

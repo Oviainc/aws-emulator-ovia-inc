@@ -24,12 +24,13 @@
 //! status it answers is computed from them.
 //!
 //! A client on the machine this emulator runs on cannot reach that host at all: nothing
-//! resolves `{api-id}.execute-api.{region}.amazonaws.com` there, so it points at the
-//! emulator's own endpoint and carries in the PATH what it cannot carry in the host — the
-//! api id ahead of the stage (plainly, or behind the [`LOCAL_ENDPOINT_PREFIX`] marker a
-//! rewritten endpoint keeps it behind), or the stage alone. [`resolve`] reads every one of
-//! those addressings, and each is checked against this service's own records, so one
-//! request still has one claimant. The sibling REST data plane
+//! resolves `{api-id}.execute-api.{region}.amazonaws.com` there, so the api is ANNOUNCED on
+//! the emulator's own endpoint instead, with the api id in the PATH behind the
+//! [`LOCAL_ENDPOINT_PREFIX`] marker (`crate::state::announced_execute_api_endpoint`), and a
+//! client that built its own address carries in the path what it cannot carry in the host —
+//! the api id ahead of the stage (plainly, or behind that same marker), or the stage alone.
+//! [`resolve`] reads every one of those addressings, and each is checked against this
+//! service's own records, so one request still has one claimant. The sibling REST data plane
 //! (`service-com-amazonaws-apigateway-backplanecontrolservice/src/service/invoke.rs`)
 //! resolves the same shapes for its own api ids, and the WEBSOCKET half of THIS service
 //! ([`super::websocket`]) resolves only WEBSOCKET apis, so each claims only what it can
@@ -155,7 +156,7 @@ use smithy_server_runtime::{http, OperationContext};
 
 use super::data_plane::{
     addresses_connections, api_id_of_host, authority_of, first_segment, forbidden, header_of,
-    host_name, identity_source_value, joined_query_parameters, json_response, path_of,
+    identity_source_value, joined_query_parameters, json_response, path_of,
     path_segments, presents_identity_source, query_of, query_parameters, service_named_by_host,
     split_first_segment, EXECUTE_API_LABEL, LOCAL_ENDPOINT_PREFIX, NOT_FOUND_MESSAGE,
     NOT_FOUND_STATUS, UNAUTHORIZED_MESSAGE, UNAUTHORIZED_STATUS, UNPLACEABLE_STATUS,
@@ -674,10 +675,12 @@ fn resolve_answer(
     // refused here never reaches the integration below, which is what makes an authorizer's
     // gate observable. A Lambda authorizer's own decision is the one part of it that needs
     // the backend, so it travels with the dispatch below.
-    let authorizer = match authorization(api, stage, route, req) {
+    let (authorizer, admitted_jwt) = match authorization(api, stage, route, req) {
         Authorization::Refused(refusal) => return Answer::Now(Box::new(refusal)),
-        Authorization::Admitted => None,
-        Authorization::DecidedByFunction(authorizer, identity) => Some((authorizer, identity)),
+        Authorization::Admitted(admitted_jwt) => (None, admitted_jwt),
+        Authorization::DecidedByFunction(authorizer, identity) => {
+            (Some((authorizer, identity)), None)
+        }
     };
     // And the payload quota, ahead of the dispatch below: a body past it is the gateway's
     // own refusal, so the integration is never reached for it.
@@ -692,6 +695,7 @@ fn resolve_answer(
         &route_path,
         req,
         authorizer,
+        admitted_jwt,
     )))
 }
 
@@ -1035,8 +1039,10 @@ fn path_variable(segment: &str) -> Option<&str> {
 
 /// What the route's `AuthorizationType` decided about this request.
 enum Authorization {
-    /// The request may proceed to the integration.
-    Admitted,
+    /// The request may proceed to the integration, with what the route's authorizer reports
+    /// about the caller it admitted — the claims and scopes of an accepted JWT
+    /// ([`super::jwt::Accepted`]), and nothing for a route whose type identifies no caller.
+    Admitted(Option<jwt::Accepted>),
     /// The request is refused, with the answer the caller receives.
     Refused(RtResponse),
     /// The decision is the authorizer FUNCTION's, which is made once the store's guard is
@@ -1087,11 +1093,11 @@ fn authorization(
 ) -> Authorization {
     let authorization_type = route.authorization_type.as_str();
     if authorization_type == AUTHORIZATION_NONE {
-        return Authorization::Admitted;
+        return Authorization::Admitted(None);
     }
     if authorization_type == AUTHORIZATION_AWS_IAM {
         if carries_sigv4_credential(req) {
-            return Authorization::Admitted;
+            return Authorization::Admitted(None);
         }
         tracing::info!(
             api_id = %api.api_id,
@@ -1201,7 +1207,11 @@ fn authorization(
         now_unix_seconds(),
     );
     match decision {
-        jwt::Decision::Allow => Authorization::Admitted,
+        // The token the gate accepted is what the integration is told about the caller:
+        // its claims and scopes travel with the dispatch ([`super::jwt::accepted`]).
+        jwt::Decision::Allow => {
+            Authorization::Admitted(Some(jwt::accepted(presented.as_deref())))
+        }
         jwt::Decision::Unauthorized(reason) => {
             tracing::info!(
                 api_id = %api.api_id,
@@ -1273,6 +1283,7 @@ fn dispatch(
     route_path: &str,
     req: &RtRequest,
     authorizer: Option<(Authorizer, Vec<String>)>,
+    admitted_jwt: Option<jwt::Accepted>,
 ) -> dispatch::Dispatch {
     let integration: Option<Integration> = route
         .target
@@ -1306,7 +1317,7 @@ fn dispatch(
             // `Api$ApiEndpoint` announced, rather than the address a local client had to
             // reach this emulator at: that is the domain the request was made to as far as
             // the api is concerned.
-            domain_name: endpoint_host(api).to_string(),
+            domain_name: endpoint_host(api),
         },
         invocation: proxy_event::Invocation {
             account_id: ::engine::emulator_account_id().to_string(),
@@ -1314,6 +1325,7 @@ fn dispatch(
             received: SystemTime::now(),
             authorizer_context: None,
             authorizer_principal: None,
+            admitted_jwt,
         },
         integration,
         authorizer,
@@ -1354,32 +1366,25 @@ fn request_headers(req: &RtRequest) -> BTreeMap<String, String> {
     headers
 }
 
-/// The host of the api's own announced endpoint, which is the `domainName` an event reports
-/// and the first label of which is its `domainPrefix`.
-fn endpoint_host(api: &Api) -> &str {
-    authority_of(&api.api_endpoint).unwrap_or(&api.api_endpoint)
+/// The host of the api's OWN default endpoint — `{api-id}.execute-api.{region}.amazonaws.com`
+/// ([`crate::state::execute_api_host`]) — which is the `domainName` an event reports and
+/// the first label of which is its `domainPrefix`.
+///
+/// Composed from the api's stored id and Region rather than from the endpoint it ANNOUNCED:
+/// what this emulator announces is the address it serves the api at, which for a client
+/// that reached the emulator's own endpoint carries no api host at all
+/// ([`crate::state::announced_execute_api_endpoint`]), while the domain the request was made
+/// to as far as the api is concerned is the api's own either way.
+fn endpoint_host(api: &Api) -> String {
+    crate::state::execute_api_host(&api.api_id, &api.region)
 }
 
-/// The Region this api is reached in, read off the endpoint it announced
-/// (`{api-id}.execute-api.{region}.amazonaws.com`) — the Region whose Lambda endpoint an
-/// `AWS_PROXY` integration's invocation is addressed to when the function's own ARN names
-/// none.
-///
-/// An endpoint this cannot read names no Region, and the account's default
-/// ([`crate::state::DEFAULT_REGION`]) is used: the Region only selects which endpoint an
-/// in-process call is addressed to.
+/// The Region this api lives in, as the record stores it ([`crate::state::Api::region`]) —
+/// the Region whose Lambda endpoint an `AWS_PROXY` integration's invocation is addressed to
+/// when the function's own ARN names none, and the Region the `execute-api` resource ARN an
+/// `AWS_IAM` route is authorized against carries.
 fn api_region(api: &Api) -> String {
-    let host = host_name(endpoint_host(api));
-    let mut labels = host.split('.');
-    let (Some(_api_id), Some(endpoint), Some(region)) =
-        (labels.next(), labels.next(), labels.next())
-    else {
-        return crate::state::DEFAULT_REGION.to_string();
-    };
-    if !endpoint.starts_with(EXECUTE_API_LABEL) {
-        return crate::state::DEFAULT_REGION.to_string();
-    }
-    region.to_string()
+    api.region.clone()
 }
 
 /// `307 Temporary Redirect` to `location`, with no body of its own: the answer for an

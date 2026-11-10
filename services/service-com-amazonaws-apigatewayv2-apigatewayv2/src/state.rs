@@ -1204,6 +1204,16 @@ pub struct Api {
     /// One of `PROTOCOL_TYPE_VALUES` (`HTTP | WEBSOCKET`).
     pub protocol_type: String,
     pub api_endpoint: String,
+    /// The Region this api lives in: the Region the request that created it was signed for
+    /// ([`request_region`]).
+    ///
+    /// A property of the RESOURCE rather than of the endpoint it announces, so it is stored
+    /// rather than read back out of [`Api::api_endpoint`] — that value is the address this
+    /// emulator serves the api at ([`announced_execute_api_endpoint`]), which names no
+    /// Region when a client reached the emulator's own endpoint. It is the Region the api's
+    /// own `execute-api` host carries ([`execute_api_host`]) and the one the `execute-api`
+    /// resource ARN an invoke is authorized against names.
+    pub region: String,
     pub description: Option<String>,
     pub version: Option<String>,
     /// Required on the modelled `Api` shape, so the record always carries one.
@@ -4393,6 +4403,17 @@ pub const MAX_HTTP_API_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// this emulator is reached at (`/_aws/execute-api/{api-id}/{stage}/{resource-path}`).
 pub const LOCAL_ENDPOINT_PREFIX: &str = "_aws";
 
+/// The second label of every `execute-api` endpoint host — `{api-id}.execute-api.…` — and
+/// the segment that names THIS service's api data plane behind
+/// [`LOCAL_ENDPOINT_PREFIX`].
+///
+/// From `Api$ApiEndpoint`: "The URI of the API, of the form
+/// `{api-id}.execute-api.{region}.amazonaws.com`". It lives here, beside the marker,
+/// because the control plane ANNOUNCES it ([`announced_execute_api_endpoint`]) and the data
+/// planes read it back (`crate::service::data_plane` re-exports it), so what a caller is
+/// given and what is served are one constant.
+pub const EXECUTE_API_LABEL: &str = "execute-api";
+
 /// The endpoint this request was addressed at when that endpoint is the EMULATOR'S OWN —
 /// a loopback address, an IP literal or `localhost`, which is what a client configured with
 /// one local endpoint URL sends — and `None` when the host names a service, which is a
@@ -4437,17 +4458,111 @@ pub fn execute_api_scheme(protocol_type: &str) -> &'static str {
     }
 }
 
-/// The default execute-api endpoint of an api: the URI clients reach it on when
+/// The default execute-api endpoint of an api: the URI clients of AWS reach it on when
 /// no custom domain name is configured.
 ///
-/// The host is the one `CreateApiResponse$ApiEndpoint` documents —
-/// `{api-id}.execute-api.{region}.amazonaws.com` — and the scheme comes from the
-/// api's `ProtocolType` (see [`execute_api_scheme`]).
+/// The host is the one `CreateApiResponse$ApiEndpoint` documents
+/// ([`execute_api_host`]) and the scheme comes from the api's `ProtocolType` (see
+/// [`execute_api_scheme`]). What this emulator ANNOUNCES for an api is
+/// [`announced_execute_api_endpoint`], which answers this form only for a caller that
+/// resolves AWS's own hosts.
 pub fn execute_api_endpoint(api_id: &str, region: &str, protocol_type: &str) -> String {
     format!(
-        "{}://{api_id}.execute-api.{region}.amazonaws.com",
-        execute_api_scheme(protocol_type)
+        "{}://{}",
+        execute_api_scheme(protocol_type),
+        execute_api_host(api_id, region)
     )
+}
+
+/// The default execute-api HOST of an api: the name AWS gives the endpoint an api is
+/// reached on, `{api-id}.execute-api.{region}.amazonaws.com`
+/// (`CreateApiResponse$ApiEndpoint`).
+///
+/// The one place that spells the host, so the endpoint a caller that resolves AWS's own
+/// hosts is announced and the `domainName` an invoke of the api reports cannot drift
+/// apart — that domain is the api's own whichever address a client had to reach this
+/// emulator at.
+pub fn execute_api_host(api_id: &str, region: &str) -> String {
+    format!("{api_id}.{EXECUTE_API_LABEL}.{region}.amazonaws.com")
+}
+
+/// The `ApiEndpoint` this service ANNOUNCES for an api whose data plane is served through
+/// this emulator's front door, resolved once when the api is created and stored, so every
+/// later read reports the same value.
+///
+/// The member exists for a client to DIAL — "the stage name is typically appended to this
+/// URI to form a complete path to a deployed API stage" (`Api$ApiEndpoint`) — so the
+/// address announced has to be one this emulator itself answers on. Which address that is
+/// follows the same rule [`announced_portal_default_domain_name`] applies to a portal's
+/// website:
+///
+/// * a request that addressed the EMULATOR'S OWN endpoint
+///   ([`reached_emulator_endpoint`]) comes from a client that resolves nothing else, so the
+///   api is announced on that same endpoint with its own id behind the
+///   [`LOCAL_ENDPOINT_PREFIX`] marker (`/_aws/execute-api/{api-id}`), the addressing
+///   `crate::service::invoke` serves;
+/// * an api created through any other request on an emulator that IS served on a port
+///   ([`served_endpoint_authority`]) is announced on that port, the one address this
+///   process answers on, so an api minted by an in-process call of another service
+///   announces an address its caller can reach too;
+/// * a request that addressed one of AWS's own hosts on an emulator served on no port at
+///   all comes from a client that resolves them, so the api is announced on the host
+///   [`execute_api_host`] builds — the shape `Api$ApiEndpoint` documents, which the data
+///   plane claims host-style.
+pub fn announced_execute_api_endpoint(
+    api_id: &str,
+    region: &str,
+    protocol_type: &str,
+    parts: &::http::request::Parts,
+    served_base: &str,
+) -> String {
+    match reached_emulator_endpoint(parts).or_else(|| served_endpoint_authority(served_base)) {
+        Some(authority) => format!(
+            "{}://{authority}/{LOCAL_ENDPOINT_PREFIX}/{EXECUTE_API_LABEL}/{api_id}",
+            execute_api_scheme(protocol_type)
+        ),
+        None => execute_api_endpoint(api_id, region, protocol_type),
+    }
+}
+
+/// The EMULATOR'S OWN endpoint this request reached — an address or a loopback name, which
+/// is what a client configured with one local endpoint URL sends — and `None` for a request
+/// whose host names a service, which is a client that resolves AWS's own hosts.
+///
+/// The tree's one reading of that question
+/// (`service_common::data_plane_addressing::reached_emulator_endpoint`), so this service
+/// writes no second rule for which host is the emulator's own; it reads the host off the
+/// header or off an absolute-form URI, as both carry it.
+fn reached_emulator_endpoint(parts: &::http::request::Parts) -> Option<String> {
+    ::service_common::data_plane_addressing::reached_emulator_endpoint(
+        &parts.uri.to_string(),
+        parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+/// The `host[:port]` this emulator is SERVED at, read off the base URL
+/// `OperationContext::endpoint` reports ("the base URL a later request addresses… Callers
+/// send normally signed requests to it"), or `None` for an emulator that is served on no
+/// port at all — which is what its unserved base names
+/// (`smithy_server_runtime::UNSERVED_URL_BASE`, a host RFC 6761 reserves so that nothing
+/// resolves it).
+///
+/// Only a value SHAPED like a host is taken
+/// (`service_common::data_plane_addressing::is_host_shaped`), so nothing that is not an
+/// address reaches a URL this service announces.
+fn served_endpoint_authority(served_base: &str) -> Option<String> {
+    if served_base == ::smithy_server_runtime::UNSERVED_URL_BASE {
+        return None;
+    }
+    let authority = served_base
+        .split_once("://")
+        .map_or(served_base, |(_scheme, rest)| rest)
+        .trim_end_matches('/');
+    ::service_common::data_plane_addressing::is_host_shaped(authority)
+        .then(|| authority.to_string())
 }
 
 /// Read a boolean out of a query parameter the model types as `__string`.

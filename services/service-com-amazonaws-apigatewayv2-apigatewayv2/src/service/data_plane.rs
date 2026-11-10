@@ -28,9 +28,10 @@ use smithy_server_runtime::http;
 
 /// The second label of every `execute-api` endpoint host: `{api-id}.execute-api.…`.
 ///
-/// From `Api$ApiEndpoint`: "The URI of the API, of the form
-/// `{api-id}.execute-api.{region}.amazonaws.com`".
-pub const EXECUTE_API_LABEL: &str = "execute-api";
+/// Re-exported from [`crate::state::EXECUTE_API_LABEL`], which owns the label because the
+/// control plane ANNOUNCES it (see `crate::state::announced_execute_api_endpoint`), so what
+/// a caller is given and what the data planes read are one constant.
+pub use crate::state::EXECUTE_API_LABEL;
 
 /// The path segment that belongs to ApiGatewayManagementApi rather than to a stage.
 ///

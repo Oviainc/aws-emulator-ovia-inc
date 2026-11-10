@@ -224,6 +224,10 @@ pub struct Invocation {
     pub authorizer_context: Option<Value>,
     /// The principal a policy-document authorizer named, if any.
     pub authorizer_principal: Option<String>,
+    /// What the route's JWT authorizer accepted about the caller, for a request it admitted
+    /// — carried into the event the same way, and `None` for a route no JWT authorizer
+    /// fronts.
+    pub admitted_jwt: Option<crate::service::jwt::Accepted>,
 }
 
 /// The event a Lambda proxy integration with `PayloadFormatVersion` `2.0` is invoked with.
@@ -311,12 +315,50 @@ fn request_context_2_0(request: &ProxyRequest, invocation: &Invocation) -> Value
     Value::Object(context)
 }
 
-/// The `requestContext.authorizer` of a `2.0` event, for a route a Lambda authorizer
-/// decided: "lambda — the context the Lambda authorizer returned". The object is the
-/// function's OWN, carried through unchanged, whatever types its members hold.
+/// The `requestContext.authorizer` of a `2.0` event, for a route an authorizer decided.
+///
+/// One member per kind of authorizer, so a handler reads the decision of the authorizer its
+/// route actually carries: "lambda — the context the Lambda authorizer returned" (the
+/// function's OWN object, carried through unchanged, whatever types its members hold), and
+/// `jwt` — the `claims` and `scopes` of the token a JWT authorizer accepted, the two members
+/// the documented `2.0` event carries for a JWT-authorized route. A route carries one
+/// authorizer, so one member is filled; a route with none reports no `authorizer` at all.
 fn authorizer_2_0(invocation: &Invocation) -> Option<Value> {
-    let context = invocation.authorizer_context.clone()?;
-    Some(json!({ "lambda": context }))
+    let mut authorizer = Map::new();
+    if let Some(context) = invocation.authorizer_context.clone() {
+        authorizer.insert("lambda".to_string(), context);
+    }
+    if let Some(accepted) = invocation.admitted_jwt.as_ref() {
+        authorizer.insert(
+            "jwt".to_string(),
+            json!({
+                "claims": claims_value(accepted),
+                "scopes": scopes_value(accepted),
+            }),
+        );
+    }
+    (!authorizer.is_empty()).then_some(Value::Object(authorizer))
+}
+
+/// The `claims` an accepted token reports: its whole claim set, as the map of TEXT values
+/// the event carries, and JSON null for a route whose authorizer accepted no token — the
+/// shape the documented event's own `"claims": null` has.
+fn claims_value(accepted: &crate::service::jwt::Accepted) -> Value {
+    if accepted.claims.is_empty() {
+        return Value::Null;
+    }
+    json!(accepted.claims)
+}
+
+/// The `scopes` an accepted token reports: "the scopes parsed from the access token in the
+/// incoming request" (`Route$AuthorizationScopes`), and JSON null for a token claiming none
+/// — an identity token carries no scope claim, and the documented event reports that absent
+/// collection as null rather than as an empty list.
+fn scopes_value(accepted: &crate::service::jwt::Accepted) -> Value {
+    if accepted.scopes.is_empty() {
+        return Value::Null;
+    }
+    json!(accepted.scopes)
 }
 
 /// The event a Lambda proxy integration with `PayloadFormatVersion` `1.0` is invoked with:
@@ -394,11 +436,13 @@ fn request_context_1_0(
 
 /// The `requestContext.authorizer` of a `1.0` event: the authorizer's context members at
 /// the TOP of the object, beside the `principalId` a policy-document authorizer named —
-/// the shape a REST proxy event carries, which this format is.
+/// the shape a REST proxy event carries, which this format is — and, for a JWT-authorized
+/// route, the `claims` and `scopes` of the accepted token, the two members the documented
+/// `1.0` event of an HTTP api carries there.
 fn authorizer_1_0(invocation: &Invocation) -> Option<Value> {
     let context = invocation.authorizer_context.clone();
     let principal = invocation.authorizer_principal.clone();
-    if context.is_none() && principal.is_none() {
+    if context.is_none() && principal.is_none() && invocation.admitted_jwt.is_none() {
         return None;
     }
     let mut authorizer = match context {
@@ -412,6 +456,10 @@ fn authorizer_1_0(invocation: &Invocation) -> Option<Value> {
     };
     if let Some(principal) = principal {
         authorizer.insert("principalId".to_string(), json!(principal));
+    }
+    if let Some(accepted) = invocation.admitted_jwt.as_ref() {
+        authorizer.insert("claims".to_string(), claims_value(accepted));
+        authorizer.insert("scopes".to_string(), scopes_value(accepted));
     }
     Some(Value::Object(authorizer))
 }
@@ -618,6 +666,7 @@ mod tests {
             received: UNIX_EPOCH + std::time::Duration::from_millis(1_583_348_638_390),
             authorizer_context: None,
             authorizer_principal: None,
+            admitted_jwt: None,
         }
     }
 

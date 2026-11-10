@@ -344,6 +344,26 @@ impl Claims {
         }
         scopes
     }
+
+    /// The whole claim set as the event's claims map carries it: every claim, by name, as
+    /// TEXT.
+    ///
+    /// The map's values are strings — a claim's value in the documented event is quoted
+    /// whatever JSON type the token wrote it as — so a string claim is reported as the
+    /// string it is and any other claim as the JSON text it had, which is the only
+    /// rendering that loses nothing about a number, a flag or a nested value.
+    fn reported(&self) -> BTreeMap<String, String> {
+        self.0
+            .iter()
+            .map(|(claim, value)| {
+                let text = match value {
+                    ::serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                (claim.clone(), text)
+            })
+            .collect()
+    }
 }
 
 /// `presented` with the RFC 6750 `Bearer` scheme prefix removed when it carries one.
@@ -407,6 +427,42 @@ pub fn described(presented: Option<&str>) -> BTreeMap<&'static str, String> {
         described.insert(AUDIENCE_CLAIM, audiences.join(","));
     }
     described
+}
+
+/// What the gateway reports to the integration about a token the gate ACCEPTED: the token's
+/// own claim set and the scopes it claims.
+///
+/// A JWT authorizer's whole decision is about the caller, and the integration behind the
+/// route is told who that caller is in the proxy event's `requestContext.authorizer` and
+/// nowhere else — "jwt: claims, scopes", the two members the documented event carries for a
+/// route a JWT authorizer admitted. So this is the authorizer's OUTPUT, beside
+/// [`evaluate`]'s decision: it is read only for a request that was admitted, which is the
+/// only request whose caller an integration is told about.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Accepted {
+    /// Every claim of the token, by claim name, as TEXT: a claims map's values are strings
+    /// in the event, so a claim that is not a JSON string is reported as its JSON text.
+    pub claims: BTreeMap<String, String>,
+    /// The scopes the token claims ([`Claims::scopes`]), in the claim-name order that reads
+    /// them — a set, so a scope claimed under both spellings is reported once.
+    pub scopes: Vec<String>,
+}
+
+/// What [`evaluate`] admitted, as the integration is told it. A value that is not a token at
+/// all reports nothing, which is what a route with no JWT authorizer in front of it has to
+/// report.
+pub fn accepted(presented: Option<&str>) -> Accepted {
+    let Some(claims) = presented.and_then(|presented| read(presented).ok()) else {
+        return Accepted::default();
+    };
+    Accepted {
+        claims: claims.reported(),
+        scopes: claims
+            .scopes()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    }
 }
 
 #[cfg(test)]

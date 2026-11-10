@@ -6,11 +6,17 @@
 //! reach that api, so its scheme names the protocol the api speaks — `wss` for a
 //! WebSocket API (the RFC 6455 handshake scheme), `https` for an HTTP API
 //! (`CreateApiResponse$ApiEndpoint`) — and its AUTHORITY is the address that api is
-//! REACHED at: an HTTP api's own `{api-id}.execute-api.{region}.amazonaws.com` host, which
-//! this emulator's front door claims and serves, and for a WEBSOCKET api the `host:port` of
+//! REACHED at: for an HTTP api created by a client that resolves AWS's own hosts, that
+//! api's own `{api-id}.execute-api.{region}.amazonaws.com` host, which this emulator's
+//! front door claims and serves, and for a WEBSOCKET api the `host:port` of
 //! the socket the core opened for that api's data plane, which is the one address a
 //! WebSocket client on this machine can complete a handshake against. Whichever operation
 //! reports the api reports the same value.
+//!
+//! The other authority an HTTP api is announced on — the EMULATOR'S OWN endpoint, for a
+//! client configured with it, which resolves no AWS host — is
+//! `http_api_published_invoke_address`'s: every row here drives a client that addresses this
+//! service's own endpoint host, which is the case the documented form applies to.
 //!
 //! The table spans the whole `ProtocolType` enum (`HTTP | WEBSOCKET`, from
 //! `smithy_query(query="shape", shape="ProtocolType")`) crossed with the regions a
@@ -44,8 +50,10 @@ struct EndpointCase {
     extra: Value,
 }
 
-/// Assert `announced` is the endpoint an api of `protocol_type` is reached at; see the
-/// module docs for the rule.
+/// Assert `announced` is the endpoint an api of `protocol_type` is reached at, for a case
+/// whose control-plane request addressed one of AWS's own hosts; see the module docs for the
+/// rule, and `http_api_published_invoke_address` for the form an api created through the
+/// emulator's own endpoint is announced on.
 ///
 /// `reporter` names the operation that reported it, so a row that disagrees says WHICH
 /// reader disagreed.

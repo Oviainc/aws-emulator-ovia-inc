@@ -348,6 +348,7 @@ mod tests {
             received: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             authorizer_context: None,
             authorizer_principal: None,
+            admitted_jwt: None,
         };
         (request, invocation)
     }
