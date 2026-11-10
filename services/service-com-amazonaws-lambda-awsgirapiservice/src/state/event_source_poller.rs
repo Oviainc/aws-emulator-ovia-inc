@@ -163,17 +163,30 @@ pub fn drive_mapping<Eng: Send + Sync + 'static>(
     // The CloudWatch store this mapping's work is published to, resolved once per poller
     // because the handle does not change.
     let metrics = FunctionMetrics::new(super::metrics::cloudwatch_state(&**engine));
-    // The IAM store the function's execution role is judged against, resolved once for the
-    // same reason. An engine carrying none shows nothing about the role.
-    let iam = super::event_source_authorization::iam_state(&**engine);
+    // The stores the decision about each pass's reads is made from, resolved once per poller
+    // because the handles do not change.
+    let policies = PolicyStores {
+        iam: super::event_source_authorization::iam_state(&**engine),
+        sources: super::event_source_resource_policy::SourcePolicies::of(&**engine),
+    };
     let claim = PollerClaim {
         state: ::engine::ServiceState::clone(&state),
         uuid: uuid.to_string(),
         held: true,
     };
     runtime.spawn(async move {
-        poll_mapping(&callback, claim, metrics, iam).await;
+        poll_mapping(&callback, claim, metrics, policies).await;
     });
+}
+
+/// The stores the decision about a pass's reads is made from: the IAM store the invoked
+/// function's execution role is resolved against — an engine carrying none shows nothing
+/// about the role — and the stores the EVENT SOURCE's own policy lives in, since a stream is
+/// fenced by the policy attached to it whoever reads it, this poller included.
+#[derive(Clone)]
+struct PolicyStores {
+    iam: Option<::engine::ServiceState<super::event_source_authorization::IamState>>,
+    sources: super::event_source_resource_policy::SourcePolicies,
 }
 
 /// The claim of the one poller of a mapping, held for as long as that poller runs.
@@ -296,7 +309,7 @@ async fn poll_mapping(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     mut claim: PollerClaim,
     metrics: FunctionMetrics,
-    iam: Option<::engine::ServiceState<super::event_source_authorization::IamState>>,
+    policies: PolicyStores,
 ) {
     let uuid = claim.uuid.clone();
     // A handle of its own, so the store can be locked while the claim is borrowed.
@@ -333,7 +346,7 @@ async fn poll_mapping(
                 // cursor moves — and the mapping resumes where it left off once the grant is
                 // back (see [`super::event_source_authorization`], including the cases that
                 // show nothing about a role and withhold nothing).
-                if let Some(detail) = withheld_shard_read(iam.as_ref(), &run) {
+                if let Some(detail) = withheld_shard_read(&policies, &run, SystemTime::now()) {
                     failures = failures.saturating_add(1);
                     if failures == 1 || failures.is_multiple_of(FAILURE_LOG_INTERVAL) {
                         ::tracing::warn!(
@@ -353,7 +366,7 @@ async fn poll_mapping(
                     &mut clients,
                     &state,
                     &metrics,
-                    iam.as_ref(),
+                    &policies,
                     &uuid,
                     &run,
                 )
@@ -384,22 +397,26 @@ async fn poll_mapping(
     }
 }
 
-/// Why the reads this pass would make on `run`'s stream are WITHHELD from the execution
-/// role of the function the mapping invokes, or `None` when they are not — which includes
-/// every case that shows nothing about the role (see
-/// [`super::event_source_authorization`]).
+/// Why the reads this pass would make on `run`'s stream are WITHHELD — from the execution
+/// role of the function the mapping invokes, or by the policy attached to the stream itself
+/// — or `None` when they are not, which includes every case that shows nothing about either
+/// (see [`super::event_source_authorization`]).
 ///
-/// Only the IAM store is locked here, and this service's is not: the decision is taken
-/// between two passes rather than inside the critical section either of them is decided in.
+/// Only the IAM store and the source's own are locked here, one at a time, and this
+/// service's is not: the decision is taken between two passes rather than inside the
+/// critical section either of them is decided in.
 fn withheld_shard_read(
-    iam: Option<&::engine::ServiceState<super::event_source_authorization::IamState>>,
+    policies: &PolicyStores,
     run: &ShardSourcedMapping,
+    now: SystemTime,
 ) -> Option<String> {
     let role_arn = run.invoke_identity_arn.as_deref()?;
     super::event_source_authorization::unreadable_event_source_held(
-        iam,
+        policies.iam.as_ref(),
+        &policies.sources,
         role_arn,
         &run.stream_arn,
+        now,
     )
 }
 
@@ -518,7 +535,7 @@ async fn move_batches(
     clients: &mut Clients,
     state: &::engine::ServiceState<ComAmazonawsLambdaAwsgirapiserviceState>,
     metrics: &FunctionMetrics,
-    iam: Option<&::engine::ServiceState<super::event_source_authorization::IamState>>,
+    policies: &PolicyStores,
     uuid: &str,
     run: &ShardSourcedMapping,
 ) -> Outcome {
@@ -552,7 +569,7 @@ async fn move_batches(
         // at the instant it started: a grant taken away while this pass was reading means
         // nothing is handed over, nothing is metered and the shard's position does not move,
         // so the records stay for the pass that follows the grant coming back.
-        if let Some(detail) = withheld_shard_read(iam, run) {
+        if let Some(detail) = withheld_shard_read(policies, run, SystemTime::now()) {
             failure = Some(detail);
             continue;
         }

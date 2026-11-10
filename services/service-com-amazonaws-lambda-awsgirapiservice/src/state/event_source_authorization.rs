@@ -39,7 +39,15 @@
 //!    read through IAM's own [`principal_policies`](IamState::principal_policies) accessor
 //!    so this service sees exactly what `CreateRole`/`PutRolePolicy` wrote, plus the
 //!    permissions boundary that caps them;
-//! 4. **the decision** — [`::service_common::iam_authorization`], the tree's ONE evaluation
+//! 4. **what the SOURCE lets be done to it** — the resource-based policy the event source
+//!    itself carries, read out of the owning service's own store
+//!    ([`super::event_source_resource_policy`]). A read of a source is a call on another
+//!    service's resource, and such a resource is fenced by its own document whoever calls:
+//!    an explicit `Deny` about one of the poller's reads withholds it whatever the role is
+//!    granted, and a grant in it stands on its own, because "the resource-based policy and
+//!    the identity-based policy are evaluated together, and access is granted if either
+//!    allows it" ([`read_is_withheld`]);
+//! 5. **the decision** — [`::service_common::iam_authorization`], the tree's ONE evaluation
 //!    of policy documents against a request, so this service and every other one handed the
 //!    same documents decide alike. How the documents in force combine — an attachment whose
 //!    document this account does not hold grants something unreadable, so it withholds a
@@ -53,14 +61,16 @@
 //! ([`crate::state::execution_role_is_unassumable`]).
 //!
 //! Nothing is refused on evidence this emulator does not have. Each of these shows nothing
-//! about the role and lets the mapping be created: an engine carrying no IAM store, a role
+//! about the reads and lets the mapping be created: an engine carrying no IAM store, a role
 //! ARN the store holds no role for (it may belong to another account), a role carrying an
 //! attachment whose document this account does not hold — an AWS-managed policy might be
-//! the very one that carries the grant — and an event source whose kind [`EVENT_SOURCE_ACCESS`]
+//! the very one that carries the grant — a source carrying no resource-based policy, and an
+//! event source whose kind [`EVENT_SOURCE_ACCESS`]
 //! states no reads for. What the documents DO state is decided in IAM's own order: an
 //! explicit `Deny` refuses, a grant allows, and policies that state nothing about a read
-//! withhold it, because the documents in force on a role are the authority on what it may
-//! do.
+//! withhold it, because the documents in force are the authority on what may be done. A role
+//! nothing is known about is the one case where only the SOURCE's document can withhold a
+//! read: an explicit `Deny` in it is evidence this emulator does have.
 //!
 //! This reading is a service's own because [`::service_common`] cannot hold it: the IAM
 //! store's type lives in the IAM service's crate, which depends on `service_common` itself.
@@ -263,30 +273,30 @@ impl EventSourceAccess {
     /// perform on `resource`, or `None` when it may perform all of them — or when nothing of
     /// the kind can be shown (see the module docs for the cases that show nothing).
     ///
+    /// `iam` is the IAM store the role is resolved against, `None` for an engine carrying
+    /// none, and `source_policy` the document the SOURCE itself carries, already read
+    /// ([`super::event_source_resource_policy`]).
+    ///
     /// The actions the sentence only ADVISES are not asked about
     /// ([`Read::decided_on_source`]).
-    fn withheld(&self, iam: &IamState, role_arn: &str, resource: &str) -> Option<&'static str> {
-        // The role itself first: a value this account's IAM holds no role under says
-        // nothing about what that role may do.
-        iam.roles.values().find(|role| role.arn == role_arn)?;
-        // The documents in force on the role. The collection is bounded by IAM's own quotas
-        // on how many policies one role carries, so this walk is bounded by the store
-        // rather than by a number of its own. Each document is read ONCE, because one
-        // source takes several actions over the same documents.
-        let policies = iam.principal_policies(role_arn)?;
-        let documents = iam::prepare_documents(&policies.documents);
-        // "A permissions boundary sets the maximum permissions that an identity-based
-        // policy can grant to an entity": the boundary CAPS what those policies grant and
-        // grants nothing itself. A role carrying none — or one whose document is not held,
-        // a ceiling this emulator cannot read — is capped by nothing.
-        let boundary = iam
-            .permissions_boundary_document(role_arn)
-            .map(|document| iam::prepare_documents(::std::slice::from_ref(&document)));
+    fn withheld(
+        &self,
+        iam: Option<&IamState>,
+        source_policy: Option<&iam::PreparedDocument>,
+        role_arn: &str,
+        resource: &str,
+    ) -> Option<&'static str> {
+        let role = iam.and_then(|iam| RolePolicies::read(iam, role_arn));
+        // Nothing in force anywhere that could withhold a read: neither a document on the
+        // role nor one on the source, which is evidence of nothing.
+        if role.is_none() && source_policy.is_none() {
+            return None;
+        }
         self.decided_actions().find(|name| {
-            call_is_withheld(
-                &documents,
-                boundary.as_deref(),
-                !policies.uncarried.is_empty(),
+            read_is_withheld(
+                role.as_ref(),
+                source_policy,
+                role_arn,
                 &format!("{}:{name}", self.namespace),
                 resource,
             )
@@ -382,19 +392,110 @@ pub(super) fn withholds_call(
     action: &str,
     resource: &str,
 ) -> Option<bool> {
-    iam.roles.values().find(|role| role.arn == role_arn)?;
-    let policies = iam.principal_policies(role_arn)?;
-    let documents = iam::prepare_documents(&policies.documents);
-    let boundary = iam
-        .permissions_boundary_document(role_arn)
-        .map(|document| iam::prepare_documents(::std::slice::from_ref(&document)));
+    let role = RolePolicies::read(iam, role_arn)?;
     Some(call_is_withheld(
-        &documents,
-        boundary.as_deref(),
-        !policies.uncarried.is_empty(),
+        &role.documents,
+        role.boundary.as_deref(),
+        role.uncarried,
         action,
         resource,
     ))
+}
+
+/// The identity-based documents in force on ONE role, read ONCE: a decision about several
+/// calls of the same role — the reads consuming one event source takes — walks these rather
+/// than parsing the store's documents again per call.
+struct RolePolicies {
+    /// The documents the role carries: its inline policies and the default version of each
+    /// managed policy attached to it.
+    documents: Vec<iam::PreparedDocument>,
+    /// The permissions boundary that CAPS them, for a role carrying one this emulator can
+    /// read.
+    boundary: Option<Vec<iam::PreparedDocument>>,
+    /// Whether the role carries an attachment whose document this account does not hold.
+    uncarried: bool,
+}
+
+impl RolePolicies {
+    /// What `iam` holds in force on `role_arn`, or `None` when nothing of the kind can be
+    /// shown: this account's IAM holds no role under that ARN (it may belong to another
+    /// account), or the store holds no policies to read for it.
+    fn read(iam: &IamState, role_arn: &str) -> Option<Self> {
+        // The role itself first: a value this account's IAM holds no role under says
+        // nothing about what that role may do.
+        iam.roles.values().find(|role| role.arn == role_arn)?;
+        // The collection is bounded by IAM's own quotas on how many policies one role
+        // carries, so this walk is bounded by the store rather than by a number of its own.
+        let policies = iam.principal_policies(role_arn)?;
+        // "A permissions boundary sets the maximum permissions that an identity-based
+        // policy can grant to an entity": the boundary CAPS what those policies grant and
+        // grants nothing itself. A role carrying none — or one whose document is not held,
+        // a ceiling this emulator cannot read — is capped by nothing.
+        let boundary = iam
+            .permissions_boundary_document(role_arn)
+            .map(|document| iam::prepare_documents(::std::slice::from_ref(&document)));
+        Some(Self {
+            documents: iam::prepare_documents(&policies.documents),
+            boundary,
+            uncarried: !policies.uncarried.is_empty(),
+        })
+    }
+}
+
+/// Whether the read `action` on `resource` is WITHHELD from the role `role_arn`, by the
+/// documents in force on that role and the resource-based policy in force on the source
+/// together, read in IAM's own order.
+///
+/// A read of a source is a call ON a resource of another service, so BOTH halves decide it:
+/// "the resource-based policy and the identity-based policy are evaluated together, and
+/// access is granted if either allows it", while an explicit `Deny` in either refuses
+/// whatever the other grants. The halves are compared against different spellings of the
+/// role for the reason [`::service_common::iam_authorization::account_principals`] states: a
+/// resource statement that DENIES the role's account denies each of its principals, while
+/// one that ALLOWS the account delegates to that account's own identity-based policies
+/// rather than granting.
+///
+/// `role` is `None` when nothing is known about the role at all ([`RolePolicies::read`]):
+/// such a role is refused nothing on evidence this emulator does not have, so only an
+/// explicit deny on the SOURCE withholds a read from it.
+fn read_is_withheld(
+    role: Option<&RolePolicies>,
+    source_policy: Option<&iam::PreparedDocument>,
+    role_arn: &str,
+    action: &str,
+    resource: &str,
+) -> bool {
+    let own = [role_arn.to_string()];
+    let mut named = own.to_vec();
+    named.extend(iam::account_principals(role_arn));
+    let source_said = |principals: &[String]| {
+        source_policy.map_or(Decision::NotStated, |document| {
+            iam::resource_outcome_prepared(
+                document,
+                &iam::Request::new(action, resource, principals),
+            )
+            .decision
+        })
+    };
+    if source_said(&named) == Decision::Denied {
+        return true;
+    }
+    let Some(role) = role else {
+        return false;
+    };
+    // "A permissions boundary does not limit the permissions granted to the entity by a
+    // resource-based policy that names it as a principal": a grant in the SOURCE's own
+    // document stands on its own, so the role's documents are not asked for one.
+    if source_said(&own) == Decision::Allowed {
+        return false;
+    }
+    call_is_withheld(
+        &role.documents,
+        role.boundary.as_deref(),
+        role.uncarried,
+        action,
+        resource,
+    )
 }
 
 /// Whether `action` on `resource` is withheld by the documents in force, read in IAM's own
@@ -431,37 +532,60 @@ fn call_is_withheld(
 }
 
 /// The sentence Lambda refuses a mapping between the event source `event_source_arn` and a
-/// function running as `role_arn` with, because the policies in force on that role withhold
-/// a read the mapping's poller would make — or `None` when the role may make every one of
-/// them, or when nothing of the kind can be shown (see the module docs).
+/// function running as `role_arn` with, because the policies in force withhold a read the
+/// mapping's poller would make — or `None` when every one of them may be made, or when
+/// nothing of the kind can be shown (see the module docs).
 ///
-/// A READ of both stores: it decides, and changes nothing. The caller refuses with the
+/// A READ of the stores: it decides, and changes nothing. The caller refuses with the
 /// modelled `InvalidParameterValueException` and persists nothing, which is what makes the
-/// refusal and the mapping the only two outcomes of such a request.
+/// refusal and the mapping the only two outcomes of such a request. The documents in force
+/// are the ones in force AT THIS INSTANT, which is what the decision is about: a policy
+/// written a moment ago decides this call.
 #[must_use]
 pub fn unreadable_event_source<Eng: Send + Sync + 'static>(
     engine: &Eng,
     role_arn: &str,
     event_source_arn: &str,
 ) -> Option<String> {
-    unreadable_event_source_held(iam_state(engine).as_ref(), role_arn, event_source_arn)
+    let now = ::std::time::SystemTime::now();
+    unreadable_event_source_held(
+        iam_state(engine).as_ref(),
+        &super::event_source_resource_policy::SourcePolicies::of(engine),
+        role_arn,
+        event_source_arn,
+        now,
+    )
 }
 
-/// The SAME decision, for a caller holding the IAM store handle already.
+/// The SAME decision, for a caller holding the store handles already.
 ///
 /// The pollers ask this of EVERY pass rather than once: Lambda reads the source acting as
 /// the role for as long as the mapping polls, so a grant taken away after the pair was
-/// wired withholds the reads of the next pass exactly as it would have withheld the wiring
-/// ([`unreadable_event_source`]). `None` for the handle is an engine carrying no IAM store,
-/// which shows nothing about the role.
+/// wired — in the role's own documents or in the SOURCE's own policy — withholds the reads
+/// of the next pass exactly as it would have withheld the wiring
+/// ([`unreadable_event_source`]). `None` for the IAM handle is an engine carrying no IAM
+/// store, which shows nothing about the role.
 #[must_use]
 pub(super) fn unreadable_event_source_held(
     iam: Option<&::engine::ServiceState<IamState>>,
+    sources: &super::event_source_resource_policy::SourcePolicies,
     role_arn: &str,
     event_source_arn: &str,
+    now: ::std::time::SystemTime,
 ) -> Option<String> {
     let access = access_of(event_source_arn)?;
-    let withheld = access.withheld(&iam?.lock(), role_arn, event_source_arn)?;
+    // The source's own document, read once for every action this decision asks about. The
+    // two stores are never locked at the same time: this one is read and released before
+    // the IAM store is taken.
+    let source_policy = sources
+        .in_force(event_source_arn, now)
+        .map(|document| iam::PreparedDocument::read(&document));
+    let withheld = access.withheld(
+        iam.map(::engine::ServiceState::lock).as_deref(),
+        source_policy.as_ref(),
+        role_arn,
+        event_source_arn,
+    )?;
     Some(access.message(event_source_arn, withheld))
 }
 

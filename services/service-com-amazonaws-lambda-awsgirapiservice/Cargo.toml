@@ -37,6 +37,13 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # identity-based policies an INVOCATION is authorized against
 # (`state::invoke_authorization`).
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# An event source also carries a RESOURCE-based policy of its own, held by the service that
+# owns the source (`state::event_source_resource_policy`): a queue's `Policy` attribute lives
+# in the Amazon SQS store above, and a data stream's or a table stream's attached policy in
+# these two — each read through the owning service's own store over the shared engine, which
+# needs that service's state TYPE.
+service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
+service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 # A container-image package names an image in the Amazon ECR registry, and Lambda follows
 # that reference when the package is stored (`state::image_source`): the registry's own
 # image and tag records are reached through the shared engine, which needs the owning
@@ -211,8 +218,9 @@ tokio = { workspace = true, features = ["time"] }
 # lambda on ONE engine in the data-plane tests, because a delivery is asserted where a
 # client sees it: on the stream the records were put to, and in the series CloudWatch
 # reports for the function. A DynamoDB table's stream is two of them: the table the item
-# is written to, and the stream surface its records are read through.
-service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
+# is written to, and the stream surface its records are read through. (The two stream
+# services' own crates are dependencies above, because a source's resource policy is read
+# out of their stores.)
 # An invocation's own log is delivered to CloudWatch Logs, so the tests that assert a run's
 # lines read them where a client reads them: through that service's own API, mounted beside
 # lambda on ONE engine.
@@ -234,7 +242,6 @@ service-com-amazonaws-sesv2-simpleemailservice-v2 = { workspace = true }
 # The same table is the sink a handler's OWN outbound call writes to in the stream-driven
 # pipeline test, mounted on that same engine so the item is read back where a client reads
 # it.
-service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810 = { workspace = true }
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 # The token-minting tests read the query fields of a minted authentication token the way a

@@ -32,7 +32,9 @@
 //!   message that has had every delivery that policy allows is moved to the dead-letter
 //!   queue the policy names instead of being handed over again. The reads of that poll are
 //!   made AS the function's execution role, so a pass whose role the policies in force on it
-//!   do not let receive from the queue takes nothing out of it at all
+//!   do not let receive from the queue — the role's own documents, or the QUEUE's own
+//!   `Policy` attribute, which fences the queue off from every consumer it denies — takes
+//!   nothing out of it at all
 //!   ([`super::event_source_authorization`]): the messages stay where they are until the
 //!   grant is in place, which is the same question the call that WIRED the pair together was
 //!   refused for.
@@ -337,6 +339,9 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
     // resolved once per pass because the handle does not change. An engine carrying none
     // shows nothing about any role.
     let iam = super::event_source_authorization::iam_state(engine);
+    // The stores an event source's OWN policy lives in, resolved for the same reason: a
+    // queue is fenced by its `Policy` attribute whoever reads it, this poller included.
+    let sources = super::event_source_resource_policy::SourcePolicies::of(engine);
     let targets = {
         let mut store = mappings.lock();
         store.materialize_all(now);
@@ -357,7 +362,7 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
         // consumes again as soon as the grant is back (see
         // [`super::event_source_authorization`], including the cases that show nothing about
         // a role and withhold nothing).
-        if let Some(detail) = withheld_queue_read(iam.as_ref(), &target) {
+        if let Some(detail) = withheld_queue_read(iam.as_ref(), &sources, &target, now) {
             note_unpollable(session, &target, &detail);
             // A mapping that may take nothing out of its queue is not gathering either: the
             // batch it was holding is let go, so the records in it are the queue's to hand
@@ -485,22 +490,27 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
     }
 }
 
-/// Why the reads this pass would make on `target`'s queue are WITHHELD from the execution
-/// role of the function the mapping invokes, or `None` when they are not — which includes
-/// every case that shows nothing about the role (see
-/// [`super::event_source_authorization`]).
+/// Why the reads this pass would make on `target`'s queue are WITHHELD — from the execution
+/// role of the function the mapping invokes, or by the queue's own policy — or `None` when
+/// they are not, which includes every case that shows nothing about either
+/// (see [`super::event_source_authorization`]).
 ///
-/// Only the IAM store is locked here, and this service's is not: the decision is taken
-/// between two steps of the pass rather than inside either of them.
+/// Only the IAM store and the queue's own are locked here, one at a time, and this service's
+/// is not: the decision is taken between two steps of the pass rather than inside either of
+/// them.
 fn withheld_queue_read(
     iam: Option<&::engine::ServiceState<IamState>>,
+    sources: &super::event_source_resource_policy::SourcePolicies,
     target: &PollTarget,
+    now: SystemTime,
 ) -> Option<String> {
     let role_arn = target.role_arn.as_deref()?;
     super::event_source_authorization::unreadable_event_source_held(
         iam,
+        sources,
         role_arn,
         &target.queue_arn,
+        now,
     )
 }
 

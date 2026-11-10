@@ -51,10 +51,10 @@ use crate::kinesis_event_source_delivery::{given_stream, put_records};
 /// `decided_on_source` entries of that source's catalog entry in
 /// `src/state/event_source_authorization.rs`, which is narrower than the whole grant
 /// [`KINESIS_READS`] advises.
-const SHARD_READS: [&str; 3] = ["GetRecords", "GetShardIterator", "DescribeStream"];
+pub(crate) const SHARD_READS: [&str; 3] = ["GetRecords", "GetShardIterator", "DescribeStream"];
 
 /// The `State` a mapping reports once it is polling its event source.
-const STATE_ENABLED: &str = "Enabled";
+pub(crate) const STATE_ENABLED: &str = "Enabled";
 
 /// The name every role below carries its one inline policy under, so a row REPLACES that
 /// document rather than adding a second one beside it.
@@ -62,15 +62,15 @@ const POLICY_NAME: &str = "event-source-reads";
 
 /// How long a row waits for work the clock owes — a function going `Active`, a mapping
 /// settling into `Enabled`, a pass taking a batch — before it is a failure.
-const BUDGET: Duration = Duration::from_secs(20);
+pub(crate) const BUDGET: Duration = Duration::from_secs(20);
 
 /// How long between two looks while waiting.
-const LOOK_AGAIN: Duration = Duration::from_millis(50);
+pub(crate) const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// How long a row watches a source a blocked mapping may not read. Several of either
 /// poller's intervals (half a second for a queue, a tenth for a shard source), so a mapping
 /// that was going to poll has had many passes in which to do it.
-const BLOCKED_WINDOW: Duration = Duration::from_secs(3);
+pub(crate) const BLOCKED_WINDOW: Duration = Duration::from_secs(3);
 
 /// Where `GetFunctionConfiguration` is bound, which is where a row reads a function's
 /// `State`.
@@ -79,7 +79,7 @@ const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 /// Lambda, IAM and Amazon SQS on ONE engine: the role is written where IAM holds it, the
 /// queue where Amazon SQS holds it, and the mapping polls both in-process — the shape
 /// `core/router` assembles.
-fn emulator_with_queues() -> MultiServiceRouter {
+pub(crate) fn emulator_with_queues() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = router_on(&engine);
     router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
@@ -94,7 +94,7 @@ fn emulator_with_queues() -> MultiServiceRouter {
 }
 
 /// The same, with Amazon Kinesis in place of Amazon SQS, for the shard-source rows.
-fn emulator_with_streams() -> MultiServiceRouter {
+pub(crate) fn emulator_with_streams() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = router_on(&engine);
     router.register_service(
@@ -151,7 +151,7 @@ async fn write_policy(
 /// source and invokes the function", so a mapping polls nothing until its function can be
 /// invoked at all — a row has to be past that before it can read anything into a pass that
 /// did not poll.
-async fn wait_until_active(router: &MultiServiceRouter, case: &str, name: &str) {
+pub(crate) async fn wait_until_active(router: &MultiServiceRouter, case: &str, name: &str) {
     let deadline = Instant::now() + BUDGET;
     loop {
         let read = call(
@@ -176,7 +176,11 @@ async fn wait_until_active(router: &MultiServiceRouter, case: &str, name: &str) 
 /// Create the mapping `body` asks for and wait until it reports `Enabled`, answering its
 /// UUID: a mapping still settling reads nothing, so every row starts from a mapping that
 /// polls.
-async fn given_enabled_mapping(router: &MultiServiceRouter, case: &str, body: &Value) -> String {
+pub(crate) async fn given_enabled_mapping(
+    router: &MultiServiceRouter,
+    case: &str,
+    body: &Value,
+) -> String {
     let created = create_mapping(router, body).await;
     assert_eq!(
         created.status,
@@ -220,7 +224,11 @@ async fn send_message(router: &MultiServiceRouter, case: &str, url: &str, body: 
 /// Wait until the queue `url` addresses holds no VISIBLE message, answering whether it got
 /// there: the mapping's pass hides every message it takes for the length of the attempt it
 /// hands it to, so "nothing visible" is what a poll of this queue looks like from outside.
-async fn polled_within_budget(router: &MultiServiceRouter, case: &str, url: &str) -> bool {
+pub(crate) async fn polled_within_budget(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+) -> bool {
     let deadline = Instant::now() + BUDGET;
     loop {
         let (visible, _, _) = queue_message_counts(router, case, url).await;
@@ -570,7 +578,7 @@ async fn a_stream_mapping_reads_only_while_its_execution_role_may_read_the_strea
 
 /// Wait until the mapping `uuid` names reports a `LastProcessingResult`, answering what it
 /// reported, or `None` when it never did.
-async fn processing_result_within_budget(
+pub(crate) async fn processing_result_within_budget(
     router: &MultiServiceRouter,
     case: &str,
     uuid: &str,

@@ -256,6 +256,12 @@ pub use batch_item_failures::{
 pub mod event_source_authorization;
 pub use event_source_authorization::unreadable_event_source;
 
+/// An event source carries a resource-based policy of its OWN, held by the service that owns
+/// the source: reading it out of that service's store lives in
+/// [`event_source_resource_policy`], beside the decision above that it is half of.
+pub mod event_source_resource_policy;
+pub use event_source_resource_policy::SourcePolicies;
+
 /// Whether a function's execution role may do what attaching it to a VPC takes lives in
 /// [`vpc_attachment_authorization`], beside the reading above, and is re-exported for the
 /// same reason: a handler names it as `crate::state::…`.
