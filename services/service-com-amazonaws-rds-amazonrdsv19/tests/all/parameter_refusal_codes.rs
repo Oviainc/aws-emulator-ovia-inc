@@ -63,6 +63,17 @@ fn option_group_rest() -> Vec<(&'static str, String)> {
     ]
 }
 
+/// The sentence pair Amazon RDS refuses a DB instance identifier with where the value is a
+/// token of the member's shape that breaks one of the two hyphen rules: it names the member
+/// at fault and states the whole rule, echoing nothing the request carried.
+fn states_the_rule(member: &str) -> String {
+    format!(
+        "The parameter {member} is not a valid identifier. Identifiers must begin with a \
+         letter; must contain only ASCII letters, digits, and hyphens; and must not end with \
+         a hyphen or contain two consecutive hyphens."
+    )
+}
+
 /// The rows of the parameter-value table.
 ///
 /// The identifier constraints are the ones those members publish ("Must contain from 1 to
@@ -74,15 +85,25 @@ fn value_rows() -> Vec<ValueRow> {
     let mut rows = Vec::new();
 
     // One member, every constraint it publishes — the axis the identifier rule
-    // generalises over.
-    for (case, identifier) in [
-        ("a leading digit", "1emu-prc-db".to_string()),
-        ("a leading hyphen", "-emu-prc-db".to_string()),
-        ("a trailing hyphen", "emu-prc-db-".to_string()),
-        ("two consecutive hyphens", "emu--prc-db".to_string()),
-        ("an underscore, outside the alphabet", "emu_prc_db".to_string()),
-        ("a multi-byte character", "emu-prc-café".to_string()),
-        ("one past the 63-character bound", format!("e{}", "a".repeat(63))),
+    // generalises over. A value that is no identifier TOKEN of the member at all is worded
+    // by the member's subject and echoes the value; a token that breaks one of the two
+    // hyphen rules states the rule instead.
+    for (case, identifier, hyphen_rule) in [
+        ("a leading digit", "1emu-prc-db".to_string(), false),
+        ("a leading hyphen", "-emu-prc-db".to_string(), false),
+        ("a trailing hyphen", "emu-prc-db-".to_string(), true),
+        ("two consecutive hyphens", "emu--prc-db".to_string(), true),
+        (
+            "an underscore, outside the alphabet",
+            "emu_prc_db".to_string(),
+            false,
+        ),
+        ("a multi-byte character", "emu-prc-café".to_string(), false),
+        (
+            "one past the 63-character bound",
+            format!("e{}", "a".repeat(63)),
+            false,
+        ),
     ] {
         rows.push(ValueRow {
             case: format!("CreateDBInstance with {case}"),
@@ -92,7 +113,11 @@ fn value_rows() -> Vec<ValueRow> {
                 ("Engine", "postgres".to_string()),
                 ("DBInstanceClass", "db.t3.micro".to_string()),
             ],
-            says: format!("Invalid database identifier:  {identifier}"),
+            says: if hyphen_rule {
+                states_the_rule("DBInstanceIdentifier")
+            } else {
+                format!("Invalid database identifier:  {identifier}")
+            },
         });
     }
 
@@ -259,7 +284,9 @@ async fn a_value_its_member_does_not_accept_is_refused_as_an_invalid_parameter_v
 }
 
 /// The members RDS words by their subject carry exactly `Invalid <subject>:  <value>` —
-/// the value from the request, and no reason, whichever constraint it broke.
+/// the value from the request, and no reason — where the value is no identifier TOKEN of
+/// that member at all, and for the OPTION GROUP name whichever clause it broke; a DB
+/// instance identifier that is a token and breaks a hyphen rule states the rule instead.
 #[tokio::test]
 async fn an_identifier_refusal_is_worded_by_the_subject_its_member_carries() {
     let router = emulator();
@@ -285,7 +312,17 @@ async fn an_identifier_refusal_is_worded_by_the_subject_its_member_carries() {
                 ("Engine", "postgres".to_string()),
                 ("DBInstanceClass", "db.t3.micro".to_string()),
             ],
-            "Invalid database identifier:  emu-subject-".to_string(),
+            states_the_rule("DBInstanceIdentifier"),
+        ),
+        (
+            "CreateOptionGroup, a leading hyphen",
+            "CreateOptionGroup",
+            {
+                let mut params = vec![("OptionGroupName", "-emu-subject".to_string())];
+                params.extend(option_group_rest());
+                params
+            },
+            "Invalid option group name:  -emu-subject".to_string(),
         ),
         (
             "CreateOptionGroup, an out-of-alphabet character",
@@ -310,13 +347,22 @@ async fn an_identifier_refusal_is_worded_by_the_subject_its_member_carries() {
             "Invalid database identifier:  1EMU-Subject-Mixed".to_string(),
         ),
         (
-            "ModifyDBInstance, a mixed-case rename target with a trailing hyphen",
+            "ModifyDBInstance, a mixed-case rename target with a leading digit",
+            "ModifyDBInstance",
+            vec![
+                ("DBInstanceIdentifier", "emu-subject-source".to_string()),
+                ("NewDBInstanceIdentifier", "9EMU-Subject-Renamed".to_string()),
+            ],
+            "Invalid database identifier:  9EMU-Subject-Renamed".to_string(),
+        ),
+        (
+            "ModifyDBInstance, a rename target ending in a hyphen",
             "ModifyDBInstance",
             vec![
                 ("DBInstanceIdentifier", "emu-subject-source".to_string()),
                 ("NewDBInstanceIdentifier", "EMU-Subject-Renamed-".to_string()),
             ],
-            "Invalid database identifier:  EMU-Subject-Renamed-".to_string(),
+            states_the_rule("NewDBInstanceIdentifier"),
         ),
         (
             "ModifyOptionGroup, a doubled hyphen",
@@ -336,7 +382,7 @@ async fn an_identifier_refusal_is_worded_by_the_subject_its_member_carries() {
         assert_eq!(
             text(&body, "Message"),
             expected,
-            "case {case:?}: expected the subject wording, got {:?}",
+            "case {case:?}: expected {expected:?}, got {:?}",
             text(&body, "Message")
         );
     }

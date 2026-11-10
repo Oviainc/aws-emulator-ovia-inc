@@ -12,9 +12,10 @@
 //!   answer — "DB subnet group '<name>' does not exist." — whichever engine's cluster the
 //!   create was placing in it;
 //! * an identifier outside the identifier rule is refused in the wording its MEMBER carries
-//!   — the subject wording this front door answers for a DB cluster's and a DB instance's
-//!   identifier — whichever control plane's engine the request's `Engine` names, because one
-//!   front door answers them all;
+//!   — the subject wording this front door answers for a DB cluster's identifier, whichever
+//!   clause the value broke, and for a DB instance's where the value is no identifier TOKEN
+//!   of that member at all — whichever control plane's engine the request's `Engine` names,
+//!   because one front door answers them all;
 //! * a Multi-AZ DB cluster whose named DB subnet group covers fewer than three Availability
 //!   Zones is the modelled 400 `InvalidVPCNetworkStateFault`, and its message names the
 //!   zones of the Region that group does not cover yet — read off the group's stored
@@ -206,13 +207,25 @@ const ENGINE_WORDINGS: &[EngineWording] = &[
     },
 ];
 
+/// The identifier-rule refusal a DB INSTANCE identifier that is a token of its member's
+/// shape and breaks one of the two hyphen rules answers with: it names the request member
+/// at fault and states the whole rule, echoing nothing the request carried.
+fn states_the_rule(member: &str) -> String {
+    format!(
+        "The parameter {member} is not a valid identifier. Identifiers must begin with a \
+         letter; must contain only ASCII letters, digits, and hyphens; and must not end with \
+         a hyphen or contain two consecutive hyphens."
+    )
+}
+
 #[tokio::test]
 async fn an_identifier_refusal_is_worded_by_the_member_it_names() {
     let router = emulator();
 
     // Values spanning the clauses of the identifier rule: a leading digit, a character
     // outside the alphabet, a trailing hyphen, two consecutive hyphens and one past the
-    // length its own member bounds.
+    // length its own member bounds. The DB CLUSTER identifier answers its subject for every
+    // one of them.
     let too_long = format!("e{}", "a".repeat(64));
     let values: [(&str, &str); 5] = [
         ("a leading digit", "1emu-wording-cl"),
@@ -247,32 +260,48 @@ async fn an_identifier_refusal_is_worded_by_the_member_it_names() {
     }
 
     // The DB instance identifier, whose subject is the other one this front door words a
-    // refusal by — again the member's, whichever engine the create names.
+    // refusal by — again the member's, whichever engine the create names, and there only
+    // where the value is no identifier token of that member at all: a token breaking a
+    // hyphen rule states the rule instead, which is how the instance path differs from the
+    // cluster path above.
     for (case, engine) in [
         ("a DocumentDB instance", "docdb"),
         ("an Amazon RDS instance", "postgres"),
     ] {
-        let body = expect_error(
-            case,
-            call(
-                &router,
-                "CreateDBInstance",
-                &[
-                    ("DBInstanceIdentifier", "1emu-wording-db"),
-                    ("Engine", engine),
-                    ("DBInstanceClass", "db.m5.large"),
-                ],
-            )
-            .await,
-            400,
-            "InvalidParameterValue",
-        );
-        let message = text(&body, "Message");
-        let expected = "Invalid database identifier:  1emu-wording-db";
-        assert_eq!(
-            message, expected,
-            "case {case:?}: expected {expected:?}, got {message:?}"
-        );
+        for (value_case, value, expected) in [
+            (
+                "a leading digit",
+                "1emu-wording-db",
+                "Invalid database identifier:  1emu-wording-db".to_string(),
+            ),
+            (
+                "a trailing hyphen",
+                "emu-wording-db-",
+                states_the_rule("DBInstanceIdentifier"),
+            ),
+        ] {
+            let case = format!("{case}, {value_case}");
+            let body = expect_error(
+                &case,
+                call(
+                    &router,
+                    "CreateDBInstance",
+                    &[
+                        ("DBInstanceIdentifier", value),
+                        ("Engine", engine),
+                        ("DBInstanceClass", "db.m5.large"),
+                    ],
+                )
+                .await,
+                400,
+                "InvalidParameterValue",
+            );
+            let message = text(&body, "Message");
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+        }
     }
 }
 

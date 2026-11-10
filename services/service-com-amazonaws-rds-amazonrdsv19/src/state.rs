@@ -3448,37 +3448,60 @@ pub fn default_option_group_name(engine: &str, major_engine_version: &str) -> St
     )
 }
 
-/// How Amazon RDS names the SUBJECT an identifier member carries when it refuses that
-/// member's value.
+/// How Amazon RDS WORDS the refusal of an identifier member's value: by the SUBJECT the
+/// member carries, or by the sentence pair that states the rule.
 ///
-/// RDS words such a refusal `Invalid <subject>:  <value>` — it names what the parameter
-/// is rather than the member, and it carries no reason, so the one text answers whichever
-/// of the member's constraints the value broke. The subject is the service's own wording
-/// rather than anything the model states, so it is given here only for the members whose
-/// refusal this emulator words that way; every other member is refused with the fixed
-/// sentence pair that names the member and states the rule
-/// ([`not_a_valid_identifier_message`]), which is what [`check_identifier`] falls back to.
+/// The subject wording is `Invalid <subject>:  <value>` — it names what the parameter is
+/// rather than the member, carries no reason, and echoes the value as the request spelled
+/// it (the two spaces after the colon are part of it, not a typo). The other is
+/// [`not_a_valid_identifier_message`], which names the member at fault, states the whole
+/// rule and echoes nothing.
 ///
-/// The two spaces after the colon are part of that wording, not a typo.
-fn identifier_subject(member: &str) -> Option<&'static str> {
+/// Neither is anything the model states: which one a member answers, and for which clause,
+/// is the service's own and is recorded per member — so it is given here, once, rather than
+/// decided in each handler.
+enum IdentifierWording {
+    /// This member is refused by its subject whichever clause the value broke.
+    Subject(&'static str),
+    /// This member is refused by its subject only where the value is no identifier TOKEN of
+    /// it at all; a token of that shape which still breaks one of the two HYPHEN rules is
+    /// refused with the sentence pair instead.
+    SubjectForAValueThatIsNoToken(&'static str),
+    /// This member is refused with the sentence pair whichever clause the value broke.
+    TheRule,
+}
+
+/// Which wording each identifier member of this front door carries.
+fn identifier_wording(member: &str) -> IdentifierWording {
     match member {
         // The identifier of a DB instance, whether `CreateDBInstance` is naming the one to
-        // create or `ModifyDBInstance` the one to rename to.
-        "DBInstanceIdentifier" | "NewDBInstanceIdentifier" => Some("database identifier"),
+        // create or `ModifyDBInstance` the one to rename to: RDS answers its subject for a
+        // value that is no identifier token of the member at all, and states the rule for a
+        // token of that shape which breaks one of the two hyphen rules.
+        "DBInstanceIdentifier" | "NewDBInstanceIdentifier" => {
+            IdentifierWording::SubjectForAValueThatIsNoToken("database identifier")
+        }
         // The identifier of a DB cluster, which RDS words by its own subject rather than
-        // by the DB instance's: the two refusals differ in that one word.
-        "DBClusterIdentifier" | "NewDBClusterIdentifier" => Some("database cluster identifier"),
+        // by the DB instance's — the two refusals differ in that one word — and words that
+        // way for every clause, including the ones the instance path states the rule for.
+        "DBClusterIdentifier" | "NewDBClusterIdentifier" => {
+            IdentifierWording::Subject("database cluster identifier")
+        }
         // The name of an option group: on create, on modify, and the name a COPY of a
         // group is created under, which is an option group's name too — so a caller
         // reading the refusal cannot tell those paths apart by its wording.
-        "OptionGroupName" | "TargetOptionGroupIdentifier" => Some("option group name"),
+        "OptionGroupName" | "TargetOptionGroupIdentifier" => {
+            IdentifierWording::Subject("option group name")
+        }
         // The identifier of a DB SNAPSHOT a copy names: the source it is taken of and the
         // name the copy is created under are both a snapshot's identifier, so the one
         // subject answers either.
         "SourceDBSnapshotIdentifier" | "TargetDBSnapshotIdentifier" => {
-            Some("snapshot identifier")
+            IdentifierWording::Subject("snapshot identifier")
         }
-        _ => None,
+        // Every other identifier member — a parameter group's name, a subscription's, a
+        // shard group's, a tenant database's — states the rule and names itself.
+        _ => IdentifierWording::TheRule,
     }
 }
 
@@ -3487,15 +3510,15 @@ fn identifier_subject(member: &str) -> Option<&'static str> {
 /// `DBInstanceIdentifier` and `DBSnapshotIdentifier` share one rule, differing only
 /// in the length bound (63 and 255): "Must contain from 1 to N letters, numbers, or
 /// hyphens. First character must be a letter. Can't end with a hyphen or contain two
-/// consecutive hyphens." Returns the message to refuse the request with — the wording
-/// [`identifier_subject`] gives for the members RDS words by their subject, and otherwise
-/// the ONE sentence pair RDS words an identifier refusal with
-/// ([`not_a_valid_identifier_message`]), which names the member at fault, states the rule
-/// and echoes nothing from the request.
+/// consecutive hyphens."
 ///
-/// The wording is the MEMBER's, not the engine's: the same member is refused the same way
-/// whichever control plane's engine the request named, which is what the recorded answers
-/// of this one front door carry.
+/// Returns the message to refuse the request with: the MEMBER, and for one member the
+/// CLAUSE the value broke, settle which of the two wordings Amazon RDS answers with (see
+/// [`IdentifierWording`]).
+///
+/// The wording is the MEMBER's and the CLAUSE's, not the engine's: the same member is
+/// refused the same way whichever control plane's engine the request named, which is what
+/// the recorded answers of this one front door carry.
 ///
 /// The CALLER answers this with `InvalidParameterValue`: a value outside the constraints
 /// its own member publishes is exactly what that Query API common error reports, and the
@@ -3504,24 +3527,38 @@ pub fn check_identifier(member: &str, value: &str, max_len: usize) -> Result<(),
     if identifier_is_well_formed(value, max_len) {
         return Ok(());
     }
-    Err(match identifier_subject(member) {
-        Some(subject) => format!("Invalid {subject}:  {value}"),
-        None => not_a_valid_identifier_message(member),
+    Err(match identifier_wording(member) {
+        IdentifierWording::Subject(subject) => format!("Invalid {subject}:  {value}"),
+        IdentifierWording::SubjectForAValueThatIsNoToken(subject)
+            if !is_an_identifier_token(value, max_len) =>
+        {
+            format!("Invalid {subject}:  {value}")
+        }
+        _ => not_a_valid_identifier_message(member),
     })
 }
 
+/// Whether `value` is written as an identifier TOKEN at all: it begins with an ASCII letter,
+/// carries only the letters, digits and hyphens an identifier is drawn from, and is no
+/// longer than `max_len` characters — the clauses a value has to satisfy to be an identifier
+/// of its member's shape AT ALL.
+///
+/// This is the clause whose refusal is worded by the member's subject rather than by the
+/// sentence pair (see [`check_identifier`]). It says nothing about the two HYPHEN rules,
+/// which a value of this shape can still break.
+fn is_an_identifier_token(value: &str, max_len: usize) -> bool {
+    value.starts_with(|c: char| c.is_ascii_alphabetic())
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && value.chars().count() <= max_len
+}
+
 /// The constraint walk behind [`check_identifier`]: whether `value` satisfies every clause
-/// the identifier members state — the alphabet, the member's own length bound, the leading
-/// letter, and the two hyphen rules. Which clause failed does not reach the caller, because
-/// Amazon RDS answers all of them with the one text its member carries.
+/// the identifier members state — that it is an identifier token at all
+/// ([`is_an_identifier_token`]: the leading letter, the alphabet and the member's own length
+/// bound) and the two hyphen rules. WHICH clause failed is what settles the wording of the
+/// refusal, which is why [`check_identifier`] asks the token clause again.
 fn identifier_is_well_formed(value: &str, max_len: usize) -> bool {
-    let length = value.chars().count();
-    value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        && length > 0
-        && length <= max_len
-        && value.starts_with(|c: char| c.is_ascii_alphabetic())
-        && !value.ends_with('-')
-        && !value.contains("--")
+    is_an_identifier_token(value, max_len) && !value.ends_with('-') && !value.contains("--")
 }
 
 /// Refuse a `MaxRecords` outside the range every describe operation documents.

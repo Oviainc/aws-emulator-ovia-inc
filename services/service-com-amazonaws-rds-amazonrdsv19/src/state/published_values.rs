@@ -660,6 +660,17 @@ pub const GLOBAL_CLUSTER_ENGINES: [&str; 2] = ["aurora-mysql", "aurora-postgresq
 /// Aurora MySQL ones (`8.0.mysql_aurora.3.08.0`); 64 leaves room for any form AWS adds.
 pub const MAX_ENGINE_VERSION_LEN: usize = 64;
 
+/// The one sentence a global database cluster's `Engine` / `EngineVersion` refusal carries:
+/// the engine the request named cannot back a global database, or the version it named is
+/// no version of that engine at all. Amazon RDS answers both with this single text.
+///
+/// It has NO variable part — neither the rejected value nor the engines a global database
+/// can run are interpolated — and it carries no terminal period, so a caller branching on
+/// the sentence to tell this refusal from another of the same `InvalidParameterValue` code
+/// sees exactly what the real service sends.
+pub const GLOBAL_CLUSTER_ENGINE_NOT_FOUND_MESSAGE: &str =
+    "The requested engine version was not found or does not support global functionality";
+
 /// Refuse a value that is not an engine version at all: AWS writes every published
 /// engine version as a dotted number, optionally carrying a lettered qualifier
 /// (`16.6`, `15.00.4382.1.v1`, `8.0.mysql_aurora.3.08.0`, `16.4-limitless`), so a
@@ -669,6 +680,11 @@ pub const MAX_ENGINE_VERSION_LEN: usize = 64;
 /// against a catalogue of its own. It is deliberately not a claim that the version
 /// exists: the engine-version catalogue this emulator publishes is explicitly not the
 /// real service's live list, so a version it does not carry is not a version AWS refuses.
+///
+/// Only the global database cluster operations resolve a version this way, and the version
+/// they could not resolve is one a global database cannot be created or upgraded on, so the
+/// refusal is their one sentence for that ([`GLOBAL_CLUSTER_ENGINE_NOT_FOUND_MESSAGE`]) —
+/// which states exactly that the requested engine version was not found.
 pub fn check_engine_version_form(value: &str) -> Result<(), String> {
     let length = value.chars().count();
     let shaped = value.starts_with(|c: char| c.is_ascii_digit())
@@ -676,25 +692,20 @@ pub fn check_engine_version_form(value: &str) -> Result<(), String> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if !shaped || length > MAX_ENGINE_VERSION_LEN {
-        return Err(format!(
-            "invalid value {value} for EngineVersion: an engine version starts with a digit \
-             and is written as a dotted number, optionally with a qualifier (16.6, \
-             8.0.mysql_aurora.3.08.0), of at most {MAX_ENGINE_VERSION_LEN} characters"
-        ));
+        return Err(GLOBAL_CLUSTER_ENGINE_NOT_FOUND_MESSAGE.to_string());
     }
     Ok(())
 }
 
-/// Refuse an `Engine` a global database cluster cannot run, naming the member, the value
-/// rejected and the set it is not in.
+/// Refuse an `Engine` a global database cluster cannot run.
+///
+/// The refusal is [`GLOBAL_CLUSTER_ENGINE_NOT_FOUND_MESSAGE`]: this front door states
+/// neither the value it rejected nor the engines it would have taken.
 pub fn check_global_cluster_engine(engine: &str) -> Result<(), String> {
     if GLOBAL_CLUSTER_ENGINES.contains(&engine) {
         return Ok(());
     }
-    Err(format!(
-        "invalid value {engine} for Engine: a global database cluster runs one of {}",
-        GLOBAL_CLUSTER_ENGINES.join(", ")
-    ))
+    Err(GLOBAL_CLUSTER_ENGINE_NOT_FOUND_MESSAGE.to_string())
 }
 
 /// The engines an option group may be associated with, as

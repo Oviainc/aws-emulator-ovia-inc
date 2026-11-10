@@ -1172,6 +1172,14 @@ struct RefusedCase {
     says: &'static str,
 }
 
+/// The sentence pair Amazon RDS refuses a `DBInstanceIdentifier` with where the value is a
+/// token of the member's shape that breaks one of the two hyphen rules: it names the member
+/// and states the whole rule, and echoes nothing the request carried.
+const NOT_A_VALID_DB_INSTANCE_IDENTIFIER: &str =
+    "The parameter DBInstanceIdentifier is not a valid identifier. Identifiers must begin \
+     with a letter; must contain only ASCII letters, digits, and hyphens; and must not end \
+     with a hyphen or contain two consecutive hyphens.";
+
 /// One row of the not-found table: an operation named a resource that is not stored.
 struct NotFoundCase {
     case: &'static str,
@@ -1218,9 +1226,11 @@ async fn documented_constraints_are_refused_at_their_bounds() {
     // `DBInstanceIdentifier` constraints rule out. None of these has a modelled error. A
     // value outside what its own member accepts carries the Query API's
     // `InvalidParameterValue`; the one row that is a parameter COMBINATION rather than a
-    // value keeps the channel this service words it through. A refusal of the instance
-    // identifier is worded by its subject ("Invalid database identifier:  <value>"), the
-    // others name their member.
+    // value keeps the channel this service words it through. An instance identifier that is
+    // no identifier TOKEN at all — it does not begin with a letter, carries a character
+    // outside the alphabet, or is past the member's bound — is worded by its subject
+    // ("Invalid database identifier:  <value>"); a token that breaks one of the two hyphen
+    // rules states the rule and names the member instead.
     let refused: &[RefusedCase] = &[
         RefusedCase {
             case: "one below the lowest Port",
@@ -1269,14 +1279,14 @@ async fn documented_constraints_are_refused_at_their_bounds() {
             identifier: "emu-bad-",
             extra: Vec::new(),
             code: "InvalidParameterValue",
-            says: "Invalid database identifier:  emu-bad-",
+            says: NOT_A_VALID_DB_INSTANCE_IDENTIFIER,
         },
         RefusedCase {
             case: "an identifier with two consecutive hyphens",
             identifier: "emu--bad",
             extra: Vec::new(),
             code: "InvalidParameterValue",
-            says: "Invalid database identifier:  emu--bad",
+            says: NOT_A_VALID_DB_INSTANCE_IDENTIFIER,
         },
         RefusedCase {
             case: "an identifier with a character outside the alphabet",

@@ -25,7 +25,8 @@
 //!    so a request carrying either without it is refused from the request alone.
 //! 5. An identifier that breaks the identifier grammar is refused with the sentence pair
 //!    that names the member and states the rule, except for the members Amazon RDS words by
-//!    their own subject.
+//!    their own subject: a DB cluster identifier whichever clause it broke, and a DB
+//!    instance identifier that is no identifier TOKEN of its member at all.
 
 use service_com_amazonaws_rds_amazonrdsv19::ops::types::SOURCE_TYPE_VALUES;
 use service_com_amazonaws_rds_amazonrdsv19::state::EVENT_SUBSCRIPTION_SOURCE_TYPES;
@@ -820,14 +821,17 @@ async fn an_unpublished_event_source_type_is_refused_with_the_published_list() {
 }
 
 /// One row of the identifier-wording table: the call, the member whose value breaks the
-/// grammar, and whether RDS words that member's refusal by its own subject.
+/// grammar, and the subject RDS words the refusal by where it words one at all.
 struct IdentifierCase {
     case: &'static str,
     action: &'static str,
     member: &'static str,
     value: &'static str,
     rest: &'static [(&'static str, &'static str)],
-    /// The subject RDS names the member by, for the members it words that way.
+    /// The subject RDS names the member by — set for a DB cluster identifier whichever
+    /// clause the value broke, and for a DB instance identifier where the value is no
+    /// identifier TOKEN of that member at all (it does not begin with a letter, carries a
+    /// character outside the alphabet, or is past the member's bound).
     subject: Option<&'static str>,
 }
 
@@ -838,7 +842,9 @@ struct IdentifierCase {
 /// can't end with a hyphen or contain two consecutive hyphens"), and the rows span its
 /// clauses — a trailing hyphen, two consecutive hyphens, a character outside the alphabet
 /// and a leading digit — across the parameter-group names, a snapshot identifier and the
-/// two members RDS words by their subject.
+/// two members RDS words by their subject, the DB instance's twice: once for a value that is
+/// no identifier token at all, which its subject answers, and once for a token breaking a
+/// hyphen rule, which the sentence pair answers.
 const IDENTIFIER_CASES: &[IdentifierCase] = &[
     IdentifierCase {
         case: "a DB parameter group name ending in a hyphen",
@@ -882,18 +888,34 @@ const IDENTIFIER_CASES: &[IdentifierCase] = &[
         subject: None,
     },
     IdentifierCase {
-        case: "a DB instance identifier, which RDS names by its subject",
+        case: "a DB instance identifier starting with a digit, which RDS names by its subject",
         action: "CreateDBInstance",
         member: "DBInstanceIdentifier",
-        value: "emu-guard-db-",
+        value: "1emu-guard-db",
         rest: &[("Engine", "postgres"), ("DBInstanceClass", "db.m5.large")],
         subject: Some("database identifier"),
     },
     IdentifierCase {
-        case: "a DB cluster identifier, which RDS names by its own subject",
+        case: "a DB instance identifier ending in a hyphen, which states the rule instead",
+        action: "CreateDBInstance",
+        member: "DBInstanceIdentifier",
+        value: "emu-guard-db-",
+        rest: &[("Engine", "postgres"), ("DBInstanceClass", "db.m5.large")],
+        subject: None,
+    },
+    IdentifierCase {
+        case: "a DB cluster identifier starting with a digit, which RDS names by its own subject",
         action: "CreateDBCluster",
         member: "DBClusterIdentifier",
         value: "1emu-guard-cl",
+        rest: &[("Engine", "aurora-mysql")],
+        subject: Some("database cluster identifier"),
+    },
+    IdentifierCase {
+        case: "a DB cluster identifier with two consecutive hyphens, worded by its subject too",
+        action: "CreateDBCluster",
+        member: "DBClusterIdentifier",
+        value: "emu--guard-cl",
         rest: &[("Engine", "aurora-mysql")],
         subject: Some("database cluster identifier"),
     },
