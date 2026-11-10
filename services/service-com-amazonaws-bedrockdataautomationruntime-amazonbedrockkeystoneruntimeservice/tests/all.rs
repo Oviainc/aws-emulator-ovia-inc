@@ -23,6 +23,8 @@ mod data_automation_invocations;
 mod input_image_classification;
 #[path = "all/job_completion_events.rs"]
 mod job_completion_events;
+#[path = "all/job_event_region_scope.rs"]
+mod job_event_region_scope;
 #[path = "all/job_output_location_and_outcome.rs"]
 mod job_output_location_and_outcome;
 #[path = "all/minted_arn_region_segment.rs"]
