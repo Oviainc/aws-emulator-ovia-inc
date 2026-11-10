@@ -45,6 +45,27 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The routing key the framework resolves for an UNSIGNED request that names this
+/// service: with no credential scope to read, `resolve_route_key` falls through to the
+/// `X-Amz-Target` prefix, so the key is this service's own service-shape name normalised
+/// (`AWSMigrationHubMultiAccountService.<Operation>` -> this) rather than the `mgh`
+/// signing name it shares with Migration Hub, whose own prefix normalises to
+/// `awsmigrationhub`.
+const TARGET_SERVICE_KEY: &str = "awsmigrationhubmultiaccountservice";
+
+/// Whether `parts` is such an unsigned request.
+///
+/// [`service_common::claims_request`] compares the resolved routing key with the SIGNING
+/// NAME, so it cannot see a request whose key is the target prefix itself. That request
+/// still names this service out of band, and claiming it is what lets the framework
+/// answer it in this service's envelope — refusing it `403` on a router that verifies
+/// signatures, as AWS refuses an unsigned call — instead of leaving it with no claimant
+/// at all. The peer crate reads its own key the same way, and the two keys are distinct,
+/// so no request is claimed by both.
+fn claims_unsigned_request(parts: &http::request::Parts) -> bool {
+    service_common::routes_to(parts, TARGET_SERVICE_KEY)
+}
+
 /// The `com-amazonaws-migrationhubconfig-awsmigrationhubmultiaccountservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -89,7 +110,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             self.entry.identity().signing_name(),
             crate::ROUTE_PATH_SEGMENTS,
             Some(self.entry.identity().shape_id()),
-        )
+        ) || claims_unsigned_request(parts)
     }
 
     fn override_operation(

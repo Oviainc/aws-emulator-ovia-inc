@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/migration_task_lifecycle.rs"]
 mod migration_task_lifecycle;
+#[path = "all/service_claiming.rs"]
+mod service_claiming;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

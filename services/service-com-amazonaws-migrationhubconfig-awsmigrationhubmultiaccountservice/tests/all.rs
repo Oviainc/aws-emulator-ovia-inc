@@ -19,6 +19,8 @@
 mod harness;
 #[path = "all/home_region_controls.rs"]
 mod home_region_controls;
+#[path = "all/service_claiming.rs"]
+mod service_claiming;
 #[path = "all/home_region_reporting.rs"]
 mod home_region_reporting;
 #[path = "all/state_roundtrip.rs"]

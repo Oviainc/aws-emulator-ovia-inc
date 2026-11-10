@@ -1,28 +1,378 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Cross-service routing for the `mgh` SigV4 signing name.
+//! Migration Hub and MigrationHub Config share one SigV4 signing name — each must still
+//! be claimed by exactly one service in the assembled router.
 //!
-//! Migration Hub (`AWSMigrationHub`, endpointPrefix `mgh`) and MigrationHub Config
-//! (`AWSMigrationHubMultiAccountService`, endpointPrefix `migrationhub-config`) SHARE one
-//! SigV4 signing name, `mgh`, and one `arnNamespace`, while serving two different
-//! endpoints. The router resolves a request's routing key from the SigV4 credential scope
-//! first, so both services see the key `mgh`: a service that claims on the signing name
-//! alone claims the other's traffic too, and the router — which refuses rather than
-//! guesses — answers `500` with an error code no AWS model declares and a 5xx an SDK
-//! retries to exhaustion.
+//! Both services declare `aws.auth#sigv4` name `mgh`
+//! (`smithy_query(query="service_info")` on either model; their endpoint prefixes are
+//! `mgh` and `migrationhub-config`), and the router resolves a request's routing key from
+//! the SigV4 credential scope FIRST, so both see the same key. A service that claims on
+//! the signing name alone therefore claims its peer's traffic too, and the router answers
+//! a refusal naming two claimants rather than serving the request from an arbitrary one.
 //!
-//! The rule these suites pin: a request signed for a signing name several emulated
-//! services share is claimed by exactly ONE of them — on an RPC protocol, the service the
-//! request's own wire form NAMES. Both models are `awsJson1_1`, so every operation posts
-//! to `/` and names its target out of band in
-//! `X-Amz-Target: <service shape>.<OperationName>`; the service-shape prefix is therefore
-//! the only discriminator either model publishes, and no path can separate the pair.
+//! Both speak `awsJson1_1`, so every request names its service out of band in
+//! `X-Amz-Target` (`AWSMigrationHubMultiAccountService.<Operation>` for MigrationHub
+//! Config, `AWSMigrationHub.<Operation>` for Migration Hub) — that prefix is the
+//! discriminator each crate's `can_handle` reads, so the split is decided the same way on
+//! both sides.
 //!
-//! Rows span what that rule generalises over: which service owns the operation, the
-//! prefix form a client may send (the shape's local name, the same name with an
-//! API-version suffix, the fully qualified Coral name), an operation name one service owns
-//! and the other does not, a prefix neither model declares, and a request carrying no
-//! target at all.
+//! The first suite pins it in the PRODUCTION router — the one `build_router` assembles —
+//! across both services' own traffic, both routing tiers (credential scope and
+//! `X-Amz-Target`), either endpoint host and a loopback endpoint, with each service's
+//! writes read back so they are seen landing in its OWN store. The suites after it mount
+//! the two services alone and ask which of them claims a request, over every prefix form
+//! a client may send, and over an unsigned request, whose routing key is the target
+//! prefix itself rather than the shared signing name.
+//!
+//! Assembling the whole router costs stack, so the first suite runs on an explicitly
+//! sized thread for the same reason `boot_serve.rs` does.
+
+use aws_emulator_router::{build_router, InMemoryEngine};
+
+/// Keep this at or above the size `boot_serve.rs` uses.
+const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+/// The emulator endpoint a client configured with `endpoint_url` addresses: a loopback
+/// host names no service at all, so only the target can decide.
+const LOOPBACK_HOST: &str = "127.0.0.1:9297";
+
+/// The progress update stream, and the migration task inside it, the Migration Hub write
+/// cases create — a name only that service's store can report back.
+const STREAM_NAME: &str = "routing-check-stream";
+const TASK_NAME: &str = "routing-check-task";
+
+/// The home region the MigrationHub Config write case sets, matching the modelled
+/// `HomeRegion` pattern `^([a-z]+)-([a-z]+)-([0-9]+)$`.
+const HOME_REGION: &str = "eu-central-1";
+
+/// What must happen to a request both services could claim on their signing name: it is
+/// served by the service the case names, with this status, and a body carrying every
+/// `present` marker and none of the `absent` ones — strings only one service's model or
+/// store can produce, so they identify which crate answered.
+struct Case {
+    name: &'static str,
+    host: &'static str,
+    target: &'static str,
+    /// Whether to sign for `mgh`. A case with `false` carries no credential scope, so the
+    /// router falls through to the `X-Amz-Target` routing tier.
+    signed: bool,
+    body: String,
+    who: &'static str,
+    status: u16,
+    present: &'static [&'static str],
+    absent: &'static [&'static str],
+}
+
+/// The rows differ along which service owns the request, the routing tier its key comes
+/// from (credential scope vs `X-Amz-Target`), the endpoint host, and whether the
+/// operation reads or writes. The cases run in order against one engine, so a read after
+/// a write shows the write landed in the writing service's own store.
+fn cases() -> Vec<Case> {
+    let account = engine::emulator_account_id();
+    vec![
+        Case {
+            // The minimal repro the issue reports: the first call every MigrationHub
+            // Config client makes, which never reached a handler because two services
+            // claimed `mgh`.
+            name: "Config DescribeHomeRegionControls on the Config endpoint host",
+            host: CONFIG_HOST,
+            target: "AWSMigrationHubMultiAccountService.DescribeHomeRegionControls",
+            signed: true,
+            body: "{}".to_string(),
+            who: "MigrationHub Config",
+            status: 200,
+            present: &["HomeRegionControls"],
+            absent: &["MigrationTaskSummaryList"],
+        },
+        Case {
+            // The same read against the emulator endpoint a client is pointed at: the
+            // host does not decide, the target does.
+            name: "Config DescribeHomeRegionControls on a loopback endpoint",
+            host: LOOPBACK_HOST,
+            target: "AWSMigrationHubMultiAccountService.DescribeHomeRegionControls",
+            signed: true,
+            body: "{}".to_string(),
+            who: "MigrationHub Config",
+            status: 200,
+            present: &["HomeRegionControls"],
+            absent: &["MigrationTaskSummaryList"],
+        },
+        Case {
+            // …and even on Migration Hub's endpoint host, for the same reason.
+            name: "Config DescribeHomeRegionControls on the Migration Hub endpoint host",
+            host: HUB_HOST,
+            target: "AWSMigrationHubMultiAccountService.DescribeHomeRegionControls",
+            signed: true,
+            body: "{}".to_string(),
+            who: "MigrationHub Config",
+            status: 200,
+            present: &["HomeRegionControls"],
+            absent: &["MigrationTaskSummaryList"],
+        },
+        Case {
+            // An UNSIGNED Config request: with no credential scope the router's next
+            // tier is `X-Amz-Target`, whose prefix resolves to this service's own key, so
+            // the claim must still split the same way.
+            name: "Config DescribeHomeRegionControls routed by X-Amz-Target alone",
+            host: LOOPBACK_HOST,
+            target: "AWSMigrationHubMultiAccountService.DescribeHomeRegionControls",
+            signed: false,
+            body: "{}".to_string(),
+            who: "MigrationHub Config",
+            status: 200,
+            present: &["HomeRegionControls"],
+            absent: &["MigrationTaskSummaryList"],
+        },
+        Case {
+            // A Config WRITE, so dispatch is shown reaching the handler that writes and
+            // not only a reader. `ControlId` matches `^hrc-[a-z0-9]{12}$`.
+            name: "Config CreateHomeRegionControl",
+            host: CONFIG_HOST,
+            target: "AWSMigrationHubMultiAccountService.CreateHomeRegionControl",
+            signed: true,
+            body: format!(
+                r#"{{"HomeRegion":"{HOME_REGION}",
+                     "Target":{{"Type":"ACCOUNT","Id":"{account}"}},
+                     "DryRun":false}}"#
+            ),
+            who: "MigrationHub Config",
+            status: 200,
+            present: &["HomeRegionControl", "hrc-", HOME_REGION],
+            absent: &[],
+        },
+        Case {
+            // The region just written, read back through the other Config reader: the
+            // write landed in the Config store the Config crate owns.
+            name: "Config GetHomeRegion after the create",
+            host: CONFIG_HOST,
+            target: "AWSMigrationHubMultiAccountService.GetHomeRegion",
+            signed: true,
+            body: "{}".to_string(),
+            who: "MigrationHub Config",
+            status: 200,
+            present: &["HomeRegion", HOME_REGION],
+            absent: &[],
+        },
+        Case {
+            // Migration Hub's own traffic, under the same signing name: it must still be
+            // served by the Migration Hub crate.
+            name: "Migration Hub ListMigrationTasks on the Migration Hub endpoint host",
+            host: HUB_HOST,
+            target: "AWSMigrationHub.ListMigrationTasks",
+            signed: true,
+            body: "{}".to_string(),
+            who: "Migration Hub",
+            status: 200,
+            present: &["MigrationTaskSummaryList"],
+            absent: &["HomeRegionControls"],
+        },
+        Case {
+            name: "Migration Hub ListMigrationTasks on the Config endpoint host",
+            host: CONFIG_HOST,
+            target: "AWSMigrationHub.ListMigrationTasks",
+            signed: true,
+            body: "{}".to_string(),
+            who: "Migration Hub",
+            status: 200,
+            present: &["MigrationTaskSummaryList"],
+            absent: &["HomeRegionControls"],
+        },
+        Case {
+            // The unsigned Migration Hub request, for the same reason as its Config
+            // counterpart.
+            name: "Migration Hub ListMigrationTasks routed by X-Amz-Target alone",
+            host: LOOPBACK_HOST,
+            target: "AWSMigrationHub.ListMigrationTasks",
+            signed: false,
+            body: "{}".to_string(),
+            who: "Migration Hub",
+            status: 200,
+            present: &["MigrationTaskSummaryList"],
+            absent: &["HomeRegionControls"],
+        },
+        Case {
+            // A Migration Hub WRITE: the stream a task lives in.
+            name: "Migration Hub CreateProgressUpdateStream",
+            host: HUB_HOST,
+            target: "AWSMigrationHub.CreateProgressUpdateStream",
+            signed: true,
+            body: format!(
+                r#"{{"ProgressUpdateStreamName":"{STREAM_NAME}","DryRun":false}}"#
+            ),
+            who: "Migration Hub",
+            status: 200,
+            present: &[],
+            absent: &["HomeRegionControls"],
+        },
+        Case {
+            name: "Migration Hub ImportMigrationTask",
+            host: HUB_HOST,
+            target: "AWSMigrationHub.ImportMigrationTask",
+            signed: true,
+            body: format!(
+                r#"{{"ProgressUpdateStream":"{STREAM_NAME}",
+                     "MigrationTaskName":"{TASK_NAME}",
+                     "DryRun":false}}"#
+            ),
+            who: "Migration Hub",
+            status: 200,
+            present: &[],
+            absent: &["HomeRegionControls"],
+        },
+        Case {
+            // The task just imported, read back: the Migration Hub writes landed in the
+            // Migration Hub store, not in its peer's.
+            name: "Migration Hub ListMigrationTasks reports the imported task",
+            host: HUB_HOST,
+            target: "AWSMigrationHub.ListMigrationTasks",
+            signed: true,
+            body: "{}".to_string(),
+            who: "Migration Hub",
+            status: 200,
+            present: &["MigrationTaskSummaryList", TASK_NAME, STREAM_NAME],
+            absent: &["HomeRegionControls", "hrc-"],
+        },
+        Case {
+            // …and the Config read still reports only what Config stored, so neither
+            // service answered for the other at any point.
+            name: "Config DescribeHomeRegionControls still reports only its own control",
+            host: CONFIG_HOST,
+            target: "AWSMigrationHubMultiAccountService.DescribeHomeRegionControls",
+            signed: true,
+            body: "{}".to_string(),
+            who: "MigrationHub Config",
+            status: 200,
+            present: &["HomeRegionControls", "hrc-", HOME_REGION],
+            absent: &[TASK_NAME, "MigrationTaskSummaryList"],
+        },
+        Case {
+            // A target naming an operation its service does not declare: the service the
+            // target NAMES answers the protocol's own routing failure (awsJson1_1 ->
+            // 501), which a client can act on — not a refusal that two services claimed
+            // the request.
+            name: "Config target naming an operation the model does not declare",
+            host: CONFIG_HOST,
+            target: "AWSMigrationHubMultiAccountService.DescribeNothingAtAll",
+            signed: true,
+            body: "{}".to_string(),
+            who: "MigrationHub Config",
+            status: 501,
+            present: &["NotImplemented"],
+            absent: &[],
+        },
+        Case {
+            name: "Migration Hub target naming an operation the model does not declare",
+            host: HUB_HOST,
+            target: "AWSMigrationHub.ListNothingAtAll",
+            signed: true,
+            body: "{}".to_string(),
+            who: "Migration Hub",
+            status: 501,
+            present: &["NotImplemented"],
+            absent: &[],
+        },
+    ]
+}
+
+#[test]
+fn migration_hub_and_migrationhub_config_are_each_claimed_by_exactly_one_service() {
+    std::thread::Builder::new()
+        .name("migrationhub-routing".to_string())
+        .stack_size(BOOT_STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("build a current-thread runtime");
+            runtime.block_on(async {
+                let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
+                let mut router = build_router(engine);
+                // Signature verification belongs to the emulator, not to this check:
+                // these cases are about which service claims a request.
+                router.set_request_authentication(false);
+
+                for case in cases() {
+                    let mut builder = http::Request::builder()
+                        .method("POST")
+                        .uri(format!("https://{}/", case.host))
+                        .header("host", case.host)
+                        .header("content-type", "application/x-amz-json-1.1")
+                        .header("x-amz-target", case.target);
+                    if case.signed {
+                        builder = builder.header("authorization", AUTHORIZATION);
+                    }
+                    let request = builder
+                        .body(bytes::Bytes::from(case.body.clone()))
+                        .expect("the request is well formed");
+                    let response = router.dispatch(request).await;
+                    let status = response.status().as_u16();
+                    let body = String::from_utf8_lossy(response.body().as_ref()).to_string();
+
+                    assert!(
+                        !body.contains("AmbiguousService"),
+                        "case {:?}: two services claimed one request: expected exactly one \
+                         claimant, got {status} {body}",
+                        case.name
+                    );
+                    assert!(
+                        !body.contains("UnknownService"),
+                        "case {:?}: no service claimed the request: expected exactly one \
+                         claimant, got {status} {body}",
+                        case.name
+                    );
+                    assert_eq!(
+                        status, case.status,
+                        "case {:?}: expected HTTP {} from {}, got {status} {body}",
+                        case.name, case.status, case.who
+                    );
+                    for marker in case.present {
+                        assert!(
+                            body.contains(marker),
+                            "case {:?}: expected a body from {} carrying {marker:?}, got \
+                             {status} {body}",
+                            case.name,
+                            case.who
+                        );
+                    }
+                    for marker in case.absent {
+                        assert!(
+                            !body.contains(marker),
+                            "case {:?}: expected a body from {} carrying no {marker:?}, got \
+                             {status} {body}",
+                            case.name,
+                            case.who
+                        );
+                    }
+                }
+            });
+        })
+        .expect("spawn the routing-check thread")
+        .join()
+        .expect("the routing check must pass");
+}
+
+// Cross-service routing for the `mgh` SigV4 signing name, from the service side.
+//
+// Migration Hub (`AWSMigrationHub`, endpointPrefix `mgh`) and MigrationHub Config
+// (`AWSMigrationHubMultiAccountService`, endpointPrefix `migrationhub-config`) SHARE one
+// SigV4 signing name, `mgh`, and one `arnNamespace`, while serving two different
+// endpoints. The router resolves a request's routing key from the SigV4 credential scope
+// first, so both services see the key `mgh`: a service that claims on the signing name
+// alone claims the other's traffic too, and the router — which refuses rather than
+// guesses — answers `500` with an error code no AWS model declares and a 5xx an SDK
+// retries to exhaustion.
+//
+// The rule the cases below pin: a request signed for a signing name several emulated
+// services share is claimed by exactly ONE of them — on an RPC protocol, the service the
+// request's own wire form NAMES. Both models are `awsJson1_1`, so every operation posts
+// to `/` and names its target out of band in
+// `X-Amz-Target: <service shape>.<OperationName>`; the service-shape prefix is therefore
+// the only discriminator either model publishes, and no path can separate the pair.
+//
+// Rows span what that rule generalises over: which service owns the operation, the
+// prefix form a client may send (the shape's local name, the same name with an
+// API-version suffix, the fully qualified Coral name), an operation name one service owns
+// and the other does not, a prefix neither model declares, and a request carrying no
+// target at all.
 
 use std::sync::Arc;
 
@@ -446,4 +796,102 @@ async fn no_mgh_request_is_answered_by_the_routers_refusals() {
         (404, "UnknownService"),
         "case \"a prefix no model declares\": nobody claims it, got {status} {code:?} {parsed}"
     );
+}
+
+/// An UNSIGNED request names no service in a credential scope, so the router resolves its
+/// routing key from the `X-Amz-Target` prefix instead — a key that is neither service's
+/// signing name. Each service claims the key its OWN prefix resolves to, so such a
+/// request still reaches exactly the service it names (and, on a router that verifies
+/// signatures, is refused there as AWS refuses it) rather than reaching none.
+#[tokio::test]
+async fn an_unsigned_request_is_claimed_by_the_service_its_target_names() {
+    let (hub, config) = both_services();
+    let router = router_with_both_services();
+
+    // Rows are (case, X-Amz-Target, the service that must claim it) on a bare emulator
+    // endpoint, which names no service, so only the target can decide.
+    let rows: Vec<(&str, &str, &str)> = vec![
+        (
+            "config DescribeHomeRegionControls",
+            "AWSMigrationHubMultiAccountService.DescribeHomeRegionControls",
+            OWNER_CONFIG,
+        ),
+        (
+            "config GetHomeRegion",
+            "AWSMigrationHubMultiAccountService.GetHomeRegion",
+            OWNER_CONFIG,
+        ),
+        (
+            "hub ListMigrationTasks",
+            "AWSMigrationHub.ListMigrationTasks",
+            OWNER_HUB,
+        ),
+        (
+            "hub CreateProgressUpdateStream",
+            "AWSMigrationHub.CreateProgressUpdateStream",
+            OWNER_HUB,
+        ),
+        (
+            "a prefix no model declares",
+            "AWSMigrationHubSomethingElse.GetHomeRegion",
+            OWNER_NEITHER,
+        ),
+    ];
+
+    for (case, target, expected) in rows {
+        let claimed = claimant(&hub, &config, &unsigned_parts(BARE_HOST, Some(target)));
+        assert_eq!(
+            claimed, expected,
+            "case {case:?} (unsigned, target {target:?}): exactly one service must claim \
+             it, got {claimed:?}"
+        );
+    }
+
+    // …and the claimed request is answered by that service, not by the router's refusals.
+    // This router verifies no signature, so the answer is the operation's own: the
+    // emulator's authenticating front door refuses an unsigned call on its own terms,
+    // which is a separate seam from which service claims it.
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", BARE_HOST)
+        .header("content-type", "application/x-amz-json-1.1")
+        .header(
+            "x-amz-target",
+            "AWSMigrationHubMultiAccountService.DescribeHomeRegionControls",
+        )
+        .body(Bytes::from(json!({}).to_string()))
+        .expect("the test request is well formed");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8_lossy(response.body().as_ref()).to_string();
+    assert_eq!(
+        status, 200,
+        "case \"unsigned DescribeHomeRegionControls\": expected the claiming service's own \
+         answer, got {status} {body}"
+    );
+    assert!(
+        body.contains("HomeRegionControls"),
+        "case \"unsigned DescribeHomeRegionControls\": expected MigrationHub Config's own \
+         answer, got {status} {body}"
+    );
+}
+
+/// The request parts of an UNSIGNED call: [`parts`] without the `Authorization` header,
+/// so the router's first routing signal is absent and the `X-Amz-Target` prefix is what
+/// it resolves the key from.
+fn unsigned_parts(host: &str, target: Option<&str>) -> http::request::Parts {
+    let mut builder = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", host)
+        .header("content-type", "application/x-amz-json-1.1");
+    if let Some(target) = target {
+        builder = builder.header("x-amz-target", target);
+    }
+    builder
+        .body(Bytes::new())
+        .expect("the test request is well formed")
+        .into_parts()
+        .0
 }
