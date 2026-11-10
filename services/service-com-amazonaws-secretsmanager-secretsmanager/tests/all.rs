@@ -21,6 +21,8 @@ mod identity_based_authorization;
 mod secret_batch_get;
 #[path = "all/secret_client_request_token.rs"]
 mod secret_client_request_token;
+#[path = "all/secret_conditioned_wildcard_attach.rs"]
+mod secret_conditioned_wildcard_attach;
 #[path = "all/secret_cross_account_resource_policy.rs"]
 mod secret_cross_account_resource_policy;
 #[path = "all/secret_customer_key_caller_authority.rs"]
