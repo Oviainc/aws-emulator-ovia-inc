@@ -21,7 +21,11 @@
 //!   satisfies that member's modelled `@pattern` — a client that handles the denial is not
 //!   handed a constraint violation instead. The SCOPE the ARN is read in is the request's
 //!   own: an ARN naming another account, or another Region than the request is signed for,
-//!   addresses nothing this store holds here and is refused the same way.
+//!   addresses nothing this store holds here and is refused the same way. The same holds
+//!   for every other kind of ARN this service mints: a `ProductUserArn`, an
+//!   `InstanceUserArn` or a `LicenseServerEndpointArn` this account's store holds no live
+//!   resource under names nothing whose ownership can be established, so each is refused
+//!   this way rather than reported as a not-found.
 //! * **Neither decision is a blanket refusal**: an association that IS held, addressed by
 //!   the `InstanceUserArn` alone, is served and observable afterwards; and a request that
 //!   names an instance the account holds is decided on that instance, so its malformed ARN
@@ -170,6 +174,7 @@ async fn every_unauthorized_refusal_is_reported_with_its_own_status() {
     let unheld_instance = "i-0123456789abcdef0";
     let unknown_association = format!("{}iu-000000009999", arn_prefix("instance-user"));
     let unknown_endpoint = format!("{}lse-000000009999", arn_prefix("license-server-endpoint"));
+    let unknown_product_user = format!("{}pu-000000009999", arn_prefix("user"));
 
     let rows: Vec<(String, String, Reply)> = vec![
         (
@@ -239,6 +244,11 @@ async fn every_unauthorized_refusal_is_reported_with_its_own_status() {
                 }),
             )
             .await,
+        ),
+        (
+            "StopProductSubscription by a ProductUserArn state holds nothing for".to_string(),
+            unknown_product_user.clone(),
+            stop_subscription(&h, &json!({ "ProductUserArn": unknown_product_user })).await,
         ),
         (
             "StartProductSubscription through an unregistered directory".to_string(),

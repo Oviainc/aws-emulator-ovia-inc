@@ -880,16 +880,20 @@ async fn product_subscriptions_round_trip_and_stop_ends_them() {
         );
 
         let again = stop_subscription(&h, &request).await;
+        // A subscription already ended resolves for nothing, so a second stop has nothing
+        // to end. WHICH refusal it gets follows the addressing the request used: the
+        // `ProductUserArn` names no live subscription of this account, so that call fails
+        // closed, while the members name a user with no subscription to the product, which
+        // is the modelled not-found.
+        let (status, code) = if index % 2 == 0 {
+            (401, "UnauthorizedException")
+        } else {
+            (404, "ResourceNotFoundException")
+        };
         assert_eq!(
-            again.status, 404,
-            "case {:?}: a subscription already ended resolves for nothing, so a second stop \
-             has nothing to end, got {again:?}",
-            row.case
-        );
-        assert_eq!(
-            again.error_type.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {:?}: expected ResourceNotFoundException, got {again:?}",
+            (again.status, again.error_type.as_deref()),
+            (status, Some(code)),
+            "case {:?}: expected HTTP {status} {code} for a second stop, got {again:?}",
             row.case
         );
     }

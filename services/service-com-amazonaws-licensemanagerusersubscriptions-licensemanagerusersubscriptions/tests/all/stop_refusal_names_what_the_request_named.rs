@@ -7,12 +7,15 @@
 //!
 //! The RULE under test, asserted over a TABLE of inputs rather than one recorded request:
 //! a refusal is worded from the identifiers the REQUEST named and no others, so one
-//! logical refusal has one sentence per ADDRESSING — a request that named the members that
+//! logical refusal has one answer per ADDRESSING — a request that named the members that
 //! identify a user is told that user has no subscription to that product, and a request
-//! that supplied a `ProductUserArn` is told that ARN has no subscription — and neither
-//! sentence depends on how far a lookup inside the service got, so neither changes with
-//! how much of the state the clock owes has been materialised, and neither reports an
-//! identifier this service minted and the caller never supplied.
+//! that supplied a `ProductUserArn` naming no live subscription of this account fails
+//! CLOSED, with the service's fixed `UnauthorizedException` sentence and nothing of the
+//! request in it, because an ARN is the identifier of a resource whose ownership has to be
+//! established and a refusal must not disclose that it resolves to nothing. Neither answer
+//! depends on how far a lookup inside the service got, so neither changes with how much of
+//! the state the clock owes has been materialised, and neither reports an identifier this
+//! service minted and the caller never supplied.
 //!
 //! The three states a stop can meet are driven for every row, because the rule says the
 //! answer does not distinguish them: the identity was never subscribed, its subscription
@@ -157,11 +160,14 @@ impl Row {
     }
 }
 
-/// The sentence a stop addressed by a `ProductUserArn` is refused with: the ARN the
-/// REQUEST supplied.
-fn expected_arn_sentence(product_user_arn: &str) -> String {
-    format!("product user {product_user_arn} has no subscription")
-}
+/// The code, the status and the FIXED sentence a stop addressed by a `ProductUserArn` that
+/// names no live subscription of this account is refused with. Spelled out here rather than
+/// read from the production constants, so a change to either of them fails a test.
+const FAIL_CLOSED: (u16, &str, &str) = (
+    401,
+    "UnauthorizedException",
+    "Unauthorized. Please check the request and access policy and try again.",
+);
 
 /// A harness whose account holds a registration for this row's `(directory, product)`.
 async fn setup(row: &Row) -> Harness {
@@ -272,11 +278,12 @@ async fn a_member_addressed_stop_is_refused_with_one_sentence() {
     }
 }
 
-/// RULE: the other addressing has its own one sentence, naming the `ProductUserArn` the
-/// REQUEST supplied — for an ARN this service never minted, for one whose subscription is
-/// still being torn down, and for one whose teardown has completed.
+/// RULE: the other addressing fails CLOSED — one answer, the service's fixed
+/// `UnauthorizedException` sentence carrying nothing of the request — for an ARN this
+/// service never minted, for one whose subscription is still being torn down, and for one
+/// whose teardown has completed.
 #[tokio::test]
-async fn an_arn_addressed_stop_names_the_arn_the_request_supplied() {
+async fn an_arn_addressed_stop_fails_closed() {
     for row in ROWS {
         let h = setup(row).await;
 
@@ -284,7 +291,7 @@ async fn an_arn_addressed_stop_names_the_arn_the_request_supplied() {
         let unknown = format!("{}pu-000000009999", arn_prefix("user"));
         let case = format!("{}: an ARN that was never subscribed", row.case);
         let never = stop_subscription(&h, &json!({ "ProductUserArn": unknown })).await;
-        assert_refusal(&case, &never, &expected_arn_sentence(&unknown), &[&unknown]);
+        assert_fail_closed(&case, &never, &unknown);
 
         let started = start_subscription(&h, &row.start_request()).await;
         let arn = minted_arn(&started, row.case);
@@ -294,13 +301,13 @@ async fn an_arn_addressed_stop_names_the_arn_the_request_supplied() {
 
         let case = format!("{}: the same ARN inside the teardown window", row.case);
         let ending = stop_subscription(&h, &json!({ "ProductUserArn": arn })).await;
-        assert_refusal(&case, &ending, &expected_arn_sentence(&arn), &[&arn]);
+        assert_fail_closed(&case, &ending, &arn);
 
         tokio::time::sleep(PAST_THE_OWED_TRANSITION).await;
 
         let case = format!("{}: the same ARN past the owed teardown", row.case);
         let gone = stop_subscription(&h, &json!({ "ProductUserArn": arn })).await;
-        assert_refusal(&case, &gone, &expected_arn_sentence(&arn), &[&arn]);
+        assert_fail_closed(&case, &gone, &arn);
         assert_eq!(
             (gone.status, gone.error_type.as_deref(), gone.message()),
             (
@@ -312,4 +319,20 @@ async fn an_arn_addressed_stop_names_the_arn_the_request_supplied() {
              owed has been materialised, got {gone:?} after {ending:?}"
         );
     }
+}
+
+/// Assert one fail-closed refusal: [`FAIL_CLOSED`]'s status, code and fixed sentence, with
+/// nothing of the ARN the request supplied in it — a refusal that disclosed the identifier
+/// would be disclosing that it names nothing.
+fn assert_fail_closed(case: &str, reply: &Reply, named: &str) {
+    let (status, code, sentence) = FAIL_CLOSED;
+    assert_eq!(
+        (reply.status, reply.error_type.as_deref(), reply.message()),
+        (status, Some(code), Some(sentence)),
+        "case {case:?}: expected the fail-closed refusal, got {reply:?}"
+    );
+    assert!(
+        !reply.message().unwrap_or_default().contains(named),
+        "case {case:?}: the fail-closed refusal must not report {named:?}, got {reply:?}"
+    );
 }

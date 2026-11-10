@@ -472,18 +472,6 @@ pub fn no_such_subscription(username: &str, product: &str, domain: Option<&str>)
     }
 }
 
-/// The sentence a request that addressed a subscription by the `ProductUserArn` it SUPPLIED
-/// is refused with when state holds no live subscription under that ARN.
-///
-/// A refusal names the identifier the REQUEST named, and no other: this is the wording for
-/// a request that supplied the ARN, while a request that addressed the subscription by the
-/// members that identify a user is refused with [`no_such_subscription`] — whatever ARN a
-/// lookup inside this service reached on the way there — so no answer discloses an
-/// identifier this service minted and the caller never supplied.
-pub fn no_such_product_user(product_user_arn: &str) -> String {
-    format!("product user {product_user_arn} has no subscription")
-}
-
 /// A registered identity provider, as `RegisterIdentityProvider` stored it.
 #[derive(Debug, Clone)]
 pub struct IdentityProviderRecord {
@@ -2295,8 +2283,9 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// one: its `ProductUserArn`, or the `(Username, IdentityProvider, Product, Domain)`
     /// identity it was subscribed with ([`product_user_arn_for`](Self::product_user_arn_for)).
     ///
-    /// `ValidationException` when neither addressing is complete, `ResourceNotFoundException`
-    /// when no such subscription is in state.
+    /// `ValidationException` when neither addressing is complete, `Ok(None)` for a
+    /// `ProductUserArn` this account's store holds no live subscription under, and
+    /// `ResourceNotFoundException` when the MEMBERS name no subscription in state.
     ///
     /// Whichever way a request addresses one, every member of a subscription's identity it
     /// names has to be the stored subscription's, for the reason the association plane
@@ -2310,13 +2299,17 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// subscription exactly as it is once the record is gone.
     ///
     /// One refusal per ADDRESSING, worded from the identifiers the REQUEST named and no
-    /// others: a request that supplied a `ProductUserArn` is refused with
-    /// [`no_such_product_user`] for the ARN it supplied, and a request that named the
-    /// members is refused with [`no_such_subscription`] for those members — whether the
-    /// identity they name is held by nothing, by a subscription whose teardown is still
-    /// running, or by a stored subscription some other member it named is not of. So
-    /// neither answer depends on how far an internal lookup got, and neither discloses an
-    /// identifier this service minted.
+    /// others. A request that named the MEMBERS is refused with [`no_such_subscription`]
+    /// for those members — whether the identity they name is held by nothing, by a
+    /// subscription whose teardown is still running, or by a stored subscription some other
+    /// member it named is not of. A request that supplied a `ProductUserArn` that resolves
+    /// to nothing is a different fact: the ARN names a resource whose ownership by the
+    /// caller cannot be established, which this service answers CLOSED — this is the
+    /// `Ok(None)` the caller lifts into
+    /// [`crate::scaffolded::Scaffolded::unauthorized`], exactly as the association plane
+    /// and the license-server plane answer an ARN of their own that state does not hold, so
+    /// no answer discloses whether an ARN resolves to anything or names an identifier this
+    /// service minted.
     pub fn resolve_product_user(
         &self,
         product_user_arn: Option<&str>,
@@ -2324,11 +2317,13 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         identity_provider: Option<&IdentityProvider>,
         product: Option<&str>,
         domain: Option<&str>,
-    ) -> Result<&ProductUserRecord, StateError> {
+    ) -> Result<Option<&ProductUserRecord>, StateError> {
         if let Some(arn) = product_user_arn {
-            let record = self
-                .live_product_user(arn)
-                .ok_or_else(|| StateError::NotFound(no_such_product_user(arn)))?;
+            // THE FAIL-CLOSED ARM: an ARN this account's store holds no live subscription
+            // under is not an identifier whose resource can be shown to be the caller's.
+            let Some(record) = self.live_product_user(arn) else {
+                return Ok(None);
+            };
             // The provider union a request names is compared by the directory it names,
             // which is what the registration a subscription was stored through is indexed
             // under; a union naming no directory is a parameter that is not valid, exactly
@@ -2355,7 +2350,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
                     domain.or(record.domain.as_deref()),
                 )));
             }
-            return Ok(record);
+            return Ok(Some(record));
         }
         let (Some(username), Some(identity_provider), Some(product)) =
             (username, identity_provider, product)
@@ -2376,6 +2371,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         // and the ARN that entry carries is not an identifier this request supplied.
         self.product_user_arn_for(&provider.arn, product, username, domain)
             .and_then(|arn| self.live_product_user(arn))
+            .map(Some)
             .ok_or_else(|| StateError::NotFound(no_such_subscription(username, product, domain)))
     }
 

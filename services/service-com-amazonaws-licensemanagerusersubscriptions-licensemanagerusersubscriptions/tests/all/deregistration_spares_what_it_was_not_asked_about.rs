@@ -429,15 +429,12 @@ async fn the_agreeing_deregistration_is_the_one_that_cascades() {
         );
 
         // Its product users went with it: the subscription the fixture started resolves for
-        // nothing, which is the refusal a `ProductUserArn` that never existed gets.
+        // nothing, which is the fail-closed refusal a `ProductUserArn` that never existed
+        // gets.
         let refused = stop_subscription(h, &json!({ "ProductUserArn": fixture.subscription })).await;
         assert_eq!(
-            refused.status, 404,
-            "case {case:?}: ResourceNotFoundException is modelled at HTTP 404, got {refused:?}"
-        );
-        assert_eq!(
-            refused.error_type.as_deref(),
-            Some("ResourceNotFoundException"),
+            (refused.status, refused.error_type.as_deref()),
+            (401, Some("UnauthorizedException")),
             "case {case:?}: the dropped subscription must resolve for nothing, got {refused:?}"
         );
 

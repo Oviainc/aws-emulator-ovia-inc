@@ -205,6 +205,24 @@ pub const UNAUTHORIZED_EXCEPTION_MESSAGE: &str =
 /// terminal until the caller changes the request or its access.
 pub const UNAUTHORIZED_EXCEPTION_STATUS: u16 = 401;
 
+/// The wire error code an authorization refusal — the decision of the IAM layer in FRONT
+/// of this service — travels under.
+///
+/// `AccessDeniedException` is a shape of this service's model ("You don't have sufficient
+/// access to perform this action.") and all but its three tagging operations declare it,
+/// but the decision is taken before a request is routed to one operation
+/// ([`crate::service`]'s authorization gate), so it is answered through [`ServiceRefusal`]
+/// — the one channel that carries a code and a status without belonging to one operation's
+/// generated enum. The code and the body a caller sees are the modelled ones either way.
+pub const ACCESS_DENIED_EXCEPTION_CODE: &str = "AccessDeniedException";
+
+/// The HTTP status [`ACCESS_DENIED_EXCEPTION_CODE`] is reported with: 400, the status the
+/// model gives that error (`smithy_query(query="shape",shape="AccessDeniedException")` —
+/// `errorKind` client with no `@httpError`, which defaults to 400), so a refusal answered
+/// ahead of the operation carries exactly the status the operation's own modelled variant
+/// would.
+pub const ACCESS_DENIED_EXCEPTION_STATUS: u16 = 400;
+
 /// The wire error code this service's TAGGING surface answers an unresolvable
 /// `ResourceArn` with — also not a shape in this service's model (`UntagResource` models
 /// only InternalServerException and ResourceNotFoundException).
@@ -263,18 +281,20 @@ pub static SERVICE_REFUSAL_SCHEMA: Schema = Schema::new_struct(
     &[&SERVICE_REFUSAL_MESSAGE],
 );
 
-/// A refusal whose error code this service's model does not declare: the code a client
-/// branches on, plus the sentence that travels with it.
+/// A refusal no operation's generated error enum can carry: the code a client branches on,
+/// the status it is reported with, plus the sentence that travels with it.
 ///
-/// Both refusals this carries are recorded behaviour of the real service, and neither is
-/// expressible as a modeled variant — the model has no shape for either code. The code is
-/// `&'static str` because [`OperationError::shape_name`] vends a `&'static str`, so a
-/// refusal can only name one of the constants above.
+/// Every refusal this carries is recorded behaviour of the real service. Two of them are
+/// not expressible as a modeled variant at all — the model has no shape for either code —
+/// and the third, the authorization refusal, is decided BEFORE a request is routed to one
+/// operation, so there is no operation enum to put it on. The code is `&'static str`
+/// because [`OperationError::shape_name`] vends a `&'static str`, so a refusal can only
+/// name one of the constants above.
 ///
 /// The STATUS travels with the code rather than being one constant for every such refusal:
-/// the two refusals are different outcomes to a client — one is about the caller's access to
-/// the resource it named, the other about a value in the request — and a client that
-/// branches on the status has to be able to tell them apart.
+/// the refusals are different outcomes to a client — the caller's access to the resource it
+/// named, the caller's permissions, a value in the request — and a client that branches on
+/// the status has to be able to tell them apart.
 #[derive(Debug, Clone)]
 pub struct ServiceRefusal {
     /// The wire error code (`__type` / `x-amzn-errortype`).
@@ -293,6 +313,17 @@ impl ServiceRefusal {
             code: UNAUTHORIZED_EXCEPTION_CODE,
             status: UNAUTHORIZED_EXCEPTION_STATUS,
             message: UNAUTHORIZED_EXCEPTION_MESSAGE.to_string(),
+        }
+    }
+
+    /// The authorization refusal of a request the IAM policies in force on its caller do
+    /// not permit: [`ACCESS_DENIED_EXCEPTION_CODE`] at [`ACCESS_DENIED_EXCEPTION_STATUS`],
+    /// carrying the sentence IAM states that decision with.
+    pub fn access_denied(message: String) -> Self {
+        Self {
+            code: ACCESS_DENIED_EXCEPTION_CODE,
+            status: ACCESS_DENIED_EXCEPTION_STATUS,
+            message,
         }
     }
 

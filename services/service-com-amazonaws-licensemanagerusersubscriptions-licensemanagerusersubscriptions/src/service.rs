@@ -20,9 +20,13 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `override_operation` — EDITED HERE: every request is served through the
+//!   authorization gate, which decides whether IAM permits the action the request named
+//!   (and, for an operation that acts on a caller-named EC2 instance, whether the account
+//!   owns that instance) BEFORE the framework deserializes or constraint-checks anything,
+//!   and then hands an authorized request to the very operation the model's own routing key
+//!   names. A key the model does not name still resolves to `None` here, so the router's
+//!   routing-error path is unchanged.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -44,6 +48,10 @@ use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service, ViolationKind,
 };
 use std::sync::Arc;
+
+/// Whether IAM lets a request perform the action it names — the decision taken ahead of
+/// EVERY operation of this service.
+mod authorization;
 
 /// The HTTP method every gated route below is bound to: each one is
 /// `@http(method: "POST", …)`, so a request arriving at one of those paths under any other
@@ -128,16 +136,17 @@ const RESOURCE_ARN_MEMBER: &str = "resourceArn";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The authorization gate for each route in [`INSTANCE_GATED_ROUTES`], each holding the
-    /// same shared engine the entry constructed every operation from.
+    /// THE GATE every request this service serves is run through: whether IAM permits the
+    /// action the request names, and — for a request that names one of this service's own
+    /// resources on an EC2 instance — whether the account owns that instance.
     ///
-    /// The gate has to decide BEFORE the framework deserializes and constraint-checks the
-    /// request, which is the one decision that cannot be made from inside a handler — and
-    /// deciding it means resolving an EC2 instance against the service that owns instances,
-    /// which is an await. So the gate is an operation ([`InstanceGate`]): the sync
-    /// [`Service::override_operation`] seam only picks it, and the gate itself resolves the
-    /// instance and then either refuses or runs the modelled operation the route names.
-    gates: Vec<InstanceGate<Eng>>,
+    /// Both decisions have to be taken BEFORE the framework deserializes and
+    /// constraint-checks the request, which is the one thing that cannot be done from
+    /// inside a handler, and the instance half means resolving an EC2 instance against the
+    /// service that owns instances, which is an await. So the gate is an operation: the
+    /// sync [`Service::override_operation`] seam only picks it, and the gate itself decides
+    /// and then either refuses or runs the modelled operation the request named.
+    gate: AuthorizationGate<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -147,13 +156,16 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
-            gates: INSTANCE_GATED_ROUTES
-                .iter()
-                .map(|route| InstanceGate {
-                    route,
-                    engine: Arc::clone(&engine),
-                })
-                .collect(),
+            gate: AuthorizationGate {
+                engine: Arc::clone(&engine),
+                instances: INSTANCE_GATED_ROUTES
+                    .iter()
+                    .map(|route| InstanceGate {
+                        route,
+                        engine: Arc::clone(&engine),
+                    })
+                    .collect(),
+            },
         }
     }
 }
@@ -182,35 +194,34 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<&dyn ErasedOperation> {
         // THE AUTHORIZATION GATE, and the only seam it can run in.
         //
-        // An operation that acts on a caller-named EC2 instance is authorized before its
-        // request shape is validated: the same call against an instance this service will
-        // not authorize is refused identically whatever else the request gets wrong —
+        // A request is authorized before its shape is validated, on both of the facts that
+        // decide whether this service acts on it at all: whether the IAM policies in force
+        // on the principal its credentials speak for allow the action it named
+        // ([`authorization::authorize`]), and — for an operation that acts on a
+        // caller-named EC2 instance — whether this account owns that instance. The same
+        // call a gate refuses is refused identically whatever else the request gets wrong —
         // whether its `Tags` map is within the modelled `@length` or past it, and whether or
         // not it even carries the members the model requires. The framework's centralized
         // walk is deserialize -> validate -> handle, so a handler runs only AFTER
         // modelled-constraint enforcement; this hook is consulted before any of it, which is
-        // why the decision lives here and not in the handlers.
+        // why the decisions live here and not in the handlers.
         //
-        // It covers EVERY such operation ([`INSTANCE_GATED_ROUTES`]), so the refusal does
-        // not depend on which one the caller reached for; each handler runs the same gate
-        // again ([`crate::state::ec2_fleet::authorize_instance`]), so the two cannot
-        // disagree about a request that gets this far.
+        // NOT a re-route: the gate serves the very operation the model's own routing key
+        // names, so a key the model does not name resolves to `None` here exactly as it
+        // does in the generated table and the router's routing-error path is unchanged.
+        // The IAM half covers EVERY modelled operation, and the instance half every
+        // operation that names an instance ([`INSTANCE_GATED_ROUTES`]), so neither refusal
+        // depends on which operation the caller reached for; each handler that resolves an
+        // instance runs that same gate again
+        // ([`crate::state::ec2_fleet::authorize_instance`]), so the two cannot disagree
+        // about a request that gets this far.
         //
         // What is picked here is the GATE, not the refusal: resolving the instance reaches
         // the service that owns instances, which cannot be awaited in this sync seam, so the
-        // gate makes that decision in its own `run` and hands an authorized request on to
-        // the modelled operation the route names.
-        if req.method() != GATED_METHOD {
-            return None;
-        }
-        // The path portion of the request URI, which is what an operation's `@http` `uri`
-        // pattern is written against. Read through `service_common::request_path`, the one
-        // shared reader for it in this tree, rather than a local copy of the split: the
-        // framework's own is `pub(crate)` in a read-only tree, and this crate now depends on
-        // that crate anyway.
-        let path = ::service_common::request_path(req.uri());
-        let gate = self.gates.iter().find(|gate| gate.route.uri == path)?;
-        Some(gate as &dyn ErasedOperation)
+        // gate makes its decisions in its own `run` and hands an authorized request on to
+        // the modelled operation the request named.
+        self.entry.protocol().routing_key(req).ok()?;
+        Some(&self.gate as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -334,7 +345,98 @@ fn unanchored_violation(
     }
 }
 
-/// The authorization gate for one [`INSTANCE_GATED_ROUTES`] entry, as an operation the
+/// THE GATE every request this service serves passes through, as an operation the dispatch
+/// path can run: first whether IAM permits the ACTION the request named, then — for a
+/// request that names one of this service's own resources on an EC2 instance — whether this
+/// account owns that instance ([`InstanceGate`]).
+///
+/// The order is AWS's: authorization is decided by the IAM layer in FRONT of the service,
+/// so it is answered before anything about the request's own resource is resolved, let
+/// alone deserialized or constraint-checked. A request both gates pass is handed to the
+/// modelled operation the request named, read off this service's own routing table, so it
+/// is served by exactly the centralized deserialize -> validate -> handle walk every other
+/// request takes: the gate changes WHICH refusal comes first, not whether the modelled
+/// constraints are enforced.
+///
+/// A request it refuses answers one thing: the refusal the decision itself carries, rendered
+/// through the service's own protocol envelope with the code and the status that refusal
+/// names ([`refusal_response`]), so it is shaped exactly like every other refusal this
+/// service sends.
+struct AuthorizationGate<Eng> {
+    /// The same shared engine the entry constructed each operation from, so the IAM
+    /// decision reads the account's own IAM and STS stores and the instance half reads this
+    /// service's own fleet seam.
+    engine: Arc<Eng>,
+    /// The instance-ownership gate for each route in [`INSTANCE_GATED_ROUTES`].
+    instances: Vec<InstanceGate<Eng>>,
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for AuthorizationGate<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        let started = std::time::Instant::now();
+        Box::pin(async move {
+            // The operation the request named, read exactly as dispatch reads it: the
+            // routing key this service's protocol resolves from the request line. It is the
+            // ACTION the IAM decision is about, and the key the modelled operation is wired
+            // under. Read and dropped inside this one statement, because
+            // `&dyn ErasedServiceDefinition` is not `Sync` and the awaits below would make
+            // this future non-`Send`; the key itself borrows the REQUEST.
+            let Ok(operation) = svc.definition().protocol().routing_key(req) else {
+                // `override_operation` picked this gate only for a request whose key
+                // resolves, so this is unreachable; answered as the request naming no
+                // modelled operation, which is what it would be.
+                return svc.definition().routing_error_response(req);
+            };
+            // THE IAM DECISION, ahead of every other answer this service could give: a
+            // caller whose permissions do not cover the action is told that and nothing
+            // about the resource it named, and the call performs nothing.
+            if let Err(refusal) = authorization::authorize(&*self.engine, ctx, operation) {
+                let code = refusal.code;
+                let response = refusal_response(svc, req, &refusal);
+                record_refusal(
+                    ctx,
+                    operation,
+                    code,
+                    response.status().as_u16(),
+                    started.elapsed(),
+                );
+                return response;
+            }
+            // The instance half, for the routes whose input names an EC2 instance.
+            if req.method() == GATED_METHOD {
+                // The path portion of the request URI, which is what an operation's `@http`
+                // `uri` pattern is written against. Read through
+                // `service_common::request_path`, the one shared reader for it in this tree,
+                // rather than a local copy of the split: the framework's own is
+                // `pub(crate)` in a read-only tree, and this crate depends on that crate
+                // anyway.
+                let path = ::service_common::request_path(req.uri());
+                if let Some(gate) = self.instances.iter().find(|gate| gate.route.uri == path) {
+                    return gate.run(svc, req, ctx).await;
+                }
+            }
+            // The modelled operation the key names, from this service's own model-derived
+            // routing table.
+            if let Some(modelled) = svc.definition().routing_table().get(operation) {
+                return modelled.run(svc, req, ctx).await;
+            }
+            svc.definition().routing_error_response(req)
+        })
+    }
+
+    // `None`, NOT an empty list: the request is still signed as the operation the model
+    // names. Answering `Some(&[])` here would serve every request of this service unsigned.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        None
+    }
+}
+
+/// The instance-ownership gate for one [`INSTANCE_GATED_ROUTES`] entry, as an operation the
 /// dispatch path can run.
 ///
 /// It is an operation rather than a predicate because the decision needs an await: the
@@ -526,7 +628,7 @@ fn refusal_response(
 /// collecting exactly as the framework gates it.
 fn record_refusal(
     ctx: &OperationContext<'_>,
-    operation: &'static str,
+    operation: &str,
     code: &str,
     status: u16,
     latency: std::time::Duration,

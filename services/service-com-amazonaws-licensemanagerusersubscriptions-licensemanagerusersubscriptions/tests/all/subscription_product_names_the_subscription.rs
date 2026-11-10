@@ -219,7 +219,8 @@ async fn a_subscription_addressed_by_arn_and_its_own_product_is_the_one_that_is_
         );
 
         // A second stop of the same subscription resolves nothing: the end was already
-        // accepted, so the identifier names no subscription an operation can act on.
+        // accepted, so the ARN names no live subscription of this account and the call
+        // fails closed rather than disclosing that it resolves to nothing.
         let case = format!("stopping the {stored_product} subscription twice");
         let repeated = stop_subscription(
             &h,
@@ -227,8 +228,10 @@ async fn a_subscription_addressed_by_arn_and_its_own_product_is_the_one_that_is_
         )
         .await;
         assert_eq!(
-            repeated.status, 404,
-            "case {case:?}: expected HTTP 404 for a subscription already ended, got {repeated:?}"
+            (repeated.status, repeated.error_type.as_deref()),
+            (401, Some("UnauthorizedException")),
+            "case {case:?}: expected the fail-closed refusal for a subscription already \
+             ended, got {repeated:?}"
         );
     }
 }

@@ -459,22 +459,30 @@ async fn an_ended_subscription_is_no_longer_a_live_subscription() {
 
         stop_subscription(&h, &row.stop_request(arn)).await.ok(case);
 
-        // A second stop, by either addressing, is the modelled `ResourceNotFoundException`:
-        // the subscription has already ended, so there is none left to end.
-        for (form, request) in [
-            ("the same addressing", row.stop_request(arn)),
-            ("the other addressing", row.other_stop_request(arn)),
+        // A second stop, by either addressing, is refused: the subscription has already
+        // ended, so there is none left to end. WHICH refusal follows the addressing — a
+        // `ProductUserArn` that names no live subscription of this account fails closed,
+        // and the members that identify a user get the modelled `ResourceNotFoundException`
+        // — so both forms are driven here.
+        for (form, request, by_arn) in [
+            ("the same addressing", row.stop_request(arn), row.by_arn),
+            (
+                "the other addressing",
+                row.other_stop_request(arn),
+                !row.by_arn,
+            ),
         ] {
             let case = format!("{case}, stopped again through {form}");
             let again = stop_subscription(&h, &request).await;
+            let (status, code) = if by_arn {
+                (401, "UnauthorizedException")
+            } else {
+                (404, "ResourceNotFoundException")
+            };
             assert_eq!(
-                again.status, 404,
-                "case {case:?}: ResourceNotFoundException is modelled at HTTP 404, got {again:?}"
-            );
-            assert_eq!(
-                again.error_type.as_deref(),
-                Some("ResourceNotFoundException"),
-                "case {case:?}: expected ResourceNotFoundException, got {again:?}"
+                (again.status, again.error_type.as_deref()),
+                (status, Some(code)),
+                "case {case:?}: expected HTTP {status} {code} for a second stop, got {again:?}"
             );
         }
 
