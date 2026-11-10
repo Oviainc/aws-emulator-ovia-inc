@@ -33,6 +33,8 @@ mod document_extraction;
 mod document_formats;
 #[path = "all/expense_analysis.rs"]
 mod expense_analysis;
+#[path = "all/proportional_and_turned_pages.rs"]
+mod proportional_and_turned_pages;
 #[path = "all/queries_and_input_refusals.rs"]
 mod queries_and_input_refusals;
 #[path = "all/raster_documents.rs"]

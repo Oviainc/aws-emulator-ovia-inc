@@ -64,8 +64,12 @@
 //!   columns and lengths place them on ([`bounding_box`]) and report the page's own
 //!   confidence — a per-word spread there would be a measurement nothing made;
 //! * every block above a word spans exactly the words it was read from (a `LINE`, a
-//!   `KEY_VALUE_SET`, a `CELL`, an `ExpenseDetection`), and a `PAGE` encloses the page's
-//!   top-level blocks rather than claiming the whole page.
+//!   `KEY_VALUE_SET`, a `CELL`, an `ExpenseDetection`), and a `PAGE` spans the page's
+//!   CONTENT — every mark found on it, whether or not it was read as a character, so a
+//!   rule, a border or a logo is part of the page it is drawn on — rather than claiming
+//!   the whole page;
+//! * a `WORD` reports as its `Geometry$RotationAngle` the quarter turn its characters were
+//!   read at, which [`ocr`] establishes by reading the page at each of its turns.
 
 pub mod ocr;
 pub mod s3_source;
@@ -1347,8 +1351,21 @@ pub fn adapter_auto_update(value: Option<&str>) -> Result<String, String> {
 // Reading a document
 // ---------------------------------------------------------------------------
 
-/// One page's lines as [`ocr`] MEASURED them off the submitted pixels, in reading order.
-pub type MeasuredPage = Vec<ocr::MeasuredLine>;
+/// One page as [`ocr`] MEASURED it off the submitted pixels: its lines in reading order,
+/// the angle its characters were read at, and the extent of the page's own content.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MeasuredPage {
+    /// Where the text of this page sits on it, one entry per line of the page's text and
+    /// in the same order.
+    pub lines: Vec<ocr::MeasuredLine>,
+    /// The angle, in degrees, the page's characters were read at — `0.0` for a page read
+    /// as it was submitted — which is what its `WORD` blocks report as
+    /// `Geometry$RotationAngle`.
+    pub rotation: f32,
+    /// The extent of the page's CONTENT: every mark found on it, read as text or not.
+    /// `None` for a page carrying no ink at all.
+    pub content: Option<ocr::Rect>,
+}
 
 /// A document's text, one entry per page, the confidence it was read with, and where on
 /// each page that text was found.
@@ -1368,10 +1385,19 @@ pub struct DocumentContent {
 }
 
 impl DocumentContent {
-    /// The measured lines of page `page_index`, when that page's text was recognised off
+    /// The measurements of page `page_index`, when that page's text was recognised off
     /// pixels.
-    fn measured_page(&self, page_index: usize) -> Option<&[ocr::MeasuredLine]> {
-        self.measured.get(page_index).map(Vec::as_slice)
+    fn measured_page(&self, page_index: usize) -> Option<&MeasuredPage> {
+        self.measured.get(page_index)
+    }
+
+    /// The angle the characters of page `page_index` were read at.
+    ///
+    /// A page whose text was not recognised off pixels carries no rotation: the characters
+    /// of a text document are not drawn on a page at all, so nothing turned them.
+    fn page_rotation(&self, page_index: usize) -> f32 {
+        self.measured_page(page_index)
+            .map_or(0.0, |page| page.rotation)
     }
 
     /// The page count `DocumentMetadata.Pages` reports.
@@ -1570,7 +1596,11 @@ pub fn read_content(
         return Ok(DocumentContent {
             pages: bounded(vec![page.text])?,
             confidence: page.confidence,
-            measured: vec![page.lines],
+            measured: vec![MeasuredPage {
+                lines: page.lines,
+                rotation: page.rotation,
+                content: page.content,
+            }],
         });
     }
     // Every other byte string is a document this service reads no page out of, and they
@@ -1903,7 +1933,7 @@ fn layout_page(
             // they somehow did not is laid out on the character grid rather than given
             // another word's rectangle.
             let measured_line = measured
-                .and_then(|lines| lines.get(index))
+                .and_then(|page| page.lines.get(index))
                 .filter(|line| line.words.len() == laid_out.len());
             let words: Vec<WordLayout> = laid_out
                 .into_iter()
@@ -1983,6 +2013,7 @@ pub fn blocks(key: &str, content: &DocumentContent, features: FeatureSet) -> Vec
     for (page_index, page_text) in content.pages.iter().enumerate() {
         let page_number = i32::try_from(page_index + 1).unwrap_or(i32::MAX);
         let lines = layout_page(key, page_index, page_text, content);
+        let rotation = content.page_rotation(page_index);
 
         let mut text_blocks: Vec<Block> = Vec::new();
         for line in &lines {
@@ -2005,12 +2036,12 @@ pub fn blocks(key: &str, content: &DocumentContent, features: FeatureSet) -> Vec
                 let mut word_geometry = geometry(word.bbox.clone());
                 // `Geometry$RotationAngle` is "a numerical value corresponding to the
                 // rotation of the WORD block. Possible values are 0, 90, 180, and 270",
-                // so it is reported for WORD blocks only. Every word this service reads
-                // is read along the page's own axes — a line is a run of inked ROWS and
-                // a word a run of inked COLUMNS within it — so the angle it was read at
-                // is 0. It never reports 90, 180 or 270, because it never reads a word
-                // at one of those angles.
-                word_geometry.rotation_angle = Some(0.0);
+                // so it is reported for WORD blocks only. The angle is the one the page's
+                // characters were READ at: a page is read at each of its quarter turns and
+                // reported at the turn its marks recognised best (see [`ocr`]), so a
+                // document scanned or photographed turned reports the turn its words are
+                // drawn at, and one read along its own rows reports 0.
+                word_geometry.rotation_angle = Some(rotation);
                 word_block.geometry = Some(word_geometry);
                 text_blocks.push(word_block);
             }
@@ -2033,18 +2064,23 @@ pub fn blocks(key: &str, content: &DocumentContent, features: FeatureSet) -> Vec
         children.extend(table_ids);
 
         let mut page_block = new_block("PAGE", block_id(key, "PAGE", &[page_index]), page_number);
-        // A PAGE's `Geometry` bounds what was READ on the page: the box enclosing its
-        // top-level blocks, which is what the service's own recorded answers carry (a box
-        // inside the page, with a polygon of four interior corners) rather than the unit
-        // square. The forms and tables of a page are derived from its lines, so the lines
-        // already enclose them. A page nothing was read on has nothing to bound, so it
-        // reports the whole page: that IS what was examined.
-        let line_boxes: Vec<BoundingBox> = lines.iter().map(|line| line.bbox.clone()).collect();
-        page_block.geometry = Some(geometry(if line_boxes.is_empty() {
-            box_of(&ocr::Rect::whole_page())
-        } else {
-            union(&line_boxes)
-        }));
+        // A PAGE's `Geometry` bounds what is ON the page: the extent of the content the
+        // reader found there, together with the blocks it was read into. A page read off
+        // pixels reports the extent of its own marks, so a rule, a border or a logo the
+        // recogniser could not name is still part of the content the page block spans; a
+        // page whose text carries no measurement reports the box enclosing its blocks.
+        // A page nothing was found on has nothing to bound, so it reports the whole page:
+        // that IS what was examined.
+        let mut page_boxes: Vec<BoundingBox> = lines.iter().map(|line| line.bbox.clone()).collect();
+        if let Some(detected) = content
+            .measured_page(page_index)
+            .and_then(|page| page.content.as_ref())
+        {
+            page_boxes.push(box_of(detected));
+        }
+        page_block.geometry = Some(geometry(
+            union_of(&page_boxes).unwrap_or_else(|| box_of(&ocr::Rect::whole_page())),
+        ));
         if !children.is_empty() {
             page_block.relationships = Some(vec![relationship("CHILD", children)]);
         }
