@@ -17,6 +17,11 @@
 // else appends to.
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
+// Declared here, in this same head region, for the reason the entry above records: what
+// LAMBDA makes of an access point EFS minted, which neither crate's own test target can
+// ask, since the ARN has to cross from one service to the other.
+#[path = "all/efs_access_point_mounted_by_lambda.rs"]
+mod efs_access_point_mounted_by_lambda;
 // Declared here, in this same head region, for the reason the entry above records: what an
 // EventBridge rule hands a Lambda target and which function qualifier the target ARN
 // addresses, which spans EventBridge and Lambda at once.

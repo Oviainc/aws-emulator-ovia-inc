@@ -33,6 +33,8 @@ mod file_system_policy;
 mod harness;
 #[path = "all/lifecycle_configuration.rs"]
 mod lifecycle_configuration;
+#[path = "all/minted_id_width.rs"]
+mod minted_id_width;
 #[path = "all/mutation_results.rs"]
 mod mutation_results;
 #[path = "all/provisioned_throughput_required.rs"]

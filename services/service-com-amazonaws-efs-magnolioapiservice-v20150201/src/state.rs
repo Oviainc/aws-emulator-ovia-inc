@@ -683,6 +683,33 @@ const SPLITMIX64_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 /// [`SPLITMIX64_STEP`], never reaching it.
 const VPC_ID_SEED: u64 = 0x5EFC_0DE0_0000_0001;
 
+/// How many lowercase hex digits the body of a MINTED resource id carries.
+///
+/// AWS mints the ids this service hands out — `fs-`, `fsmt-`, `fsap-`, and the `eni-` and
+/// `vpc-` ids of the network a mount target is reported on — with 17 hex digits, and the
+/// services that consume them pin that width: Lambda admits an EFS access point as a
+/// function's file system only as `…:access-point/fsap-[a-f0-9]{17}`
+/// (`smithy_query(query="shape",shape="FileSystemConfig",model_path="services/service-com-amazonaws-lambda-awsgirapiservice/smithy-model/com-amazonaws-lambda-awsgirapiservice.json")`).
+/// Every id pattern in this service's own model admits 8 to 40 digits, so a 17-digit body
+/// satisfies this service and every consumer of what it mints.
+const MINTED_ID_HEX: usize = 17;
+
+/// The salt the digits beyond the first 16 of a minted id are finalised from, so they do
+/// not read as a constant tail every id shares. A fixed salt, like [`VPC_ID_SEED`].
+const MINTED_ID_SALT: u64 = 0x1D5A_1701_0000_0001;
+
+/// [`MINTED_ID_HEX`] lowercase hex digits derived from `seed`.
+///
+/// The leading digits are [`hex_of`], a bijection on 64 bits, so two distinct seeds never
+/// produce the same id however many digits follow; the rest come from the finalisation of
+/// the salted seed.
+fn minted_hex_of(seed: u64) -> String {
+    let mut digits = hex_of(seed);
+    digits.push_str(&hex_of(seed ^ MINTED_ID_SALT));
+    digits.truncate(MINTED_ID_HEX);
+    digits
+}
+
 /// 16 lowercase hex digits from one SplitMix64 finalisation of `seed`. A bijection, so
 /// two distinct seeds never produce the same digits.
 fn hex_of(seed: u64) -> String {
@@ -720,15 +747,18 @@ pub struct ComAmazonawsEfsMagnolioapiserviceV20150201State {
 }
 
 impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
-    /// 16 lowercase hex digits for the body of a minted id, so `fs-`/`fsmt-` ids match
-    /// their modelled `^(fs|fsmt)-[0-9a-f]{8,40}$` patterns and their length bounds.
+    /// [`MINTED_ID_HEX`] lowercase hex digits for the body of a minted id, the width AWS
+    /// mints these ids in — so `fs-`/`fsmt-`/`fsap-` ids match their modelled
+    /// `^(fs|fsmt|fsap)-[0-9a-f]{8,40}$` patterns and their length bounds here, and the
+    /// ids and ARNs built from them also satisfy the narrower patterns the services that
+    /// consume them model.
     ///
     /// The digits come from SplitMix64 over a stored counter rather than from the
     /// counter itself: the step is a bijection, so two resources never collide, while
     /// the ids do not read as consecutive integers a client could guess the next of.
     pub fn mint_hex(&mut self) -> String {
         self.next_id_seed = self.next_id_seed.wrapping_add(SPLITMIX64_STEP);
-        hex_of(self.next_id_seed)
+        minted_hex_of(self.next_id_seed)
     }
 
     /// The next creation ordinal, which fixes list and pagination order.
@@ -744,7 +774,7 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
     /// writes nothing at all, and every caller observes the same VPC for the life of the
     /// process.
     pub fn vpc_id(&self) -> String {
-        format!("vpc-{}", hex_of(VPC_ID_SEED))
+        format!("vpc-{}", minted_hex_of(VPC_ID_SEED))
     }
 
     /// The record for `subnet_id`, or the Availability Zone and /24 it WOULD be given on

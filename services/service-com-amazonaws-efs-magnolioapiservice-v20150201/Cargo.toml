@@ -32,6 +32,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Lets a suite assert a minted id or ARN against the pattern a consuming service's model
+# carries for it, written out as that model writes it.
+regex = "1.13"
 
 [lints]
 workspace = true
