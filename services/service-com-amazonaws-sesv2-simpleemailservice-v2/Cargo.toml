@@ -34,6 +34,11 @@ aws-sdk-sns = { version = "1", default-features = false }
 # (`state::event_publication::notification`). The same crate the classic SES surface reads
 # a raw message with.
 mailparse = "0.16"
+# `csv`: the ONE writer of the comma-separated form of an export job's file
+# (`state::export_file`), so the quoting of a cell that needs it is the codec's rule and
+# not re-derived here. The same crate the other emulated services that publish a CSV
+# artifact write theirs with.
+csv = "1.3"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

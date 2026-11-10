@@ -43,6 +43,12 @@ mod dedicated_ips;
 /// The order this service states an enumerated type's values in when it refuses a
 /// value outside them.
 mod enum_value_sets;
+/// The export-job plane's one piece of behaviour: the file a run writes, which is the
+/// records its data source selects rendered in the data format it asks for.
+mod export_file;
+/// The account's VDM metric series, which a metric query reports and a metrics export
+/// writes into its file.
+mod metric_series;
 /// The account's pricing plane: the plan ladder, and where a requested plan lands on
 /// the account's pricing attributes.
 mod pricing;
@@ -57,6 +63,8 @@ pub mod template_rendering;
 pub use configuration_sets::*;
 pub use dedicated_ips::*;
 pub use enum_value_sets::*;
+pub use export_file::*;
+pub use metric_series::*;
 pub use pricing::*;
 pub use suppression::*;
 
@@ -1319,6 +1327,29 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
         for endpoint in self.multi_region_endpoints.values_mut() {
             endpoint.settle(now);
         }
+        // An export job's run writes its file as it completes, from the records its
+        // data source selects as they stood when the run fell due — so the file is
+        // written once, and every later download of the job serves those bytes. At most
+        // `MAX_EXPORT_FILES_PER_CALL` are written here, so one call cannot be made to
+        // pay for every pending run; the rest stay owed, and the next call writes them.
+        let completing: Vec<String> = self
+            .export_jobs
+            .iter()
+            .filter(|(_, job)| job.completion_falls_due(now))
+            .map(|(job_id, _)| job_id.clone())
+            .take(MAX_EXPORT_FILES_PER_CALL)
+            .collect();
+        for job_id in completing {
+            let Some(job) = self.export_jobs.get(&job_id).cloned() else {
+                continue;
+            };
+            let file = export_file::render(self, &job);
+            if let Some(stored) = self.export_jobs.get_mut(&job_id) {
+                stored.file = Some(file);
+            }
+        }
+        // A run whose file has not been written is NOT complete: the status moves only
+        // where the file it reports is there to be downloaded.
         for job in self.export_jobs.values_mut() {
             job.settle(now);
         }
@@ -3717,6 +3748,13 @@ impl ExportJobStatus {
     }
 }
 
+/// `ExportSourceType`'s value for "the metrics export", whose data source is a
+/// `MetricsDataSource` (see `crate::ops::types::EXPORT_SOURCE_TYPE_VALUES`).
+pub const EXPORT_SOURCE_METRICS_DATA: &str = "METRICS_DATA";
+
+/// `ExportSourceType`'s value for "the Message Insights export".
+pub const EXPORT_SOURCE_MESSAGE_INSIGHTS: &str = "MESSAGE_INSIGHTS";
+
 /// The `ExportSourceType` the data source `data_source` selects, or `None` when it
 /// selects neither or both.
 ///
@@ -3730,8 +3768,8 @@ pub fn export_source_type(
         data_source.metrics_data_source.as_ref(),
         data_source.message_insights_data_source.as_ref(),
     ) {
-        (Some(_), None) => Some("METRICS_DATA"),
-        (None, Some(_)) => Some("MESSAGE_INSIGHTS"),
+        (Some(_), None) => Some(EXPORT_SOURCE_METRICS_DATA),
+        (None, Some(_)) => Some(EXPORT_SOURCE_MESSAGE_INSIGHTS),
         _ => None,
     }
 }
@@ -3759,6 +3797,18 @@ pub fn export_destination_s3_url_is_set_by_ses() -> String {
     "ExportDestination.S3Url is set by SES and must not be included in a \
      CreateExportJob request."
         .to_string()
+}
+
+/// How this service words `NotFoundException` for a `JobId` the account holds no export
+/// job for, stated once for every operation that reads an export job by its id.
+///
+/// `NotFoundException` is documented only as "the resource you attempted to access
+/// doesn't exist", which names no resource, so the sentence names the resource kind and
+/// the requested id, which is its only variable part, taken from the request — the same
+/// wording this service gives every other resource it is asked for by id
+/// ([`import_job_not_found`]).
+pub fn export_job_not_found(job_id: &str) -> String {
+    format!("Export job {job_id} does not exist.")
 }
 
 /// One export job: the data the export draws on, the format it is written in, how far
@@ -3790,6 +3840,11 @@ pub struct ExportJobRecord {
     pub completion_due_at: SystemTime,
     /// When the run completed, once it has.
     pub completed_at: Option<SystemTime>,
+    /// The file the run wrote, once it has completed: "SES writes the export file to
+    /// a location that it manages", and this is that location. Written ONCE, as the
+    /// run falls due ([`ExportFile`]), so every download of the job serves the same
+    /// bytes and the statistics reported for the job count exactly those records.
+    pub file: Option<ExportFile>,
 }
 
 impl ExportJobRecord {
@@ -3813,6 +3868,7 @@ impl ExportJobRecord {
                 .checked_add(EXPORT_JOB_COMPLETION_SETTLE)
                 .unwrap_or(processing_due_at),
             completed_at: None,
+            file: None,
         }
     }
 
@@ -3821,15 +3877,31 @@ impl ExportJobRecord {
     /// Both are owed by the clock, so applying them changes nothing a later caller
     /// would otherwise have seen — and a run whose whole span has already elapsed
     /// settles straight to `COMPLETED` rather than one status per call.
+    ///
+    /// The file the run writes is the store's to render ([`ExportFile`]), because the
+    /// records it draws on are the account's rather than the job's: the store applies
+    /// [`Self::completion_falls_due`] first and hands the file in before calling this.
     pub fn settle(&mut self, now: SystemTime) {
         if self.status == ExportJobStatus::Created && now >= self.processing_due_at {
             self.status = ExportJobStatus::Processing;
         }
-        if self.status == ExportJobStatus::Processing && now >= self.completion_due_at {
+        // A run is complete only once the file it is complete BY has been written, so a
+        // read never reports a finished run with nothing to download. The write is the
+        // store's ([`ExportFile`]), and what it has not got to yet stays owed.
+        if self.status == ExportJobStatus::Processing
+            && now >= self.completion_due_at
+            && self.file.is_some()
+        {
             self.status = ExportJobStatus::Completed;
             // The run finished when it fell due, not when somebody first looked.
             self.completed_at = Some(self.completion_due_at);
         }
+    }
+
+    /// Whether the run's completion falls due at `now` and has not been applied yet,
+    /// which is the one instant its file is written at.
+    pub fn completion_falls_due(&self, now: SystemTime) -> bool {
+        self.status != ExportJobStatus::Completed && now >= self.completion_due_at
     }
 
     /// This job's position in a listing of the account's export jobs: the instant it

@@ -113,6 +113,8 @@ mod email_templates;
 mod enum_value_set_order;
 #[path = "all/export_job_creation.rs"]
 mod export_job_creation;
+#[path = "all/export_job_reads.rs"]
+mod export_job_reads;
 #[path = "all/export_jobs.rs"]
 mod export_jobs;
 #[path = "all/import_jobs.rs"]

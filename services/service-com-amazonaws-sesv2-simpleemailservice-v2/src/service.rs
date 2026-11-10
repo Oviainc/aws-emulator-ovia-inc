@@ -79,6 +79,11 @@ use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse}
 
 pub mod wire;
 
+/// The route that serves the export file of an export job at the pre-signed URL
+/// `GetExportJob` hands out for it — a path the model binds no operation to, so it is
+/// claimed on the same seam the SDK collection listings are.
+pub mod export_download;
+
 /// Unit cases for the media type this service announces (see the module header); the
 /// module is test-only, so nothing it holds is part of the served surface.
 #[cfg(test)]
@@ -376,6 +381,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// walk too. Held in a field because [`Service::override_operation`] hands back a
     /// borrow of it.
     media_type: AnnouncedMediaTypeRoute,
+    /// Serves a download of an export job's file; [`Service::override_operation`]
+    /// hands it the requests it claims. Held in a field for the same reason.
+    export_file: export_download::ExportFileRoute<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -384,10 +392,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             protocol: wire::NullMessageRestJson::new(),
             sdk_collection_listings: SDK_COLLECTION_LISTINGS,
             media_type: AnnouncedMediaTypeRoute,
+            export_file: export_download::ExportFileRoute::new(engine),
         }
     }
 }
@@ -442,10 +451,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the paging members in the query string. The route table resolves such a
         // request to no operation at all, so it is claimed here and served by the
         // modelled operation itself.
-        self.sdk_collection_listings
+        if let Some(listing) = self
+            .sdk_collection_listings
             .iter()
             .find(|listing| listing.claims(req))
-            .map(|listing| listing as &dyn ErasedOperation)
+        {
+            return Some(listing as &dyn ErasedOperation);
+        }
+        // Nor the download of an export job's export file, which is not an API call at
+        // all: it is the artifact `GetExportJob` hands out a pre-signed URL for, served
+        // by the route that owns it (see [`export_download`]).
+        self.export_file
+            .claims(req)
+            .map(|_| &self.export_file as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

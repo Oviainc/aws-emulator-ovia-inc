@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetExportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetExportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetExportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads one export job of the account and reports it: the stored record
+//! ([`crate::state::ExportJobRecord`]) is where every member of the answer comes
+//! from, and when the run has completed the answer carries the pre-signed URL its
+//! file is downloaded from. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +148,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetExportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetExportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetExportJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetExportJob without the shared emulator state",
+            ));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // Reporting only: the one thing this materialises is the progress the stored
+        // runs had already made at `now`, which was due whether or not anybody called —
+        // so this read leaves every later caller seeing exactly what it saw.
+        let job = {
+            let mut store = state.lock();
+            store.settle(now);
+            let Some(job) = store.export_jobs.get(&input.job_id) else {
+                return Err(GetExportJobErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::export_job_not_found(&input.job_id)),
+                })
+                .into());
+            };
+            job.clone()
+        };
+
+        // "When the job status is COMPLETED, the response includes a pre-signed URL in
+        // ExportDestination.S3Url that you use to download the export file", and "the
+        // URL expires five minutes after GetExportJob returns it": a run that has not
+        // written its file yet has no URL to hand out, and the one handed out for a run
+        // that has leads back to this emulator, where the file it wrote is served.
+        let s3_url = job.file.as_ref().and_then(|_| {
+            let path = crate::state::export_file_path(&job.job_id);
+            let request = smithy_server_runtime::SignedUrlRequest::new(
+                smithy_server_runtime::http::Method::GET,
+                SIGNING_NAME,
+                &path,
+            );
+            match ctx
+                .url_signer()
+                .sign(request, crate::state::EXPORT_FILE_URL_EXPIRY)
+            {
+                Ok(signed) => Some(signed.as_str().to_string()),
+                // The path is this service's own and the expiry a constant, so nothing
+                // a caller sends can reach here. A URL that cannot be signed is one
+                // nothing could download the file from, so the member it would fill is
+                // absent rather than carrying an address that leads nowhere.
+                Err(error) => {
+                    ::tracing::warn!(
+                        %error,
+                        "an export job's download URL could not be signed"
+                    );
+                    None
+                }
+            }
+        });
+
+        Ok(GetExportJobOutput {
+            // The id the job is keyed by, which is the only name it has.
+            job_id: Some(job.job_id.clone()),
+            // "The type of source of the export job", decided by the data source the
+            // create supplied and stored with the job.
+            export_source_type: Some(job.source_type.clone()),
+            job_status: Some(job.status.as_str().to_string()),
+            // "The destination of the export job": the data format the create asked
+            // for, plus the download URL once there is a file to download.
+            export_destination: Some(ExportDestination {
+                data_format: job.data_format.clone(),
+                s3_url,
+            }),
+            // "The data source of the export job", exactly as the create supplied it.
+            export_data_source: Some(job.data_source.clone()),
+            created_timestamp: Some(::aws_smithy_types::DateTime::from(job.created_at)),
+            // "The timestamp of when the export job was completed": a run that has not
+            // completed has no such instant, so the member is absent until it does.
+            completed_timestamp: job.completed_at.map(::aws_smithy_types::DateTime::from),
+            // "The failure details about an export job": an emulated run is bookkeeping
+            // and cannot fail, so no job has failure details to report.
+            failure_info: None,
+            // "The statistics about the export job": the counts of the run that wrote
+            // the file, which exist once it has written one.
+            statistics: job.file.as_ref().map(crate::state::ExportFile::statistics),
+        })
     }
 }
+
+/// The SigV4 signing name this service's model declares
+/// (`smithy_query(query="service_info")`: `sigv4Name` `ses`), which the download URL
+/// is signed for because that URL addresses this service.
+const SIGNING_NAME: &str = "ses";
