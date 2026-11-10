@@ -30,6 +30,13 @@
 //! artifact it cannot write — lands in the modelled `Failed` status with the `ClientError:`
 //! reason naming that leg, never an artifact or a metric for work that produced nothing.
 //!
+//! RULE FOUR — whether an accepted job RUNS turns on whether the role's trust document
+//! admits the SageMaker service principal for `sts:AssumeRole`, not on the FORM that grant
+//! is written in: a role admitted by any of those forms backs a job that reads `InProgress`
+//! with no `FailureReason` and then settles `Completed` with none either, while a document
+//! that withholds the grant is refused with the role-assumption wording and leaves the name
+//! absent.
+//!
 //! The tables span what the rules generalise over: how the channel's location is addressed
 //! (one object, a prefix holding several, a manifest naming them), how many records and
 //! features the data carries, whether the output path carries a trailing separator, how many
@@ -193,12 +200,25 @@ impl Emulator {
     /// principal, and attach `permissions` as an inline policy when the case gives one.
     /// Answers the role's ARN.
     async fn given_role(&self, role_name: &str, permissions: Option<&str>) -> String {
+        self.given_role_trusting(role_name, &sagemaker_trust(), permissions)
+            .await
+    }
+
+    /// The same, for a role whose trust document the case states itself: one creation path,
+    /// so a case exercising another FORM of the same grant is stored exactly like the
+    /// canonical one.
+    async fn given_role_trusting(
+        &self,
+        role_name: &str,
+        trust: &str,
+        permissions: Option<&str>,
+    ) -> String {
         let (status, body) = self
             .iam(
                 "CreateRole",
                 &[
                     ("RoleName", role_name),
-                    ("AssumeRolePolicyDocument", &sagemaker_trust()),
+                    ("AssumeRolePolicyDocument", trust),
                 ],
             )
             .await;
@@ -1114,6 +1134,277 @@ async fn a_role_sagemaker_cannot_assume_is_refused_before_any_job_is_stored() {
             (status, error_code(&described).as_str()),
             (400, "ValidationException"),
             "case {case:?}: a refused create stores no job, got {status} with {described}"
+        );
+    }
+}
+
+/// How SageMaker words a `RoleArn` it cannot assume. The fixed text is everything but the
+/// role ARN, which is the one the REQUEST supplied.
+fn could_not_assume_role(role_arn: &str) -> String {
+    format!(
+        "Could not assume role {role_arn}. Please ensure that the role exists and allows \
+         principal '{SERVICE_PRINCIPAL}' to assume the role."
+    )
+}
+
+/// How SageMaker words a training job this account holds no record of.
+const RESOURCE_NOT_FOUND: &str = "Requested resource not found.";
+
+/// RULE FOUR: whether an accepted job RUNS turns on whether the execution role admits the
+/// SageMaker service principal for the assume — not on the FORM the trust document states
+/// that grant in. So a role admitted by any of those forms backs a job that reports
+/// `InProgress` with no `FailureReason` on the first read and then the terminal `Completed`
+/// with none either, naming an artifact Amazon S3 holds; a role whose document withholds the
+/// grant is refused with the 400 `ValidationException` whose message names the role as sent,
+/// and the name it refused stays absent.
+///
+/// The rows differ along what the rule generalises over: whether `Principal.Service` names
+/// one principal or a list of them, whether the grant sits in one statement or among several,
+/// whether `Statement` is an object or a list, whether `Action` names the assume itself, a
+/// list containing it or a wildcard covering it, and — for the withholding half — whether the
+/// document names another principal, another action, or denies the grant outright.
+#[tokio::test]
+async fn an_admitted_execution_role_runs_the_job_whatever_form_its_trust_document_takes() {
+    /// One case: the role the trust document is attached to, the document itself, and
+    /// whether SageMaker can assume that role.
+    struct Row {
+        case: &'static str,
+        role: &'static str,
+        trust: Value,
+        admitted: bool,
+    }
+
+    let emulator = Emulator::new();
+    emulator.given_bucket(BUCKET).await;
+    emulator
+        .given_object(BUCKET, "control/data.csv", &csv_records(6, 2))
+        .await;
+    let output = format!("s3://{BUCKET}/control-output/");
+
+    let rows = vec![
+        Row {
+            case: "the service principal and the assume, each as one string",
+            role: "control-one-string",
+            trust: json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": { "Service": SERVICE_PRINCIPAL },
+                    "Action": "sts:AssumeRole",
+                }],
+            }),
+            admitted: true,
+        },
+        Row {
+            case: "the service principal among a list of principals",
+            role: "control-principal-list",
+            trust: json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": { "Service": ["ec2.amazonaws.com", SERVICE_PRINCIPAL] },
+                    "Action": "sts:AssumeRole",
+                }],
+            }),
+            admitted: true,
+        },
+        Row {
+            case: "the grant in the second of two statements",
+            role: "control-second-statement",
+            trust: json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": { "Service": "ec2.amazonaws.com" },
+                        "Action": "sts:AssumeRole",
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Principal": { "Service": SERVICE_PRINCIPAL },
+                        "Action": "sts:AssumeRole",
+                    },
+                ],
+            }),
+            admitted: true,
+        },
+        Row {
+            case: "one statement as an object rather than a list, and the assume among a \
+                   list of actions",
+            role: "control-statement-object",
+            trust: json!({
+                "Version": "2012-10-17",
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": { "Service": SERVICE_PRINCIPAL },
+                    "Action": ["sts:TagSession", "sts:AssumeRole"],
+                },
+            }),
+            admitted: true,
+        },
+        Row {
+            case: "a prefix wildcard covering the assume",
+            role: "control-wildcard-action",
+            trust: json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": { "Service": SERVICE_PRINCIPAL },
+                    "Action": "sts:Assume*",
+                }],
+            }),
+            admitted: true,
+        },
+        Row {
+            case: "another service principal only",
+            role: "control-other-principal",
+            trust: json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": { "Service": "ec2.amazonaws.com" },
+                    "Action": "sts:AssumeRole",
+                }],
+            }),
+            admitted: false,
+        },
+        Row {
+            case: "the service principal, for another action",
+            role: "control-other-action",
+            trust: json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": { "Service": SERVICE_PRINCIPAL },
+                    "Action": "s3:GetObject",
+                }],
+            }),
+            admitted: false,
+        },
+        Row {
+            case: "the service principal, explicitly denied the assume",
+            role: "control-denied",
+            trust: json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Deny",
+                    "Principal": { "Service": SERVICE_PRINCIPAL },
+                    "Action": "sts:AssumeRole",
+                }],
+            }),
+            admitted: false,
+        },
+    ];
+
+    for row in rows {
+        let role_arn = emulator
+            .given_role_trusting(row.role, &row.trust.to_string(), Some(&read_and_write()))
+            .await;
+        let job = format!("control-job-{}", row.role);
+        let (status, answered) = emulator
+            .sagemaker(
+                "CreateTrainingJob",
+                &training_body(
+                    &job,
+                    &role_arn,
+                    json!([channel(
+                        "train",
+                        &format!("s3://{BUCKET}/control/data.csv"),
+                        "S3Prefix"
+                    )]),
+                    &output,
+                ),
+            )
+            .await;
+
+        if !row.admitted {
+            assert_eq!(
+                (
+                    status,
+                    error_code(&answered),
+                    str_field(&answered, "message")
+                ),
+                (
+                    400,
+                    "ValidationException".to_string(),
+                    could_not_assume_role(&role_arn)
+                ),
+                "case {:?}: the role refusal as SageMaker words it, got {status} with \
+                 {answered}",
+                row.case
+            );
+            let (status, described) = emulator
+                .sagemaker("DescribeTrainingJob", &json!({ "TrainingJobName": &job }))
+                .await;
+            assert_eq!(
+                (
+                    status,
+                    error_code(&described),
+                    str_field(&described, "message")
+                ),
+                (
+                    400,
+                    "ValidationException".to_string(),
+                    RESOURCE_NOT_FOUND.to_string()
+                ),
+                "case {:?}: a refused create leaves the name absent, got {status} with \
+                 {described}",
+                row.case
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, 200,
+            "case {:?}: a role SageMaker can assume is accepted, got {status} with {answered}",
+            row.case
+        );
+        // The first read a waiting client makes: the job is RUNNING, and a running job has
+        // no failure to report.
+        let accepted = emulator
+            .sagemaker_ok("DescribeTrainingJob", &json!({ "TrainingJobName": &job }))
+            .await;
+        assert_eq!(
+            (
+                str_field(&accepted, "TrainingJobStatus"),
+                accepted.get("FailureReason").cloned()
+            ),
+            ("InProgress".to_string(), None),
+            "case {:?}: an accepted job is in progress and has not failed, got {accepted}",
+            row.case
+        );
+
+        tokio::time::sleep(PAST_ENDS_DUE).await;
+        let settled = emulator
+            .sagemaker_ok("DescribeTrainingJob", &json!({ "TrainingJobName": &job }))
+            .await;
+        assert_eq!(
+            (
+                str_field(&settled, "TrainingJobStatus"),
+                settled.get("FailureReason").cloned()
+            ),
+            ("Completed".to_string(), None),
+            "case {:?}: the job must settle into the outcome of its own run, got {settled}",
+            row.case
+        );
+        let reported = settled
+            .pointer("/ModelArtifacts/S3ModelArtifacts")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            reported,
+            artifact_uri(&output, &job),
+            "case {:?}: the artifact URI under the declared output path, got {settled}",
+            row.case
+        );
+        assert!(
+            emulator
+                .object_bytes(BUCKET, &artifact_key(&output, &job))
+                .await
+                .is_some(),
+            "case {:?}: Amazon S3 must hold the artifact {reported}",
+            row.case
         );
     }
 }
