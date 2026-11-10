@@ -894,6 +894,31 @@ pub fn map_key_refusal_quoting(
     .into_iter()
     .flatten()
     .collect();
+    map_key_requirements_refusal(member_path, value, &requirements)
+}
+
+/// As [`map_key_refusal_quoting`], with the requirements the key shape declares stated by
+/// the CALLER rather than built from `@length` bounds and a `@pattern`.
+///
+/// The entry point for a key shape whose constraint the bounds-and-pattern parameters cannot
+/// express — an enumerated TYPE, whose requirement is its value set
+/// ([`requirement`] over [`ViolationKind::EnumValue`]) — and the one body
+/// [`map_key_refusal_quoting`] itself runs, so the clause, the bracketed list and the
+/// envelope stay single-homed however a service's key shape is constrained. Each
+/// requirement is a sentence [`requirement`] wrote, so a requirement a handler lists cannot
+/// be worded differently from the one a reported member gets, and the ORDER is the caller's,
+/// because the order a set is stated in is part of what that service states.
+///
+/// `value` is the map as the clause quotes it
+/// ([`crate::validation::rendered_map_in_key_order`] renders one) and `None` for the
+/// valueless clause — the service whose recordings show no value, and the map whose
+/// rendering is past the largest value a clause quotes.
+#[must_use]
+pub fn map_key_requirements_refusal(
+    member_path: &str,
+    value: Option<&str>,
+    requirements: &[String],
+) -> String {
     // The value half is the framework's own spelling of one, so a clause about a key reads
     // like a clause about a member the walk reported.
     let stated_value = match value {
@@ -903,7 +928,7 @@ pub fn map_key_refusal_quoting(
     let clause = format!(
         "{stated_value} '{member_path}' failed to satisfy constraint: Map keys must satisfy \
          constraint: {}",
-        bracketed_findings(&requirements)
+        bracketed_findings(requirements)
     );
     // The ENVELOPE is the framework's too: one placeholder violation about the same
     // member renders it, and that violation's own clause is then swapped for the one
@@ -1839,7 +1864,8 @@ mod tests {
         enum_value_not_found,
         envelope_over, float_value_text, hashed_enum_order, in_float_value_rendering,
         in_hashed_enum_order, in_pattern_first_order, in_stated_enum_order, map_key_refusal,
-        map_key_refusal_quoting, must_be_at_least, must_be_at_most, must_be_one_of,
+        map_key_refusal_quoting, map_key_requirements_refusal, must_be_at_least, must_be_at_most,
+        must_be_one_of,
         must_match_pattern, parameter_pattern_mismatch, parameter_pattern_refusal,
         parameter_value_mismatch, parameters_value_mismatch, pattern_constraint_report,
         pattern_mismatch, pattern_requirement_unstated, property_count_refusal,
@@ -2248,6 +2274,73 @@ mod tests {
                 row.max,
                 row.pattern,
             );
+            assert_eq!(
+                stated, row.expected,
+                "case {:?}: expected {:?}, got {stated:?}",
+                row.case, row.expected
+            );
+        }
+    }
+
+    /// RULE: the requirements a key clause lists are the CALLER's where the key shape's
+    /// constraint is one the bounds-and-pattern parameters cannot express — an enumerated
+    /// value set — and everything else about the message is the same body
+    /// [`map_key_refusal_quoting`] runs.
+    ///
+    /// The rows differ along the constraint class the key shape declares, how many
+    /// requirements it states and whether the map is quoted.
+    #[test]
+    fn a_map_key_refusal_states_the_requirements_it_was_given() {
+        /// One row: the member path, the map as quoted (`None` for the valueless clause),
+        /// the requirements the key shape declares, and the message stated.
+        struct Row {
+            case: &'static str,
+            member_path: &'static str,
+            value: Option<&'static str>,
+            requirements: Vec<String>,
+            expected: &'static str,
+        }
+
+        let enum_set = requirement(ViolationKind::EnumValue(vec![
+            "INDEX_SLOW_LOGS".to_owned(),
+            "AUDIT_LOGS".to_owned(),
+        ]));
+        let length = requirement(ViolationKind::MaxLength(128));
+        let rows = [
+            Row {
+                case: "an enumerated key set, quoting the map",
+                member_path: "logPublishingOptions",
+                value: Some("{ACCESS_LOGS=Option(enabled=true)}"),
+                requirements: vec![enum_set.clone()],
+                expected: "1 validation error detected: Value \
+                           '{ACCESS_LOGS=Option(enabled=true)}' at 'logPublishingOptions' \
+                           failed to satisfy constraint: Map keys must satisfy constraint: \
+                           [Member must satisfy enum value set: [INDEX_SLOW_LOGS, AUDIT_LOGS]]",
+            },
+            Row {
+                case: "the same set with no map quoted",
+                member_path: "logPublishingOptions",
+                value: None,
+                requirements: vec![enum_set.clone()],
+                expected: "1 validation error detected: Value at 'logPublishingOptions' failed \
+                           to satisfy constraint: Map keys must satisfy constraint: [Member \
+                           must satisfy enum value set: [INDEX_SLOW_LOGS, AUDIT_LOGS]]",
+            },
+            Row {
+                case: "two requirements, in the order they were given",
+                member_path: "tags",
+                value: Some("{k=v}"),
+                requirements: vec![length.clone(), enum_set.clone()],
+                expected: "1 validation error detected: Value '{k=v}' at 'tags' failed to \
+                           satisfy constraint: Map keys must satisfy constraint: [Member must \
+                           have length less than or equal to 128, Member must satisfy enum \
+                           value set: [INDEX_SLOW_LOGS, AUDIT_LOGS]]",
+            },
+        ];
+
+        for row in rows {
+            let stated =
+                map_key_requirements_refusal(row.member_path, row.value, &row.requirements);
             assert_eq!(
                 stated, row.expected,
                 "case {:?}: expected {:?}, got {stated:?}",

@@ -365,6 +365,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::service::domain_configuration::ebs_performance_refusal(
                 input.ebs_options.as_ref(),
             ),
+            // A log type outside the modelled `LogType` set is a key the map's key shape
+            // does not admit: an INPUT constraint, so it is stated before the options are
+            // judged against each other.
+            crate::state::log_type_key_refusal(input.log_publishing_options.as_ref()),
             crate::state::log_publishing_refusal(input.log_publishing_options.iter().flatten()),
             // And the group that ARN names has to be one CloudWatch Logs holds: a
             // create that enables publishing to a group nobody created configures a

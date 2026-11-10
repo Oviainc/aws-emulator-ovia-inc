@@ -1986,7 +1986,67 @@ fn declaring_shape(schema: &Schema) -> Option<String> {
 }
 
 /// How a member the request left UNSET is stated inside a rendered structure.
-const UNSET_MEMBER: &str = "null";
+///
+/// `pub` for the same reason [`rendered_record`] is: a HANDLER that words its own clause
+/// about a value no walk ahead of it reported has to spell an unset member the same way a
+/// clause restored from the walk does.
+pub const UNSET_MEMBER: &str = "null";
+
+/// `entries` as a map renders, with the entries put in KEY order first — the form a clause
+/// quotes a map-valued member in, stated the one way the same map is stated twice.
+///
+/// Key order because a map reaches a handler (and this walk) as the built input's own
+/// unordered map, so the order its entries were written in is not the order the request
+/// carried them in. `pub` for the same reason [`rendered_map`] is.
+///
+/// `None` when the rendering would be longer than the largest value a clause quotes
+/// ([`MAX_RESTORED_ECHO`]) — measured BEFORE anything is joined, so an oversized rendering
+/// is never allocated, and the clause then states no value at all, the valueless form
+/// [`crate::validation_message::map_key_requirements_refusal`] takes. That is what keeps one
+/// request from sizing the message it is refused with: the map a caller sends is bounded by
+/// nothing this module can see, and each entry of it renders to more text than it occupied.
+#[must_use]
+pub fn rendered_map_in_key_order(entries: &[(&str, String)]) -> Option<String> {
+    // The braces, plus `<key>=<value>` and `, ` per entry — the same measurement
+    // [`rendered_entries`] makes for the walk's own map rendering.
+    let mut length = 2;
+    for (index, (key, value)) in entries.iter().enumerate() {
+        if index > 0 {
+            length += 2; // ", "
+        }
+        length += key.len() + 1 + value.len();
+        if length > MAX_RESTORED_ECHO {
+            return None;
+        }
+    }
+    let mut ordered: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect();
+    ordered.sort_unstable_by_key(|(key, _)| *key);
+    Some(rendered_map(&ordered))
+}
+
+/// `members` as a STRUCTURE of shape `name` renders: the shape's name over the members
+/// given, each `<member>=<value>`, in the order given — the form the AWS SDKs and the
+/// validation layer in front of a service print a modelled structure in.
+///
+/// THE ONE renderer of that form, called by this module's own walk ([`rendered_structure`],
+/// [`rendered_declared_structure`]) and `pub` for the same reason [`rendered_map`] is: the
+/// constraint classes no walk ahead of a handler reports (a map's KEY, a cap the SERVICE
+/// rather than the model states) are stated by the HANDLER, which has to quote a structure
+/// the same way a clause restored from the walk does. What a member the request left unset
+/// renders as is the caller's ([`UNSET_MEMBER`] is how this module's own declared-member
+/// form states one), and so is the member ORDER, which a clause states as the model
+/// declares it.
+#[must_use]
+pub fn rendered_record(name: &str, members: &[(&str, &str)]) -> String {
+    let rendered: Vec<String> = members
+        .iter()
+        .map(|(member, value)| format!("{member}={value}"))
+        .collect();
+    format!("{name}({})", rendered.join(", "))
+}
 
 /// The children of one composite being walked, and whether more arrived than
 /// [`MAX_RENDERED_CHILDREN`] allows, one of them was larger than a composite may hold,
@@ -2099,15 +2159,15 @@ fn rendered_structure(name: &str, children: &[RenderedChild], max_render: usize)
     if name.len() + rendered_length(children, true)? > max_render {
         return None;
     }
-    let members: Vec<String> = children
+    let members: Vec<(&str, &str)> = children
         .iter()
         .map(|child| {
             let member = child.name.as_deref()?;
             let rendering = child.rendering.as_deref()?;
-            Some(format!("{member}={rendering}"))
+            Some((member, rendering))
         })
         .collect::<Option<Vec<_>>>()?;
-    Some(format!("{name}({})", members.join(", ")))
+    Some(rendered_record(name, &members))
 }
 
 /// `children` as a structure renders over the members `declared` names: the shape's name
@@ -2127,7 +2187,7 @@ fn rendered_declared_structure(
     max_render: usize,
 ) -> Option<String> {
     let mut length = name.len() + 2;
-    let mut members: Vec<String> = Vec::with_capacity(declared.len());
+    let mut members: Vec<(&str, &str)> = Vec::with_capacity(declared.len());
     for member in declared {
         let rendering = match children
             .iter()
@@ -2143,9 +2203,9 @@ fn rendered_declared_structure(
         if length > max_render {
             return None;
         }
-        members.push(format!("{member}={rendering}"));
+        members.push((member.as_str(), rendering));
     }
-    Some(format!("{name}({})", members.join(", ")))
+    Some(rendered_record(name, &members))
 }
 
 /// The members the shape `name` is PRINTED with, as the caller stated them
@@ -2769,11 +2829,12 @@ mod tests {
     use super::{
         echo_of, is_elision_of, list_of_element, named_byte_count, quoted_echo, quoted_echo_up_to,
         echo_held_to, rendered_declared_structure, rendered_entries, rendered_map,
-        rendered_sequence, rendered_structure, unanchored, unanchored_grouping_alternation,
+        rendered_map_in_key_order, rendered_record, rendered_sequence, rendered_structure,
+        unanchored, unanchored_grouping_alternation,
         unanchored_keeping_inner_anchors, Composite, RenderedChild, Submitted, SubmittedEcho,
         SubmittedValues, MAX_RECORDED_BYTES, MAX_RECORDED_DEPTH, MAX_RECORDED_LEAVES,
         MAX_RECORDED_RENDERED_BYTES, MAX_RECORDED_RENDERINGS, MAX_RENDERED_CHILDREN,
-        MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
+        MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL, UNSET_MEMBER,
     };
     use super::whole_value_expression;
     use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
@@ -3447,6 +3508,109 @@ mod tests {
         ];
         for (case, children, expected) in structures {
             let actual = rendered_structure("Thing", &children, MAX_RESTORED_ECHO);
+            assert_eq!(
+                actual.as_deref(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: the renderers a HANDLER states its own clause with produce the same forms the
+    /// walk's own composites do — a structure as `<ShapeName>(<member>=<value>, …)` over
+    /// the members given, a map as `{<key>=<value>, …}` over its entries in KEY order — and
+    /// a map larger than a clause quotes renders as nothing, so one request cannot size the
+    /// message it is refused with.
+    #[test]
+    fn the_handler_renderers_state_the_walk_s_own_forms() {
+        /// One structure row: the members given and the rendering they state.
+        struct Record {
+            case: &'static str,
+            members: Vec<(&'static str, &'static str)>,
+            expected: &'static str,
+        }
+
+        // The rows differ along how many members there are and whether one of them is the
+        // unset spelling.
+        let records = [
+            Record {
+                case: "no members",
+                members: vec![],
+                expected: "Thing()",
+            },
+            Record {
+                case: "one member",
+                members: vec![("name", "n")],
+                expected: "Thing(name=n)",
+            },
+            Record {
+                case: "two members in the order given",
+                members: vec![("name", "n"), ("size", "2")],
+                expected: "Thing(name=n, size=2)",
+            },
+            Record {
+                case: "a member the request left unset",
+                members: vec![("name", UNSET_MEMBER), ("size", "2")],
+                expected: "Thing(name=null, size=2)",
+            },
+        ];
+        for Record {
+            case,
+            members,
+            expected,
+        } in records
+        {
+            let actual = rendered_record("Thing", &members);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+
+        /// One map row: the entries given, in the order they arrive, and the rendering.
+        struct Map {
+            case: &'static str,
+            entries: Vec<(&'static str, String)>,
+            expected: Option<&'static str>,
+        }
+
+        // The rows differ along the entry count and the order the entries arrive in, which
+        // the rendering is independent of, and the last is past what a clause quotes.
+        let entry = |key: &'static str, value: &str| (key, value.to_string());
+        let maps = [
+            Map {
+                case: "no entries",
+                entries: vec![],
+                expected: Some("{}"),
+            },
+            Map {
+                case: "one entry",
+                entries: vec![entry("b", "2")],
+                expected: Some("{b=2}"),
+            },
+            Map {
+                case: "two entries already in key order",
+                entries: vec![entry("a", "1"), entry("b", "2")],
+                expected: Some("{a=1, b=2}"),
+            },
+            Map {
+                case: "the same two entries the other way round",
+                entries: vec![entry("b", "2"), entry("a", "1")],
+                expected: Some("{a=1, b=2}"),
+            },
+            Map {
+                case: "a map larger than a clause quotes",
+                entries: vec![entry("a", &"x".repeat(MAX_RESTORED_ECHO))],
+                expected: None,
+            },
+        ];
+        for Map {
+            case,
+            entries,
+            expected,
+        } in maps
+        {
+            let actual = rendered_map_in_key_order(&entries);
             assert_eq!(
                 actual.as_deref(),
                 expected,

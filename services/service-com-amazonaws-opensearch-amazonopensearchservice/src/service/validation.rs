@@ -440,6 +440,39 @@ pub(crate) fn constraint_report(member: &str, value: &str, kind: ViolationKind) 
         .unwrap_or_else(|| restated(&violation).message())
 }
 
+/// The `ValidationException` message for a MAP whose KEY broke a constraint the map's KEY
+/// SHAPE declares — the one constraint class no walk ahead of a handler reports, because
+/// that walk treats a map's key as a path SEGMENT rather than as a constrained leaf, so
+/// the handler applies the key shape's constraints and words the refusal with this.
+///
+/// The envelope, the clause and the member path are the ones a boundary refusal states
+/// ([`::service_common::validation_message::map_key_requirements_refusal`], the fleet's one
+/// home for a key clause, and `constraints::path` for the lowerCamel member spelling), and
+/// the requirement is the framework's own sentence for that class ([`requirement`]) — so a
+/// caller cannot tell a key constraint this service checks itself from one the model's
+/// traits carry. `member` is the member's name as the MODEL spells it and `value` the map as
+/// the clause quotes it, `None` for a map larger than a clause quotes.
+pub(crate) fn map_key_constraint_report(
+    member: &str,
+    value: Option<&str>,
+    kind: ViolationKind,
+) -> String {
+    let stated = requirement(&kind).unwrap_or_else(|| {
+        Violation {
+            path: String::new(),
+            kind,
+            value: None,
+            sensitive: false,
+        }
+        .message()
+    });
+    ::service_common::validation_message::map_key_requirements_refusal(
+        &constraints::path::member(member),
+        value,
+        std::slice::from_ref(&stated),
+    )
+}
+
 // =============================================================================
 // The element constraint sets this model declares
 // =============================================================================

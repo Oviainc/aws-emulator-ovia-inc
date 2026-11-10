@@ -213,13 +213,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(&ctx.parts().headers);
 
-        // A suspension window the documented maximum cannot hold, or an
-        // access-policy document past the documented maximum size, is refused
-        // before anything is stored.
+        // THE INPUT CONSTRAINTS FIRST, before anything is stored: a log type
+        // outside the modelled `LogType` set, a suspension window the documented
+        // maximum cannot hold, or an access-policy document past the documented
+        // maximum size.
         let refusal = input
-            .automated_snapshot_pause_options
+            .log_publishing_options
             .as_ref()
-            .and_then(snapshot_pause_refusal)
+            .and_then(crate::state::log_publishing_options_refusal)
+            .or_else(|| {
+                input
+                    .automated_snapshot_pause_options
+                    .as_ref()
+                    .and_then(snapshot_pause_refusal)
+            })
             .or_else(|| {
                 input
                     .access_policies
@@ -229,6 +236,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(reason) = refusal {
             return Err(CreateElasticsearchDomainErrorModeled::ValidationException(
                 ValidationException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        // The documented per-domain tag allowance, on the list this create would
+        // STORE as the record's whole tag set — the same ceiling `AddTags`
+        // enforces on the set a merge would leave behind, so neither path can
+        // leave a domain carrying more tags than a domain may have. Read before
+        // the store is locked, since it is a property of the request alone.
+        if let Some(reason) =
+            crate::state::oversized_tag_list(input.tag_list.as_ref().map_or(0, Vec::len))
+        {
+            return Err(CreateElasticsearchDomainErrorModeled::LimitExceededException(
+                LimitExceededException {
                     message: Some(reason),
                 },
             )

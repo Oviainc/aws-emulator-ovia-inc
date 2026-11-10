@@ -162,9 +162,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // already renders, with ONE rendering of its own: a `@pattern` requirement
         // quotes the expression a value has to satisfy, not the whole-value pair the
         // model wraps that expression in — a model's `^…$` is how it demands a total
-        // match, and the service publishes the expression inside it. The CHECK is
-        // unchanged (the boundary still runs the model's pattern as written); only the
-        // quoting differs, and the code travels with the message as it must.
+        // match, and the service publishes the expression inside it. An expression
+        // that anchors its own BRANCHES is a whole-value expression already (the two
+        // ends of its text are the first and last branch's anchors), so it is quoted
+        // as the model declares it: dropping those ends would state a requirement of
+        // no branch. Both renderings are recorded on this surface — see
+        // `crate::state::quoted_pattern`, the one home for the choice, which the
+        // handler-stated clauses reach too. The CHECK is unchanged (the boundary still
+        // runs the model's pattern as written); only the quoting differs, and the code
+        // travels with the message as it must.
         //
         // The other thing that is this service's own is the VALUE half of a clause: a
         // member the request broke SEVERAL constraints of is stated without the value it
@@ -176,8 +182,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // An authentication refusal keeps the framework's wording: it is not an
         // input-constraint failure.
         let without_value = members_stated_without_their_value(refusal);
-        ::service_common::validation_message::aws_validation_refusal_withholding(
+        ::service_common::validation_message::aws_validation_refusal_withholding_with(
             refusal,
+            crate::state::quoted_pattern,
             |path| without_value.contains(path),
         )
     }

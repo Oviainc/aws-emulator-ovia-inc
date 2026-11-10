@@ -161,6 +161,8 @@ mod instance_type_engine_refusal;
 mod instance_type_limits;
 #[path = "all/log_publishing_destinations.rs"]
 mod log_publishing_destinations;
+#[path = "all/log_type_key_constraint.rs"]
+mod log_type_key_constraint;
 #[path = "all/migration_listing.rs"]
 mod migration_listing;
 #[path = "all/migration_owner_resolution.rs"]

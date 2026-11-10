@@ -43,6 +43,11 @@ use std::time::SystemTime;
 #[allow(unused_imports)]
 use crate::ops::types::*;
 
+/// The input constraints this surface applies ITSELF — the ones the boundary
+/// walk in front of a handler cannot reach — and how a refusal of one is worded.
+mod request_constraints;
+pub use request_constraints::*;
+
 /// The region an ARN or endpoint uses when the request carries no SigV4
 /// credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -1439,15 +1444,23 @@ impl DomainPackage {
 /// the boundary validator to enforce.
 pub const MAX_TAGS_PER_DOMAIN: usize = 10;
 
-/// `Some(reason)` when one `AddTags` call names more tags than a domain may
+/// `Some(reason)` when ONE call's tag list names more tags than a domain may
 /// carry at all.
 ///
-/// A domain holds at most [`MAX_TAGS_PER_DOMAIN`] keys, so a single call naming
+/// A domain holds at most [`MAX_TAGS_PER_DOMAIN`] keys, so a single list naming
 /// more than that cannot describe a tag set the service would keep: it is the
 /// allowance's own refusal, reached on the request's list alone and therefore
-/// before anything is merged — which is also what keeps the merge's cost bounded
-/// by the allowance rather than by how long a list the request carried, since
-/// `TagList` declares no length for the boundary validator to enforce.
+/// before any domain is resolved — which is what keeps the cost of one call
+/// bounded by the allowance rather than by how long a list the request carried,
+/// since neither `TagList` nor the operations that take one declare a length for
+/// the boundary validator to enforce.
+///
+/// It bounds ONE list, which is the whole stored set on a create
+/// (`CreateElasticsearchDomain`'s `TagList` becomes the record's tags) and the
+/// submitted half on an `AddTags`, where the handler counts the set the MERGE
+/// would leave behind against the same allowance before it lands. Both halves
+/// are needed: this one alone would let repeated calls, each inside the
+/// allowance, grow a stored record past it.
 pub fn oversized_tag_list(count: usize) -> Option<String> {
     (count > MAX_TAGS_PER_DOMAIN).then(|| {
         format!(

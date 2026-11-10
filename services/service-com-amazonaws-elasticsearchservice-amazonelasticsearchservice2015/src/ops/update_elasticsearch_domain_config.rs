@@ -296,13 +296,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let dry_run = input.dry_run.unwrap_or(false);
         let region = crate::state::request_region(&ctx.parts().headers);
 
-        // A suspension window the documented maximum cannot hold, or an
-        // access-policy document past the documented maximum size, is refused
-        // before anything is merged.
+        // THE INPUT CONSTRAINTS FIRST, before the domain is resolved: a log type
+        // outside the modelled `LogType` set, a suspension window the documented
+        // maximum cannot hold, or an access-policy document past the documented
+        // maximum size.
         let refusal = input
-            .automated_snapshot_pause_options
+            .log_publishing_options
             .as_ref()
-            .and_then(crate::state::snapshot_pause_refusal)
+            .and_then(crate::state::log_publishing_options_refusal)
+            .or_else(|| {
+                input
+                    .automated_snapshot_pause_options
+                    .as_ref()
+                    .and_then(crate::state::snapshot_pause_refusal)
+            })
             .or_else(|| {
                 input
                     .access_policies

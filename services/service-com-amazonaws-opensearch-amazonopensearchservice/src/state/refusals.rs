@@ -177,6 +177,115 @@ pub fn malformed_index_name(member: &str, value: &str) -> ValidationException {
     }
 }
 
+/// The `ValidationException` payload for a MAP of log-publishing options whose KEY is not
+/// a log type this surface admits.
+///
+/// The map's key shape is an enumerated type, so this is a constraint the MODEL declares —
+/// but the validating walk treats a map's key as a path SEGMENT rather than as a
+/// constrained leaf, so no walk ahead of a handler reports it and the handler states it.
+/// Being an INPUT constraint it is applied before the domain the call names is resolved: a
+/// key outside the set is refused by naming the member, never reported as a domain that
+/// does not exist.
+///
+/// MEMBERSHIP is [`admitted_log_types`] — the generated `LOG_TYPE_VALUES` plus the one
+/// value the live surface takes that this model has not caught up with — and the ORDER the
+/// set is stated in is the order the front door's own hash table over those values is
+/// walked ([`::service_common::validation_message::hashed_enum_order`]), which is the order
+/// a recorded refusal of this map's keys lists them in. ONE validation error for the member
+/// however many of its keys are outside the set: the clause is about the member's value,
+/// and that value is the one map.
+pub fn log_type_key_refusal(
+    options: Option<&std::collections::HashMap<String, LogPublishingOption>>,
+) -> Option<ValidationException> {
+    let options = options?;
+    let admitted = admitted_log_types();
+    if options
+        .keys()
+        .all(|log_type| admitted.contains(&log_type.as_str()))
+    {
+        return None;
+    }
+    let stated: Vec<String> = ::service_common::validation_message::hashed_enum_order(&admitted)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    Some(ValidationException {
+        message: Some(crate::service::validation::map_key_constraint_report(
+            "LogPublishingOptions",
+            rendered_log_publishing_options(options).as_deref(),
+            ::aws_smithy_schema_server::ViolationKind::EnumValue(stated),
+        )),
+    })
+}
+
+/// The log type the LIVE surface admits that this model's `LogType` enum does not declare.
+///
+/// EVIDENCE: the refusal this service is recorded answering an out-of-enum log type with
+/// lists this value beside the four the model declares, while the legacy 2015-01-01
+/// surface's recorded refusal lists only those four — so the two surfaces publish
+/// different sets, and this is the one value the model here has not caught up with. The
+/// same reading `crate::service::validation`'s own table of stated requirements applies to
+/// a member whose validation surface the model lags.
+///
+/// It decides BOTH halves deliberately: the set the refusal STATES, and what a caller may
+/// SEND — a service that publishes a value as admissible accepts it, so refusing it while
+/// advertising it would state one set and enforce another. DROP this constant once the
+/// model declares the value: `admitted_log_types` then adds nothing, which is exactly what
+/// it checks before pushing.
+const LIVE_LOG_TYPE: &str = "TASK_DETAILS_LOGS";
+
+/// Every log type this surface admits: the ones the model declares, plus
+/// [`LIVE_LOG_TYPE`] where the model does not declare it yet.
+///
+/// Read off the generated constant rather than listed, so a value the model gains is
+/// admitted by the model alone; the extra value is added once and only while it is missing.
+fn admitted_log_types() -> Vec<&'static str> {
+    let mut admitted: Vec<&'static str> = crate::ops::LOG_TYPE_VALUES.to_vec();
+    if !admitted.contains(&LIVE_LOG_TYPE) {
+        admitted.push(LIVE_LOG_TYPE);
+    }
+    admitted
+}
+
+/// `options` as a refusal quotes it back: the map form AWS echoes a map-valued member in
+/// ([`::service_common::validation::rendered_map_in_key_order`], the fleet's one renderer of
+/// that form, which answers `None` for a map larger than a clause quotes), each value the
+/// printed form of the `LogPublishingOption` it carried.
+fn rendered_log_publishing_options(
+    options: &std::collections::HashMap<String, LogPublishingOption>,
+) -> Option<String> {
+    let entries: Vec<(&str, String)> = options
+        .iter()
+        .map(|(log_type, option)| (log_type.as_str(), rendered_log_publishing_option(option)))
+        .collect();
+    ::service_common::validation::rendered_map_in_key_order(&entries)
+}
+
+/// One `LogPublishingOption` as the validation layer in front of the service prints a
+/// modelled structure ([`::service_common::validation::rendered_record`]): the shape's name
+/// over EVERY member the shape declares, in declaration order, with one the request left
+/// unset stated as the fleet's `UNSET_MEMBER`.
+fn rendered_log_publishing_option(option: &LogPublishingOption) -> String {
+    let arn = option
+        .cloud_watch_logs_log_group_arn
+        .as_deref()
+        .unwrap_or(::service_common::validation::UNSET_MEMBER);
+    let enabled = option.enabled.map_or_else(
+        || ::service_common::validation::UNSET_MEMBER.to_string(),
+        |enabled| enabled.to_string(),
+    );
+    let arn_member =
+        ::aws_smithy_schema_server::constraints::path::member("CloudWatchLogsLogGroupArn");
+    let enabled_member = ::aws_smithy_schema_server::constraints::path::member("Enabled");
+    ::service_common::validation::rendered_record(
+        "LogPublishingOption",
+        &[
+            (arn_member.as_str(), arn),
+            (enabled_member.as_str(), enabled.as_str()),
+        ],
+    )
+}
+
 /// The `ValidationException` payload for an `IndexSchema` that is not a JSON
 /// object.
 ///

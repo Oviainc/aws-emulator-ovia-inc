@@ -444,6 +444,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let name = input.domain_name.clone();
+
+        // THE INPUT CONSTRAINT FIRST, before the domain this change addresses is
+        // resolved: a `LogPublishingOptions` key outside the modelled `LogType` set is a
+        // value the map's own key shape does not admit, and an input constraint is stated
+        // by naming the member rather than reported as a domain that does not exist. The
+        // walk in front of this handler cannot state it — it treats a map's key as a path
+        // segment rather than as a constrained leaf — so the handler does, before the
+        // lookup.
+        if let Some(refusal) = crate::state::log_type_key_refusal(input.log_publishing_options.as_ref())
+        {
+            return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
+        }
+
         let dry_run = input.dry_run.unwrap_or(false);
         // The two members that decide what a dry run LEAVES BEHIND, captured before
         // the merge below consumes the request: which analysis was asked for, and the

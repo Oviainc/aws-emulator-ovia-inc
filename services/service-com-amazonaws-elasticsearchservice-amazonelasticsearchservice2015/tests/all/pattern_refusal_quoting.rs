@@ -10,9 +10,12 @@
 //! only the clause's quoting differs, and a caller that lifts the advertised expression
 //! out of the message gets one it can apply itself.
 //!
-//! The pair is dropped POSITIONALLY — the leading `^` with the trailing `$` — so an
-//! expression whose own branches are anchored keeps the anchors inside it. The version
-//! row below is exactly that case and is asserted as such.
+//! The pair is dropped only where what it encloses carries NO anchor of its own. An
+//! expression that anchors its own BRANCHES (an alternation of `^…$` branches) is a
+//! whole-value expression already — the two ends of its text are the first and last
+//! branch's anchors — so it is quoted exactly as the model declares it: dropping those
+//! ends would state a requirement of no branch. The version row below is that case and is
+//! asserted as such.
 //!
 //! Each row's modelled expression is the model's, read with
 //! `smithy_query(query="shape",shape="DomainName,PackageName,ElasticsearchVersionString,\
@@ -53,14 +56,10 @@ const NAME_PATTERN: &str = r"^[a-z][a-z0-9\-]+$";
 const NAME_QUOTED: &str = r"[a-z][a-z0-9\-]+";
 
 /// The `@pattern` of `ElasticsearchVersionString`: an alternation each of whose branches
-/// is anchored on its own, so only the leading `^` and the trailing `$` are dropped.
+/// is anchored on its own, so nothing is dropped and the expression is published as the
+/// model declares it.
 const VERSION_PATTERN: &str =
     r"^[0-9]{1}\.[0-9]{1,2}$|^OpenSearch_[0-9]{1,2}\.[0-9]{1,2}$|^OS_[0-9]{1,2}\.[0-9]{1,2}$";
-
-/// That expression without the OUTER pair — the interior anchors are part of what the
-/// service publishes.
-const VERSION_QUOTED: &str =
-    r"[0-9]{1}\.[0-9]{1,2}$|^OpenSearch_[0-9]{1,2}\.[0-9]{1,2}$|^OS_[0-9]{1,2}\.[0-9]{1,2}";
 
 fn cases() -> Vec<Case> {
     vec![
@@ -112,8 +111,8 @@ fn cases() -> Vec<Case> {
             quoted: NAME_QUOTED,
         },
         Case {
-            // The alternation: each branch anchored on its own, so the drop is only the
-            // outer pair.
+            // The alternation: each branch anchored on its own, so the expression is
+            // already a whole-value one and is quoted as declared.
             case: "CreateElasticsearchDomain's ElasticsearchVersion member",
             method: "POST",
             path: "/2015-01-01/es/domain".to_string(),
@@ -122,7 +121,7 @@ fn cases() -> Vec<Case> {
                 "ElasticsearchVersion": "7.10.1"
             })),
             modelled: VERSION_PATTERN,
-            quoted: VERSION_QUOTED,
+            quoted: VERSION_PATTERN,
         },
         Case {
             // A member nested inside a structure member.
@@ -171,8 +170,10 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// RULE: a `@pattern` refusal quotes the expression without the whole-value pair the
-/// model wraps it in, on every member of this API's input surface.
+/// RULE: a `@pattern` refusal quotes the expression the service advertises — the model's
+/// text without the whole-value pair the model wrapped it in, and the model's text
+/// unchanged where what that pair encloses anchors its own branches — on every member of
+/// this API's input surface.
 #[tokio::test]
 async fn a_pattern_refusal_quotes_the_expression_without_the_modelled_pair() {
     let router = router();
@@ -203,14 +204,22 @@ async fn a_pattern_refusal_quotes_the_expression_without_the_modelled_pair() {
             message.starts_with("1 validation error detected: "),
             "case {case:?}: the envelope must count the errors it states, got {message:?}"
         );
-        assert!(
-            message.contains(&format!("{PATTERN_CLAUSE}{quoted}")),
-            "case {case:?}: the clause must quote {quoted:?}, got {message:?}"
-        );
-        assert!(
-            !message.contains(&format!("{PATTERN_CLAUSE}{modelled}")),
-            "case {case:?}: the clause must not quote the modelled {modelled:?}, got \
-             {message:?}"
+        let stated = message
+            .split_once(PATTERN_CLAUSE)
+            .map(|(_, expression)| expression.to_string())
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the clause must state the pattern requirement, got \
+                     {message:?}"
+                )
+            });
+        // The expression runs to the end of the clause, and with one validation error the
+        // clause ends the message — so this pins the WHOLE expression rather than
+        // asserting that the quoted one is somewhere inside it.
+        assert_eq!(
+            stated, quoted,
+            "case {case:?}: the clause must quote {quoted:?} (the model declares \
+             {modelled:?}), got {stated:?}"
         );
     }
 }

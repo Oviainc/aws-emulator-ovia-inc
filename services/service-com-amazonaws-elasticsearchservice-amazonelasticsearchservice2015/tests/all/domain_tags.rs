@@ -12,8 +12,10 @@
 //!    key is untouched — and `RemoveTags` drops only the keys it names.
 //! 2. The tag set is PERSISTED per domain: tagging one domain leaves another
 //!    domain's tags alone, and a read never changes what the next read sees.
-//! 3. A domain may carry at most the documented number of tags; the call that
-//!    would exceed it is refused and attaches nothing.
+//! 3. A domain may carry at most the documented number of tags, on BOTH paths
+//!    that store a tag set: the call that would take an existing domain's set
+//!    past the allowance is refused and attaches nothing, and a create whose
+//!    `TagList` is longer than the allowance stores no domain at all.
 //! 4. An `ARN` that resolves to no domain of this account is refused as invalid
 //!    input by all three operations, and attaches nothing.
 
@@ -404,6 +406,64 @@ async fn the_documented_tag_allowance_bounds_one_domains_set() {
         Some("w"),
         "the accepted re-valuing must have landed, got {held:?}"
     );
+}
+
+/// RULE 3, on the other path that stores a tag set: a CREATE whose `TagList` is
+/// longer than the allowance is refused on that list and stores no domain, so no
+/// path can leave a domain carrying more tags than a domain may have.
+#[tokio::test]
+async fn the_allowance_bounds_the_tag_list_a_create_stores() {
+    let router = router();
+
+    // The rows cross the published bound: one below it, exactly at it, and one
+    // past it.
+    for (case, count, expected) in [
+        ("one below the allowance", MAX_TAGS_PER_DOMAIN - 1, 200),
+        ("exactly at the allowance", MAX_TAGS_PER_DOMAIN, 200),
+        ("one past the allowance", MAX_TAGS_PER_DOMAIN + 1, 409),
+    ] {
+        let name = format!("created-with-{count}-tags");
+        let keys: Vec<String> = (0..count).map(|index| format!("key-{index}")).collect();
+        let tags: Vec<(&str, &str)> = keys.iter().map(|key| (key.as_str(), "v")).collect();
+        let created = create_domain(
+            &router,
+            &json!({"DomainName": name, "TagList": tag_list(&tags)}),
+        )
+        .await;
+        assert_eq!(
+            created.status, expected,
+            "case {case:?}: expected HTTP {expected}, got {} {}",
+            created.status, created.body
+        );
+        if expected == 200 {
+            let arn = created.text(case, "/DomainStatus/ARN");
+            assert_eq!(
+                tags_of(&router, &arn, case).await.len(),
+                count,
+                "case {case:?}: the domain must hold the whole set its create carried"
+            );
+            continue;
+        }
+        assert!(
+            created.error_type.contains("LimitExceededException"),
+            "case {case:?}: the error must be LimitExceededException, got {:?} / {}",
+            created.error_type,
+            created.body
+        );
+        let read = call_in(
+            &router,
+            REGION,
+            "GET",
+            &format!("/2015-01-01/es/domain/{name}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            read.status, 404,
+            "case {case:?}: a refused create must store no domain, got {} {}",
+            read.status, read.body
+        );
+    }
 }
 
 /// RULE 4: an ARN naming no domain of this account is refused by all three

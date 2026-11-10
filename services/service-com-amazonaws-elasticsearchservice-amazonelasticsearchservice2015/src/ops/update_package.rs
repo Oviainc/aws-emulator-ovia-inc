@@ -154,6 +154,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
 
+        // THE INPUT CONSTRAINT FIRST, before any id is resolved — see
+        // `crate::state::package_id_refusal`.
+        if let Some(message) = crate::state::package_id_refusal(&input.package_id) {
+            return Err(UpdatePackageErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let now = ::std::time::SystemTime::now();
         // A package is held by the control plane of the Region its create was
         // signed for, so that is the scope this id is resolved in.

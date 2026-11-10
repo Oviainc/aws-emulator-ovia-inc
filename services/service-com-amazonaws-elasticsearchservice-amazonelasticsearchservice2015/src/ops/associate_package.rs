@@ -160,6 +160,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
 
+        // THE INPUT CONSTRAINT FIRST, before either resource is resolved — see
+        // `crate::state::package_id_refusal`.
+        if let Some(message) = crate::state::package_id_refusal(&input.package_id) {
+            return Err(AssociatePackageErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let now = ::std::time::SystemTime::now();
         // Both the package and the domain are held by the control plane of the
         // Region the call was signed for, so that is the scope each is resolved

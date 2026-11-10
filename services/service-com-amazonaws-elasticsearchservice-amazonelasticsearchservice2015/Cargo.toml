@@ -26,6 +26,9 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # The fleet's home for how a boundary refusal is worded (`override_refusal`).
 service-common = { path = "../common" }
+# Checks a value against the syntax a shape declares, for the constraints the
+# boundary walk cannot reach (a map key, a shape this model leaves unconstrained).
+regex = "1.13"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
