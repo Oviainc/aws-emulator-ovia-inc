@@ -13,14 +13,13 @@
 //!
 //! So a control-plane call that reached an address this store announced for a plane
 //! ([`super::super::state::published_plane`]) reached an endpoint that binds no operation
-//! for its path, and is answered as such: the framework's own refusal of an unrouted path
-//! — HTTP 404 with the bare `UnknownOperationException` element as the whole body — with
-//! no operation run, no member reported and nothing in the store touched. Every other
-//! address — the endpoint the client is already talking to, this service's published
-//! regional host — keeps serving the whole control surface.
+//! for its path, and is answered as such: this family's front-door envelope for a request
+//! it can name no operation for ([`super::unknown_operation`]), with no operation run, no
+//! member reported and nothing in the store touched. Every other address — the endpoint
+//! the client is already talking to, this service's published regional host — keeps
+//! serving the whole control surface.
 
-use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
-use ::aws_smithy_types::body::SdkBody;
+use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use ::smithy_server_runtime::{BoxFuture, ErasedOperation, OperationContext, Service};
 
 /// Whether this request reached an address this store announced for a data plane.
@@ -65,16 +64,13 @@ impl ErasedOperation for UnroutedOnDataPlaneAddress {
     }
 }
 
-/// HTTP 404 with the bare `UnknownOperationException` element as the whole body and no
-/// error-type header: the path is bound to no operation here, so no operation was
-/// identified to name one for, and there is no member and no value to report.
+/// The front door's own answer to a path it binds no operation for: no operation was
+/// identified to name one for, so there is no member and no value to report.
 ///
-/// The body is the framework's own ([`::smithy_server_runtime::UNRECOGNISED_PROTOCOL_BODY`]),
-/// which is the one wording this emulator states an unrouted path in — the same answer
-/// the ingest plane gives a `/putMedia` that reached an address that does not route it.
+/// The wording is this family's one wording for an unroutable request
+/// ([`super::unknown_operation::unknown_operation_response`]) — the same answer the ingest
+/// plane gives a `/putMedia`, and the read plane a `/getMedia`, that reached an address
+/// that does not route it.
 fn unrouted_address_response() -> RtResponse {
-    RtResponse::new(
-        StatusCode::try_from(404).expect("the status is a constant of this module"),
-        SdkBody::from(::smithy_server_runtime::UNRECOGNISED_PROTOCOL_BODY),
-    )
+    super::unknown_operation::unknown_operation_response()
 }

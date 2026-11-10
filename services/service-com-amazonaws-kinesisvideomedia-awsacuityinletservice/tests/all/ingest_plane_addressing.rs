@@ -10,9 +10,10 @@
 //! to \"READ\"" — so `POST /putMedia` is served at the origin
 //! `GetDataEndpoint(APIName=PUT_MEDIA)` hands a producer. Every OTHER address of this
 //! emulator — the control-plane front door the discovery call itself arrived on, and the
-//! read plane's own origin — binds no operation for that path, so it answers the refusal
-//! an endpoint gives an unrouted path (HTTP 404, the bare `UnknownOperationException`
-//! element as the whole body, and no error-type header, since no operation was identified
+//! read plane's own origin — binds no operation for that path, so it answers the front
+//! door's reply to a request it can name no operation for (HTTP 400 with the
+//! `Output`/`Version` envelope carrying the unknown-operation `__type` and "Unable to
+//! determine operation name", and no error-type header, since no operation was identified
 //! to name one for) and ingests nothing: the stream's archive stays empty, while the
 //! identical bytes sent to the announced write origin persist exactly one fragment.
 //!
@@ -287,8 +288,8 @@ const ROWS: &[Row] = &[
 
 /// RULE: `POST /putMedia` is served at the origin announced for the write plane; at every
 /// other address of this emulator the path is bound to no operation, so it is answered
-/// `404` with the bare `UnknownOperationException` element and no error-type header, and
-/// nothing is ingested.
+/// with the front door's unknown-operation envelope (HTTP 400) and no error-type header,
+/// and nothing is ingested.
 #[tokio::test]
 async fn the_ingest_route_is_served_only_at_the_origin_announced_for_the_write_plane() {
     let harness = Harness::new();
@@ -360,16 +361,16 @@ async fn the_ingest_route_is_served_only_at_the_origin_announced_for_the_write_p
         } else {
             assert_eq!(
                 status(&response),
-                404,
+                400,
                 "case {case:?} ({authority}): expected the unrouted-path refusal, got {} {}",
                 status(&response),
                 text(&response)
             );
             assert_eq!(
-                text(&response),
-                smithy_server_runtime::UNRECOGNISED_PROTOCOL_BODY,
-                "case {case:?} ({authority}): expected the bare UnknownOperationException \
-                 element as the whole body, got {:?}",
+                json(&response),
+                crate::read_plane_addressing::unknown_operation_envelope(),
+                "case {case:?} ({authority}): expected the front door's unknown-operation \
+                 envelope as the whole body, got {:?}",
                 text(&response)
             );
             assert!(

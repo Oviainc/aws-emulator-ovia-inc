@@ -24,7 +24,9 @@
 //!
 //! The rows differ along what the rule generalises over: which `APIName` was asked for (so
 //! which plane's address is announced), which media operation of that plane is then called,
-//! and whether the call is addressed to the announced authority or to the control-plane one.
+//! and whether the call is addressed to the announced authority or to the control-plane one
+//! — where a route bound on the announced address alone is answered by the front door
+//! instead.
 
 use std::net::{Ipv4Addr, Ipv6Addr, TcpStream};
 use std::sync::Arc;
@@ -256,34 +258,63 @@ async fn the_announced_data_endpoint_serves_the_media_reads_of_its_plane() {
     }
 
     // The media and archived-media operations of the read plane, addressed to the authority
-    // the control plane announced for it: each is served by the service that models it, and
-    // the same call addressed to the control-plane authority is served the same way — the
-    // announced address is an address of this emulator, not a different emulator.
-    let reads: &[(&str, &str, Value)] = &[
+    // the control plane announced for it: each is served by the service that models it. The
+    // same call addressed to the CONTROL-plane authority meets the other half of the split —
+    // a stream's media APIs are not served at the endpoint the discovery call is made to
+    // ("You must first call the GetDataEndpoint API to get an endpoint. Then send the
+    // GetMedia requests to this endpoint"), so Kinesis Video Media's own route is bound on
+    // the announced address alone and the control-plane front door answers it as the
+    // unroutable request it is. Archived Media's `/listFragments` is that service's route
+    // and is not scoped by this emulator yet, so it still answers at either address; what
+    // the row pins is that the announced authority is an address of THIS emulator rather
+    // than a different one.
+    //
+    // (case, path, the status at the announced read authority, the status at the
+    // control-plane authority)
+    let reads: &[(&str, &str, u16, u16, Value)] = &[
         (
             "GetMedia on the announced authority",
             "/getMedia",
+            200,
+            400,
             json!({ "StreamName": STREAM, "StartSelector": { "StartSelectorType": "EARLIEST" } }),
         ),
         (
             "ListFragments on the announced authority",
             "/listFragments",
+            200,
+            200,
             json!({ "StreamName": STREAM, "FragmentSelector": whole_archive() }),
         ),
     ];
-    for (case, path, body) in reads {
-        for authority in [read_authority.as_str(), CONTROL_AUTHORITY] {
+    for (case, path, on_the_plane, on_the_control_plane, body) in reads {
+        for (authority, expected) in [
+            (read_authority.as_str(), *on_the_plane),
+            (CONTROL_AUTHORITY, *on_the_control_plane),
+        ] {
             let answer = call(&router, authority, path, body).await;
             assert_eq!(
-                answer.status, 200,
-                "case {case:?} at {authority:?}: expected the plane's own service to serve it, \
-                 got {answer:?}"
+                answer.status, expected,
+                "case {case:?} at {authority:?}: expected HTTP {expected} from the service that \
+                 binds the route there, got {answer:?}"
             );
-            assert_eq!(
-                answer.error_code(),
-                "",
-                "case {case:?} at {authority:?}: expected no refusal, got {answer:?}"
-            );
+            if expected == 200 {
+                assert_eq!(
+                    answer.error_code(),
+                    "",
+                    "case {case:?} at {authority:?}: expected no refusal, got {answer:?}"
+                );
+            } else {
+                // The front door's own answer to a request it can name no operation for:
+                // the fault travels in the envelope's `Output`, so no `__type` sits at the
+                // body's root for `error_code` to read.
+                assert_eq!(
+                    answer.body["Output"]["__type"].as_str(),
+                    Some("com.amazon.kinesis.video.v20170930#UnknownOperationException"),
+                    "case {case:?} at {authority:?}: expected the front door's \
+                     unknown-operation envelope, got {answer:?}"
+                );
+            }
         }
     }
 

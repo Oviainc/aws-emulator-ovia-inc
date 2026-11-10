@@ -49,9 +49,16 @@
 //! same seam SCOPES this service's routes to the endpoint a control call arrives on: a call
 //! that reached an address this service announced for a data plane is answered as the
 //! unrouted path it is ([`data_plane_address`]).
+//!
+//! A third seam is taken too: `override_routing_error` answers a request this service
+//! claimed and could name no modelled operation for in this family's FRONT-DOOR envelope
+//! ([`unknown_operation`]), which is the one wording every endpoint of it states an
+//! unroutable request in — the framework's `rest` default (`501 NotImplemented`) is a
+//! status this service never answers.
 
 pub mod data_plane_address;
 pub mod error_message_member;
+pub mod unknown_operation;
 
 use aws_smithy_schema_server::Violation;
 use smithy_server_runtime::{
@@ -184,12 +191,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
+        // routing table resolved it. The framework's `rest` default is `501
+        // NotImplemented`, which this family's endpoints never answer: a request whose
+        // method and URI name no operation this endpoint hosts is rejected by the front
+        // door ahead of any handler, in the envelope [`unknown_operation`] states.
         let _ = req;
-        None
+        Some(unknown_operation::unknown_operation_response())
     }
 
     fn override_framework_error(

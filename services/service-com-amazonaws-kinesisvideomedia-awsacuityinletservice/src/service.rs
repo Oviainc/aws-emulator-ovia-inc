@@ -60,14 +60,27 @@
 //!   is, with nothing ingested.
 //!
 //! The Matroska container a producer submits is read by [`matroska`].
+//!
+//! ## Where the modelled read route is served
+//!
+//! The modelled `POST /getMedia` belongs to the READ plane and is bound on the address
+//! `GetDataEndpoint` announces for it, exactly as the ingest route is bound on the write
+//! plane's ([`read_plane`]). A reader that sent it to this emulator's control-plane front
+//! door, or to the write plane's address, reached an endpoint that binds no operation for
+//! that path, so [`Service::override_operation`] names this family's front-door answer for
+//! an unroutable request instead of the operation — nothing is resolved and nothing is
+//! read.
 
 pub mod matroska;
 pub mod put_media;
+pub mod read_plane;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+use ::service_com_amazonaws_kinesisvideo_kinesisvideo_20170930::service::unknown_operation;
 
 /// Whether this service serves the request these `parts` came from.
 ///
@@ -119,6 +132,14 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// of one of its own operations, and it owns the shared engine so a fragment it
     /// takes lands in the same store `GetMedia` reads.
     ingest: put_media::PutMediaIngest<Eng>,
+    /// The shared engine, held beside the entry so the seams below can read this store —
+    /// which is where the addresses the control plane announced for this stream's planes
+    /// live ([`read_plane`]).
+    engine: Arc<Eng>,
+    /// What a modelled read call that reached an address which does not serve the read
+    /// plane is answered with. Stateless, and held rather than built per request because
+    /// the seam answers a reference borrowed from `&self`.
+    unrouted_on_other_address: unknown_operation::UnknownOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -128,7 +149,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             ingest: put_media::PutMediaIngest::new(Arc::clone(&engine)),
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
+            unrouted_on_other_address: unknown_operation::UnknownOperation,
         }
     }
 }
@@ -182,6 +205,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if put_media::claims_request(req) && self.ingest.serves_the_addressed_plane(req) {
             return Some(&self.ingest as &dyn ErasedOperation);
         }
+        // And the modelled read route is bound on the READ plane's own address: a call for
+        // it that reached the control-plane front door or the write plane's address
+        // reached an endpoint that binds no operation for its path, so the front door's
+        // answer to an unroutable request is named for it instead of the operation, and no
+        // operation of this service runs (see [`read_plane`]).
+        if read_plane::claims_request(req) && !read_plane::read_plane_served_at(&*self.engine, req)
+        {
+            return Some(&self.unrouted_on_other_address as &dyn ErasedOperation);
+        }
         None
     }
 
@@ -213,7 +245,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if put_media::claims_request(req) {
             return Some(put_media::unrouted_address_response());
         }
-        None
+        // And every other request this service claimed and could name no modelled
+        // operation for — one of its routes under a method its model does not bind — is
+        // the same unroutable request, answered in the same envelope. The framework's
+        // `rest` default (`501 NotImplemented`) is a status no endpoint of this family
+        // answers.
+        Some(unknown_operation::unknown_operation_response())
     }
 
     fn override_framework_error(

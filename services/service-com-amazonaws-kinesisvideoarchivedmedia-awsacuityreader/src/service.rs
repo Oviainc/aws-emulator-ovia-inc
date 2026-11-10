@@ -187,12 +187,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
+        // routing table resolved it. The framework's `rest` default is `501
+        // NotImplemented`, which no endpoint of the Kinesis Video Streams family
+        // answers: a request whose method and URI name no operation this endpoint hosts
+        // is rejected by the front door ahead of any handler, in the one envelope that
+        // family states an unroutable request in — the control plane's
+        // `service::unknown_operation`, which owns that wording for the whole family.
         let _ = req;
-        None
+        Some(
+            ::service_com_amazonaws_kinesisvideo_kinesisvideo_20170930::service::unknown_operation
+                ::unknown_operation_response(),
+        )
     }
 
     fn override_framework_error(

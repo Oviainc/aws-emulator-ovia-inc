@@ -19,6 +19,8 @@ mod get_media;
 mod ingest_plane_addressing;
 #[path = "all/put_media_ingest.rs"]
 mod put_media_ingest;
+#[path = "all/read_plane_addressing.rs"]
+mod read_plane_addressing;
 #[path = "all/route_claim.rs"]
 mod route_claim;
 #[path = "all/route_claims.rs"]

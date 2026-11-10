@@ -53,6 +53,7 @@ use std::time::SystemTime;
 
 use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use ::aws_smithy_types::body::SdkBody;
+use ::service_com_amazonaws_kinesisvideo_kinesisvideo_20170930::service::unknown_operation as control_plane_front_door;
 use ::service_com_amazonaws_kinesisvideo_kinesisvideo_20170930::state as control_plane;
 use ::service_com_amazonaws_kinesisvideoarchivedmedia_awsacuityreader::state as archive;
 use ::smithy_server_runtime::{http, BoxFuture, ErasedOperation, OperationContext, Service};
@@ -701,18 +702,16 @@ fn ingest_served_at<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -
 }
 
 /// What an address that does not route `/putMedia` answers a producer that sent one
-/// there: the refusal an endpoint gives a path it binds no operation for — HTTP 404, the
-/// bare `UnknownOperationException` element as the whole body, and no error-type header,
-/// because no operation was identified to name one for. Nothing is read from the request
-/// and nothing is ingested.
+/// there: the refusal an endpoint gives a path it binds no operation for, since no
+/// operation was identified to name a member or a value for. Nothing is read from the
+/// request and nothing is ingested.
 ///
-/// The body is the framework's own ([`::smithy_server_runtime::UNRECOGNISED_PROTOCOL_BODY`]),
-/// which is the one wording this emulator states an unrouted path in.
+/// The wording is this family's one wording for an unroutable request
+/// ([`control_plane_front_door::unknown_operation_response`]) — the same answer the read
+/// plane gives a `/getMedia`, and the control plane a control call, that reached an address
+/// which does not route it.
 pub fn unrouted_address_response() -> RtResponse {
-    RtResponse::new(
-        StatusCode::try_from(404).expect("the status is a constant of this module"),
-        SdkBody::from(::smithy_server_runtime::UNRECOGNISED_PROTOCOL_BODY),
-    )
+    control_plane_front_door::unknown_operation_response()
 }
 
 /// Whether the buffered request parts address the ingest plane: a `POST` whose first URI

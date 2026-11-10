@@ -161,8 +161,9 @@ async fn an_announced_address_maps_back_to_the_plane_that_serves_its_api() {
 
 /// RULE: this service's own routes are served at the endpoint a control call arrives on
 /// and not at an address it announced for a data plane — a control call that reached a
-/// plane's address is answered `404` naming the operation it could not route, with no
-/// message and nothing in the store changed, while the same call at the control-plane
+/// plane's address reached an endpoint that binds no operation for its path, so the front
+/// door answers it with HTTP 400 and this family's unknown-operation envelope, names no
+/// error type and changes nothing in the store, while the same call at the control-plane
 /// address is served.
 ///
 /// The rows differ in the control operation asked for (a read, a list and the discovery
@@ -194,14 +195,14 @@ async fn a_control_call_is_not_served_at_an_address_announced_for_a_data_plane()
             let response = harness.call_at(plane, path, body.clone()).await;
             assert_eq!(
                 response.status().as_u16(),
-                404,
+                400,
                 "case {case:?}: a data plane's address routes no control operation, got {} {:?}",
                 response.status(),
                 String::from_utf8_lossy(response.body())
             );
-            // The refusal is the framework's own answer for an unrouted path: the bare
-            // element naming the condition, with no error-type header, because no
-            // operation was identified to name one for.
+            // The refusal is the front door's own answer to a request it can name no
+            // operation for, with no error-type header, because no operation was
+            // identified to name one for.
             assert!(
                 response.headers().get("x-amzn-errortype").is_none(),
                 "case {case:?}: no operation was identified, so none is named in the \
@@ -209,10 +210,11 @@ async fn a_control_call_is_not_served_at_an_address_announced_for_a_data_plane()
                 response.headers().get("x-amzn-errortype")
             );
             assert_eq!(
-                String::from_utf8_lossy(response.body()),
-                smithy_server_runtime::UNRECOGNISED_PROTOCOL_BODY,
-                "case {case:?}: expected the one wording this emulator states an unrouted \
-                 path in, got {:?}",
+                serde_json::from_slice::<serde_json::Value>(response.body())
+                    .unwrap_or(serde_json::Value::Null),
+                crate::unknown_operation_envelope::unknown_operation_envelope(),
+                "case {case:?}: expected the one envelope this family states an unroutable \
+                 request in, got {:?}",
                 String::from_utf8_lossy(response.body())
             );
         }

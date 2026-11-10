@@ -41,5 +41,7 @@ mod stream_record_state_model;
 mod stream_tags;
 #[path = "all/stream_version_mismatch_message.rs"]
 mod stream_version_mismatch_message;
+#[path = "all/unknown_operation_envelope.rs"]
+mod unknown_operation_envelope;
 #[path = "all/version_token_read_paths.rs"]
 mod version_token_read_paths;
