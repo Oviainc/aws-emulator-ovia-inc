@@ -185,7 +185,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let now = std::time::SystemTime::now();
         let region = crate::state::request_region(&ctx.parts().headers);
         let signing_name = ctx.identity().signing_name().to_string();
 
@@ -205,6 +204,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .await?;
 
         let mut state = state.lock();
+        // The clock is read HERE, under the lock that writes, because the gate above took
+        // time: what the clock owes is materialised against the instant the write happens,
+        // and the association's own `AssociationDate` and the `ASSOCIATING` -> `ASSOCIATED`
+        // transition it owes are measured from the moment it is stored — never from a
+        // reading taken before the hop, which would date the association earlier than the
+        // write and could leave the transition the span exists for already due.
+        let now = std::time::SystemTime::now();
         state.materialise_due(now);
 
         let key = crate::state::provider_key(&input.identity_provider).map_err(into_error)?;

@@ -15,6 +15,8 @@
 mod arn_addressing_cross_checks_domain;
 #[path = "all/arn_and_members_address_one_resource.rs"]
 mod arn_and_members_address_one_resource;
+#[path = "all/association_is_stamped_at_write_time.rs"]
+mod association_is_stamped_at_write_time;
 #[path = "all/associations_follow_their_registration.rs"]
 mod associations_follow_their_registration;
 #[path = "all/deregistration_spares_what_it_was_not_asked_about.rs"]
