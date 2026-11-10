@@ -173,6 +173,8 @@ mod key_group_config_read;
 mod key_group_delete;
 #[path = "all/key_group_lifecycle.rs"]
 mod key_group_lifecycle;
+#[path = "all/key_group_refusal_message_source.rs"]
+mod key_group_refusal_message_source;
 #[path = "all/key_group_update.rs"]
 mod key_group_update;
 #[path = "all/key_value_store_delete.rs"]
