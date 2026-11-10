@@ -28,7 +28,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_b2bi_b2bi::state::{
-    partnership_not_found, profile_not_found, transformer_not_found,
+    partnership_not_found, profile_not_found, profile_reference_not_found, transformer_not_found,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -297,13 +297,13 @@ async fn every_operation_refuses_an_unheld_resource_at_the_same_status() {
                 "email": "partner@example.com",
                 "capabilities": []
             }),
-            profile_not_found(UNKNOWN_PROFILE),
+            profile_reference_not_found(UNKNOWN_PROFILE),
         ),
         (
             "UpdateProfile",
             "UpdateProfile",
             json!({ "profileId": UNKNOWN_PROFILE, "name": "renamed" }),
-            profile_not_found(UNKNOWN_PROFILE),
+            profile_reference_not_found(UNKNOWN_PROFILE),
         ),
         (
             "DeleteProfile",

@@ -326,10 +326,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(crate::state::TokenReplay::InFlight) => {
                     return Err(CreatePartnershipErrorModeled::ConflictException(
                         ConflictException {
-                            message: crate::state::create_in_flight(
-                                "partnership",
-                                input.client_token.as_deref().unwrap_or_default(),
-                            ),
+                            message: crate::state::CLIENT_TOKEN_IN_FLIGHT.to_string(),
                         },
                     )
                     .into())
@@ -352,7 +349,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.profiles.contains_key(&input.profile_id) {
             return Err(CreatePartnershipErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: crate::state::profile_not_found(&input.profile_id),
+                    message: crate::state::profile_reference_not_found(&input.profile_id),
                 },
             )
             .into());

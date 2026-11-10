@@ -320,15 +320,17 @@ async fn a_created_transformer_round_trips_every_persisted_member() {
 ///
 /// Source: the recorded AWS behaviour for
 /// `b2bi.create-transformer-mixed-legacy-and-new-fields-error` (a mixed request is refused
-/// with `ValidationException` and creates nothing). Only the status and the error code are
-/// requirements; the recorded message is an example, so this test asserts the message the
-/// handler builds from the request rather than that text.
+/// with `ValidationException` and creates nothing), whose message is one FIXED sentence
+/// stating the two sets of fields and that they must not be mixed — it reports none of the
+/// members the request supplied.
 ///
 /// The rows are every (deprecated member, replacement member) pair: 4 x 4 = 16, so the
 /// rule is asserted over the whole cross product rather than the one pair the corpus
 /// recorded.
 #[tokio::test]
 async fn mixing_the_deprecated_and_current_configuration_members_is_refused() {
+    use service_com_amazonaws_b2bi_b2bi::ops::create_transformer::MIXED_CONFIGURATION_STYLES;
+
     let router = b2bi_router();
     let shared_token = "mixed-style-token";
 
@@ -356,12 +358,10 @@ async fn mixing_the_deprecated_and_current_configuration_members_is_refused() {
             // model, unlike `ResourceNotFoundException`'s `message` —
             // `smithy_query(query="shape",shape="ValidationException")`.
             let message = text(&body, "Message");
-            assert!(
-                message.ends_with(&format!(
-                    "this request specifies {current_member} and {legacy_member}"
-                )),
-                "case {case:?}: the refusal must name the members this request sent in each \
-                 style, got {message:?} in {body}"
+            assert_eq!(
+                message, MIXED_CONFIGURATION_STYLES,
+                "case {case:?}: the refusal states the rule in fixed text, got {message:?} \
+                 in {body}"
             );
         }
     }

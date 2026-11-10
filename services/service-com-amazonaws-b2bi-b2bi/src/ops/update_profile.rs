@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(profile) = state.profiles.get_mut(&input.profile_id) else {
             return Err(UpdateProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: crate::state::profile_not_found(&input.profile_id),
+                    message: crate::state::profile_reference_not_found(&input.profile_id),
                 },
             )
             .into());

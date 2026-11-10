@@ -231,26 +231,16 @@ fn current_members_present(input: &UpdateTransformerInput) -> Vec<&'static str> 
 }
 
 /// The modelled refusal for a request that configures the transformer in BOTH styles at
-/// once — the same rule `CreateTransformer` enforces, stated over the same two member
-/// lists: the deprecated members and the ones that replace them describe one conversion
-/// two ways, so a record written from both would be ambiguous.
+/// once — the same rule `CreateTransformer` enforces, stated in the same words over the
+/// same two member lists: the deprecated members and the ones that replace them describe
+/// one conversion two ways, so a record written from both would be ambiguous.
 ///
-/// The HTTP status (400) and the error code (`ValidationException`) are the requirement;
-/// the message is built from the REQUEST — it names the members this caller sent in each
-/// style — so a caller can fix the request from the text alone.
-fn mixed_configuration_styles(
-    legacy: &[&'static str],
-    current: &[&'static str],
-) -> UpdateTransformerError {
+/// The sentence is entirely fixed text
+/// ([`crate::ops::create_transformer::MIXED_CONFIGURATION_STYLES`]) and reports nothing of
+/// which members this particular request supplied.
+fn mixed_configuration_styles() -> UpdateTransformerError {
     UpdateTransformerErrorModeled::ValidationException(ValidationException {
-        message: format!(
-            "A transformer must be configured with the fields {} or with the legacy fields \
-             {}, not both: this request specifies {} and {}",
-            crate::ops::create_transformer::CURRENT_MEMBERS.join(", "),
-            crate::ops::create_transformer::LEGACY_MEMBERS.join(", "),
-            current.join(", "),
-            legacy.join(", "),
-        ),
+        message: crate::ops::create_transformer::MIXED_CONFIGURATION_STYLES.to_string(),
     })
     .into()
 }
@@ -382,7 +372,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let legacy = legacy_members_present(&input);
         let current = current_members_present(&input);
         if !legacy.is_empty() && !current.is_empty() {
-            return Err(mixed_configuration_styles(&legacy, &current));
+            return Err(mixed_configuration_styles());
         }
 
         // Every member the request names is written; one it omits keeps its stored value.

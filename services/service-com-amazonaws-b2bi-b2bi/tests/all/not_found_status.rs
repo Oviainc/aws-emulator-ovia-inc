@@ -23,8 +23,8 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_b2bi_b2bi::scaffolded::{wire_status, NOT_FOUND_STATUS};
 use service_com_amazonaws_b2bi_b2bi::state::{
-    capability_not_found, partnership_not_found, profile_not_found, transformer_job_not_found,
-    transformer_not_found, transformer_reference_not_found,
+    capability_not_found, partnership_not_found, profile_not_found, profile_reference_not_found,
+    transformer_job_not_found, transformer_not_found, transformer_reference_not_found,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -158,7 +158,7 @@ async fn every_not_found_refusal_of_this_service_carries_one_client_error_status
             "UpdateProfile on a never-minted profileId",
             "UpdateProfile",
             json!({ "profileId": unknown_profile, "name": "renamed" }),
-            profile_not_found(unknown_profile),
+            profile_reference_not_found(unknown_profile),
         ),
         (
             "GetCapability on a never-minted capabilityId",

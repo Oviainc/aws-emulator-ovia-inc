@@ -967,12 +967,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and content that does not parse cannot be converted into anything.
         let document = match input.source.file_format.as_str() {
             documents::JSON => {
-                let parsed = documents::parse_json(content).map_err(|failure| {
-                    invalid(format!(
-                        "source.inputFile.fileContent is declared as {} but is not valid JSON: {}",
-                        documents::JSON, failure
-                    ))
-                })?;
+                // The JSON parser's own diagnostic IS the refusal: it says what the parse
+                // stopped on and where, with the submitted document withheld, and it names
+                // no input member (`documents::json_parse_diagnostic`).
+                let parsed = documents::parse_json(content).map_err(invalid)?;
                 from_json(parsed, 0).map_err(|failure| invalid(not_converted(failure)))?
             }
             documents::XML => {

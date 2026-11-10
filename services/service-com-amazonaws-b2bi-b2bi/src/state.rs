@@ -111,13 +111,19 @@ pub const MAX_RECORDS_PER_STORE: usize = 1_000;
 /// AWS answers a duplicate of an in-flight request with `ConflictException` and replays
 /// the original resource only once that request has completed (recorded for
 /// `CreateTransformer` by trace `b2bi.create-transformer-idempotent-token-concurrent-dedup`:
-/// of N concurrent creates sharing one token exactly one resource is minted and the losing
-/// racers are refused with `ConflictException`). A create is served here in microseconds,
-/// so "while the first request runs" would be a window no concurrent client could ever
-/// observe: the create a token started therefore reports in flight for this span, the same
-/// non-zero span this emulator gives every transition a call starts, and a caller acting
-/// straight after the call sees that transient state.
-pub const IDEMPOTENT_CREATE_IN_FLIGHT: Duration = Duration::from_millis(250);
+/// of N concurrent creates sharing one token exactly one resource is minted, the losing
+/// racers are refused with `ConflictException`, and a replay issued AFTER the original
+/// request completed answers with the id it minted). A create is served here in
+/// microseconds, so "while the first request runs" would be a window no concurrent client
+/// could ever observe: the create a token started therefore reports in flight for this
+/// span, and a caller racing the original sees that transient state.
+///
+/// The span is deliberately SHORT — shorter than the spread over which concurrent callers
+/// reach the service, and far shorter than one caller's own sequential retry — because
+/// both halves of that recording have to hold: a duplicate racing the original is refused,
+/// while the caller's NEXT call, issued after it has the original's answer, replays the
+/// resource rather than being refused.
+pub const IDEMPOTENT_CREATE_IN_FLIGHT: Duration = Duration::from_millis(5);
 
 /// How long after `StartTransformerJob` a transformer job reports `running`.
 ///
@@ -552,12 +558,13 @@ impl ComAmazonawsB2biB2biState {
 /// The `ConflictException` message for a create whose `clientToken` names a create that
 /// has not settled yet: the caller is the racer that lost the in-flight race, and the
 /// request it duplicated is the one that mints the resource.
-pub fn create_in_flight(resource_type: &str, client_token: &str) -> String {
-    format!(
-        "Another request to create a {resource_type} with clientToken {client_token} is in \
-         progress; retry once it has completed to receive its result"
-    )
-}
+///
+/// ONE fixed sentence, the same for every create this service offers and carrying nothing
+/// of the token or of the resource type: an `@idempotencyToken` is a value the CALLER
+/// generated, so echoing it tells the caller nothing it does not already know, and a retry
+/// wrapper that keys on this refusal matches the sentence rather than parsing it.
+pub const CLIENT_TOKEN_IN_FLIGHT: &str =
+    "This clientToken has been used for a previous request that is still being processed.";
 
 /// The digest of what a create request asked for, as the `@idempotencyToken` replay check
 /// compares it: `rendered` is the request's own members, rendered by the handler that owns
@@ -599,23 +606,32 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsB2biB2biState>)
 }
 
-/// The `ResourceNotFoundException` message for a `profileId` the store does not hold.
+/// The `ResourceNotFoundException` message the two operations that address the PROFILE
+/// RECORD itself report an absent `profileId` with — `GetProfile` and `DeleteProfile`.
 ///
-/// Every one of these four is built from the request's own identifier, in the form this
-/// service states for that resource type (the forms recorded from AWS): a client parses
-/// the id back out of the message, so the template is part of the contract and must not
-/// be an emulator-local phrase.
+/// Built from the request's own identifier, in the form recorded from AWS for those two
+/// paths: a client parses the id back out of the message, so the template is part of the
+/// contract and must not be an emulator-local phrase. The service states a DIFFERENT
+/// template on every other path that resolves a `profileId`
+/// ([`profile_reference_not_found`]) — two code paths of the real service, each recorded
+/// with its own wording, so the template is chosen per path rather than per service.
+///
+/// Source: one recorded unit (`b2bi.get-profile-not-found`) carries BOTH forms — an
+/// earlier beat reads an unknown profile through `GetProfile` and requires this template,
+/// a later one mutates a deleted profile through `UpdateProfile` and requires the other.
 pub fn profile_not_found(profile_id: &str) -> String {
     format!("Profile ID {profile_id} not found.")
 }
 
-/// The `ResourceNotFoundException` message for a `profileId` an operation resolves as a
-/// REFERENCE — the profile a listing is narrowed to, rather than the operation's own
-/// identifier.
+/// The `ResourceNotFoundException` message every OTHER path that resolves a `profileId`
+/// reports it absent with — `UpdateProfile`, which resolves the record before writing to
+/// it, `CreatePartnership`, which resolves the profile its partnership is created under,
+/// and `ListPartnerships`, whose page is narrowed to it.
 ///
-/// The recorded form for that path names the member the id arrived in, so it is a
-/// different template from [`profile_not_found`] — the same split a transformer's two
-/// paths carry ([`transformer_not_found`] and [`transformer_reference_not_found`]).
+/// The recorded form for those paths names the MEMBER the id arrived in, so it is a
+/// different template from [`profile_not_found`] — the same per-path split a transformer's
+/// two forms carry ([`transformer_not_found`] and [`transformer_reference_not_found`]) and
+/// a capability's ([`capability_not_found`] and [`capability_update_not_found`]).
 pub fn profile_reference_not_found(profile_id: &str) -> String {
     format!("Profile with profileId {profile_id} not found.")
 }

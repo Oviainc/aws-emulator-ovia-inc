@@ -259,34 +259,29 @@ fn current_members_present(input: &CreateTransformerInput) -> Vec<&'static str> 
 /// operations-answer.md` (cause 5, trace
 /// `b2bi.create-transformer-mixed-legacy-and-new-fields-error`) records that "a request
 /// that mixes the deprecated legacy fields (fileFormat/mappingTemplate/ediType) with the
-/// new inputConversion field is refused with ValidationException and creates nothing",
-/// with the recorded message example "A Transformer must use the fields input, mapping,
-/// and output, or the fields fileFormat, ...".
-///
-/// The HTTP status (400) and the error code (`ValidationException`) are what that
-/// recording requires; the recorded text is only an example, so the message here is built
-/// from the REQUEST — it names the members this caller actually sent in each style — so a
-/// caller can fix the request from the text alone.
+/// new inputConversion field is refused with ValidationException and creates nothing".
 ///
 /// Only the overlap is refused. A request that names NEITHER style is stored as supplied:
 /// no recording or model constraint says the real service refuses an unconfigured
 /// transformer, and refusing a request AWS may serve is the worse error.
-fn mixed_configuration_styles(
-    legacy: &[&'static str],
-    current: &[&'static str],
-) -> CreateTransformerError {
+fn mixed_configuration_styles() -> CreateTransformerError {
     CreateTransformerErrorModeled::ValidationException(ValidationException {
-        message: format!(
-            "A transformer must be configured with the fields {} or with the legacy fields \
-             {}, not both: this request specifies {} and {}",
-            CURRENT_MEMBERS.join(", "),
-            LEGACY_MEMBERS.join(", "),
-            current.join(", "),
-            legacy.join(", "),
-        ),
+        message: MIXED_CONFIGURATION_STYLES.to_string(),
     })
     .into()
 }
+
+/// The whole sentence a transformer configured in both styles at once is refused with.
+///
+/// ENTIRELY FIXED TEXT: the refusal states the two sets of fields a transformer may be
+/// configured with and that they must not be mixed, and reports NOTHING of which members
+/// this particular request supplied — a caller reads the rule, not its own request, back
+/// out of it. Shared with `UpdateTransformer`, which enforces the same rule over the same
+/// two member sets ([`LEGACY_MEMBERS`] and [`CURRENT_MEMBERS`]).
+pub const MIXED_CONFIGURATION_STYLES: &str =
+    "A Transformer must use the fields input, mapping, and output, or the fields \
+     fileFormat, mappingTemplate, ediType, and sampleDocument. These fields must not be \
+     mixed";
 
 /// The modelled refusal for a store already holding
 /// [`crate::state::MAX_RECORDS_PER_STORE`] transformers: this emulator will not grow its
@@ -433,7 +428,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let legacy = legacy_members_present(&input);
         let current = current_members_present(&input);
         if !legacy.is_empty() && !current.is_empty() {
-            return Err(mixed_configuration_styles(&legacy, &current));
+            return Err(mixed_configuration_styles());
         }
 
         // A create names no resource of its own until it mints one, so it is judged — and
@@ -490,10 +485,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(crate::state::TokenReplay::InFlight) => {
                     return Err(CreateTransformerErrorModeled::ConflictException(
                         ConflictException {
-                            message: crate::state::create_in_flight(
-                                "transformer",
-                                input.client_token.as_deref().unwrap_or_default(),
-                            ),
+                            message: crate::state::CLIENT_TOKEN_IN_FLIGHT.to_string(),
                         },
                     )
                     .into())

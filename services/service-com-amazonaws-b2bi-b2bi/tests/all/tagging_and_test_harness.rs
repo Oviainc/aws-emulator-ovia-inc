@@ -728,12 +728,16 @@ async fn test_conversion_refuses_source_content_that_is_not_its_declared_format(
             "case {case:?}: expected ValidationException, got {body}"
         );
         // A document that IS its declared format got past the format check and was refused
-        // by the conversion; one that is not never reached it.
+        // by the conversion; one that is not never reached it. A JSON document that does
+        // not parse is refused with the JSON parser's own diagnostic, whose location clause
+        // reports the submitted document as redacted (`aws_worded_refusals.rs` asserts that
+        // wording over a table of its own); an XML one is refused for the format it was
+        // declared as.
         let message = text(&body, "Message");
-        let expected = if *is_that_format {
-            "could not be converted to X12"
-        } else {
-            "is declared as"
+        let expected = match (*is_that_format, *file_format) {
+            (true, _) => "could not be converted to X12",
+            (false, "JSON") => "at [Source: REDACTED",
+            (false, _) => "is declared as",
         };
         assert!(
             message.contains(expected),

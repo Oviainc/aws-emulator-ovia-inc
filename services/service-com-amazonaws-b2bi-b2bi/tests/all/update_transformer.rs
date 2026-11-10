@@ -448,6 +448,8 @@ async fn an_active_transformer_takes_no_update_at_all() {
 /// The rows are every (deprecated member, replacement member) pair: 4 x 4 = 16.
 #[tokio::test]
 async fn mixing_the_deprecated_and_current_configuration_members_is_refused() {
+    use service_com_amazonaws_b2bi_b2bi::ops::create_transformer::MIXED_CONFIGURATION_STYLES;
+
     let router = b2bi_router();
     let current = current_members();
     let (transformer_id, created) = created_transformer(
@@ -477,12 +479,10 @@ async fn mixing_the_deprecated_and_current_configuration_members_is_refused() {
             // `ValidationException`'s member is `Message` (capital M) in this service's
             // model — `smithy_query(query="shape",shape="ValidationException")`.
             let message = text(&body, "Message");
-            assert!(
-                message.ends_with(&format!(
-                    "this request specifies {current_member} and {legacy_member}"
-                )),
-                "case {case:?}: the refusal must name the members this request sent in each \
-                 style, got {message:?} in {body}"
+            assert_eq!(
+                message, MIXED_CONFIGURATION_STYLES,
+                "case {case:?}: the refusal states the rule in fixed text, got {message:?} \
+                 in {body}"
             );
         }
     }

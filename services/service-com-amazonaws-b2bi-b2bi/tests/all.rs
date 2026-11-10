@@ -11,6 +11,8 @@
 // points it into `tests/all/`.
 #[path = "all/authorization.rs"]
 mod authorization;
+#[path = "all/aws_worded_refusals.rs"]
+mod aws_worded_refusals;
 #[path = "all/canonical_document.rs"]
 mod canonical_document;
 #[path = "all/client_error_bodies.rs"]
@@ -21,6 +23,8 @@ mod delete_transformer;
 mod edi_parsing;
 #[path = "all/generate_mapping.rs"]
 mod generate_mapping;
+#[path = "all/jsonata_probe.rs"]
+mod jsonata_probe;
 #[path = "all/mapped_file_encoding.rs"]
 mod mapped_file_encoding;
 #[path = "all/not_found_status.rs"]

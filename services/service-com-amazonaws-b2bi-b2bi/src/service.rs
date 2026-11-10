@@ -54,18 +54,22 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 
 /// Render one violation the way b2bi states it.
 ///
-/// A violated numeric `@range` bound names the member path and the bound it failed, and
-/// NOTHING of the value that was rejected. Every other class keeps the framework's own
-/// sentence (`Violation::message`, value and all): b2bi is only known to drop the value
-/// for a numeric range bound, and a class this service has no recorded wording for is
-/// better left as the framework states it than reworded on a guess.
+/// Two classes are stated differently from the way the framework states them, and every
+/// other class keeps the framework's own sentence (`Violation::message`, value and all):
+/// a class this service has no recorded wording for is better left as the framework
+/// states it than reworded on a guess.
 ///
-/// The two requirement sentences and the envelope below mirror the framework's own
+/// * a violated numeric `@range` bound names the member path and the bound it failed, and
+///   NOTHING of the value that was rejected;
+/// * a violated `@pattern` states the regular expression WITHOUT the `^`/`$` anchors the
+///   model writes around the service's own expression, which is the tree's shared
+///   rendering (`::service_common::validation::unanchored`).
+///
+/// The requirement sentences and the envelope below mirror the framework's own
 /// (`vendor/smithy-schema-server/src/constraints.rs`: `Violation::requirement` and
 /// `envelope`) and must stay in step with them. They are restated here rather than
 /// reused because that crate renders a clause only through `Violation::message`, which
-/// always prefixes the rejected value — the one thing this service must not report for a
-/// range bound.
+/// always prefixes the rejected value and always prints a pattern as the model writes it.
 ///
 /// MIGRATION NOTE (the one `services/common/src/validation.rs` asks every new inliner to
 /// leave): this is the same value-free clause rendering that
@@ -76,39 +80,66 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// seam to call; the fix that owns the migration declares that shared module (or a public
 /// `Violation::message_without_value()`) and replaces both copies with a call to it.
 fn clause(violation: &Violation) -> String {
-    let requirement = match &violation.kind {
-        ViolationKind::MinValue(min) => {
-            format!("Member must have value greater than or equal to {min}")
-        }
-        ViolationKind::MaxValue(max) => {
-            format!("Member must have value less than or equal to {max}")
-        }
+    let (subject, requirement) = match &violation.kind {
+        // A numeric bound is stated with no value at all, whether or not the member is
+        // `@sensitive`.
+        ViolationKind::MinValue(min) => (
+            "Value".to_string(),
+            format!("Member must have value greater than or equal to {min}"),
+        ),
+        ViolationKind::MaxValue(max) => (
+            "Value".to_string(),
+            format!("Member must have value less than or equal to {max}"),
+        ),
+        // A pattern keeps the framework's subject — which already withholds a
+        // `@sensitive` member's value — and restates only the expression.
+        ViolationKind::Pattern(pattern) => (
+            subject(violation),
+            format!(
+                "Member must satisfy regular expression pattern: {}",
+                ::service_common::validation::unanchored(pattern)
+            ),
+        ),
         _ => return violation.message(),
     };
     format!(
-        "Value at '{}' failed to satisfy constraint: {requirement}",
+        "{subject} at '{}' failed to satisfy constraint: {requirement}",
         violation.path
     )
 }
 
-/// Whether `violation` is the class this service rewords: a violated numeric `@range`
-/// bound.
-fn is_range(violation: &Violation) -> bool {
+/// How a clause names the value that was rejected, exactly as the framework names it: the
+/// value itself, `null` for a member that was absent, and NOTHING AT ALL for a
+/// `@sensitive` member, whose value never reaches a response.
+fn subject(violation: &Violation) -> String {
+    if violation.sensitive {
+        return "Value".to_string();
+    }
+    match &violation.value {
+        Some(shown) => format!("Value '{shown}'"),
+        None => "Value null".to_string(),
+    }
+}
+
+/// Whether `violation` is one of the classes this service rewords: a violated numeric
+/// `@range` bound, or a violated `@pattern`.
+fn is_reworded(violation: &Violation) -> bool {
     matches!(
         violation.kind,
-        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
+        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_) | ViolationKind::Pattern(_)
     )
 }
 
 /// The `ValidationException` message for a refused request: the AWS validation envelope
 /// (`N validation error(s) detected: `) over one clause per violation.
 ///
-/// `None` declines the refusal, leaving the framework's wording, for a request with no
-/// range violation at all — there is nothing to reword there. A request that mixes a
-/// range violation with another class IS reworded, so the range clause drops its value
-/// while every other clause reads exactly as the framework would have stated it.
-fn range_envelope(violations: &[Violation]) -> Option<String> {
-    if !violations.iter().any(is_range) {
+/// `None` declines the refusal, leaving the framework's wording, for a request carrying no
+/// violation of a class this service rewords — there is nothing to reword there. A request
+/// that mixes one with another class IS reworded, so the reworded clause reads as this
+/// service states it while every other clause reads exactly as the framework would have
+/// stated it.
+fn reworded_envelope(violations: &[Violation]) -> Option<String> {
+    if !violations.iter().any(is_reworded) {
         return None;
     }
     let clauses: Vec<String> = violations.iter().map(clause).collect();
@@ -178,15 +209,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // service reword it.
         //
         // b2bi states a violated numeric `@range` bound WITHOUT the value that violated
-        // it: the message names the member path and the bound only. The code stays the
-        // modelled `ValidationException` (HTTP 400) — what the framework would have
-        // answered — so only the wording changes, and only for that class: every other
-        // refusal, authentication included, keeps the framework's wording because
-        // `range_envelope` declines it.
+        // it (the message names the member path and the bound only), and a violated
+        // `@pattern` with the expression unanchored. The code stays the modelled
+        // `ValidationException` (HTTP 400) — what the framework would have answered — so
+        // only the wording changes, and only for those classes: every other refusal,
+        // authentication included, keeps the framework's wording because
+        // `reworded_envelope` declines it.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),
-                message: range_envelope(violations)?,
+                message: reworded_envelope(violations)?,
             }),
             _ => None,
         }

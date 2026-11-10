@@ -708,6 +708,161 @@ fn invalid(message: impl Into<String>) -> TestMappingError {
     TestMappingErrorModeled::ValidationException(ValidationException { message }).into()
 }
 
+/// The clause every refusal that carries the JSONata engine's own diagnosis begins with.
+///
+/// Fixed text: it says which engine refused the mapping and what the service was doing,
+/// and it names NO input member — the diagnosis that follows it is the engine's account of
+/// the expression, not this service's account of the member the expression arrived in.
+const JSONATA_FAILURE: &str = "JSONata error. Failed to map input file:";
+
+/// How the embedded engine marks the end-of-input symbol in its own sentence.
+///
+/// The engine states an expression that ran out of input as that symbol standing where an
+/// operand belongs; the JSONata error catalogue states the same failure as the TOKEN the
+/// expression still needed before it ended ([`awaited_closer`]), which is the sentence a
+/// caller reads — and the engine itself states that sentence wherever its own parse knows
+/// which token was awaited.
+const END_OF_INPUT_SYMBOL: &str = "`(end)`";
+
+/// The modelled 400 for a JSONata expression the engine refused: the fixed clause above,
+/// the engine's own diagnosis of the expression, and the span of the expression the
+/// diagnosis is about ([`jsonata_message`]).
+fn jsonata_refusal(template: &str, failure: &::jsonata_rs::Error) -> TestMappingError {
+    invalid(jsonata_message(template, &failure.to_string()))
+}
+
+/// The whole sentence a refused JSONata expression is reported with.
+///
+/// `rendered` is the engine's own rendering of the failure, which carries an error code, the
+/// position in the expression it stopped at, and the sentence stating what was wrong
+/// (`<code> @ <position>: <sentence>`). The code is the engine's internal handle on the
+/// sentence and is not reported; the sentence is, with the tokens it quotes written the way
+/// the error catalogue writes them, and the position becomes the SPAN of the expression the
+/// diagnosis is about: from where its first token begins to one past where the parse
+/// stopped.
+///
+/// A diagnosis carrying no position — which the engine renders for a failure that is about
+/// the expression as a whole rather than a place in it — is reported without a span.
+fn jsonata_message(template: &str, rendered: &str) -> String {
+    let Some((position, sentence)) = engine_diagnosis(rendered) else {
+        return format!("{JSONATA_FAILURE} {}", as_a_sentence(rendered));
+    };
+    // An expression that ran out of input is stated as the token it still needed, which is
+    // read off the EXPRESSION — the innermost mark the caller left open. Where it left
+    // none open, nothing was awaited and the engine's own sentence stands.
+    let awaited = sentence
+        .contains(END_OF_INPUT_SYMBOL)
+        .then(|| awaited_closer(template))
+        .flatten();
+    let diagnosis = match awaited {
+        Some(closer) => as_a_sentence(&format!(
+            "Expected \"{closer}\" before end of expression"
+        )),
+        None => as_a_sentence(sentence),
+    };
+    let (from_line, from_column) = expression_start(template);
+    let (line, column) = position_in(template, position);
+    format!(
+        "{JSONATA_FAILURE} {diagnosis} From line {from_line} column {from_column} to line \
+         {line} column {column}."
+    )
+}
+
+/// The token an expression that ran out of input still needed: the closing mark of the
+/// INNERMOST bracket the caller left open, and `None` when it left none open.
+///
+/// Read off the expression itself, because that is where the awaited token is: a bracket
+/// the caller opened is a bracket the parse was still inside when the input ended. String
+/// literals, backtick-quoted names and comments carry no structure, so each is skipped to
+/// its terminator — the same reading [`max_template_nesting`] does of the same bytes, with
+/// the same `closing_quote` — and a template whose literal or comment is UNTERMINATED hides
+/// whatever follows from this scan, so nothing is claimed to be awaited there.
+///
+/// Single-pass over a template already bounded by [`MAX_TEMPLATE_BYTES`], nested no deeper
+/// than [`MAX_TEMPLATE_NESTING`] (both checked before the engine is handed the template),
+/// so the walk and the marks it holds are bounded by those two ceilings.
+fn awaited_closer(template: &str) -> Option<char> {
+    let bytes = template.as_bytes();
+    let mut open: Vec<u8> = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            quote @ (b'"' | b'\'' | b'`') => index = closing_quote(bytes, index, quote)?,
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                let end = bytes[index + 2..]
+                    .windows(2)
+                    .position(|pair| pair == b"*/")?;
+                index += 2 + end + 1;
+            }
+            mark @ (b'(' | b'[' | b'{') => open.push(mark),
+            b')' | b']' | b'}' => {
+                open.pop();
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    match open.last()? {
+        b'(' => Some(')'),
+        b'[' => Some(']'),
+        _ => Some('}'),
+    }
+}
+
+/// The position the engine stopped at and the sentence it states, read off its own
+/// rendering (`<code> @ <position>: <sentence>`), or `None` when it rendered no position.
+fn engine_diagnosis(rendered: &str) -> Option<(usize, &str)> {
+    let (code, sentence) = rendered.split_once(": ")?;
+    let (_, position) = code.split_once(" @ ")?;
+    Some((position.trim().parse().ok()?, sentence))
+}
+
+/// One diagnosis as a sentence: the tokens the engine quotes in backticks written in the
+/// double quotes the error catalogue states them in, and a full stop to close it.
+fn as_a_sentence(diagnosis: &str) -> String {
+    let stated = diagnosis.trim().replace('`', "\"");
+    if stated.ends_with('.') {
+        stated
+    } else {
+        format!("{stated}.")
+    }
+}
+
+/// Where the expression's first token begins, as a line and a column counted from one.
+///
+/// The span a diagnosis carries is the span of the EXPRESSION, so it starts at the first
+/// token rather than at the first byte: leading whitespace is not part of the expression,
+/// and neither is the `$` that introduces a variable or function name — the name is the
+/// token.
+fn expression_start(template: &str) -> (usize, usize) {
+    let first = template
+        .char_indices()
+        .find(|(_, character)| !character.is_whitespace())
+        .map(|(offset, character)| match character {
+            '$' => offset + '$'.len_utf8(),
+            _ => offset,
+        })
+        .unwrap_or(0);
+    position_in(template, first.min(template.len()))
+}
+
+/// The one-based line, and the one-based column in bytes, of byte `offset` of `template`.
+///
+/// The engine reports the position it stopped at as the offset of the byte AFTER the token
+/// it read, so the offset one past the template's last byte — where a parse that ran out of
+/// input stops — is a position this answers for. An offset inside a multi-byte character
+/// names that character, so no position the engine reports can split one.
+fn position_in(template: &str, offset: usize) -> (usize, usize) {
+    let mut offset = offset.min(template.len());
+    while offset > 0 && !template.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let before = &template[..offset];
+    let line = 1 + before.matches('\n').count();
+    let line_start = before.rfind('\n').map_or(0, |at| at + '\n'.len_utf8());
+    (line, 1 + before.len() - line_start)
+}
+
 /// The 501 for a template in a language this emulator has no engine for.
 ///
 /// `TestMapping` itself is implemented, so the wording names the engine that is missing
@@ -1033,11 +1188,10 @@ fn evaluate_jsonata(template: &str, document: Option<&str>) -> Result<String, Te
     // past its own recursion limit, so neither this parse nor the interpreter's can be
     // driven arbitrarily deep.
     if let Some(document) = document {
-        ::serde_json::from_str::<::serde_json::Value>(document).map_err(|failure| {
-            invalid(format!(
-                "inputFileContent is not a well-formed JSON document: {failure}"
-            ))
-        })?;
+        // The JSON parser's own diagnostic IS the refusal, the same reading the conversion
+        // source path reports (`crate::state::documents::json_parse_diagnostic`): it says
+        // what the parse stopped on and where, with the submitted document withheld.
+        crate::state::documents::parse_json(document).map_err(invalid)?;
     }
 
     let arena = ::bumpalo::Bump::new();
@@ -1059,11 +1213,7 @@ fn evaluate_jsonata(template: &str, document: Option<&str>) -> Result<String, Te
             "mappingTemplate is not a valid JSONata expression: the interpreter could not parse it",
         )
     })?;
-    let expression = parsed.map_err(|failure| {
-        invalid(format!(
-            "mappingTemplate is not a valid JSONata expression: {failure}"
-        ))
-    })?;
+    let expression = parsed.map_err(|failure| jsonata_refusal(template, &failure))?;
 
     // Read off the parse, before anything is evaluated: a step this emulator cannot bound
     // cannot be interrupted either. The answer is the 501 naming the construct, not a
@@ -1087,9 +1237,7 @@ fn evaluate_jsonata(template: &str, document: Option<&str>) -> Result<String, Te
                 "mappingTemplate nested deeper than the {MAX_EVALUATION_DEPTH} evaluations \
                  this emulator allows one TestMapping evaluation"
             )),
-            other => invalid(format!(
-                "evaluating mappingTemplate over inputFileContent failed: {other}"
-            )),
+            other => jsonata_refusal(template, &other),
         })?;
 
     // The result's size is decided BEFORE it is serialized: `Value::serialize` builds the

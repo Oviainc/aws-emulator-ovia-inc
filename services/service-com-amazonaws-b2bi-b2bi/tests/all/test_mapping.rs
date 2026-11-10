@@ -391,7 +391,10 @@ async fn the_identity_template_round_trips_any_input_document() {
 
 /// An `inputFileContent` that is not a well-formed document of the declared format is
 /// refused with the modelled `ValidationException` (HTTP 400) — never mapped, and never
-/// answered with a 501, which would claim the operation is unimplemented.
+/// answered with a 501, which would claim the operation is unimplemented. The sentence is
+/// the JSON parser's own diagnostic of where the document stopped parsing, with the
+/// document itself withheld (`aws_worded_refusals.rs` asserts that wording over a table of
+/// its own).
 #[tokio::test]
 async fn a_malformed_input_document_is_refused_as_a_validation_exception() {
     let router = b2bi_router();
@@ -426,32 +429,45 @@ async fn a_malformed_input_document_is_refused_as_a_validation_exception() {
             "case {case:?}: expected ValidationException, got {body}"
         );
         // `Message` is the member this service's model declares (capital M).
+        let message = body["Message"].as_str().unwrap_or_default();
         assert!(
-            body["Message"]
-                .as_str()
-                .is_some_and(|message| message.contains("inputFileContent")),
-            "case {case:?}: the refusal must name inputFileContent, got {body}"
+            message.contains("at [Source: REDACTED"),
+            "case {case:?}: the refusal must carry the parser's own diagnostic with the \
+             document withheld, got {body}"
+        );
+        assert!(
+            !message.contains("inputFileContent"),
+            "case {case:?}: the parser's diagnostic names no input member, got {body}"
         );
     }
 }
 
 /// A `mappingTemplate` the JSONata interpreter will not accept is refused the same way:
-/// a 400 `ValidationException` naming the member, with the interpreter's own account of
-/// the failure.
+/// a 400 `ValidationException` carrying the engine's own account of the failure under the
+/// fixed clause it reports a JSONata failure with (`jsonata_probe.rs` asserts that
+/// wording over a table of its own), or — for the one template this emulator refuses
+/// BEFORE the engine sees it, because its scan cannot read past an unterminated literal —
+/// this service's own sentence naming the member.
 #[tokio::test]
 async fn an_unusable_mapping_template_is_refused_as_a_validation_exception() {
     let router = b2bi_router();
 
-    let cases: &[(&str, &str)] = &[
-        ("unclosed parenthesis", "("),
-        ("dangling operator", "1 +"),
-        ("unterminated string", r#""abc"#),
-        ("unclosed object constructor", r#"{"a": 1"#),
-        ("unknown function", "$notAFunction(a)"),
-        ("arithmetic on a string member", r#""text" - 1"#),
+    /// The fixed clause a refusal carrying the engine's diagnosis begins with.
+    const JSONATA_FAILURE: &str = "JSONata error. Failed to map input file:";
+
+    // (case, the template, whether the ENGINE is what diagnosed it)
+    let cases: &[(&str, &str, bool)] = &[
+        ("unclosed parenthesis", "(", true),
+        ("dangling operator", "1 +", true),
+        // Refused by this emulator's own pre-parse scan, which cannot read past an
+        // unterminated literal, so there is no engine diagnosis to report.
+        ("unterminated string", r#""abc"#, false),
+        ("unclosed object constructor", r#"{"a": 1"#, true),
+        ("unknown function", "$notAFunction(a)", true),
+        ("arithmetic on a string member", r#""text" - 1"#, true),
     ];
 
-    for (case, template) in cases {
+    for (case, template, engine_diagnosed) in cases {
         let (status, body) = test_mapping(&router, "JSON", r#"{"a":1}"#, template).await;
         assert_eq!(
             status, 400,
@@ -465,12 +481,19 @@ async fn an_unusable_mapping_template_is_refused_as_a_validation_exception() {
         // `Message`, not `message`: this service's model names
         // `ValidationException$Message` with a capital M, and the emulator renders the
         // member the model declares.
-        assert!(
-            body["Message"]
-                .as_str()
-                .is_some_and(|message| message.contains("mappingTemplate")),
-            "case {case:?}: the refusal must name mappingTemplate, got {body}"
-        );
+        let message = body["Message"].as_str().unwrap_or_default();
+        if *engine_diagnosed {
+            assert!(
+                message.starts_with(JSONATA_FAILURE),
+                "case {case:?}: the refusal must carry the engine's diagnosis under \
+                 {JSONATA_FAILURE:?}, got {body}"
+            );
+        } else {
+            assert!(
+                message.contains("mappingTemplate"),
+                "case {case:?}: the refusal must name mappingTemplate, got {body}"
+            );
+        }
     }
 }
 

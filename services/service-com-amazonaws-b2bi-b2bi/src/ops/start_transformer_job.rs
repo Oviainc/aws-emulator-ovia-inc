@@ -607,10 +607,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(crate::state::TokenReplay::InFlight) => {
                         return Err(StartTransformerJobErrorModeled::ConflictException(
                             ConflictException {
-                                message: crate::state::create_in_flight(
-                                    "transformer job",
-                                    input.client_token.as_deref().unwrap_or_default(),
-                                ),
+                                message: crate::state::CLIENT_TOKEN_IN_FLIGHT.to_string(),
                             },
                         )
                         .into())

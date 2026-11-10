@@ -12,6 +12,9 @@
 //!
 //! Both checks delegate to a maintained parser — `serde_json` for JSON, `quick-xml` for
 //! XML — rather than to hand-written syntax rules, and report that parser's own message.
+//! For JSON that message is the whole refusal ([`json_parse_diagnostic`]): the parser
+//! states what the parse stopped on and where, and a service surfaces that diagnostic
+//! rather than its own account of the member the document arrived in.
 //!
 //! Beside them sits [`to_document_text`], the JSON LAYOUT a generated mapping template is
 //! written in: `CreateStarterMappingTemplate`'s `mappingTemplate` is modelled as a plain
@@ -30,9 +33,51 @@ pub const XML: &str = "XML";
 /// leaves unset).
 pub const NOT_USED: &str = "NOT_USED";
 
-/// Parse `content` as a JSON document, answering `serde_json`'s own message on failure.
+/// Parse `content` as a JSON document, answering the parser's own diagnostic of where the
+/// parse stopped on failure ([`json_parse_diagnostic`]).
 pub fn parse_json(content: &str) -> Result<::serde_json::Value, String> {
-    ::serde_json::from_str(content).map_err(|failure| failure.to_string())
+    ::serde_json::from_str(content).map_err(|failure| json_parse_diagnostic(content, &failure))
+}
+
+/// WHERE a JSON document the caller submitted stopped parsing, as the JSON parser states
+/// it: what the parse stopped on, what belonged there instead, and the position — with the
+/// document itself withheld.
+///
+/// This is the WHOLE sentence a request carrying an unparsable JSON document is refused
+/// with: it names no input member, because the diagnostic is the parser's own rather than
+/// this service's account of the member, and it reports the source as redacted rather than
+/// echoing a document that may be sensitive back to the caller.
+///
+/// Every reading in it — the offending character and its character code, the word a parse
+/// stopped on where a value belongs, the expectation at that position, and the line and
+/// column — is the tree's shared one ([`::service_common::json_parse_fault`]), taken from
+/// the parse that actually ran, so two services handed one document cannot disagree about
+/// where it went wrong.
+pub fn json_parse_diagnostic(content: &str, failure: &::serde_json::Error) -> String {
+    use ::service_common::json_parse_fault as fault;
+
+    // A document that stops on an unquoted word where a value belongs is reported by
+    // naming that WORD, at the position the word starts; every other fault names the
+    // character the parse stopped on, or the end of the input, at the position the parse
+    // itself reports.
+    let (diagnosis, line, column) = match fault::unrecognized_token(content, failure) {
+        Some((word, line, column)) => (
+            format!(
+                "Unrecognized token '{word}': was expecting ({})",
+                fault::VALUE_CLASSES
+            ),
+            line,
+            column,
+        ),
+        None => {
+            let (line, column) = fault::stopped_at(content, failure);
+            (fault::unexpected_input(content, failure), line, column)
+        }
+    };
+    format!(
+        "{diagnosis} at {}",
+        fault::location_clause(fault::REDACTED_SOURCE, line, column)
+    )
 }
 
 /// Render `document` as the pretty-printed JSON TEXT a GENERATED mapping template is
