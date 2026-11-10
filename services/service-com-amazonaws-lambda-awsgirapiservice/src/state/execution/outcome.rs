@@ -65,7 +65,13 @@ pub enum Completion {
     /// Such a handler's answer is what it WROTE rather than what it returned, so the
     /// boundaries here are the handler's own writes — which is what a streaming caller
     /// reads as the stream's chunks.
-    Streamed(Vec<String>),
+    Streamed {
+        /// The writes the handler made, in order.
+        chunks: Vec<String>,
+        /// The failure the handler came to once it had already written, when it failed;
+        /// see [`StreamFailure`].
+        failure: Option<StreamFailure>,
+    },
     /// The handler (or the runtime resolving it) raised.
     Raised {
         /// The exception's type name, or the `Runtime.*` class of a runtime failure.
@@ -79,6 +85,24 @@ pub enum Completion {
     Stopped(Stop),
     /// The interpreter itself could not be built or driven. Not a guest failure.
     Internal(String),
+}
+
+/// The failure a RESPONSE-STREAMING handler came to AFTER it had already written to its
+/// response stream.
+///
+/// A stream that has carried bytes cannot be withdrawn, so the bytes already written stay
+/// the answer and the failure is reported BESIDE them — which is what lets a streaming
+/// caller tell a complete response from one cut short. A handler that failed before its
+/// first write wrote nothing and carries no failure here: it delivered no bytes, and its
+/// error is in the run's log alone.
+#[derive(Debug, Clone)]
+pub struct StreamFailure {
+    /// The exception's type name.
+    pub error_type: String,
+    /// The exception's message.
+    pub error_message: String,
+    /// The handler's own stack, one formatted frame per entry.
+    pub stack_trace: Vec<String>,
 }
 
 /// One finished run.

@@ -557,17 +557,22 @@ async fn the_local_clock_is_the_zone_the_function_configures() {
 
 /// A RESPONSE-STREAMING handler's answer is the bytes it WROTE, in the order it wrote
 /// them. The stream is the answer, so one that has been begun cannot be withdrawn: a
-/// handler that fails delivers what it had written and nothing more, with no error code on
-/// the invocation, and its failure is reported in the run's log as the one `Invoke Error`
-/// record the runtime writes for it. One row per way such a handler can end.
+/// handler that fails delivers what it had written and nothing more, and the failure that
+/// cut it short IS reported on the invocation — so a client can tell those bytes from a
+/// complete response — while a handler that failed before its first write began no stream
+/// and reports no error code at all. Either failure is reported in the run's log as the one
+/// `Invoke Error` record the runtime writes for it. One row per way such a handler can end.
 #[tokio::test]
 async fn a_response_streaming_handlers_answer_is_what_it_wrote() {
-    let cases: &[(&str, &str, &str, bool)] = &[
+    // The case, the handler, the bytes the caller is delivered, the `FunctionError` the
+    // invocation reports, and whether the run wrote an `Invoke Error` record.
+    let cases: &[(&str, &str, &str, Option<&str>, bool)] = &[
         (
             "a handler that writes and ends",
             "exports.handler = awslambda.streamifyResponse(async (event, stream) => { \
              stream.write('first\\n'); stream.write('second\\n'); stream.end(); });",
             "first\nsecond\n",
+            None,
             false,
         ),
         (
@@ -575,6 +580,7 @@ async fn a_response_streaming_handlers_answer_is_what_it_wrote() {
             "exports.handler = awslambda.streamifyResponse(async () => { \
              throw new Error('threw before writing'); });",
             "",
+            None,
             true,
         ),
         (
@@ -582,20 +588,20 @@ async fn a_response_streaming_handlers_answer_is_what_it_wrote() {
             "exports.handler = awslambda.streamifyResponse(async (event, stream) => { \
              stream.write('partial\\n'); throw new Error('threw after writing'); });",
             "partial\n",
+            Some("Unhandled"),
             true,
         ),
     ];
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
-    for (index, (case, source, expected, failed)) in cases.iter().enumerate() {
+    for (index, (case, source, expected, function_error, failed)) in cases.iter().enumerate() {
         let name = format!("streaming-{index}");
         create_function(&router, &name, &[("index.js", source)], json!({})).await;
         let (answered, log) = invoke_with_log(&router, &name).await;
         assert_eq!(
-            answered.function_error(),
-            None,
-            "case {case}: a stream that has begun carries no error code on the invocation, \
-             got {}",
+            answered.function_error().as_deref(),
+            *function_error,
+            "case {case}: expected the function error {function_error:?}, got {}",
             answered.text()
         );
         assert_eq!(

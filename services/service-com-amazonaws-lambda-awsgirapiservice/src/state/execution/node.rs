@@ -73,7 +73,7 @@ use super::package::PackageModule;
 
 // What one run may spend and what it came to are the same for every engine, so they are
 // the shared ones ([`super::outcome`]) rather than this engine's own.
-pub use super::outcome::{Budget, Completion, Finished, Stop};
+pub use super::outcome::{Budget, Completion, Finished, Stop, StreamFailure};
 
 /// The core modules this emulator supplies to a run.
 mod core_modules;
@@ -700,7 +700,19 @@ fn read_completion(answered: &str, bounds: &Arc<Bounds>) -> Completion {
             if chunks.iter().map(String::len).sum::<usize>() > bounds.response_bytes {
                 return Completion::Stopped(bounds.breach(Stop::Response));
             }
-            Completion::Streamed(chunks)
+            // A streaming handler that failed once its stream had already carried bytes
+            // reports that failure beside the writes, and the runtime reports it only then
+            // ([`runtime`]'s `callStreamingHandler`): the bytes stay the answer, and the
+            // failure is what the stream's trailer names.
+            let failure = document
+                .get("errorType")
+                .and_then(::serde_json::Value::as_str)
+                .map(|error_type| StreamFailure {
+                    error_type: error_type.to_string(),
+                    error_message: member("errorMessage"),
+                    stack_trace: traced(&document),
+                });
+            Completion::Streamed { chunks, failure }
         }
         Some("raised") => {
             let error_type = member("errorType");
@@ -721,21 +733,26 @@ fn read_completion(answered: &str, bounds: &Arc<Bounds>) -> Completion {
             Completion::Raised {
                 error_type,
                 error_message,
-                stack_trace: document
-                    .get("trace")
-                    .and_then(::serde_json::Value::as_array)
-                    .map(|frames| {
-                        frames
-                            .iter()
-                            .filter_map(::serde_json::Value::as_str)
-                            .map(str::to_string)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                stack_trace: traced(&document),
             }
         }
         _ => Completion::Internal("the runtime answered with no outcome".into()),
     }
+}
+
+/// The formatted frames of the stack the runtime reported on `document`, one per entry.
+fn traced(document: &::serde_json::Value) -> Vec<String> {
+    document
+        .get("trace")
+        .and_then(::serde_json::Value::as_array)
+        .map(|frames| {
+            frames
+                .iter()
+                .filter_map(::serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The JSON document the runtime source is handed.
@@ -1310,7 +1327,13 @@ mod tests {
                 "a handler the module does not export",
                 "exports.other = async () => 1;",
                 "Runtime.HandlerNotFound",
-                "index.handler is undefined or not a function",
+                "index.handler is undefined or not exported",
+            ),
+            (
+                "an export that is not a function",
+                "exports.handler = 'not callable';",
+                "Runtime.HandlerNotFound",
+                "index.handler is not a function",
             ),
             (
                 "a module that does not load",
@@ -1327,8 +1350,8 @@ mod tests {
             (
                 "a value that cannot be serialized",
                 "exports.handler = async () => { const held = {}; held.self = held; return held; };",
-                "TypeError",
-                "circular",
+                "Error",
+                "Unable to stringify response body",
             ),
         ];
         for (case, source, error_type, message) in cases {

@@ -511,7 +511,14 @@ async fn an_unhandled_node_handler_error_is_a_two_hundred_with_the_trace_documen
             &[("index.js", "exports.other = async () => 1;")],
             "index.handler",
             "Runtime.HandlerNotFound",
-            "index.handler is undefined or not a function",
+            "index.handler is undefined or not exported",
+        ),
+        (
+            "an export the module holds that is not a function",
+            &[("index.js", "exports.handler = { not: 'callable' };")],
+            "index.handler",
+            "Runtime.HandlerNotFound",
+            "index.handler is not a function",
         ),
         (
             "a module that does not load",
@@ -553,8 +560,15 @@ async fn an_unhandled_node_handler_error_is_a_two_hundred_with_the_trace_documen
                  return held; };",
             )],
             "index.handler",
-            "TypeError",
-            "circular",
+            "Error",
+            "Unable to stringify response body",
+        ),
+        (
+            "a value no JSON text can carry",
+            &[("index.js", "exports.handler = async () => ({ big: 1n });")],
+            "index.handler",
+            "Error",
+            "Unable to stringify response body",
         ),
         (
             "a malformed handler name",

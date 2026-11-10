@@ -336,7 +336,7 @@ pub use execution::{
     durable_data_key_fault, engine_for, environment_key_fault, function_sdk_access,
     invocation_trace_context, layer_archives, log_target, mint_request_id, run_invocation,
     runs_handler, supplied_trace_header, AwsAccess, Engine, EnvironmentKeyFault, Invocation,
-    Invoked, LogTarget, Unrunnable,
+    Invoked, LogTarget, Unrunnable, FUNCTION_ERROR_UNHANDLED,
 };
 
 /// How large a stored .zip archive is once EXPANDED — the second size Lambda reports for a

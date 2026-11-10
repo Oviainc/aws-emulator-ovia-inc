@@ -53,7 +53,13 @@ pub fn run_outcome(run: &Result<Invoked, Unrunnable>) -> DurableOutcome {
                 .filter(|result| !result.is_empty()),
         );
     }
-    let document = ::serde_json::from_slice::<::serde_json::Value>(&invoked.payload).ok();
+    // The document the run FAILED with, wherever the run keeps it: for a response-streaming
+    // run the payload is the bytes the handler had already written and the document is kept
+    // beside them, so one failure is read the same way however it was produced
+    // ([`Invoked::error_document`]).
+    let document = invoked
+        .error_document()
+        .and_then(|document| ::serde_json::from_str::<::serde_json::Value>(&document).ok());
     let member = |name: &str| {
         document
             .as_ref()

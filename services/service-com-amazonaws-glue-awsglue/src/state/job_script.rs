@@ -706,7 +706,7 @@ fn read_outcome(completion: &python::Completion) -> JobRunOutcome {
     match completion {
         // A Glue job script is a program rather than a function, so what it ANSWERED is not
         // part of the run: a script that ran to its end exited cleanly.
-        python::Completion::Returned(_) | python::Completion::Streamed(_) => {
+        python::Completion::Returned(_) | python::Completion::Streamed { .. } => {
             JobRunOutcome::Succeeded
         }
         python::Completion::Raised {

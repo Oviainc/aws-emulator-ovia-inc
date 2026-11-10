@@ -82,6 +82,9 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
 
     var state = null;
     var cache = Object.create(null);
+    // The modules a `require` is currently inside, outermost first: the chain a module that
+    // cannot be found names as the REQUIRE STACK of the failure ([`requireNotFound`]).
+    var loading = [];
     var timers = [];
     var nextTimerId = 1;
     // The major version of the managed runtime this invocation names, which is what the
@@ -98,6 +101,9 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     var RUNTIME_PREFIX = 'runtime:';
     var LAYER_ROOT = '/opt';
     var RUNTIME_ROOT = '/var/runtime';
+    // The runtime's OWN entry module, which is what requires the handler's module: the
+    // outermost entry of every require stack a failed resolution reports.
+    var RUNTIME_ENTRY = RUNTIME_ROOT + '/index.mjs';
     var FILE_URL_PREFIX = 'file://';
 
     function rootOf(id) {
@@ -370,6 +376,36 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         return error;
     }
 
+    // The failure a REQUIRE of a specifier that resolves to nothing throws: the message a
+    // node runtime writes for it, which names the specifier and then the REQUIRE STACK —
+    // the files that were requiring, innermost first, ending at the runtime's own entry
+    // module. The stack is what tells a caller WHERE the missing module was asked for, so a
+    // packaging error can be told apart from a handler-name one.
+    //
+    // An `import` that resolves to nothing fails with [`moduleNotFound`] instead: a module
+    // the engine's own loader resolves is reached through no require chain, so there is no
+    // require stack to name.
+    function requireNotFound(request, frames) {
+        var stack = frames === undefined || frames === null ? requireStack() : frames;
+        var error = new Error(
+            "Cannot find module '" + request + "'\nRequire stack:\n- " + stack.join('\n- ')
+        );
+        error.code = 'MODULE_NOT_FOUND';
+        error.requireStack = stack;
+        return error;
+    }
+
+    // The files a require is currently inside, innermost first, ending at the runtime's own
+    // entry module — which is the module that requires the handler's.
+    function requireStack() {
+        var frames = [];
+        for (var index = loading.length - 1; index >= 0; index -= 1) {
+            frames.push(loading[index]);
+        }
+        frames.push(RUNTIME_ENTRY);
+        return frames;
+    }
+
     // ---------------------------------------------------------------- module loading
 
     // Whether the nearest `package.json` above `path` declares its files to be ES
@@ -406,18 +442,23 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         return declaredEsModule(id);
     }
 
-    function requireFrom(directory) {
+    // The `require` ONE module scope is given: it resolves from that module's own
+    // directory, and a specifier it cannot resolve fails naming that module's own require
+    // stack — `frames` — rather than whatever happens to be loading when the call is made.
+    // A module keeps its `require` after it has loaded, and so keeps the chain it was
+    // loaded through, which is the chain node names.
+    function requireFrom(directory, frames) {
         var required = function (request) {
             var id = resolveRequest(directory, request);
             if (id === null) {
-                throw moduleNotFound(request);
+                throw requireNotFound(request, frames);
             }
             return requireId(id);
         };
         required.resolve = function (request) {
             var id = resolveRequest(directory, request);
             if (id === null) {
-                throw moduleNotFound(request);
+                throw requireNotFound(request, frames);
             }
             return filenameOf(id);
         };
@@ -444,7 +485,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         var core = id.indexOf(CORE_PREFIX) === 0;
         var source = core ? coreSourceOf(id.slice(CORE_PREFIX.length)) : sourceOf(id);
         if (source === null) {
-            throw moduleNotFound(core ? id.slice(CORE_PREFIX.length) : filenameOf(id));
+            throw requireNotFound(core ? id.slice(CORE_PREFIX.length) : filenameOf(id));
         }
         var filename = filenameOf(id);
         var directory = core ? '' : directoryOf(id);
@@ -457,6 +498,11 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             paths: core ? [] : searchPaths(directory)
         };
         cache[id] = module;
+        // Inside this module from here on: a require it makes that resolves to nothing names
+        // this file as the innermost frame of its require stack, over the chain it was itself
+        // reached through.
+        loading.push(filename);
+        var frames = requireStack();
         try {
             if (!core && endsWith(id, '.json')) {
                 module.exports = JSON.parse(source);
@@ -488,7 +534,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
                 compiled.call(
                     module.exports,
                     module.exports,
-                    requireFrom(directory),
+                    requireFrom(directory, frames),
                     module,
                     filename,
                     core ? 'node:' + id.slice(CORE_PREFIX.length) : filenameOf(directory)
@@ -498,6 +544,8 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         } catch (error) {
             delete cache[id];
             throw error;
+        } finally {
+            loading.pop();
         }
         return module.exports;
     }
@@ -1101,6 +1149,10 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         }
     }
 
+    // What the runtime reports for a value its response serializer cannot turn into JSON;
+    // see [`serialized`].
+    var UNSTRINGIFIABLE_RESPONSE = 'Unable to stringify response body';
+
     // A failure of the RUNTIME rather than of a value the handler threw. Its trace is the
     // one line an error with no stack has — the "<ErrorType>: <message>" line every node
     // trace starts with.
@@ -1190,12 +1242,20 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         settle(reported);
     }
 
+    // The response the runtime answers for a value the handler produced: that value as
+    // JSON text.
+    //
+    // A value the serializer cannot turn into JSON fails the invocation as the RUNTIME's own
+    // `Error` — "Unable to stringify response body" — rather than as the class the engine
+    // raised for the value it refused (a circular structure, a BigInt): what failed is the
+    // runtime's attempt to answer with that value, so that is the error reported, and it is
+    // recorded in the invocation's log the way every failed invocation is.
     function serialized(value) {
         var payload;
         try {
             payload = JSON.stringify(value === undefined ? null : value);
         } catch (error) {
-            return raised(error);
+            return handlerFailure(new Error(UNSTRINGIFIABLE_RESPONSE));
         }
         if (payload === undefined) {
             payload = 'null';
@@ -1255,7 +1315,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         var inside = packagePath('', modulePath);
         var id = inside === null ? null : fileCandidate(inside);
         if (id === null) {
-            return Promise.reject(moduleNotFound(modulePath));
+            return Promise.reject(requireNotFound(modulePath));
         }
         if (esModuleFile(id)) {
             // Why this file is an ES module, for the error of a module that reaches for a
@@ -1395,12 +1455,25 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         return Promise.resolve(entry(event, stream, context)).then(streamed, function (error) {
             // A response-streaming invocation's answer is the stream, and a stream that has
             // been begun cannot be withdrawn: what the caller is delivered is the bytes the
-            // handler wrote, and the failure is reported in the invocation's LOG — the
-            // `Invoke Error` record below — which is where a streaming client reads what a
-            // run came to. A handler that failed before its first write therefore delivers
-            // no bytes and no error code, and its failure is in the log.
-            logInvokeError(raised(error));
-            return streamed();
+            // handler wrote, and the failure is reported BESIDE them, so the stream's
+            // trailer can name the error that cut the response short. The failure is also
+            // in the invocation's LOG — the `Invoke Error` record below — which is where a
+            // streaming client reads what a run came to. A handler that failed before its
+            // first write delivers no bytes and no error code: the stream was never begun,
+            // so there is nothing for an error to have truncated, and its failure is in the
+            // log alone.
+            var reported = raised(error);
+            logInvokeError(reported);
+            if (chunks.length === 0) {
+                return streamed();
+            }
+            return {
+                outcome: 'streamed',
+                chunks: chunks,
+                errorType: reported.errorType,
+                errorMessage: reported.errorMessage,
+                trace: reported.trace
+            };
         });
     }
 
@@ -1453,10 +1526,19 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         }
         return loadHandlerModule(split.module).then(function (exported) {
             var entry = property(exported, split.path);
+            // The two ways the handler string names nothing callable, each reported the
+            // way a node runtime words it: an export the module does not have at all, and
+            // an export it has that is not a function.
+            if (entry === null || entry === undefined) {
+                return runtimeFailure(
+                    'Runtime.HandlerNotFound',
+                    input.handler + ' is undefined or not exported'
+                );
+            }
             if (typeof entry !== 'function') {
                 return runtimeFailure(
                     'Runtime.HandlerNotFound',
-                    input.handler + ' is undefined or not a function'
+                    input.handler + ' is not a function'
                 );
             }
             var event;

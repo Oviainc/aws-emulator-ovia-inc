@@ -443,9 +443,31 @@ pub struct Invoked {
     /// returned a value instead. A streaming caller is delivered one chunk per entry, so
     /// the chunk boundaries it sees are the handler's own.
     pub chunks: Vec<Vec<u8>>,
+    /// The error document of a failure a response-streaming handler came to AFTER it had
+    /// already written, where [`Invoked::payload`] is the bytes it had written rather than
+    /// that document.
+    ///
+    /// Absent for every other run, where the payload IS the document; see
+    /// [`Invoked::error_document`].
+    pub stream_failure: Option<Vec<u8>>,
 }
 
 impl Invoked {
+    /// The error document this run failed with, or `None` for a run that did not fail.
+    ///
+    /// For almost every run the response payload IS that document, which is what an
+    /// unhandled error answers with. A RESPONSE-STREAMING run is the exception: its payload
+    /// is the bytes the handler had already written, so the document is kept beside them
+    /// ([`Invoked::stream_failure`]) and is what the stream's trailer reports as the details
+    /// of the error that cut the response short.
+    #[must_use]
+    pub fn error_document(&self) -> Option<String> {
+        self.function_error.as_ref().map(|_| {
+            let document = self.stream_failure.as_ref().unwrap_or(&self.payload);
+            String::from_utf8_lossy(document).to_string()
+        })
+    }
+
     /// The `LogResult` for this run: "The last 4 KB of the execution log, which is
     /// base64-encoded."
     #[must_use]
@@ -776,11 +798,19 @@ fn answered(
     let (payload, function_error) = match &finished.completion {
         Completion::Returned(payload) => (payload.clone().into_bytes(), None),
         // A response-streaming handler's answer is the bytes it WROTE. The stream IS the
-        // answer, and one that has been begun cannot be withdrawn, so no failure is
-        // attributed to the invocation: the caller is delivered what the handler wrote, and
-        // a handler that failed before its first write delivers nothing. Its failure is in
-        // the run's LOG, as the `Invoke Error` record the runtime writes for it.
-        Completion::Streamed(chunks) => (chunks.concat().into_bytes(), None),
+        // answer, and one that has been begun cannot be withdrawn, so those bytes stay the
+        // answer whatever the handler went on to do — and a handler that failed ONCE IT HAD
+        // WRITTEN fails the invocation beside them, so the stream's trailer names the error
+        // that cut the response short and the client can tell a complete response from a
+        // truncated one. A handler that failed before its first write delivers no bytes and
+        // no error code: nothing was begun for an error to have truncated, and its failure
+        // is in the run's LOG alone, as the `Invoke Error` record the runtime writes for it.
+        Completion::Streamed { chunks, failure } => (
+            chunks.concat().into_bytes(),
+            failure
+                .as_ref()
+                .map(|_| FUNCTION_ERROR_UNHANDLED.to_string()),
+        ),
         Completion::Raised {
             error_type,
             error_message,
@@ -882,10 +912,26 @@ fn answered(
         log: log.text(),
         duration: finished.elapsed,
         chunks: match &finished.completion {
-            Completion::Streamed(chunks) => {
+            Completion::Streamed { chunks, .. } => {
                 chunks.iter().map(|chunk| chunk.clone().into_bytes()).collect()
             }
             _ => Vec::new(),
+        },
+        // The error document of a failure that came once the stream had already carried
+        // bytes: the payload is those bytes, so the document is kept here for the trailer
+        // that reports it.
+        stream_failure: match &finished.completion {
+            Completion::Streamed {
+                failure: Some(failure),
+                ..
+            } => Some(error_document(
+                &failure.error_message,
+                Some(&failure.error_type),
+                request_id,
+                &failure.stack_trace,
+                engine,
+            )),
+            _ => None,
         },
     }
 }
@@ -1665,6 +1711,7 @@ mod tests {
                 log_events: Vec::new(),
                 duration: Duration::ZERO,
                 chunks: Vec::new(),
+                stream_failure: None,
             };
             let decoded = ::base64::Engine::decode(
                 &::base64::engine::general_purpose::STANDARD,

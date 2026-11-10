@@ -541,13 +541,16 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
     }
 }
 
-/// The event-stream answer to a run: the handler's response as one `PayloadChunk`, then
+/// The event-stream answer to a run: one `PayloadChunk` per write the handler made, then
 /// the terminating `InvokeComplete`.
 ///
 /// A handler that RAISED still streams what it produced — "the details of any returned
-/// error" are the complete event's, which is where a streaming client reads them, so the
-/// error document travels as the chunk and the completion names the error. A chunk is
-/// written only when there is payload to write.
+/// error" are the complete event's, which is where a streaming client reads them. For a
+/// handler that never began a stream the error document travels as the chunk and the
+/// completion names the error; for one that failed after writing, the bytes it wrote travel
+/// as the chunks and the completion carries the error document as its details, so the client
+/// can tell those bytes are a response cut short. A chunk is written only when there is
+/// payload to write.
 fn streamed_response(
     protocol: &dyn ServerHttpProtocol,
     executed_version: &str,
@@ -573,10 +576,7 @@ fn streamed_response(
     }
     let complete = InvokeWithResponseStreamCompleteEvent {
         error_code: invoked.function_error.clone(),
-        error_details: invoked
-            .function_error
-            .as_ref()
-            .map(|_| String::from_utf8_lossy(&invoked.payload).to_string()),
+        error_details: invoked.error_document(),
         log_result: if tail_requested {
             Some(invoked.log_tail())
         } else {

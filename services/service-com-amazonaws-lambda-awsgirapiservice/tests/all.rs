@@ -257,6 +257,8 @@ mod invocation_refusal_diagnostics;
 mod invocation_run_capacity;
 #[path = "all/invoke_addressed_function.rs"]
 mod invoke_addressed_function;
+#[path = "all/invoke_durable_execution_handle.rs"]
+mod invoke_durable_execution_handle;
 #[path = "all/invoke_function_error_document.rs"]
 mod invoke_function_error_document;
 #[path = "all/invoke_request_id.rs"]
@@ -299,6 +301,8 @@ mod node_handler_sdk_esm;
 mod node_initialization_type;
 #[path = "all/node_invoke_run.rs"]
 mod node_invoke_run;
+#[path = "all/node_loader_errors.rs"]
+mod node_loader_errors;
 #[path = "all/node_runtime_environment.rs"]
 mod node_runtime_environment;
 #[path = "all/nodejs_invoke_run.rs"]
@@ -309,6 +313,8 @@ mod permission_and_policy_refusals;
 mod permission_principal_and_qualifier_rules;
 #[path = "all/policy_versions_and_resources.rs"]
 mod policy_versions_and_resources;
+#[path = "all/probe_loader.rs"]
+mod probe_loader;
 #[path = "all/provisioned_concurrency.rs"]
 mod provisioned_concurrency;
 #[path = "all/provisioned_concurrency_resolution.rs"]
@@ -337,6 +343,8 @@ mod reserved_tag_keys;
 mod resource_tags;
 #[path = "all/response_stream_invocation.rs"]
 mod response_stream_invocation;
+#[path = "all/response_stream_trailer.rs"]
+mod response_stream_trailer;
 #[path = "all/runtime_management_config.rs"]
 mod runtime_management_config;
 #[path = "all/s3_package_source.rs"]

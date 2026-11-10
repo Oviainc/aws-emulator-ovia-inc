@@ -481,7 +481,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store guard lives in THIS block and no longer: everything the run needs is
         // copied out of the record here, and the run below happens with no guard held, so
         // one caller's handler cannot stall another caller's request.
-        let (invocation, slot, function_name, resource, kms_key_arn) = {
+        let (invocation, slot, function_name, resource, kms_key_arn, version) = {
             let mut store = state.lock();
         let (record, version) = crate::state::resolve_function(
             &mut store,
@@ -857,6 +857,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 function_name,
                 resource,
                 kms_key_arn,
+                version,
             )
         };
         // The slot this invocation holds, released when it goes out of scope — which is when
@@ -884,6 +885,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(environment_key_refusal(fault));
         }
 
+        // An invocation of a DURABLE function starts a durable execution whatever the
+        // invocation type is: `DurableExecutionArn` is "The ARN of the durable execution
+        // that was started. This is returned when invoking a durable function", which is
+        // the handle every durable-execution operation addresses, so a client that invokes
+        // one synchronously has it too.
+        //
+        // It is started HERE, once this invocation is admitted and its environment key has
+        // answered and before the run begins: an invocation Lambda refuses runs nothing, so
+        // it registers no execution for something that will never run — and the execution
+        // this one does register is settled below on what its run comes to.
+        let started_durable = {
+            let mut store = state.lock();
+            match store.functions.get_mut(&function_name) {
+                // A function deleted while this invocation was being admitted holds nothing
+                // to register an execution on.
+                None => StartedDurableExecution::default(),
+                Some(record) => start_durable_execution(
+                    record,
+                    input.durable_execution_name.as_deref(),
+                    &version,
+                    &invocation.payload,
+                    now,
+                )?,
+            }
+        };
+        if started_durable.deduplicated {
+            // "If you invoke a durable function using a name that already exists with the
+            // same payload, Lambda returns the existing execution instead of creating a
+            // duplicate": the repeat is the SAME invocation answered again, so the handler
+            // does not run a second time and the answer is what the execution it names
+            // already came to — the result it returned, or the error it failed with under
+            // the `FunctionError` signal that failure carries.
+            let (payload, function_error) = deduplicated_answer(
+                &state,
+                &function_name,
+                input.durable_execution_name.as_deref(),
+            );
+            return Ok(InvokeOutput {
+                status_code: REQUEST_RESPONSE_STATUS,
+                executed_version: Some(executed_version),
+                function_error,
+                payload: Some(payload),
+                durable_execution_arn: started_durable.durable_execution_arn,
+                log_result: None,
+            });
+        }
+
         // "RequestResponse (default) – Invoke the function synchronously. Keep the
         // connection open until the function returns a response or times out. The API
         // response includes the function response and additional data." So the handler is
@@ -891,9 +939,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // unhandled error is still HTTP 200" — the error document and the `FunctionError`
         // signal for an exception it raised. "The status code in the API response doesn't
         // reflect function errors."
-        let invoked = crate::state::run_invocation(invocation)
-            .await
-            .map_err(unrunnable)?;
+        let invoked = crate::state::run_invocation(invocation).await;
+        // The run was the durable execution's own, so the execution ends in the status this
+        // invocation came to: a caller polling the handle it was answered sees a terminal
+        // status rather than `RUNNING` for ever (`crate::state::durable_run`).
+        if let Some(name) = &started_durable.execution_name {
+            crate::state::durable_run::settle(
+                &state,
+                &function_name,
+                name,
+                &crate::state::durable_run::run_outcome(&invoked),
+            );
+        }
+        let invoked = invoked.map_err(unrunnable)?;
         Ok(InvokeOutput {
             status_code: REQUEST_RESPONSE_STATUS,
             executed_version: Some(executed_version),
@@ -905,9 +963,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 _ => None,
             },
             payload: Some(invoked.payload),
-            ..InvokeOutput::default()
+            durable_execution_arn: started_durable.durable_execution_arn,
         })
     }
+}
+
+/// What a DE-DUPLICATED repeat answers: what the execution it names already came to.
+///
+/// "Lambda returns the existing execution instead of creating a duplicate", so the repeat is
+/// not a second run and invents no answer of its own — it reports the `Result` the execution
+/// returned, or, for one that FAILED, the error it holds as the two members every runtime's
+/// error document carries, under the `FunctionError` signal a failed invocation reports. An
+/// execution that has reached neither — one still running, started by an asynchronous
+/// invocation — has produced no answer yet, so there is none to report.
+fn deduplicated_answer(
+    state: &::engine::ServiceState<crate::state::ComAmazonawsLambdaAwsgirapiserviceState>,
+    function: &str,
+    name: Option<&str>,
+) -> (Vec<u8>, Option<String>) {
+    let mut store = state.lock();
+    let Some(execution) = name.and_then(|name| {
+        store
+            .functions
+            .get_mut(function)
+            .and_then(|record| record.durable_executions.get(name))
+    }) else {
+        return (Vec::new(), None);
+    };
+    if let Some(error) = execution.error.as_ref() {
+        let mut document = ::serde_json::Map::new();
+        if let Some(message) = error.error_message.as_ref() {
+            document.insert(
+                "errorMessage".to_string(),
+                ::serde_json::Value::String(message.clone()),
+            );
+        }
+        if let Some(error_type) = error.error_type.as_ref() {
+            document.insert(
+                "errorType".to_string(),
+                ::serde_json::Value::String(error_type.clone()),
+            );
+        }
+        return (
+            ::serde_json::Value::Object(document).to_string().into_bytes(),
+            Some(crate::state::FUNCTION_ERROR_UNHANDLED.to_string()),
+        );
+    }
+    (
+        execution
+            .result
+            .clone()
+            .unwrap_or_default()
+            .into_bytes(),
+        None,
+    )
 }
 
 /// How a key that cannot decrypt a function's environment variables is answered: the

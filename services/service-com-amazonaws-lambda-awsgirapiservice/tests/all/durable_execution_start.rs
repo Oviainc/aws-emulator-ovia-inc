@@ -658,8 +658,10 @@ struct NoStartCase {
     status: u16,
 }
 
-/// The rows: an invocation of a function that is not durable and names no execution, a dry
-/// run of a durable function, and a synchronous invocation nothing can run.
+/// The rows: an invocation of a function that is not durable and names no execution, and
+/// a dry run of a durable function. A SYNCHRONOUS invocation of a durable function does
+/// start one — "This is returned when invoking a durable function" is not qualified by the
+/// invocation type — and is covered by `invoke_durable_execution_handle`.
 fn no_start_cases() -> Vec<NoStartCase> {
     vec![
         NoStartCase {
@@ -675,13 +677,6 @@ fn no_start_cases() -> Vec<NoStartCase> {
             invocation_type: "DryRun",
             requested_name: Some("dry-run-execution"),
             status: 204,
-        },
-        NoStartCase {
-            case: "a synchronous invocation, whose package this suite stores unreadable",
-            durable: true,
-            invocation_type: "RequestResponse",
-            requested_name: Some("synchronous-execution"),
-            status: 502,
         },
     ]
 }
