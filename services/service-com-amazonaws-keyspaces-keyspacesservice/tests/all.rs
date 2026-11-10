@@ -15,6 +15,8 @@
 mod a_keyspace_takes_a_new_resource_before_it_settles;
 #[path = "all/auto_scaling_propagation.rs"]
 mod auto_scaling_propagation;
+#[path = "all/cdc_specification_omitted_view_type.rs"]
+mod cdc_specification_omitted_view_type;
 #[path = "all/cdc_specification_tags_on_update.rs"]
 mod cdc_specification_tags_on_update;
 #[path = "all/cdc_stream_tag_lifetime.rs"]

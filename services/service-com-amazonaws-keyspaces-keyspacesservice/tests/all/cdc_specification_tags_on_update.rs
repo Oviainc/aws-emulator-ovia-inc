@@ -84,7 +84,7 @@ const SHAPES: [Shape; 3] = [
 ];
 
 /// The tag set `ListTagsForResource` reports for one resource, as a map.
-async fn listed_tags(emulator: &Cdc, case: &str, resource_arn: &str) -> BTreeMap<String, String> {
+pub(crate) async fn listed_tags(emulator: &Cdc, case: &str, resource_arn: &str) -> BTreeMap<String, String> {
     let listed = assert_ok(
         case,
         emulator

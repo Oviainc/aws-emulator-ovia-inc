@@ -309,7 +309,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
         // "The CDC stream settings of the table": whether the table captures its changes
-        // to a stream from now on, and (for one being created) which images it publishes.
+        // to a stream from now on, and — only where one is being created — which images it
+        // publishes. A specification that names no `viewType` carries none here, so no
+        // defaulted selection can be read back as a selection the caller asked for.
         let cdc = crate::state::resolve_cdc(input.cdc_specification.as_ref());
         let to_tag_failure = |rejection: crate::state::TagRejection| -> UpdateTableError {
             UpdateTableErrorModeled::ValidationException(ValidationException {
@@ -446,15 +448,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|stream| (stream.stream_arn.clone(), stream.stream_view_type.clone()));
             // "The view type specifies the changes Amazon Keyspaces records for each
             // changed row in the stream. After you create the stream, you can't make
-            // changes to this selection." A request naming a different view type for a
+            // changes to this selection." A request NAMING a different view type for a
             // stream that already exists is refused, rather than silently ignored or
-            // applied to records the consumer is already reading.
+            // applied to records the consumer is already reading. `viewType` is an
+            // optional member, so a request that omits it asks for no selection at all
+            // and re-asserts the stream exactly as it stands — the modelled default is
+            // what a stream is MINTED with, never a change demanded of a live one.
             if let Some((_, view_type)) = live.as_ref().filter(|_| cdc.enabled) {
-                if view_type != &cdc.view_type {
+                if let Some(requested) = cdc
+                    .requested_view_type
+                    .as_deref()
+                    .filter(|requested| *requested != view_type.as_str())
+                {
                     return Err(invalid(format!(
                         "cdcSpecification.viewType is '{}' for the stream of table \
                          '{}.{}' and cannot be changed to '{}' while that stream exists",
-                        view_type, input.keyspace_name, input.table_name, cdc.view_type
+                        view_type, input.keyspace_name, input.table_name, requested
                     )));
                 }
             }
@@ -505,7 +514,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &region,
                         &input.keyspace_name,
                         &input.table_name,
-                        &cdc.view_type,
+                        cdc.view_type_for_new_stream(),
                     );
                     let Some(stream_arn) = enabled else {
                         // The store refuses only a view type outside the model's
@@ -516,7 +525,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 message: Some(format!(
                                     "Amazon Keyspaces could not enable a CDC stream \
                                      publishing viewType '{}' for table '{}.{}'.",
-                                    cdc.view_type, input.keyspace_name, input.table_name
+                                    cdc.view_type_for_new_stream(),
+                                    input.keyspace_name,
+                                    input.table_name
                                 )),
                             },
                         )

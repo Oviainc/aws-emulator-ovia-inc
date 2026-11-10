@@ -2691,11 +2691,17 @@ pub fn resolve_encryption(
 pub struct ResolvedCdc {
     /// Whether the table is to have a stream capturing its changes.
     pub enabled: bool,
-    /// The `ViewType` that stream publishes, defaulted when the specification omits it.
+    /// The `ViewType` the specification NAMED, and `None` when it carried none: the
+    /// model makes `CdcSpecification$viewType` optional, so a specification that omits
+    /// it asks for no particular selection at all.
+    ///
     /// It decides which images a record carries, which is fixed when the stream is
     /// created ("After you create the stream, you can't make changes to this
     /// selection"), so it says nothing about a table whose CDC is being turned off.
-    pub view_type: String,
+    /// Read it through [`ResolvedCdc::view_type_for_new_stream`] wherever a stream is
+    /// being MINTED — that is the only place the documented default belongs — and
+    /// through this field itself wherever the question is what the caller asked for.
+    pub requested_view_type: Option<String>,
     /// "The tags (key-value pairs) that you want to apply to the stream"
     /// (`CdcSpecification$tags`), exactly as supplied.
     pub tags: Vec<Tag>,
@@ -2704,12 +2710,33 @@ pub struct ResolvedCdc {
     pub propagate_table_tags: bool,
 }
 
+impl ResolvedCdc {
+    /// Which images a stream MINTED for this specification publishes: the view type the
+    /// specification named, and otherwise [`DEFAULT_CDC_VIEW_TYPE`]
+    /// (`CdcSpecification$viewType`: "both versions of the row, before and after the
+    /// change. This is the default").
+    ///
+    /// The default describes a stream being created, which is the only moment the
+    /// selection is chosen. It is never an instruction about a stream that already
+    /// exists, whose selection is already fixed — for that question ask
+    /// [`ResolvedCdc::requested_view_type`], which is empty exactly when the caller
+    /// named no view type and so asked for no change.
+    pub fn view_type_for_new_stream(&self) -> &str {
+        self.requested_view_type
+            .as_deref()
+            .unwrap_or(DEFAULT_CDC_VIEW_TYPE)
+    }
+}
+
 /// What a `cdcSpecification` asks for, or `None` when the request carries none.
 ///
 /// `CdcStatus` and `ViewType` are modelled enums, so the boundary validator has already
 /// refused a value outside either. What the model cannot state is which statuses ask for
 /// a capturing stream — `ENABLED`, and `ENABLING`, which is the status a stream already
-/// being brought up reports — and that the view type has a documented default.
+/// being brought up reports. The view type is carried through exactly as supplied,
+/// including its absence: the documented default is applied only where a stream is
+/// minted ([`ResolvedCdc::view_type_for_new_stream`]), never turned into a selection the
+/// caller never asked for.
 pub fn resolve_cdc(supplied: Option<&CdcSpecification>) -> Option<ResolvedCdc> {
     let specification = supplied?;
     Some(ResolvedCdc {
@@ -2717,10 +2744,7 @@ pub fn resolve_cdc(supplied: Option<&CdcSpecification>) -> Option<ResolvedCdc> {
             specification.status.as_str(),
             CDC_STATUS_ENABLED | CDC_STATUS_ENABLING
         ),
-        view_type: specification
-            .view_type
-            .clone()
-            .unwrap_or_else(|| DEFAULT_CDC_VIEW_TYPE.to_string()),
+        requested_view_type: specification.view_type.clone(),
         tags: specification.tags.clone().unwrap_or_default(),
         propagate_table_tags: specification.propagate_tags.as_deref()
             == Some(CDC_PROPAGATE_TAGS_TABLE),

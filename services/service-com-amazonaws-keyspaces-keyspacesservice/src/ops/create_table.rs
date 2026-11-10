@@ -469,7 +469,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &region,
                 &input.keyspace_name,
                 &input.table_name,
-                &cdc.view_type,
+                cdc.view_type_for_new_stream(),
             );
             let Some(stream_arn) = enabled else {
                 return Err(CreateTableErrorModeled::InternalServerException(
@@ -477,7 +477,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(format!(
                             "Amazon Keyspaces could not enable a CDC stream publishing \
                              viewType '{}' for table '{}.{}'.",
-                            cdc.view_type, input.keyspace_name, input.table_name
+                            cdc.view_type_for_new_stream(),
+                            input.keyspace_name,
+                            input.table_name
                         )),
                     },
                 )
