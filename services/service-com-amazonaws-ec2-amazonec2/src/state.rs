@@ -1973,6 +1973,14 @@ pub use ipv6_pools::*;
 pub mod traffic_mirror_sessions;
 pub use traffic_mirror_sessions::*;
 
+/// The Traffic Mirror target store's own primitives — the id prefix, the bounds, the byte
+/// charge and the error channel the Traffic Mirror target operations share, with the one
+/// write and the one removal path a target enters and leaves the store by. Re-exported, so
+/// a handler reaches them as `crate::state::<item>` like every other primitive of this
+/// module.
+pub mod traffic_mirror_targets;
+pub use traffic_mirror_targets::*;
+
 /// The VPC peering connections the account holds — what one is stored as, the status words,
 /// the `initiating-request` -> `pending-acceptance` move the clock owes a fresh request, the
 /// expiry of a request nobody answered, the store's bounds and its refusals — in a module of

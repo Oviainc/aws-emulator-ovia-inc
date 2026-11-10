@@ -1744,3 +1744,9 @@ mod create_transit_gateway_peering_attachment;
 // without cancelling anything. Declared beside `prefix_lists` for the reason the note above
 #[path = "all/spot_instance_request_cancellation.rs"]
 mod spot_instance_request_cancellation;
+// What `DeleteTrafficMirrorTarget` removes out of the Traffic Mirror target store, what it
+// refuses (an id naming no target, a target a session still mirrors to, a request naming no
+// id) and what it leaves alone. Declared at the tail of this file, which is where every new
+// ec2 suite lands, for the reason the note at the top records.
+#[path = "all/traffic_mirror_targets.rs"]
+mod traffic_mirror_targets;

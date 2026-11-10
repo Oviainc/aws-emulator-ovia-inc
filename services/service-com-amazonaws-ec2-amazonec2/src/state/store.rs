@@ -1205,6 +1205,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Traffic Mirror session until `CreateTrafficMirrorSession` mints one, and
     /// `DeleteTrafficMirrorSession` takes one back out. See [`traffic_mirror_sessions`].
     pub traffic_mirror_sessions: BTreeMap<String, crate::ops::types::TrafficMirrorSession>,
+    /// Every Traffic Mirror target the account holds, by `TrafficMirrorTargetId`, as the
+    /// modelled [`crate::ops::types::TrafficMirrorTarget`] shape itself — so a member a
+    /// writer sets round-trips through a describe without a field-by-field copy that can
+    /// silently drop one, the way [`Self::traffic_mirror_sessions`] holds a session. Ordered
+    /// by id, the one stable order a describe reports and pages over, so a pagination token
+    /// can name the id the next page starts at. Starts EMPTY: a fresh account holds no
+    /// Traffic Mirror target until `CreateTrafficMirrorTarget` mints one, and
+    /// `DeleteTrafficMirrorTarget` takes one back out. See [`traffic_mirror_targets`].
+    pub traffic_mirror_targets: BTreeMap<String, crate::ops::types::TrafficMirrorTarget>,
     /// Reservations by `ReservationId`.
     pub reservations: HashMap<String, ReservationRecord>,
     /// Reservation ids in launch order: the stable order `DescribeInstances`
@@ -3179,6 +3188,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             traffic_mirror_filters: BTreeMap::new(),
             traffic_mirror_filter_client_tokens: HashMap::new(),
             traffic_mirror_sessions: BTreeMap::new(),
+            traffic_mirror_targets: BTreeMap::new(),
             reservations: HashMap::new(),
             reservation_order: Vec::new(),
             instances: HashMap::new(),
