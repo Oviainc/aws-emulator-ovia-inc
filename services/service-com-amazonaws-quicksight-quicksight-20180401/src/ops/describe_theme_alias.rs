@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeThemeAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeThemeAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeThemeAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the alias stored under `(AwsAccountId, ThemeId, AliasName)`: the version of
+//! the theme that alias names. A read on stored state — an alias exists only because a
+//! `CreateThemeAlias` minted it, so a name none was minted under is not found.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +151,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeThemeAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeThemeAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeThemeAlias"))
+        // A report on stored state: nothing here writes to the store.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeThemeAliasErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(crate::state::next_request_id()),
+                },
+            )
+            .into());
+        };
+
+        let request_id = crate::state::next_request_id();
+        let store = state.lock();
+        let key = (input.aws_account_id, input.theme_id);
+        let Some(theme) = store.themes.get(&key) else {
+            let theme_arn = crate::state::theme_arn(&region, &key.0, &key.1);
+            return Err(DescribeThemeAliasErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Theme {theme_arn} is not found")),
+                    // `ExceptionResourceType` declares no member for a theme, so this
+                    // refusal reports none rather than an unmodelled value.
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        let Some(alias) = theme.alias(&input.alias_name) else {
+            return Err(DescribeThemeAliasErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Alias {} is not found", input.alias_name)),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeThemeAliasOutput {
+            theme_alias: Some(alias.to_theme_alias()),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

@@ -31,6 +31,8 @@ mod refresh_schedule_lifecycle;
 mod search_data_sets;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/theme_alias_lifecycle.rs"]
+mod theme_alias_lifecycle;
 #[path = "all/theme_lifecycle.rs"]
 mod theme_lifecycle;
 #[path = "all/topic_lifecycle.rs"]

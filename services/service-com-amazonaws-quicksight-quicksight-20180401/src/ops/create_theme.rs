@@ -276,6 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 created_time,
                 last_updated_time: created_time,
                 versions: vec![version],
+                // A create mints no alias: an alias is a name a later
+                // `CreateThemeAlias` gives one of the theme's versions.
+                aliases: std::collections::BTreeMap::new(),
                 permissions: input.permissions.unwrap_or_default(),
                 tags: input.tags.unwrap_or_default(),
             },

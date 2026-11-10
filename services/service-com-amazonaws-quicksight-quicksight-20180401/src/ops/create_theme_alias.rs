@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateThemeAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateThemeAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateThemeAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Gives one existing version of an existing theme a name of the caller's choosing,
+//! under `(AwsAccountId, ThemeId, AliasName)`, and reports the alias it stored. The
+//! alias holds no configuration of its own — it is a name for a version — so every
+//! later read resolves it to the version it points at.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +160,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateThemeAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateThemeAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateThemeAlias"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateThemeAliasErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(crate::state::next_request_id()),
+                },
+            )
+            .into());
+        };
+
+        let request_id = crate::state::next_request_id();
+        let region = crate::state::request_region(ctx.parts());
+
+        // The model's `AliasName` pattern admits the service's own keywords beside the
+        // names a caller mints, but this operation documents that an alias name can't
+        // begin with a `$`: such a name is reserved, so it names no alias a caller may
+        // create.
+        if input
+            .alias_name
+            .starts_with(crate::state::ALIAS_RESERVED_PREFIX)
+        {
+            return Err(
+                CreateThemeAliasErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "The alias name {} can't begin with {}.",
+                            input.alias_name,
+                            crate::state::ALIAS_RESERVED_PREFIX
+                        )),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        let key = (input.aws_account_id.clone(), input.theme_id.clone());
+        let Some(theme) = store.themes.get_mut(&key) else {
+            let theme_arn =
+                crate::state::theme_arn(&region, &input.aws_account_id, &input.theme_id);
+            return Err(CreateThemeAliasErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Theme {theme_arn} is not found")),
+                    // `ExceptionResourceType` declares no member for a theme, so this
+                    // refusal reports none rather than an unmodelled value.
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        // An alias is a name for a version that exists: a version the theme's history
+        // does not hold is nothing to point at. The refusal names the version by its
+        // ARN, the address the missing resource would have had.
+        if theme.version(input.theme_version_number).is_none() {
+            let version_arn = crate::state::theme_version_arn(
+                &region,
+                &input.aws_account_id,
+                &input.theme_id,
+                input.theme_version_number,
+            );
+            return Err(CreateThemeAliasErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Theme {version_arn} is not found")),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // An alias name is taken once: the name already names an alias of this theme.
+        if theme.aliases.contains_key(&input.alias_name) {
+            return Err(CreateThemeAliasErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: Some(format!("Alias {} already exists", input.alias_name)),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // The alias name comes from the request, so how many aliases one theme
+        // accumulates is the caller's to choose: this ceiling is what bounds it.
+        if theme.aliases.len() >= crate::state::MAX_THEME_ALIASES_PER_THEME {
+            return Err(CreateThemeAliasErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The theme with ID {} already holds the maximum of {} aliases.",
+                        theme.theme_id,
+                        crate::state::MAX_THEME_ALIASES_PER_THEME
+                    )),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::ThemeAliasRecord {
+            arn: crate::state::theme_alias_arn(
+                &region,
+                &input.aws_account_id,
+                &input.theme_id,
+                &input.alias_name,
+            ),
+            alias_name: input.alias_name.clone(),
+            theme_version_number: input.theme_version_number,
+        };
+        let theme_alias = record.to_theme_alias();
+        theme.aliases.insert(input.alias_name, record);
+
+        Ok(CreateThemeAliasOutput {
+            theme_alias: Some(theme_alias),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

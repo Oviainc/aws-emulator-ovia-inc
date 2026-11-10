@@ -7,7 +7,7 @@
 //! the model's enum catalogs — so the per-operation files in `src/ops/` share one
 //! implementation instead of each growing its own.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -21,7 +21,7 @@ use crate::ops::types::{
     PerformanceConfiguration, PhysicalTable, RefreshFrequency, RefreshSchedule,
     ResourcePermission,
     RowLevelPermissionDataSet, RowLevelPermissionTagConfiguration, SemanticModelConfiguration,
-    SslProperties, Tag, Theme, ThemeConfiguration, ThemeVersion, TopicDetails,
+    SslProperties, Tag, Theme, ThemeAlias, ThemeConfiguration, ThemeVersion, TopicDetails,
     VpcConnectionProperties,
 };
 
@@ -1072,6 +1072,13 @@ pub struct ThemeRecord {
     pub last_updated_time: DateTime,
     /// The theme's versions, in version-number order (so the last is the latest).
     pub versions: Vec<ThemeVersionRecord>,
+    /// The aliases a caller minted for this theme, keyed by `AliasName`.
+    ///
+    /// An alias belongs to one theme and its name identifies it inside that theme, so
+    /// it is held on the theme's own record: two themes of the same account can each
+    /// carry an alias of the same name, pointing at versions of their own. Ordered by
+    /// name so a read that pages through them has one stable order.
+    pub aliases: BTreeMap<String, ThemeAliasRecord>,
     pub permissions: Vec<ResourcePermission>,
     pub tags: Vec<Tag>,
 }
@@ -1081,6 +1088,11 @@ impl ThemeRecord {
     /// reports. A theme always has at least the version its create minted.
     pub fn latest_version(&self) -> Option<&ThemeVersionRecord> {
         self.versions.last()
+    }
+
+    /// The theme's alias named `alias_name`, if a caller minted one.
+    pub fn alias(&self, alias_name: &str) -> Option<&ThemeAliasRecord> {
+        self.aliases.get(alias_name)
     }
 
     /// The theme's version numbered `version_number`, if it has one.
@@ -1146,6 +1158,38 @@ impl ThemeVersionRecord {
             // emulator fails a theme creation.
             errors: None,
             status: Some(self.status_at(now).to_string()),
+        }
+    }
+}
+
+/// The prefix the model reserves on an `AliasName`: `CreateThemeAlias` documents that
+/// an alias name can't begin with a `$`, because names that do are the service's own
+/// keywords ([`ALIAS_LATEST`], [`ALIAS_PUBLISHED`]).
+pub const ALIAS_RESERVED_PREFIX: char = '$';
+
+/// How many aliases one theme may hold before a create refuses with the modelled
+/// `LimitExceededException`. Same standing as [`MAX_THEMES_PER_ACCOUNT`]: a fidelity
+/// limit on a map whose keys the caller chooses, not a published quota.
+pub const MAX_THEME_ALIASES_PER_THEME: usize = 1_000;
+
+/// A stored theme alias: the name a caller minted and the theme version it points at.
+///
+/// It holds no version of its own — an alias IS a name for one of the theme's
+/// versions, so a read resolves it to that version rather than to a copy of it.
+#[derive(Debug, Clone)]
+pub struct ThemeAliasRecord {
+    pub arn: String,
+    pub alias_name: String,
+    pub theme_version_number: i64,
+}
+
+impl ThemeAliasRecord {
+    /// The modelled `ThemeAlias` structure this record describes.
+    pub fn to_theme_alias(&self) -> ThemeAlias {
+        ThemeAlias {
+            arn: Some(self.arn.clone()),
+            alias_name: Some(self.alias_name.clone()),
+            theme_version_number: Some(self.theme_version_number),
         }
     }
 }
@@ -1431,6 +1475,21 @@ pub fn theme_version_arn(
         region,
         aws_account_id,
         &format!("theme/{theme_id}/version/{version_number}"),
+    )
+}
+
+/// The ARN of one alias of a theme: `.../theme/<ThemeId>/alias/<AliasName>` — an alias
+/// is a child of the theme it names a version of, so its ARN is scoped by that theme.
+pub fn theme_alias_arn(
+    region: &str,
+    aws_account_id: &str,
+    theme_id: &str,
+    alias_name: &str,
+) -> String {
+    quicksight_arn(
+        region,
+        aws_account_id,
+        &format!("theme/{theme_id}/alias/{alias_name}"),
     )
 }
 

@@ -212,20 +212,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             // Any other alias is one a caller minted with `CreateThemeAlias`, which
-            // stores the version it points at; the theme holds none under this name.
-            (Some(alias_name), _) => {
-                return Err(DescribeThemeErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Theme with ID {} has no alias {alias_name}.",
-                            record.theme_id
-                        )),
-                        resource_type: None,
-                        request_id: Some(request_id),
-                    },
-                )
-                .into());
-            }
+            // stored the version it points at: the read resolves it to that version,
+            // and a name no alias was minted under selects none.
+            (Some(alias_name), _) => match record.alias(alias_name) {
+                Some(alias) => match record.version(alias.theme_version_number) {
+                    Some(version) => Some(version),
+                    // The version an alias names is one the theme held when the alias
+                    // was minted, so the refusal names THAT version rather than the
+                    // version number this request did not carry.
+                    None => {
+                        return Err(DescribeThemeErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(format!(
+                                    "Theme with ID {} has no version {}.",
+                                    record.theme_id, alias.theme_version_number
+                                )),
+                                resource_type: None,
+                                request_id: Some(request_id),
+                            },
+                        )
+                        .into());
+                    }
+                },
+                None => {
+                    return Err(DescribeThemeErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "Theme with ID {} has no alias {alias_name}.",
+                                record.theme_id
+                            )),
+                            resource_type: None,
+                            request_id: Some(request_id),
+                        },
+                    )
+                    .into());
+                }
+            },
             (None, Some(version_number)) => record.version(version_number),
             (None, None) => record.latest_version(),
         };
