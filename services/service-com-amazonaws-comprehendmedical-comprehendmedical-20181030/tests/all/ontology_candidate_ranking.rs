@@ -10,7 +10,7 @@
 //!   that divide the mention's own confidence between them — so a client can page the
 //!   candidates for review and tell a confident match from a long-tail one;
 //! * a qualifier written as part of a condition's name carries the qualifier-value
-//!   concept it names in its own right FIRST and then the concepts of the mention it
+//!   concept it names in its own right, and not the concepts of the mention it
 //!   qualifies;
 //! * an age counts how old the person is, so a medical-condition analysis reports it
 //!   neither as a time expression of its own nor as the time of a condition, while a
@@ -327,56 +327,123 @@ async fn a_linked_mention_reports_the_ranked_candidates_of_its_own_family() {
     }
 }
 
-/// The candidates of a qualifier split off a condition's name: the qualifier value it
-/// names in its own right, and then the concepts of the mention it qualifies.
+/// The candidates an ATTRIBUTE reports are the concepts its OWN written form names: the
+/// modelled `SNOMEDCTAttribute` carries "the SNOMED-CT concepts specific to an
+/// attribute", while the entity's list answers what the ENTITY could refer to — so a
+/// qualifier split off a condition's name reports the qualifier values it names and none
+/// of the disorders its entity reports.
 ///
-/// The rows are the digit and the roman-numeral spelling of two subtypes, so a handler
-/// that reported a single candidate for the qualifier fails here.
+/// The rows span the subtype qualifiers (the digit and the roman-numeral spelling) and
+/// the acuity, quality and direction modifiers, so a handler that continued an
+/// attribute's list with its entity's concepts — which turns a qualifier into the
+/// disorder it qualifies — fails here, as does one that left a modifier's own concepts
+/// out.
 #[tokio::test]
-async fn a_qualifier_continues_the_candidates_of_the_entity_it_qualifies() {
+async fn an_attribute_reports_the_concepts_its_own_text_names() {
     let router = router();
-    let rows: &[(&str, &str, &str)] = &[
-        ("Patient has type 2 diabetes mellitus.", "type 2", "Type 2"),
-        ("Patient has type 1 diabetes mellitus.", "type 1", "Type 1"),
+    // (text, the mention, the attribute as written, the concept its own form names).
+    // Source: the qualifier-value hierarchy of the SNOMED CT US edition.
+    let rows: &[(&str, &str, &str, &str, &str)] = &[
+        (
+            "Patient has type 2 diabetes mellitus.",
+            "diabetes mellitus",
+            "type 2",
+            "258195006",
+            "Type 2 (qualifier value)",
+        ),
+        (
+            "Patient has type 1 diabetes mellitus.",
+            "diabetes mellitus",
+            "type 1",
+            "258194007",
+            "Type 1 (qualifier value)",
+        ),
         (
             "Patient has type II diabetes mellitus.",
+            "diabetes mellitus",
             "type II",
-            "Type 2",
+            "258195006",
+            "Type 2 (qualifier value)",
+        ),
+        (
+            "Chronic cough with wheezing.",
+            "cough",
+            "Chronic",
+            "90734009",
+            "Chronic (qualifier value)",
+        ),
+        (
+            "Acute bronchitis on examination.",
+            "bronchitis",
+            "Acute",
+            "263654008",
+            "Acute (qualifier value)",
+        ),
+        (
+            "Severe asthma reported.",
+            "asthma",
+            "Severe",
+            "24484000",
+            "Severe (severity modifier) (qualifier value)",
+        ),
+        (
+            "Mild anemia noted.",
+            "anemia",
+            "Mild",
+            "255604002",
+            "Mild (qualifier value)",
+        ),
+        (
+            "Left pneumonia on the radiograph.",
+            "pneumonia",
+            "Left",
+            "7771000",
+            "Left (qualifier value)",
+        ),
+        (
+            "Bilateral pneumonia on the radiograph.",
+            "pneumonia",
+            "Bilateral",
+            "51440002",
+            "Right and left (qualifier value)",
         ),
     ];
 
-    for (text, qualifier, qualifier_value) in rows {
-        let case = format!("InferSNOMEDCT {text:?}");
+    for (text, mention, written, code, description) in rows {
+        let case = format!("InferSNOMEDCT {text:?} {written:?}");
         let answer = infer(&router, "InferSNOMEDCT", text).await;
-        let entity = mention_entity(&case, &answer, "diabetes mellitus");
+        let entity = mention_entity(&case, &answer, mention);
         let entity_codes: Vec<String> = candidates(&case, &entity, "SNOMEDCTConcepts")
             .iter()
             .map(|concept| concept["Code"].as_str().unwrap_or_default().to_string())
             .collect();
         let attribute = attributes(&entity)
             .into_iter()
-            .find(|attribute| attribute["Text"].as_str() == Some(qualifier))
+            .find(|attribute| attribute["Text"].as_str() == Some(*written))
             .unwrap_or_else(|| {
-                panic!("case {case:?}: expected the qualifier attribute {qualifier:?}, got {answer}")
+                panic!("case {case:?}: expected the attribute {written:?}, got {answer}")
             });
         let list = candidates(&case, &attribute, "SNOMEDCTConcepts");
-        assert_ranked_candidates(&case, &attribute, &list, 2);
+        assert_ranked_candidates(&case, &attribute, &list, 1);
 
-        let leading = list[0]["Description"].as_str().unwrap_or_default();
+        let leading = (
+            list[0]["Code"].as_str().unwrap_or_default(),
+            list[0]["Description"].as_str().unwrap_or_default(),
+        );
         assert_eq!(
             leading,
-            format!("{qualifier_value} (qualifier value)"),
-            "case {case:?}: the qualifier's own concept is its leading candidate, got \
+            (*code, *description),
+            "case {case:?}: the attribute's own concept is its leading candidate, got \
              {leading:?}"
         );
-        let continued: Vec<String> = list[1..]
+        let reported: Vec<String> = list
             .iter()
             .map(|concept| concept["Code"].as_str().unwrap_or_default().to_string())
             .collect();
         assert!(
-            continued.iter().all(|code| entity_codes.contains(code)),
-            "case {case:?}: the qualifier's remaining candidates are the concepts of the \
-             mention it qualifies {entity_codes:?}, got {continued:?}"
+            reported.iter().all(|code| !entity_codes.contains(code)),
+            "case {case:?}: an attribute reports none of the concepts of the entity it \
+             modifies {entity_codes:?}, got {reported:?}"
         );
     }
 }

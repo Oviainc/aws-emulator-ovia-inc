@@ -33,6 +33,8 @@ mod phi_detection_jobs;
 mod refusal_messages;
 #[path = "all/rx_norm_inference.rs"]
 mod rx_norm_inference;
+#[path = "all/snomedct_attribute_concepts.rs"]
+mod snomedct_attribute_concepts;
 #[path = "all/snomedct_inference.rs"]
 mod snomedct_inference;
 #[path = "all/state_roundtrip.rs"]

@@ -10,6 +10,11 @@
 //! lexicon entry lists. Nothing is matched out of a particular request, and no value is
 //! carried over from one call to the next.
 //!
+//! Every concept list is read off the stretch of text it is reported on: an entity links
+//! what ITS written form names, and an attribute links what its OWN written form names
+//! (the qualifier value of a modifier, the body structure of a site), so no span is ever
+//! reported with another span's concepts.
+//!
 //! No maintained crates.io crate ships a clinical-text model that can be loaded
 //! in-process without an external runtime, so the engine here is rule- and
 //! lexicon-based — the same class of engine as `crate::ops::infer_icd10_cm` and as the
@@ -862,9 +867,10 @@ const CONCEPTS_OXYGEN_THERAPY: &[Concept] = &[Concept {
 }];
 
 // The qualifier-value concepts. Source: the qualifier-value hierarchy of the SNOMED CT
-// release named by `DETAILS_*` above, whose members are what a subtype qualifier of a
-// condition is linked to — they are concepts in their own right, which is why the
-// modelled `SNOMEDCTAttribute` carries a concept list of its own.
+// release named by `DETAILS_*` above, whose members are what a qualifier of an entity is
+// linked to — they are concepts in their own right, which is why the modelled
+// `SNOMEDCTAttribute` carries "the SNOMED-CT concepts specific to an attribute" rather
+// than sharing the entity's list.
 
 const CONCEPTS_QUALIFIER_TYPE_1: &[Concept] = &[Concept {
     code: "258194007",
@@ -876,31 +882,144 @@ const CONCEPTS_QUALIFIER_TYPE_2: &[Concept] = &[Concept {
     description: "Type 2 (qualifier value)",
 }];
 
-/// The concepts each subtype qualifier this pass can split off is linked to, by the
-/// qualifier as the shared tokenizer normalizes it — lowercase tokens separated by single
-/// spaces, so the digit and the roman-numeral spellings of one subtype reach the same
-/// concept.
+const CONCEPTS_QUALIFIER_ACUTE: &[Concept] = &[Concept {
+    code: "263654008",
+    description: "Acute (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_SUBACUTE: &[Concept] = &[Concept {
+    code: "19939008",
+    description: "Subacute (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_CHRONIC: &[Concept] = &[Concept {
+    code: "90734009",
+    description: "Chronic (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_INTERMITTENT: &[Concept] = &[Concept {
+    code: "7087005",
+    description: "Intermittent (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_RECURRENT: &[Concept] = &[Concept {
+    code: "255227004",
+    description: "Recurrent (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_MILD: &[Concept] = &[Concept {
+    code: "255604002",
+    description: "Mild (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_MODERATE: &[Concept] = &[Concept {
+    code: "6736007",
+    description: "Moderate (severity modifier) (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_SEVERE: &[Concept] = &[Concept {
+    code: "24484000",
+    description: "Severe (severity modifier) (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_LEFT: &[Concept] = &[Concept {
+    code: "7771000",
+    description: "Left (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_RIGHT: &[Concept] = &[Concept {
+    code: "24028007",
+    description: "Right (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_BILATERAL: &[Concept] = &[Concept {
+    code: "51440002",
+    description: "Right and left (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_UPPER: &[Concept] = &[Concept {
+    code: "261183002",
+    description: "Upper (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_LOWER: &[Concept] = &[Concept {
+    code: "261122009",
+    description: "Lower (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_MEDIAL: &[Concept] = &[Concept {
+    code: "255561001",
+    description: "Medial (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_LATERAL: &[Concept] = &[Concept {
+    code: "49370004",
+    description: "Lateral (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_ANTERIOR: &[Concept] = &[Concept {
+    code: "255549009",
+    description: "Anterior (qualifier value)",
+}];
+
+const CONCEPTS_QUALIFIER_POSTERIOR: &[Concept] = &[Concept {
+    code: "255551005",
+    description: "Posterior (qualifier value)",
+}];
+
+/// The concepts each written form an ATTRIBUTE of an entity can be placed by is linked
+/// to, by that written form as the shared tokenizer normalizes it — lowercase tokens
+/// separated by single spaces, so the digit and the roman-numeral spellings of one
+/// subtype, and any case the text writes a modifier in, reach the same concept.
 ///
-/// A qualifier this table does not name is still reported as the attribute it is, with no
-/// concept list rather than a concept the ontology does not hold.
-const QUALIFIER_CONCEPTS: &[(&str, &[Concept])] = &[
+/// The rows are the attribute vocabularies this pass reads — the subtype qualifiers it
+/// splits off a condition's name, and the shared acuity, quality and direction modifiers
+/// (`crate::ops::infer_icd10_cm`'s `ACUITY_MODIFIERS`, `QUALITY_MODIFIERS` and
+/// `DIRECTION_MODIFIERS`) — each paired with the qualifier value the written form names in
+/// its own right.
+///
+/// A written form this table does not name is still reported as the attribute it is, with
+/// no concept list rather than a concept the ontology does not hold: the table is the
+/// ontology data this pass carries, never a fallback onto another span's concepts.
+const ATTRIBUTE_CONCEPTS: &[(&str, &[Concept])] = &[
+    // The subtype qualifiers split off a condition's name.
     ("type 1", CONCEPTS_QUALIFIER_TYPE_1),
     ("type i", CONCEPTS_QUALIFIER_TYPE_1),
     ("type 2", CONCEPTS_QUALIFIER_TYPE_2),
     ("type ii", CONCEPTS_QUALIFIER_TYPE_2),
+    // How far the condition has progressed (`ACUITY`).
+    ("acute", CONCEPTS_QUALIFIER_ACUTE),
+    ("subacute", CONCEPTS_QUALIFIER_SUBACUTE),
+    ("chronic", CONCEPTS_QUALIFIER_CHRONIC),
+    ("intermittent", CONCEPTS_QUALIFIER_INTERMITTENT),
+    ("recurrent", CONCEPTS_QUALIFIER_RECURRENT),
+    // How it presents (`QUALITY`).
+    ("mild", CONCEPTS_QUALIFIER_MILD),
+    ("moderate", CONCEPTS_QUALIFIER_MODERATE),
+    ("severe", CONCEPTS_QUALIFIER_SEVERE),
+    // Which side or part of the body it is on (`DIRECTION`).
+    ("left", CONCEPTS_QUALIFIER_LEFT),
+    ("right", CONCEPTS_QUALIFIER_RIGHT),
+    ("bilateral", CONCEPTS_QUALIFIER_BILATERAL),
+    ("upper", CONCEPTS_QUALIFIER_UPPER),
+    ("lower", CONCEPTS_QUALIFIER_LOWER),
+    ("medial", CONCEPTS_QUALIFIER_MEDIAL),
+    ("lateral", CONCEPTS_QUALIFIER_LATERAL),
+    ("anterior", CONCEPTS_QUALIFIER_ANTERIOR),
+    ("posterior", CONCEPTS_QUALIFIER_POSTERIOR),
 ];
 
-/// The concepts the qualifier written at `span` is linked to, or an empty list when this
-/// pass can name none.
-fn qualifier_concepts(tokens: &[Token], span: &Span) -> &'static [Concept] {
+/// The concepts the stretch of text at `span` names in its OWN right, or an empty list
+/// when this pass can name none for it.
+fn attribute_concepts(tokens: &[Token], span: &Span) -> &'static [Concept] {
     let phrase = tokens[span.tokens.clone()]
         .iter()
         .map(|token| token.lower.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    QUALIFIER_CONCEPTS
+    ATTRIBUTE_CONCEPTS
         .iter()
-        .find(|(qualifier, _)| *qualifier == phrase.as_str())
+        .find(|(written, _)| *written == phrase.as_str())
         .map_or(&[][..], |(_, concepts)| *concepts)
 }
 
@@ -2048,16 +2167,12 @@ struct Attribute {
     /// Tokens between the attribute and the mention, which is what the relationship
     /// confidence falls off with.
     distance: usize,
+    /// The concepts THIS stretch of text names in its own right, which is what the
+    /// modelled `SNOMEDCTConcepts` of an attribute reports: "the SNOMED-CT concepts
+    /// specific to an attribute". It is empty when this pass holds no ontology row for
+    /// the written form — never the list of the entity the attribute modifies, which is
+    /// that entity's own answer to a different question.
     concepts: &'static [Concept],
-    /// Whether this attribute is a qualifier OF the entity's own written form — a subtype
-    /// split off the mention — rather than a mention of its own.
-    ///
-    /// Such a qualifier is written as part of the condition's name, so the concepts the
-    /// WHOLE mention names are concepts it could refer to as well: its candidate list
-    /// continues with the entity's own candidates after the qualifier-value concepts.
-    /// An attribute a lexicon of its own placed (a body site, a measured value) names
-    /// concepts of its own kind only.
-    qualifies_entity: bool,
 }
 
 /// One entity the pass placed: the stretch of text naming it, its lexicon entry, and the
@@ -2203,8 +2318,10 @@ fn measurement_attributes(
             category: CATEGORY_TEST_TREATMENT_PROCEDURE,
             score: WEIGHT_PATTERN,
             distance,
+            // A measured number and the unit it was measured in name no concept of the
+            // ontology: what is linked is the test that produced them, so this attribute
+            // reports no concept list rather than the test's own concepts.
             concepts: &[],
-            qualifies_entity: false,
         });
         index = end;
     }
@@ -2247,14 +2364,16 @@ fn modifier_attributes(
             index - span.tokens.end
         };
         covered[index] = true;
+        let span = Span::of(tokens, index..index + 1);
         attributes.push(Attribute {
-            span: Span::of(tokens, index..index + 1),
             attribute_type,
             category: attribute_category(attribute_type, entity_category),
             score: WEIGHT_MODIFIER,
             distance,
-            concepts: &[],
-            qualifies_entity: false,
+            // What this modifier itself names in the ontology, which is what the
+            // modelled concept list of an attribute reports.
+            concepts: attribute_concepts(tokens, &span),
+            span,
         });
     }
     attributes
@@ -2316,20 +2435,17 @@ fn attribute_traits(
         .collect()
 }
 
-/// The candidate list of one mention: the concepts its own lexicon entry names, then the
-/// concepts of `then` — the entity a qualifier belongs to — with nothing repeated and the
-/// whole list cut at [`CONCEPT_CANDIDATE_LIMIT`].
+/// The candidate list of one stretch of text: the concepts ITS OWN ontology rows name,
+/// with nothing repeated and the whole list cut at [`CONCEPT_CANDIDATE_LIMIT`].
 ///
-/// The modelled concept lists are "the SNOMED concepts that the entity could refer to",
-/// so a qualifier written as part of a condition's name carries the qualifier-value
-/// concepts it names in its own right FIRST and then the concepts of the whole mention it
-/// qualifies, which that stretch of text could refer to as well.
-fn candidate_list(
-    own: &'static [Concept],
-    then: &'static [Concept],
-) -> Vec<&'static Concept> {
+/// A concept list answers what the stretch of text it is reported on could refer to — an
+/// entity's "the SNOMED-CT concepts that the entity could refer to", an attribute's "the
+/// SNOMED-CT concepts specific to an attribute" — so no span's list is ever continued
+/// with another span's concepts: a qualifier of a condition reports the qualifier values
+/// it names, and the condition reports the disorders it names.
+fn candidate_list(own: &'static [Concept]) -> Vec<&'static Concept> {
     let mut candidates: Vec<&'static Concept> = Vec::with_capacity(CONCEPT_CANDIDATE_LIMIT);
-    for concept in own.iter().chain(then) {
+    for concept in own {
         if candidates.len() == CONCEPT_CANDIDATE_LIMIT {
             break;
         }
@@ -2428,8 +2544,7 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
                     // The qualifier is written immediately in front of the name it
                     // qualifies, so nothing stands between the two.
                     distance: 0,
-                    concepts: qualifier_concepts(&tokens, qualifier),
-                    qualifies_entity: true,
+                    concepts: attribute_concepts(&tokens, qualifier),
                 })
                 .collect(),
         })
@@ -2450,7 +2565,6 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
                     score,
                     distance,
                     concepts: term.concepts,
-                    qualifies_entity: false,
                 });
             }
             _ => loose_anatomy.push((span.clone(), term)),
@@ -2536,17 +2650,9 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
                     .clamp(0.0, 1.0);
                 let part = &text[attribute.span.start..attribute.span.end];
                 let attribute_score = span_confidence(attribute.score, part);
-                // The concepts this stretch of text could refer to: its own, continued by
-                // the concepts of the entity it qualifies when it is a qualifier OF that
-                // entity's written form.
-                let candidates = candidate_list(
-                    attribute.concepts,
-                    if attribute.qualifies_entity {
-                        entity_concepts
-                    } else {
-                        &[]
-                    },
-                );
+                // The concepts specific to THIS attribute: the ones its own written form
+                // names in the ontology, never the ones the entity it modifies names.
+                let candidates = candidate_list(attribute.concepts);
                 SNOMEDCTAttribute {
                     category: Some(attribute.category.to_string()),
                     r#type: Some(attribute.attribute_type.to_string()),
@@ -2574,7 +2680,7 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
             end_offset: Some(character_offset(&starts, entity.span.end)),
             attributes: Some(attributes),
             traits: Some(traits),
-            snomedct_concepts: Some(concepts(&candidate_list(entity_concepts, &[]), score)),
+            snomedct_concepts: Some(concepts(&candidate_list(entity_concepts), score)),
         });
     }
     reported
