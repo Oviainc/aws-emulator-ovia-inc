@@ -284,6 +284,8 @@ mod state_roundtrip;
 mod static_reference_catalogs;
 #[path = "all/valid_db_instance_modifications.rs"]
 mod valid_db_instance_modifications;
+#[path = "all/waiting_statement_budget.rs"]
+mod waiting_statement_budget;
 #[path = "all/wire_decimal_doubles.rs"]
 mod wire_decimal_doubles;
 // Declared because the build enforces that every file under `tests/all/` is: the suite this
