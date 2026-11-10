@@ -83,6 +83,8 @@ mod name_conflict_precedes_capacity;
 mod not_found_precedes_payload_refusal;
 #[path = "all/oidc_identity_source_authorization.rs"]
 mod oidc_identity_source_authorization;
+#[path = "all/oidc_token_audience_claim.rs"]
+mod oidc_token_audience_claim;
 #[path = "all/policy_store_alias.rs"]
 mod policy_store_alias;
 #[path = "all/policy_store_authorization.rs"]

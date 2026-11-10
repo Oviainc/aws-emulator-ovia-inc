@@ -31,21 +31,21 @@ use crate::harness::{self, error_code, fault_message};
 use crate::is_authorized_with_token::{no_identity_source_message, policy};
 
 /// The entity type the identity sources in this suite generate principals as.
-const PRINCIPAL_TYPE: &str = "MyCorp::User";
+pub(crate) const PRINCIPAL_TYPE: &str = "MyCorp::User";
 
 /// The entity type the OIDC group configuration below maps group claims to.
 const GROUP_TYPE: &str = "MyCorp::UserGroup";
 
 /// The resource every request in this suite asks about.
-const DOCUMENT: &str = "doc-1";
+pub(crate) const DOCUMENT: &str = "doc-1";
 
 /// The action every request in this suite asks about.
-const ACTION: (&str, &str) = ("MyCorp::Action", "read");
+pub(crate) const ACTION: (&str, &str) = ("MyCorp::Action", "read");
 
 /// The refusal a presented token whose audience the identity source accepts none of is
 /// answered with: ONE fixed sentence with no variable part, the same one the Amazon Cognito
 /// arm of the audience rule earns.
-const AUDIENCE_NOT_ACCEPTED: &str = "Token audience claim contains no valid audience";
+pub(crate) const AUDIENCE_NOT_ACCEPTED: &str = "Token audience claim contains no valid audience";
 
 /// The claim the group-mapping source below reads group membership from, which is the
 /// `groupConfiguration.groupClaim` it was created with rather than any fixed claim name.
@@ -72,7 +72,7 @@ fn token_with_header(header: &Value, claims: &Value) -> String {
 
 /// The token an OIDC provider mints: a JOSE header naming a real signing algorithm and the
 /// key it signed with, plus `claims`.
-fn token(claims: &Value) -> String {
+pub(crate) fn token(claims: &Value) -> String {
     token_with_header(
         &json!({ "alg": "RS256", "kid": "oidc-key-1", "typ": "JWT" }),
         claims,
@@ -95,13 +95,13 @@ fn epoch_seconds(offset: Duration, ahead: bool) -> i64 {
 }
 
 /// An `exp` claim an hour ahead: a token the clock has not run out on.
-fn live() -> i64 {
+pub(crate) fn live() -> i64 {
     epoch_seconds(Duration::from_secs(3600), true)
 }
 
 /// Create an identity source in `store` for `configuration`, prove the store really
 /// persisted it by reading it back through `GetIdentitySource`, and return its id.
-async fn oidc_source(
+pub(crate) async fn oidc_source(
     router: &MultiServiceRouter,
     store: &str,
     configuration: &Value,
@@ -136,7 +136,7 @@ async fn oidc_source(
 
 /// One `IsAuthorizedWithToken` request against `store`, carrying whatever token members
 /// `tokens` names.
-fn request(store: &str, tokens: Value) -> Value {
+pub(crate) fn request(store: &str, tokens: Value) -> Value {
     let mut body = json!({
         "policyStoreId": store,
         "action": { "actionType": ACTION.0, "actionId": ACTION.1 },
