@@ -767,18 +767,17 @@ impl LifecyclePolicyRecord {
     /// The resource type is the exception the model states:
     /// `UpdateLifecyclePolicyRequest$PolicyDetails` is "the configuration of the
     /// lifecycle policy. You cannot update the policy type or the resource type",
-    /// so a configuration that omits it leaves the type the policy was created
-    /// with in place rather than unsetting it. A configuration that STATES it has
-    /// been checked against that stored type already (the update refuses a
-    /// different one), so storing it here is what fills in a type nothing had
-    /// stated yet and is otherwise a write of the value already held.
+    /// so the type the policy was created with stays in place whichever way the
+    /// replacement treats it: a configuration that omits it asks for no change,
+    /// and one that states it has been checked against the stored type already
+    /// (the update refuses a different one), so it restates the value held. That
+    /// is why the member is taken out of the replacement and dropped here rather
+    /// than written: a default policy's resource type is written ONCE, by the
+    /// create that required it.
     pub fn replace_default_policy_configuration(
         &mut self,
         configuration: DefaultPolicyConfiguration,
     ) {
-        if configuration.resource_type.is_some() {
-            self.default_policy_type = configuration.resource_type;
-        }
         self.create_interval = configuration.create_interval;
         self.retain_interval = configuration.retain_interval;
         self.copy_tags = configuration.copy_tags;
@@ -1578,11 +1577,15 @@ fn immutable_member_changed(
     }
 
     if let Some(stated) = details.resource_type.as_deref() {
-        if policy
-            .default_policy_type
-            .as_deref()
-            .is_some_and(|stored| stated != stored)
-        {
+        // Every DEFAULT policy holds a resource type — the create requires the
+        // member that states which kind of default policy to create, since it
+        // documents no value the service fills in
+        // ([`omitted_default_policy_members`]) — and this operation may not
+        // change it, so only a configuration restating the type the policy
+        // holds asks for no change. A policy that is not a default policy may
+        // state the member nowhere at all
+        // ([`default_policy_only_parameters_refused`]).
+        if policy.default_policy && policy.default_policy_type.as_deref() != Some(stated) {
             return Some(RESOURCE_TYPE_MEMBER);
         }
     }
@@ -1618,9 +1621,12 @@ fn immutable_member_changed(
 ///   ([`LifecyclePolicyRecord::target_resource_types`]) so the `resourceTypes`
 ///   filter cannot start selecting a policy under another type.
 ///
-/// A policy holding no value for one of them has none to change, so a
-/// configuration stating one fills in the single stored copy instead of being
-/// refused.
+/// Every DEFAULT policy holds a resource type, because the create requires the
+/// member that states which kind of default policy to create
+/// ([`omitted_default_policy_members`]), so a configuration stating one either
+/// restates that type or is refused. A policy holding no value for one of the
+/// OTHER members has none to change, so a configuration stating one fills in the
+/// single stored copy instead of being refused.
 ///
 /// The refusal is the service's non-updatable-parameter answer
 /// ([`parameters_cannot_be_updated`]), naming the parameter
@@ -1907,19 +1913,28 @@ fn schedule_path(position: usize) -> String {
 ///   activates the event-based policy") and `Actions` ("the actions to be
 ///   performed when the event-based policy is activated") instead.
 ///
-/// WHICH kind of policy a configuration describes is decided by its
-/// `PolicyType` alone ([`configures_event_based_policy`]), so the set of members
-/// required of it is fixed before any of them is read: a configuration that
-/// names no type describes a snapshot policy ("The default is
-/// `EBS_SNAPSHOT_MANAGEMENT`") and is required to state the members one is built
-/// from, whichever other members it happens to carry.
+/// Whether the policy is a DEFAULT one is the write path's to state ([`PolicyKind`],
+/// as for [`materialized_policy_details`]), and WHICH kind of custom policy a
+/// configuration describes is decided by its `PolicyType` alone
+/// ([`configures_event_based_policy`]), so the set of members required of it is
+/// fixed before any of them is read: a configuration that names no type
+/// describes a snapshot policy ("The default is `EBS_SNAPSHOT_MANAGEMENT`") and
+/// is required to state the members one is built from, whichever other members
+/// it happens to carry.
 ///
 /// A DEFAULT policy is configured from the `[Default policies only]` members,
-/// each of which documents a value the service fills in, so it requires none of
-/// them and is not judged here.
+/// which are judged by [`omitted_default_policy_members`] from the KIND of
+/// default policy the request describes rather than from the structure: those
+/// members may be stated in the request body instead of inside it.
 ///
 /// Source: `smithy_query(query="shape", shape="PolicyDetails")`.
-pub fn omitted_configuration_members(details: &PolicyDetails) -> Vec<String> {
+pub fn omitted_configuration_members(
+    details: &PolicyDetails,
+    kind: PolicyKind<'_>,
+) -> Vec<String> {
+    if let PolicyKind::Default { resource_type } = kind {
+        return omitted_default_policy_members(resource_type);
+    }
     let required: Vec<(&str, bool)> = if configures_event_based_policy(details) {
         vec![
             ("EventSource", details.event_source.is_some()),
@@ -1937,6 +1952,40 @@ pub fn omitted_configuration_members(details: &PolicyDetails) -> Vec<String> {
         .filter(|(_, stated)| !*stated)
         .map(|(name, _)| name.to_string())
         .collect()
+}
+
+/// The `[Default policies only]` member a DEFAULT policy's request leaves
+/// unstated that such a policy cannot be built without, by its own wire name.
+/// Empty when the request states it.
+///
+/// All but one of those members document the value the service fills in for a
+/// request that omits it — `CreateInterval` "If you do not specify a value, the
+/// default is 1", `RetainInterval` 7, `CopyTags` and `ExtendDeletion` false (the
+/// sentence each of [`DEFAULT_CREATE_INTERVAL`], [`DEFAULT_RETAIN_INTERVAL`],
+/// [`DEFAULT_COPY_TAGS`] and [`DEFAULT_EXTEND_DELETION`] quotes) — so a request
+/// omitting one of them asks for the documented value and is complete without
+/// it.
+///
+/// The resource type documents no such value: `PolicyDetails$ResourceType` and
+/// `CreateLifecyclePolicyRequest$DefaultPolicy` say "Specify the type of default
+/// policy to create", with `VOLUME` for the snapshot kind and `INSTANCE` for the
+/// AMI kind and nothing for a request that names neither. It is also the member
+/// that decides what such a policy manages and targets
+/// ([`default_policy_managed_type`],
+/// [`LifecyclePolicyRecord::target_resource_types`]), so a request stating it
+/// NOWHERE — not in the body, not in the configuration structure, and not as the
+/// `PolicyType` one kind of default policy alone manages
+/// ([`default_policy_kind`]) — describes no kind of default policy and is
+/// refused rather than stored as a policy whose reads and filters could not
+/// agree on what it is.
+///
+/// Source: `smithy_query(query="doc", shape="PolicyDetails",
+/// member="ResourceType")`.
+pub fn omitted_default_policy_members(resource_type: Option<&str>) -> Vec<String> {
+    match resource_type {
+        Some(_) => Vec::new(),
+        None => vec![RESOURCE_TYPE_MEMBER.to_string()],
+    }
 }
 
 /// The `InvalidRequestException` for a create that states no policy

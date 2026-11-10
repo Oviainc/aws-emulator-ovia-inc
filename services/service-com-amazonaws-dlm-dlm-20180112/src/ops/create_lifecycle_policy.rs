@@ -251,29 +251,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Which kind of DEFAULT policy this request asks for, resolved ONCE for
+        // the required-member rule below and for the configuration stored
+        // further down: the resource type the request states in either of its
+        // two places, else the kind that manages the `PolicyType` its
+        // configuration states, since for a default policy those two members
+        // state one fact — the kind of default policy `DefaultPolicy` offers
+        // "for EBS-backed AMIs" is the policy `PolicyDetails$PolicyType` calls
+        // "IMAGE_MANAGEMENT". A configuration naming a type the kind it asks for
+        // does not manage, or one no kind of default policy manages at all,
+        // describes no default policy and is refused before anything is stored
+        // rather than being dropped.
+        let default_policy_kind = if is_default {
+            let stated_resource_type = input.default_policy.clone().or_else(|| {
+                input
+                    .policy_details
+                    .as_ref()
+                    .and_then(|details| details.resource_type.clone())
+            });
+            match crate::state::default_policy_kind(
+                stated_resource_type.as_deref(),
+                input.policy_details.as_ref(),
+            ) {
+                Ok(kind) => kind,
+                Err(refusal) => {
+                    return Err(
+                        CreateLifecyclePolicyErrorModeled::InvalidRequestException(refusal).into(),
+                    )
+                }
+            }
+        } else {
+            None
+        };
+
+        // WHICH members the policy this request creates is built from, which is
+        // what the record stores and every read of it reports.
+        let kind = if is_default {
+            crate::state::PolicyKind::Default {
+                resource_type: default_policy_kind.as_deref(),
+            }
+        } else {
+            crate::state::PolicyKind::Custom
+        };
+
         // The other cross-member rules the model cannot express, and the reason
         // `InvalidRequestException` carries a `RequiredParameters` member at
         // all: which configuration members a request must state depends on the
         // KIND of policy it describes, so the model can mark none of them
         // `@required`. A request that names neither `DefaultPolicy` nor
-        // `PolicyDetails` describes no policy at all; a configuration that
-        // describes one leaves out nothing that kind of policy is built from.
-        // Refused before anything is stored, so no policy is left holding a
-        // configuration AWS would never have accepted.
-        if !is_default {
-            let Some(details) = input.policy_details.as_ref() else {
+        // `PolicyDetails` describes no policy at all; a request that describes
+        // one leaves out nothing that kind of policy is built from — the
+        // configuration members a custom policy of its type is built from, and,
+        // for a default policy, the one `[Default policies only]` member that
+        // documents no value the service fills in for a request omitting it: the
+        // type of default policy to create. Refused before anything is stored,
+        // so no policy is left holding a configuration AWS would never have
+        // accepted.
+        let omitted = match input.policy_details.as_ref() {
+            Some(details) => crate::state::omitted_configuration_members(details, kind),
+            // A request carrying no configuration structure states its
+            // configuration in the request body, which is a DEFAULT policy's
+            // other documented place for it; the kind of default policy it asks
+            // for is judged from what the request resolved to above, there being
+            // no structure to read it from.
+            None if is_default => {
+                crate::state::omitted_default_policy_members(default_policy_kind.as_deref())
+            }
+            None => {
                 return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
                     crate::state::no_policy_configuration(),
                 )
-                .into());
-            };
-            let omitted = crate::state::omitted_configuration_members(details);
-            if !omitted.is_empty() {
-                return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
-                    crate::state::configuration_members_omitted(&omitted),
-                )
-                .into());
+                .into())
             }
+        };
+        if !omitted.is_empty() {
+            return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
+                crate::state::configuration_members_omitted(&omitted),
+            )
+            .into());
         }
 
         // And the cross-member rules inside a schedule: every nested rule the
@@ -323,38 +378,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Which kind of DEFAULT policy this request asks for, resolved ONCE for
-        // the configuration stored below: the resource type the request states
-        // in either of its two places, else the kind that manages the
-        // `PolicyType` its configuration states, since for a default policy
-        // those two members state one fact — the kind of default policy
-        // `DefaultPolicy` offers "for EBS-backed AMIs" is the policy
-        // `PolicyDetails$PolicyType` calls "IMAGE_MANAGEMENT". A configuration
-        // naming a type the kind it asks for does not manage, or one no kind of
-        // default policy manages at all, describes no default policy and is
-        // refused before anything is stored rather than being dropped.
-        let default_policy_kind = if is_default {
-            let stated_resource_type = input.default_policy.clone().or_else(|| {
-                input
-                    .policy_details
-                    .as_ref()
-                    .and_then(|details| details.resource_type.clone())
-            });
-            match crate::state::default_policy_kind(
-                stated_resource_type.as_deref(),
-                input.policy_details.as_ref(),
-            ) {
-                Ok(kind) => kind,
-                Err(refusal) => {
-                    return Err(
-                        CreateLifecyclePolicyErrorModeled::InvalidRequestException(refusal).into(),
-                    )
-                }
-            }
-        } else {
-            None
-        };
-
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
@@ -386,13 +409,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::configuration_stated_twice`]), which this path leaves
         // as it stands; what is fixed here is that no record is left holding a
         // configuration whose language or type contradicts its kind.
-        let kind = if is_default {
-            crate::state::PolicyKind::Default {
-                resource_type: default_policy_kind.as_deref(),
-            }
-        } else {
-            crate::state::PolicyKind::Custom
-        };
         let mut policy_details = input
             .policy_details
             .map(|details| crate::state::materialized_policy_details(details, kind));

@@ -438,8 +438,12 @@ async fn a_default_policy_reports_every_default_only_parameter_it_states() {
                 with_body_parameter(request, parameter.member, &parameter.value),
             ));
         }
+        // A default policy's configuration states which KIND of default policy
+        // to create — `PolicyDetails$ResourceType` here — because that member
+        // documents no value the service fills in for a request omitting it; a
+        // row stating the member itself replaces this one.
         let details = with_details_parameter(
-            json!({"PolicyLanguage": DEFAULT_POLICY_LANGUAGE}),
+            json!({"PolicyLanguage": DEFAULT_POLICY_LANGUAGE, "ResourceType": "VOLUME"}),
             parameter.member,
             &parameter.value,
         );

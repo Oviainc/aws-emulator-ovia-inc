@@ -25,6 +25,8 @@ mod default_policy_only_body_parameter_set;
 mod default_policy_only_parameters;
 #[path = "all/default_policy_only_refusal_composition.rs"]
 mod default_policy_only_refusal_composition;
+#[path = "all/default_policy_requires_a_resource_type.rs"]
+mod default_policy_requires_a_resource_type;
 #[path = "all/default_policy_resource_type.rs"]
 mod default_policy_resource_type;
 #[path = "all/effective_cadence_ordering.rs"]

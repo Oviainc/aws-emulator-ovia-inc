@@ -284,20 +284,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would have had to state: the members the kind of policy it describes
         // is built from. Judged after the lookup (the policy has to exist before
         // its kind can be read) and before the first write, so a refused update
-        // leaves the stored policy exactly as it was. A DEFAULT policy is
-        // configured from members that each document a value the service fills
-        // in, so it requires none of them.
-        if !policy.default_policy {
-            if let Some(details) = input.policy_details.as_ref() {
-                let omitted = crate::state::omitted_configuration_members(details);
-                if !omitted.is_empty() {
-                    return Err(
-                        UpdateLifecyclePolicyErrorModeled::InvalidRequestException(
-                            crate::state::configuration_members_omitted(&omitted),
-                        )
-                        .into(),
-                    );
+        // leaves the stored policy exactly as it was. The kind is the policy's
+        // own, which this update cannot change — for a DEFAULT policy the kind
+        // of default policy it is, named by the resource type the replacement
+        // restates or, where it omits it, the one the policy holds, since an
+        // update that omits that member leaves it in place.
+        if let Some(details) = input.policy_details.as_ref() {
+            let kind = if policy.default_policy {
+                crate::state::PolicyKind::Default {
+                    resource_type: details
+                        .resource_type
+                        .as_deref()
+                        .or(policy.default_policy_type.as_deref()),
                 }
+            } else {
+                crate::state::PolicyKind::Custom
+            };
+            let omitted = crate::state::omitted_configuration_members(details, kind);
+            if !omitted.is_empty() {
+                return Err(UpdateLifecyclePolicyErrorModeled::InvalidRequestException(
+                    crate::state::configuration_members_omitted(&omitted),
+                )
+                .into());
             }
         }
 

@@ -20,8 +20,9 @@
 //! The rows span what the rule generalises over: both `DefaultPolicyTypeValues`
 //! members, both places a create can state the type in, both directions of a
 //! change, an update that agrees with the stored type and one that differs, a
-//! create stating the two places in agreement and in disagreement, and a policy
-//! that stored no type at all.
+//! create stating the two places in agreement and in disagreement, and a create
+//! that states the type in neither place (which `ResourceType`'s own rule
+//! refuses — `default_policy_requires_a_resource_type.rs` spans that rule).
 
 use std::sync::Arc;
 
@@ -245,19 +246,13 @@ async fn assert_reports_resource_type(
     router: &MultiServiceRouter,
     case: &str,
     id: &str,
-    resource_type: Option<&str>,
+    resource_type: &str,
 ) {
-    let expected_type = resource_type
-        .map(|wanted| {
-            DEFAULT_POLICY_TYPES
-                .iter()
-                .find(|(candidate, _)| *candidate == wanted)
-                .map(|(_, policy_type)| *policy_type)
-                .expect("the row names a DefaultPolicyTypeValues member")
-        })
-        // A default policy whose configuration states no resource type states no
-        // type of its own either, so it carries the documented default.
-        .unwrap_or("EBS_SNAPSHOT_MANAGEMENT");
+    let expected_type = DEFAULT_POLICY_TYPES
+        .iter()
+        .find(|(candidate, _)| *candidate == resource_type)
+        .map(|(_, policy_type)| *policy_type)
+        .expect("the row names a DefaultPolicyTypeValues member");
 
     let read = get(router, id).await;
     assert_eq!(
@@ -268,7 +263,7 @@ async fn assert_reports_resource_type(
     let reported = at(read.policy(), "/PolicyDetails/ResourceType");
     assert_eq!(
         reported,
-        resource_type.map(|value| json!(value)).unwrap_or(Value::Null),
+        json!(resource_type),
         "case {case:?}: expected PolicyDetails.ResourceType {resource_type:?}, got {reported:?}"
     );
     let read_policy_type = at(read.policy(), "/PolicyDetails/PolicyType");
@@ -299,10 +294,10 @@ async fn assert_reports_resource_type(
             let selected = answer.listed_ids().contains(&id.to_string());
             assert_eq!(
                 selected,
-                resource_type == Some(candidate),
+                resource_type == candidate,
                 "case {case:?}: ?{filter}={candidate} must {} a policy reporting \
                  {resource_type:?}, got {:?}",
-                if resource_type == Some(candidate) {
+                if resource_type == candidate {
                     "select"
                 } else {
                     "skip"
@@ -354,7 +349,7 @@ async fn a_default_policys_resource_type_is_one_value_every_read_and_filter_agre
                 "case {case:?}: the create must be accepted, got {} with {:?}",
                 created.status, created.body
             );
-            assert_reports_resource_type(&router, &case, &created.policy_id(), Some(resource_type))
+            assert_reports_resource_type(&router, &case, &created.policy_id(), resource_type)
                 .await;
         }
     }
@@ -394,7 +389,7 @@ async fn an_update_may_not_change_a_default_policys_resource_type() {
 
             // Nothing of the refused request took effect: not the type it asked
             // for, and not the configuration it carried beside it.
-            assert_reports_resource_type(&router, &case, &id, Some(resource_type)).await;
+            assert_reports_resource_type(&router, &case, &id, resource_type).await;
             let read = get(&router, &id).await;
             let create_interval = at(read.policy(), "/PolicyDetails/CreateInterval");
             assert_eq!(
@@ -442,7 +437,7 @@ async fn an_update_restating_the_stored_resource_type_is_accepted() {
                 accepted.status, accepted.body
             );
 
-            assert_reports_resource_type(&router, &case, &id, Some(resource_type)).await;
+            assert_reports_resource_type(&router, &case, &id, resource_type).await;
             let read = get(&router, &id).await;
             for (member, expected) in [("CreateInterval", json!(5)), ("RetainInterval", json!(10))] {
                 let actual = at(read.policy(), &format!("/PolicyDetails/{member}"));
@@ -456,50 +451,32 @@ async fn an_update_restating_the_stored_resource_type_is_accepted() {
     }
 }
 
-/// A policy whose configuration stated NO resource type has none to change, so
-/// an update stating one fills in that single stored value — and then every read
-/// and every filter reports it, which is the whole of the rule.
+/// A create that states the type in NEITHER place describes no kind of default
+/// policy, so it is refused and leaves no policy behind: the member documents no
+/// value the service fills in, unlike the other `[Default policies only]`
+/// members. The rule's own rows live in
+/// `default_policy_requires_a_resource_type.rs`.
 #[tokio::test]
-async fn an_update_states_the_resource_type_of_a_policy_that_stored_none() {
+async fn a_create_stating_the_resource_type_in_neither_place_is_refused() {
     let router = emulator();
-    for (resource_type, _) in DEFAULT_POLICY_TYPES {
-        let case = format!("a SIMPLIFIED policy with no resource type, updated to {resource_type}");
-        let created = create(
-            &router,
-            json!({
-                "ExecutionRoleArn": role_arn(),
-                "Description": "a default policy stating no resource type",
-                "State": "ENABLED",
-                "PolicyDetails": {"PolicyLanguage": DEFAULT_POLICY_LANGUAGE},
-            }),
-        )
-        .await;
-        assert_eq!(
-            created.status, 200,
-            "case {case:?}: the create must be accepted, got {} with {:?}",
-            created.status, created.body
-        );
-        let id = created.policy_id();
-        assert_reports_resource_type(&router, &case, &id, None).await;
-
-        let accepted = update(
-            &router,
-            &id,
-            json!({
-                "PolicyDetails": {
-                    "PolicyLanguage": DEFAULT_POLICY_LANGUAGE,
-                    "ResourceType": resource_type,
-                },
-            }),
-        )
-        .await;
-        assert_eq!(
-            accepted.status, 200,
-            "case {case:?}: the update must be accepted, got {} with {:?}",
-            accepted.status, accepted.body
-        );
-        assert_reports_resource_type(&router, &case, &id, Some(resource_type)).await;
-    }
+    let case = "a SIMPLIFIED configuration stating no resource type";
+    let before = policy_count(&router).await;
+    let answer = create(
+        &router,
+        json!({
+            "ExecutionRoleArn": role_arn(),
+            "Description": "a default policy stating no resource type",
+            "State": "ENABLED",
+            "PolicyDetails": {"PolicyLanguage": DEFAULT_POLICY_LANGUAGE},
+        }),
+    )
+    .await;
+    assert_refused(case, "ResourceType", &answer);
+    assert_eq!(
+        policy_count(&router).await,
+        before,
+        "case {case:?}: a refused create must leave no policy behind"
+    );
 }
 
 /// One request may not state the resource type in both places: `DefaultPolicy`
