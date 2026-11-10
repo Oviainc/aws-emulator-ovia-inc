@@ -15,6 +15,8 @@
 mod bucket_policy;
 #[path = "all/bucket_policy_enforcement.rs"]
 mod bucket_policy_enforcement;
+#[path = "all/encryption_key_state.rs"]
+mod encryption_key_state;
 #[path = "all/identity_authorization.rs"]
 mod identity_authorization;
 #[path = "all/index_mode.rs"]

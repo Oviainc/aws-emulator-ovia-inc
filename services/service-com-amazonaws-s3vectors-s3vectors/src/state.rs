@@ -9,6 +9,7 @@
 //! one place a helper several operations need can live.
 
 pub mod authorization;
+pub mod key_access;
 pub mod metadata_budget;
 
 use std::collections::{BTreeMap, VecDeque};

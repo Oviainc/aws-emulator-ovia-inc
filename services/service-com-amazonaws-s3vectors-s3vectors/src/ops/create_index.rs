@@ -251,6 +251,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(refusal)?;
         let index_mode = bucket.default_index_mode.clone();
+        // An index encrypted with a customer managed KMS key is created THROUGH that key,
+        // so this call uses it before the index exists: a key KMS will not use refuses the
+        // create and nothing is written (`crate::state::key_access`). The key in force is
+        // the effective one — the request's own, or the bucket's where the request names
+        // none — and which of the two it is decides the sentence the refusal carries.
+        if let Some(message) = crate::state::key_access::refusal(
+            &*self.engine,
+            &region,
+            &encryption,
+            crate::state::key_access::key_source(input.encryption_configuration.as_ref()),
+        ) {
+            return Err(CreateIndexErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
         // The store is this process's memory, so the ceilings in `crate::state`
         // are what keep a create loop from growing it without bound.
         if let Some(message) = crate::state::index_quota_exceeded(bucket) {

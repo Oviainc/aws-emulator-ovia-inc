@@ -29,6 +29,9 @@ service-common = { path = "../common" }
 # A vector bucket policy names the principals it governs, and the STS store resolves
 # which principal a request's access key id speaks for.
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# A vector bucket or index encrypted with a customer managed KMS key is created through
+# that key, so the KMS store answers whether the key may be used at all.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

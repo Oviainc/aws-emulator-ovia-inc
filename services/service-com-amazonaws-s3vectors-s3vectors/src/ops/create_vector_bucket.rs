@@ -229,6 +229,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+        // A bucket encrypted with a customer managed KMS key is created THROUGH that key,
+        // so this call uses it before the bucket exists: a key KMS will not use refuses
+        // the create and nothing is written (`crate::state::key_access`).
+        if let Some(message) = crate::state::key_access::refusal(
+            &*self.engine,
+            &region,
+            &encryption,
+            crate::state::key_access::key_source(input.encryption_configuration.as_ref()),
+        ) {
+            return Err(CreateVectorBucketErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
         // The store is this process's memory, so the ceilings in `crate::state`
         // are what keep a create loop from growing it without bound.
         if let Some(message) = crate::state::bucket_quota_exceeded(&store) {
