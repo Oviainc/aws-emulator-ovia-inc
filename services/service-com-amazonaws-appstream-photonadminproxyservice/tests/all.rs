@@ -17,6 +17,8 @@ mod app_block_builder;
 mod app_blocks;
 #[path = "all/associated_fleets.rs"]
 mod associated_fleets;
+#[path = "all/images.rs"]
+mod images;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
 #[path = "all/resource_tags.rs"]

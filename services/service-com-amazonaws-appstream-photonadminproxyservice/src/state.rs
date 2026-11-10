@@ -46,6 +46,14 @@
 //! `CreateStack`/`CreateFleet` persisted is the one `TagResource` adds to,
 //! `UntagResource` removes from and `ListTagsForResource` reports, so there is no second
 //! copy to drift.
+//!
+//! The image catalog lives here as well, in its own module: `DescribeImages` renders the
+//! [`ImageRecord`]s this store holds — the base images AWS publishes, seeded into it, and
+//! any image an operation of this API mints — a page at a time.
+
+mod images;
+
+pub use images::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -920,7 +928,7 @@ impl UserStackAssociationFilter<'_> {
 }
 
 /// Per-service state for com-amazonaws-appstream-photonadminproxyservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsAppstreamPhotonadminproxyserviceState {
     /// Stacks by `Name`. `BTreeMap` so every Describe page walks a stable order.
     pub stacks: BTreeMap<String, StackRecord>,
@@ -940,6 +948,13 @@ pub struct ComAmazonawsAppstreamPhotonadminproxyserviceState {
     /// is also what a `DeleteAppBlock` names. `BTreeMap` so every page of a read walks a
     /// stable order.
     pub app_blocks: BTreeMap<String, AppBlockRecord>,
+    /// Images by `Name` — the name a fleet or an image builder names an image by.
+    ///
+    /// SEEDED with the base images AWS publishes ([`seed_image_catalog`]), which no
+    /// account creates, and the same map an operation that mints a private image writes
+    /// into, so `DescribeImages` reads ONE catalog. `BTreeMap` so every page of a read
+    /// walks a stable order.
+    pub images: BTreeMap<String, ImageRecord>,
     /// `(FleetName, StackName)` edges written by `AssociateFleet`.
     pub fleet_stack_associations: BTreeSet<(String, String)>,
     /// The account's usage report subscription, once one has been created; `None` while
@@ -957,6 +972,26 @@ pub struct ComAmazonawsAppstreamPhotonadminproxyserviceState {
     /// what `DescribeUserStackAssociations` renders is literally what the batch
     /// persisted. `BTreeMap` so every page of a read walks a stable order.
     pub user_stack_associations: BTreeMap<UserStackAssociationKey, UserStackAssociation>,
+}
+
+/// A fresh store holds no caller-created resource and the WHOLE published image catalog:
+/// the base images are the one part of this state nothing creates, so they are seeded
+/// rather than written by a request.
+impl Default for ComAmazonawsAppstreamPhotonadminproxyserviceState {
+    fn default() -> Self {
+        Self {
+            stacks: BTreeMap::new(),
+            themes: BTreeMap::new(),
+            fleets: BTreeMap::new(),
+            app_block_builders: BTreeMap::new(),
+            app_blocks: BTreeMap::new(),
+            images: seed_image_catalog(),
+            fleet_stack_associations: BTreeSet::new(),
+            usage_report_subscription: None,
+            users: BTreeMap::new(),
+            user_stack_associations: BTreeMap::new(),
+        }
+    }
 }
 
 impl ComAmazonawsAppstreamPhotonadminproxyserviceState {

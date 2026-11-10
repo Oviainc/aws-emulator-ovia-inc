@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeImages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeImages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeImages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: renders the [`crate::state::ImageRecord`]s this service's store holds —
+//! the base images AWS publishes, seeded into the store, and every image an operation of
+//! this API mints — a page at a time, so a client can enumerate the images visible to the
+//! account and pick one for a fleet or an image builder. `Names` or `Arns` select the
+//! images to report and a name or ARN naming none answers `ResourceNotFoundException`
+//! (HTTP 404); `Type` narrows the report to one visibility.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +108,13 @@ impl From<DescribeImagesErrorModeled> for DescribeImagesError {
     }
 }
 
+/// The sentence a request naming both the images' names and their ARNs is refused with.
+/// It restates the operation's own documented rule: "Retrieves a list that describes one
+/// or more specified images, if the image names or image ARNs are provided" — a request
+/// addresses the images it asks about one way or the other, not both at once.
+const NAMES_AND_ARNS_MESSAGE: &str =
+    "You must specify either the image names or the image ARNs, not both.";
+
 /// The `DescribeImages` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -147,18 +151,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeImages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeImagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeImages"))
+        // "Retrieves a list that describes one or more specified images, if the image
+        // names or image ARNs are provided": a request addresses the images it asks about
+        // by name or by ARN, so carrying both is an incorrect combination of parameters.
+        let by_name = input.names.as_ref().is_some_and(|names| !names.is_empty());
+        let by_arn = input.arns.as_ref().is_some_and(|arns| !arns.is_empty());
+        if by_name && by_arn {
+            return Err(
+                DescribeImagesErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(NAMES_AND_ARNS_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The records one page carries, as [`crate::state::page_size`] decides it from
+        // the `MaxResults` the request asked for and this read's own page ceiling.
+        let page_size =
+            crate::state::page_size(input.max_results, crate::state::DESCRIBE_IMAGES_PAGE_SIZE)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("DescribeImages"))?;
+        // The Region the request addresses: a published base image reports the ARN of the
+        // Region it is asked about, and an image minted here reports the ARN its create
+        // stamped.
+        let region = crate::state::request_region(ctx.parts());
+        // A read: the guard is only ever read through, so a Describe can never change
+        // what a later caller sees.
+        let state = state.lock();
+
+        // "Otherwise, all images in the account are described": a request naming no image
+        // asks about every image the account can see, and one naming some asks about
+        // exactly those, so a name or an ARN addressing no stored image is a resource that
+        // was not found.
+        let mut selected: ::std::collections::BTreeSet<String> = match (&input.names, &input.arns) {
+            (Some(names), _) if by_name => {
+                let mut selected = ::std::collections::BTreeSet::new();
+                for name in names {
+                    match state.images.get(name) {
+                        Some(record) => {
+                            selected.insert(record.name.clone());
+                        }
+                        None => {
+                            return Err(DescribeImagesErrorModeled::ResourceNotFoundException(
+                                ResourceNotFoundException {
+                                    message: Some(crate::state::resource_not_found_message(
+                                        crate::state::IMAGE_KIND,
+                                        name,
+                                    )),
+                                },
+                            )
+                            .into());
+                        }
+                    }
+                }
+                selected
+            }
+            (_, Some(arns)) if by_arn => {
+                let mut selected = ::std::collections::BTreeSet::new();
+                for arn in arns {
+                    match state.image_by_arn(&region, arn) {
+                        Some(record) => {
+                            selected.insert(record.name.clone());
+                        }
+                        None => {
+                            return Err(DescribeImagesErrorModeled::ResourceNotFoundException(
+                                ResourceNotFoundException {
+                                    message: Some(
+                                        crate::state::tagged_resource_not_found_message(arn),
+                                    ),
+                                },
+                            )
+                            .into());
+                        }
+                    }
+                }
+                selected
+            }
+            _ => state.images.keys().cloned().collect(),
+        };
+
+        // "The type of image (public, private, or shared) to describe": the member narrows
+        // the report to the images of that visibility, so a request carrying it is
+        // answered with the selected images that carry it and no others.
+        if let Some(visibility) = input.r#type.as_deref() {
+            selected.retain(|name| {
+                state
+                    .images
+                    .get(name)
+                    .is_some_and(|record| record.visibility == visibility)
+            });
+        }
+
+        let page = crate::state::paginate_sized(&selected, input.next_token.as_deref(), page_size)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(
+                    "NextToken is not a pagination token this service issued",
+                )
+            })?;
+        let images: Vec<Image> = page
+            .names
+            .iter()
+            .filter_map(|name| state.images.get(name))
+            .map(|record| record.to_image(&region))
+            .collect();
+
+        Ok(DescribeImagesOutput {
+            images: Some(images),
+            next_token: page.next_token,
+        })
     }
 }
