@@ -47,6 +47,8 @@ mod domain_unit_name_uniqueness;
 mod domain_units_for_parent;
 #[path = "all/entity_owners.rs"]
 mod entity_owners;
+#[path = "all/failure_envelope.rs"]
+mod failure_envelope;
 #[path = "all/form_type_deletion.rs"]
 mod form_type_deletion;
 #[path = "all/form_type_revisions.rs"]

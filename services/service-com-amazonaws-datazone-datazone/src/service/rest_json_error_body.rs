@@ -21,12 +21,21 @@
 //!
 //! WHERE IT IS APPLIED. The framework's shared `restJson1` renderer writes the `__type`
 //! member for every service it serves (`vendor/smithy-schema-server/src/rest_json.rs`),
-//! and that renderer is not this crate's to change, so the body is corrected at the one
-//! seam a service owns over its whole modelled sequence: the protocol
+//! and that renderer is not this crate's to change, so the body is corrected at the seams
+//! a service owns over the answers it writes: the protocol
 //! [`smithy_server_runtime::Service::override_protocol`] hands the dispatch walk
-//! ([`DataZoneRestJson`]). Everything else about an answer stays with the framework
+//! ([`DataZoneRestJson`]), which serializes every failure a HANDLER raised, and
+//! [`smithy_server_runtime::Service::override_routing_error`], which answers a request no
+//! modeled operation serves. Everything else about an answer stays with the framework
 //! renderer that owns it — the status, every header including `x-amzn-errortype`, request
 //! deserialization and the whole SUCCESS path are untouched.
+//!
+//! One class of failure is left as the framework writes it: a refusal rendered BEFORE a
+//! handler runs (an absent required member, a value outside a modelled bound, an
+//! unauthenticated caller). The dispatch walk renders it from the protocol's pre-dispatch
+//! ENVELOPE — a framework enum describing which protocol family states the failure, not a
+//! response this crate is handed — so no service-owned seam sees those bytes:
+//! `override_refusal` chooses only the code and the message inside that envelope.
 
 use aws_smithy_runtime_api::http::{Request, Response};
 use aws_smithy_schema::serde::{SerializableStruct, ShapeDeserializer};

@@ -27,9 +27,10 @@
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
 //! - `override_routing_error` — how this service words a request that reached it
-//!   but named no modeled operation. The default returns `None`, so the entry
-//!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
-//!   404, …). Return `Some(resp)` to answer in your own envelope if desired.
+//!   but named no modeled operation. This service DOES take it: the entry's own
+//!   protocol-correct answer, with the one difference a FAILURE's body carries
+//!   (see [`rest_json_error_body`]), so a request this service does not serve
+//!   answers in the same envelope every other failure of it does.
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
@@ -37,7 +38,10 @@
 //!
 //! A sixth seam, `override_protocol`, is one this service DOES take: it serves the
 //! model's own `restJson1` codec with the one difference the shared renderer cannot
-//! express — what a FAILURE's body carries (see [`rest_json_error_body`]).
+//! express — what a FAILURE's body carries (see [`rest_json_error_body`]). That
+//! difference is a property of this service's wire envelope, not of one renderer, so
+//! both seams this service takes — the protocol (a failure a handler raised) and the
+//! routing error (a request no modeled operation serves) — answer through it.
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
@@ -127,12 +131,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // routing table resolved it.
+        //
+        // The STATUS, the headers and the wording stay the generated entry's: this
+        // service states nothing of its own about a request it does not serve. Only the
+        // BODY is this service's, and by the same rule every other failure of it follows
+        // ([`rest_json_error_body`]): a `restJson1` failure names its error shape in
+        // `x-amzn-errortype`, so its body carries the shape's own members and no
+        // discriminator. The shared pre-dispatch renderer writes one for every service it
+        // serves, and this is the seam that owns a routing failure's answer here.
+        Some(rest_json_error_body::with_served_error_body(
+            smithy_server_runtime::ErasedServiceDefinition::routing_error_response(
+                &self.entry,
+                req,
+            ),
+        ))
     }
 
     fn override_framework_error(
@@ -142,9 +155,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The router calls this on a transport-level failure it detects up front —
         // before (or instead of) naming an operation — such as a malformed
         // `aws-chunked` body. Returning `None` keeps the entry's protocol-correct
-        // rendering. Return `Some(resp)` to reword that failure in your own
-        // envelope. The error is borrowed, so the default renderer can still
-        // consume it on `None`.
+        // rendering.
+        //
+        // NOT taken, unlike the routing seam above: this one is handed the failure by
+        // shared reference and no request, so the entry's own renderer — which consumes
+        // the failure and reads the request's protocol — cannot be called from here, and
+        // re-deriving a body would state the failure a second way. The body that renderer
+        // writes stays as it writes it.
         let _ = error;
         None
     }
