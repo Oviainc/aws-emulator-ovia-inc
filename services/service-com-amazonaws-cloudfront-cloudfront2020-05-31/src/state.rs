@@ -3759,15 +3759,28 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
 /// `DefaultCacheBehavior` and `CacheBehavior` are two Smithy structures declaring the SAME
 /// members, so ONE macro resolves both — two copies of this walk would be two things to
 /// keep in step.
+///
+/// `$multi_tenant` says which KIND of distribution the behaviour belongs to, for the same
+/// reason [`resolve_distribution_config`] reads it: a member documented as supported only
+/// on a standard distribution is no member of a multi-tenant one's configuration, so the
+/// service supplies no default for it there either.
 macro_rules! resolve_behavior_members {
-    ($behavior:expr) => {{
+    ($behavior:expr, $multi_tenant:expr) => {{
         let mut behavior = $behavior;
-        // An absent trusted-signer or trusted-key-group wrapper is a behaviour that
-        // requires no signed URL or cookie: not enabled, and nobody in the list.
-        behavior.trusted_signers = Some(behavior.trusted_signers.unwrap_or_default());
+        let multi_tenant: bool = $multi_tenant;
+        // An absent trusted-key-group wrapper is a behaviour that requires no signed URL
+        // or cookie: not enabled, and nobody in the list. `TrustedSigners` says the same
+        // thing for the deprecated account-based form, and it is one of the members only a
+        // standard distribution has, so only a standard behaviour gets it.
+        if !multi_tenant {
+            behavior.trusted_signers = Some(behavior.trusted_signers.unwrap_or_default());
+        }
         behavior.trusted_key_groups = Some(behavior.trusted_key_groups.unwrap_or_default());
         behavior.allowed_methods = Some(resolve_allowed_methods(behavior.allowed_methods));
-        behavior.smooth_streaming = Some(behavior.smooth_streaming.unwrap_or(DEFAULT_SMOOTH_STREAMING));
+        if !multi_tenant {
+            behavior.smooth_streaming =
+                Some(behavior.smooth_streaming.unwrap_or(DEFAULT_SMOOTH_STREAMING));
+        }
         behavior.compress = Some(behavior.compress.unwrap_or(DEFAULT_COMPRESS));
         behavior.lambda_function_associations =
             Some(behavior.lambda_function_associations.unwrap_or_default());
@@ -3778,12 +3791,16 @@ macro_rules! resolve_behavior_members {
         behavior.grpc_config = Some(behavior.grpc_config.unwrap_or_default());
         // The legacy cache-key members travel as ONE group: a behaviour that states its
         // cache key with `ForwardedValues` also gets the three TTLs resolved, while one
-        // that attaches a cache policy states none of them and gets none.
+        // that attaches a cache policy states none of them and gets none. The three TTLs
+        // are standard-only members as well, so only a standard behaviour has them
+        // supplied.
         if let Some(forwarded) = behavior.forwarded_values {
             behavior.forwarded_values = Some(resolve_forwarded_values(forwarded));
-            behavior.min_ttl = Some(behavior.min_ttl.unwrap_or(DEFAULT_MIN_TTL));
-            behavior.default_ttl = Some(behavior.default_ttl.unwrap_or(DEFAULT_DEFAULT_TTL));
-            behavior.max_ttl = Some(behavior.max_ttl.unwrap_or(DEFAULT_MAX_TTL));
+            if !multi_tenant {
+                behavior.min_ttl = Some(behavior.min_ttl.unwrap_or(DEFAULT_MIN_TTL));
+                behavior.default_ttl = Some(behavior.default_ttl.unwrap_or(DEFAULT_DEFAULT_TTL));
+                behavior.max_ttl = Some(behavior.max_ttl.unwrap_or(DEFAULT_MAX_TTL));
+            }
         }
         behavior
     }};

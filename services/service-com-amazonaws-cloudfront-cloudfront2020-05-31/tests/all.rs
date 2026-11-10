@@ -285,6 +285,8 @@ mod server_supplied_config_members;
 mod staging_config_promotion;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stored_config_round_trip.rs"]
+mod stored_config_round_trip;
 #[path = "all/streaming_distribution_list.rs"]
 mod streaming_distribution_list;
 #[path = "all/tag_resource.rs"]

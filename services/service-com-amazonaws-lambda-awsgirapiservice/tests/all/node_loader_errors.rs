@@ -32,14 +32,14 @@ const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 
 /// The task root a deployment package's files are mounted at, which is what a node stack
 /// frame and a require stack name them by.
-const TASK_ROOT: &str = "/var/task";
+pub(crate) const TASK_ROOT: &str = "/var/task";
 
 /// The runtime's own entry module, the outermost frame of every require stack: it is the
 /// module that requires the handler's.
-const RUNTIME_ENTRY: &str = "/var/runtime/index.mjs";
+pub(crate) const RUNTIME_ENTRY: &str = "/var/runtime/index.mjs";
 
 /// A .zip deployment package holding `entries`.
-fn package(entries: &[(&str, &str)]) -> Vec<u8> {
+pub(crate) fn package(entries: &[(&str, &str)]) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
@@ -57,7 +57,7 @@ fn package(entries: &[(&str, &str)]) -> Vec<u8> {
 
 /// Create a `nodejs20.x` function holding `entries` with the handler `handler`, and bring
 /// it to the state an invocation needs.
-async fn create_node_function(
+pub(crate) async fn create_node_function(
     router: &smithy_server_runtime::MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     name: &str,
@@ -88,7 +88,7 @@ async fn create_node_function(
 }
 
 /// `Invoke` on `name`.
-async fn invoke(
+pub(crate) async fn invoke(
     router: &smithy_server_runtime::MultiServiceRouter,
     name: &str,
 ) -> Answer {
@@ -105,7 +105,7 @@ async fn invoke(
 
 /// The require stack text a node runtime appends to a `Cannot find module` message: the
 /// requiring files, innermost first, one per line.
-fn require_stack(frames: &[&str]) -> String {
+pub(crate) fn require_stack(frames: &[&str]) -> String {
     let listed: Vec<String> = frames.iter().map(|frame| format!("- {frame}")).collect();
     format!("\nRequire stack:\n{}", listed.join("\n"))
 }
@@ -278,15 +278,27 @@ async fn a_handler_that_cannot_be_loaded_is_reported_the_way_the_node_runtime_re
             case.message
         );
         // The trace a node runtime reports opens with the "<errorType>: <errorMessage>"
-        // line, which is how a client reading the log sees the same failure.
+        // line, which is how a client reading the log sees the same failure. A trace is a
+        // stack TEXT reported one entry per LINE, so a message spanning several lines — a
+        // require stack does — opens the trace with one entry per line of it
+        // ([`crate::node_error_trace_lines`] holds that rule over its own table).
+        let head = format!("{}: {}", case.error_type, case.message);
+        let opened: Vec<&str> = document
+            .get("trace")
+            .and_then(Value::as_array)
+            .map(|frames| {
+                frames
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .take(head.split('\n').count())
+                    .collect()
+            })
+            .unwrap_or_default();
         assert_eq!(
-            document
-                .get("trace")
-                .and_then(Value::as_array)
-                .and_then(|frames| frames.first())
-                .and_then(Value::as_str),
-            Some(format!("{}: {}", case.error_type, case.message).as_str()),
-            "case {:?}: expected the trace to open with the error line, got {document}",
+            opened,
+            head.split('\n').collect::<Vec<&str>>(),
+            "case {:?}: expected the trace to open with the lines of the error line, got \
+             {document}",
             case.case
         );
     }

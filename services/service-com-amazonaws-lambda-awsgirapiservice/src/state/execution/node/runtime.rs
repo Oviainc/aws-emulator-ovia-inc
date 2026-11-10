@@ -1054,6 +1054,14 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
 
     // ---------------------------------------------------------------- the invocation
 
+    // The LINES of one error's stack text, which is what a node runtime reports a trace as:
+    // the stack is text, and the document carries it one entry per line, so no entry ever
+    // holds a newline. A head line whose message spans several lines (a `Cannot find module`
+    // message carries its require stack) therefore occupies one entry per line of it.
+    function traceLines(head) {
+        return String(head).split('\n');
+    }
+
     // What a node runtime reports for a value a handler threw. An ERROR reports its own
     // class, its message and its stack — whose first line is the "<ErrorType>: <message>"
     // line, which this engine's stack does not carry, so it is stated here. Anything else
@@ -1070,7 +1078,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         }
         var type = typeof error.name === 'string' && error.name !== '' ? error.name : 'Error';
         var message = error.message === undefined ? '' : String(error.message);
-        var trace = [type + ': ' + decorated(message)];
+        var trace = traceLines(type + ': ' + decorated(message));
         if (typeof error.stack === 'string' && error.stack !== '') {
             var frames = error.stack.split('\n');
             for (var index = 0; index < frames.length; index += 1) {
@@ -1085,6 +1093,12 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             errorMessage: decorated(message),
             trace: trace
         };
+    }
+
+    // How many entries of a reported trace its HEAD line occupies: one per line of the
+    // "<ErrorType>: <message>" line a trace opens with ([`traceLines`]).
+    function headLineCount(reported) {
+        return traceLines(reported.errorType + ': ' + reported.errorMessage).length;
     }
 
     // The message the RUNTIME reports for an error class whose own wording it states rather
@@ -1161,7 +1175,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             outcome: 'raised',
             errorType: type,
             errorMessage: message,
-            trace: [type + ': ' + message]
+            trace: traceLines(type + ': ' + message)
         };
     }
 
@@ -1227,8 +1241,8 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             // The runtime's own error line, then the frames of the rejection reason's own
             // stack under it: the reason's head line is replaced rather than repeated,
             // because the error being reported is the runtime's.
-            trace: ['Runtime.UnhandledPromiseRejection: ' + message]
-                .concat(reported.trace.slice(1))
+            trace: traceLines('Runtime.UnhandledPromiseRejection: ' + message)
+                .concat(reported.trace.slice(headLineCount(reported)))
         };
     }
 

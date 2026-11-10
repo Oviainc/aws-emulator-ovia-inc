@@ -14,14 +14,19 @@
 
 use super::*;
 
-/// Resolve the members the service supplies on the default cache behaviour.
-pub(super) fn resolve_default_cache_behavior(behavior: DefaultCacheBehavior) -> DefaultCacheBehavior {
-    resolve_behavior_members!(behavior)
+/// Resolve the members the service supplies on the default cache behaviour of a
+/// distribution whose configuration is multi-tenant when `multi_tenant` says so.
+pub(super) fn resolve_default_cache_behavior(
+    behavior: DefaultCacheBehavior,
+    multi_tenant: bool,
+) -> DefaultCacheBehavior {
+    resolve_behavior_members!(behavior, multi_tenant)
 }
 
-/// Resolve the members the service supplies on one ordered cache behaviour.
-pub(super) fn resolve_cache_behavior(behavior: CacheBehavior) -> CacheBehavior {
-    resolve_behavior_members!(behavior)
+/// Resolve the members the service supplies on one ordered cache behaviour of a
+/// distribution whose configuration is multi-tenant when `multi_tenant` says so.
+pub(super) fn resolve_cache_behavior(behavior: CacheBehavior, multi_tenant: bool) -> CacheBehavior {
+    resolve_behavior_members!(behavior, multi_tenant)
 }
 
 /// The methods a cache behaviour allows and caches: the ones it names, or
@@ -3958,6 +3963,15 @@ pub(super) fn render_token(value: u64, len: usize) -> String {
 /// A member that is a CHOICE the configuration has not made (a cache policy id, a
 /// real-time log configuration, an anycast ip list, a tenant or connection-mode setting)
 /// is left absent: the service applies nothing to it.
+///
+/// Which KIND of distribution the configuration describes decides which of them are its
+/// members at all: a member documented as supported only on a standard distribution
+/// (`Aliases`, `PriceClass`, `IsIPV6Enabled`, `ContinuousDeploymentPolicyId`, `Staging`, and
+/// a cache behaviour's `TrustedSigners`, `SmoothStreaming` and legacy TTLs) is no member of a
+/// multi-tenant one, so a multi-tenant configuration has none of them supplied — a member
+/// the service refuses on the way in ([`multi_tenant_direct_only_member`]) is not one it
+/// supplies a default for, which is what makes the configuration a read reports one a later
+/// update admits back unchanged.
 pub fn resolve_distribution_config(mut config: DistributionConfig) -> DistributionConfig {
     // Which KIND of distribution the configuration describes decides which members the
     // service supplies at all: a member documented as supported only on a standard
@@ -3974,11 +3988,18 @@ pub fn resolve_distribution_config(mut config: DistributionConfig) -> Distributi
     config.origins.items = origins.into_iter().map(resolve_origin).collect();
     config.origin_groups = Some(config.origin_groups.unwrap_or_default());
 
-    config.default_cache_behavior =
-        resolve_default_cache_behavior(std::mem::take(&mut config.default_cache_behavior));
+    config.default_cache_behavior = resolve_default_cache_behavior(
+        std::mem::take(&mut config.default_cache_behavior),
+        multi_tenant,
+    );
     let mut behaviors = config.cache_behaviors.take().unwrap_or_default();
     if let Some(items) = behaviors.items.take() {
-        behaviors.items = Some(items.into_iter().map(resolve_cache_behavior).collect());
+        behaviors.items = Some(
+            items
+                .into_iter()
+                .map(|behavior| resolve_cache_behavior(behavior, multi_tenant))
+                .collect(),
+        );
     }
     config.cache_behaviors = Some(behaviors);
 
