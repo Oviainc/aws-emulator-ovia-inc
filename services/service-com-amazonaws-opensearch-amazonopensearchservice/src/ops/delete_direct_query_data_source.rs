@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDirectQueryDataSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDirectQueryDataSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDirectQueryDataSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Releases one direct query data source of this account: the
+//! [`crate::state::DirectQueryDataSourceRecord`] `AddDirectQueryDataSource`
+//! persisted, so no read path reports it any more, its name is free for another
+//! add and the tags it carried are no longer tags of this account.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +67,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{direct_query_data_source_absent, service_state, state_unavailable};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -168,18 +166,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDirectQueryDataSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDirectQueryDataSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        let mut store = state.lock();
+
+        // The data source is addressed by its name across the account, so resolving
+        // that name is part of READING the request: a name the account holds nothing
+        // under names nothing to delete, and is refused in the same words every other
+        // read of an absent name is refused in. The removal comes off the SAME lookup,
+        // so a served delete has released exactly the record a refusal would have
+        // denied.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDirectQueryDataSource"))
+        // Nothing is provisioned for a direct query data source and the model gives it
+        // no status member, so it has no non-terminal state to rest in: the record goes
+        // with the call that deleted it, taking its name, its ARN and the tags held on
+        // it out of this account's state. The tag set the tagging operations resolve
+        // that ARN to lives ON the record, so it is released by the same removal.
+        if store
+            .direct_query_data_sources
+            .remove(&input.data_source_name)
+            .is_none()
+        {
+            return Err(DeleteDirectQueryDataSourceErrorModeled::ValidationException(
+                direct_query_data_source_absent(),
+            )
+            .into());
+        }
+
+        // This operation's output targets `smithy.api#Unit`, so the served answer
+        // carries no members at all.
+        Ok(DeleteDirectQueryDataSourceOutput)
     }
 }
