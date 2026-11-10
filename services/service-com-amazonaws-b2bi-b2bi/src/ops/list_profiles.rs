@@ -149,9 +149,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A reporting operation: nothing about the store changes here.
-        if let Err(denied) =
-            crate::state::authorize(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
-        {
+        // A List addresses the whole collection rather than one member of it, so it is
+        // judged — and a refusal is worded — against that collection's ARN.
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::collection_arn(&crate::state::request_region(ctx.parts()), "profile"),
+        ) {
             return Err(ListProfilesErrorModeled::AccessDeniedException(denied).into());
         }
         let Some(store) = crate::state::service_state(&*self.engine) else {

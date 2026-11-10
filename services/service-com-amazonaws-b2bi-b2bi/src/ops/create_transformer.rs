@@ -293,15 +293,13 @@ fn mixed_configuration_styles(
 /// transformer store further, so the request is refused rather than served by allocating
 /// more.
 ///
-/// `quotaCode` and `serviceCode` name the limit that was actually reached — this
-/// emulator's own storage bound and this service's own code — rather than an AWS quota
-/// code, which only AWS can assign.
+/// `quotaCode` and `serviceCode` name the quota that was reached, so a caller can read
+/// its current value there — which is why the NUMBER is not in the sentence, only AWS's
+/// own quota wording for the resource type and the account
+/// ([`crate::state::quota_reached`]).
 fn store_full() -> CreateTransformerError {
     CreateTransformerErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
-        message: format!(
-            "this emulator stores at most {} transformers",
-            crate::state::MAX_RECORDS_PER_STORE
-        ),
+        message: crate::state::quota_reached("Transformer"),
         resource_id: ::engine::emulator_account_id().to_string(),
         resource_type: "transformer".to_string(),
         service_code: "b2bi".to_string(),
@@ -438,9 +436,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(mixed_configuration_styles(&legacy, &current));
         }
 
-        if let Err(denied) =
-            crate::state::authorize(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
-        {
+        // A create names no resource of its own until it mints one, so it is judged — and
+        // a refusal is worded — against the account's whole transformer collection.
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::collection_arn(
+                &crate::state::request_region(ctx.parts()),
+                "transformer",
+            ),
+        ) {
             return Err(CreateTransformerErrorModeled::AccessDeniedException(denied).into());
         }
         let Some(store) = crate::state::service_state(&*self.engine) else {

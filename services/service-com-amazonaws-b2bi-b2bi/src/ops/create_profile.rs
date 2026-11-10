@@ -176,14 +176,12 @@ impl From<CreateProfileErrorModeled> for CreateProfileError {
 ///
 /// `quotaCode` / `serviceCode` name the quota that was reached, as the Service Quotas
 /// emulator publishes it for this service, so a client that reads the exception can
-/// look the limit up. Deleting a profile releases a slot, so this is a refusal of ONE
-/// request, not a permanent one.
+/// look the limit up — which is why the NUMBER is not in the sentence
+/// ([`crate::state::quota_reached`]). Deleting a profile releases a slot, so this is a
+/// refusal of ONE request, not a permanent one.
 fn quota_exceeded() -> CreateProfileError {
     CreateProfileErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
-        message: format!(
-            "Account has reached the limit of {} profiles",
-            crate::state::MAX_PROFILES_PER_ACCOUNT
-        ),
+        message: crate::state::quota_reached("Profile"),
         resource_id: ::engine::emulator_account_id().to_string(),
         resource_type: "profile".to_string(),
         service_code: crate::state::SERVICE_CODE.to_string(),
@@ -426,9 +424,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        if let Err(denied) =
-            crate::state::authorize(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
-        {
+        // A create names no resource of its own until it mints one, so it is judged — and
+        // a refusal is worded — against the account's whole profile collection.
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::collection_arn(&crate::state::request_region(ctx.parts()), "profile"),
+        ) {
             return Err(CreateProfileErrorModeled::AccessDeniedException(denied).into());
         }
         let Some(store) = crate::state::service_state(&*self.engine) else {

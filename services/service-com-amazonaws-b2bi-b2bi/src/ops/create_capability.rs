@@ -199,12 +199,13 @@ fn request_digest(input: &CreateCapabilityInput) -> String {
     ))
 }
 
+/// The modelled refusal for an account already holding its quota of capabilities
+/// ([`crate::state::MAX_RECORDS_PER_STORE`] of them here): AWS's own quota sentence, with
+/// the numeric limit left to the `quotaCode` / `serviceCode` members a caller reads the
+/// quota's current value from ([`crate::state::quota_reached`]).
 fn store_full() -> CreateCapabilityError {
     CreateCapabilityErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
-        message: format!(
-            "this emulator stores at most {} capabilities",
-            crate::state::MAX_RECORDS_PER_STORE
-        ),
+        message: crate::state::quota_reached("Capability"),
         resource_id: ::engine::emulator_account_id().to_string(),
         resource_type: "capability".to_string(),
         service_code: "b2bi".to_string(),
@@ -313,9 +314,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        if let Err(denied) =
-            crate::state::authorize(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
-        {
+        // A create names no resource of its own until it mints one, so it is judged — and
+        // a refusal is worded — against the account's whole capability collection.
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::collection_arn(
+                &crate::state::request_region(ctx.parts()),
+                "capability",
+            ),
+        ) {
             return Err(CreateCapabilityErrorModeled::AccessDeniedException(denied).into());
         }
         let region = crate::state::request_region(ctx.parts());

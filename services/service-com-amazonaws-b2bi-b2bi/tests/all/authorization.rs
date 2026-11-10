@@ -29,10 +29,14 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::onboarding_loop::{call, call_as, error_code, ACCOUNT};
 
 /// The role every session below is assumed from.
-const ROLE: &str = "b2bi-onboarding";
+pub(crate) const ROLE: &str = "b2bi-onboarding";
+
+/// The name of the session the role is assumed under, so the refusal a denied request
+/// answers with names the session ARN `sts:GetCallerIdentity` reports.
+pub(crate) const SESSION_NAME: &str = "onboarding-session";
 
 /// The access key id of the assumed-role session's credentials.
-const SESSION_KEY_ID: &str = "ASIAEXAMPLESESSION01";
+pub(crate) const SESSION_KEY_ID: &str = "ASIAEXAMPLESESSION01";
 
 /// The name of the inline policy the role carries.
 const POLICY_NAME: &str = "inline";
@@ -43,13 +47,13 @@ const SESSION_SECONDS: i32 = 3_600;
 /// One emulator holding b2bi (and the CloudWatch Logs service `CreateProfile` provisions a
 /// log group through) over one shared engine, with that engine kept so a test can seed the
 /// IAM and STS stores the authorization decision is read from.
-struct Emulator {
-    router: MultiServiceRouter,
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(service_com_amazonaws_b2bi_b2bi::EmulatedService::new(
@@ -65,7 +69,7 @@ impl Emulator {
 
     /// Mint the assumed-role session [`SESSION_KEY_ID`] speaks for, as `sts:AssumeRole`
     /// records one: the identity is the `assumed-role` ARN `sts:GetCallerIdentity` reports.
-    fn given_session(&self) {
+    pub(crate) fn given_session(&self) {
         let now = SystemTime::now();
         let vend = sts::NewSession {
             role_arn: Some(format!("arn:aws:iam::{ACCOUNT}:role/{ROLE}")),
@@ -73,7 +77,7 @@ impl Emulator {
                 sts::Identity {
                     user_id: sts::role_id(ROLE),
                     account: ACCOUNT.to_string(),
-                    arn: format!("arn:aws:sts::{ACCOUNT}:assumed-role/{ROLE}/onboarding-session"),
+                    arn: format!("arn:aws:sts::{ACCOUNT}:assumed-role/{ROLE}/{SESSION_NAME}"),
                 },
                 sts::SessionKind::AssumedRole,
                 SESSION_SECONDS,
@@ -92,7 +96,7 @@ impl Emulator {
     /// A `document` that is a JSON STRING is stored verbatim rather than as its JSON text,
     /// because that is how a percent-encoded document — the form IAM reports a policy in —
     /// and a document that is not a policy at all reach the store.
-    fn given_role_policy(&self, document: &Value) {
+    pub(crate) fn given_role_policy(&self, document: &Value) {
         let policy_document = match document.as_str() {
             Some(verbatim) => verbatim.to_string(),
             None => document.to_string(),
@@ -111,7 +115,7 @@ impl Emulator {
     }
 
     /// Take every policy off the role — what `iam:DeleteRolePolicy` does.
-    fn given_no_role_policy(&self) {
+    pub(crate) fn given_no_role_policy(&self) {
         let store = iam::service_state(&*self.engine).expect("the IAM store");
         store.lock().role_inline_policies.remove(&iam::name_key(ROLE));
     }

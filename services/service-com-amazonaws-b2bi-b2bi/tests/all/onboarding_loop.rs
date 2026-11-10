@@ -145,13 +145,25 @@ pub(crate) async fn call_as(
     operation: &str,
     body: Value,
 ) -> (u16, Value) {
+    call_as_signed_for(router, access_key_id, SIGNING_REGION, operation, body).await
+}
+
+/// Invoke one operation signed for `region` with the access key id `access_key_id`, so a
+/// test can speak for the principal that key names in the Region of its choosing.
+pub(crate) async fn call_as_signed_for(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    region: &str,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential={access_key_id}/20240101/{SIGNING_REGION}/b2bi/\
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20240101/{region}/b2bi/\
                  aws4_request, SignedHeaders=host, Signature=deadbeef"
             ),
         )
@@ -1446,8 +1458,11 @@ async fn updating_a_profile_applies_only_the_members_it_names() {
 }
 
 /// RULE: a create refuses once its store is full, with the modelled
-/// `ServiceQuotaExceededException` (HTTP 402) naming the limit that was reached — AWS's
-/// documented five-profile limit for profiles, and the emulator's own residency bound
+/// `ServiceQuotaExceededException` (HTTP 402) stating AWS's quota sentence for the
+/// resource type and the account whose quota was reached — and NOT the numeric limit,
+/// which a caller reads from the `serviceCode`/`quotaCode` the refusal names, because a
+/// quota is adjustable per account. The ceilings themselves are AWS's documented
+/// five-profile limit for profiles and the emulator's own residency bound
 /// (`MAX_RECORDS_PER_STORE`) for the stores AWS publishes no limit for, so repeated
 /// unauthenticated creates cannot grow the process's memory without limit. Rows span all
 /// three stores, each on its own engine.
@@ -1539,9 +1554,25 @@ async fn a_create_is_refused_once_its_store_is_full() {
             "ServiceQuotaExceededException",
             "case {case:?}: expected ServiceQuotaExceededException, got {response}"
         );
+        let expected_message = format!(
+            "{} limit reached for AWS account {ACCOUNT}",
+            match case {
+                "profile" => "Profile",
+                "capability" => "Capability",
+                _ => "Partnership",
+            }
+        );
+        assert_eq!(
+            text(&response, "message"),
+            expected_message,
+            "case {case:?}: the refusal must state the quota sentence {expected_message:?}, \
+             got {:?}",
+            text(&response, "message")
+        );
         assert!(
-            text(&response, "message").contains(&bound.to_string()),
-            "case {case:?}: the refusal must name the limit it reached, got {:?}",
+            !text(&response, "message").contains(&bound.to_string()),
+            "case {case:?}: the numeric limit belongs in the quota members, not the \
+             sentence, got {:?}",
             text(&response, "message")
         );
         assert!(

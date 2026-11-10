@@ -764,6 +764,31 @@ pub fn resource_arn(region: &str, kind: &str, id: &str) -> String {
     ::engine::emulator_arn(SERVICE_CODE, region, &format!("{kind}/{id}"))
 }
 
+/// The ARN of the account's whole collection of one resource type in `region`, which is
+/// what a request addressing the collection rather than one member of it is authorized
+/// against: a create (it names no resource until it mints one) and a List (it names none
+/// at all) act on every resource of that type the account holds, spelled with IAM's
+/// wildcard id — the same form a policy scoping a statement to every resource of the type
+/// is written with.
+pub fn collection_arn(region: &str, kind: &str) -> String {
+    resource_arn(region, kind, ANY_RESOURCE)
+}
+
+/// The `ServiceQuotaExceededException` message for a create refused because the account
+/// has reached its quota of `resource_type` resources (capitalised as the sentence names
+/// it: `Profile`, `Capability`, `Partnership`, `Transformer`).
+///
+/// The only variable part is the account the quota belongs to. The numeric limit is NOT in
+/// the sentence: a quota is adjustable per account, so what the limit currently is travels
+/// in the exception's own `serviceCode`/`quotaCode` members, which name the quota a caller
+/// reads its value (and its adjusted value) from.
+pub fn quota_reached(resource_type: &str) -> String {
+    format!(
+        "{resource_type} limit reached for AWS account {}",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// The tag-key prefix AWS reserves for its own tags across every service: a caller may
 /// not create or edit a key that starts with it, in any casing.
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
@@ -1245,9 +1270,12 @@ pub async fn write_object(
 /// string as [`SERVICE_CODE`].
 pub const IAM_ACTION_PREFIX: &str = SERVICE_CODE;
 
-/// The resource an operation that addresses no existing resource is authorized against:
-/// a create has no ARN yet, and a list addresses the whole collection, so the request is
-/// matched against the policy wildcard rather than against an ARN nothing holds.
+/// The wildcard id IAM writes "every resource" with, which this service uses two ways:
+/// as the id of a whole collection of one resource type ([`collection_arn`]), and as the
+/// resource an operation bound to no resource type at all is authorized against — a dry
+/// run over content the request carries (`TestMapping`, `TestParsing`, `TestConversion`,
+/// `GenerateMapping`, `CreateStarterMappingTemplate`), which touches nothing the account
+/// holds and so has no ARN to name.
 pub const ANY_RESOURCE: &str = "*";
 
 /// The STS session store in the SAME shared engine, which is where the identity an access
@@ -1276,7 +1304,9 @@ pub fn iam_state<Eng: Send + Sync + 'static>(
 
 /// Authorize this request against the IAM identity policies of the principal the signing
 /// credentials name, as the service prefix [`IAM_ACTION_PREFIX`] and `operation` name the
-/// action and `resource` names what it acts on ([`ANY_RESOURCE`] where no ARN exists yet).
+/// action and `resource` names what it acts on: the ARN of the resource the request
+/// addresses, the [`collection_arn`] of the resource type a create or a List acts on, or
+/// [`ANY_RESOURCE`] for an action bound to no resource type at all.
 ///
 /// The DECISION is [`::service_common::iam_authorization`], the tree's one evaluation of
 /// IAM policy documents against a request, so b2bi and every other service handed the same
@@ -1378,8 +1408,14 @@ pub fn authorize<Eng: Send + Sync + 'static>(
 }
 
 /// The modelled `AccessDeniedException` for a refused request, worded the way IAM words an
-/// authorization failure: the principal, the action, the resource it was asked for (left
-/// out where the request addresses no ARN) and which of IAM's two rules refused it.
+/// authorization failure: the principal, the action, the resource it was asked for and
+/// which of IAM's two rules refused it.
+///
+/// The resource clause names whatever the request was judged against — the ARN of the
+/// resource it addresses, or the wildcard ARN of the collection a create or a List acts on
+/// ([`collection_arn`]), which is what tells a caller the SCOPE the deny applied to. Only
+/// an action bound to no resource type at all ([`ANY_RESOURCE`]) states no clause: there
+/// is nothing to name.
 fn access_denied(
     principal: &str,
     action: &str,

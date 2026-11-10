@@ -31,6 +31,8 @@ mod onboarding_loop;
 mod profile_filter_and_job_locations;
 #[path = "all/references_logging_and_quota.rs"]
 mod references_logging_and_quota;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/starter_mapping_template.rs"]
 mod starter_mapping_template;
 #[path = "all/state_roundtrip.rs"]

@@ -24,7 +24,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::onboarding_loop::{
     b2bi_router, call, call_signed_for, capability_configuration, error_code, given_capability,
-    given_capability_buckets, given_partnership, given_profile, given_transformer, text,
+    given_capability_buckets, given_partnership, given_profile, given_transformer, text, ACCOUNT,
     SIGNING_REGION,
 };
 
@@ -648,9 +648,14 @@ async fn the_profile_quota_is_enforced_charged_and_released() {
             ),
             "case logging={logging}: the refusal must name the published quota, got {body}"
         );
-        assert!(
-            text(&body, "message").contains(&limit.to_string()),
-            "case logging={logging}: the refusal must name the limit, got {:?}",
+        // The sentence names the resource type and the account whose quota was reached,
+        // not the numeric limit: a quota is adjustable per account, so its value travels
+        // in the `serviceCode`/`quotaCode` members asserted just above.
+        let expected_message = format!("Profile limit reached for AWS account {ACCOUNT}");
+        assert_eq!(
+            text(&body, "message"),
+            expected_message,
+            "case logging={logging}: the refusal must state {expected_message:?}, got {:?}",
             text(&body, "message")
         );
     }

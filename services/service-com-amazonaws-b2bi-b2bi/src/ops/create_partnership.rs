@@ -214,12 +214,13 @@ fn request_digest(input: &CreatePartnershipInput) -> String {
     ))
 }
 
+/// The modelled refusal for an account already holding its quota of partnerships
+/// ([`crate::state::MAX_RECORDS_PER_STORE`] of them here): AWS's own quota sentence, with
+/// the numeric limit left to the `quotaCode` / `serviceCode` members a caller reads the
+/// quota's current value from ([`crate::state::quota_reached`]).
 fn store_full() -> CreatePartnershipError {
     CreatePartnershipErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
-        message: format!(
-            "this emulator stores at most {} partnerships",
-            crate::state::MAX_RECORDS_PER_STORE
-        ),
+        message: crate::state::quota_reached("Partnership"),
         resource_id: ::engine::emulator_account_id().to_string(),
         resource_type: "partnership".to_string(),
         service_code: "b2bi".to_string(),
@@ -285,9 +286,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        if let Err(denied) =
-            crate::state::authorize(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
-        {
+        // A create names no resource of its own until it mints one, so it is judged — and
+        // a refusal is worded — against the account's whole partnership collection.
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::collection_arn(
+                &crate::state::request_region(ctx.parts()),
+                "partnership",
+            ),
+        ) {
             return Err(CreatePartnershipErrorModeled::AccessDeniedException(denied).into());
         }
         let Some(store) = crate::state::service_state(&*self.engine) else {

@@ -558,9 +558,9 @@ async fn getting_an_unknown_transformer_is_refused_as_not_found() {
 
 /// RULE: `CreateTransformer` refuses once the transformer store is at the emulator's
 /// residency bound (`MAX_RECORDS_PER_STORE`), with the modelled
-/// `ServiceQuotaExceededException` (HTTP 402) naming that bound — the same ceiling the
-/// service's other creates hold, so repeated creates cannot grow the process's memory
-/// without limit.
+/// `ServiceQuotaExceededException` (HTTP 402) stating AWS's quota sentence for
+/// transformers and the account — the same ceiling the service's other creates hold, so
+/// repeated creates cannot grow the process's memory without limit.
 #[tokio::test]
 async fn creating_a_transformer_is_refused_once_the_store_is_at_the_residency_bound() {
     let router = b2bi_router();
@@ -591,9 +591,14 @@ async fn creating_a_transformer_is_refused_once_the_store_is_at_the_residency_bo
         "ServiceQuotaExceededException",
         "expected ServiceQuotaExceededException, got {response}"
     );
-    assert!(
-        text(&response, "message").contains(&bound.to_string()),
-        "the refusal must name the emulator's own bound, got {:?}",
+    let expected_message = format!(
+        "Transformer limit reached for AWS account {}",
+        engine::EMULATOR_ACCOUNT_ID
+    );
+    assert_eq!(
+        text(&response, "message"),
+        expected_message,
+        "the refusal must state the quota sentence {expected_message:?}, got {:?}",
         text(&response, "message")
     );
 }
