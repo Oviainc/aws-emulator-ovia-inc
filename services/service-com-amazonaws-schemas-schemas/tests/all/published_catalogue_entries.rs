@@ -136,7 +136,10 @@ fn source_rows() -> Vec<SourceRow> {
                 "InvestigationLinked",
                 "InvestigationPendingTriage",
             ],
-            cloud_trail_family: true,
+            // The catalogue publishes the investigation lifecycle for this source and no
+            // CloudTrail-delivered schema: its recorded page opens with
+            // `InvestigationCancelled`. `catalogue_publications.rs` owns that rule.
+            cloud_trail_family: false,
             extra_cloud_trail_spelling: None,
         },
         SourceRow {

@@ -2460,7 +2460,9 @@ pub const AWS_EVENT_SOURCES: &[&str] = &[
     "aws.acm",
     "aws.acm-pca",
     "aws.act",
-    "aws.aidevops",
+    // `aws.aidevops` is deliberately NOT here: the catalogue publishes its investigation
+    // lifecycle event types ([`AWS_SERVICE_EVENT_TYPES`]) and no CloudTrail-delivered
+    // schema for it, so its block of the catalogue is those entries alone.
     "aws.airflow",
     "aws.amazon.connect",
     "aws.amazonmq",
@@ -2850,68 +2852,77 @@ pub struct PublishedEvent {
 /// `LastModified` is "the date and time that schema was modified": a property of the
 /// PUBLISHED schema, which is what a client compares against its cached copy to decide
 /// whether that copy is stale. So what the member has to satisfy is that it is the
-/// SCHEMA's own instant — fixed, at whole-second precision, the same in every process
-/// and across every reset of this store, and distinct between schemas that were
-/// published at different times. A reading of the clock satisfies none of that: it
-/// makes every entry report the same instant, moves that instant on every boot, and so
-/// invalidates every client's cache on every run.
+/// instant that schema was PUBLISHED at — fixed, at whole-second precision, and the same
+/// in every process and across every reset of this store. A reading of the clock
+/// satisfies none of that: it moves the instant on every boot, and so invalidates every
+/// client's cache on every run.
 ///
-/// An entry the catalogue publishes a publication instant OF ITS OWN for carries it as
-/// seed data ([`MANAGED_PUBLICATION_INSTANTS`]), because such an instant is a fact about
-/// that one entry and no function of its name. For an entry the catalogue publishes no
-/// instant for, it is derived from the one thing that identifies the schema and never
-/// changes — its name — by a stable digest, placed in the window the catalogue has been
-/// maintained over ([`CATALOGUE_EPOCH_SECONDS`], [`CATALOGUE_SPAN_SECONDS`]), so every
-/// process derives the same instant for the same name.
+/// The instant is catalogue DATA and is computed from NOTHING: a publication writes a
+/// SET of entries at one instant, so the entries of one publication all report that
+/// instant and an entry's own name says nothing about when it was published. The
+/// publications the catalogue publishes an instant of their own for are
+/// [`MANAGED_PUBLICATIONS`]; every entry none of them names belongs to the publication
+/// that wrote the rest of the catalogue, [`CATALOGUE_PUBLICATION_INSTANT`].
 pub fn managed_last_modified(schema_name: &str) -> SystemTime {
-    if let Some((_, published)) = MANAGED_PUBLICATION_INSTANTS
-        .iter()
-        .find(|(name, _)| *name == schema_name)
-    {
-        return published_instant(published);
-    }
-    let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(schema_name.as_bytes());
-    let mut offset = [0u8; 8];
-    offset.copy_from_slice(&digest[..8]);
-    let seconds = u64::from_be_bytes(offset) % CATALOGUE_SPAN_SECONDS;
-    SystemTime::UNIX_EPOCH + Duration::from_secs(CATALOGUE_EPOCH_SECONDS + seconds)
+    published_instant(managed_publication_instant(schema_name))
 }
 
-/// The instant the catalogue publishes as a schema's `LastModified`, for the entries it
-/// publishes one of their own for.
+/// The `date-time` the catalogue publishes as the `LastModified` of the entry named
+/// `schema_name`: the instant of the publication that wrote that entry.
+fn managed_publication_instant(schema_name: &str) -> &'static str {
+    MANAGED_PUBLICATIONS
+        .iter()
+        .find(|(_, published)| published.contains(&schema_name))
+        .map_or(CATALOGUE_PUBLICATION_INSTANT, |(instant, _)| *instant)
+}
+
+/// The publications the catalogue publishes an instant OF THEIR OWN for: each one's
+/// instant and the entries it published.
 ///
-/// Some published entries carry a historical publication instant that belongs to that
-/// entry alone — two entries of one source, named alike but for a letter's case, report
-/// instants years apart — so the instant is CATALOGUE DATA, seeded per entry like the
-/// entry's name, its version count and its document, and nothing about the name yields
-/// it. An entry absent from this table has no published instant to report, and
-/// [`managed_last_modified`] derives a stable one for it instead.
+/// A publication instant is a fact about the entries that publication wrote and no
+/// function of their names — two entries of one source, named alike but for a letter's
+/// case, report instants years apart, while entries of one publication whose names have
+/// nothing in common report the same instant to the second. So it is CATALOGUE DATA,
+/// seeded like an entry's name, its version count and its document.
 ///
-/// Each value is a whole-second `date-time`, as [`published_instant`] reads it.
-const MANAGED_PUBLICATION_INSTANTS: &[(&str, &str)] = &[
+/// Source: the instants the published catalogue reports for these entries, which are
+/// historical — a publication of the past, years before the catalogue was otherwise
+/// written, reported identically on every request.
+///
+/// Each instant is a whole-second `date-time`, as [`published_instant`] reads it.
+const MANAGED_PUBLICATIONS: &[(&str, &[&str])] = &[
     (
-        "aws.autoscaling@AWSAPICallViaCloudTrail",
         "2019-12-01T00:59:43Z",
+        &["aws.autoscaling@AWSAPICallViaCloudTrail"],
     ),
-    // The EC2 Fleet entries, published together and each carrying the instant of that
-    // publication: an instant years before the rest of the source's entries, which no
-    // digest of a name yields.
-    ("aws.ec2fleet@EC2FleetError", "2020-12-17T18:43:39Z"),
-    ("aws.ec2fleet@EC2FleetInformation", "2020-12-17T18:43:39Z"),
+    // The EC2 Fleet entries: the fleet events were published in one pass and the spot
+    // fleet events in the next second, so each set reports its own pass's instant —
+    // years before the rest of their source's entries.
     (
-        "aws.ec2fleet@EC2FleetInstanceChange",
         "2020-12-17T18:43:39Z",
+        &[
+            "aws.ec2fleet@EC2FleetError",
+            "aws.ec2fleet@EC2FleetInformation",
+            "aws.ec2fleet@EC2FleetInstanceChange",
+            "aws.ec2fleet@EC2FleetSpotInstanceRequestChange",
+            "aws.ec2fleet@EC2FleetStateChange",
+        ],
     ),
     (
-        "aws.ec2fleet@EC2FleetSpotInstanceRequestChange",
-        "2020-12-17T18:43:39Z",
+        "2020-12-17T18:43:40Z",
+        &[
+            "aws.ec2fleet@EC2SpotFleetError",
+            "aws.ec2fleet@EC2SpotFleetInformation",
+            "aws.ec2fleet@EC2SpotFleetInstanceChange",
+            "aws.ec2fleet@EC2SpotFleetSpotInstanceRequestChange",
+            "aws.ec2fleet@EC2SpotFleetStateChange",
+        ],
     ),
-    ("aws.ec2fleet@EC2FleetStateChange", "2020-12-17T18:43:39Z"),
-    ("aws.health@AWSHealthAbuseEvent", "2026-03-12T21:12:29Z"),
-    ("aws.tag@TagChangeOnResource", "2022-03-24T16:40:20Z"),
+    ("2022-03-24T16:40:20Z", &["aws.tag@TagChangeOnResource"]),
+    ("2026-03-12T21:12:29Z", &["aws.health@AWSHealthAbuseEvent"]),
 ];
 
-/// One of [`MANAGED_PUBLICATION_INSTANTS`]' values as an instant.
+/// One of [`MANAGED_PUBLICATIONS`]' instants as an instant.
 ///
 /// Read by the same `date-time` reader the wire uses, so a seeded instant is exactly
 /// the instant its text names rather than one hand-computed from calendar arithmetic
@@ -2932,16 +2943,23 @@ fn published_instant(text: &str) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
 }
 
-/// The start of the window the AWS-managed catalogue's publication instants fall in,
-/// in seconds since the Unix epoch: 2019-12-01T00:00:00Z, the month the EventBridge
-/// schema registry became available, so no entry claims to have been published before
-/// the registry existed.
-const CATALOGUE_EPOCH_SECONDS: u64 = 1_575_158_400;
-
-/// How wide that window is: six years of whole seconds, which is long enough that no
-/// two entries of a catalogue this size are forced onto the same instant and short
-/// enough that every instant in it is in the past.
-const CATALOGUE_SPAN_SECONDS: u64 = 6 * 365 * 24 * 60 * 60;
+/// The instant of the publication that wrote the catalogue this store seeds: what every
+/// entry [`MANAGED_PUBLICATIONS`] names no earlier publication of its own for reports.
+///
+/// The entries of one publication report one instant, so a catalogue written by a single
+/// publication reports a single instant for the entries it wrote — which is what the
+/// published catalogue does for the entries of any one of its passes, whatever their
+/// names. Nothing here is computed from an entry: a value derived from the name would
+/// scatter the entries of one publication over unrelated moments, which is precisely
+/// what `LastModified` is read to rule out.
+///
+/// It is 2019-12-01T00:00:00Z, when the event schema registry became available, so the
+/// catalogue this store seeds was published as that registry came up. Fixed seed data,
+/// so it reports the same instant in every process and across every reset of the store.
+/// It bounds no other member: an earlier VERSION of an entry was created before the
+/// publication that wrote the entry, which is where [`MANAGED_VERSION_INTERVAL`] lays
+/// each one.
+const CATALOGUE_PUBLICATION_INSTANT: &str = "2019-12-01T00:00:00Z";
 
 /// How far apart the catalogue's versions of one schema are published.
 ///

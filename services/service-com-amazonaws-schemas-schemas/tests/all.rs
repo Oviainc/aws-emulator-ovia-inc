@@ -17,6 +17,8 @@ mod aws_managed_and_versions;
 mod aws_managed_catalog_metadata;
 #[path = "all/aws_managed_event_catalog.rs"]
 mod aws_managed_event_catalog;
+#[path = "all/catalogue_publications.rs"]
+mod catalogue_publications;
 #[path = "all/catalogue_source_inventory.rs"]
 mod catalogue_source_inventory;
 #[path = "all/code_binding_lifecycle.rs"]

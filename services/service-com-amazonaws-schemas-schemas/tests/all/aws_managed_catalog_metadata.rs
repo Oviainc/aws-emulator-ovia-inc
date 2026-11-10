@@ -87,7 +87,8 @@ fn timestamp_at(answer: &Answer, member: &str) -> String {
 /// Source: `crate::state::AWS_EVENT_SOURCES`, the sources the catalogue publishes
 /// CloudTrail-delivered schemas for — which is not every source it publishes anything
 /// for (`schema_name_collation.rs` covers a source that publishes its own event types
-/// and no CloudTrail-delivered schema). The first two rows are the sources the issue
+/// and no CloudTrail-delivered schema, and `catalogue_publications.rs` owns which
+/// sources carry the family at all). The first two rows are the sources the issue
 /// cited; the rest are sources it did not, including ones whose name is not a single
 /// dotted word (`aws.amazon.connect`) and ones that publish nothing beyond the
 /// CloudTrail family.
@@ -96,7 +97,7 @@ fn source_rows() -> Vec<&'static str> {
         "aws.a4b",
         "aws.events",
         "aws.act",
-        "aws.aidevops",
+        "aws.abuse",
         "aws.amazon.connect",
         "aws.amazonmq",
         "aws.amazonq",
@@ -167,11 +168,11 @@ async fn the_catalogue_publishes_the_whole_cloud_trail_family_of_a_source_it_hol
     }
 }
 
-/// RULE (an invariant): a published schema's `LastModified` is a property OF THE SCHEMA
-/// — the same value in every store and across every reset, at whole-second precision —
-/// and not of the moment the store was built, so two stores built at two different
-/// moments report the same catalogue and schemas published at different times report
-/// different instants.
+/// RULE (an invariant): a published schema's `LastModified` is a property OF THE
+/// PUBLISHED SCHEMA — the same value in every store and across every reset, at
+/// whole-second precision — and not of the moment the store was built, so two stores
+/// built at two different moments report the same catalogue. WHICH instant each entry
+/// reports (the instant of the publication that wrote it) is `catalogue_publications.rs`.
 #[tokio::test]
 async fn a_published_schema_reports_its_own_fixed_last_modified() {
     let first = Emulator::new();
@@ -225,10 +226,14 @@ async fn a_published_schema_reports_its_own_fixed_last_modified() {
             timestamp_at(&again, "LastModified"),
             "case {name:?}: a read must not move the instant"
         );
-        assert!(
-            seen.insert(modified.clone()),
-            "case {name:?}: {modified:?} is reported for another schema too — a \
-             published instant is the schema's own"
+        // Every row above is an entry of ONE publication — none of them carries an
+        // earlier publication of its own — so they report one instant between them,
+        // which is what the entries of any one publication do.
+        seen.insert(modified.clone());
+        assert_eq!(
+            seen.len(),
+            1,
+            "case {name:?}: entries of one publication report one instant, got {seen:?}"
         );
 
         // The listing reports the same instant as the read of the schema.
