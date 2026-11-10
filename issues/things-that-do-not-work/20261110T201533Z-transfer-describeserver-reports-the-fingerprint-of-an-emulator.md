@@ -1,0 +1,56 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: transfer-sftp-connector-sends-file-to-own-server
+Issue-Step: task#11
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: transfer-sftp-connector-sends-file-to-own-server
+Issue-Shape-Id: com.amazonaws.transfer#TransferService
+Issue-Key: transfer|DescribeServer|2xx->2xx|$.Server.HostKeyFingerprint
+Issue-Commit: 03df40548cc183621db41b1021feb6ebc20165db
+
+# Transfer DescribeServer reports the fingerprint of an emulator-minted Ed25519 host key, not the server's own host key
+
+> _Note: this issue was identified against the code base at commit `03df40548cc183621db41b1021feb6ebc20165db`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DescribeServer
+
+## Description
+ONE root cause on the Transfer server read surface: the `HostKeyFingerprint` a 200 DescribeServer reports does not identify the host key the described server actually serves with, because the emulator mints its own Ed25519 key for every service-managed server and silently discards any `HostKey` material it cannot parse.
+
+This is the only transfer wire divergence in this replay that the report marked neither stub-blocked nor OWNED by an open issue (its cluster carries EMPTY `owned_by` and EMPTY `stub_path`). Related OPEN issues that do NOT carry this wire key, and therefore do not cover it: 20261108T040831Z-transfer-listhostkeys-reports-type-ssh-ed25519-for-an.md (ListHostKeys.Type on a different fixture/binding), 20261029T184519Z-transfer-security-policy-catalogue-and-host-key-reads.md (ListHostKeys/DescribeHostKey reads) and 20261026T022407Z-transfer-host-key-and-web-app-planes-still.md (ImportHostKey refusing PEM/PKCS#1 material). Re-replay the binding named in Issue-Trace/Issue-Step independently of all three.
+
+=== Cause 1 of 1: DescribeServer.HostKeyFingerprint is the fingerprint of a key the server was never given ===
+AWS: Smithy (services/service-com-amazonaws-transfer-transferservice/smithy-model/com-amazonaws-transfer-transferservice.json) DescribeServer(ServerId @required) -> {Server: DescribedServer @required}. DescribedServer.HostKeyFingerprint is documented as "Specifies the Base64-encoded SHA256 fingerprint of the server's host key. This value is equivalent to the output of the `ssh-keygen -l -f my-new-server-key` command" — i.e. OpenSSH's `SHA256:<base64>` form, computed over THE SERVER'S OWN HOST KEY: the same key that server's ListHostKeys / DescribeHostKey entry describes, and the same key an SFTP client sees when it connects and that a caller pins as a trusted host key. The model fixes no concrete value (the key is minted per server), so for the key's properties: recorded behavior only — the recording for this step carries HostKeyFingerprint as a per-run value the corpus masks ('<shaped-not-asserted>'), and the corpus's other transfer host-key reads record a service-managed server's host key as an `ssh-rsa` key (fixtures transfer-list-host-keys-on-server-workflow#task#2/#task#3 and transfer-import-invalid-host-key-then-list-unchanged#task#3 all record Type 'ssh-rsa'). The requirement is therefore: HostKeyFingerprint is the `SHA256:<base64>` fingerprint of the key the server actually serves with — the key the request supplied when it supplied one, otherwise the service-managed key the service generated for that server — and it agrees with the fingerprint and algorithm that server's own host-key reads report. No recorded literal (the fingerprint string, the key id, the import date) is part of the requirement; the relation between the reported fingerprint and the server's host key is.
+Emulator: the 200 DescribeServer body carries a HostKeyFingerprint the replay reports as diverging from the recorded field ($.Server.HostKeyFingerprint: value_mismatch, expected '<shaped-not-asserted>'). The value served is the fingerprint of a freshly minted Ed25519 key: services/service-com-amazonaws-transfer-transferservice/src/ops/create_server.rs:438-442 resolves the server's host key as `input.host_key.as_deref().and_then(st::read_host_key).unwrap_or_else(st::mint_host_key)`, and src/state.rs:2615-2618 `mint_host_key` always generates an Ed25519 keypair, so every service-managed server reports an `ssh-ed25519` key's fingerprint where the recordings show `ssh-rsa`. src/state.rs:2552-2603 `read_host_key` parses ONLY the OpenSSH private-key container ('-----BEGIN OPENSSH PRIVATE KEY-----'), so a `HostKey` supplied as PEM/PKCS#1 ('-----BEGIN RSA PRIVATE KEY-----') or PKCS#8 returns None and is dropped with no refusal at all — the server is created, and src/ops/create_server.rs:463 stores the minted key's fingerprint as the server's. Hypothesis: these two together are why the fingerprint this read reports is not the fingerprint the recording's server had. DescribeServer itself only echoes the stored value (src/ops/describe_server.rs:212).
+Why: HostKeyFingerprint is the one value a client has to compare the server's identity against. A caller that reads it to pin the server as a trusted host (the documented bootstrap for an SFTP connector's TrustedHostKeys, and for `ssh-keyscan`-based verification) pins a fingerprint belonging to a key nothing else in the account holds the counterpart of, so host-key verification can never succeed and the mismatch is indistinguishable from a man-in-the-middle. A caller that supplies its own `HostKey` on CreateServer is worse off: the create succeeds, returns a ServerId, and the server silently serves a different, emulator-generated key — the caller's key is gone with no error to react to.
+Fix: the CreateServer handler's host-key resolution and the server state that backs it (services/service-com-amazonaws-transfer-transferservice/src/ops/create_server.rs around the host-key resolution, and the `read_host_key`/`mint_host_key`/`host_key_material` helpers in src/state.rs) — the service-managed key must be minted in the algorithm the service uses for a service-managed host key (`ssh-rsa` per the recordings), supplied `HostKey` material must be read in the private-key encodings AWS accepts rather than OpenSSH's container alone, and material that still cannot be read must be REFUSED with the modelled InvalidRequestException instead of being replaced by a minted key. DescribeServer's projection (src/ops/describe_server.rs) must keep reporting the stored key's own fingerprint, so it agrees with ListHostKeys/DescribeHostKey for that server.
+Traces: transfer-sftp-connector-sends-file-to-own-server#task#11.
+
+## Evidence
+Replay of simparity-wire-aws-v1 against the emulator built from this checkout: emulator_up true (/__admin/health 200, data listener accepting), 345 steps total, 304 passed, 41 mismatched, 0 errored, 0 blocked, score 88.1%, 29 divergence clusters.
+
+The cluster filed here (the ONLY one with EMPTY owned_by and EMPTY stub_path):
+  fixture_id: transfer-sftp-connector-sends-file-to-own-server
+  step_key: task#11
+  service: transfer, operation: DescribeServer, verdict: mismatch
+  expected_status 200, actual_status 200
+  detail: $.Server.HostKeyFingerprint: value_mismatch (expected '<shaped-not-asserted>', got 'SHA256:Ss1rvWFZSM5jJzJbmFZIl4DD2va08a0S3F31h9IrKuc')
+  divergence_key: service=transfer|DescribeServer|status=200->200|keys=$.Server.HostKeyFingerprint
+  affected (1): transfer-sftp-connector-sends-file-to-own-server#task#11
+The recorded value is masked by the corpus as a per-run value, and the emulator's literal 'SHA256:Ss1rvWFZSM5jJzJbmFZIl4DD2va08a0S3F31h9IrKuc' is likewise a per-run value of this emulator run: neither literal is the requirement. What is asserted — and what diverges — is the field the recording carries for the server's own host key at this read.
+
+Corroborating recorded evidence that the emulator's service-managed host key is the wrong key, from the same replay (these clusters are owned by other open issues and are NOT filed here; they are cited only as evidence of the shared key-material cause):
+  transfer-list-host-keys-on-server-workflow#task#2 — $.HostKeys[0] expected {Type: 'ssh-rsa', ...}, got {Type: 'ssh-ed25519', Fingerprint: 'SHA256:gPwUKp2zYH+T2+wqy6KE8RbOBLpBVZpxe+dSJEb63Do', ...}
+  transfer-list-host-keys-on-server-workflow#task#3 — $.HostKey.Type: expected 'ssh-rsa', got 'ssh-ed25519'
+  transfer-import-invalid-host-key-then-list-unchanged#task#3 — $.HostKeys[...].Type: expected 'ssh-rsa', got 'ssh-ed25519'
+
+Model evidence: smithy_query query=operation operation=DescribeServer and query=doc shape=DescribedServer member=HostKeyFingerprint on services/service-com-amazonaws-transfer-transferservice/smithy-model/com-amazonaws-transfer-transferservice.json — DescribeServer -> {Server: DescribedServer @required}; HostKeyFingerprint doc: "Specifies the Base64-encoded SHA256 fingerprint of the server's host key. This value is equivalent to the output of the ssh-keygen -l -f my-new-server-key command."
+Source evidence: src/ops/describe_server.rs:212 (host_key_fingerprint echoed from the stored server); src/ops/create_server.rs:431-442 (host key = read_host_key(input.host_key) OR mint_host_key, with no refusal for unreadable material) and :463 (stored as the server's fingerprint), :485 (same key materialised into the host-key collection); src/state.rs:2526-2603 (normalised_openssh_private_key / read_host_key accept ONLY the OpenSSH private-key container) and :2605-2631 (mint_host_key always generates Ed25519; host_key_material reads the fingerprint as SHA256:<base64>).
+
+## Steps to Reproduce
+1. git_clone, build and boot the emulator from this checkout, then replay simparity-wire-aws-v1 and re-run the binding in Issue-Trace/Issue-Step: transfer-sftp-connector-sends-file-to-own-server#task#11 (operation DescribeServer).
+2. By hand against the emulator (region us-west-2): transfer create-server --protocols SFTP --identity-provider-type SERVICE_MANAGED --domain S3 --endpoint-type PUBLIC, then poll transfer describe-server --server-id s-... until State=ONLINE.
+3. Read the 200 DescribeServer body's Server.HostKeyFingerprint, then transfer list-host-keys --server-id s-... and transfer describe-host-key for the key it reports. The fingerprint must be the SHA256:<base64> fingerprint of that server's host key, and that key must be the algorithm the service uses for a service-managed host key (the recordings show Type 'ssh-rsa'). Observe the emulator reports an 'ssh-ed25519' key instead, so the fingerprint belongs to a key of the wrong algorithm.
+4. Supplied-key half of the same cause: ssh-keygen -t rsa -m PEM -f hostkey (a PEM/PKCS#1 '-----BEGIN RSA PRIVATE KEY-----' body) and call transfer create-server --host-key "$(cat hostkey)" --protocols SFTP --identity-provider-type SERVICE_MANAGED --domain S3. Compute the supplied key's own fingerprint with ssh-keygen -l -f hostkey and compare it with Server.HostKeyFingerprint from describe-server: they must be the same key, or the create must have been refused with InvalidRequestException. Observe the create succeeds and DescribeServer reports the fingerprint of a different, emulator-minted Ed25519 key, with the supplied key discarded silently.
