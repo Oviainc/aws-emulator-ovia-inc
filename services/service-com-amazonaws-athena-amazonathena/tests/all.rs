@@ -14,6 +14,9 @@
 #[path = "all/catalog_statements.rs"]
 mod catalog_statements;
 
+#[path = "all/data_catalog_delete.rs"]
+mod data_catalog_delete;
+
 #[path = "all/data_catalog_lifecycle.rs"]
 mod data_catalog_lifecycle;
 

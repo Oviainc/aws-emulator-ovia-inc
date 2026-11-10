@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDataCatalog
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDataCatalog`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDataCatalog::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the named data catalog from this service's registry and answers
+//! with the record it removed, so a later `GetDataCatalog` of that name is refused and a
+//! second delete of the same name finds nothing left to remove.
 //!
 //! ## Shape of an operation
 //!
@@ -144,20 +138,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDataCatalog` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDataCatalogErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDataCatalog"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteDataCatalogErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("Athena state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // The lookup and the removal share ONE critical section, so two deletes of the
+        // same catalog cannot both remove it: whichever takes the lock second finds the
+        // registry no longer holding that name and is refused below.
+        let mut store = state.lock();
+
+        let ::std::collections::btree_map::Entry::Occupied(entry) =
+            store.data_catalogs.entry(input.name.clone())
+        else {
+            // Athena models no not-found error for this operation; naming a catalog this
+            // account does not hold is "something wrong with the input to the request",
+            // which is what `InvalidRequestException` (HTTP 400) reports, under the code
+            // for a refusal the request itself caused. The sentence comes from
+            // `crate::state`, where the delete path's wording of a catalog miss lives
+            // beside every other operation's.
+            return Err(invalid_request(
+                crate::state::data_catalog_not_found_on_delete(&input.name),
+            ));
+        };
+
+        // `DeleteCatalogOnly` is documented usable "only ... with the FEDERATED
+        // catalogs", and which type a catalog is is the REGISTRY's answer rather than the
+        // request's, so the check reads the stored record.
+        if input.delete_catalog_only
+            && entry.get().catalog_type != crate::state::DATA_CATALOG_TYPE_FEDERATED
+        {
+            let message = crate::state::delete_catalog_only_unsupported(
+                &input.name,
+                &entry.get().catalog_type,
+            );
+            return Err(invalid_request(message));
+        }
+
+        // The registry stops holding the catalog here. `DeleteCatalogOnly` changes
+        // nothing about that: what it leaves behind is the Glue connection and the Lambda
+        // function a FEDERATED catalog is created alongside, neither of which this
+        // emulator creates, so there is nothing else for either form of the call to drop.
+        let removed = entry.remove();
+
+        // The response is the record the registry no longer holds, through the same
+        // projection `GetDataCatalog` reads a live one through.
+        Ok(DeleteDataCatalogOutput {
+            data_catalog: Some(removed.to_deleted_data_catalog()),
+        })
     }
+}
+
+/// The operation's own client error: HTTP 400 `InvalidRequestException` of the class a
+/// refusal the caller's own input caused belongs to.
+///
+/// Every refusal above is a bad request rather than an unwritten operation, and
+/// `InvalidRequestException` is the client error this operation models: "Indicates that
+/// something is wrong with the input to the request." Raised through the service's own
+/// refusal channel, which is what carries the code under both names the wire gives it.
+fn invalid_request(message: impl Into<String>) -> DeleteDataCatalogError {
+    DeleteDataCatalogError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }

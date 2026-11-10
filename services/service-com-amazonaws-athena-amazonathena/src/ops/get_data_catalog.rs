@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // does not exist is "something wrong with the input to the request", which
             // is what `InvalidRequestException` (HTTP 400) reports, under the code for a
             // refusal the request itself caused. The sentence comes from `crate::state`,
-            // so every operation that answers a catalog miss words it identically.
+            // which holds one wording per path that answers a catalog miss.
             return Err(GetDataCatalogError::invalid_request(
                 crate::state::ERROR_CODE_INVALID_INPUT,
                 crate::state::data_catalog_not_found(&input.name),

@@ -119,3 +119,19 @@ pub async fn create_work_group(router: &MultiServiceRouter, name: &str) {
 pub fn request_token(seed: &str) -> String {
     format!("{seed:-<32}")
 }
+
+/// The wire error code (`__type`) of an error body, with the shape-id prefix the awsJson
+/// protocols may carry stripped.
+pub fn error_code(body: &Value) -> String {
+    let raw = body["__type"].as_str().unwrap_or("<no __type>");
+    raw.rsplit(['#', '/']).next().unwrap_or(raw).to_string()
+}
+
+/// The refusal wording of an error body, under either casing of the `Message` member.
+pub fn message(body: &Value) -> String {
+    body["Message"]
+        .as_str()
+        .or_else(|| body["message"].as_str())
+        .unwrap_or("<no Message>")
+        .to_string()
+}

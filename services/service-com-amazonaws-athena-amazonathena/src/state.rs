@@ -272,7 +272,8 @@ pub fn glue_data_catalog_id() -> String {
     glue_state::resolve_catalog_id(None)
 }
 
-/// The refusal message for a read whose named data catalog this account does not hold.
+/// The refusal message for an operation whose named data catalog this account does not
+/// hold.
 ///
 /// The template is the one every Athena resource miss follows — the kind of entity, the
 /// name the request addressed, and "was not found" — which is also how an execution miss
@@ -280,6 +281,36 @@ pub fn glue_data_catalog_id() -> String {
 /// operation that answers a catalog miss words it identically.
 pub fn data_catalog_not_found(catalog_name: &str) -> String {
     format!("DataCatalog {catalog_name} was not found.")
+}
+
+/// The refusal message a DELETE whose named data catalog this account does not hold
+/// answers with.
+///
+/// The same miss as [`data_catalog_not_found`], worded as the DELETE path words it:
+/// "DataCatalog " + the requested `Name` + " was not found", with no closing period.
+/// Athena punctuates the two paths differently — the recorded behaviour of a read of an
+/// absent catalog closes the sentence and that of a delete of one does not — so the two
+/// sentences are separate helpers and neither path can drift onto the other's wording.
+pub fn data_catalog_not_found_on_delete(catalog_name: &str) -> String {
+    format!("DataCatalog {catalog_name} was not found")
+}
+
+/// The refusal message for a delete that asks for the Athena catalog alone to be removed
+/// from a catalog whose type does not take that request.
+///
+/// `DeleteDataCatalogInput$DeleteCatalogOnly` documents "You can only use this with the
+/// `FEDERATED` catalogs", because it is only a federated catalog that Athena creates a
+/// Glue connection and a Lambda function alongside — for every other type there is no
+/// second half of the resource to leave behind. That restriction is the only source for
+/// this refusal: no recording exercises the member against a catalog of another type, so
+/// the sentence is this service's own, built the way its other refusals are — naming the
+/// member the request set, the catalog it addressed and the type that registry record
+/// holds.
+pub fn delete_catalog_only_unsupported(catalog_name: &str, catalog_type: &str) -> String {
+    format!(
+        "DeleteCatalogOnly can only be used with {DATA_CATALOG_TYPE_FEDERATED} data \
+         catalogs, and DataCatalog {catalog_name} is a {catalog_type} data catalog."
+    )
 }
 
 /// The refusal message for a metadata read whose `DatabaseName` names no database the
@@ -522,6 +553,12 @@ pub const DATA_CATALOG_STATUS_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
 /// "`CREATE_COMPLETE`: Data catalog creation complete."
 pub const DATA_CATALOG_STATUS_CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 
+/// The `DataCatalogStatus` of a catalog whose deletion is done: `DataCatalog$Status`
+/// documents "`DELETE_COMPLETE`: Federated data catalog deleted." and is "the status of
+/// the creation or deletion of the data catalog", so it is the status a delete reports for
+/// the catalog it removed.
+pub const DATA_CATALOG_STATUS_DELETE_COMPLETE: &str = "DELETE_COMPLETE";
+
 /// How long a federated catalog stays [`DATA_CATALOG_STATUS_CREATE_IN_PROGRESS`] before
 /// it is [`DATA_CATALOG_STATUS_CREATE_COMPLETE`].
 ///
@@ -634,6 +671,23 @@ impl DataCatalogRecord {
 
     /// The record as the modelled `DataCatalog` shape a read answers with, as of `now`.
     pub fn to_data_catalog(&self, now: SystemTime) -> DataCatalog {
+        self.to_data_catalog_in_status(self.status_at(now))
+    }
+
+    /// The record as the `DataCatalog` a DELETE answers with: the same projection a read
+    /// answers with, in the deletion status the removal reached.
+    ///
+    /// `DataCatalog$Status` is "the status of the creation or deletion of the data
+    /// catalog", and what this projection reports is the deletion — complete, because the
+    /// registry no longer holds the record when the delete returns, so no part of the
+    /// removal is still owed and no later read of it is possible.
+    pub fn to_deleted_data_catalog(&self) -> DataCatalog {
+        self.to_data_catalog_in_status(DATA_CATALOG_STATUS_DELETE_COMPLETE)
+    }
+
+    /// The record as the modelled `DataCatalog` shape, reporting `status`. Every other
+    /// member is the record's own, so a read and a delete differ in the status alone.
+    fn to_data_catalog_in_status(&self, status: &str) -> DataCatalog {
         DataCatalog {
             name: self.name.clone(),
             description: self.description.clone(),
@@ -648,7 +702,7 @@ impl DataCatalogRecord {
                         .collect(),
                 )
             },
-            status: Some(self.status_at(now).to_string()),
+            status: Some(status.to_string()),
             connection_type: self.connection_type.clone(),
             // `DataCatalog$Error` is the "text of the error that occurred during data
             // catalog creation or deletion"; nothing here fails, so there is none.
