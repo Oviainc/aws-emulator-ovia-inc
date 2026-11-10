@@ -28,6 +28,7 @@
 //!   one naming an `ExpectedBucketOwner` that is not the account's answers HTTP 403
 //!   `AccessDenied`. Every refusal leaves the stored configurations exactly as they were.
 
+use service_com_amazonaws_s3_amazons3::ops::put_bucket_inventory_configuration::PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS;
 use service_com_amazonaws_s3_amazons3::ops::types::{
     INVENTORY_FORMAT_VALUES, INVENTORY_FREQUENCY_VALUES, INVENTORY_INCLUDED_OBJECT_VERSIONS_VALUES,
     INVENTORY_OPTIONAL_FIELD_VALUES,
@@ -137,7 +138,7 @@ fn stored_configurations() -> Vec<Configuration> {
 const KMS_KEY_ARN: &str = "arn:aws:kms:us-east-1:123456789012:key/inventory-key";
 
 /// Put every configuration of `configurations` on `name`, failing the case loudly if any put
-/// does not answer the modelled 200.
+/// does not answer [`PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS`].
 async fn stand_up(
     router: &MultiServiceRouter,
     case: &str,
@@ -149,7 +150,7 @@ async fn stand_up(
         let put = put_inventory(router, name, wanted).await;
         assert_eq!(
             put.status,
-            200,
+            PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS,
             "case {case:?}: setup must put {:?}, got {} ({})",
             wanted.id,
             put.status,
@@ -255,8 +256,9 @@ async fn a_delete_removes_the_inventory_id_it_names_and_nothing_else() {
         let again = put_inventory(&router, &name, &replacement).await;
         assert_eq!(
             again.status,
-            200,
-            "case {case:?}: expected a put under the deleted id to answer 200, got {} ({})",
+            PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS,
+            "case {case:?}: expected a put under the deleted id to answer \
+             {PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             again.status,
             body_of(&again)
         );

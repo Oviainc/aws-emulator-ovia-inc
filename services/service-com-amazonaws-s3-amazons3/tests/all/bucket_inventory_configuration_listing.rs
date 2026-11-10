@@ -31,6 +31,7 @@
 //!   one naming an `ExpectedBucketOwner` that is not the account's answers HTTP 403
 //!   `AccessDenied`.
 
+use service_com_amazonaws_s3_amazons3::ops::put_bucket_inventory_configuration::PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS;
 use service_com_amazonaws_s3_amazons3::ops::types::{
     INVENTORY_FORMAT_VALUES, INVENTORY_FREQUENCY_VALUES, INVENTORY_INCLUDED_OBJECT_VERSIONS_VALUES,
     INVENTORY_OPTIONAL_FIELD_VALUES,
@@ -105,7 +106,7 @@ fn plain(id: &str) -> Configuration {
 }
 
 /// Put every configuration of `configurations` on `name`, failing the case loudly if any put
-/// does not answer the modelled 200.
+/// does not answer [`PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS`].
 async fn stand_up(
     router: &MultiServiceRouter,
     case: &str,
@@ -117,7 +118,7 @@ async fn stand_up(
         let put = put_inventory(router, name, wanted).await;
         assert_eq!(
             put.status,
-            200,
+            PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS,
             "case {case:?}: setup must put {:?}, got {} ({})",
             wanted.id,
             put.status,
@@ -602,7 +603,7 @@ async fn a_listing_reports_what_its_own_puts_recorded_beside_other_bucket_config
             let put = put_inventory(&router, &name, wanted).await;
             assert_eq!(
                 put.status,
-                200,
+                PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS,
                 "case {case:?}: setup must put {:?}, got {} ({})",
                 wanted.id,
                 put.status,

@@ -15,7 +15,9 @@
 //!   Intelligent-Tiering configuration to the specified bucket. You can have up to 1,000 S3
 //!   Intelligent-Tiering configurations per bucket"
 //!   (`PutBucketIntelligentTieringConfiguration`'s own documentation), so a put under a new
-//!   id ADDS one and a put under an id already carried replaces that one alone.
+//!   id ADDS one and a put under an id already carried replaces that one alone. A successful
+//!   put answers [`PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS`] with an
+//!   empty body.
 //! * The payload IS the configuration: what a put names is what the listing reports back,
 //!   member for member, and the configuration's own `Id` is the id the request identifies
 //!   ("The ID used to identify the S3 Intelligent-Tiering configuration").
@@ -60,6 +62,7 @@
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use service_com_amazonaws_s3_amazons3::ops::put_bucket_intelligent_tiering_configuration::PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS;
 use service_com_amazonaws_s3_amazons3::state::{
     INVALID_ACCESS_TIER_CODE, INVALID_ARGUMENT_CODE, INVALID_CONFIG_ID_CODE,
     MALFORMED_CONTINUATION_TOKEN_CODE,
@@ -509,8 +512,9 @@ async fn a_configuration_round_trips_through_the_bucket() {
         let put = put_configuration(&router, &name, &configuration.id, &configuration).await;
         assert_eq!(
             put.status,
-            200,
-            "case {case:?}: expected the put to answer 200, got {} ({})",
+            PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
+            "case {case:?}: expected the put to answer \
+             {PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             put.status,
             body_of(&put)
         );
@@ -576,8 +580,9 @@ async fn a_bucket_carries_one_configuration_per_id() {
         let put = put_configuration(&router, name, id, &ConfigurationRow::enabled(id)).await;
         assert_eq!(
             put.status,
-            200,
-            "case {id:?}: expected the put to answer 200, got {} ({})",
+            PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
+            "case {id:?}: expected the put to answer \
+             {PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             put.status,
             body_of(&put)
         );
@@ -602,8 +607,9 @@ async fn a_bucket_carries_one_configuration_per_id() {
     let again = put_configuration(&router, name, "mu", &replacement).await;
     assert_eq!(
         again.status,
-        200,
-        "case \"replace mu\": expected the put to answer 200, got {} ({})",
+        PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
+        "case \"replace mu\": expected the put to answer \
+         {PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
         again.status,
         body_of(&again)
     );
@@ -633,8 +639,9 @@ async fn the_listing_pages_over_the_configurations() {
         let put = put_configuration(&router, name, &id, &ConfigurationRow::enabled(&id)).await;
         assert_eq!(
             put.status,
-            200,
-            "case {id:?}: expected the put to answer 200, got {} ({})",
+            PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
+            "case {id:?}: expected the put to answer \
+             {PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             put.status,
             body_of(&put)
         );
@@ -813,7 +820,7 @@ async fn a_configuration_outside_its_published_bounds_is_refused() {
     let put = put_configuration(&router, name, &held.id, &held).await;
     assert_eq!(
         put.status,
-        200,
+        PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
         "the held configuration must be recorded, got {} ({})",
         put.status,
         body_of(&put)
@@ -970,8 +977,9 @@ async fn an_id_outside_the_published_length_bound_is_refused() {
         let put = put_configuration(&router, name, &id, &configuration).await;
         assert_eq!(
             put.status,
-            200,
-            "case {case:?}: expected the put to answer 200, got {} ({})",
+            PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
+            "case {case:?}: expected the put to answer \
+             {PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             put.status,
             body_of(&put)
         );
@@ -1178,8 +1186,9 @@ async fn each_configuration_is_read_back_under_its_own_id() {
         let put = put_configuration(&router, name, &configuration.id, configuration).await;
         assert_eq!(
             put.status,
-            200,
-            "case {case:?}: expected the put to answer 200, got {} ({})",
+            PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
+            "case {case:?}: expected the put to answer \
+             {PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             put.status,
             body_of(&put)
         );
@@ -1247,8 +1256,9 @@ async fn deleting_a_configuration_removes_that_one_alone() {
         let put = put_configuration(&router, name, &configuration.id, configuration).await;
         assert_eq!(
             put.status,
-            200,
-            "case {case:?}: expected the put to answer 200, got {} ({})",
+            PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
+            "case {case:?}: expected the put to answer \
+             {PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             put.status,
             body_of(&put)
         );
@@ -1334,7 +1344,7 @@ async fn deleting_a_configuration_removes_that_one_alone() {
     let put = put_configuration(&router, name, &fresh.id, &fresh).await;
     assert_eq!(
         put.status,
-        200,
+        PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
         "a bucket whose configurations were all deleted still takes one, got {} ({})",
         put.status,
         body_of(&put)
@@ -1381,7 +1391,7 @@ async fn a_per_id_call_naming_nothing_the_bucket_carries_is_refused() {
         let put = put_configuration(&router, on, &held.id, &held).await;
         assert_eq!(
             put.status,
-            200,
+            PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
             "the held configuration must be recorded on {on:?}, got {} ({})",
             put.status,
             body_of(&put)
@@ -1397,7 +1407,7 @@ async fn a_per_id_call_naming_nothing_the_bucket_carries_is_refused() {
     .await;
     assert_eq!(
         put.status,
-        200,
+        PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
         "the neighbour's own configuration must be recorded, got {} ({})",
         put.status,
         body_of(&put)
@@ -1571,8 +1581,9 @@ async fn deleting_every_configuration_leaves_the_bucket_carrying_none() {
                 let put = put_configuration(&router, on, &configuration.id, configuration).await;
                 assert_eq!(
                     put.status,
-                    200,
-                    "case {case:?}: expected the put of {:?} on {on} to answer 200, got {} ({})",
+                    PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
+                    "case {case:?}: expected the put of {:?} on {on} to answer \
+                     {PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
                     configuration.id,
                     put.status,
                     body_of(&put)
@@ -1706,7 +1717,7 @@ async fn a_per_id_read_reports_the_latest_configuration_recorded_under_that_id()
     let put = put_configuration(&router, name, &untouched.id, &untouched).await;
     assert_eq!(
         put.status,
-        200,
+        PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
         "the untouched configuration must be recorded, got {} ({})",
         put.status,
         body_of(&put)
@@ -1756,8 +1767,9 @@ async fn a_per_id_read_reports_the_latest_configuration_recorded_under_that_id()
         let put = put_configuration(&router, name, id, configuration).await;
         assert_eq!(
             put.status,
-            200,
-            "case {case:?}: expected the put to answer 200, got {} ({})",
+            PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
+            "case {case:?}: expected the put to answer \
+             {PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             put.status,
             body_of(&put)
         );
@@ -1810,8 +1822,9 @@ async fn a_per_id_read_reaches_a_configuration_the_first_listing_page_does_not_c
         let put = put_configuration(&router, name, &id, &ConfigurationRow::enabled(&id)).await;
         assert_eq!(
             put.status,
-            200,
-            "case {id:?}: expected the put to answer 200, got {} ({})",
+            PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS,
+            "case {id:?}: expected the put to answer \
+             {PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             put.status,
             body_of(&put)
         );

@@ -13,8 +13,8 @@
 //! * `PutBucketInventoryConfiguration` "adds an S3 Inventory configuration (identified by
 //!   the inventory ID) to the bucket" (the operation's own documentation): the
 //!   `InventoryConfiguration` payload becomes the configuration stored under THAT id in
-//!   full, every other id is left alone, and the call answers the modelled 200 with an empty
-//!   body. A second put under one id replaces that configuration rather than merging into
+//!   full, every other id is left alone, and the call answers
+//!   [`PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS`] with an empty body. A second put under one id replaces that configuration rather than merging into
 //!   it, so a member the replacement omits is gone — which is also why repeating a put of
 //!   one id adds nothing to what the bucket carries.
 //! * `GetBucketInventoryConfiguration` reports exactly that container, with every member the
@@ -35,6 +35,7 @@
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use service_com_amazonaws_s3_amazons3::ops::put_bucket_inventory_configuration::PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS;
 use service_com_amazonaws_s3_amazons3::ops::types::{
     INVENTORY_FORMAT_VALUES, INVENTORY_FREQUENCY_VALUES,
     INVENTORY_INCLUDED_OBJECT_VERSIONS_VALUES, INVENTORY_OPTIONAL_FIELD_VALUES,
@@ -545,8 +546,9 @@ async fn an_inventory_configuration_round_trips_under_its_own_id() {
         let put = put_inventory(&router, &name, &wanted).await;
         assert_eq!(
             put.status,
-            200,
-            "case {case:?}: expected the put to answer 200, got {} ({})",
+            PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS,
+            "case {case:?}: expected the put to answer \
+             {PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             put.status,
             String::from_utf8_lossy(&put.body)
         );
@@ -584,8 +586,9 @@ async fn an_inventory_configuration_round_trips_under_its_own_id() {
         .disabled();
         let answer = put_inventory(&router, &name, &replacement).await;
         assert_eq!(
-            answer.status, 200,
-            "case {case:?}: expected the replacing put to answer 200, got {}",
+            answer.status, PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS,
+            "case {case:?}: expected the replacing put to answer \
+             {PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS}, got {}",
             answer.status
         );
         let after = reported_configuration(&get_inventory(&router, &name, &wanted.id).await);
@@ -635,8 +638,9 @@ async fn each_id_carries_its_own_configuration() {
         let put = put_inventory(&router, name, wanted).await;
         assert_eq!(
             put.status,
-            200,
-            "case {:?}: expected the put to answer 200, got {} ({})",
+            PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS,
+            "case {:?}: expected the put to answer \
+             {PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             wanted.id,
             put.status,
             String::from_utf8_lossy(&put.body)
@@ -649,8 +653,9 @@ async fn each_id_carries_its_own_configuration() {
         let repeated = put_inventory(&router, name, wanted).await;
         assert_eq!(
             repeated.status,
-            200,
-            "case {:?}: expected a repeated put to answer 200, got {} ({})",
+            PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS,
+            "case {:?}: expected a repeated put to answer \
+             {PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             wanted.id,
             repeated.status,
             String::from_utf8_lossy(&repeated.body)
@@ -685,8 +690,9 @@ async fn each_id_carries_its_own_configuration() {
     .filtered("replaced/");
     let answer = put_inventory(&router, name, &replaced).await;
     assert_eq!(
-        answer.status, 200,
-        "case \"replacing one of several ids\": expected 200, got {}",
+        answer.status, PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS,
+        "case \"replacing one of several ids\": expected \
+         {PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS}, got {}",
         answer.status
     );
     for wanted in &stored {
@@ -783,8 +789,9 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
     let put = put_inventory(&router, name, &stored).await;
     assert_eq!(
         put.status,
-        200,
-        "case setup: expected the put to answer 200, got {} ({})",
+        PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS,
+        "case setup: expected the put to answer \
+         {PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
         put.status,
         String::from_utf8_lossy(&put.body)
     );
@@ -964,7 +971,8 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
 
 /// "You can have up to 1,000 inventory configurations per bucket": the 1,001st NEW
 /// configuration is refused with the operation's own `TooManyConfigurations`, while replacing
-/// one of the 1,000 creates none and still answers 200.
+/// one of the 1,000 creates none and still answers
+/// [`PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS`].
 #[tokio::test]
 async fn one_configuration_past_the_per_bucket_limit_is_refused() {
     let router = router();
@@ -985,7 +993,7 @@ async fn one_configuration_past_the_per_bucket_limit_is_refused() {
         let answer = put_inventory(&router, name, &configuration_of(&id)).await;
         assert_eq!(
             answer.status,
-            200,
+            PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS,
             "case {id:?}: a configuration within the limit must be recorded, got {} ({})",
             answer.status,
             String::from_utf8_lossy(&answer.body)
@@ -1012,8 +1020,9 @@ async fn one_configuration_past_the_per_bucket_limit_is_refused() {
     let answer = put_inventory(&router, name, &replacement).await;
     assert_eq!(
         answer.status,
-        200,
-        "case \"replacing a configuration at the limit\": expected HTTP 200, got {} ({})",
+        PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS,
+        "case \"replacing a configuration at the limit\": expected HTTP \
+         {PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
         answer.status,
         String::from_utf8_lossy(&answer.body)
     );

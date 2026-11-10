@@ -11,7 +11,8 @@
 //! `Status` outside its enum (`InvalidArgument`), an `Id` longer than
 //! [`crate::state::MAX_CONFIGURATION_ID_CHARS`] characters (`InvalidConfigId`), or a
 //! tiering whose `Days` is outside the range the `AccessTier` it names publishes
-//! (`InvalidAccessTier`).
+//! (`InvalidAccessTier`). Success is
+//! [`PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS`] with an empty body.
 //!
 //! The read sides are `GetBucketIntelligentTieringConfiguration` and
 //! `ListBucketIntelligentTieringConfigurations`, and
@@ -119,9 +120,25 @@ impl PutBucketIntelligentTieringConfigurationOutput {
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "PUT",
         "/{Bucket}?intelligent-tiering",
-        Some(200u16),
+        Some(PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS),
     ));
 }
+
+/// The HTTP status a successful `PutBucketIntelligentTieringConfiguration` answers:
+/// `204 No Content`.
+///
+/// A successful write of an S3 Intelligent-Tiering configuration has nothing to return — the
+/// modelled output shape is `smithy.api#Unit`, which
+/// `smithy_query(query="operation",operation="PutBucketIntelligentTieringConfiguration")`
+/// reports with no members — and S3 answers it 204 with an empty body, where the model's
+/// `@http` code says 200; the same subresource's
+/// `DeleteBucketIntelligentTieringConfiguration` carries 204 in the model itself. Named once
+/// here so the operation's `SUCCESS_STATUS` (what the serializer reads) and the output
+/// schema's `@http` code cannot drift apart — the reading the sibling id-addressed
+/// configuration writes give their own no-content puts
+/// ([`super::put_bucket_analytics_configuration::PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS`],
+/// [`super::put_bucket_metrics_configuration::PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS`]).
+pub const PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS: u16 = 204;
 
 pub static PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &PutBucketIntelligentTieringConfigurationOutput::SCHEMA;
 
@@ -195,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "PutBucketIntelligentTieringConfiguration";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = PUT_BUCKET_INTELLIGENT_TIERING_CONFIGURATION_SUCCESS_STATUS;
 
     async fn handle(
         &self,

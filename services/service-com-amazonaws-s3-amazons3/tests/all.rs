@@ -125,6 +125,8 @@ mod bucket_website_refusals;
 mod checksum_mode_header_case;
 #[path = "all/cli_download_legs.rs"]
 mod cli_download_legs;
+#[path = "all/configuration_subresource_put_status.rs"]
+mod configuration_subresource_put_status;
 #[path = "all/copy_source_header_envelopes.rs"]
 mod copy_source_header_envelopes;
 #[path = "all/copy_source_url_encoding.rs"]

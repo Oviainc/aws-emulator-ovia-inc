@@ -6,7 +6,9 @@
 //! bucket carried under THAT id and leaving every other id untouched. The payload IS the
 //! configuration, so what the request names becomes the stored configuration — the
 //! destination, the schedule, the filter and the optional fields it asked for — and
-//! `GetBucketInventoryConfiguration` reports it back. Refused before anything is written
+//! `GetBucketInventoryConfiguration` reports it back. Success is
+//! [`PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS`] with an empty body. Refused before
+//! anything is written
 //! when the request is not one S3 records: an id outside the published length, an id that
 //! disagrees with the payload's own `Id`, or a member naming a value outside its enum's
 //! published set (`InvalidArgument`), and a NEW configuration past
@@ -134,9 +136,23 @@ impl PutBucketInventoryConfigurationOutput {
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "PUT",
         "/{Bucket}?inventory",
-        Some(200u16),
+        Some(PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS),
     ));
 }
+
+/// The HTTP status a successful `PutBucketInventoryConfiguration` answers: `204 No Content`.
+///
+/// A successful write of an S3 Inventory configuration has nothing to return — the modelled
+/// output shape is `smithy.api#Unit`, which
+/// `smithy_query(query="operation",operation="PutBucketInventoryConfiguration")` reports with
+/// no members — and S3 answers it 204 with an empty body, where the model's `@http` code says
+/// 200; the same subresource's `DeleteBucketInventoryConfiguration` carries 204 in the model
+/// itself. Named once here so the operation's `SUCCESS_STATUS` (what the serializer reads)
+/// and the output schema's `@http` code cannot drift apart — the reading the sibling
+/// id-addressed configuration writes give their own no-content puts
+/// ([`super::put_bucket_analytics_configuration::PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS`],
+/// [`super::put_bucket_metrics_configuration::PUT_BUCKET_METRICS_CONFIGURATION_SUCCESS_STATUS`]).
+pub const PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS: u16 = 204;
 
 pub static PUT_BUCKET_INVENTORY_CONFIGURATION_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &PutBucketInventoryConfigurationOutput::SCHEMA;
 
@@ -205,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "PutBucketInventoryConfiguration";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::PUT_BUCKET_INVENTORY_CONFIGURATION_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = PUT_BUCKET_INVENTORY_CONFIGURATION_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = PUT_BUCKET_INVENTORY_CONFIGURATION_SUCCESS_STATUS;
 
     async fn handle(
         &self,
