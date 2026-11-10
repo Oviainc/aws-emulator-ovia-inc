@@ -323,11 +323,14 @@ const PUBLISHED_ROWS: &[Published] = &[
     Published {
         service_code: "fsx",
         quota_code: "L-E43BDB2E",
-        quota_name: "Windows File Server total SSD storage capacity",
+        quota_name: "Windows SSD storage capacity",
         value: 524_288.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The maximum amount of SSD storage capacity (in GiB) for all Amazon FSx for \
+             Windows File Server file systems that you can have in this account.",
+        ),
         period: None,
         metric: None,
     },
@@ -442,16 +445,14 @@ const PUBLISHED_ROWS: &[Published] = &[
     Published {
         service_code: "glue",
         quota_code: "L-E6C807E7",
-        quota_name: "Rate of GetTables requests",
+        quota_name: "Concurrent compute capacity for Ray worker instances in M-DPUs per \
+                     account.",
         value: 50.0,
         unit: "None",
         adjustable: false,
         description: None,
-        period: Some((1, "SECOND")),
-        metric: Some(Metered::CallCount {
-            usage_service: "Glue",
-            api: "GetTables",
-        }),
+        period: None,
+        metric: None,
     },
     Published {
         service_code: "glue",
@@ -557,10 +558,13 @@ const PUBLISHED_ROWS: &[Published] = &[
         service_code: "imagebuilder",
         quota_code: "L-BA4D191B",
         quota_name: "Concurrent builds",
-        value: 10.0,
+        value: 100.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The maximum number of concurrent builds that can be in progress in this \
+             account in the current Region.",
+        ),
         period: None,
         metric: None,
     },

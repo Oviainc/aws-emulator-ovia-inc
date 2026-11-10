@@ -152,11 +152,9 @@ struct Probe {
 /// default-quota listing of each service for which code names which quota. The rows
 /// differ along everything the rule generalises over: a counted resource plane and a
 /// request rate, an
-/// adjustable row and a not-adjustable one, `Unit` `None` and a throughput unit, a row
+/// adjustable row and a not-adjustable one, `Unit` `None` and a size unit, a row
 /// with no `Period` and rows published over a one-second window, metered and unmetered
-/// rows, and values from 5 to 10,000,000. Every row but the two `glacier` ones names a
-/// quota the issue did not cite; `glacier`'s published catalog is eight rows long and
-/// the issue cites all eight, so its recorded row is pinned as one row of this table.
+/// rows, and values from 5 to 10,000,000.
 const PROBES: &[Probe] = &[
     Probe {
         service_code: "events",
@@ -171,32 +169,32 @@ const PROBES: &[Probe] = &[
     Probe {
         service_code: "events",
         quota_code: "L-755FD01C",
-        quota_name: "PutRule throttle limit in transactions per second",
-        value: 50.0,
+        quota_name: "Rate of invocations per API destination",
+        value: 300.0,
         unit: "None",
         adjustable: true,
         period: Some((1, "SECOND")),
-        call_count: Some(("EventBridge", "PutRule")),
+        call_count: None,
     },
     Probe {
         service_code: "firehose",
         quota_code: "L-CC1FDDAA",
-        quota_name: "Rate of PutRecordBatch requests",
-        value: 5000.0,
+        quota_name: "Rate of UpdateDestination requests",
+        value: 5.0,
         unit: "None",
         adjustable: false,
         period: Some((1, "SECOND")),
-        call_count: Some(("Kinesis Firehose", "PutRecordBatch")),
+        call_count: Some(("Kinesis Firehose", "UpdateDestination")),
     },
     Probe {
         service_code: "firehose",
         quota_code: "L-ED7DA7FC",
-        quota_name: "Dynamic partitions per delivery stream",
-        value: 500.0,
+        quota_name: "Rate of TagDeliveryStream requests",
+        value: 5.0,
         unit: "None",
         adjustable: false,
-        period: None,
-        call_count: None,
+        period: Some((1, "SECOND")),
+        call_count: Some(("Kinesis Firehose", "TagDeliveryStream")),
     },
     Probe {
         service_code: "fms",
@@ -221,9 +219,9 @@ const PROBES: &[Probe] = &[
     Probe {
         service_code: "fsx",
         quota_code: "L-4EDE4065",
-        quota_name: "Windows File Server total throughput capacity",
+        quota_name: "Windows throughput capacity",
         value: 10_240.0,
-        unit: "Megabytes/Second",
+        unit: "None",
         adjustable: true,
         period: None,
         call_count: None,

@@ -137,8 +137,8 @@ const BOUND_ROWS: &[Bound] = &[
         unit: "None",
         adjustable: false,
         description: Some(
-            "The maximum number of CreateEndpoint requests you can make per second in this \
-             account in the current Region.",
+            "The maximum number of requests per second for CreateEndpoint API. Additional \
+             requests are throttled.",
         ),
         period: Some((1, "SECOND")),
         metric: call_count("EventBridge", "CreateEndpoint"),
@@ -774,12 +774,23 @@ async fn a_request_rate_row_names_the_operation_it_throttles() {
                 json!(usage_service.expect("a metered service has an AWS/Usage name")),
                 "case {case}: expected the AWS/Usage display name of the service, got {quota}"
             );
-            assert_eq!(
-                quota["Description"],
-                json!(format!(
+            // Each service words the rate class the way its own recorded rows word it:
+            // EventBridge publishes a number of requests per second FOR THAT API, and
+            // every other covered service a number of requests the account may make.
+            let expected = if *service_code == "events" {
+                format!(
+                    "The maximum number of requests per second for {api} API. Additional \
+                     requests are throttled."
+                )
+            } else {
+                format!(
                     "The maximum number of {api} requests you can make per second in this \
                      account in the current Region."
-                )),
+                )
+            };
+            assert_eq!(
+                quota["Description"],
+                json!(expected),
                 "case {case}: expected the sentence AWS publishes for a request-rate quota, \
                  got {quota}"
             );
