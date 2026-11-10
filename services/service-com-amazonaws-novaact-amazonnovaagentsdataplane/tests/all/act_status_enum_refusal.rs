@@ -5,10 +5,13 @@
 //!
 //! The rule under test: a status value the model's enum does not declare is refused with
 //! HTTP 400 `ValidationException` whose message is the counted envelope over one clause
-//! naming the member path and the value set the model declares — every value of it, in the
-//! order the model declares them, and no echo of what the caller sent. The order is read
-//! off the model, so two requests that break the same value set are refused with the very
-//! same sentence.
+//! naming the member path and the value set the model declares — every value of it, listed
+//! in the order this front door walks its own table of the admissible values
+//! (`service_common::validation_message::hashed_enum_order`) rather than in the order the
+//! model declares them, and no echo of what the caller sent. The order is derived from the
+//! values themselves, so two requests that break the same value set are refused with the
+//! very same sentence; `enum_value_set_order.rs` holds the rule over every enum of this
+//! model.
 //!
 //! The table varies what the rule generalises over: the form of the rejected value (empty,
 //! a declared value in the wrong case, a value belonging to ANOTHER enum of this model, a
@@ -22,10 +25,10 @@ use crate::workflow_lifecycle::{text, Emulator};
 
 /// `ActStatus`' values in the order the MODEL declares them
 /// (`smithy_query(query="shape",shape="ActStatus")` reports
-/// `RUNNING, PENDING_CLIENT_ACTION, PENDING_HUMAN_ACTION, SUCCEEDED, FAILED, TIMED_OUT`),
-/// which is the order a clause listing the set states them in. The crate's own
-/// `ACT_STATUS_VALUES` holds the same values sorted, so the two are cross-checked below
-/// rather than one being derived from the other.
+/// `RUNNING, PENDING_CLIENT_ACTION, PENDING_HUMAN_ACTION, SUCCEEDED, FAILED, TIMED_OUT`).
+/// A clause listing the set puts them through the shared derivation of the listing order
+/// below. The crate's own `ACT_STATUS_VALUES` holds the same values sorted, so the two are
+/// cross-checked below rather than one being derived from the other.
 const DECLARED_ACT_STATUSES: [&str; 6] = [
     "RUNNING",
     "PENDING_CLIENT_ACTION",
@@ -89,7 +92,7 @@ async fn update(emulator: &Emulator, placed: &Placed, status: &str) -> (u16, Val
 }
 
 #[tokio::test]
-async fn a_status_outside_the_value_set_is_refused_with_the_set_as_the_model_declares_it() {
+async fn a_status_outside_the_value_set_is_refused_with_the_set_the_front_door_lists() {
     let emulator = Emulator::new("us-east-1");
     let placed = placed_act(&emulator).await;
 
@@ -103,11 +106,13 @@ async fn a_status_outside_the_value_set_is_refused_with_the_set_as_the_model_dec
         "the declared order must list exactly the statuses the model declares"
     );
 
-    // The one sentence every row must read, built from the model's own value list.
+    // The one sentence every row must read, built from the model's own value list put
+    // through the order the front door lists a value set in.
     let expected = format!(
         "1 validation error detected: Value at 'status' failed to satisfy constraint: \
          Member must satisfy enum value set: [{}]",
-        DECLARED_ACT_STATUSES.join(", ")
+        ::service_common::validation_message::hashed_enum_order(&DECLARED_ACT_STATUSES)
+            .join(", ")
     );
 
     let rows = [
@@ -122,8 +127,8 @@ async fn a_status_outside_the_value_set_is_refused_with_the_set_as_the_model_dec
         " RUNNING",
     ];
     for value in rows {
-        // Repeated, because a sentence that listed the set in the iteration order of a
-        // hashed container could differ between two refusals of the same request.
+        // Repeated, because a sentence that listed the set in the per-process iteration
+        // order of a hashed container could differ between two refusals of the same request.
         for attempt in 1..=2 {
             let (status, answer) = update(&emulator, &placed, value).await;
             assert_eq!(

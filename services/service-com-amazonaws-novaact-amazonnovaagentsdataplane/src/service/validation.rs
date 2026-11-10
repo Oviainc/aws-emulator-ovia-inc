@@ -16,9 +16,16 @@
 //!   submitted, and the refusal is stable across requests. It holds for whichever member of
 //!   whichever operation broke it: a body member, a URI label and a query parameter alike.
 //! * an enumerated type's value SET is stated the same way: the clause lists the values the
-//!   type admits, in the order the model declares them, and names no submitted value,
-//!   because the set is the requirement every value of that member must be in rather than
-//!   the one value that was not. So this refusal too reads the same whatever a caller sent.
+//!   type admits and names no submitted value, because the set is the requirement every
+//!   value of that member must be in rather than the one value that was not. So this refusal
+//!   too reads the same whatever a caller sent. The values are listed in the order this
+//!   front door walks its OWN table of the admissible values — a table keyed on each value's
+//!   text, so the listing is the table's buckets in ascending order
+//!   ([`in_hashed_enum_order`]) — and not in the order the model declares them. The order is
+//!   derived from the values themselves, so it belongs to the enumerated TYPE: every member
+//!   of every operation targeting one enum is listed alike, at whatever depth and in
+//!   whatever binding the value arrived, and a type the model gains needs nothing added
+//!   here.
 //!
 //! Both of those renderings, the counted envelope, the clause, the member path and every
 //! other constraint class's requirement belong to [`service_common::validation_message`] —
@@ -31,6 +38,7 @@
 //! clause the framework wrote for it, value and all. Those two are the classes this service
 //! has recordings of, and the ones it restates.
 
+use service_common::validation_message::in_hashed_enum_order;
 use smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
 
 /// How this service states `refusal`, or `None` to keep the framework's wording.
@@ -46,8 +54,14 @@ pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
     if !violations.iter().any(states_no_value) {
         return None;
     }
+    // An enumerated type's admissible values are listed in the order the table of them is
+    // walked rather than in the order the schema presented them, so each violation is
+    // re-ordered BEFORE the envelope words it: only the values move, and every other
+    // violation class comes back untouched. Doing it here — on the one refusal this service
+    // states — is what makes the order hold for every enum of this model.
+    let stated = Refusal::Invalid(violations.iter().map(in_hashed_enum_order).collect());
     service_common::validation_message::aws_validation_refusal_withholding_violations(
-        refusal,
+        &stated,
         states_no_value,
     )
 }
@@ -112,29 +126,39 @@ mod tests {
     }
 
     /// An enumerated type's value set is stated without the value the request sent, listing
-    /// the values the model declares in the order it declares them.
+    /// the values in the order the table of them is walked — whichever order the schema
+    /// presented them in, since the order is derived from the values themselves.
     #[test]
     fn an_enum_value_set_is_stated_without_the_submitted_value() {
-        let refusal = Refusal::Invalid(vec![violation(
-            "status",
-            ViolationKind::EnumValue(vec![
-                "RUNNING".to_owned(),
-                "PENDING_CLIENT_ACTION".to_owned(),
-                "SUCCEEDED".to_owned(),
-            ]),
-        )]);
-        let stated = refused(&refusal).expect("an enum value set is this service's to state");
-        assert!(
-            stated
-                .message
-                .contains("[RUNNING, PENDING_CLIENT_ACTION, SUCCEEDED]"),
-            "expected the value set listed as the model declares it, got {:?}",
-            stated.message
+        let declared = ["RUNNING", "PENDING_CLIENT_ACTION", "SUCCEEDED"];
+        let listed = format!(
+            "[{}]",
+            service_common::validation_message::hashed_enum_order(&declared).join(", ")
         );
-        assert!(
-            !stated.message.contains("submitted"),
-            "expected no submitted value in the clause, got {:?}",
-            stated.message
-        );
+        for (label, presented) in [
+            ("as the model declares it", declared),
+            (
+                "reversed",
+                ["SUCCEEDED", "PENDING_CLIENT_ACTION", "RUNNING"],
+            ),
+        ] {
+            let refusal = Refusal::Invalid(vec![violation(
+                "status",
+                ViolationKind::EnumValue(
+                    presented.iter().map(|value| (*value).to_owned()).collect(),
+                ),
+            )]);
+            let stated = refused(&refusal).expect("an enum value set is this service's to state");
+            assert!(
+                stated.message.contains(&listed),
+                "case {label:?}: expected the value set listed {listed}, got {:?}",
+                stated.message
+            );
+            assert!(
+                !stated.message.contains("submitted"),
+                "case {label:?}: expected no submitted value in the clause, got {:?}",
+                stated.message
+            );
+        }
     }
 }

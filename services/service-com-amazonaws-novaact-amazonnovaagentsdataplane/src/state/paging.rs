@@ -100,7 +100,12 @@ impl PageOrder {
                 "sortOrder",
                 format!(
                     "sortOrder must be one of {}, not {other}",
-                    SORT_ORDER_VALUES.join(" | ")
+                    // The value set is listed in the order this service's table of the
+                    // admissible values is walked — the one order it lists an enumerated
+                    // type's values in, so the clause the boundary walk states for an
+                    // unknown `sortOrder` and this one do not list the same set two ways.
+                    ::service_common::validation_message::hashed_enum_order(SORT_ORDER_VALUES)
+                        .join(" | ")
                 ),
             )),
         }

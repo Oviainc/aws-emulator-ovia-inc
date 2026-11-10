@@ -9,8 +9,9 @@
 //! and the modelled expression WITHOUT its `^` / `$` anchors, and no value at all — the
 //! requirement is the expression every value of that member must match rather than the one
 //! value that missed it. An enumerated member's value SET is stated the same way, listing
-//! the values the model declares and no submitted value. Every other constraint class keeps
-//! the clause the framework writes, value and all.
+//! the values the model declares — in the order the front door walks its own table of them
+//! (`service_common::validation_message::hashed_enum_order`) — and no submitted value. Every
+//! other constraint class keeps the clause the framework writes, value and all.
 //!
 //! The table varies what that rule generalises over rather than the one recorded request:
 //! which operation refuses, where the member is bound (a body member, a URI label, a
@@ -55,7 +56,9 @@ const MAX_RESULTS_MIN: i64 = 1;
 const MAX_RESULTS_MAX: i64 = 100;
 
 /// `SortOrder`'s value set, in the order the model declares it
-/// (`smithy_query(query="shape",shape="SortOrder")`).
+/// (`smithy_query(query="shape",shape="SortOrder")`). A clause listing the set puts it
+/// through the order the front door lists a value set in
+/// (`service_common::validation_message::hashed_enum_order`).
 const SORT_ORDER_VALUES: [&str; 2] = ["Ascending", "Descending"];
 
 /// One refused request and the clauses its message must carry, in order.
@@ -263,10 +266,11 @@ fn cases() -> Vec<Case> {
                 &pattern_requirement(NEXT_TOKEN_PATTERN),
             )],
         },
-        // An enumerated member: the requirement is the value set the model declares, and
-        // the clause names no submitted value — the same half of the rule a `@pattern`
-        // clause follows, because the set, like the expression, is what every value of the
-        // member must satisfy rather than the one value that did not.
+        // An enumerated member: the requirement is the value set the model declares, listed
+        // in the order the front door walks its table of those values, and the clause names
+        // no submitted value — the same half of the rule a `@pattern` clause follows,
+        // because the set, like the expression, is what every value of the member must
+        // satisfy rather than the one value that did not.
         Case {
             label: "a body member outside its enum value set",
             method: "POST",
@@ -277,7 +281,8 @@ fn cases() -> Vec<Case> {
                 "sortOrder",
                 &format!(
                     "Member must satisfy enum value set: [{}]",
-                    SORT_ORDER_VALUES.join(", ")
+                    ::service_common::validation_message::hashed_enum_order(&SORT_ORDER_VALUES)
+                        .join(", ")
                 ),
             )],
         },

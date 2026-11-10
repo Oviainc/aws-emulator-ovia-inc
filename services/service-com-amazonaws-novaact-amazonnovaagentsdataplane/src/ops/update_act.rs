@@ -187,14 +187,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // here means a status an act can hold, and anything else is refused rather than
         // stored as a status no read could report. The requirement is stated through the
         // workspace's shared sentence for a value outside an enumerated type's set, over
-        // the values in the order the model declares them and without echoing what the
-        // caller sent — the same choice `crate::service::validation` makes for the clause
-        // the boundary walk states.
+        // the values in the order the table of them is walked — a table keyed on each
+        // value's own text, not the order the model declares them — and without echoing
+        // what the caller sent, the same choice `crate::service::validation` makes for the
+        // clause the boundary walk states, so the two refusals read alike.
         let requested = crate::state::ActStatus::from_wire(&input.status).ok_or_else(|| {
-            let declared: Vec<String> = crate::state::ActStatus::ALL
+            let admitted: Vec<&str> = crate::state::ActStatus::ALL
                 .iter()
-                .map(|status| status.as_wire().to_string())
+                .map(|status| status.as_wire())
                 .collect();
+            let declared: Vec<String> = ::service_common::validation_message::hashed_enum_order(
+                &admitted,
+            )
+            .into_iter()
+            .map(str::to_string)
+            .collect();
             UpdateActErrorModeled::ValidationException(
                 crate::state::paging::field_validation_failed(
                     "status",
