@@ -17,11 +17,11 @@
 // else appends to.
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
-// Declared here, in this same head region, for the reason the entry above records: what
-// LAMBDA makes of an access point EFS minted, which neither crate's own test target can
-// ask, since the ARN has to cross from one service to the other.
-#[path = "all/efs_access_point_mounted_by_lambda.rs"]
-mod efs_access_point_mounted_by_lambda;
+// Declared here, in this same head region, for the reason the entry above records: what a
+// CodePipeline execution publishes onto the default event bus, and which rule's SQS target
+// receives it, spans four crates at once (CodePipeline, Amazon S3, EventBridge, Amazon SQS).
+#[path = "all/codepipeline_execution_state_changes_reach_a_queue_target.rs"]
+mod codepipeline_execution_state_changes_reach_a_queue_target;
 // Declared here, in this same head region, for the reason the entry above records: what an
 // EventBridge rule hands a Lambda target and which function qualifier the target ARN
 // addresses, which spans EventBridge and Lambda at once.
@@ -45,7 +45,6 @@ mod ses_v1_discovers_a_verified_sending_identity;
 // stack publishes for it.
 #[path = "all/cloudformation_provisions_secrets_manager_secrets.rs"]
 mod cloudformation_provisions_secrets_manager_secrets;
-// Declared here, in this same head region, for the reason the entry above records: what a
 // RUNNING fault-injection experiment makes of the targeted role's calls to the service whose
 // API it names, which spans four services.
 #[path = "all/fis_injected_api_fault.rs"]
@@ -1293,6 +1292,11 @@ mod opensearch_domain_vpc_placement;
 // handed nothing more.
 #[path = "all/cloudformation_stack_update_redirects_a_schedule.rs"]
 mod cloudformation_stack_update_redirects_a_schedule;
+// Declared here, in this same head region, for the reason the entry above records: what
+// LAMBDA makes of an access point EFS minted, which neither crate's own test target can
+// ask, since the ARN has to cross from one service to the other.
+#[path = "all/efs_access_point_mounted_by_lambda.rs"]
+mod efs_access_point_mounted_by_lambda;
 // Declared here, in this same head region, for the reason the entry above records: the tags
 // a bucket a stack created carries, which CloudFormation stamps and Amazon S3 reports.
 #[path = "all/cloudformation_stamps_s3_bucket_stack_provenance.rs"]
