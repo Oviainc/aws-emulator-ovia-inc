@@ -35,6 +35,9 @@ mod query_execution_identity;
 #[path = "all/query_execution_lifecycle.rs"]
 mod query_execution_lifecycle;
 
+#[path = "all/query_failure_classification.rs"]
+mod query_failure_classification;
+
 #[path = "all/query_result_outputs.rs"]
 mod query_result_outputs;
 

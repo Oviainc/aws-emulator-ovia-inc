@@ -69,6 +69,29 @@ pub const ERROR_TYPE_ENTITY_NOT_FOUND: i32 = 1301;
 /// a `SHOW CREATE VIEW` addresses it.
 pub const ERROR_TYPE_VIEW: i32 = 1502;
 
+/// The `AthenaError$ErrorType` Athena publishes for the GENERIC user-error class: a
+/// statement the caller has to change, of no narrower published class — which is the
+/// class whose messages carry the `GENERIC_USER_ERROR` prefix.
+pub const ERROR_TYPE_GENERIC_USER: i32 = 1000;
+
+/// The `AthenaError$ErrorType` Athena publishes for a table DEFINITION the caller got
+/// wrong: a `CREATE EXTERNAL TABLE` whose storage the catalog cannot register the table
+/// on, such as a `LOCATION` that is not a folder.
+pub const ERROR_TYPE_TABLE_DEFINITION: i32 = 1100;
+
+/// Athena's message for a `CREATE EXTERNAL TABLE` whose `LOCATION` denotes a file: fixed
+/// text with no variable part — it names neither the statement's table nor its location.
+const LOCATION_ON_FILE: &str = "Cannot create table on file, please specify a directory";
+
+/// Athena's message for a read of a table the catalog marks as an Iceberg table and holds
+/// no metadata location for: fixed text with no variable part — it names neither the
+/// database, the table nor the serialization library.
+const ICEBERG_WITHOUT_METADATA_LOCATION: &str = "GENERIC_USER_ERROR: Detected Iceberg type \
+     table without metadata location. Please make sure an Iceberg-enabled compute engine \
+     such as Athena or EMR Spark is used to create the table, or the table is created by \
+     using the Iceberg open source AWS library iceberg-aws. Setting table_type parameter \
+     in Glue metastore to create an Iceberg table is not supported.";
+
 /// How many levels of view a statement may read through: a view over a view over a table
 /// is resolved, and a chain longer than this is reported rather than followed.
 const MAX_VIEW_DEPTH: usize = 4;
@@ -212,6 +235,26 @@ impl Failure {
         ))
     }
 
+    /// A `CREATE EXTERNAL TABLE` declares a `LOCATION` that denotes a single OBJECT
+    /// rather than the folder an external table's data lives under.
+    pub fn location_on_file() -> Self {
+        Self::classified(
+            LOCATION_ON_FILE.to_string(),
+            ERROR_CATEGORY_USER,
+            ERROR_TYPE_TABLE_DEFINITION,
+        )
+    }
+
+    /// A statement reads a table the catalog marks as an Iceberg table and holds no
+    /// Iceberg metadata location for, so there is no table metadata to read it through.
+    pub fn iceberg_without_metadata_location() -> Self {
+        Self::classified(
+            ICEBERG_WITHOUT_METADATA_LOCATION.to_string(),
+            ERROR_CATEGORY_USER,
+            ERROR_TYPE_GENERIC_USER,
+        )
+    }
+
     /// This failure as the outcome of a run that produced nothing.
     fn outcome(self) -> Outcome {
         Outcome::Failed {
@@ -293,6 +336,15 @@ fn perform<Eng: Send + Sync + 'static>(
         CatalogStatement::ShowRelations { schema, .. } => (schema.catalog.clone(), schema.at),
     };
     let catalog_id = catalog_id_of(engine, &catalog, at)?;
+    // An external table's LOCATION has to denote a FOLDER: the clause is validated here,
+    // before the catalog entry it would define is resolved, because what it declares is
+    // wrong whatever the catalog holds. The object store's guard is taken and released
+    // inside, so no two stores are ever held at once.
+    if let CatalogStatement::CreateExternalTable(table) = statement {
+        if location_denotes_an_object(engine, table.location.as_deref()) {
+            return Err(Failure::location_on_file());
+        }
+    }
     let Some(state) = glue_state::service_state(engine) else {
         return Err(Failure::emulator(CATALOG_UNREACHABLE));
     };
@@ -325,6 +377,93 @@ const CATALOG_UNREACHABLE: &str =
 /// The message for an object store this engine does not carry.
 const OBJECT_STORE_UNREACHABLE: &str =
     "the object store is not reachable on this engine, so no table's data can be read";
+
+/// Whether `location` denotes a single OBJECT rather than the folder an external table's
+/// data lives under.
+///
+/// Athena's own rule for the clause is that a location names a FOLDER: its documentation
+/// tells a caller to close a folder or bucket location with a trailing separator and never
+/// to write a file name in it, and a statement that does name a file is refused rather
+/// than registered. So both halves of what is known decide it:
+///
+/// * what the OBJECT STORE holds there — an object stored at exactly the key the location
+///   names is a file, and a key other objects live UNDER is a folder, whatever either is
+///   named;
+/// * where the object store holds nothing at that key at all, the NAME itself: a location
+///   closed with a separator names a folder, and one whose last segment carries a file
+///   extension names a file.
+///
+/// A location that is no object-store path at all names no object here.
+fn location_denotes_an_object<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    location: Option<&str>,
+) -> bool {
+    let Some(location) = location
+        .map(str::trim)
+        .filter(|location| !location.is_empty())
+    else {
+        return false;
+    };
+    let Some((bucket_name, key)) =
+        data::parse_s3_uri(location).filter(|(_, key)| !key.is_empty())
+    else {
+        return false;
+    };
+    match held_at(engine, &bucket_name, &key) {
+        HeldAt::Object => true,
+        HeldAt::Folder => false,
+        HeldAt::Nothing => !location.ends_with('/') && names_a_file(&key),
+    }
+}
+
+/// What the object store holds at one key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldAt {
+    /// An object stored at exactly that key.
+    Object,
+    /// No object at the key itself, but objects under it: a folder.
+    Folder,
+    /// Nothing at the key and nothing under it.
+    Nothing,
+}
+
+/// What the object store holds at `key` of `bucket_name`, under ONE guard of its store.
+fn held_at<Eng: Send + Sync + 'static>(engine: &Eng, bucket_name: &str, key: &str) -> HeldAt {
+    let Some(state) = s3_state::service_state(engine) else {
+        return HeldAt::Nothing;
+    };
+    let store = state.lock();
+    let Some(bucket) = store.bucket(bucket_name) else {
+        return HeldAt::Nothing;
+    };
+    if bucket.object(key).is_some() {
+        return HeldAt::Object;
+    }
+    let under = format!("{key}/");
+    if bucket.objects().any(|(held, _)| held.starts_with(&under)) {
+        return HeldAt::Folder;
+    }
+    HeldAt::Nothing
+}
+
+/// Whether the last segment of `key` is a FILE name: a name closed by an extension, which
+/// is the form Athena's documentation of the clause tells a caller not to write in it.
+///
+/// An extension is letters: a segment closed by digits — a dated or versioned folder, say
+/// — is a folder name, and so is one carrying no extension at all.
+fn names_a_file(key: &str) -> bool {
+    let name = key.rsplit('/').next().unwrap_or(key);
+    name.rsplit_once('.')
+        .is_some_and(|(stem, extension)| {
+            !stem.is_empty()
+                && !extension.is_empty()
+                && extension.len() <= MAX_FILE_EXTENSION
+                && extension.chars().all(|letter| letter.is_ascii_alphabetic())
+        })
+}
+
+/// How long the extension of a file name may be for [`names_a_file`] to read it as one.
+const MAX_FILE_EXTENSION: usize = 10;
 
 /// The `CatalogId` the data catalog `catalog` names, or why its metadata cannot be read.
 ///

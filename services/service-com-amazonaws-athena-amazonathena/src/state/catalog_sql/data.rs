@@ -70,6 +70,25 @@ const JSON_SERDES: &[&str] = &[
     "org.openx.data.jsonserde.JsonSerDe",
 ];
 
+/// The table property that records which open table format a catalog entry holds its
+/// data in, as the engines that write such a table record it.
+const TABLE_TYPE_PROPERTY: &str = "table_type";
+
+/// The value [`TABLE_TYPE_PROPERTY`] carries for a table of the Iceberg open table
+/// format.
+const ICEBERG_TABLE_TYPE: &str = "ICEBERG";
+
+/// The table property that records WHERE an Iceberg table's current metadata file is: the
+/// one object every read of such a table has to go through, because the table's schema,
+/// its snapshots and the data files of each are named there rather than in the catalog.
+const METADATA_LOCATION_PROPERTY: &str = "metadata_location";
+
+/// The serialization library an Iceberg table's storage descriptor carries.
+const ICEBERG_SERDE: &str = "org.apache.iceberg.mr.hive.HiveIcebergSerDe";
+
+/// The `InputFormat` an Iceberg table's storage descriptor carries.
+const ICEBERG_INPUT_FORMAT: &str = "org.apache.iceberg.mr.hive.HiveIcebergInputFormat";
+
 /// How the objects at a table's location are decoded into rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Decoder {
@@ -212,6 +231,16 @@ impl DataSource {
             .and_then(|serde| serde.serialization_library.clone())
             .unwrap_or_else(|| ddl::LAZY_SIMPLE_SERDE.to_string());
         let input_format = storage.and_then(|storage| storage.input_format.clone());
+        let table_parameters = table.parameters.clone().unwrap_or_default();
+        // A table of an open table format is read THROUGH its own metadata, so one the
+        // catalog marks as such and holds no metadata location for cannot be read at all
+        // — which is a failure of the caller's own catalog entry, of Athena's published
+        // class for it, and not a storage format this engine merely does not decode.
+        if is_iceberg(&table_parameters, &library, input_format.as_deref())
+            && property(&table_parameters, METADATA_LOCATION_PROPERTY).is_none()
+        {
+            return Err(Failure::iceberg_without_metadata_location());
+        }
         let decoder = decoder_of(&library, input_format.as_deref(), &serde_parameters)
             .ok_or_else(|| {
                 Failure::emulator(format!(
@@ -220,7 +249,6 @@ impl DataSource {
                     relation.database, relation.table
                 ))
             })?;
-        let table_parameters = table.parameters.clone().unwrap_or_default();
         Ok(Self {
             relation: relation.clone(),
             local_name: relation.local_name(),
@@ -532,6 +560,39 @@ fn named_type(data_type: &str) -> String {
         .unwrap_or(&data_type)
         .trim()
         .to_string()
+}
+
+/// The value the table property `name` carries, whatever case the catalog recorded the
+/// property's NAME in, and `None` when the property is absent or carries no value at all.
+///
+/// A property a client wrote through the catalog API carries whatever name that client
+/// spelled, so a reader that matched the name byte for byte would miss the same property
+/// under another spelling of its case.
+fn property<'held>(
+    parameters: &'held HashMap<String, String>,
+    name: &str,
+) -> Option<&'held str> {
+    parameters.iter().find_map(|(property, value)| {
+        let value = value.trim();
+        (property.trim().eq_ignore_ascii_case(name) && !value.is_empty()).then_some(value)
+    })
+}
+
+/// Whether the catalog marks this entry as a table of the ICEBERG open table format.
+///
+/// Either half of the entry says so: the `table_type` property an engine that writes such
+/// a table records the format in, or a storage descriptor carrying Iceberg's own
+/// serialization library or input format.
+fn is_iceberg(
+    parameters: &HashMap<String, String>,
+    library: &str,
+    input_format: Option<&str>,
+) -> bool {
+    property(parameters, TABLE_TYPE_PROPERTY)
+        .is_some_and(|table_type| table_type.eq_ignore_ascii_case(ICEBERG_TABLE_TYPE))
+        || library.trim().eq_ignore_ascii_case(ICEBERG_SERDE)
+        || input_format
+            .is_some_and(|format| format.trim().eq_ignore_ascii_case(ICEBERG_INPUT_FORMAT))
 }
 
 /// How a table stored with the SerDe `library` under the input format `input_format` is
