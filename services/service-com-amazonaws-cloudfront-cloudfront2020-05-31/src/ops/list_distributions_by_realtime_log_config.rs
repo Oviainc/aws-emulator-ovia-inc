@@ -218,10 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             Err(crate::state::RealtimeLogConfigAddress::NotFound) => {
                 return Err(ListDistributionsByRealtimeLogConfigErrorModeled::InvalidArgument(
-                    crate::state::invalid_realtime_log_config(
-                        "no real-time log configuration answers to the Name or ARN the request \
-                         names",
-                    ),
+                    crate::state::invalid_argument_no_such_realtime_log_config(),
                 )
                 .into())
             }

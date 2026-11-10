@@ -188,17 +188,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The documented constraints the model carries no trait for — the sampling rate's
-        // range above all — refused with the modelled `InvalidArgument` ("An argument is
-        // invalid"), naming the member and the constraint it broke.
-        if let Some(reason) = crate::state::realtime_log_config_refusal(
+        // range above all — refused with the modelled `InvalidArgument`, under the sentence
+        // the service words the constraint that was broken in.
+        if let Some(refusal) = crate::state::realtime_log_config_refusal(
             input.sampling_rate,
             &input.end_points,
             &input.fields,
         ) {
-            return Err(CreateRealtimeLogConfigErrorModeled::InvalidArgument(
-                crate::state::invalid_realtime_log_config(&reason),
-            )
-            .into());
+            return Err(CreateRealtimeLogConfigErrorModeled::InvalidArgument(refusal).into());
         }
 
         // "The unique name of this real-time log configuration": a name identifies ONE

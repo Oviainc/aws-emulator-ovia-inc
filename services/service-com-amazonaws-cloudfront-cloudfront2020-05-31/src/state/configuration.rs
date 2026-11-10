@@ -2344,19 +2344,28 @@ pub fn anycast_ip_list_already_exists(name: &str) -> EntityAlreadyExists {
 /// The modelled `InvalidArgument` (HTTP 400) for an `IpCount` no Anycast static IP list can
 /// be allocated for.
 ///
-/// What the refusal states is the CONSTRAINT on the parameter — the value set the member
-/// documents ([`ANYCAST_IP_COUNTS`]) — which a caller cannot work out from the model alone,
-/// since the member carries no `@range`. The value submitted is named beside it, as every
-/// other `InvalidArgument` here names the argument it refused, so a caller that sent
-/// several learns which one broke.
-pub fn invalid_anycast_ip_count(ip_count: i32) -> crate::ops::types::InvalidArgument {
-    let admitted: Vec<String> = ANYCAST_IP_COUNTS.iter().map(i32::to_string).collect();
+/// FIXED service text ([`invalid_anycast_ip_count_message`]): what the refusal states is the
+/// CONSTRAINT on the parameter — the value set the member documents ([`ANYCAST_IP_COUNTS`]) —
+/// which a caller cannot work out from the model alone, since the member carries no
+/// `@range`. The value SUBMITTED is no part of it: the caller already holds it, and the
+/// sentence states the rule it broke.
+pub fn invalid_anycast_ip_count() -> crate::ops::types::InvalidArgument {
     crate::ops::types::InvalidArgument {
-        message: Some(format!(
-            "An argument is invalid: IpCount must be one of {}, not {ip_count}",
-            admitted.join(", ")
-        )),
+        message: Some(invalid_anycast_ip_count_message()),
     }
+}
+
+/// The sentence CloudFront refuses an `IpCount` outside the documented value set with, on the
+/// wire: it names the parameter the quantity arrives under and then the two counts a list may
+/// be allocated for, which are this service's own ([`ANYCAST_IP_COUNTS`]) rather than numbers
+/// repeated into the text.
+pub fn invalid_anycast_ip_count_message() -> String {
+    let admitted: Vec<String> = ANYCAST_IP_COUNTS.iter().map(i32::to_string).collect();
+    format!(
+        "The parameter Quantity Invalid quantity provided. The quantity of IPs in an \
+         AnycastIpList should be either {}.",
+        admitted.join(" or ")
+    )
 }
 
 /// The modelled `EntityLimitExceeded` (HTTP 400) for a create this account's Anycast static
@@ -3173,6 +3182,55 @@ pub fn no_such_public_key() -> crate::ops::types::NoSuchPublicKey {
 /// "correct" this constant to the documentation sentence.
 pub const NO_SUCH_PUBLIC_KEY_MESSAGE: &str = "The specified CloudFront public key does not exist.";
 
+/// The modelled `NoSuchPublicKey` (HTTP 404) an operation that ADDRESSES a public key by its
+/// `Id` answers an id it cannot resolve.
+///
+/// Every operation of that surface models this one not-found code, so one code and one status
+/// cover two conditions and the MESSAGE is what tells them apart — the same split
+/// [`unresolved_field_level_encryption_profile_id`] makes for a profile and
+/// [`unresolved_key_group_id`] for a key group. An `Id` that could never have been a public key
+/// id ([`is_unreadable_public_key_id`]) is reported as the identifier CloudFront cannot read,
+/// naming the member it arrived in ([`id_format_invalid_message`]); every other `Id` the store
+/// holds no key for is the absent-key sentence ([`NO_SUCH_PUBLIC_KEY_MESSAGE`]). Both are fixed
+/// text and neither carries the value submitted.
+///
+/// Only where a public key is ADDRESSED, by the `Id` the sentence names: a `PublicKeyId` a
+/// SUBMITTED configuration references is resolved against the store alone, so an id of any
+/// shape it holds no key for is that absent-key sentence.
+pub fn unresolved_public_key_id(id: &str) -> crate::ops::types::NoSuchPublicKey {
+    if is_unreadable_public_key_id(id) {
+        crate::ops::types::NoSuchPublicKey {
+            message: Some(id_format_invalid_message("Id")),
+        }
+    } else {
+        no_such_public_key()
+    }
+}
+
+/// Whether `id` could never have been the identifier of a public key — a property of the VALUE
+/// alone, so an operation that addresses one decides it before consulting the store.
+///
+/// Two ways a value is no public key identifier at all:
+///
+/// * it is written in the public key NAMESPACE — under the prefix public key ids are minted
+///   with ([`PUBLIC_KEY_ID_PREFIX`]) — but not in the shape that namespace's ids take
+///   ([`is_public_key_id`]), so it is a public key id that cannot be read;
+/// * it is a well-formed id of ANOTHER resource kind of this service
+///   ([`is_minted_entity_id_of_another_kind`]) — a distribution, a field-level encryption
+///   configuration or profile, or one of the UUID-keyed kinds — whose namespace is disjoint
+///   from this one's.
+///
+/// Every OTHER value could have been an identifier CloudFront issued and is therefore resolved
+/// against the STORE, which reports it ABSENT: a value under no prefix of this service, one
+/// carrying separators, and one in another case (the prefix above is the character ids are
+/// minted with, so a lower-case letter is not that prefix) are each a value this service may
+/// not refuse on its form — `GetPublicKey$Id` is a plain `string` with no `@pattern`, and a
+/// name or a caller reference is simply a key that is not there.
+fn is_unreadable_public_key_id(id: &str) -> bool {
+    (id.starts_with(PUBLIC_KEY_ID_PREFIX) && !is_public_key_id(id))
+        || is_minted_entity_id_of_another_kind(id, is_public_key_id)
+}
+
 /// The modelled `PublicKeyInUse` (HTTP 409) for a delete of a public key a stored record
 /// still references.
 ///
@@ -3247,7 +3305,7 @@ pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE: &str =
 pub fn unresolved_field_level_encryption_profile_id(
     id: &str,
 ) -> crate::ops::types::NoSuchFieldLevelEncryptionProfile {
-    if is_minted_entity_id_of_another_kind(id) {
+    if is_minted_entity_id_of_another_kind(id, is_field_level_encryption_profile_id) {
         crate::ops::types::NoSuchFieldLevelEncryptionProfile {
             message: Some(id_format_invalid_message("Id")),
         }
@@ -3256,19 +3314,25 @@ pub fn unresolved_field_level_encryption_profile_id(
     }
 }
 
-/// Whether `value` is a minted id of a resource kind OTHER than a field-level encryption
-/// profile: an id of the sibling field-level encryption CONFIG, a public key, a distribution,
-/// or one of the UUID-keyed policy kinds.
+/// Whether `value` is a minted id of a resource kind OTHER than the one an operation
+/// ADDRESSES — `addressed` being the predicate of the kind it addresses: an id of the
+/// field-level encryption CONFIG or PROFILE namespaces, a public key, a distribution, or one
+/// of the UUID-keyed kinds.
 ///
-/// Each of those namespaces is disjoint from a profile id's
-/// ([`is_field_level_encryption_profile_id`]), so a value in one of them could never have
-/// been a profile id — which is what separates an identifier of the WRONG RESOURCE KIND from
-/// a profile id, a name or a caller reference the store simply holds nothing for.
-pub(super) fn is_minted_entity_id_of_another_kind(value: &str) -> bool {
-    is_field_level_encryption_config_id(value)
-        || is_public_key_id(value)
-        || is_distribution_id(value)
-        || is_minted_uuid(value)
+/// Each of those namespaces is disjoint from the others', so a value in one of them could
+/// never have been an id of a kind it does not belong to — which is what separates an
+/// identifier of the WRONG RESOURCE KIND from an id, a name or a caller reference of the
+/// right kind that the store simply holds nothing for.
+pub(super) fn is_minted_entity_id_of_another_kind(
+    value: &str,
+    addressed: fn(&str) -> bool,
+) -> bool {
+    !addressed(value)
+        && (is_field_level_encryption_config_id(value)
+            || is_field_level_encryption_profile_id(value)
+            || is_public_key_id(value)
+            || is_distribution_id(value)
+            || is_minted_uuid(value))
 }
 
 /// The modelled `FieldLevelEncryptionProfileInUse` (HTTP 409) for a delete of a profile a

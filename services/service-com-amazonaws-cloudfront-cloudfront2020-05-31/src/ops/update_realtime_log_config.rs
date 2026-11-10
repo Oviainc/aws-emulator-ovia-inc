@@ -211,13 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Checked against that configuration, by the same rule a create's is, before
         // anything is written: a refused update leaves the record exactly as it was.
-        if let Some(reason) =
+        if let Some(refusal) =
             crate::state::realtime_log_config_refusal(sampling_rate, &end_points, &fields)
         {
-            return Err(UpdateRealtimeLogConfigErrorModeled::InvalidArgument(
-                crate::state::invalid_realtime_log_config(&reason),
-            )
-            .into());
+            return Err(UpdateRealtimeLogConfigErrorModeled::InvalidArgument(refusal).into());
         }
 
         let updated = store

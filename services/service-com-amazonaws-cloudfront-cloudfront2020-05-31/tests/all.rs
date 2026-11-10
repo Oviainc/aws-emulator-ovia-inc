@@ -253,6 +253,8 @@ mod realtime_log_config_lifecycle;
 mod realtime_log_config_list;
 #[path = "all/refusal_contract.rs"]
 mod refusal_contract;
+#[path = "all/refusal_message_fidelity.rs"]
+mod refusal_message_fidelity;
 #[path = "all/request_supplied_order_and_values.rs"]
 mod request_supplied_order_and_values;
 #[path = "all/request_validation_limits.rs"]

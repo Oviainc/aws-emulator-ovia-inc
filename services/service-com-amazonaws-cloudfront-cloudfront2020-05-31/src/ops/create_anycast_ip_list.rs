@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // value set is refused here rather than before the handler runs.
         if !crate::state::ANYCAST_IP_COUNTS.contains(&input.ip_count) {
             return Err(CreateAnycastIpListErrorModeled::InvalidArgument(
-                crate::state::invalid_anycast_ip_count(input.ip_count),
+                crate::state::invalid_anycast_ip_count(),
             )
             .into());
         }

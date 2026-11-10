@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this id names, and nothing is minted for an id the store does not hold.
         let Some(stored) = store.public_key(&input.id) else {
             return Err(UpdatePublicKeyErrorModeled::NoSuchPublicKey(
-                crate::state::no_such_public_key(),
+                crate::state::unresolved_public_key_id(&input.id),
             )
             .into());
         };
@@ -245,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot miss. The `None` arm is the modelled 404 rather than a panic.
         let Some(stored) = store.apply_public_key_config(&input.id, config) else {
             return Err(UpdatePublicKeyErrorModeled::NoSuchPublicKey(
-                crate::state::no_such_public_key(),
+                crate::state::unresolved_public_key_id(&input.id),
             )
             .into());
         };

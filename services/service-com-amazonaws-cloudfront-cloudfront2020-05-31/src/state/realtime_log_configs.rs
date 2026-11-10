@@ -271,64 +271,104 @@ pub fn realtime_log_config_arn(name: &str) -> String {
 /// single request chooses how large a record the store retains — checked BEFORE the walk
 /// over the endpoints, so the per-endpoint work is bounded too.
 ///
-/// The reason carries no error wording of its own: the caller prefixes it with the wording
-/// of whichever refusal its own model declares.
+/// The refusal is the `InvalidArgument` every operation that submits a configuration models,
+/// built whole here. The rules CloudFront PUBLISHES for a parameter carry the service's own
+/// sentence for that parameter — the sampling rate's range
+/// ([`sampling_rate_out_of_range_message`]) and the two lists that have to name something
+/// ([`empty_list_parameter_message`]) — rather than a sentence of this emulator's, while the
+/// bounds that are this emulator's OWN are worded as such ([`invalid_realtime_log_config`]).
 pub fn realtime_log_config_refusal(
     sampling_rate: i64,
     end_points: &[EndPoint],
     fields: &[String],
-) -> Option<String> {
+) -> Option<InvalidArgument> {
     if !(MIN_SAMPLING_RATE..=MAX_SAMPLING_RATE).contains(&sampling_rate) {
-        return Some(format!(
-            "SamplingRate must be a whole number between {MIN_SAMPLING_RATE} and \
-             {MAX_SAMPLING_RATE} (inclusive) but the request submits {sampling_rate}"
-        ));
+        return Some(InvalidArgument {
+            message: Some(sampling_rate_out_of_range_message()),
+        });
     }
     if end_points.is_empty() {
-        return Some(
-            "a real-time log configuration sends its log data to a Kinesis data stream, so \
-             EndPoints names at least one endpoint"
-                .to_string(),
-        );
+        return Some(InvalidArgument {
+            message: Some(empty_list_parameter_message("EndPoints", "endpoint")),
+        });
     }
     if fields.is_empty() {
-        return Some(
-            "a real-time log configuration states the fields included in each log record, so \
-             Fields names at least one field"
-                .to_string(),
-        );
+        return Some(InvalidArgument {
+            message: Some(empty_list_parameter_message("Fields", "field")),
+        });
     }
     if end_points.len() > MAX_REALTIME_LOG_CONFIG_END_POINTS {
-        return Some(format!(
+        return Some(invalid_realtime_log_config(&format!(
             "a real-time log configuration names at most {MAX_REALTIME_LOG_CONFIG_END_POINTS} \
              endpoints but the request names {}",
             end_points.len()
-        ));
+        )));
     }
     if fields.len() > MAX_REALTIME_LOG_CONFIG_FIELDS {
-        return Some(format!(
+        return Some(invalid_realtime_log_config(&format!(
             "a real-time log configuration includes at most {MAX_REALTIME_LOG_CONFIG_FIELDS} \
              fields but the request includes {}",
             fields.len()
-        ));
+        )));
     }
     // Only now walked, so the per-endpoint work is bounded by the length checked above.
     for end_point in end_points {
         if end_point.stream_type != KINESIS_STREAM_TYPE {
-            return Some(format!(
+            return Some(invalid_realtime_log_config(&format!(
                 "the only valid EndPoint StreamType is {KINESIS_STREAM_TYPE} but the request \
                  submits {}",
                 end_point.stream_type
-            ));
+            )));
         }
         if end_point.kinesis_stream_config.is_none() {
-            return Some(format!(
+            return Some(invalid_realtime_log_config(&format!(
                 "an EndPoint of StreamType {KINESIS_STREAM_TYPE} names the Kinesis data stream \
                  to send to, but the request submits one with no KinesisStreamConfig"
-            ));
+            )));
         }
     }
     None
+}
+
+/// The sentence CloudFront refuses a list parameter submitted with no entries with, on the
+/// wire: it names the MEMBER the list arrived in and what one entry of it is, and states what
+/// the parameter has to carry rather than anything the request submitted — so every refusal of
+/// this condition reads the same.
+///
+/// One producer for every list of this service a request has to name something in, so no two
+/// of them can word the same refusal differently.
+pub fn empty_list_parameter_message(parameter: &str, item: &str) -> String {
+    format!("The parameter {parameter} must contain at least one {item}.")
+}
+
+/// The sentence CloudFront refuses a `SamplingRate` outside the range it publishes for the
+/// parameter with, on the wire.
+///
+/// The text states the CONSTRAINT the parameter carries — the service names the parameter and
+/// the two ends of its range — and nothing the request submitted reaches it, so every refusal
+/// of this condition reads the same whatever value was sent. The ends come from the range
+/// this service admits ([`MIN_SAMPLING_RATE`]..=[`MAX_SAMPLING_RATE`]): CloudFront words the
+/// lower end EXCLUSIVELY ("greater than") and the upper end inclusively, so the lower end is
+/// written as the value just below the smallest rate a configuration may carry.
+pub fn sampling_rate_out_of_range_message() -> String {
+    format!(
+        "The parameter SamplingRate must be an integer greater than {} and less than or equal \
+         to {MAX_SAMPLING_RATE}.",
+        MIN_SAMPLING_RATE - 1
+    )
+}
+
+/// The modelled `InvalidArgument` (HTTP 400) an operation whose model serves no
+/// `NoSuchRealtimeLogConfig` answers a `Name` or `ARN` the store holds no configuration for.
+///
+/// The CONDITION is the one [`no_such_realtime_log_config`] reports — no configuration
+/// answers to the identifier — so the SENTENCE is that condition's
+/// ([`NO_SUCH_REALTIME_LOG_CONFIG_MESSAGE`]) whichever code the operation's model makes it
+/// carry, and nothing from the request belongs in it.
+pub fn invalid_argument_no_such_realtime_log_config() -> InvalidArgument {
+    InvalidArgument {
+        message: Some(NO_SUCH_REALTIME_LOG_CONFIG_MESSAGE.to_string()),
+    }
 }
 
 /// The reason a create whose `Name` is empty is refused with.

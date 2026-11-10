@@ -24,8 +24,11 @@
 //!   sure that the request can't be replayed": the same request again reports the key the
 //!   first create stored, and a different configuration under a reference already taken is
 //!   refused (`PublicKeyAlreadyExists`, 409);
-//! * an id no public key holds is `NoSuchPublicKey` (404) under the fixed sentence this
-//!   service states for that code, from BOTH readers of the one record;
+//! * an id of the public key namespace, or of no namespace of this service at all, that no
+//!   public key holds is `NoSuchPublicKey` (404) under the fixed sentence this service states
+//!   for that code, from BOTH readers of the one record (an id drawn from ANOTHER of this
+//!   service's namespaces is the identifier-format sentence instead, which
+//!   `refusal_message_fidelity` holds that surface to);
 //! * `PublicKeyConfig$Comment`: "The comment cannot be longer than 128 characters", so a
 //!   longer comment is refused before anything is stored;
 //! * the number of public keys the account holds is BOUNDED, and a create past the bound
@@ -495,11 +498,13 @@ async fn create_persists_the_configuration_every_read_then_reports() {
         );
     }
 
-    // An id no public key holds exists in no namespace: neither a well-shaped one nor an
-    // arbitrary string. BOTH readers of the one record answer the same way, under the fixed
-    // sentence this service states for that code — which names no part of the request, so the
-    // id asked about is no part of it.
-    for id in ["K1AAAAAAAAAAAA", "E1AAAAAAAAAAAA", "not-an-id", "0"] {
+    // An id no public key holds: a well-shaped id of this namespace that was never minted,
+    // and values of no namespace of this service at all. BOTH readers of the one record
+    // answer the same way, under the fixed sentence this service states for that code — which
+    // names no part of the request, so the id asked about is no part of it. An id drawn from
+    // ANOTHER of this service's namespaces is a different condition (the identifier cannot be
+    // read as a public key id at all) and is asserted in `refusal_message_fidelity`.
+    for id in ["K1AAAAAAAAAAAA", "not-an-id", "0"] {
         for (reader, missing) in [
             ("GetPublicKey", get_key(&router, id).await),
             ("GetPublicKeyConfig", get_key_config(&router, id).await),

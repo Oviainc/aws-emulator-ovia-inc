@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(stored) = store.public_key(&input.id) else {
             return Err(GetPublicKeyConfigErrorModeled::NoSuchPublicKey(
-                crate::state::no_such_public_key(),
+                crate::state::unresolved_public_key_id(&input.id),
             )
             .into());
         };
