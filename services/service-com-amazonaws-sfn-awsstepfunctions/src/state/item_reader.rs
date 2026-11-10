@@ -686,22 +686,15 @@ fn kind_of(value: &Value) -> &'static str {
     }
 }
 
-/// The first member of `members` that is not one of `allowed`.
+/// The first member of `members` that is not one of `allowed`
+/// ([`super::unknown_member`]).
 fn unknown(members: &Map<String, Value>, allowed: &[&str]) -> Option<String> {
-    members
-        .keys()
-        .find(|member| !allowed.contains(&member.as_str()))
-        .cloned()
+    super::unknown_member(members, allowed)
 }
 
-/// The text `document` names `member` with; `None` for a member it does not carry as a
-/// non-empty string.
+/// The text `document` names `member` with ([`super::declared_text`]).
 fn text(document: &Value, member: &str) -> Option<String> {
-    document
-        .get(member)
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string)
+    super::declared_text(document, member)
 }
 
 /// The failure a state whose `ItemReader` could not be READ reports: the ASL error name

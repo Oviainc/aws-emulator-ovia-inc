@@ -10,12 +10,14 @@
 //! the states, the data-flow members, the context object and the intrinsic functions
 //! the definition uses — and only a state or member whose semantics need something
 //! outside this process (a `Task` whose `Resource` names no integration call this
-//! emulator makes, a Distributed Map's S3 `ResultWriter`, an `ItemReader` whose
+//! emulator makes, a Distributed Map's `ResultWriter` whose `WriterConfig` asks for a
+//! dataset this emulator does not write, an `ItemReader` whose
 //! `InputType` this emulator does not read) ends
 //! the execution `FAILED` with ASL's `States.Runtime` and a cause that says what was
 //! not run. The integration calls that ARE made are
-//! `tests/all/task_integrations.rs`, and the datasets an `ItemReader` DOES read are
-//! `tests/all/map_item_reader.rs`.
+//! `tests/all/task_integrations.rs`, the datasets an `ItemReader` DOES read are
+//! `tests/all/map_item_reader.rs`, and the results a `ResultWriter` DOES write are
+//! `tests/all/map_result_writer.rs`.
 //!
 //! Each table below spans one class of that rule: the recorded Distributed Map that
 //! this suite's issue was filed about is ONE row of the first one.
@@ -400,8 +402,11 @@ async fn what_cannot_be_run_in_process_fails_rather_than_being_faked() {
             expected: Expected::Failure("States.Runtime"),
         },
         RunCase {
-            case: "a Distributed Map's S3 ResultWriter",
-            definition: r#"{"StartAt":"M","States":{"M":{"Type":"Map","ResultWriter":{"Resource":"arn:aws:states:::s3:putObject","Parameters":{"Bucket":"b"}},"ItemProcessor":{"ProcessorConfig":{"Mode":"DISTRIBUTED"},"StartAt":"P","States":{"P":{"Type":"Pass","End":true}}},"End":true}}}"#,
+            // The results this emulator DOES write are written to S3 for real
+            // (`tests/all/map_result_writer.rs`); a `WriterConfig` asking for another
+            // dataset — one JSON value per line — is still not written, and says so.
+            case: "a Distributed Map's ResultWriter whose OutputType is not written",
+            definition: r#"{"StartAt":"M","States":{"M":{"Type":"Map","ResultWriter":{"Resource":"arn:aws:states:::s3:putObject","WriterConfig":{"OutputType":"JSONL"},"Parameters":{"Bucket":"b"}},"ItemProcessor":{"ProcessorConfig":{"Mode":"DISTRIBUTED"},"StartAt":"P","States":{"P":{"Type":"Pass","End":true}}},"End":true}}}"#,
             input: "[1]",
             expected: Expected::Failure("States.Runtime"),
         },

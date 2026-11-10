@@ -2025,25 +2025,25 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// Called once the execution has been ADMITTED, against bytes that already
     /// include these records' ([`PlannedMapRun::measure`]).
     ///
-    /// One attempt's Map Runs are POSITIONAL: the walk reports them in the order it
-    /// entered their `Map` states, and a redrive re-runs the same definition over the
-    /// same input, so its walk enters the same states in the same order. The record
-    /// already at a position therefore belongs to the same `Map` state and MOVES —
-    /// keeping its ARN, which a client may be holding, and counting the redrive —
-    /// while a position no earlier attempt reached gets a Map Run of its own. The
-    /// position is what identifies it, not the label, because one walk can enter one
-    /// `Map` state many times (a Distributed Map nested inside another runs once per
-    /// outer item) and each of those entries is a Map Run in its own right.
+    /// One attempt's Map Runs are reported in the order it entered their `Map` states,
+    /// and the ARN each one is recorded under was decided by the WALK as that state was
+    /// entered ([`PlannedMapRun::arn`]): a walk CONTINUING an attempt is handed the Map
+    /// Run that attempt already started — matched by the state's own label and by which
+    /// entry into it the walk is making ([`asl::StartedMapRun::arn`],
+    /// [`super::map_runs::resumed`]) — and mints one for every other state, because the
+    /// results a run's `ResultWriter` writes and the output its state puts out name the
+    /// Map Run before this call can record it. A run the walk re-entered therefore
+    /// MOVES, keeping the ARN a client may be holding and counting the redrive.
     ///
-    /// A record an earlier attempt left at a position this one did not reach, or at
-    /// one this one entered a DIFFERENT state at, is no longer a Map Run of this
-    /// execution and is dropped rather than left listed under it.
+    /// A Map Run an earlier attempt started that this one did not re-enter STAYS a Map
+    /// Run of this execution: "Step Functions preserves the results and execution
+    /// history of the successful steps", and a Map Run that ran is a resource that
+    /// happened, so `ListMapRuns` goes on reporting it in the order its state was
+    /// entered.
     pub fn record_map_runs(
         &mut self,
         execution_arn: &str,
         state_machine_arn: &str,
-        state_machine_name: &str,
-        region: &str,
         planned: Vec<PlannedMapRun>,
     ) {
         // An attempt that entered no Distributed Map state reports nothing, and says
@@ -2051,42 +2051,24 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         if planned.is_empty() {
             return;
         }
-        let previous: Vec<String> = self
+        // The Map Runs this execution already has, in the order their states were
+        // entered; one whose record the store no longer holds is not one of them.
+        let mut recorded: Vec<String> = self
             .map_runs_by_execution
             .get(execution_arn)
             .cloned()
-            .unwrap_or_default();
-        let mut recorded: Vec<String> = Vec::with_capacity(planned.len());
-        for (position, plan) in planned.into_iter().enumerate() {
-            let reused = previous
-                .get(position)
-                .filter(|arn| {
-                    self.map_runs
-                        .get(*arn)
-                        .is_some_and(|map_run| map_run.label == plan.label)
-                })
-                .cloned();
-            let arn = match reused {
-                Some(arn) => arn,
-                None => {
-                    let id = self.fresh_uuid();
-                    map_run_arn(region, state_machine_name, &plan.label, &id)
-                }
-            };
-            self.put_map_run(arn.clone(), execution_arn, state_machine_arn, plan);
-            recorded.push(arn);
-        }
-        for arn in previous {
-            if recorded.contains(&arn) {
-                continue;
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|arn| self.map_runs.contains_key(arn))
+            .collect();
+        for plan in planned {
+            let arn = plan.arn.clone();
+            // A run this attempt re-entered keeps its place in the list; one no earlier
+            // attempt started is appended after them.
+            if !recorded.contains(&arn) {
+                recorded.push(arn.clone());
             }
-            if let Some(map_run) = self.map_runs.remove(&arn) {
-                self.retained_bytes = self.retained_bytes.saturating_sub(map_run.retained_bytes);
-            }
-            self.pending_map_runs.retain(|pending| pending != &arn);
-            // A record that is no longer a Map Run of this execution takes the child
-            // workflow executions it had started with it.
-            self.discard_child_executions_of(&arn);
+            self.put_map_run(arn, execution_arn, state_machine_arn, plan);
         }
         self.map_runs_by_execution
             .insert(execution_arn.to_string(), recorded);
@@ -2100,13 +2082,11 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// already listed under this execution stand: they belong to states this walk
     /// passed before the task, which happened once and are not re-entered. Each Map
     /// Run here is therefore a position no earlier call reached, appended after them
-    /// with an ARN of its own.
+    /// under the ARN the walk minted for it.
     pub fn append_map_runs(
         &mut self,
         execution_arn: &str,
         state_machine_arn: &str,
-        state_machine_name: &str,
-        region: &str,
         planned: Vec<PlannedMapRun>,
     ) {
         if planned.is_empty() {
@@ -2118,8 +2098,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .cloned()
             .unwrap_or_default();
         for plan in planned {
-            let id = self.fresh_uuid();
-            let arn = map_run_arn(region, state_machine_name, &plan.label, &id);
+            let arn = plan.arn.clone();
             self.put_map_run(arn.clone(), execution_arn, state_machine_arn, plan);
             recorded.push(arn);
         }
@@ -2190,8 +2169,16 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         // The children of the attempt this record is REPLACING belong to a run of
         // this `Map` state that happened before: a redrive re-ran the state, so the
         // executions it started then are gone and the ones it started now take their
-        // place under the same Map Run.
-        self.discard_child_executions_of(&arn);
+        // place under the same Map Run — all but the ones this attempt KEPT, whose
+        // items it did not run again ([`PlannedChildExecution::preserved`]) and whose
+        // records therefore stay exactly as they are.
+        let kept: Vec<String> = plan
+            .children
+            .iter()
+            .filter(|child| child.preserved)
+            .map(|child| child.arn.clone())
+            .collect();
+        self.discard_child_executions_of_except(&arn, &kept);
         self.record_child_executions(&arn, execution_arn, plan.children);
     }
 
@@ -2228,6 +2215,14 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         let trace_header = parent.trace_header.clone();
         let mut recorded = Vec::with_capacity(children.len());
         for child in children {
+            // An execution this attempt KEPT is one it did not start: its record holds
+            // the history, the dates and the output of the attempt that did, which a
+            // redrive preserves, so it is listed under the Map Run again and written
+            // not at all.
+            if child.preserved && self.executions.contains_key(&child.arn) {
+                recorded.push(child.arn);
+                continue;
+            }
             let opened = HistoryEvent {
                 id: 1,
                 previous_event_id: 0,
@@ -2315,11 +2310,28 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// Drop every child workflow execution of the Map Run `map_run_arn` names, so no
     /// execution is left under a Map Run whose items it no longer belongs to.
     pub(super) fn discard_child_executions_of(&mut self, map_run_arn: &str) {
+        self.discard_child_executions_of_except(map_run_arn, &[]);
+    }
+
+    /// As [`ComAmazonawsSfnAwsstepfunctionsState::discard_child_executions_of`],
+    /// keeping the executions `kept` names.
+    ///
+    /// They are the children a continued attempt of the Map Run KEPT: their items were
+    /// not run again, so the records they already have are the ones that go on being
+    /// reported ([`PlannedChildExecution::preserved`]).
+    pub(super) fn discard_child_executions_of_except(
+        &mut self,
+        map_run_arn: &str,
+        kept: &[String],
+    ) {
         for arn in self
             .executions_by_map_run
             .remove(map_run_arn)
             .unwrap_or_default()
         {
+            if kept.contains(&arn) {
+                continue;
+            }
             if let Some(execution) = self.executions.remove(&arn) {
                 self.retained_bytes = self.retained_bytes.saturating_sub(execution.retained_bytes);
             }

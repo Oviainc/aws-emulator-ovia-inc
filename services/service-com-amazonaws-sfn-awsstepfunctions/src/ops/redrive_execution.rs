@@ -204,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Phase 1, under the lock: resolve the execution, refuse what cannot be
         // redriven, and read what the re-run needs. The lock is released before the
         // walk, so no other request waits on an interpretation.
-        let (definition, execution_input, previous_event_id, machine_arn, machine_name, context, redrive_step) = {
+        let (definition, execution_input, previous_event_id, machine_arn, context, redrive_step) = {
             let mut store = state.lock();
             // Settle first: an execution whose terminal status the clock already owed
             // is terminal when this call decides whether it can be redriven.
@@ -312,7 +312,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 execution.input.clone(),
                 execution.last_event_id(),
                 machine.arn.clone(),
-                machine.name.clone(),
                 context,
                 execution.redrive_step.clone(),
             )
@@ -349,6 +348,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &context.role_arn,
                 unassumable,
             );
+            // This attempt CONTINUES the execution, so each Distributed Map state it
+            // re-enters is the Map Run that execution already has: it keeps that ARN,
+            // and the items whose child workflow execution already succeeded are not
+            // run again — "Step Functions preserves the results and execution history
+            // of the successful steps, and doesn't rerun these steps when you redrive
+            // an execution".
+            let acting = crate::state::task_authorization::Acting {
+                map_runs: crate::state::map_runs::resumed(&self.engine, &input.execution_arn),
+                ..acting
+            };
             crate::state::integration::interpret(ctx, &region, acting, move |tasks| {
                 crate::state::plan_redrive(
                     &crate::state::RunAttempt {
@@ -452,13 +461,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // The re-run re-entered this execution's Distributed Map states, so
                     // each one's Map Run runs again: the record it already has moves,
                     // keeping the ARN a client may be holding.
-                    store.record_map_runs(
-                        &input.execution_arn,
-                        &machine_arn,
-                        &machine_name,
-                        &crate::state::arn_region(&machine_arn),
-                        map_runs,
-                    );
+                    store.record_map_runs(&input.execution_arn, &machine_arn, map_runs);
                     // The re-run started a run-a-job task's job again and PARKED at it,
                     // which is polled to its end exactly as a first attempt's is.
                     let watching = parked.is_some();

@@ -231,7 +231,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             execution_arn,
             start_date,
             machine_arn,
-            machine_name,
             context,
             reply,
         ) = {
@@ -421,7 +420,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 execution_arn,
                 start_date,
                 machine.arn.clone(),
-                machine.name.clone(),
                 context,
                 crate::state::asl::CallbackReply {
                     state_name,
@@ -531,13 +529,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     if let Some(waiting) = waiting {
                         store.schedule_activity_task(&execution_arn, waiting);
                     }
-                    store.append_map_runs(
-                        &execution_arn,
-                        &machine_arn,
-                        &machine_name,
-                        &crate::state::arn_region(&machine_arn),
-                        map_runs,
-                    );
+                    store.append_map_runs(&execution_arn, &machine_arn, map_runs);
                     let watching = parked.is_some();
                     if let Some(parked) = parked {
                         let region = crate::state::arn_region(&machine_arn);

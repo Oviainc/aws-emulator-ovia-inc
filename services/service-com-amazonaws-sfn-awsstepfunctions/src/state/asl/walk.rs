@@ -2157,11 +2157,6 @@ impl Interpreter<'_> {
         at: Duration,
     ) -> Result<StateStep, Fault> {
         self.push_entered("MapStateEntered", name, at, &raw);
-        // Which Map state of this walk this one is, in ENTRY order: the Map Run it may
-        // start is recorded once its items are done, and the list it goes in is read
-        // in this order rather than that one.
-        let entered = self.map_runs_entered;
-        self.map_runs_entered = self.map_runs_entered.saturating_add(1);
         let (processor, distributed) = map_processor(name, state).map_err(|failure| failure.at(at))?;
         let (processor_states, processor_start) =
             states_of(processor, &format!("the 'ItemProcessor' of state '{name}'"))
@@ -2174,6 +2169,25 @@ impl Interpreter<'_> {
             .and_then(Value::as_str)
             .unwrap_or(name)
             .to_string();
+        // Which DISTRIBUTED Map state of this walk this one is, in ENTRY order: the Map
+        // Run it starts is recorded once its items are done, and the list it goes in is
+        // read in this order rather than that one. An inline `Map` starts no Map Run, so
+        // it takes no place in that list and is not counted here.
+        let entered = self.map_runs_entered;
+        // And WHICH entry into a state of this label it is, which is what the Map Run
+        // the attempt being continued already started is matched by: a Distributed Map
+        // nested inside another is entered once per outer item, and each of those
+        // entries is a Map Run of its own.
+        let occurrence = self
+            .map_runs_entered_by_label
+            .get(&label)
+            .copied()
+            .unwrap_or(0);
+        if distributed {
+            self.map_runs_entered = self.map_runs_entered.saturating_add(1);
+            self.map_runs_entered_by_label
+                .insert(label.clone(), occurrence.saturating_add(1));
+        }
         // "ItemBatcher — specifies how to batch the items": a state that declares one
         // hands each iteration a BATCH of its items rather than one item, and the
         // `ItemSelector` is applied to each item on the way into its batch.
@@ -2210,9 +2224,89 @@ impl Interpreter<'_> {
         .iter()
         .any(|member| state.contains_key(*member));
 
+        // A Distributed Map "starts a Map Run", a resource of its own, so the Map Run
+        // this state runs as is resolved AS THE STATE IS ENTERED: its items' own
+        // results are written under its id ([`super::super::result_writer`]) and the
+        // state's output names its ARN, so neither can wait for the store to mint one.
+        // A walk CONTINUING an attempt is handed the Map Run that attempt already
+        // started ([`Tasks::map_run`]), which keeps the ARN a client is holding.
+        let resumed = match distributed {
+            true => self.tasks.map_run(occurrence, &label),
+            false => None,
+        };
+        let map_run_arn = match &resumed {
+            Some(resumed) => resumed.arn.clone(),
+            None => self.fresh_map_run_arn(&label),
+        };
+        // "ResultWriter — specifies the Amazon S3 location where Step Functions writes
+        // all child workflow execution results": the results it writes are a MAP RUN's,
+        // and an inline `Map` starts none — so a state that declares one without a
+        // DISTRIBUTED processor describes a dataset there is no run to write, and the
+        // state is not run for it rather than run as though the member were not there.
+        if !distributed && state.contains_key("ResultWriter") {
+            return Err(runtime(format!(
+                "the 'Map' state '{name}' carries a 'ResultWriter', which writes the results of a \
+                 Map Run, while its processor declares no 'DISTRIBUTED' mode and so starts no Map \
+                 Run, so nothing was run for it"
+            ))
+            .at(at));
+        }
+        // "Step Functions starts a child workflow execution for each item": those
+        // executions are started BY the service, as the state machine's own execution
+        // role, so a role that may not start them is a Map Run that fails having
+        // started NONE of them. Asked before the state's items are read, because
+        // nothing of the run happens without that grant.
+        if distributed {
+            if let Some(failure) = self.child_start_denial() {
+                self.map_runs.push((
+                    entered,
+                    StartedMapRun {
+                        arn: map_run_arn,
+                        label: label.clone(),
+                        status: super::super::MAP_RUN_STATUS_FAILED,
+                        started_at: at,
+                        stopped_at: at,
+                        max_concurrency: super::super::reported_max_concurrency(
+                            i64::try_from(concurrency).unwrap_or(i64::MAX),
+                        ),
+                        tolerated_failure_count: i64::try_from(tolerated_count)
+                            .unwrap_or(i64::MAX),
+                        tolerated_failure_percentage: tolerated_percentage as f32,
+                        // Nothing was iterated and nothing was started: the run failed
+                        // before its first child, which is what makes a missing grant
+                        // tell apart from a granted one.
+                        total_items: 0,
+                        items: Vec::new(),
+                        children: Vec::new(),
+                    },
+                ));
+                self.push(super::super::EVENT_MAP_STATE_FAILED, name, at);
+                return self.catch_or_fail(
+                    (name, "MapStateExited"),
+                    state,
+                    language,
+                    &raw,
+                    &effective,
+                    failure,
+                    context,
+                    at,
+                );
+            }
+        }
+
         // The tally belongs to the LAST attempt: a retried `Map` state resets it, so
         // what is reported is what the attempt the state ended on did.
         let mut tally = MapTally::default();
+        // Where this state's results are written, for a Distributed Map that declares a
+        // `ResultWriter`: the destination is read, and the results written, by the
+        // attempt that produced them.
+        let writer = match distributed {
+            true => state.get("ResultWriter"),
+            false => None,
+        };
+        // What the attempt the state ended on WROTE: the document the state puts out
+        // for having written its results, which is not the results themselves.
+        let mut written: Option<Value> = None;
         // How many items the attempt the state ended on iterated, which is what the Map
         // Run reports: every attempt reads the state's item source again, so the figure
         // belongs to the attempt rather than to the state.
@@ -2267,11 +2361,36 @@ impl Interpreter<'_> {
                 tolerated_count,
                 tolerated_percentage,
                 tolerance_declared,
+                // What the attempt being CONTINUED already ran each item as, for a
+                // redrive: the items whose child execution succeeded are not run again.
+                resumed: resumed.as_ref().map(|resumed| resumed.items.as_slice()),
             };
             // This attempt's own members read `$$.State.RetryCount`, so they are
             // evaluated with the context of the attempt they are on.
             let context = with_retry_count(context, me.retry_count);
-            let (outcome, end) = me.run_map_items(&plan, &effective, &context, at, &mut tally);
+            let (mut outcome, end) = me.run_map_items(&plan, &effective, &context, at, &mut tally);
+            // "ResultWriter — specifies the Amazon S3 location where Step Functions
+            // writes all child workflow execution results": writing them is part of
+            // what this ATTEMPT does, so it happens here — whichever status the items
+            // reached, because the results of a failed run are written too — and a
+            // write that could not be made is the attempt's own failure, which the
+            // state's `Retry` answers for exactly as it answers for its items'. A run
+            // that had already failed keeps its own failure, which happened first.
+            written = None;
+            if let Some(writer) = writer {
+                match me.write_results(
+                    name, language, writer, &map_run_arn, &tally, &effective, &context,
+                ) {
+                    Ok(document) => written = Some(document),
+                    Err(failure) => {
+                        if outcome.is_ok() {
+                            outcome = Err(failure);
+                        }
+                    }
+                }
+            }
+            // Every attempt records the event of the outcome it reached, which is the
+            // outcome of its items AND of the results it wrote for them.
             let event = if outcome.is_ok() {
                 super::super::EVENT_MAP_STATE_SUCCEEDED
             } else {
@@ -2297,6 +2416,7 @@ impl Interpreter<'_> {
             self.map_runs.push((
                 entered,
                 StartedMapRun {
+                    arn: map_run_arn,
                     label: label.clone(),
                     status: if outcome.is_ok() {
                         super::super::MAP_RUN_STATUS_SUCCEEDED
@@ -2320,8 +2440,13 @@ impl Interpreter<'_> {
         }
         match outcome {
             Ok(results) => {
+                // What the state produced: where its results were WRITTEN for a run
+                // that declared a `ResultWriter`, and the results themselves for every
+                // other one. The state's own result-side data flow is applied to
+                // whichever document that is.
+                let produced = written.unwrap_or(results);
                 let value = self
-                    .produced(state, language, &raw, &effective, Some(results), context, true)
+                    .produced(state, language, &raw, &effective, Some(produced), context, true)
                     .map_err(|failure| failure.at(end))?;
                 self.push_exited("MapStateExited", name, end, &value);
                 Ok(StateStep {
@@ -2452,6 +2577,137 @@ impl Interpreter<'_> {
         dataset.items(name, self.tasks).map_err(reported)
     }
 
+    /// Write the results of the Map Run `map_run_arn` where the state's `ResultWriter`
+    /// says, and answer the document the state puts out for having written them.
+    ///
+    /// The writer's own `Parameters` (or JSONata `Arguments`) is a payload template of
+    /// the state's language, so it is rendered here — against the state's effective
+    /// input, exactly as its `ItemSelector` is — and the results are then written
+    /// through the same seam the dataset an `ItemReader` names is read over
+    /// ([`super::super::result_writer`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn write_results(
+        &self,
+        name: &str,
+        language: &'static str,
+        writer: &Value,
+        map_run_arn: &str,
+        tally: &MapTally,
+        effective: &Value,
+        context: &Value,
+    ) -> Result<Value, Failure> {
+        let parameters = match writer.get("Arguments").or_else(|| writer.get("Parameters")) {
+            Some(template) => self.render_selector(language, template, effective, context)?,
+            None => Value::Object(Map::new()),
+        };
+        let destination =
+            super::super::result_writer::read(name, writer, &parameters).map_err(reported)?;
+        // One record per child workflow execution the run's items ran as, in the order
+        // they were started, each reporting what that execution itself reports.
+        let results: Vec<super::super::result_writer::ItemResult> = tally
+            .children
+            .iter()
+            .map(|child| super::super::result_writer::ItemResult {
+                status: child.status.to_string(),
+                execution_arn: child.arn.clone(),
+                name: child.name.clone(),
+                input: child.input.clone(),
+                output: child.output.clone(),
+                error: child.error.clone(),
+                cause: child.cause.clone(),
+                // The instants that execution ran between: for a child this attempt
+                // started, the offsets its own iteration began and ended at — its stop
+                // owed to the clock one `settle` later, exactly as the store records it
+                // ([`Interpreter::settle`]) — and for one it KEPT, the dates the record
+                // already carries, which is what `DescribeExecution` goes on reporting
+                // for it. So the results and the execution never disagree.
+                start_date: iso(match child.kept {
+                    Some((started, _)) => started,
+                    None => super::super::after(self.start, child.started_at),
+                }),
+                stop_date: iso(match child.kept {
+                    Some((_, stopped)) => stopped,
+                    None => super::super::after(
+                        self.start,
+                        self.settle.saturating_add(child.finished_at),
+                    ),
+                }),
+                // A child workflow execution is never redriven on its own — its Map
+                // Run redrives it, and a run that redrives one starts it afresh — so
+                // every record reports the count its own execution carries, which is
+                // the zero it was started with.
+                redrive_count: 0,
+            })
+            .collect();
+        let written = super::super::result_writer::write(
+            name,
+            &destination,
+            map_run_arn,
+            self.state_machine_arn(),
+            &results,
+            self.tasks,
+        )
+        .map_err(reported)?;
+        Ok(written.reported())
+    }
+
+    /// The state machine this walk runs, as the context object (`$$`) reports it:
+    /// "StateMachine.Id", which is the ARN every child workflow execution of a Map Run
+    /// of it ran under.
+    pub(super) fn state_machine_arn(&self) -> &str {
+        self.base_context
+            .pointer("/StateMachine/Id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    }
+
+    /// A fresh ARN for the Map Run a Distributed Map state labelled `label` starts.
+    ///
+    /// The id is drawn from the same generator a child workflow execution's name is
+    /// ([`Interpreter::fresh_child_name`]), because it is the field that tells two Map
+    /// Runs of one `Map` state apart and nothing outside this walk has minted it yet:
+    /// the run's results are written under it before the store records the run.
+    pub(super) fn fresh_map_run_arn(&mut self, label: &str) -> String {
+        let id = self.fresh_child_name();
+        super::super::map_run_arn(&self.region, &self.machine_name, label, &id)
+    }
+
+    /// Why the execution role this walk runs as may not start the CHILD workflow
+    /// executions of a Distributed Map state, or `None` when nothing of the kind can be
+    /// shown.
+    ///
+    /// "Step Functions starts a child workflow execution for each item": the start is
+    /// made by the service, as the state machine's own execution role, on the state
+    /// machine the children run — so it is subject to `states:StartExecution` on that
+    /// state machine, which is the same access request the optimized
+    /// `states:startExecution` integration's own call is subject to
+    /// ([`super::super::integration::access_request`]) and is decided by the same gate
+    /// ([`Tasks::authorize`]).
+    ///
+    /// RECORDED: the failure is the service's own [`RUNTIME_ERROR`] — the run could not
+    /// be made, which is neither retried nor caught — and it carries the refusal the
+    /// start came back with, so an operator reads which principal was denied which
+    /// action on which state machine.
+    pub(super) fn child_start_denial(&self) -> Option<Failure> {
+        let call = match super::super::integration::read(CHILD_START_RESOURCE) {
+            Ok(call) => call,
+            // The `Resource` is this crate's own constant, so it resolves. A build in
+            // which it did not could form no access request for the start, and an
+            // authorization this emulator cannot make is not a grant: the run fails
+            // rather than starting children nothing judged.
+            Err(why) => {
+                debug_assert!(false, "the child-start integration must resolve: {why}");
+                return Some(runtime(format!(
+                    "the child workflow executions of this 'Map' state could not be authorized: \
+                     {why}"
+                )));
+            }
+        };
+        let request = serde_json::json!({ "StateMachineArn": self.state_machine_arn() });
+        let denied = self.tasks.authorize(&call, &request)?;
+        Some(runtime(denied.cause))
+    }
+
     /// `items` grouped as the state's `ItemBatcher` says, for a state that declares
     /// one: each of the documents the state's iterations are then handed is one BATCH.
     ///
@@ -2551,6 +2807,39 @@ impl Interpreter<'_> {
         attempt
     }
 
+    /// The child workflow execution the attempt being CONTINUED ran the item whose own
+    /// document is `document` as, with its position among that attempt's children; and
+    /// `None` for an item that attempt did not get a success for.
+    ///
+    /// An item is identified by WHAT IT IS — the document the iteration is handed, which
+    /// is that child's own `input` — rather than only by where it sits: the item source
+    /// is read again on the continued attempt, so a dataset whose objects changed
+    /// between them must not attribute one item's result to another. The item's own
+    /// position is tried first, because that is where an unchanged dataset's match is,
+    /// and a child another item has already claimed is never matched twice.
+    pub(super) fn kept_child<'plan>(
+        &self,
+        plan: &MapPlan<'plan>,
+        index: usize,
+        document: &str,
+        claimed: &[bool],
+    ) -> Option<(usize, &'plan super::super::integration::FinishedChild)> {
+        let items = plan.resumed?;
+        let at = |position: usize| -> Option<&'plan super::super::integration::FinishedChild> {
+            match claimed.get(position).copied().unwrap_or(true) {
+                true => None,
+                false => items
+                    .get(position)?
+                    .as_ref()
+                    .filter(|kept| kept.input == document),
+            }
+        };
+        if let Some(kept) = at(index) {
+            return Some((index, kept));
+        }
+        (0..items.len()).find_map(|position| Some((position, at(position)?)))
+    }
+
     /// [`Interpreter::run_map_items`]' own work, inside the stop it restores.
     fn walk_map_items(
         &mut self,
@@ -2580,6 +2869,10 @@ impl Interpreter<'_> {
         // tolerates none, so the first failure is the state's own and the iterations
         // that had not finished stop there.
         let tolerant = plan.distributed || plan.tolerance_declared;
+        // Which of the child executions the attempt being CONTINUED ran have been
+        // claimed by an item of this one, so two items never keep the same execution
+        // ([`Interpreter::kept_child`]).
+        let mut claimed = vec![false; plan.resumed.map_or(0, <[_]>::len)];
         let mut at = at;
         let mut index = 0usize;
         for chunk in plan.items.chunks(batch) {
@@ -2617,6 +2910,48 @@ impl Interpreter<'_> {
                     },
                     None => item.clone(),
                 };
+                // "Step Functions preserves the results and execution history of the
+                // successful steps, and doesn't rerun these steps when you redrive an
+                // execution": an item whose child workflow execution SUCCEEDED in the
+                // attempt being continued is not run a second time. Its result stands
+                // as this attempt's, the execution it ran as is reported unchanged —
+                // and so is left untouched by the store — and the per-item work it
+                // already did is therefore not repeated.
+                let document = item_input.to_string();
+                if let Some((position, kept)) = self.kept_child(plan, index, &document, &claimed) {
+                    claimed[position] = true;
+                    let value = kept
+                        .output
+                        .as_deref()
+                        .and_then(|output| serde_json::from_str(output).ok())
+                        .unwrap_or(Value::Null);
+                    match measure_payload(&value, "a 'Map' iteration") {
+                        Ok(bytes) => results_bytes = results_bytes.saturating_add(bytes),
+                        Err(failure) => return (Err(failure), batch_end),
+                    }
+                    results.push(value);
+                    tally.items.push(MapItemOutcome {
+                        finished_at: batch_start,
+                        failed: false,
+                    });
+                    tally.children.push(StartedChildExecution {
+                        name: kept.name.clone(),
+                        arn: kept.arn.clone(),
+                        input: kept.input.clone(),
+                        output: kept.output.clone(),
+                        error: None,
+                        cause: None,
+                        status: super::super::EXECUTION_STATUS_SUCCEEDED,
+                        started_at: batch_start,
+                        finished_at: batch_start,
+                        item_count: kept.item_count,
+                        // The dates the execution it ran as already reports, which do
+                        // not move by being kept.
+                        kept: Some((kept.start_date, kept.stop_date)),
+                    });
+                    index += 1;
+                    continue;
+                }
                 // A DISTRIBUTED Map "starts a child workflow execution for each
                 // item", so this item's iteration runs as an execution of its own:
                 // its ARN is minted HERE, before the iteration, because the item's
@@ -2711,6 +3046,9 @@ impl Interpreter<'_> {
                                 .unwrap_or(i32::MAX),
                             false => 1,
                         },
+                        // This item RAN in this attempt, so the execution it ran as is
+                        // one this attempt started.
+                        kept: None,
                     });
                 }
                 let outcome_event = match &branch.outcome {

@@ -131,6 +131,8 @@ mod list_state_machine_aliases_pages;
 mod map_item_batcher;
 #[path = "all/map_item_reader.rs"]
 mod map_item_reader;
+#[path = "all/map_result_writer.rs"]
+mod map_result_writer;
 #[path = "all/map_run_failure_budget.rs"]
 mod map_run_failure_budget;
 #[path = "all/map_run_updates.rs"]
@@ -161,6 +163,8 @@ mod role_log_and_key_authorization;
 mod run_a_job_pattern_calls;
 #[path = "all/running_execution_history.rs"]
 mod running_execution_history;
+#[path = "all/s3_sdk_task_integration.rs"]
+mod s3_sdk_task_integration;
 #[path = "all/saga_compensation_on_task_failure.rs"]
 mod saga_compensation_on_task_failure;
 #[path = "all/sdk_response_envelope.rs"]

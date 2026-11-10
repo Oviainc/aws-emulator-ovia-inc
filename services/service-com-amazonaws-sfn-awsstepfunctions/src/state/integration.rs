@@ -548,8 +548,20 @@ pub enum Body {
     /// Every member no path, query or header binding carries, as one JSON document.
     Document,
     /// The one member the operation binds as its `httpPayload`: that member is the
-    /// whole body, and no other member is in it.
+    /// whole body, and no other member is in it. The member is reported as the
+    /// DOCUMENT those bytes hold where they are one, which is what an integration
+    /// whose payload member carries a document (a function's own JSON response)
+    /// reports.
     Member(&'static str),
+    /// The same binding for a payload member the invoked model types as a BLOB of
+    /// bytes rather than as a document: an object's own content. It is reported as the
+    /// TEXT those bytes are, whatever they hold, which is what the integration answers
+    /// — a state reads a JSON object's content with `States.StringToJson` precisely
+    /// because the member it arrives in is a string. Bytes that are not UTF-8 are
+    /// reported as the text they lossily decode to, because a state's data is a JSON
+    /// document and a JSON string holds no other bytes; the datasets this emulator
+    /// reads and writes are text ([`super::item_reader`], [`super::result_writer`]).
+    Text(&'static str),
     /// Nothing: every member of this operation is bound somewhere else.
     Empty,
 }
@@ -1073,15 +1085,17 @@ pub const APIS: &[Api] = &[
     },
 ];
 
-/// Amazon S3, for the one call this crate makes to it: the DATASET a `Map` state's
-/// `ItemReader` names ([`super::item_reader`]).
+/// Amazon S3, for the calls this crate makes to it: the DATASET a `Map` state's
+/// `ItemReader` names ([`super::item_reader`]), the result objects its `ResultWriter`
+/// writes ([`super::result_writer`]), and a `Task` state whose `Resource` names one of
+/// its operations through the AWS SDK integration family.
 ///
-/// Deliberately NOT one of [`APIS`]: a `Task` state's `Resource` naming an S3
-/// operation is still work no integration call is made for, because an S3 answer is a
-/// restXml document and an integration's result is the operation's own response
-/// members, which this emulator does not read out of that protocol. [`read`] reports
-/// such a `Resource` as before. What these bindings serve is the dataset read, whose
-/// answer is the object's own BYTES rather than a response document.
+/// Deliberately NOT one of [`APIS`], which is where the OPTIMIZED family's services are
+/// looked up: S3 publishes no optimized integration, so `arn:aws:states:::s3:<action>`
+/// names no `Task` state's work — it is how a `Map` state's `ItemReader` and
+/// `ResultWriter` name their dataset. [`read`] reaches these facts for the AWS SDK
+/// family's own token (`aws-sdk:s3:<action>`) and reports an optimized `Resource` as
+/// work nothing was run for, exactly as before.
 ///
 /// `services/service-com-amazonaws-s3-amazons3/smithy-model/
 /// com-amazonaws-s3-amazons3.json`: restXml, sigv4Name `s3`, endpointPrefix `s3`,
@@ -1105,16 +1119,20 @@ static S3_API: Api = Api {
 /// label.
 const S3_NAMESPACE: &str = "s3";
 
-/// The REST bindings of the two S3 operations a dataset read makes.
+/// The REST bindings of the three S3 operations a dataset read and a dataset write
+/// make.
 ///
-/// `smithy_query(query="operation",operation="ListObjectsV2,GetObject",
+/// `smithy_query(query="operation",operation="ListObjectsV2,GetObject,PutObject",
 /// model_path="services/service-com-amazonaws-s3-amazons3/smithy-model/
 /// com-amazonaws-s3-amazons3.json")`: `ListObjectsV2` is `http` GET
 /// `/{Bucket}?list-type=2` with `Bucket` an `httpLabel` and `Prefix`,
 /// `ContinuationToken` and `MaxKeys` `httpQuery` members, answering an XML document
 /// as the whole body; `GetObject` is GET `/{Bucket}/{Key+}?x-id=GetObject` with
-/// `Bucket` and the GREEDY `Key` as `httpLabel`s, and its output binds `Body` as its
-/// `httpPayload`.
+/// `Bucket` and the GREEDY `Key` as `httpLabel`s, its output binds `Body` as its
+/// `httpPayload` and `ETag`, `ContentType` and `VersionId` to headers whose value is
+/// the text they carry; `PutObject` is PUT `/{Bucket}/{Key+}?x-id=PutObject` over
+/// the same two labels, with `Body` as the request's own `httpPayload` and `ETag` bound
+/// to the answer's `ETag` header.
 const S3_REST: &[Rest] = &[
     Rest {
         operation: LIST_OBJECTS_OPERATION,
@@ -1127,7 +1145,7 @@ const S3_REST: &[Rest] = &[
             ("ContinuationToken", "continuation-token"),
             ("MaxKeys", "max-keys"),
         ],
-        response_body: Body::Member(DATASET_BODY),
+        response_body: Body::Text(DATASET_BODY),
         response_status: "",
         response_headers: &[],
     },
@@ -1138,9 +1156,34 @@ const S3_REST: &[Rest] = &[
         request_body: Body::Empty,
         headers: &[],
         query: &[],
-        response_body: Body::Member(DATASET_BODY),
+        response_body: Body::Text(DATASET_BODY),
         response_status: "",
-        response_headers: &[],
+        // The output members a read's answer carries beside the object's bytes: the
+        // ones whose value IS the text the header holds, so what the result reports is
+        // the answer's own. A member the model types as a number or an instant
+        // (`ContentLength`, `LastModified`) is deliberately absent: its header carries
+        // text, and reporting that text under a member a client reads as a number
+        // would be the wrong type rather than the answer.
+        response_headers: &[
+            ("ETag", "ETag"),
+            ("ContentType", "Content-Type"),
+            ("VersionId", "x-amz-version-id"),
+        ],
+    },
+    Rest {
+        operation: PUT_OBJECT_OPERATION,
+        method: "PUT",
+        uri: "/{Bucket}/{Key+}?x-id=PutObject",
+        // The object's own bytes are the request's body: the operation binds `Body` as
+        // its `httpPayload`, so what the write carries under that member IS the object.
+        request_body: Body::Member(DATASET_BODY),
+        headers: &[],
+        query: &[],
+        // A write answers no document at all — every member of its output is a header —
+        // so the one the caller of a write reads is the entity tag the answer carried.
+        response_body: Body::Empty,
+        response_status: "",
+        response_headers: &[("ETag", "ETag")],
     },
 ];
 
@@ -1148,16 +1191,31 @@ const S3_REST: &[Rest] = &[
 pub const LIST_OBJECTS_OPERATION: &str = "ListObjectsV2";
 /// See [`LIST_OBJECTS_OPERATION`].
 pub const GET_OBJECT_OPERATION: &str = "GetObject";
+/// The S3 operation a dataset WRITE makes, as that model spells it: the one call a
+/// `Map` state's `ResultWriter` is made of ([`super::result_writer`]).
+pub const PUT_OBJECT_OPERATION: &str = "PutObject";
+
+/// The S3 operations a `Task` state's AWS SDK integration call IS made for.
+///
+/// Both are operations whose answer this emulator reads as the operation's own output:
+/// `GetObject` binds the object's bytes as its output's `httpPayload`, and `PutObject`
+/// answers no body at all, so its output is the headers its answer carried. A LISTING's
+/// answer is a restXml document whose elements this emulator does not read as that
+/// operation's output members, so a `Task` naming it is reported as work nothing was
+/// run for rather than answered with that document's text — the dataset read that DOES
+/// consume it reads the text itself ([`super::item_reader`]).
+const S3_SDK_OPERATIONS: &[&str] = &[GET_OBJECT_OPERATION, PUT_OBJECT_OPERATION];
 
 /// The member a dataset read reports the answer's BODY under: `GetObject`'s own
 /// `Body`, which that operation binds as its `httpPayload`, and — for the listing,
 /// whose protocol carries its document as the whole body — that document's text.
 pub const DATASET_BODY: &str = "Body";
 
-/// The dataset-read call `operation` names, for the one reader that makes them
-/// ([`super::item_reader`]); `None` for an operation these bindings do not carry.
+/// The dataset call `operation` names, for the reader that reads a `Map` state's
+/// dataset ([`super::item_reader`]) and the writer that writes its results
+/// ([`super::result_writer`]); `None` for an operation these bindings do not carry.
 ///
-/// A dataset read is NOT a `Task` state's integration: its result is not reported to
+/// A dataset call is NOT a `Task` state's integration: its result is not reported to
 /// any state, so the call carries no SDK envelope, no run-a-job pattern and no
 /// conversion — only where the request goes and how the answer's body comes back.
 #[must_use]
@@ -2040,6 +2098,58 @@ pub trait CallbackHandovers: Send + Sync {
 /// See [`CallbackHandovers`].
 pub type Handovers = ::std::sync::Arc<dyn CallbackHandovers>;
 
+/// The Map Run a Distributed Map state of the execution being walked is ALREADY
+/// running, for a walk that CONTINUES an attempt rather than beginning one.
+///
+/// "To redrive a workflow that includes a Distributed Map state whose Map Run failed,
+/// you must redrive the parent workflow", and a redrive "preserves the results and
+/// execution history of the successful steps, and doesn't rerun these steps": the Map
+/// state is entered again, but it is the SAME Map Run — it keeps the ARN a client is
+/// holding — and the items whose child workflow execution already succeeded are not
+/// run a second time.
+#[derive(Debug, Clone)]
+pub struct ResumedMapRun {
+    /// The Map Run's own ARN, which this attempt goes on reporting under.
+    pub arn: String,
+    /// What the attempt being continued ran each item as, by item index: the child
+    /// workflow execution that item SUCCEEDED as, and `None` for an item that failed
+    /// or was never started — the ones this attempt runs again.
+    pub items: Vec<Option<FinishedChild>>,
+}
+
+/// One child workflow execution an earlier attempt of a Distributed Map state's item
+/// SUCCEEDED as, as the store holds it.
+///
+/// It is what the item contributes to this attempt without being run: its result
+/// stands as the iteration's own, and the execution record itself is left untouched,
+/// so the per-item work it did is not repeated.
+#[derive(Debug, Clone)]
+pub struct FinishedChild {
+    pub name: String,
+    pub arn: String,
+    /// "The string that contains the JSON input data" that execution was started
+    /// with, and the output it succeeded with.
+    pub input: String,
+    pub output: Option<String>,
+    /// The instants that execution really ran between, as its own record carries them:
+    /// it is not run again, so those are the dates it goes on reporting.
+    pub start_date: ::std::time::SystemTime,
+    pub stop_date: ::std::time::SystemTime,
+    /// "The total number of items processed in a child workflow execution", as that
+    /// record carries it.
+    pub item_count: i32,
+}
+
+/// What answers [`Tasks::map_run`]: the Map Run the Distributed Map state labelled
+/// `label` — the `occurrence`-th of this walk's entries into a state with that label —
+/// is already running, or `None` where it is starting a new one.
+///
+/// A closure rather than a trait, for the same reason [`RoleGate`] is one: what it
+/// answers lives in this service's own store and is reached through the engine the
+/// operation holds ([`super::map_runs`]), and the walk knows nothing of either.
+pub type MapRuns =
+    ::std::sync::Arc<dyn Fn(usize, &str) -> Option<ResumedMapRun> + Send + Sync>;
+
 /// What performs a `Task` state's service integration for one walk.
 ///
 /// The walk is synchronous — it runs on a blocking thread and its states are a
@@ -2084,6 +2194,19 @@ pub trait Tasks: Send + Sync {
     /// this BEFORE [`Tasks::perform`] and fails the task with what this answers. The
     /// default shows nothing, for a walk with no role to judge the call against.
     fn authorize(&self, _call: &Call, _request: &Value) -> Option<Failed> {
+        None
+    }
+
+    /// The Map Run the Distributed Map state labelled `label` is ALREADY running
+    /// ([`ResumedMapRun`]), for the `occurrence`-th entry this walk makes into a state
+    /// with that label — one Distributed Map nested inside another is entered once per
+    /// outer item, and each of those entries is a Map Run of its own.
+    ///
+    /// Asked as the state is entered, because what it answers decides both the ARN the
+    /// Map Run reports and which of the state's items this attempt runs. The default
+    /// answers nothing, which is what a walk that BEGINS an attempt does: every item
+    /// runs, under a Map Run of its own.
+    fn map_run(&self, _occurrence: usize, _label: &str) -> Option<ResumedMapRun> {
         None
     }
 }
@@ -2180,19 +2303,41 @@ pub fn read(resource: &str) -> Result<Call, String> {
     // Each family names the service by its OWN token: the optimized one by the
     // service's ARN namespace, the AWS SDK one by the name the SDKs give it
     // ([`Api::sdk_token`]).
-    let api = APIS
-        .iter()
-        .find(|api| match aws_sdk {
-            true => api.sdk_token() == service,
-            false => api.namespace == service,
-        })
-        .ok_or_else(|| {
-            format!(
-                "'{shown}' names an integration with '{}', which is not one of the services this \
-                 emulator makes a 'Task' state's integration call to, so nothing was run for it",
-                super::asl::echoed(service)
-            )
-        })?;
+    //
+    // S3 is reached through the AWS SDK family ALONE: its wire facts are stated
+    // apart from [`APIS`] ([`S3_API`]) because the service publishes no optimized
+    // integration of its own, so `arn:aws:states:::s3:<action>` names no `Task`
+    // state's work — it is the `Resource` of a `Map` state's `ItemReader` and
+    // `ResultWriter`, which read and write their dataset through
+    // [`dataset_call`] instead.
+    let api = match aws_sdk && service == S3_API.sdk_token() {
+        true => {
+            let named = operation_of(action);
+            if !S3_SDK_OPERATIONS.contains(&named.as_str()) {
+                return Err(format!(
+                    "'{shown}' names the '{named}' operation of {}, whose answer this emulator \
+                     does not read as that operation's own output members, so nothing was run \
+                     for it",
+                    S3_API.sdk_id
+                ));
+            }
+            &S3_API
+        }
+        false => APIS
+            .iter()
+            .find(|api| match aws_sdk {
+                true => api.sdk_token() == service,
+                false => api.namespace == service,
+            })
+            .ok_or_else(|| {
+                format!(
+                    "'{shown}' names an integration with '{}', which is not one of the services \
+                     this emulator makes a 'Task' state's integration call to, so nothing was \
+                     run for it",
+                    super::asl::echoed(service)
+                )
+            })?,
+    };
     // The run-a-job pattern is performed for the integrations [`RUN_A_JOB`] names
     // the reporting and stopping calls of; the callback pattern waits for a
     // `SendTaskSuccess` nothing inside the execution makes.
@@ -2633,6 +2778,10 @@ struct Dispatcher {
     /// Where the handover of a callback token is recorded and its answer read back
     /// ([`CallbackHandovers`]); `None` for a walk with no store to record one in.
     handovers: Option<Handovers>,
+    /// What answers which Map Run a Distributed Map state of this walk is already
+    /// running ([`MapRuns`]); `None` for a walk that begins an attempt, whose every
+    /// Map state starts a Map Run of its own.
+    map_runs: Option<MapRuns>,
 }
 
 /// What decides whether the execution role a walk runs as may make one integration
@@ -2768,6 +2917,10 @@ impl Tasks for Dispatcher {
     fn settle_handover(&self, token: &str) -> Option<Replied> {
         self.handovers.as_ref()?.settled(token)
     }
+
+    fn map_run(&self, occurrence: usize, label: &str) -> Option<ResumedMapRun> {
+        self.map_runs.as_ref()?(occurrence, label)
+    }
 }
 
 /// Run `work` — one interpretation of a definition — on a blocking thread, serving
@@ -2825,12 +2978,14 @@ where
     let role = acting.role;
     let connections = acting.connections;
     let handed = acting.handovers;
+    let resumed_map_runs = acting.map_runs;
     let walk = ::tokio::task::spawn_blocking(move || {
         let dispatcher = Dispatcher {
             calls,
             depth,
             role,
             handovers: handed,
+            map_runs: resumed_map_runs,
         };
         work(&dispatcher)
     });
@@ -3170,7 +3325,7 @@ impl Rest {
             // The payload member IS the body: a value given as text is those bytes, and
             // a document is its JSON text, which is what the member the integration
             // documents as a document carries.
-            Body::Member(member) => match document.get(member) {
+            Body::Member(member) | Body::Text(member) => match document.get(member) {
                 None | Some(Value::Null) => Vec::new(),
                 Some(Value::String(text)) => text.clone().into_bytes(),
                 Some(value) => ::serde_json::to_vec(value).map_err(|error| error.to_string())?,
@@ -3224,6 +3379,16 @@ impl Rest {
             match self.response_body {
                 Body::Member(member) => {
                     members.insert(member.to_string(), payload);
+                }
+                // A payload member the model types as a BLOB is the bytes themselves,
+                // so it is reported as the TEXT it is even where those bytes parse as a
+                // document: that is the string the integration answers, and the one a
+                // state reads with `States.StringToJson`.
+                Body::Text(member) => {
+                    members.insert(
+                        member.to_string(),
+                        Value::String(String::from_utf8_lossy(&answered.payload).to_string()),
+                    );
                 }
                 // The body IS the operation's output document, so the members it
                 // holds are the answer's own: they are reported beside the ones the
@@ -3281,7 +3446,7 @@ impl Rest {
     /// itself or the answer carries none.
     fn response_member(&self) -> Option<&'static str> {
         match self.response_body {
-            Body::Member(member) => Some(member),
+            Body::Member(member) | Body::Text(member) => Some(member),
             Body::Document | Body::Empty => None,
         }
     }

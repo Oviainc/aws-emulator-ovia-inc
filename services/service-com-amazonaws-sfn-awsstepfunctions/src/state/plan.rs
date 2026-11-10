@@ -94,6 +94,7 @@ pub fn plan_redrive(
         context,
         from,
         first_walked_event_id(previous_event_id, true),
+        EXECUTION_SETTLE_DELAY,
         tasks,
     );
     plan_from_run(run, start, EXECUTION_SETTLE_DELAY, Some(opening), previous_event_id)
@@ -153,6 +154,11 @@ impl Planned {
 /// outcome is owed after.
 #[derive(Debug, Clone)]
 pub struct PlannedMapRun {
+    /// The Map Run's own ARN, as the walk resolved it when the `Map` state was entered
+    /// ([`asl::StartedMapRun::arn`]): what the store records this run under, so the
+    /// results its `ResultWriter` wrote and the output its state put out name the Map
+    /// Run a client then reads.
+    pub arn: String,
     pub label: String,
     pub status: String,
     pub start_date: SystemTime,
@@ -189,6 +195,10 @@ pub struct PlannedChildExecution {
     pub start_date: SystemTime,
     pub due_at: SystemTime,
     pub item_count: i32,
+    /// Whether this is an execution an EARLIER attempt started that this one KEPT
+    /// ([`asl::StartedChildExecution::kept`]): the record it already has is left
+    /// exactly as it is, so a redrive does not restart a child that had succeeded.
+    pub preserved: bool,
 }
 
 impl PlannedChildExecution {
@@ -222,6 +232,7 @@ impl PlannedMapRun {
     /// writes.
     pub fn measure(&self) -> usize {
         std::mem::size_of::<MapRun>()
+            + self.arn.len()
             + self.label.len()
             // `status` is held twice while the terminal one is still owed to the clock.
             + 2 * self.status.len()
@@ -272,6 +283,7 @@ pub fn plan_run_settling_after(
         start,
         context,
         first_walked_event_id(previous_event_id, true),
+        settle,
         tasks,
     );
     plan_from_run(run, start, settle, Some(opening), previous_event_id)
@@ -318,6 +330,7 @@ pub fn plan_reply(
         reply,
         elapsed,
         first_walked_event_id(previous_event_id, false),
+        EXECUTION_SETTLE_DELAY,
         tasks,
     )?;
     let mut planned = plan_from_run(run, now, EXECUTION_SETTLE_DELAY, None, previous_event_id);
@@ -384,6 +397,7 @@ pub fn plan_callback_reply(
         reply,
         elapsed,
         first_walked_event_id(previous_event_id, false),
+        EXECUTION_SETTLE_DELAY,
         tasks,
     )?;
     Some(plan_from_run(
@@ -432,6 +446,7 @@ pub fn plan_job_reply(
         reply,
         elapsed,
         first_walked_event_id(previous_event_id, false),
+        EXECUTION_SETTLE_DELAY,
         tasks,
     )?;
     Some(plan_from_run(
@@ -610,6 +625,7 @@ fn plan_from_run(
         .map_runs
         .into_iter()
         .map(|map_run| PlannedMapRun {
+            arn: map_run.arn,
             label: map_run.label,
             status: map_run.status.to_string(),
             start_date: after(start, map_run.started_at),
@@ -650,6 +666,7 @@ fn plan_from_run(
                     start_date: after(start, child.started_at),
                     due_at: after(start, settle.saturating_add(child.finished_at)),
                     item_count: child.item_count,
+                    preserved: child.kept.is_some(),
                 })
                 .collect(),
         })

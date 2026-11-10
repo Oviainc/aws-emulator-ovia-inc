@@ -155,7 +155,7 @@ async fn resolve<Eng: Send + Sync + 'static>(
     // Phase 1, under the lock: read what the continuation needs, and stop if there is
     // nothing left to continue. The lock is RELEASED before the walk, so no other
     // request waits on an interpretation.
-    let Some((definition, input, start_date, machine_arn, machine_name, context, previous_event_id)) = ({
+    let Some((definition, input, start_date, machine_arn, context, previous_event_id)) = ({
         let mut store = state.lock();
         store.settle(now);
         let execution = store
@@ -200,7 +200,6 @@ async fn resolve<Eng: Send + Sync + 'static>(
                 execution.input.clone(),
                 execution.start_date,
                 machine.arn.clone(),
-                machine.name.clone(),
                 context,
                 execution.last_event_id(),
             )
@@ -304,13 +303,7 @@ async fn resolve<Eng: Send + Sync + 'static>(
         if let Some(parked) = parked {
             store.park_job(execution_arn, parked, &region);
         }
-        store.append_map_runs(
-            execution_arn,
-            &machine_arn,
-            &machine_name,
-            &region,
-            planned.map_runs,
-        );
+        store.append_map_runs(execution_arn, &machine_arn, planned.map_runs);
     }
     // The job's outcome may have carried the execution to its terminal status, which
     // is a status change this service publishes onto the account's default event bus.

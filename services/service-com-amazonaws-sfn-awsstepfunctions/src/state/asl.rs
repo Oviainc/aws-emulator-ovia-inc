@@ -27,7 +27,9 @@
 //! A `Map` state's items come from the DATASET its `ItemReader` names when it declares
 //! one — read out of S3 for real ([`super::item_reader`]) — else from its own input;
 //! an `ItemBatcher` then groups them into the batches its iterations are handed
-//! ([`super::item_batcher`]).
+//! ([`super::item_batcher`]). A Distributed Map's `ResultWriter` WRITES what its items
+//! produced back to S3, just as really ([`super::result_writer`]), and the state then
+//! puts out where they were written.
 //!
 //! A `Task` state's work is RUN too, in the one way this process can run each kind:
 //!
@@ -71,10 +73,12 @@
 //!   request is not one JSON document,
 //!   a run-a-job pattern over an integration whose job cannot be reported or
 //!   stopped, a `Resource` naming no integration at all;
-//! * a Distributed Map's `ResultWriter`, which WRITES an S3 dataset, and a dataset its
-//!   `ItemReader` names that this emulator does not read (an `InputType` outside
-//!   `CSV`/`JSON`/`JSONL`) — the datasets it DOES read are read from S3 for real
-//!   ([`super::item_reader`]).
+//! * a dataset a Distributed Map's `ItemReader` names that this emulator does not read
+//!   (an `InputType` outside `CSV`/`JSON`/`JSONL`), and a `ResultWriter` asking for a
+//!   dataset it does not write (a `WriterConfig` outside the `JSON` output written with
+//!   no transformation) or declared by a `Map` state that starts no Map Run to write the
+//!   results of — the datasets it DOES read and write are read from and written
+//!   to S3 for real ([`super::item_reader`], [`super::result_writer`]).
 //!
 //! Reaching one of those ends the execution in the service's own failure state:
 //! `FAILED`, with the ASL-documented [`RUNTIME_ERROR`] name and a cause that says
@@ -135,8 +139,17 @@
 //! of its own, and each of that state's items is reported as the child EXECUTION it
 //! started ([`StartedChildExecution`]): one per item, carrying the `ItemSelector`
 //! projection as its own input and the item's own result as its output, under an ARN
-//! of its own that the item's states read through `$$.Execution.Id`. An INLINE Map
-//! starts neither, exactly as the service starts neither for one.
+//! of its own that the item's states read through `$$.Execution.Id`. Those starts are
+//! made by the service as the state machine's execution role, so a role that may not
+//! make them is a Map Run that fails having started none ([`RUNTIME_ERROR`], carrying
+//! the refusal the start came back with). An
+//! INLINE Map starts neither, exactly as the service starts neither for one.
+//!
+//! A walk that CONTINUES an attempt of an execution — which is what a redrive of a
+//! failed Map Run's parent is — enters the same `Map` state again as the SAME Map Run,
+//! and the items whose child execution already succeeded are not run a second time:
+//! "Step Functions preserves the results and execution history of the successful steps,
+//! and doesn't rerun these steps" ([`super::integration::ResumedMapRun`]).
 //!
 //! ## Time
 //!
@@ -183,6 +196,13 @@ use work_events::*;
 /// name's failures are — and it is TERMINAL: it is neither retried nor caught
 /// ([`errors_match`]), so a definition cannot recover from one.
 pub const RUNTIME_ERROR: &str = "States.Runtime";
+
+/// The `Resource` of the optimized integration that STARTS an execution of a state
+/// machine, which is the call a Distributed Map's child workflow executions are
+/// started by: it names the access request such a start is subject to
+/// ([`super::integration::TARGET_RESOURCES`]), so the grant the service needs to start
+/// a child is read in exactly one place.
+const CHILD_START_RESOURCE: &str = "arn:aws:states:::states:startExecution";
 
 /// The ASL predefined error name for a payload that outgrew what a state may carry
 /// ("States.DataLimitExceeded").
@@ -749,11 +769,11 @@ fn executable_members(state_type: &str) -> &'static [&'static str] {
             "Next",
             "End",
         ],
-        // `ResultWriter` is deliberately absent: it WRITES an S3 dataset, and the
-        // manifest of result files it writes is not produced here. `ItemReader` and
-        // `ItemBatcher` are interpreted — the dataset is read from S3 for real
-        // ([`super::item_reader`]) and its items are grouped as declared
-        // ([`super::item_batcher`]).
+        // `ResultWriter` is interpreted too: it WRITES an S3 dataset, and the manifest
+        // of result files it writes is written there for real
+        // ([`super::result_writer`]), as `ItemReader` and `ItemBatcher` are — the
+        // dataset is read from S3 ([`super::item_reader`]) and its items are grouped as
+        // declared ([`super::item_batcher`]).
         "Map" => &[
             "Type",
             "Comment",
@@ -770,6 +790,7 @@ fn executable_members(state_type: &str) -> &'static [&'static str] {
             "MaxConcurrency",
             "MaxConcurrencyPath",
             "ResultSelector",
+            "ResultWriter",
             "ResultPath",
             "OutputPath",
             "Retry",
@@ -986,6 +1007,7 @@ fn jsonata_members(state_type: &str, activity: bool) -> &'static [&'static str] 
             "ItemProcessor",
             "Iterator",
             "MaxConcurrency",
+            "ResultWriter",
             "Retry",
             "Catch",
             "ToleratedFailureCount",
@@ -1060,6 +1082,12 @@ pub struct MapItemOutcome {
 /// them into instants against the execution's own start — the walk never sleeps.
 #[derive(Debug, Clone)]
 pub struct StartedMapRun {
+    /// The Map Run's own ARN, resolved as its `Map` state was entered: the one the
+    /// attempt being continued already reports ([`super::integration::ResumedMapRun`])
+    /// and a fresh one for a state starting a Map Run of its own, so the results its
+    /// `ResultWriter` writes and the output its state puts out name the Map Run the
+    /// store goes on to record.
+    pub arn: String,
     /// The state's `Label` when it declares one, else the state's own name: "a
     /// user-defined or an auto-generated string that identifies a Map state".
     pub label: String,
@@ -1124,6 +1152,13 @@ pub struct StartedChildExecution {
     /// declares an `ItemBatcher`, whose children are each handed one batch
     /// ([`super::item_batcher::item_count`]).
     pub item_count: i32,
+    /// The instants this execution really ran between, for one an EARLIER attempt
+    /// started and this one KEPT: a redrive "preserves the results and execution
+    /// history of the successful steps, and doesn't rerun these steps", so the item it
+    /// ran was not run again, the record it already has is left exactly as it is, and
+    /// the dates it reports are the ones that attempt recorded. `None` for an execution
+    /// THIS attempt started, whose instants are its own offsets into the run.
+    pub kept: Option<(SystemTime, SystemTime)>,
 }
 
 /// What one walk of a definition produced.
@@ -1638,6 +1673,11 @@ struct MapPlan<'a> {
     tolerated_percentage: f64,
     /// Whether the state declares any tolerated-failure member at all.
     tolerance_declared: bool,
+    /// What the attempt being CONTINUED ran each item as, by item index, for a walk
+    /// that continues one ([`super::integration::ResumedMapRun::items`]): the items
+    /// whose child workflow execution already succeeded are not run again. `None` for
+    /// a walk that BEGINS an attempt, every item of which runs.
+    resumed: Option<&'a [Option<super::integration::FinishedChild>]>,
 }
 
 /// A `Parallel` state's branches: each one's state list and entry point.
@@ -1982,12 +2022,19 @@ fn scan_expression(expression: &str, into: &mut BTreeSet<String>) {
 ///
 /// `first_event_id` is the id the first history event this walk records will carry,
 /// which a cause naming the event a state was entered at reports.
+///
+/// `settle` is how long after this walk's outcomes the clock makes them due, which the
+/// caller decides ([`super::EXECUTION_SETTLE_DELAY`], and `Duration::ZERO` for a
+/// synchronous start): the walk never sleeps for it, and what it needs it for is the
+/// instant a child workflow execution of a Distributed Map STOPS at, which the results
+/// that run writes report ([`Interpreter::settle`]).
 pub fn run(
     definition: &str,
     input: &str,
     start: SystemTime,
     context: &Context,
     first_event_id: i64,
+    settle: Duration,
     tasks: &dyn Tasks,
 ) -> Run {
     interpret(
@@ -1998,6 +2045,7 @@ pub fn run(
         Entry::Start,
         Duration::ZERO,
         first_event_id,
+        settle,
         tasks,
     )
     .0
@@ -2026,6 +2074,7 @@ pub fn redrive(
     context: &Context,
     from: &RedriveStep,
     first_event_id: i64,
+    settle: Duration,
     tasks: &dyn Tasks,
 ) -> Run {
     let state_input = serde_json::from_str(&from.state_input).unwrap_or(Value::Null);
@@ -2037,6 +2086,7 @@ pub fn redrive(
         Entry::At(from.state_name.clone(), state_input),
         Duration::ZERO,
         first_event_id,
+        settle,
         tasks,
     )
     .0;
@@ -2087,6 +2137,7 @@ pub fn resume(
     reply: &ActivityReply,
     elapsed: Duration,
     first_event_id: i64,
+    settle: Duration,
     tasks: &dyn Tasks,
 ) -> Option<Run> {
     let state_input: Value = serde_json::from_str(&reply.state_input).ok()?;
@@ -2098,6 +2149,7 @@ pub fn resume(
         Entry::Reply(reply.clone(), state_input),
         elapsed,
         first_event_id,
+        settle,
         tasks,
     );
     applied.then_some(run)
@@ -2131,6 +2183,7 @@ pub fn resume_job(
     reply: &JobReply,
     elapsed: Duration,
     first_event_id: i64,
+    settle: Duration,
     tasks: &dyn Tasks,
 ) -> Option<Run> {
     let state_input: Value = serde_json::from_str(&reply.state_input).ok()?;
@@ -2142,6 +2195,7 @@ pub fn resume_job(
         Entry::Job(reply.clone(), state_input),
         elapsed,
         first_event_id,
+        settle,
         tasks,
     );
     applied.then_some(run)
@@ -2173,6 +2227,7 @@ pub fn resume_callback(
     reply: &CallbackReply,
     elapsed: Duration,
     first_event_id: i64,
+    settle: Duration,
     tasks: &dyn Tasks,
 ) -> Option<Run> {
     let state_input: Value = serde_json::from_str(&reply.state_input).ok()?;
@@ -2184,6 +2239,7 @@ pub fn resume_callback(
         Entry::Callback(reply.clone(), state_input),
         elapsed,
         first_event_id,
+        settle,
         tasks,
     );
     applied.then_some(run)
@@ -2247,6 +2303,7 @@ fn interpret(
     entry: Entry,
     elapsed: Duration,
     first_event_id: i64,
+    settle: Duration,
     tasks: &dyn Tasks,
 ) -> (Run, bool) {
     let document: Value = match serde_json::from_str(definition) {
@@ -2385,6 +2442,7 @@ fn interpret(
         steps: Vec::new(),
         first_event_id,
         start,
+        settle,
         base_context: context.value(&input_value, start),
         tasks,
         waiting: None,
@@ -2399,6 +2457,7 @@ fn interpret(
         map_depth: 0,
         map_runs: Vec::new(),
         map_runs_entered: 0,
+        map_runs_entered_by_label: BTreeMap::new(),
         reply,
         job_reply,
         callback_reply,
@@ -2818,6 +2877,15 @@ struct Interpreter<'tasks> {
     /// When the execution started, which a `Wait` state's `Timestamp` is measured
     /// against.
     start: SystemTime,
+    /// How long after an outcome this walk computes the clock makes it DUE, as the call
+    /// that started the walk decides it ([`run`]).
+    ///
+    /// The walk sleeps for none of it: what it needs the span for is the instant a
+    /// child workflow execution of a Distributed Map stops at, because the results that
+    /// run writes report the dates its children ran between and the store records those
+    /// children as stopping when the clock makes their outcome due — so what is written
+    /// to S3 and what `DescribeExecution` answers for the same child cannot disagree.
+    settle: Duration,
     base_context: Value,
     /// What a `Task` state's service integration is performed by, for the one walk
     /// this interpreter is: a nested `Map` iteration or `Parallel` branch runs in
@@ -2856,7 +2924,7 @@ struct Interpreter<'tasks> {
     /// nothing, so the task is not run rather than run as though its job had ended.
     map_depth: usize,
     /// The Map Run every Distributed Map state this walk entered started, each with
-    /// the position of its state among the Map states this walk ENTERED
+    /// the position of its state among the DISTRIBUTED Map states this walk ENTERED
     /// ([`Interpreter::map_runs_entered`]).
     ///
     /// A run is recorded when its items are done, so the list is built in FINISH
@@ -2865,9 +2933,15 @@ struct Interpreter<'tasks> {
     /// offset, so the position is carried rather than derived from the instants.
     /// Bounded by [`MAX_STATE_TRANSITIONS`], which every `Map` state spends from.
     map_runs: Vec<(usize, StartedMapRun)>,
-    /// How many `Map` states this walk has ENTERED, which is what numbers the Map
-    /// Runs above in entry order.
+    /// How many DISTRIBUTED `Map` states this walk has ENTERED, which is what numbers
+    /// the Map Runs above in entry order. An inline `Map` starts no Map Run, so it
+    /// takes no number.
     map_runs_entered: usize,
+    /// How many times this walk has entered a Distributed Map state of each LABEL,
+    /// which is what the Map Run an attempt being CONTINUED already started is matched
+    /// by ([`super::integration::Tasks::map_run`]). Bounded by the state count of the
+    /// definition, every entry of which spends from [`MAX_STATE_TRANSITIONS`].
+    map_runs_entered_by_label: BTreeMap<String, usize>,
     /// The reply a worker made to the activity task this walk is CONTINUING from,
     /// when it is one: the state the reply names produces that result instead of
     /// suspending. Taken when it is applied, so one reply answers one task.
@@ -3850,6 +3924,10 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // a history carries.
         first_event_id: FIRST_EVENT_ID,
         start: test.start,
+        // `TestState` owes the clock nothing: it reports what one state computes in the
+        // call that asked, and the child executions a span like this would date belong
+        // to an execution.
+        settle: Duration::ZERO,
         base_context,
         // `TestState` tests ONE state, with no execution around it: a state whose
         // work is an invocation is tested through its `mock`, so nothing is called
@@ -3869,6 +3947,7 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // as — belong to an execution.
         map_runs: Vec::new(),
         map_runs_entered: 0,
+        map_runs_entered_by_label: BTreeMap::new(),
         // `TestState` continues no execution: a state whose work is an invocation is
         // answered by the request's own `mock`, not by a worker's reply.
         reply: None,

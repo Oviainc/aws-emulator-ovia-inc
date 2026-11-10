@@ -249,7 +249,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             execution_arn,
             start_date,
             machine_arn,
-            machine_name,
             context,
             reply,
         ) = {
@@ -377,7 +376,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 execution_arn,
                 execution.start_date,
                 machine.arn.clone(),
-                machine.name.clone(),
                 context,
                 // Which kind of task the token named decides which continuation the
                 // reply begins: an activity's task is answered at the state that
@@ -509,13 +507,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // A Distributed Map state the continuation entered started a Map
                     // Run of its own, which `ListMapRuns` reports for this execution
                     // beside the ones its earlier states started.
-                    store.append_map_runs(
-                        &execution_arn,
-                        &machine_arn,
-                        &machine_name,
-                        &crate::state::arn_region(&machine_arn),
-                        map_runs,
-                    );
+                    store.append_map_runs(&execution_arn, &machine_arn, map_runs);
                     // The continuation PARKED at the job a run-a-job task started,
                     // which is polled to its end exactly as one a start parked at is.
                     let watching = parked.is_some();

@@ -3457,6 +3457,38 @@ pub fn arn_region(arn: &str) -> String {
         .to_string()
 }
 
+/// The first key of `members` that is not one of `allowed`.
+///
+/// The ONE reading of a CLOSED set of members in this crate: the sets a `Map` state's
+/// `ItemReader` ([`item_reader`]) and its `ResultWriter` ([`result_writer`]) declare
+/// are closed, so a member outside one names something the definition asked for and
+/// this emulator does not do — which is what each of them reports rather than running
+/// as though the member were not there.
+pub fn unknown_member(
+    members: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+) -> Option<String> {
+    members
+        .keys()
+        .find(|member| !allowed.contains(&member.as_str()))
+        .cloned()
+}
+
+/// The text `document` names `member` with; `None` for a member it does not carry as a
+/// non-empty string.
+///
+/// The ONE reading of a member a definition writes as TEXT: the members an
+/// `ItemReader` and a `ResultWriter` name their dataset by are strings, and a member
+/// that is absent, empty or of another type names nothing — which each of them reports
+/// rather than reading a value out of the wrong type.
+pub fn declared_text(document: &serde_json::Value, member: &str) -> Option<String> {
+    document
+        .get(member)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
 /// The message the modelled `InvalidArn` carries for `diagnosis`, the ARN component
 /// that failed validation.
 ///
@@ -4453,10 +4485,12 @@ pub mod item_batcher;
 pub mod item_reader;
 mod json_diagnostic;
 pub mod jsonata;
+pub mod map_runs;
 pub mod observability;
 pub mod payload_size;
 mod plan;
 pub use plan::*;
+pub mod result_writer;
 pub mod run_a_job;
 pub mod store;
 pub use store::{

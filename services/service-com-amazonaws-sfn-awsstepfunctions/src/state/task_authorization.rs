@@ -74,7 +74,9 @@ use ::std::sync::Arc;
 
 use ::service_common::iam_authorization::{self as iam, Decision};
 
-use super::integration::{access_request, Call, Failed, Handovers, RoleGate, TASK_FAILED_ERROR};
+use super::integration::{
+    access_request, Call, Failed, Handovers, MapRuns, RoleGate, TASK_FAILED_ERROR,
+};
 
 /// The GLOBAL service principal Step Functions assumes a state machine's execution
 /// role as.
@@ -244,6 +246,11 @@ pub struct Acting {
     /// Where the handover of a callback (`.waitForTaskToken`) token is recorded and its
     /// answer read back ([`super::callbacks::handovers`]).
     pub handovers: Option<Handovers>,
+    /// What answers which Map Run a Distributed Map state of the walk is ALREADY
+    /// running ([`super::map_runs::resumed`]), for the call that CONTINUES an attempt
+    /// rather than beginning one. `None` for every other call, whose Map states each
+    /// start a Map Run of their own.
+    pub map_runs: Option<MapRuns>,
 }
 
 /// Debug without disclosing anything either closure reads: a connection holds
@@ -255,6 +262,7 @@ impl ::std::fmt::Debug for Acting {
             .field("role", &self.role.is_some())
             .field("connections", &self.connections.is_some())
             .field("handovers", &self.handovers.is_some())
+            .field("map_runs", &self.map_runs.is_some())
             .finish()
     }
 }
@@ -272,6 +280,10 @@ pub fn acting<Eng: Send + Sync + 'static>(
         role: role_gate(engine, region, role_arn, unassumable),
         connections: super::http_task::connections(engine),
         handovers: super::callbacks::handovers(engine),
+        // A walk that BEGINS an attempt runs every item of every Map state it enters,
+        // each under a Map Run of its own: only the call that continues an attempt
+        // carries the Map Runs it is continuing ([`Acting::map_runs`]).
+        map_runs: None,
     }
 }
 

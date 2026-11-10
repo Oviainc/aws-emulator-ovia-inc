@@ -665,13 +665,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Every Distributed Map state the walk entered started a Map Run, which
             // `ListMapRuns` reports for this execution and `DescribeMapRun` by its own
             // ARN.
-            store.record_map_runs(
-                &arn,
-                &machine_arn,
-                &machine_name,
-                &region,
-                planned.map_runs,
-            );
+            store.record_map_runs(&arn, &machine_arn, planned.map_runs);
             // The walk reached an activity task: it is queued under its activity's ARN
             // for a worker to claim with `GetActivityTask`, and the execution waits at
             // that state until one answers it.
