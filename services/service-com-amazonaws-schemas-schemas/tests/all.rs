@@ -21,6 +21,8 @@ mod aws_managed_event_catalog;
 mod catalogue_source_inventory;
 #[path = "all/code_binding_lifecycle.rs"]
 mod code_binding_lifecycle;
+#[path = "all/code_binding_source.rs"]
+mod code_binding_source;
 #[path = "all/code_bindings.rs"]
 mod code_bindings;
 #[path = "all/code_bindings_for_managed_schemas.rs"]

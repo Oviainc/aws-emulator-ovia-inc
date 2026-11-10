@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCodeBindingSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCodeBindingSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCodeBindingSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Serves the source a code binding's generation produced: the archive of source
+//! files generated, in the binding's language, from the schema version the binding
+//! was generated from. Implemented here — this is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +70,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
+
+use crate::state::JsonNode;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +149,1076 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCodeBindingSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCodeBindingSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; a code binding is named by the schema
+        // it belongs to and carries no ARN, so this handler needs nothing from it.
+        let _ = ctx;
+
+        // The names this request supplies are checked against the service's own
+        // constraints for them first, in the order the URI states them: a name outside
+        // one names no resource anywhere, so the request is refused on its form rather
+        // than answered as if the name merely named nothing yet. See
+        // `crate::state::validate_names`.
+        crate::state::validate_names(Some(&input.registry_name), Some(&input.schema_name))
+            .map_err(|refusal| {
+                GetCodeBindingSourceError::from(
+                    GetCodeBindingSourceErrorModeled::BadRequestException(refusal),
+                )
+            })?;
+
+        // Same request-level constraint as `PutCodeBinding` and `DescribeCodeBinding`: a
+        // language this service generates no bindings for is refused as a bad request,
+        // before any lookup — it is not a source that happens to be missing. The
+        // generator this operation renders with is keyed by the canonical identifier
+        // `crate::state::code_binding_language` admits, so the two sets are the same
+        // set; `tests/all/code_binding_source.rs` drives every language in the catalog.
+        let target = crate::state::code_binding_language(&input.language)
+            .and_then(Target::of)
+            .ok_or_else(|| {
+                GetCodeBindingSourceError::from(
+                    GetCodeBindingSourceErrorModeled::BadRequestException(
+                        crate::state::unsupported_code_binding_language(),
+                    ),
+                )
+            })?;
+
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCodeBindingSourceError::from(
+                GetCodeBindingSourceErrorModeled::InternalServerErrorException(
+                    crate::state::internal_error(),
+                ),
+            )
+        })?;
+        // A read: this operation only REPORTS the binding's source. The source is
+        // computed from the schema version the binding was generated from — a version's
+        // document never changes once written — so two reads of one binding answer the
+        // same archive and nothing is written here.
+        let state = store.lock();
+
+        // The one resolution every read that names a schema version makes: the
+        // registry, the schema in it and the version the request selects, each step
+        // answering its own refusal. See `crate::state::readable_schema_version`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCodeBindingSource"))
+        // `SchemaVersion` "limits the results to only this schema version"; absent, the
+        // latest stored version answers, which is the version a put with no
+        // `SchemaVersion` generated against. A value with nothing in it limits the read
+        // to no version at all, so it is read as absent too.
+        let crate::state::ResolvedSchemaVersion { schema, version, .. } = state
+            .readable_schema_version(
+                &input.registry_name,
+                &input.schema_name,
+                input.schema_version.as_deref(),
+            )
+            .map_err(|refusal| {
+                GetCodeBindingSourceError::from(GetCodeBindingSourceErrorModeled::NotFoundException(
+                    refusal.not_found(),
+                ))
+            })?;
+        // The binding is keyed by the version NUMBER, as `PutCodeBinding` stored it: a
+        // code binding is a resource of the version it was generated from.
+        let number = version.version;
+
+        // There is source to serve only where generation has PRODUCED it: a binding
+        // nobody started has none, and neither has one whose generation is still in
+        // progress — which is what the status `DescribeCodeBinding` reports is for. Both
+        // are the same absence, so both answer the service's one sentence for a code
+        // binding that cannot be read.
+        let missing = || {
+            GetCodeBindingSourceError::from(GetCodeBindingSourceErrorModeled::NotFoundException(
+                crate::state::code_binding_not_found(&input.schema_name, number, target.as_wire()),
+            ))
+        };
+        let binding = schema
+            .code_bindings
+            .get(&(number, target.as_wire().to_string()))
+            .ok_or_else(missing)?;
+        if binding.status_at(::std::time::SystemTime::now()) != crate::state::CODE_GENERATION_COMPLETE
+        {
+            return Err(missing());
+        }
+
+        // Generated from the STORED document of the version the binding is attached to,
+        // never from the request: the archive is what the generation this binding
+        // records produced.
+        Ok(GetCodeBindingSourceOutput {
+            body: Some(code_binding_archive(
+                target,
+                &schema.name,
+                &version.r#type,
+                &version.content,
+            )),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The code generator: a schema document in, source files out.
+//
+// What a code binding IS, is the code a client builds its handler against — one
+// declaration per named schema the document declares, in the language asked for. So the
+// archive is COMPUTED from the stored document: the named schemas it declares decide
+// which files exist, each schema's own members decide what each file declares, and the
+// JSON Schema type of a member decides the type the declaration gives it. A document
+// that declares no named structure therefore generates no source file, and a document
+// that declares twenty generates twenty.
+//
+// The mapping below is this emulator's, stated once here: AWS publishes the bindings,
+// not the generator that writes them, so what is pinned is the mapping itself — JSON
+// Schema type to language type — and the layout a package of that language puts its
+// files in. `tests/all/code_binding_source.rs` asserts it over a table of documents.
+// ---------------------------------------------------------------------------
+
+/// A code-binding language this operation generates source for.
+///
+/// One variant per value of [`crate::state::CODE_BINDING_LANGUAGES`] — the set the
+/// request's `Language` is admitted from — so a language the service accepts always has
+/// a renderer, and the count is checked while this crate is compiled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Java8,
+    TypeScript3,
+    Python36,
+    Go1,
+}
+
+impl Target {
+    /// Every target, in [`crate::state::CODE_BINDING_LANGUAGES`] order.
+    const ALL: &'static [Self] = &[Self::Java8, Self::TypeScript3, Self::Python36, Self::Go1];
+
+    /// The canonical `Language` identifier this target is asked for by.
+    const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Java8 => "Java8",
+            Self::TypeScript3 => "TypeScript3",
+            Self::Python36 => "Python36",
+            Self::Go1 => "Go1",
+        }
+    }
+
+    /// The target a CANONICAL language identifier names — the one
+    /// [`crate::state::code_binding_language`] hands back, so a spelling the service
+    /// does not accept never reaches here.
+    fn of(language: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|target| target.as_wire() == language)
+    }
+
+    /// The directory inside the archive that the package's files live under, as a
+    /// package of this language lays its sources out. Empty where the language puts them
+    /// at the archive root.
+    const fn source_root(self) -> &'static str {
+        match self {
+            // Maven's standard directory layout.
+            Self::Java8 => "src/main/java/",
+            Self::TypeScript3 | Self::Python36 => "src/",
+            Self::Go1 => "",
+        }
+    }
+
+    /// The extension the language's source files carry.
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Java8 => "java",
+            Self::TypeScript3 => "ts",
+            Self::Python36 => "py",
+            Self::Go1 => "go",
+        }
+    }
+
+    /// The file one generated structure is declared in, without its extension: the
+    /// declaration's own name where the language names a file after the type it
+    /// declares, and the name in the language's file-name case otherwise.
+    fn file_stem(self, declared: &str) -> String {
+        match self {
+            Self::Java8 | Self::TypeScript3 => type_identifier(declared),
+            Self::Python36 | Self::Go1 => snake_case(declared),
+        }
+    }
+}
+
+/// Every language the service admits has a renderer in [`Target`]: a language added to
+/// the catalog without one fails the BUILD here rather than being refused at runtime as
+/// a language the service does not generate for.
+const _: () = assert!(Target::ALL.len() == crate::state::CODE_BINDING_LANGUAGES.len());
+
+/// The package every generated source file lives in, below the language's own source
+/// root: the schema's own package, named for the schema the binding was generated from.
+const PACKAGE_ROOT: &str = "schema";
+
+/// The JSON Schema `format` that says a string holds an instant, which every language
+/// below gives its own date-time type.
+const TIMESTAMP_FORMAT: &str = "date-time";
+
+/// Where a draft-04 document holds the named schemas beside its root one.
+const DRAFT4_DEFINITIONS: &str = "definitions";
+
+/// The reference a draft-04 document names one of its own [`DRAFT4_DEFINITIONS`] by.
+const DRAFT4_DEFINITION_REF: &str = "#/definitions/";
+
+/// How deep a chain of named aliases a member's type is followed through before it is
+/// given up on as a type the generator cannot name. A document may define an alias for
+/// an alias; it may also define one for itself, which is why this is bounded.
+const MAX_ALIAS_HOPS: usize = 8;
+
+/// How deeply nested a member's own declaration is read — a list of a list of a list —
+/// before the member is given a type the generator can always name. Bounds the walk
+/// over a document a caller wrote.
+const MAX_DECLARATION_DEPTH: usize = 8;
+
+/// One structure the generator renders a source file for: a named schema of the document
+/// that declares members.
+#[derive(Debug, Clone)]
+struct Structure {
+    /// The name the document declares it under.
+    name: String,
+    /// Its members, in the order the document declares them.
+    members: Vec<Member>,
+}
+
+/// One member of a [`Structure`], as the document declares it.
+#[derive(Debug, Clone)]
+struct Member {
+    /// The member name the document declares, which is the name on the wire.
+    name: String,
+    /// What the member holds.
+    declared: Declared,
+    /// Whether the document's `required` list names it.
+    required: bool,
+}
+
+/// What a member's JSON Schema declaration says it holds, reduced to the cases the
+/// languages below have a type for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Declared {
+    /// `"type": "string"`.
+    Text,
+    /// `"type": "integer"`.
+    Integer,
+    /// `"type": "number"`.
+    Number,
+    /// `"type": "boolean"`.
+    Flag,
+    /// A string whose `format` is [`TIMESTAMP_FORMAT`].
+    Timestamp,
+    /// `"type": "array"`, holding what its `items` declare.
+    List(Box<Declared>),
+    /// A reference to another structure of the same document.
+    Named(String),
+    /// A declaration that names no type above: an object with no members of its own (a
+    /// free-form map), a declaration with no `type` at all, or a reference out of the
+    /// document.
+    Unknown,
+}
+
+/// The archive `GetCodeBindingSource` answers: the source files generated from
+/// `document` for `target`, in the order the document declares them.
+///
+/// Infallible. A document that declares no named structure generates no source file,
+/// and so does one this service could not have stored (every stored document is a JSON
+/// object): the archive is then an empty one, rather than a failure of a binding whose
+/// generation the service reported complete.
+///
+/// Its size is the stored document's: one declaration per named schema and a few lines
+/// per member of it. What a caller can grow is therefore the document, which
+/// `crate::state::MAX_STORED_CONTENT_BYTES` and the model's own cap on `Content` bound
+/// before it is stored, and the nesting of one member's type, which
+/// [`MAX_DECLARATION_DEPTH`] bounds here.
+fn code_binding_archive(
+    target: Target,
+    schema_name: &str,
+    schema_type: &str,
+    document: &str,
+) -> Vec<u8> {
+    let package = package_segments(schema_name);
+    let structures = declared_structures(document, schema_type, schema_name);
+    let mut archive = ::zip::ZipWriter::new(::std::io::Cursor::new(Vec::new()));
+    // One archive for one (version, language) pair, so its bytes are the generation's
+    // own: the entry timestamp is fixed rather than taken from the clock, which is what
+    // makes two reads of one binding answer the same archive.
+    let options = ::zip::write::SimpleFileOptions::default()
+        .last_modified_time(::zip::DateTime::default());
+    let mut written: BTreeSet<String> = BTreeSet::new();
+    for structure in &structures {
+        let file = render(target, &package, structure);
+        if !written.insert(file.path.clone()) {
+            // Two declarations of one name are one file; a JSON object holds one member
+            // per name, so this is only reachable for a document that repeats a key.
+            continue;
+        }
+        if archive.start_file(&file.path, options).is_err() {
+            continue;
+        }
+        let _ = archive.write_all(file.text.as_bytes());
+    }
+    archive
+        .finish()
+        .map(::std::io::Cursor::into_inner)
+        .unwrap_or_default()
+}
+
+/// The named structures `document` declares, in its own order.
+///
+/// Where they are declared is the document's LANGUAGE: an OpenAPI 3 document declares
+/// them under `components/schemas`, and a JSON Schema draft-04 document is itself the
+/// root schema, with any further ones under [`DRAFT4_DEFINITIONS`].
+///
+/// A named schema that declares no `properties` object declares no structure: it is an
+/// alias for the value it describes, so it gets no source file and a member that
+/// references it takes the type it describes.
+fn declared_structures(document: &str, schema_type: &str, schema_name: &str) -> Vec<Structure> {
+    let Some(parsed) = JsonNode::parse(document) else {
+        return Vec::new();
+    };
+
+    let mut declared: Vec<(String, &JsonNode)> = Vec::new();
+    if schema_type == crate::state::SchemaType::OpenApi3.as_wire() {
+        if let Some(JsonNode::Object(schemas)) = parsed
+            .member("components")
+            .and_then(|components| components.member("schemas"))
+        {
+            for (name, schema) in schemas {
+                declared.push((name.clone(), schema));
+            }
+        }
+    } else {
+        // The draft-04 document's root schema is a structure in its own right, and the
+        // schema's own name is the only name it has.
+        declared.push((type_identifier(schema_name), &parsed));
+        if let Some(JsonNode::Object(definitions)) = parsed.member(DRAFT4_DEFINITIONS) {
+            for (name, schema) in definitions {
+                declared.push((name.clone(), schema));
+            }
+        }
+    }
+
+    // Which names are structures, and what the rest stand for, before any member is
+    // read: a member's type may reference a name the document declares later.
+    let structure_names: BTreeSet<&str> = declared
+        .iter()
+        .filter(|(_, schema)| members_of(schema).is_some())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let aliases: BTreeMap<&str, Declared> = declared
+        .iter()
+        .filter(|(name, schema)| members_of(schema).is_none() && !structure_names.contains(name.as_str()))
+        .map(|(name, schema)| (name.as_str(), declared_by(schema, 0)))
+        .collect();
+
+    let mut structures: Vec<Structure> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for (name, schema) in &declared {
+        let Some(properties) = members_of(schema) else {
+            continue;
+        };
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let required = required_members(schema);
+        let members = properties
+            .iter()
+            .map(|(member, declaration)| Member {
+                name: member.clone(),
+                declared: resolve(declared_by(declaration, 0), &structure_names, &aliases, 0),
+                required: required.contains(member.as_str()),
+            })
+            .collect();
+        structures.push(Structure {
+            name: name.clone(),
+            members,
+        });
+    }
+    structures
+}
+
+/// The `properties` a named schema declares, for a schema that declares an object of
+/// them — which is what makes it a structure rather than an alias.
+fn members_of(schema: &JsonNode) -> Option<&Vec<(String, JsonNode)>> {
+    match schema.member("properties") {
+        Some(JsonNode::Object(properties)) => Some(properties),
+        _ => None,
+    }
+}
+
+/// The member names a schema's `required` list names.
+fn required_members(schema: &JsonNode) -> BTreeSet<&str> {
+    match schema.member("required") {
+        Some(JsonNode::List(names)) => names
+            .iter()
+            .filter_map(|name| match name {
+                JsonNode::Text(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect(),
+        _ => BTreeSet::new(),
+    }
+}
+
+/// What one JSON Schema declaration says the value it describes holds.
+///
+/// A `type` the draft states as a union (which is how draft-04 says a value may be
+/// null) is read as the first type in it the generator has a type for. `depth` is how
+/// many list declarations this one is nested in; see [`MAX_DECLARATION_DEPTH`].
+fn declared_by(declaration: &JsonNode, depth: usize) -> Declared {
+    if depth > MAX_DECLARATION_DEPTH {
+        return Declared::Unknown;
+    }
+    if let Some(JsonNode::Text(reference)) = declaration.member("$ref") {
+        return match reference
+            .strip_prefix(crate::state::OPENAPI_COMPONENT_REF)
+            .or_else(|| reference.strip_prefix(DRAFT4_DEFINITION_REF))
+        {
+            Some(name) => Declared::Named(name.to_string()),
+            // A reference to anything other than a named schema of this document names
+            // nothing the generator can declare a type for.
+            None => Declared::Unknown,
+        };
+    }
+    let declared_types: Vec<&str> = match declaration.member("type") {
+        Some(JsonNode::Text(name)) => vec![name.as_str()],
+        Some(JsonNode::List(names)) => names
+            .iter()
+            .filter_map(|name| match name {
+                JsonNode::Text(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for declared_type in declared_types {
+        let declared = match declared_type {
+            "string" => match declaration.member("format") {
+                Some(JsonNode::Text(format)) if format == TIMESTAMP_FORMAT => Declared::Timestamp,
+                _ => Declared::Text,
+            },
+            "integer" => Declared::Integer,
+            "number" => Declared::Number,
+            "boolean" => Declared::Flag,
+            "array" => Declared::List(Box::new(
+                declaration
+                    .member("items")
+                    .map(|items| declared_by(items, depth + 1))
+                    .unwrap_or(Declared::Unknown),
+            )),
+            // "object" with no `properties` of its own carries members this generator
+            // cannot name, and "null" says only that the member may be absent.
+            _ => continue,
+        };
+        return declared;
+    }
+    Declared::Unknown
+}
+
+/// `declared` with every reference to a named ALIAS replaced by what that alias stands
+/// for, so only references to structures the archive holds a file for survive.
+fn resolve(
+    declared: Declared,
+    structures: &BTreeSet<&str>,
+    aliases: &BTreeMap<&str, Declared>,
+    hops: usize,
+) -> Declared {
+    if hops > MAX_ALIAS_HOPS {
+        return Declared::Unknown;
+    }
+    match declared {
+        Declared::List(item) => Declared::List(Box::new(resolve(
+            *item,
+            structures,
+            aliases,
+            hops + 1,
+        ))),
+        Declared::Named(name) => {
+            if structures.contains(name.as_str()) {
+                return Declared::Named(name);
+            }
+            match aliases.get(name.as_str()) {
+                Some(aliased) => resolve(aliased.clone(), structures, aliases, hops + 1),
+                None => Declared::Unknown,
+            }
+        }
+        other => other,
+    }
+}
+
+/// The package a schema's generated files live in, below [`PACKAGE_ROOT`]: the schema
+/// name's own segments, lower-cased, so a schema published for one event source lands
+/// in that source's package.
+///
+/// A schema name's segments are the runs of letters and digits in it — the service
+/// admits `.`, `@`, `-` and `_` in a name (`crate::state::validate_names`), none of
+/// which a package or directory name of these languages carries.
+fn package_segments(schema_name: &str) -> Vec<String> {
+    let mut segments = vec![PACKAGE_ROOT.to_string()];
+    segments.extend(
+        schema_name
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|part| !part.is_empty())
+            .map(str::to_lowercase),
+    );
+    segments
+}
+
+/// One generated source file: where it sits in the archive, and its text.
+#[derive(Debug)]
+struct SourceFile {
+    path: String,
+    text: String,
+}
+
+/// The source file one structure renders to for `target`.
+fn render(target: Target, package: &[String], structure: &Structure) -> SourceFile {
+    let path = format!(
+        "{}{}/{}.{}",
+        target.source_root(),
+        package.join("/"),
+        target.file_stem(&structure.name),
+        target.extension()
+    );
+    let text = match target {
+        Target::Java8 => java_source(package, structure),
+        Target::TypeScript3 => typescript_source(structure),
+        Target::Python36 => python_source(structure),
+        Target::Go1 => go_source(package, structure),
+    };
+    SourceFile { path, text }
+}
+
+/// The structures `structure` references, by their declared names, in the order its
+/// members name them: what a language that imports a sibling declaration per file needs
+/// at the top of the file.
+fn referenced(structure: &Structure) -> Vec<&str> {
+    let mut named: Vec<&str> = Vec::new();
+    for member in &structure.members {
+        let mut declared = &member.declared;
+        while let Declared::List(item) = declared {
+            declared = item;
+        }
+        if let Declared::Named(name) = declared {
+            if name != &structure.name && !named.contains(&name.as_str()) {
+                named.push(name.as_str());
+            }
+        }
+    }
+    named
+}
+
+/// The Java type a declaration maps to.
+///
+/// Every type is a reference type: a member a document does not require is absent, and
+/// a Java field holds that as `null`, which a primitive cannot. The qualified names are
+/// written out rather than imported, so a generated file needs no import list.
+fn java_type(declared: &Declared) -> String {
+    match declared {
+        Declared::Text => "String".to_string(),
+        Declared::Integer => "Long".to_string(),
+        Declared::Number => "Double".to_string(),
+        Declared::Flag => "Boolean".to_string(),
+        Declared::Timestamp => "java.time.OffsetDateTime".to_string(),
+        Declared::List(item) => format!("java.util.List<{}>", java_type(item)),
+        Declared::Named(name) => type_identifier(name),
+        Declared::Unknown => "Object".to_string(),
+    }
+}
+
+/// One Java class per structure, in the schema's package: a private field per member
+/// and the accessor pair a Java client reads it through.
+fn java_source(package: &[String], structure: &Structure) -> String {
+    let class = type_identifier(&structure.name);
+    let mut text = format!("package {};\n\npublic class {class} {{\n", package.join("."));
+    for member in &structure.members {
+        text.push_str(&format!(
+            "    private {} {};\n",
+            java_type(&member.declared),
+            lower_camel(&member.name)
+        ));
+    }
+    for member in &structure.members {
+        let declared = java_type(&member.declared);
+        let field = lower_camel(&member.name);
+        let accessor = upper_camel(&member.name);
+        text.push_str(&format!(
+            "\n    public {declared} get{accessor}() {{\n        return this.{field};\n    }}\n"
+        ));
+        text.push_str(&format!(
+            "\n    public void set{accessor}(final {declared} {field}) {{\n        \
+             this.{field} = {field};\n    }}\n"
+        ));
+    }
+    text.push_str("}\n");
+    text
+}
+
+/// The TypeScript type a declaration maps to.
+fn typescript_type(declared: &Declared) -> String {
+    match declared {
+        Declared::Text => "string".to_string(),
+        Declared::Integer | Declared::Number => "number".to_string(),
+        Declared::Flag => "boolean".to_string(),
+        Declared::Timestamp => "Date".to_string(),
+        Declared::List(item) => format!("Array<{}>", typescript_type(item)),
+        Declared::Named(name) => type_identifier(name),
+        Declared::Unknown => "any".to_string(),
+    }
+}
+
+/// One exported interface per structure, with the members the document declares. A
+/// member the document does not require is optional, which is what a TypeScript `?`
+/// says.
+fn typescript_source(structure: &Structure) -> String {
+    let mut text = String::new();
+    for name in referenced(structure) {
+        let declared = type_identifier(name);
+        let module = Target::TypeScript3.file_stem(name);
+        text.push_str(&format!("import {{ {declared} }} from \"./{module}\";\n"));
+    }
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "export interface {} {{\n",
+        type_identifier(&structure.name)
+    ));
+    for member in &structure.members {
+        let optional = if member.required { "" } else { "?" };
+        text.push_str(&format!(
+            "  {}{optional}: {};\n",
+            quoted_if_needed(&member.name),
+            typescript_type(&member.declared)
+        ));
+    }
+    text.push_str("}\n");
+    text
+}
+
+/// A TypeScript property name as it is written in an interface: as the document declares
+/// it where that is an identifier, quoted where it is not (a name with a `-` in it, as
+/// an event's `detail-type`).
+fn quoted_if_needed(name: &str) -> String {
+    let identifier = !name.is_empty()
+        && !name.starts_with(|character: char| character.is_ascii_digit())
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '$');
+    if identifier {
+        name.to_string()
+    } else {
+        format!("\"{name}\"")
+    }
+}
+
+/// The Python type a declaration maps to, without the optionality its member carries.
+fn python_type(declared: &Declared) -> String {
+    match declared {
+        Declared::Text => "str".to_string(),
+        Declared::Integer => "int".to_string(),
+        Declared::Number => "float".to_string(),
+        Declared::Flag => "bool".to_string(),
+        Declared::Timestamp => "datetime".to_string(),
+        Declared::List(item) => format!("List[{}]", python_type(item)),
+        Declared::Named(name) => type_identifier(name),
+        Declared::Unknown => "Any".to_string(),
+    }
+}
+
+/// One class per structure, its members declared as the annotated attributes Python 3.6
+/// takes. A member the document does not require is `Optional`.
+fn python_source(structure: &Structure) -> String {
+    let annotations: Vec<(String, String)> = structure
+        .members
+        .iter()
+        .map(|member| {
+            let declared = python_type(&member.declared);
+            let annotation = if member.required {
+                declared
+            } else {
+                format!("Optional[{declared}]")
+            };
+            (snake_case(&member.name), annotation)
+        })
+        .collect();
+
+    // Only what the annotations below actually name is imported.
+    let mut text = String::new();
+    if annotations
+        .iter()
+        .any(|(_, annotation)| annotation.contains("datetime"))
+    {
+        text.push_str("from datetime import datetime\n");
+    }
+    let typing: Vec<&str> = ["Any", "List", "Optional"]
+        .into_iter()
+        .filter(|name| {
+            annotations
+                .iter()
+                .any(|(_, annotation)| annotation.contains(name))
+        })
+        .collect();
+    if !typing.is_empty() {
+        text.push_str(&format!("from typing import {}\n", typing.join(", ")));
+    }
+    for name in referenced(structure) {
+        text.push_str(&format!(
+            "from .{} import {}\n",
+            Target::Python36.file_stem(name),
+            type_identifier(name)
+        ));
+    }
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "\nclass {}:\n",
+        type_identifier(&structure.name)
+    ));
+    if annotations.is_empty() {
+        // A class body is never empty in Python, and a structure with no member of its
+        // own declares nothing else.
+        text.push_str("    pass\n");
+    }
+    for (field, annotation) in &annotations {
+        text.push_str(&format!("    {field}: {annotation}\n"));
+    }
+    text
+}
+
+/// The Go type a declaration maps to.
+fn go_type(declared: &Declared) -> String {
+    match declared {
+        Declared::Text => "string".to_string(),
+        Declared::Integer => "int64".to_string(),
+        Declared::Number => "float64".to_string(),
+        Declared::Flag => "bool".to_string(),
+        Declared::Timestamp => "time.Time".to_string(),
+        Declared::List(item) => format!("[]{}", go_type(item)),
+        Declared::Named(name) => type_identifier(name),
+        Declared::Unknown => "interface{}".to_string(),
+    }
+}
+
+/// One struct per structure, in the package the schema's files share: an exported field
+/// per member, tagged with the member name the document declares, which is the name on
+/// the wire.
+fn go_source(package: &[String], structure: &Structure) -> String {
+    let fields: Vec<(String, String, String)> = structure
+        .members
+        .iter()
+        .map(|member| {
+            let tag = if member.required {
+                format!("`json:\"{}\"`", member.name)
+            } else {
+                format!("`json:\"{},omitempty\"`", member.name)
+            };
+            (
+                upper_camel(&member.name),
+                go_type(&member.declared),
+                tag,
+            )
+        })
+        .collect();
+    // Go's package name is the directory the files live in, which is the last segment
+    // of the schema's package.
+    let package_name = package
+        .last()
+        .cloned()
+        .unwrap_or_else(|| PACKAGE_ROOT.to_string());
+    let mut text = format!("package {package_name}\n");
+    if fields.iter().any(|(_, declared, _)| declared.contains("time.")) {
+        text.push_str("\nimport \"time\"\n");
+    }
+    text.push_str(&format!(
+        "\ntype {} struct {{\n",
+        type_identifier(&structure.name)
+    ));
+    for (field, declared, tag) in &fields {
+        text.push_str(&format!("\t{field} {declared} {tag}\n"));
+    }
+    text.push_str("}\n");
+    text
+}
+
+// ---------------------------------------------------------------------------
+// Identifiers. A schema's names are JSON names: they carry separators and cases no
+// language declares a type or a field under, so each generated name is built from the
+// SAME tokenisation of the JSON name and only the joining differs.
+// ---------------------------------------------------------------------------
+
+/// `name`'s identifier segments: its runs of letters and digits, split again at each
+/// camel-case hump, so one tokenisation serves every case below.
+fn segments(name: &str) -> Vec<String> {
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut previous: Option<char> = None;
+    for character in name.chars() {
+        if !character.is_alphanumeric() {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+            previous = None;
+            continue;
+        }
+        let starts_hump = character.is_uppercase()
+            && previous.is_some_and(|earlier| earlier.is_lowercase() || earlier.is_numeric());
+        if starts_hump && !current.is_empty() {
+            segments.push(std::mem::take(&mut current));
+        }
+        current.push(character);
+        previous = Some(character);
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// `segment` with its first character upper-cased and the rest as written, so an
+/// acronym the document capitalised stays capitalised.
+fn capitalised(segment: &str) -> String {
+    let mut characters = segment.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
+    }
+}
+
+/// `name` in upper camel case.
+fn upper_camel(name: &str) -> String {
+    segments(name)
+        .iter()
+        .map(|segment| capitalised(segment))
+        .collect()
+}
+
+/// `name` in lower camel case: upper camel with the first character lower-cased, which
+/// is the field name every language below that uses one takes.
+fn lower_camel(name: &str) -> String {
+    let camel = upper_camel(name);
+    let mut characters = camel.chars();
+    match characters.next() {
+        Some(first) => first.to_lowercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
+    }
+}
+
+/// `name` in snake case.
+fn snake_case(name: &str) -> String {
+    segments(name)
+        .iter()
+        .map(|segment| segment.to_lowercase())
+        .collect::<Vec<String>>()
+        .join("_")
+}
+
+/// The identifier a declared TYPE is named by: `name` in upper camel case, guarded
+/// against the two names no language declares a type under — one that is empty, and one
+/// that starts with a digit.
+fn type_identifier(name: &str) -> String {
+    let camel = upper_camel(name);
+    match camel.chars().next() {
+        None => UNNAMED_TYPE.to_string(),
+        Some(first) if first.is_ascii_digit() => format!("{UNNAMED_TYPE}{camel}"),
+        Some(_) => camel,
+    }
+}
+
+/// The name a declaration gets where the document's own name is none a language can
+/// declare a type under. See [`type_identifier`].
+const UNNAMED_TYPE: &str = "Schema";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The document the cases below generate from: an OpenAPI 3 document with an
+    /// envelope that references a nested structure and an aliased scalar, a required
+    /// member, a timestamp, a list and a free-form object.
+    const OPENAPI: &str = r##"{"openapi":"3.0.0","components":{"schemas":{
+        "AWSEvent":{"type":"object","required":["detail"],"properties":{
+            "detail-type":{"type":"string"},
+            "detail":{"$ref":"#/components/schemas/Detail"},
+            "resources":{"type":"array","items":{"$ref":"#/components/schemas/Resource"}}}},
+        "Detail":{"type":"object","properties":{
+            "placedAt":{"type":"string","format":"date-time"},
+            "quantity":{"type":"integer"},
+            "price":{"type":"number"},
+            "paid":{"type":"boolean"},
+            "extra":{"type":"object"}}},
+        "Resource":{"type":"string"}}}}"##;
+
+    /// The structures are the document's named schemas that declare members, in the
+    /// document's order; an aliased scalar is none of them and its references take the
+    /// type it stands for.
+    #[test]
+    fn the_structures_are_the_documents_named_schemas() {
+        let structures = declared_structures(OPENAPI, "OpenApi3", "order.placed");
+        let names: Vec<&str> = structures
+            .iter()
+            .map(|structure| structure.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["AWSEvent", "Detail"],
+            "case \"openapi\": a named schema with no properties is an alias, not a \
+             structure, got {names:?}"
+        );
+        let envelope = &structures[0];
+        let declared: Vec<(&str, Declared, bool)> = envelope
+            .members
+            .iter()
+            .map(|member| (member.name.as_str(), member.declared.clone(), member.required))
+            .collect();
+        assert_eq!(
+            declared,
+            vec![
+                ("detail-type", Declared::Text, false),
+                ("detail", Declared::Named("Detail".to_string()), true),
+                (
+                    "resources",
+                    Declared::List(Box::new(Declared::Text)),
+                    false
+                ),
+            ],
+            "case \"openapi\": the envelope's members must be read from the document, \
+             got {declared:?}"
+        );
+    }
+
+    /// A draft-04 document is itself the root structure, named for the schema, and its
+    /// `definitions` are the rest.
+    #[test]
+    fn a_draft4_document_is_its_own_root_structure() {
+        let draft4 = r##"{"type":"object","properties":{"cause":{"$ref":"#/definitions/Cause"}},
+            "definitions":{"Cause":{"type":"object","properties":{"id":{"type":"string"}}}}}"##;
+        let structures = declared_structures(draft4, "JSONSchemaDraft4", "order.placed_v1");
+        let names: Vec<&str> = structures
+            .iter()
+            .map(|structure| structure.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["OrderPlacedV1", "Cause"],
+            "case \"draft4\": the root structure is named for the schema, got {names:?}"
+        );
+        assert_eq!(
+            structures[0].members[0].declared,
+            Declared::Named("Cause".to_string()),
+            "case \"draft4\": a definition reference must resolve to the structure, got {:?}",
+            structures[0].members[0]
+        );
+    }
+
+    /// A document that declares no named structure generates no source file.
+    #[test]
+    fn a_document_with_no_named_schema_generates_no_file() {
+        for (case, document, schema_type) in [
+            ("no components", r#"{"openapi":"3.0.0"}"#, "OpenApi3"),
+            ("not a document", "not json at all", "OpenApi3"),
+        ] {
+            let structures = declared_structures(document, schema_type, "demo");
+            assert!(
+                structures.is_empty(),
+                "case {case:?}: expected no structure, got {structures:?}"
+            );
+        }
+    }
+
+    /// The identifier cases: one tokenisation, three joinings.
+    #[test]
+    fn identifiers_are_built_from_the_json_name() {
+        for (name, upper, lower, snake) in [
+            ("detail-type", "DetailType", "detailType", "detail_type"),
+            ("bucketName", "BucketName", "bucketName", "bucket_name"),
+            ("AWSEvent", "AWSEvent", "aWSEvent", "awsevent"),
+            ("id", "Id", "id", "id"),
+        ] {
+            assert_eq!(
+                upper_camel(name),
+                upper,
+                "case {name:?}: wrong upper camel, got {}",
+                upper_camel(name)
+            );
+            assert_eq!(
+                lower_camel(name),
+                lower,
+                "case {name:?}: wrong lower camel, got {}",
+                lower_camel(name)
+            );
+            assert_eq!(
+                snake_case(name),
+                snake,
+                "case {name:?}: wrong snake case, got {}",
+                snake_case(name)
+            );
+        }
+        assert_eq!(
+            type_identifier("4you"),
+            "Schema4you",
+            "a name no type can be declared under is guarded, got {}",
+            type_identifier("4you")
+        );
+    }
+
+    /// The package is the schema name's segments below the one root every binding
+    /// shares.
+    #[test]
+    fn the_package_is_named_for_the_schema() {
+        for (schema, expected) in [
+            ("aws.s3@ObjectCreated", vec!["schema", "aws", "s3", "objectcreated"]),
+            ("order.placed_v1", vec!["schema", "order", "placed", "v1"]),
+            ("demo", vec!["schema", "demo"]),
+        ] {
+            let segments = package_segments(schema);
+            assert_eq!(
+                segments, expected,
+                "case {schema:?}: wrong package, got {segments:?}"
+            );
+        }
+    }
+
+    /// Every language renders the same structures, each in its own layout and types.
+    #[test]
+    fn every_language_renders_the_documents_structures() {
+        for target in Target::ALL.iter().copied() {
+            let archive = code_binding_archive(target, "aws.s3@ObjectCreated", "OpenApi3", OPENAPI);
+            let mut read = ::zip::ZipArchive::new(::std::io::Cursor::new(archive))
+                .unwrap_or_else(|error| {
+                    panic!("case {:?}: the body must be a zip archive: {error}", target.as_wire())
+                });
+            let names: Vec<String> = read
+                .file_names()
+                .map(|name| {
+                    name.expect("a listed entry carries a name")
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(
+                names.len(),
+                2,
+                "case {:?}: one file per structure, got {names:?}",
+                target.as_wire()
+            );
+            for name in &names {
+                assert!(
+                    name.starts_with(&format!(
+                        "{}schema/aws/s3/objectcreated/",
+                        target.source_root()
+                    )) && name.ends_with(&format!(".{}", target.extension())),
+                    "case {:?}: wrong layout for {name:?}",
+                    target.as_wire()
+                );
+            }
+            let mut texts = String::new();
+            for index in 0..read.len() {
+                let mut file = read.by_index(index).expect("an entry that was just listed");
+                let mut text = String::new();
+                ::std::io::Read::read_to_string(&mut file, &mut text)
+                    .expect("generated source is UTF-8");
+                texts.push_str(&text);
+            }
+            assert!(
+                texts.contains("Detail"),
+                "case {:?}: the referenced structure must be named, got {texts}",
+                target.as_wire()
+            );
+        }
     }
 }

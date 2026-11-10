@@ -33,6 +33,9 @@ hex = { workspace = true }
 # A stable digest of a published schema's name, so the AWS-managed catalogue's
 # per-schema metadata is the schema's own and the same in every process.
 sha2 = { workspace = true }
+# The ZIP archive `GetCodeBindingSource` answers with: a code binding's source is a
+# package of files, which is one archive.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

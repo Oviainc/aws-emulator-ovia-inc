@@ -1282,9 +1282,11 @@ pub struct ResolvedSchemaVersion<'a> {
 /// version in one language.
 ///
 /// It holds no generated source — this slice models the binding's LIFECYCLE only, as
-/// `PutCodeBinding` and `DescribeCodeBinding` report it. `GetCodeBindingSource`, which
-/// is what serves the generated source itself, is still a scaffold stub and answers
-/// 501; it owns the decision of what that source is.
+/// `PutCodeBinding` and `DescribeCodeBinding` report it. The source itself is COMPUTED
+/// from the schema version the binding is attached to, whose document never changes
+/// once written, by the generator in `crate::ops::get_code_binding_source`: storing a
+/// second copy of it here would be a copy that could disagree with the document it was
+/// generated from.
 #[derive(Debug, Clone)]
 pub struct CodeBinding {
     /// The language generation was asked for: one of [`CODE_BINDING_LANGUAGES`],

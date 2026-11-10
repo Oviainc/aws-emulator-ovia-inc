@@ -206,8 +206,15 @@ fn cases(stale_revision: &str, current_revision: &str) -> Vec<Case> {
             shape: "NotFoundException",
             code: CODE_RESOURCE_NOT_FOUND,
         },
-        // (`GetCodeBindingSource` is still scaffolded too, so the code-binding
-        // not-found row above is `DescribeCodeBinding`'s alone.)
+        Case {
+            case: "GetCodeBindingSource for a language no binding was put for",
+            method: "GET",
+            uri: format!("{}/language/Java8/source", schema_uri(REGISTRY, SCHEMA)),
+            body: None,
+            status: 404,
+            shape: "NotFoundException",
+            code: CODE_RESOURCE_NOT_FOUND,
+        },
         Case {
             case: "GetResourcePolicy for a registry that holds no policy",
             method: "GET",

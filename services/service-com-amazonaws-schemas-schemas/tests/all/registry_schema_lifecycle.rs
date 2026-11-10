@@ -59,6 +59,31 @@ impl Emulator {
         uri: &str,
         body: Option<Value>,
     ) -> Answer {
+        self.dispatch(region, method, uri, body, true).await
+    }
+
+    /// Dispatch one request and answer with the response body left UNPARSED where it is
+    /// not JSON.
+    ///
+    /// For the one operation whose output is an `httpPayload` blob
+    /// (`GetCodeBindingSource`): its success answer is an archive, which is no JSON
+    /// document, so [`Self::call`] would fail the case on it. A refusal still arrives as
+    /// this service's JSON error envelope, so [`Answer::body`] carries one when there is
+    /// one and [`Answer::raw`] carries the bytes either way.
+    pub(crate) async fn call_payload(&self, method: &str, uri: &str) -> Answer {
+        self.dispatch(REGION, method, uri, None, false).await
+    }
+
+    /// The one dispatch every call above goes through. `json_body` says whether a body
+    /// that is not JSON fails the case or is left to [`Answer::raw`].
+    async fn dispatch(
+        &self,
+        region: &str,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        json_body: bool,
+    ) -> Answer {
         let payload = body.map(|b| b.to_string()).unwrap_or_default();
         let request = http::Request::builder()
             .method(method)
@@ -94,13 +119,15 @@ impl Emulator {
         let raw = response.body().clone();
         let body = if raw.is_empty() {
             Value::Null
-        } else {
+        } else if json_body {
             serde_json::from_slice(&raw).unwrap_or_else(|e| {
                 panic!(
                     "{method} {uri} answered {status} with a body that is not JSON ({e}): {}",
                     String::from_utf8_lossy(&raw)
                 )
             })
+        } else {
+            serde_json::from_slice(&raw).unwrap_or(Value::Null)
         };
         Answer {
             status,
