@@ -43,6 +43,8 @@ mod error_message_member;
 mod error_response_contract;
 #[path = "all/input_constraint_refusals.rs"]
 mod input_constraint_refusals;
+#[path = "all/list_associations_pagination.rs"]
+mod list_associations_pagination;
 #[path = "all/microsoft_teams_channel_configuration.rs"]
 mod microsoft_teams_channel_configuration;
 #[path = "all/microsoft_teams_configured_teams.rs"]
