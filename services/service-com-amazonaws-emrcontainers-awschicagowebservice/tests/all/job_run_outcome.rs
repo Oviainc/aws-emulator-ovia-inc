@@ -15,10 +15,11 @@
 //!    the clock, so a client that polls `DescribeJobRun` eventually reads a terminal
 //!    `state` of the modelled `JobRunState` enum together with a `finishedAt` no earlier
 //!    than the run's `createdAt`, and the state the run is reported in brings its
-//!    `stateDetails` with it. The outcome here is the modelled FAILURE state with a
-//!    `failureReason` of the modelled `FailureReason` enum: this emulator executes no
-//!    Spark workload, so the driver a submission names never runs, and a run reported as
-//!    having completed would state an outcome nothing produced.
+//!    `stateDetails` with it. The end an admitted run nobody cancels reaches, while the
+//!    virtual cluster it was admitted to is available throughout, is the modelled state
+//!    for a run that finished, and it carries no `failureReason`
+//!    ([`crate::job_run_completion`] is this binary's suite for that rule and for the
+//!    other end).
 //! 2. `retryPolicyExecution.currentAttemptCount` is "the current number of attempts made
 //!    on the driver of the job", counted out of the run's own lifecycle: none while the
 //!    run is still waiting for a running slot, one from the admission that starts it, and
@@ -31,9 +32,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_emrcontainers_awschicagowebservice::ops::types::{
-    FAILURE_REASON_VALUES, JOB_RUN_STATE_VALUES,
-};
+use service_com_amazonaws_emrcontainers_awschicagowebservice::ops::types::JOB_RUN_STATE_VALUES;
 use service_com_amazonaws_emrcontainers_awschicagowebservice::state;
 
 use crate::virtual_cluster_job_run_loop::{field, instant_millis, text, Emr};
@@ -284,9 +283,9 @@ async fn every_admitted_job_run_reaches_a_terminal_state_on_the_clock() {
         );
         assert_eq!(
             reported,
-            state::JOB_FAILED,
-            "case {label:?}: nothing executes the driver, so the outcome is the modelled \
-             failure state, got {settled}"
+            state::JOB_COMPLETED,
+            "case {label:?}: a run admitted to an available cluster and left alone reaches \
+             the state of a run that finished, got {settled}"
         );
         let finished_at = instant_millis(&settled, "/finishedAt", label);
         assert!(
@@ -303,10 +302,10 @@ async fn every_admitted_job_run_reaches_a_terminal_state_on_the_clock() {
             "case {label:?}: the detail must describe the state the run is reported in, not \
              the one it was in before"
         );
-        let reason = text(&settled, "/failureReason", label);
         assert!(
-            FAILURE_REASON_VALUES.contains(&reason.as_str()),
-            "case {label:?}: failureReason {reason:?} is not a modelled FailureReason"
+            settled.get("failureReason").is_none(),
+            "case {label:?}: a run that finished did not fail, so it reports no \
+             failureReason: {settled}"
         );
         assert_eq!(
             attempts_made(&settled, label),
@@ -339,13 +338,17 @@ async fn every_admitted_job_run_reaches_a_terminal_state_on_the_clock() {
     let case = "the states filter over the finished runs";
     let ids: Vec<&String> = submitted.iter().map(|(_, id, _)| id).collect();
     for (query, expected) in [
-        (format!("?states={}", state::JOB_FAILED), ids.len()),
+        (format!("?states={}", state::JOB_COMPLETED), ids.len()),
         (
-            format!("?states={}&states={}", state::JOB_FAILED, state::JOB_RUNNING),
+            format!(
+                "?states={}&states={}",
+                state::JOB_COMPLETED,
+                state::JOB_RUNNING
+            ),
             ids.len(),
         ),
         (format!("?states={}", state::JOB_CANCELLED), 0),
-        (format!("?states={}", state::JOB_COMPLETED), 0),
+        (format!("?states={}", state::JOB_FAILED), 0),
     ] {
         let listed = listed_runs(&emr, case, &cluster, &query).await;
         assert_eq!(
@@ -354,7 +357,8 @@ async fn every_admitted_job_run_reaches_a_terminal_state_on_the_clock() {
             "case {case:?}: {query} must report {expected} runs, got {listed:?}"
         );
     }
-    let listed = listed_runs(&emr, case, &cluster, &format!("?states={}", state::JOB_FAILED)).await;
+    let listed =
+        listed_runs(&emr, case, &cluster, &format!("?states={}", state::JOB_COMPLETED)).await;
     for (_, id, _) in &submitted {
         let same = listed
             .iter()

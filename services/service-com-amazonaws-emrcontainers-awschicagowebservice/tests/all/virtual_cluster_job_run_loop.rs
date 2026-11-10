@@ -81,6 +81,10 @@ impl Answer {
 /// The emulator under test.
 pub(crate) struct Emr {
     router: MultiServiceRouter,
+    /// The one shared engine the mounted service was constructed from, kept so a suite
+    /// that has to stage a condition no request reaches can reach this service's store
+    /// ([`Self::store`]).
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emr {
@@ -90,8 +94,20 @@ impl Emr {
         // This suite signs nothing, so pin authentication off rather than inheriting the
         // process-wide switch.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// This service's store in that engine — the very one every handler above reads and
+    /// writes.
+    ///
+    /// For a fixture that has to stage a state the API offers no call for;
+    /// [`crate::job_run_completion`] stages compute that goes away behind a job run
+    /// nobody cancelled. Everything a request can set up is set up through a request.
+    pub(crate) fn store(
+        &self,
+    ) -> engine::ServiceState<state::ComAmazonawsEmrcontainersAwschicagowebserviceState> {
+        state::service_state(&*self.engine).expect("the emr-containers store is the engine's")
     }
 
     pub(crate) async fn send(&self, method: &str, path: &str, body: Option<Value>) -> Answer {

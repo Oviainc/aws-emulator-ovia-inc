@@ -88,17 +88,15 @@ pub const CLUSTER_TERMINATED: &str = "TERMINATED";
 /// `JobRunState` members this slice uses. Each is a value of the generated
 /// `JOB_RUN_STATE_VALUES` catalog in `ops::types::shared_types`.
 ///
-/// `JOB_SUBMITTED` is one of the two states no handler here writes: EMR on EKS reports it
+/// `JOB_SUBMITTED` is the one state no handler here writes: EMR on EKS reports it
 /// for a run handed to the scheduler, and this slice accepts a run `PENDING` and admits it
 /// to `RUNNING` from there. It is named because `job_state_is_terminal` and
 /// [`job_state_is_in_queue`] are written against the whole catalog, so a run in either
 /// waiting state is counted as queued.
 ///
-/// `JOB_COMPLETED` is the other: it reports a driver that ran to completion, and this
-/// slice executes no Spark workload, so the outcome every admitted run reaches is the
-/// modelled failure state ([`JOB_NOT_EXECUTED_STATE_DETAILS`]) rather than a success
-/// nothing produced. It is named because `job_state_is_terminal` covers the whole
-/// catalog, so a `COMPLETED` value a caller FILTERS on is still classified.
+/// `JOB_COMPLETED` is the outcome an admitted run the caller leaves alone reaches, and
+/// `JOB_FAILED` the one it reaches when the compute it was admitted to is no longer there
+/// to finish it ([`job_run_outcome`]).
 pub const JOB_PENDING: &str = "PENDING";
 pub const JOB_SUBMITTED: &str = "SUBMITTED";
 pub const JOB_RUNNING: &str = "RUNNING";
@@ -161,24 +159,41 @@ pub const JOB_CANCEL_PENDING_STATE_DETAILS: &str = "Job run cancellation request
 /// `JobRun$stateDetails` for a run a cancellation ended.
 pub const JOB_CANCELLED_STATE_DETAILS: &str = "Job run cancelled before it finished.";
 
-/// `JobRun$stateDetails` for the outcome an admitted run reaches here.
-///
-/// This service is a control plane: it records a job run faithfully, but it executes no
-/// Spark workload, so the driver a run names never runs and the run ends in the modelled
-/// failure state with a detail that says exactly that. Reporting such a run as having
-/// succeeded would state an outcome nothing produced.
-pub const JOB_NOT_EXECUTED_STATE_DETAILS: &str =
-    "The job driver was not executed: this emulator records job runs and runs no Spark \
-     workload, so the job run ended without running.";
+/// `JobRun$stateDetails` for a run whose driver ran to the end of the span this service
+/// gives it with nothing cancelling it and its compute up throughout.
+pub const JOB_COMPLETED_STATE_DETAILS: &str = "Job run completed.";
+
+/// `JobRun$stateDetails` for a run whose compute went away before its driver was done.
+pub const JOB_CLUSTER_UNAVAILABLE_STATE_DETAILS: &str =
+    "The virtual cluster this job run was admitted to is no longer available, so the job \
+     run did not finish.";
 
 /// `JobRun$failureReason` for that outcome, a value of the modelled `FailureReason` enum
 /// (`INTERNAL_ERROR`, `USER_ERROR`, `VALIDATION_ERROR`, `CLUSTER_UNAVAILABLE`).
 ///
-/// Nothing the submission carried is at fault — the two caller-facing values do not
-/// apply — and the reason the driver never ran is that there is no Kubernetes cluster
-/// behind the virtual cluster's container provider to run it on, which is the one this
-/// value names.
-pub const JOB_NOT_EXECUTED_FAILURE_REASON: &str = "CLUSTER_UNAVAILABLE";
+/// Nothing the submission carried is at fault — the two caller-facing values do not apply
+/// — and the run did not end for a fault of this service either: the compute behind the
+/// virtual cluster the run was admitted to stopped being available to it, which is the
+/// condition this value names.
+pub const JOB_CLUSTER_UNAVAILABLE_FAILURE_REASON: &str = "CLUSTER_UNAVAILABLE";
+
+/// The `JobRunState` an admitted run's driver ends in, and the `JobRun$failureReason` that
+/// end carries, given whether the compute the run was admitted to is still available to
+/// it.
+///
+/// A job run is work submitted to the virtual cluster's compute, so the end of its driver
+/// is a statement about that compute: while it is there, the driver this service admitted
+/// and nobody cancelled reached its end, which is the terminal state AWS reports for a run
+/// that finished and carries no `failureReason`; once it is gone, the run cannot be
+/// finished on it and ends in the modelled failure state for compute that is unavailable
+/// ([`JOB_CLUSTER_UNAVAILABLE_FAILURE_REASON`]).
+pub fn job_run_outcome(compute_available: bool) -> (&'static str, Option<&'static str>) {
+    if compute_available {
+        (JOB_COMPLETED, None)
+    } else {
+        (JOB_FAILED, Some(JOB_CLUSTER_UNAVAILABLE_FAILURE_REASON))
+    }
+}
 
 /// The `JobRun$stateDetails` — "additional details of the job run state" — a run reports
 /// once it has settled into `state`.
@@ -191,7 +206,8 @@ pub fn job_run_state_details(state: &str) -> Option<&'static str> {
         JOB_RUNNING => Some(JOB_RUNNING_STATE_DETAILS),
         JOB_CANCEL_PENDING => Some(JOB_CANCEL_PENDING_STATE_DETAILS),
         JOB_CANCELLED => Some(JOB_CANCELLED_STATE_DETAILS),
-        JOB_FAILED => Some(JOB_NOT_EXECUTED_STATE_DETAILS),
+        JOB_COMPLETED => Some(JOB_COMPLETED_STATE_DETAILS),
+        JOB_FAILED => Some(JOB_CLUSTER_UNAVAILABLE_STATE_DETAILS),
         _ => None,
     }
 }
@@ -1230,6 +1246,14 @@ pub struct JobRunRecord {
     pub pending: Option<PendingTransition>,
 }
 
+/// The transition a run's admission owes: the END of the run's driver.
+///
+/// A scheduled transition names the state it lands in, and the state the end of a driver
+/// lands in is not known until it falls due ([`job_run_outcome`]) — so what is scheduled
+/// is the end of a run whose compute carries it through, and the other end is reached by
+/// materialising this one against a compute that has gone.
+const JOB_DRIVER_END: &str = JOB_COMPLETED;
+
 impl JobRunRecord {
     /// Materialise this job run's transition if the clock has made it due.
     ///
@@ -1239,10 +1263,13 @@ impl JobRunRecord {
     ///
     /// The admission that starts a run is also what makes its OUTCOME due: a run AWS
     /// hands back in a non-terminal state reaches a terminal one, so once this run is
-    /// `RUNNING` the clock owes it the end of its driver [`JOB_OUTCOME_SPAN`] later. That
-    /// end is the modelled failure state: this service executes no Spark workload, so the
-    /// driver never runs and the run says so in its `stateDetails` and `failureReason`.
-    fn settle(&mut self, now: Instant) {
+    /// `RUNNING` the clock owes it the end of its driver [`JOB_OUTCOME_SPAN`] later.
+    ///
+    /// WHICH end it reaches is decided when that end falls due rather than when it was
+    /// scheduled, out of `compute_available` — whether the virtual cluster this run was
+    /// admitted to is still available to finish it ([`job_run_outcome`]) — so a run that
+    /// outlives its compute ends differently from one whose compute carried it through.
+    fn settle(&mut self, now: Instant, compute_available: bool) {
         let Some(pending) = self.pending.take() else {
             return;
         };
@@ -1250,18 +1277,24 @@ impl JobRunRecord {
             self.pending = Some(pending);
             return;
         }
-        self.state = pending.next_state.to_string();
-        self.state_details = job_run_state_details(pending.next_state).map(str::to_string);
-        if pending.next_state == JOB_RUNNING {
+        let mut failure_reason = None;
+        let next_state = if pending.next_state == JOB_DRIVER_END {
+            let (outcome, reason) = job_run_outcome(compute_available);
+            failure_reason = reason;
+            outcome
+        } else {
+            pending.next_state
+        };
+        self.state = next_state.to_string();
+        self.state_details = job_run_state_details(next_state).map(str::to_string);
+        if next_state == JOB_RUNNING {
             // The admission starts an attempt on the driver, and owes its outcome.
             self.attempt_count = self.attempt_count.saturating_add(1);
-            self.pending = Some(PendingTransition::due_in(JOB_FAILED, JOB_OUTCOME_SPAN));
+            self.pending = Some(PendingTransition::due_in(JOB_DRIVER_END, JOB_OUTCOME_SPAN));
         }
-        if job_state_is_terminal(pending.next_state) {
+        if job_state_is_terminal(next_state) {
             self.finished_at_millis = Some(pending.due_at_millis);
-            if pending.next_state == JOB_FAILED {
-                self.failure_reason = Some(JOB_NOT_EXECUTED_FAILURE_REASON.to_string());
-            }
+            self.failure_reason = failure_reason.map(str::to_string);
         }
     }
 
@@ -2074,25 +2107,29 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             // automatically". The run keeps the transition it already owes, with its due
             // instant in the past, so the first call after a slot frees starts it. Every
             // other transition (a cancellation, a teardown) answers to the clock alone.
-            let waiting_for_a_slot = self
-                .job_runs
-                .get(&id)
-                .and_then(|record| {
-                    let transition = record.pending.as_ref()?;
-                    Some(
-                        now >= transition.due_at
-                            && transition.next_state == JOB_RUNNING
-                            && !self.cluster_has_free_running_slot(&record.virtual_cluster_id),
-                    )
-                })
-                .unwrap_or(false);
+            let Some(record) = self.job_runs.get(&id) else {
+                continue;
+            };
+            let due_transition = record
+                .pending
+                .as_ref()
+                .filter(|transition| now >= transition.due_at)
+                .map(|transition| transition.next_state);
+            let waiting_for_a_slot = due_transition == Some(JOB_RUNNING)
+                && !self.cluster_has_free_running_slot(&record.virtual_cluster_id);
+            // The end of a run's driver lands in the state the compute it was admitted to
+            // accounts for, so the cluster that hosts the run is read here, before the run
+            // is moved, and only for the transition that end is (see
+            // [`JobRunRecord::settle`]).
+            let compute_available = due_transition == Some(JOB_DRIVER_END)
+                && self.job_run_compute_is_available(record);
             if waiting_for_a_slot {
                 self.pending_job_runs.insert(id);
                 continue;
             }
             let still_pending = match self.job_runs.get_mut(&id) {
                 Some(record) => {
-                    record.settle(now);
+                    record.settle(now, compute_available);
                     record.pending.is_some()
                 }
                 None => false,
@@ -2167,6 +2204,23 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             current_concurrent_job_runs: self
                 .cluster_run_count(virtual_cluster_id, |state| state == JOB_RUNNING),
         }
+    }
+
+    /// Whether the compute a stored job run was admitted to is still available to finish
+    /// it: the virtual cluster the run names is still held at the run's own region and
+    /// still `RUNNING`.
+    ///
+    /// A job run is work submitted to ONE virtual cluster's compute
+    /// (`POST /virtualclusters/{virtualClusterId}/jobruns`), so this is what decides the
+    /// end its driver reaches ([`job_run_outcome`]): a cluster past `RUNNING` is being or
+    /// has been torn down, and a cluster this endpoint no longer holds is gone, and in
+    /// neither case is there compute left to carry the run's driver to its end.
+    fn job_run_compute_is_available(&self, record: &JobRunRecord) -> bool {
+        self.virtual_clusters
+            .get(&record.virtual_cluster_id)
+            .is_some_and(|cluster| {
+                cluster.region == record.region && cluster.state == CLUSTER_RUNNING
+            })
     }
 
     /// Whether this cluster may take one more RUNNING job run right now.

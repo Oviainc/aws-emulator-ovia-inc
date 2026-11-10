@@ -121,7 +121,7 @@ async fn cancelling_a_terminal_job_run_is_refused_with_the_cancellable_state_wor
         TerminalRun {
             label: "a run nobody cancelled, settled by the clock",
             route: Route::LeftAlone,
-            expected_state: state::JOB_FAILED,
+            expected_state: state::JOB_COMPLETED,
         },
     ];
     for row in rows {
