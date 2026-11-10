@@ -20,10 +20,10 @@
 //!    named keys and is idempotent. What either writes is what `ListTagsForResource` and
 //!    the resource's own reader read back, because there is one stored tag set, not two.
 //! 3. ABSENCE. An ARN that names no resource this store holds — an unknown id, another app
-//!    environment, a deleted resource, a collection this service does not hold, another
-//!    service's ARN, or a string that is not an ARN at all — is refused on all three
-//!    operations with HTTP 404 and this service's one not-found literal, and changes
-//!    nothing.
+//!    environment, a deleted resource, a collection this service names no resource kind
+//!    with, another service's ARN, or a string that is not an ARN at all — is refused on
+//!    all three operations with HTTP 404 and this service's one not-found literal, and
+//!    changes nothing.
 //! 4. The partition, region and account elements of the ARN do not decide which resource
 //!    it names: this store keys every resource by (appId, environmentName, id) alone and
 //!    the emulator serves a single account, so the same resource is addressed through any
@@ -56,8 +56,9 @@ const ACCOUNT: &str = "000000000000";
 /// (`arn:aws:amplifyuibuilder:<region>:<account>:app/<appId>/environment/<environmentName>/<collection>/<id>`),
 /// which is also the collection element of that kind's own REST URIs
 /// (`/app/{appId}/environment/{environmentName}/components/{id}`, see this crate's
-/// `OPERATIONS.md`).
-const COLLECTIONS: [&str; 3] = ["components", "forms", "themes"];
+/// `OPERATIONS.md`) — one per resource kind of this service whose record holds a tag set
+/// (`Component$tags`, `Form$tags`, `Theme$tags`, `CodegenJob$tags`).
+const COLLECTIONS: [&str; 4] = ["components", "forms", "themes", "codegen-jobs"];
 
 /// The message of a not-found refusal on a reporting call — this service's one literal for
 /// an identifier that names no resource, asserted in `resource_error_messages.rs` too.
@@ -245,6 +246,8 @@ fn create_payload(collection: &str, name: &str, tags: Option<&Value>) -> Value {
             "schemaVersion": "1.0",
         }),
         "themes" => json!({"name": name, "values": []}),
+        // A codegen job carries no name; `StartCodegenJobData` requires its render config.
+        "codegen-jobs" => json!({"renderConfig": {"react": {}}}),
         other => panic!("no create payload is written for {other:?}"),
     };
     if let Some(tags) = tags {
@@ -579,8 +582,12 @@ async fn an_arn_that_names_no_resource_is_absent_on_every_tagging_operation() {
             arn("components", APP_ID, ENVIRONMENT, &deleted_id),
         ),
         (
-            "a collection this service holds no resource of",
+            "an id that names no resource of the ARN's collection",
             arn("codegen-jobs", APP_ID, ENVIRONMENT, &live_component),
+        ),
+        (
+            "a collection this service names no resource kind with",
+            arn("widgets", APP_ID, ENVIRONMENT, &live_component),
         ),
         (
             "another service's ARN",

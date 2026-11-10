@@ -38,12 +38,14 @@
 //!
 //! ## The tagging surface
 //!
-//! A component, a form and a theme each carry the tag set their create stored, so
-//! the tagging operations hold no store of their own: `ListTagsForResource`
-//! reports, and `TagResource` / `UntagResource` change, the `tags` of the one
-//! record the resource's own reader answers from. [`parse_resource_arn`] is what
-//! resolves a `resourceArn` to that record, and [`resource_tags`] /
-//! [`with_resource_tags_mut`] are the one read and the one write over it.
+//! Every record of this service that holds a tag set — a component, a form, a
+//! theme and a codegen job each carry the one their create or start stored — is
+//! reached through the tagging surface, which holds no store of its own:
+//! `ListTagsForResource` reports, and `TagResource` / `UntagResource` change, the
+//! `tags` of the one record the resource's own reader answers from.
+//! [`parse_resource_arn`] is what resolves a `resourceArn` to that record, and
+//! [`resource_tags`] / [`with_resource_tags_mut`] are the one read and the one
+//! write over it.
 //!
 //! ## The page walk
 //!
@@ -1013,6 +1015,21 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
     ) -> Option<&StoredCodegenJob> {
         self.codegen_jobs_in(app_id, environment_name)
             .iter()
+            .find(|job| job.id == id)
+    }
+
+    /// The codegen job `id` names in one app environment, for a caller that
+    /// changes it — the counterpart of [`Self::component_mut`], [`Self::form_mut`]
+    /// and [`Self::theme_mut`].
+    pub fn codegen_job_mut(
+        &mut self,
+        app_id: &str,
+        environment_name: &str,
+        id: &str,
+    ) -> Option<&mut StoredCodegenJob> {
+        self.codegen_jobs
+            .get_mut(&(app_id.to_string(), environment_name.to_string()))?
+            .iter_mut()
             .find(|job| job.id == id)
     }
 
@@ -2029,26 +2046,36 @@ pub const ARN_SERVICE: &str = "amplifyuibuilder";
 
 /// A resource kind the tagging surface addresses.
 ///
-/// Amplify UI Builder names a component, a form and a theme with an ARN of the
-/// documented form
+/// Amplify UI Builder names each of its app-environment resources with an ARN of
+/// the documented form
 /// `arn:<partition>:amplifyuibuilder:<region>:<account>:app/<appId>/environment/<environmentName>/<collection>/<id>`,
-/// whose `<collection>` is [`TaggedKind::collection`]. The model declares no ARN
-/// shape to read the form off — each tagging input's `resourceArn` targets the
-/// bare `String` with neither `@length` nor `@pattern`
+/// whose `<collection>` is [`TaggedKind::collection`] — the element of that
+/// resource's own ARN template in the model
+/// (`smithy_query(query="shape", shape="ComponentResource,FormResource,ThemeResource,CodegenJobResource")`).
+/// The model declares no ARN shape to read the form off — each tagging input's
+/// `resourceArn` targets the bare `String` with neither `@length` nor `@pattern`
 /// (`smithy_query(query="operation", operation="ListTagsForResource,TagResource,UntagResource")`)
-/// — so the form is the documented one, and these three are the kinds of this
-/// service whose own records hold a tag set.
+/// — so the form is the documented one.
+///
+/// The kinds listed here are EVERY kind of this service whose own record holds a
+/// tag set: a component, a form and a theme carry the tags their create stored,
+/// and a codegen job carries the tags its start stored (`CodegenJob$tags`, which
+/// `GetCodegenJob` reports). A record that holds a tag set is reachable through
+/// the operations modelled to read and change one, so the two readers of a
+/// resource — its own `Get…` and `ListTagsForResource` — never disagree about
+/// whether it exists or about what it carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaggedKind {
     Component,
     Form,
     Theme,
+    CodegenJob,
 }
 
 impl TaggedKind {
     /// Every kind the tagging surface addresses, in the order the resource's own
     /// collection URIs are listed in this crate's `OPERATIONS.md`.
-    pub const ALL: [Self; 3] = [Self::Component, Self::Form, Self::Theme];
+    pub const ALL: [Self; 4] = [Self::Component, Self::Form, Self::Theme, Self::CodegenJob];
 
     /// The ARN path element naming the collection that holds this kind — the same
     /// element the resource's own REST URIs use
@@ -2058,6 +2085,7 @@ impl TaggedKind {
             Self::Component => "components",
             Self::Form => "forms",
             Self::Theme => "themes",
+            Self::CodegenJob => "codegen-jobs",
         }
     }
 
@@ -2142,6 +2170,9 @@ pub fn resource_tags(
         TaggedKind::Theme => state
             .theme(app, environment, id)
             .map(|theme| theme.tags.clone()),
+        TaggedKind::CodegenJob => state
+            .codegen_job(app, environment, id)
+            .map(|job| job.tags.clone()),
     }
 }
 
@@ -2173,6 +2204,9 @@ pub fn with_resource_tags_mut<R>(
         TaggedKind::Theme => state
             .theme_mut(app, environment, id)
             .map(|theme| change(&mut theme.tags)),
+        TaggedKind::CodegenJob => state
+            .codegen_job_mut(app, environment, id)
+            .map(|job| change(&mut job.tags)),
     }
 }
 

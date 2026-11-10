@@ -20,6 +20,9 @@ mod codegen_job_list;
 #[path = "all/codegen_job_scope.rs"]
 mod codegen_job_scope;
 
+#[path = "all/codegen_job_tagging.rs"]
+mod codegen_job_tagging;
+
 #[path = "all/component_lifecycle.rs"]
 mod component_lifecycle;
 

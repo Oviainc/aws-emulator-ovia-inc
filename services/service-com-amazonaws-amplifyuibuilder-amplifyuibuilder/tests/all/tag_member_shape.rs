@@ -56,33 +56,27 @@ struct Kind {
     collection: &'static str,
     /// Whether this kind has an `Export…` operation reporting whole records.
     exported: bool,
-    /// Whether an ARN of this kind resolves on the tagging surface — the collection
-    /// element is also the collection element of the documented ARN form for the three
-    /// kinds `ListTagsForResource` reaches.
-    tagged_by_arn: bool,
 }
 
-/// The four records of this service that carry a `Tags` member.
+/// The four records of this service that carry a `Tags` member. Each one's collection
+/// element is also the collection element of its documented ARN form, so the tagging
+/// surface reaches every one of them.
 const KINDS: [Kind; 4] = [
     Kind {
         collection: "components",
         exported: true,
-        tagged_by_arn: true,
     },
     Kind {
         collection: "forms",
         exported: true,
-        tagged_by_arn: true,
     },
     Kind {
         collection: "themes",
         exported: true,
-        tagged_by_arn: true,
     },
     Kind {
         collection: "codegen-jobs",
         exported: false,
-        tagged_by_arn: false,
     },
 ];
 
@@ -334,20 +328,18 @@ async fn assert_every_reader_reports(
         );
     }
 
-    if kind.tagged_by_arn {
-        let listed = list_tags(router, kind, id).await;
-        assert_eq!(
-            listed.status, 200,
-            "case {case:?}: ListTagsForResource must answer HTTP 200, got {} with {:?}",
-            listed.status, listed.body
-        );
-        assert_eq!(
-            &listed.tags(),
-            expected,
-            "case {case:?}: ListTagsForResource must report {expected:?}, got {:?}",
-            listed.tags()
-        );
-    }
+    let listed = list_tags(router, kind, id).await;
+    assert_eq!(
+        listed.status, 200,
+        "case {case:?}: ListTagsForResource must answer HTTP 200, got {} with {:?}",
+        listed.status, listed.body
+    );
+    assert_eq!(
+        &listed.tags(),
+        expected,
+        "case {case:?}: ListTagsForResource must report {expected:?}, got {:?}",
+        listed.tags()
+    );
 }
 
 /// The tag sets a create supplies, differing along what the rule generalises over: whether
@@ -417,8 +409,7 @@ async fn every_tagged_record_reports_its_tag_set_as_a_map() {
 async fn a_removal_that_empties_a_tag_set_leaves_the_empty_map() {
     let router = emulator();
 
-    for kind in KINDS.iter().filter(|kind| kind.tagged_by_arn) {
-        let kind = *kind;
+    for kind in KINDS {
         let created = create(&router, kind, "Emptied", None).await;
         assert_eq!(
             created.status, 200,
