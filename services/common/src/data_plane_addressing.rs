@@ -17,9 +17,11 @@
 //! planes cannot drift on which requests they claim: the reserved path segment that names a
 //! plane ([`EMULATOR_PATH_NAMESPACE`]), the first path segment and the rest
 //! ([`first_segment`]), the host without its userinfo or port ([`host_only`]), the port a
-//! client addressed ([`addressed_port`]), and whether a host names a SERVICE at all
+//! client addressed ([`addressed_port`]), whether a host names a SERVICE at all
 //! ([`names_a_service`]) — which is what separates the emulator's own endpoint from
-//! another service's.
+//! another service's — and the address of the endpoint this emulator answers on, which is
+//! what a DISCOVERY operation publishes for a plane served at the front door
+//! ([`emulator_endpoint_authority`]).
 //!
 //! Services still carrying their own copy of these: this module postdates them, and
 //! `grep -rln 'EMULATOR_PATH_NAMESPACE' services/*/src` lists them (today the API Gateway,
@@ -139,6 +141,33 @@ pub fn reached_endpoint_host(
 #[must_use]
 pub fn listener_authority(listener: &::emulator_server::ResourceListener) -> String {
     host_port_authority(&listener.host(), listener.port())
+}
+
+/// The `host[:port]` of the ONE endpoint this emulator serves its whole surface at — what
+/// a DISCOVERY operation publishes for a plane the client then DIALS, when that plane is
+/// served at the emulator's own front door rather than on a listener of its own.
+///
+/// [`::smithy_server_runtime::OperationContext::endpoint`] is "the base URL a later request
+/// addresses… Callers send normally signed requests to it"; this is that base without its
+/// scheme ([`url_authority`]), because what such an operation publishes is an address a
+/// client appends a path to, not a URL.
+///
+/// It is the data port's own published base, so it does not depend on which host the
+/// request that read it carried: an endpoint discovered through an in-process call is
+/// published at the same address as one a client discovered itself.
+#[must_use]
+pub fn emulator_endpoint_authority(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    url_authority(ctx.endpoint().as_str()).to_string()
+}
+
+/// The authority of `url`: what follows its `scheme://`, or the whole value when it names
+/// no scheme — which is an authority already.
+#[must_use]
+pub fn url_authority(url: &str) -> &str {
+    url.split_once("://")
+        .map_or(url, |(_scheme, authority)| authority)
 }
 
 /// A `host:port` authority, with an IPv6 host bracketed as RFC 3986 requires
@@ -288,8 +317,28 @@ mod tests {
     }
 
     #[test]
-    fn a_listeners_address_is_written_as_a_url_parses_it() {
-        // The rows span the bind addresses a core listener reports: an IPv4 literal, an
+    fn an_endpoint_base_reads_as_the_authority_a_client_dials() {
+        // The rows span the bases `OperationContext::endpoint` reports: the unserved
+        // base, a loopback bind with a port, a bracketed IPv6 bind, a name, and a value
+        // that is an authority already.
+        let cases: &[(&str, &str)] = &[
+            ("https://emulator.invalid", "emulator.invalid"),
+            ("https://127.0.0.1:39355", "127.0.0.1:39355"),
+            ("https://[::1]:9297", "[::1]:9297"),
+            ("http://localhost:9297", "localhost:9297"),
+            ("127.0.0.1:9297", "127.0.0.1:9297"),
+        ];
+        for (base, expected) in cases {
+            let authority = url_authority(base);
+            assert_eq!(
+                authority, *expected,
+                "case {base:?}: expected {expected:?}, got {authority:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listeners_address_is_written_as_a_url_parses_it() {        // The rows span the bind addresses a core listener reports: an IPv4 literal, an
         // IPv6 literal (bracketed here), one already bracketed, and a name.
         let cases: &[(&str, u16, &str)] = &[
             ("127.0.0.1", 9297, "127.0.0.1:9297"),

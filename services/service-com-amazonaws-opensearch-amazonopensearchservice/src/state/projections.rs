@@ -399,14 +399,14 @@ pub fn published_domain_address(emulator_endpoint: &str, domain_name: &str) -> S
 /// It is the data port's own published base, so it does not depend on which host the
 /// request that read it carried: a domain CloudFormation created through an in-process
 /// call publishes the same address as one a client created itself.
+///
+/// The reading itself is the shared one every plane of this emulator publishes its
+/// address by (`service_common::data_plane_addressing`), so this service cannot drift
+/// from it.
 pub fn emulator_endpoint_authority(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
 ) -> String {
-    let endpoint = ctx.endpoint();
-    let base = endpoint.as_str();
-    base.split_once("://")
-        .map_or(base, |(_scheme, authority)| authority)
-        .to_string()
+    ::service_common::data_plane_addressing::emulator_endpoint_authority(ctx)
 }
 
 /// The host a VPC-access domain is reached on over IPv4 — what

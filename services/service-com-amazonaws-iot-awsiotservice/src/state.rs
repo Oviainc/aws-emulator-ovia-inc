@@ -23,13 +23,15 @@
 //! the `jobId` it documents as unique for the account), whose per-thing EXECUTIONS
 //! live in the shared store the IoT Jobs data plane serves (see
 //! [`job_execution_store`]), and the account's IoT ENDPOINT IDENTIFIERS — the
-//! `<identifier>` of `<identifier>.iot.<region>.amazonaws.com`, the account-specific
-//! prefix every IoT endpoint address is built from. `DescribeEndpoint` is documented
-//! as "returns or creates a unique endpoint specific to the Amazon Web Services
-//! account making the call. The first time DescribeEndpoint is called, an endpoint is
-//! created. All subsequent calls to DescribeEndpoint return the same endpoint", so the
-//! identifier is recorded here on the call that creates it and read back by every
-//! later call.
+//! account-specific prefix AWS names an account's IoT endpoint by
+//! (`<identifier>.iot.<region>.amazonaws.com`), which identifies the endpoint
+//! `DescribeEndpoint` created for a region (that call PUBLISHES the address this
+//! emulator serves that endpoint at; see `ops::describe_endpoint`). `DescribeEndpoint`
+//! is documented as "returns or creates a unique endpoint specific to the Amazon Web
+//! Services account making the call. The first time DescribeEndpoint is called, an
+//! endpoint is created. All subsequent calls to DescribeEndpoint return the same
+//! endpoint", so the identifier is recorded here on the call that creates it and read
+//! back by every later call.
 //!
 //! It also holds the account's THING TYPES, keyed by `thingTypeName` for the same
 //! reason: the name is the type's identity and the `@httpLabel` of

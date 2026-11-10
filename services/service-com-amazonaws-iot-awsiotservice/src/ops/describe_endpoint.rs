@@ -2,10 +2,10 @@
 
 //! @op DescribeEndpoint
 //!
-//! Implemented: resolves the account's IoT endpoint identifier for the region the
-//! request was signed for — creating and persisting it on the first call, reading the
-//! persisted one on every later call — and renders the address of the requested
-//! endpoint type from it.
+//! Implemented: resolves the account's IoT endpoint for the region the request was
+//! signed for — creating and persisting it on the first call, reading the persisted one
+//! on every later call — and answers with the address that endpoint is SERVED at, which
+//! is the address of this emulator's own endpoint.
 //!
 //! ## Shape of an operation
 //!
@@ -110,11 +110,11 @@ impl From<DescribeEndpointErrorModeled> for DescribeEndpointError {
     }
 }
 
-/// Longest region token this operation will put in an endpoint address.
+/// Longest region token this operation will key an account's endpoint record by.
 ///
-/// The region comes from the caller's credential scope, and the address is a
-/// hostname, so the token is bounded like the DNS label it becomes (RFC 1035 §2.3.4:
-/// 63 octets).
+/// The region comes from the caller's credential scope and names the Region whose
+/// endpoint was asked for, which AWS carries as one label of that endpoint's hostname,
+/// so the token is bounded like the DNS label it is (RFC 1035 §2.3.4: 63 octets).
 const MAX_REGION_LENGTH: usize = 63;
 
 /// The endpoint types `DescribeEndpoint` serves.
@@ -171,34 +171,40 @@ impl EndpointType {
             .copied()
             .find(|candidate| candidate.token() == requested)
     }
-
-    /// The hostname of this endpoint type for `identifier` in `region`.
-    ///
-    /// The forms are the ones the AWS IoT Developer Guide publishes for an account's
-    /// endpoints ("AWS IoT device data and service endpoints"): the data endpoint is
-    /// the `<identifier>.iot.<region>.amazonaws.com` the `endpointAddress` member
-    /// documents, its ATS variant suffixes the identifier with `-ats`, and the
-    /// credential-provider and Jobs endpoints insert their own `credentials` /
-    /// `jobs` label. Every one of them is built from the same account identifier.
-    pub fn address(self, identifier: &str, region: &str) -> String {
-        match self {
-            Self::Data => format!("{identifier}.iot.{region}.amazonaws.com"),
-            Self::DataAts => format!("{identifier}-ats.iot.{region}.amazonaws.com"),
-            Self::CredentialProvider => {
-                format!("{identifier}.credentials.iot.{region}.amazonaws.com")
-            }
-            Self::Jobs => format!("{identifier}.jobs.iot.{region}.amazonaws.com"),
-        }
-    }
 }
 
-/// The region this request's endpoint address names: the region of its SigV4
-/// credential scope ([`crate::state::request_region`], the same region this service
-/// scopes a minted ARN to), lowercased because a hostname label is.
+/// The address this account's IoT endpoint is PUBLISHED at: the `host[:port]` of the one
+/// endpoint this emulator serves its whole surface at.
 ///
-/// A region that is not a hostname label (an endpoint address is a hostname) falls
-/// back to [`crate::state::DEFAULT_REGION`] rather than rendering an address that is
-/// not a name.
+/// `endpointAddress` is not a label a client reads — it is the address it then DIALS:
+/// "Returns or creates a unique endpoint specific to the Amazon Web Services account
+/// making the call", and every SDK sample builds its IoT data, Jobs or credentials client
+/// with that value as its endpoint. So the address announced has to be one THIS emulator
+/// answers on, with the configuration the calling client already has; the host AWS names
+/// an account's endpoint resolves off this machine, and a client sent there leaves the
+/// emulator entirely and reaches no data plane at all.
+///
+/// What this emulator answers on is its own front door
+/// ([`::service_common::data_plane_addressing::emulator_endpoint_authority`]), which binds
+/// the whole surface — the IoT control plane, the IoT data plane, and the Jobs and
+/// Commands data plane the discovered endpoint is used for — and resolves a request to the
+/// service its SigV4 credential scope names, so a client built from this address reaches
+/// the plane it signs for. It is therefore the address of EVERY endpoint type: one
+/// endpoint serves them all here, where AWS gives each its own hostname.
+///
+/// Scheme and host only, no path: the value is an address a client appends the modelled
+/// path to, exactly as the `identifier.iot.region.amazonaws.com` form the member
+/// documents is.
+fn published_endpoint_address(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::service_common::data_plane_addressing::emulator_endpoint_authority(ctx)
+}
+
+/// The region whose endpoint this request asks for: the region of its SigV4 credential
+/// scope ([`crate::state::request_region`], the same region this service scopes a minted
+/// ARN to), lowercased because the hostname label AWS carries it as is.
+///
+/// A region that is not a hostname label falls back to [`crate::state::DEFAULT_REGION`]
+/// rather than keying an account's endpoint by a value that names no Region.
 fn endpoint_region(parts: &::http::request::Parts) -> String {
     let region = crate::state::request_region(parts).to_ascii_lowercase();
     let is_label = !region.is_empty()
@@ -318,15 +324,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The region is read from the request's credential scope, so the address
-        // names the region the caller addressed; the account is the emulator's own.
+        // The region is read from the request's credential scope, so the endpoint
+        // resolved is the one of the Region the caller addressed; the account is the
+        // emulator's own.
         let region = endpoint_region(ctx.parts());
         let account_id = ::engine::emulator_account_id();
 
         // "Returns or creates": the first call in a region creates the account's
-        // endpoint identifier and records it, every later call answers from that
-        // record, so all of this account's endpoint addresses share one prefix and
-        // repeating the call returns the same endpoint.
+        // endpoint there and records its identifier, every later call reads that record,
+        // so this account has ONE endpoint per region and repeating the call returns
+        // the same endpoint.
         //
         // The region is read from the caller's credential scope, so the set of keys the
         // record store is grown by is client-influenced, and that store is BOUNDED:
@@ -334,19 +341,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::MAX_ENDPOINT_REGIONS` regions and records nothing past that
         // cap, so no sequence of requests can grow this service's state without limit by
         // varying the signed region. Answering past the cap costs nothing observable:
-        // the identifier is a pure function of the account and the region
-        // (`crate::state::derive_endpoint_identifier`), so the address a caller is told
-        // never depends on whether a record for it fit.
-        let (identifier, created) = {
+        // the identifier a record holds is a pure function of the account and the region
+        // (`crate::state::derive_endpoint_identifier`).
+        let created = {
             let mut store = state.lock();
             let already_created = store.endpoint_identifier(&region).is_some();
-            (
-                store.endpoint_identifier_or_create(account_id, &region),
-                !already_created,
-            )
+            store.endpoint_identifier_or_create(account_id, &region);
+            !already_created
         };
 
-        let endpoint_address = endpoint_type.address(&identifier, &region);
+        // WHERE that endpoint answers, which is what the caller is told: this emulator's
+        // own endpoint, the one address its IoT planes are served at.
+        let endpoint_address = published_endpoint_address(ctx);
 
         audit(
             ctx,

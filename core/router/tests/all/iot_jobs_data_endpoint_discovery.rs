@@ -13,9 +13,9 @@
 //! first), NOT on the `Host` header, so a jobs-data request would be served
 //! whatever host it addressed; the second leg therefore proves the data plane is
 //! mounted, reachable and stateful at the address discovery hands back, not that
-//! the host is the dispatch key. The address itself is pinned here per endpoint
-//! type — each type's documented host form, the two types differing, and a
-//! repeated call reporting the identical address — and more thoroughly in
+//! the host is the dispatch key. The address itself is pinned here as the address
+//! this emulator is SERVED at — the one a client can dial, for every endpoint type
+//! and across repeated calls — and more thoroughly in
 //! `services/service-com-amazonaws-iot-awsiotservice/tests/all/describe_endpoint.rs`.
 //!
 //! Assembling the router costs stack (see `boot_serve.rs`), so it is built — and
@@ -25,12 +25,22 @@ use std::sync::Arc;
 
 use aws_emulator_router::{build_router, InMemoryEngine};
 use serde_json::Value;
+use smithy_server_runtime::EndpointUrl;
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// The region every request below is signed for.
 const REGION: &str = "us-east-1";
+
+/// The address this emulator is served at, as the core publishes it from its data
+/// port — the base every address a handler hands out names. A client reaches the
+/// emulator here and nowhere else, which is why discovery has to report it.
+const SERVED_AT: &str = "https://127.0.0.1:39355";
+
+/// The `host[:port]` of [`SERVED_AT`]: what a published address is, since what a
+/// client is handed is an address it appends a path to, not a URL.
+const SERVED_AUTHORITY: &str = "127.0.0.1:39355";
 
 /// A command for the data-plane leg to start an execution of. Its account
 /// segment is arbitrary: the Jobs data plane reads the thing name out of the
@@ -42,14 +52,15 @@ const REGION: &str = "us-east-1";
 /// scaffold (its own issue), so this test writes the entry that create will.
 const COMMAND_ARN: &str = "arn:aws:iot:us-east-1:111122223333:command/reboot";
 
-/// One endpoint type a client can discover its data plane with, and the host
-/// form AWS publishes for it: `{identifier}` is the account's endpoint
-/// identifier and `{region}` the signed region.
+/// One endpoint type a client can discover its data plane with.
+///
+/// There is no per-type host form here: AWS names each type its own hostname, and
+/// this emulator serves every one of those endpoints at the single endpoint it
+/// answers on, so each type resolves to that one address — and a client built on
+/// any of them reaches the plane its SigV4 scope names.
 struct TypeCase {
     /// The `endpointType` the discovery call names.
     endpoint_type: &'static str,
-    /// What follows the identifier label in that type's address.
-    host_suffix: &'static str,
     /// The thing this row drives the data plane with, so two rows cannot see
     /// each other's job executions.
     thing_name: &'static str,
@@ -61,12 +72,10 @@ struct TypeCase {
 const TYPE_CASES: &[TypeCase] = &[
     TypeCase {
         endpoint_type: "iot:Data-ATS",
-        host_suffix: "-ats.iot.{region}.amazonaws.com",
         thing_name: "discovery-probe-ats",
     },
     TypeCase {
         endpoint_type: "iot:Jobs",
-        host_suffix: ".jobs.iot.{region}.amazonaws.com",
         thing_name: "discovery-probe-jobs",
     },
 ];
@@ -78,23 +87,6 @@ fn authorization(signing_name: &str) -> String {
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{signing_name}/aws4_request, \
          SignedHeaders=host;x-amz-date, Signature=deadbeef"
     )
-}
-
-/// The identifier label of `address` given the host form `suffix` it must carry,
-/// asserting the form as it goes.
-fn identifier_of(case: &str, address: &str, suffix: &str) -> String {
-    let identifier = address.strip_suffix(suffix).unwrap_or_else(|| {
-        panic!("case {case}: expected an address ending in {suffix}, got {address:?}")
-    });
-    assert!(
-        !identifier.is_empty()
-            && identifier
-                .chars()
-                .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit()),
-        "case {case}: expected a lowercase-alphanumeric identifier label before {suffix}, \
-         got {identifier:?} from {address:?}"
-    );
-    identifier.to_string()
 }
 
 #[test]
@@ -113,6 +105,11 @@ fn a_discovered_iot_endpoint_address_serves_the_jobs_data_plane() {
                 .expect("register the command this test starts");
             let mut router = build_router(engine);
             router.set_request_authentication(false);
+            // Serve the emulator at an address a client can dial, as the core does
+            // when its data port starts: that is the address discovery must report.
+            router.set_url_base(
+                EndpointUrl::parse(SERVED_AT).expect("the served base is a usable endpoint"),
+            );
 
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
@@ -139,7 +136,7 @@ fn a_discovered_iot_endpoint_address_serves_the_jobs_data_plane() {
                 let (status, rendered, parsed) = call(
                     "GET",
                     format!(
-                        "https://iot.{REGION}.amazonaws.com/endpoint?endpointType={endpoint_type}"
+                        "https://{SERVED_AUTHORITY}/endpoint?endpointType={endpoint_type}"
                     ),
                     "iot",
                     String::new(),
@@ -158,12 +155,17 @@ fn a_discovered_iot_endpoint_address_serves_the_jobs_data_plane() {
                     .to_string()
             };
 
-            let mut discovered: Vec<(&str, String, String)> = Vec::new();
             for case in TYPE_CASES {
                 let endpoint_type = case.endpoint_type;
-                let suffix = case.host_suffix.replace("{region}", REGION);
                 let address = discover(endpoint_type);
-                let identifier = identifier_of(endpoint_type, &address, &suffix);
+
+                // The announced address is the one this emulator is served at: a
+                // client that follows it reaches the emulator, not a host outside it.
+                assert_eq!(
+                    address, SERVED_AUTHORITY,
+                    "case {endpoint_type}: discovery must announce the address this \
+                     emulator is served at, expected {SERVED_AUTHORITY}, got {address}"
+                );
 
                 // "All subsequent calls to DescribeEndpoint return the same
                 // endpoint": a client that discovers twice must be sent to one
@@ -234,29 +236,6 @@ fn a_discovered_iot_endpoint_address_serves_the_jobs_data_plane() {
                     "case {endpoint_type}: the execution started at {address} must be the one \
                      queued for {}, got {rendered}",
                     case.thing_name
-                );
-
-                discovered.push((endpoint_type, address, identifier));
-            }
-
-            // Each endpoint type names its own host, and every one of this
-            // account's endpoints carries the one identifier the control plane
-            // created for the region.
-            for (endpoint_type, address, identifier) in &discovered {
-                let collisions = discovered
-                    .iter()
-                    .filter(|(_, other, _)| other == address)
-                    .count();
-                assert_eq!(
-                    collisions, 1,
-                    "case {endpoint_type}: each endpoint type must report its own address, \
-                     but {address} is reported for {collisions} of them"
-                );
-                assert_eq!(
-                    identifier, &discovered[0].2,
-                    "case {endpoint_type}: every endpoint of one account in one region carries \
-                     the same identifier, expected {}, got {identifier} (from {address})",
-                    discovered[0].2
                 );
             }
         })

@@ -29,6 +29,8 @@ mod command_registry;
 mod describe_endpoint;
 #[path = "all/device_certificate_issuance.rs"]
 mod device_certificate_issuance;
+#[path = "all/endpoint_discovery_reachability.rs"]
+mod endpoint_discovery_reachability;
 #[path = "all/fleet_index_description.rs"]
 mod fleet_index_description;
 #[path = "all/indexing_configuration.rs"]
