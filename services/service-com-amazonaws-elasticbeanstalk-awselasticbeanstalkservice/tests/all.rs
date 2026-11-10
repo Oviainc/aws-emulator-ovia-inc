@@ -89,6 +89,8 @@ mod platform_version_catalog_projection;
 mod platform_versions;
 #[path = "all/record_projections.rs"]
 mod record_projections;
+#[path = "all/recorded_wire_members.rs"]
+mod recorded_wire_members;
 #[path = "all/rejection_rules.rs"]
 mod rejection_rules;
 #[path = "all/reported_instant_precision.rs"]

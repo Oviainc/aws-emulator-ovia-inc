@@ -272,8 +272,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The platform version whose options are reported: the one the
         // configuration set the request names is FOR, or the one the request
-        // names itself.
-        let (mut solution_stack_name, mut platform_arn, named_outright) = match configuration_set {
+        // names itself, together with the tier that configuration is for.
+        let resolved = match configuration_set {
             Some(ConfigurationSet::Template {
                 application_name,
                 template_name,
@@ -292,6 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     template.solution_stack_name.clone(),
                     template.platform_arn.clone(),
                     false,
+                    None,
                 )
             }
             // A terminated environment runs nothing, so it is no longer a
@@ -320,14 +321,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     environment.solution_stack_name.clone(),
                     environment.platform_arn.clone(),
                     false,
+                    environment.tier.clone(),
                 )
             }
             None => (
                 input.solution_stack_name.clone(),
                 input.platform_arn.clone(),
                 true,
+                None,
             ),
         };
+        let (mut solution_stack_name, mut platform_arn, named_outright, tier) = resolved;
 
         // A platform version is named by its solution stack name and by its
         // ARN, and this service's catalog publishes both, so either form
@@ -402,6 +406,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             solution_stack_name,
             platform_arn,
             options: Some(options),
+            // The environment tier the described catalog is the one of. A
+            // request that names a configuration SET is answered for the tier
+            // that set is for — an environment's own tier, which an update
+            // cannot change, and the tier every configuration starts in for a
+            // template — and a request that names a platform version outright
+            // names no set, so the catalog is the one of that same starting
+            // tier.
+            tier: Some(crate::state::environment_tier_with_defaults(tier.as_ref())),
         })
     }
 }

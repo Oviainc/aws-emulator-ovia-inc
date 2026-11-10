@@ -350,7 +350,23 @@ impl Answer {
     /// Every value at `path` — a `/`-separated element path whose last segment
     /// is the element read and whose earlier segments are the enclosing
     /// elements, e.g. `Environments/member/EnvironmentId` — in document order.
+    ///
+    /// An element carrying no text is NOT reported: an absent member and one
+    /// reported empty read the same way to almost every suite. The suite that
+    /// asserts an EMPTY element is the exception and reads
+    /// [`Answer::values_at_including_empty`] instead; both go through the one
+    /// scanner below, so the two cannot disagree about where an element is.
     pub(crate) fn values_at(&self, path: &str) -> Vec<&str> {
+        self.values_at_including_empty(path)
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .collect()
+    }
+
+    /// As [`Answer::values_at`], keeping the empty text an element with no
+    /// content carries — for a member whose RECORDED value is the empty string,
+    /// where "absent" and "present and empty" are different answers.
+    pub(crate) fn values_at_including_empty(&self, path: &str) -> Vec<&str> {
         let mut segments = path.split('/').collect::<Vec<&str>>();
         let tag = segments.pop().expect("a path names at least one element");
         let mut scopes = vec![self.body.as_str()];
@@ -363,7 +379,6 @@ impl Answer {
         scopes
             .iter()
             .flat_map(|scope| elements(scope, tag))
-            .filter(|value| !value.trim().is_empty())
             .collect()
     }
 
@@ -504,8 +519,8 @@ pub(crate) fn form_encoded(value: &str) -> String {
     encoded
 }
 
-/// `e-` followed by exactly 13 lowercase alphanumerics, the form the real
-/// service issues an `EnvironmentId` in.
+/// `e-` followed by exactly [`eb::state::ENVIRONMENT_ID_BODY_LENGTH`] lowercase
+/// alphanumerics, the form the real service issues an `EnvironmentId` in.
 pub(crate) fn is_environment_id(id: &str) -> bool {
     id.strip_prefix("e-").is_some_and(|body| {
         body.len() == eb::state::ENVIRONMENT_ID_BODY_LENGTH
@@ -669,7 +684,8 @@ async fn the_application_and_environment_lifecycle_runs_end_to_end() {
     let environment_id = environment.expect("EnvironmentId", case).to_string();
     assert!(
         is_environment_id(&environment_id),
-        "case {case:?}: expected an e-<13 lowercase alnum> EnvironmentId, got {environment_id:?}"
+        "case {case:?}: expected an e-<lowercase alnum> EnvironmentId of the published length, \
+         got {environment_id:?}"
     );
     let cname = environment.expect("CNAME", case).to_string();
     assert_eq!(

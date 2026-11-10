@@ -21,7 +21,7 @@
 //!    request id.
 //! 5. An environment reports the platform version it runs on however the request
 //!    named it, and a tier with every member the service defaults filled in.
-//! 6. An `EnvironmentId` has AWS's `e-` + 13 lowercase alphanumerics form, is
+//! 6. An `EnvironmentId` has AWS's `e-` + 10 lowercase alphanumerics form, is
 //!    unique, and does not change once minted.
 //! 7. A call records its activity as a SEQUENCE of events sharing one request
 //!    id, which `DescribeEvents` reports newest-first as a list.

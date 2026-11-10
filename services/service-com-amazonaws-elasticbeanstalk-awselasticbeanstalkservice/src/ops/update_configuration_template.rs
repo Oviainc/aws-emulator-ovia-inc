@@ -225,10 +225,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Constraint: You can remove only UserDefined configuration options."
-        // An option the catalog of the platform version this template is for
-        // defines as the SERVICE's own is not the caller's to take out; one the
-        // catalog does not define at all is the caller's own option, so naming
-        // it is no such removal.
+        // An option whose VALUE the service itself sets on the resources it
+        // provisions (the topic it created, the queue it created) is not the
+        // caller's to take out; an option the catalog publishes at a default
+        // the caller overrode IS, and so is one the catalog does not define at
+        // all — the caller's own option, whose removal is no such removal.
         let options_to_remove = input.options_to_remove.as_deref().unwrap_or_default();
         let catalog = store.published_option_catalog(crate::state::configuration_platform(
             &region,
@@ -238,10 +239,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for specification in options_to_remove {
             let (namespace, option_name, _) =
                 crate::state::option_specification_key(specification);
-            let service_defined = catalog.iter().any(|option| {
-                option.namespace == namespace && option.name == option_name && !option.user_defined
+            let service_owned = catalog.iter().any(|option| {
+                option.namespace == namespace && option.name == option_name && option.service_owned
             });
-            if service_defined {
+            if service_owned {
                 return Err(UpdateConfigurationTemplateError::invalid_parameter_value(
                     format!(
                         "Configuration option '{namespace}:{option_name}' is not a UserDefined \
@@ -293,6 +294,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &updated
         );
+        // "TemplateUrl": the Amazon S3 location of the template document this
+        // call just rewrote — the same location the create reported, derived
+        // the same way, so a create-then-update round trip reports one
+        // location for one template.
+        let output = UpdateConfigurationTemplateOutput {
+            template_url: Some(crate::state::configuration_template_url(
+                &region,
+                &updated.application_name,
+                &updated.template_name,
+            )),
+            ..output
+        };
 
         // The activity this call performed, recorded for `DescribeEvents`: the
         // operation starting and completing, under this request's id.

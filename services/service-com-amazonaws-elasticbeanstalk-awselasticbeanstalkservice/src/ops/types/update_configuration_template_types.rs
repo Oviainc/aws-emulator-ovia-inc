@@ -21,7 +21,15 @@ pub struct UpdateConfigurationTemplateInput {
     pub options_to_remove: Option<Vec<OptionSpecification>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.elasticbeanstalk#ConfigurationSettingsDescription")]
+/// What `UpdateConfigurationTemplate` reports: the modelled
+/// `ConfigurationSettingsDescription`, plus `TemplateUrl`.
+///
+/// Member set and order from
+/// `smithy_query(query="shape", shape="ConfigurationSettingsDescription")`, with
+/// `TemplateUrl` — the stored template's Amazon S3 location, RECORDED BEHAVIOUR
+/// rather than modelled — appended last. See `types::unmodelled_member_wire` for
+/// why the shape is hand-written, and `CreateConfigurationTemplateOutput` in
+/// `types::shared_types`, whose create answers the same member.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateConfigurationTemplateOutput {
     pub solution_stack_name: Option<String>,
@@ -34,5 +42,81 @@ pub struct UpdateConfigurationTemplateOutput {
     pub date_created: Option<::aws_smithy_types::DateTime>,
     pub date_updated: Option<::aws_smithy_types::DateTime>,
     pub option_settings: Option<Vec<ConfigurationOptionSetting>>,
+    pub template_url: Option<String>,
 }
+
+eb_schema_and_codec!(
+    UpdateConfigurationTemplateOutput,
+    UPDATE_CONFIGURATION_TEMPLATE_OUTPUT_SCHEMA,
+    "com.amazonaws.elasticbeanstalk#ConfigurationSettingsDescription",
+    "com.amazonaws.elasticbeanstalk",
+    "ConfigurationSettingsDescription",
+    (
+        M_SOLUTION_STACK_NAME,
+        solution_stack_name,
+        "SolutionStackName",
+        0,
+        opt,
+        string
+    ),
+    (M_PLATFORM_ARN, platform_arn, "PlatformArn", 1, opt, string),
+    (
+        M_APPLICATION_NAME,
+        application_name,
+        "ApplicationName",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_TEMPLATE_NAME,
+        template_name,
+        "TemplateName",
+        3,
+        opt,
+        string
+    ),
+    (M_DESCRIPTION, description, "Description", 4, opt, string),
+    (
+        M_ENVIRONMENT_NAME,
+        environment_name,
+        "EnvironmentName",
+        5,
+        opt,
+        string
+    ),
+    (
+        M_DEPLOYMENT_STATUS,
+        deployment_status,
+        "DeploymentStatus",
+        6,
+        opt,
+        string
+    ),
+    (
+        M_DATE_CREATED,
+        date_created,
+        "DateCreated",
+        7,
+        opt,
+        date_time
+    ),
+    (
+        M_DATE_UPDATED,
+        date_updated,
+        "DateUpdated",
+        8,
+        opt,
+        date_time
+    ),
+    (
+        M_OPTION_SETTINGS,
+        option_settings,
+        "OptionSettings",
+        9,
+        opt,
+        list_of_struct(ConfigurationOptionSetting)
+    ),
+    (M_TEMPLATE_URL, template_url, "TemplateUrl", 10, opt, string),
+);
 

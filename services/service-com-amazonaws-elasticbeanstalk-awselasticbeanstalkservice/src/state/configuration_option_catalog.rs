@@ -67,9 +67,14 @@ pub struct ConfigurationOption {
     /// [`CHANGE_SEVERITY_RESTART_ENVIRONMENT`] and
     /// [`CHANGE_SEVERITY_RESTART_APPLICATION_SERVER`].
     pub change_severity: &'static str,
-    /// "You can remove only `UserDefined` options from a configuration" — false
-    /// for an option the SERVICE itself sets on the environment it provisions.
-    pub user_defined: bool,
+    /// Whether the SERVICE owns this option's VALUE — one it sets on the
+    /// environment it provisions (the topic it created, the queue it created)
+    /// rather than one the caller supplies. It is what decides whether an
+    /// `OptionsToRemove` may take the option out of a configuration set; it is
+    /// NOT the published `UserDefined` flag, which answers whether the USER
+    /// defined the option and so is false for every option this catalog
+    /// publishes (see [`ConfigurationOption::to_description`]).
+    pub service_owned: bool,
     /// One of [`OPTION_VALUE_TYPE_LIST`] and [`OPTION_VALUE_TYPE_SCALAR`].
     pub value_type: &'static str,
     pub value_options: &'static [&'static str],
@@ -97,7 +102,7 @@ impl ConfigurationOption {
             name,
             default_value,
             change_severity,
-            user_defined: true,
+            service_owned: false,
             value_type: OPTION_VALUE_TYPE_SCALAR,
             value_options: &[],
             min_value: None,
@@ -148,10 +153,10 @@ impl ConfigurationOption {
         self
     }
 
-    /// An option the SERVICE sets rather than the caller — see
-    /// [`Self::user_defined`].
-    pub const fn service_defined(mut self) -> Self {
-        self.user_defined = false;
+    /// An option whose VALUE the SERVICE sets rather than the caller — see
+    /// [`Self::service_owned`].
+    pub const fn service_owned(mut self) -> Self {
+        self.service_owned = true;
         self
     }
 
@@ -190,7 +195,14 @@ impl ConfigurationOption {
             name: Some(self.name.to_string()),
             default_value: stated(self.default_value),
             change_severity: Some(self.change_severity.to_string()),
-            user_defined: Some(self.user_defined),
+            // "true: This configuration option was defined by the user …
+            // false: This configuration was not defined by the user." Every
+            // option this catalog publishes is one the PLATFORM VERSION
+            // defines, so none of them was defined by the user; an option the
+            // caller defines (an application environment variable, which the
+            // caller names) is not in the catalog at all, which is why there is
+            // no `true` here to read off a catalog entry.
+            user_defined: Some(false),
             value_type: Some(self.value_type.to_string()),
             value_options: (!self.value_options.is_empty()).then(|| {
                 self.value_options
@@ -205,6 +217,11 @@ impl ConfigurationOption {
                 pattern: Some(pattern.to_string()),
                 label: Some(label.to_string()),
             }),
+            // The option reference's own sentence about the option, from the
+            // one table that holds them (see
+            // [`super::configuration_option_descriptions`]); a unit test there
+            // pins that every published option has one.
+            description: option_description(self.namespace, self.name).map(str::to_string),
         }
     }
 }
@@ -235,9 +252,7 @@ pub(super) const OPTION_PROXY_SERVER: &str = "ProxyServer";
 /// [`ENVIRONMENT_TYPE_LOAD_BALANCED`], the same constants the environment
 /// resource derivation reads, so the catalog cannot publish a default the rest
 /// of this service does not honour. The Auto Scaling sizes' `MaxValue` is
-/// [`MAX_ENVIRONMENT_INSTANCES`] — a bound this emulator CHOSE (it is what
-/// keeps one environment's stored inventory bounded), published here so a
-/// caller reads the same bound the service enforces.
+/// [`MAX_PUBLISHED_ASG_SIZE`], the bound the option reference states for them.
 pub const GENERAL_CONFIGURATION_OPTIONS: &[ConfigurationOption] = &[
     // aws:autoscaling:asg — "the minimum number of instances you want in your
     // Auto Scaling group" and the maximum, plus where they may be launched.
@@ -260,14 +275,14 @@ pub const GENERAL_CONFIGURATION_OPTIONS: &[ConfigurationOption] = &[
         CHANGE_SEVERITY_NO_INTERRUPTION,
         "4",
     )
-    .with_range(0, MAX_ENVIRONMENT_INSTANCES as i32),
+    .with_range(0, MAX_PUBLISHED_ASG_SIZE),
     ConfigurationOption::new(
         NAMESPACE_AUTOSCALING_ASG,
         OPTION_MIN_SIZE,
         CHANGE_SEVERITY_NO_INTERRUPTION,
         DEFAULT_MIN_SIZE_VALUE,
     )
-    .with_range(0, MAX_ENVIRONMENT_INSTANCES as i32),
+    .with_range(0, MAX_PUBLISHED_ASG_SIZE),
     // aws:autoscaling:launchconfiguration — the instances themselves.
     ConfigurationOption::new(
         "aws:autoscaling:launchconfiguration",
@@ -601,7 +616,7 @@ pub const GENERAL_CONFIGURATION_OPTIONS: &[ConfigurationOption] = &[
         CHANGE_SEVERITY_NO_INTERRUPTION,
         "",
     )
-    .service_defined(),
+    .service_owned(),
     ConfigurationOption::new(
         NAMESPACE_SNS_TOPICS,
         OPTION_NOTIFICATION_TOPIC_NAME,
@@ -661,6 +676,18 @@ pub const GENERAL_CONFIGURATION_OPTIONS: &[ConfigurationOption] = &[
         "",
     ),
 ];
+
+/// The upper bound the option reference states for both Auto Scaling group
+/// sizes: "Maximum number of instances you want running. Must be a positive
+/// integer that is less than 10000", and `MinSize` "no greater than MaxSize".
+/// It is the `MaxValue` the published description of each carries.
+///
+/// It is NOT [`MAX_ENVIRONMENT_INSTANCES`], the number of instances one
+/// environment's stored inventory holds here: that bound is this emulator's own
+/// (a larger `MinSize` is held down to it rather than materialised), so
+/// publishing it as the option's restriction would tell a caller the service
+/// refuses a group size the real one accepts.
+pub const MAX_PUBLISHED_ASG_SIZE: i32 = 10000;
 
 /// `aws:autoscaling:asg` / `MinSize`'s default as the catalog publishes it — the
 /// option value [`DEFAULT_MIN_SIZE`] is the count of, checked against it below
@@ -744,7 +771,7 @@ pub const WORKER_TIER_CONFIGURATION_OPTIONS: &[ConfigurationOption] = &[
         CHANGE_SEVERITY_RESTART_ENVIRONMENT,
         "",
     )
-    .service_defined(),
+    .service_owned(),
 ];
 
 /// The web server the Linux platforms proxy through, where the platform offers
@@ -1080,4 +1107,55 @@ pub fn resolved_option_settings(
         })
         .collect();
     merge_option_settings(&defaults, written)
+}
+
+/// `OptionSource$Origin` (and `$Identifier`) for a value in force because the
+/// PLATFORM VERSION defines that default — nobody set it.
+///
+/// RECORDED BEHAVIOUR, not modelled: the awsQuery
+/// `ConfigurationSettingsDescription` carries one `OptionSettingDetails` entry
+/// per described option, naming where its effective value came from, and the
+/// recorded entries carry `Service` for a platform default and `API` for a
+/// value a request set.
+pub const OPTION_SOURCE_SERVICE: &str = "Service";
+/// `OptionSource$Origin` (and `$Identifier`) for a value the configuration set
+/// itself holds — one a request wrote through the API. See
+/// [`OPTION_SOURCE_SERVICE`].
+pub const OPTION_SOURCE_API: &str = "API";
+
+/// Where each option of a resolved configuration set got its effective value:
+/// one entry per setting [`resolved_option_settings`] reports, in the same
+/// order, so the two lists line up position for position.
+///
+/// The source is decided by the layer the value came from: an option the
+/// configuration set WROTE is in force because a request set it ([`
+/// OPTION_SOURCE_API`]), and one in force only because the platform version
+/// defines that default is the SERVICE's ([`OPTION_SOURCE_SERVICE`]). This is
+/// the only thing that tells a value a caller set apart from an inherited
+/// default, which is what a client reads to confirm a setting it applied took
+/// effect.
+pub fn resolved_option_setting_details(
+    catalog: &[&'static ConfigurationOption],
+    written: &[ConfigurationOptionSetting],
+) -> Vec<OptionSettingDetail> {
+    let set_through_the_api: BTreeSet<(String, String, String)> =
+        written.iter().map(option_setting_key).collect();
+    resolved_option_settings(catalog, written)
+        .iter()
+        .map(|setting| {
+            let origin = if set_through_the_api.contains(&option_setting_key(setting)) {
+                OPTION_SOURCE_API
+            } else {
+                OPTION_SOURCE_SERVICE
+            };
+            OptionSettingDetail {
+                namespace: setting.namespace.clone(),
+                option_name: setting.option_name.clone(),
+                option_source: Some(OptionSource {
+                    identifier: Some(origin.to_string()),
+                    origin: Some(origin.to_string()),
+                }),
+            }
+        })
+        .collect()
 }

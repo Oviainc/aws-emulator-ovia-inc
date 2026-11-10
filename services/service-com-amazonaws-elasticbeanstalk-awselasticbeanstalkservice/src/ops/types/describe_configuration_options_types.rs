@@ -22,15 +22,56 @@ pub struct DescribeConfigurationOptionsInput {
     pub options: Option<Vec<OptionSpecification>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.elasticbeanstalk#ConfigurationOptionsDescription")]
+/// What `DescribeConfigurationOptions` reports: the modelled
+/// `ConfigurationOptionsDescription`, plus `Tier`.
+///
+/// Member set and order from
+/// `smithy_query(query="shape", shape="ConfigurationOptionsDescription")`, with
+/// `Tier` — the environment tier the described catalog is the one of, RECORDED
+/// BEHAVIOUR rather than modelled — appended last. See
+/// `types::unmodelled_member_wire` for why the shape is hand-written.
 #[derive(Debug, Clone, Default)]
 pub struct DescribeConfigurationOptionsOutput {
     pub solution_stack_name: Option<String>,
     pub platform_arn: Option<String>,
     pub options: Option<Vec<ConfigurationOptionDescription>>,
+    pub tier: Option<EnvironmentTier>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.elasticbeanstalk#ConfigurationOptionDescription")]
+eb_schema_and_codec!(
+    DescribeConfigurationOptionsOutput,
+    DESCRIBE_CONFIGURATION_OPTIONS_OUTPUT_SCHEMA,
+    "com.amazonaws.elasticbeanstalk#ConfigurationOptionsDescription",
+    "com.amazonaws.elasticbeanstalk",
+    "ConfigurationOptionsDescription",
+    (
+        M_SOLUTION_STACK_NAME,
+        solution_stack_name,
+        "SolutionStackName",
+        0,
+        opt,
+        string
+    ),
+    (M_PLATFORM_ARN, platform_arn, "PlatformArn", 1, opt, string),
+    (
+        M_OPTIONS,
+        options,
+        "Options",
+        2,
+        opt,
+        list_of_struct(ConfigurationOptionDescription)
+    ),
+    (M_TIER, tier, "Tier", 3, opt, struct_of(EnvironmentTier)),
+);
+
+/// One published configuration option: the modelled
+/// `ConfigurationOptionDescription`, plus `Description`.
+///
+/// Member set and order from
+/// `smithy_query(query="shape", shape="ConfigurationOptionDescription")`, with
+/// `Description` — the option reference's own text for the option, RECORDED
+/// BEHAVIOUR rather than modelled — appended last. See
+/// `types::unmodelled_member_wire` for why the shape is hand-written.
 #[derive(Debug, Clone, Default)]
 pub struct ConfigurationOptionDescription {
     pub namespace: Option<String>,
@@ -44,7 +85,63 @@ pub struct ConfigurationOptionDescription {
     pub max_value: Option<i32>,
     pub max_length: Option<i32>,
     pub regex: Option<OptionRestrictionRegex>,
+    pub description: Option<String>,
 }
+
+eb_schema_and_codec!(
+    ConfigurationOptionDescription,
+    CONFIGURATION_OPTION_DESCRIPTION_SCHEMA,
+    "com.amazonaws.elasticbeanstalk#ConfigurationOptionDescription",
+    "com.amazonaws.elasticbeanstalk",
+    "ConfigurationOptionDescription",
+    (M_NAMESPACE, namespace, "Namespace", 0, opt, string),
+    (M_NAME, name, "Name", 1, opt, string),
+    (
+        M_DEFAULT_VALUE,
+        default_value,
+        "DefaultValue",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_CHANGE_SEVERITY,
+        change_severity,
+        "ChangeSeverity",
+        3,
+        opt,
+        string
+    ),
+    (
+        M_USER_DEFINED,
+        user_defined,
+        "UserDefined",
+        4,
+        opt,
+        boolean
+    ),
+    (M_VALUE_TYPE, value_type, "ValueType", 5, opt, string),
+    (
+        M_VALUE_OPTIONS,
+        value_options,
+        "ValueOptions",
+        6,
+        opt,
+        list_of_string
+    ),
+    (M_MIN_VALUE, min_value, "MinValue", 7, opt, integer),
+    (M_MAX_VALUE, max_value, "MaxValue", 8, opt, integer),
+    (M_MAX_LENGTH, max_length, "MaxLength", 9, opt, integer),
+    (
+        M_REGEX,
+        regex,
+        "Regex",
+        10,
+        opt,
+        struct_of(OptionRestrictionRegex)
+    ),
+    (M_DESCRIPTION, description, "Description", 11, opt, string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.elasticbeanstalk#OptionRestrictionRegex")]
 #[derive(Debug, Clone, Default)]

@@ -14,6 +14,13 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+// The schema and codec macro a structure needs when the wire carries a member
+// the on-disk model does not declare — see that module's own note.
+// `#[macro_use]`, and declared FIRST, so the macros are in the textual scope of
+// every `*_types` module below.
+#[macro_use]
+pub mod unmodelled_member_wire;
+
 pub mod abort_environment_update_types;
 pub mod apply_environment_managed_action_types;
 pub mod associate_environment_operations_role_types;

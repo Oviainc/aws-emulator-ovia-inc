@@ -463,6 +463,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &template
         );
+        // "TemplateUrl": the Amazon S3 location the template document was
+        // stored at, which this call is what stores. Derived from the region,
+        // the account's own storage bucket and the two names the request
+        // supplied — see `crate::state::configuration_template_url`.
+        let output = CreateConfigurationTemplateOutput {
+            template_url: Some(crate::state::configuration_template_url(
+                &region,
+                &template.application_name,
+                &template.template_name,
+            )),
+            ..output
+        };
         let subject = template.event_subject();
         let template_name = template.template_name.clone();
         store.configuration_templates.insert(template.key(), template);

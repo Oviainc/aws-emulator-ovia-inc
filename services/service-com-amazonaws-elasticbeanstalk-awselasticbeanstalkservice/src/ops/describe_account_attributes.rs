@@ -148,6 +148,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::MAX_CONFIGURATION_TEMPLATES,
                 )),
                 custom_platform_quota: Some(quota(crate::state::MAX_PLATFORM_VERSIONS)),
+                // RECORDED BEHAVIOUR, not modelled: the wire `ResourceQuotas`
+                // carries a sixth quota, for health groups, with its own
+                // maximum. A health group is the unit enhanced health reports
+                // an ENVIRONMENT's instances under — one per environment it is
+                // turned on for — so the number of them this account can hold
+                // is the number of environments it can hold, rather than a
+                // second bound invented beside it.
+                health_group_quota: Some(quota(crate::state::MAX_ENVIRONMENTS)),
             }),
         })
     }

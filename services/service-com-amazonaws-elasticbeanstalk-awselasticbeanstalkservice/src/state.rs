@@ -41,11 +41,14 @@ use crate::ops::types::{
     EventDescription, InstanceHealthSummary, ManagedAction, ManagedActionHistoryItem, MaxAgeRule,
     MaxCountRule,
     OptionRestrictionRegex,
+    OptionSettingDetail,
+    OptionSource,
     OptionSpecification,
     PlatformBranchSummary, PlatformDescription, PlatformFramework, PlatformProgrammingLanguage,
     PlatformSummary, S3Location, SingleInstanceHealth, StatusCodes, Tag,
 };
 pub mod configuration_option_catalog;
+pub mod configuration_option_descriptions;
 pub mod environment_health;
 pub mod event_notifications;
 pub mod managed_action_schedule;
@@ -53,6 +56,7 @@ pub mod platform_catalog;
 pub mod version_processing;
 
 pub use configuration_option_catalog::*;
+pub use configuration_option_descriptions::*;
 pub use environment_health::*;
 pub use event_notifications::*;
 pub use managed_action_schedule::*;
@@ -677,6 +681,34 @@ pub fn storage_bucket_name(region: &str) -> String {
         ::engine::emulator_account_id()
     )
 }
+
+/// The Amazon S3 location of a stored configuration template, as the awsQuery
+/// `CreateConfigurationTemplate` and `UpdateConfigurationTemplate` results
+/// report it:
+/// `https://s3-<region>.amazonaws.com/<bucket>/resources/templates/<application>/<template>`.
+///
+/// RECORDED BEHAVIOUR, not modelled: `ConfigurationSettingsDescription` has no
+/// `TemplateUrl` member on disk, and the responses the real service answers a
+/// template write with carry one. It is DERIVED, not stored: the bucket is the
+/// account's own storage location in this region ([`storage_bucket_name`]) and
+/// the key is the templates prefix followed by the application and the template
+/// the request named, so two reports of one template agree and the value tracks
+/// the names a client supplied.
+///
+/// The host is Amazon S3's own, not this emulator's endpoint, because the member
+/// states WHERE the service stored the template document rather than handing out
+/// a location to fetch it from: nothing presigns it and no credential makes it
+/// readable, exactly as in the responses this form is taken from.
+pub fn configuration_template_url(region: &str, application: &str, template: &str) -> String {
+    format!(
+        "https://s3-{region}.amazonaws.com/{}/{CONFIGURATION_TEMPLATE_PREFIX}{application}/{template}",
+        storage_bucket_name(region)
+    )
+}
+
+/// The key prefix the account's storage bucket holds saved configurations under.
+/// See [`configuration_template_url`].
+const CONFIGURATION_TEMPLATE_PREFIX: &str = "resources/templates/";
 
 /// The Amazon S3 error codes that say the object a read named IS NOT THERE: the
 /// bucket does not exist, or the key does not. `NoSuchBucket` and `NoSuchKey` are the
@@ -1967,6 +1999,13 @@ macro_rules! configuration_settings_description {
                 template.platform_arn.as_deref(),
                 &template.option_settings,
             )),
+            // The members the WIRE carries beyond the model are per response:
+            // a template WRITE reports the stored template's Amazon S3
+            // location, and a READ of a configuration set reports where each
+            // resolved option's value came from, the set's link points and its
+            // environment tier. Each handler fills in the ones its own
+            // response carries, so this projection leaves them absent.
+            ..Default::default()
         }
     }};
 }
@@ -3310,7 +3349,7 @@ impl Default for ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
 }
 
 impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
-    /// A fresh unique `EnvironmentId`, in the `e-<13 lowercase alphanumerics>`
+    /// A fresh unique `EnvironmentId`, in the `e-<10 lowercase alphanumerics>`
     /// form the real service issues one in.
     ///
     /// The id is OPAQUE — `EnvironmentDescription$EnvironmentId` is documented as
@@ -4029,6 +4068,23 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
         resolved_option_settings(&self.published_option_catalog(stack), written)
     }
 
+    /// Where every option of that same resolved configuration set got its
+    /// effective value — see [`resolved_option_setting_details`]. One entry per
+    /// setting [`Self::resolved_configuration_settings`] reports, in the same
+    /// order, resolved against the catalog of the platform version the set is
+    /// for, so the reported detail cannot be about a different option set than
+    /// the reported settings.
+    pub fn resolved_configuration_setting_details(
+        &self,
+        region: &str,
+        solution_stack_name: Option<&str>,
+        platform_arn: Option<&str>,
+        written: &[ConfigurationOptionSetting],
+    ) -> Vec<OptionSettingDetail> {
+        let stack = configuration_platform(region, solution_stack_name, platform_arn);
+        resolved_option_setting_details(&self.published_option_catalog(stack), written)
+    }
+
     /// How many environments have not reached `Terminated` — the count the
     /// environment quota covers.
     pub fn running_environment_count(&self) -> usize {
@@ -4550,9 +4606,9 @@ pub fn invalid_resource_arn_message(resource_arn: &str) -> String {
 pub const TAG_KEY_IN_BOTH_LISTS_MESSAGE: &str =
     "A tag with the same key can't be added and removed in a single operation.";
 
-/// How many characters an `EnvironmentId` body carries: `e-` plus 13 lowercase
+/// How many characters an `EnvironmentId` body carries: `e-` plus 10 lowercase
 /// alphanumerics is the form the real service issues one in.
-pub const ENVIRONMENT_ID_BODY_LENGTH: usize = 13;
+pub const ENVIRONMENT_ID_BODY_LENGTH: usize = 10;
 
 /// `length` random lowercase hexadecimal characters, for an opaque
 /// server-generated id.

@@ -499,7 +499,7 @@ async fn every_option_description_carries_the_restrictions_that_option_has() {
             name: "Interval",
             default_value: Some("10"),
             change_severity: eb::state::CHANGE_SEVERITY_NO_INTERRUPTION,
-            user_defined: "true",
+            user_defined: "false",
             value_type: eb::state::OPTION_VALUE_TYPE_SCALAR,
             value_options: &[],
             min_value: Some("5"),
@@ -513,7 +513,7 @@ async fn every_option_description_carries_the_restrictions_that_option_has() {
             name: "DeploymentPolicy",
             default_value: Some("AllAtOnce"),
             change_severity: eb::state::CHANGE_SEVERITY_NO_INTERRUPTION,
-            user_defined: "true",
+            user_defined: "false",
             value_type: eb::state::OPTION_VALUE_TYPE_SCALAR,
             value_options: &[
                 "AllAtOnce",
@@ -533,7 +533,7 @@ async fn every_option_description_carries_the_restrictions_that_option_has() {
             name: "XRayEnabled",
             default_value: Some("false"),
             change_severity: eb::state::CHANGE_SEVERITY_NO_INTERRUPTION,
-            user_defined: "true",
+            user_defined: "false",
             value_type: eb::state::OPTION_VALUE_TYPE_SCALAR,
             value_options: eb::state::BOOLEAN_VALUE_OPTIONS,
             min_value: None,
@@ -549,7 +549,7 @@ async fn every_option_description_carries_the_restrictions_that_option_has() {
             name: "SupportedArchitectures",
             default_value: Some("x86_64"),
             change_severity: eb::state::CHANGE_SEVERITY_RESTART_ENVIRONMENT,
-            user_defined: "true",
+            user_defined: "false",
             value_type: eb::state::OPTION_VALUE_TYPE_LIST,
             value_options: &["arm64", "x86_64"],
             min_value: None,
@@ -563,7 +563,7 @@ async fn every_option_description_carries_the_restrictions_that_option_has() {
             name: "EC2KeyName",
             default_value: None,
             change_severity: eb::state::CHANGE_SEVERITY_RESTART_ENVIRONMENT,
-            user_defined: "true",
+            user_defined: "false",
             value_type: eb::state::OPTION_VALUE_TYPE_SCALAR,
             value_options: &[],
             min_value: None,
@@ -579,7 +579,7 @@ async fn every_option_description_carries_the_restrictions_that_option_has() {
             name: "PreferredStartTime",
             default_value: None,
             change_severity: eb::state::CHANGE_SEVERITY_NO_INTERRUPTION,
-            user_defined: "true",
+            user_defined: "false",
             value_type: eb::state::OPTION_VALUE_TYPE_SCALAR,
             value_options: &[],
             min_value: None,
@@ -593,7 +593,7 @@ async fn every_option_description_carries_the_restrictions_that_option_has() {
             name: "RootVolumeType",
             default_value: None,
             change_severity: eb::state::CHANGE_SEVERITY_RESTART_ENVIRONMENT,
-            user_defined: "true",
+            user_defined: "false",
             value_type: eb::state::OPTION_VALUE_TYPE_SCALAR,
             value_options: &["gp2", "gp3", "io1", "standard"],
             min_value: None,
@@ -602,9 +602,11 @@ async fn every_option_description_carries_the_restrictions_that_option_has() {
             regex_label: None,
         },
         OptionCase {
-            // "UserDefined false: this configuration was not defined by the
-            // user" — the topic the service itself creates for an
-            // environment's notifications.
+            // The topic the service itself creates for an environment's
+            // notifications — an option whose VALUE the service sets. It
+            // reports `UserDefined` false for the same reason every row above
+            // does: the option is one the PLATFORM defines, not one the user
+            // defined.
             case: "an option the service sets",
             namespace: "aws:elasticbeanstalk:sns:topics",
             name: "Notification Topic ARN",
@@ -625,7 +627,7 @@ async fn every_option_description_carries_the_restrictions_that_option_has() {
             name: "NumProcesses",
             default_value: Some("1"),
             change_severity: eb::state::CHANGE_SEVERITY_RESTART_APPLICATION_SERVER,
-            user_defined: "true",
+            user_defined: "false",
             value_type: eb::state::OPTION_VALUE_TYPE_SCALAR,
             value_options: &[],
             min_value: Some("1"),

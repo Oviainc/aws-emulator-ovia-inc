@@ -24,7 +24,13 @@ pub struct DescribeAccountAttributesOutput {
     pub resource_quotas: Option<ResourceQuotas>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.elasticbeanstalk#ResourceQuotas")]
+/// The account's Elastic Beanstalk quotas: the modelled `ResourceQuotas`, plus
+/// `HealthGroupQuota`.
+///
+/// Member set and order from
+/// `smithy_query(query="shape", shape="ResourceQuotas")`, with
+/// `HealthGroupQuota` — RECORDED BEHAVIOUR rather than modelled — appended last.
+/// See `types::unmodelled_member_wire` for why the shape is hand-written.
 #[derive(Debug, Clone, Default)]
 pub struct ResourceQuotas {
     pub application_quota: Option<ResourceQuota>,
@@ -32,7 +38,64 @@ pub struct ResourceQuotas {
     pub environment_quota: Option<ResourceQuota>,
     pub configuration_template_quota: Option<ResourceQuota>,
     pub custom_platform_quota: Option<ResourceQuota>,
+    pub health_group_quota: Option<ResourceQuota>,
 }
+
+eb_schema_and_codec!(
+    ResourceQuotas,
+    RESOURCE_QUOTAS_SCHEMA,
+    "com.amazonaws.elasticbeanstalk#ResourceQuotas",
+    "com.amazonaws.elasticbeanstalk",
+    "ResourceQuotas",
+    (
+        M_APPLICATION_QUOTA,
+        application_quota,
+        "ApplicationQuota",
+        0,
+        opt,
+        struct_of(ResourceQuota)
+    ),
+    (
+        M_APPLICATION_VERSION_QUOTA,
+        application_version_quota,
+        "ApplicationVersionQuota",
+        1,
+        opt,
+        struct_of(ResourceQuota)
+    ),
+    (
+        M_ENVIRONMENT_QUOTA,
+        environment_quota,
+        "EnvironmentQuota",
+        2,
+        opt,
+        struct_of(ResourceQuota)
+    ),
+    (
+        M_CONFIGURATION_TEMPLATE_QUOTA,
+        configuration_template_quota,
+        "ConfigurationTemplateQuota",
+        3,
+        opt,
+        struct_of(ResourceQuota)
+    ),
+    (
+        M_CUSTOM_PLATFORM_QUOTA,
+        custom_platform_quota,
+        "CustomPlatformQuota",
+        4,
+        opt,
+        struct_of(ResourceQuota)
+    ),
+    (
+        M_HEALTH_GROUP_QUOTA,
+        health_group_quota,
+        "HealthGroupQuota",
+        5,
+        opt,
+        struct_of(ResourceQuota)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.elasticbeanstalk#ResourceQuota")]
 #[derive(Debug, Clone, Default)]

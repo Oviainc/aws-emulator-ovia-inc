@@ -99,3 +99,32 @@ Cause 7 (elasticbeanstalk-environment-create-option-setting-reflected#task#4): $
 3. Cause 4/7: eb.create_environment(ApplicationName=A, EnvironmentName=E, SolutionStackName=<same stack>, OptionSettings=[{'Namespace':'aws:elasticbeanstalk:application:environment','OptionName':'SPRING_PROFILES_ACTIVE','Value':'prod'}]) -> check the EnvironmentId shape ('e-' + 10 lowercase alphanumerics), then eb.describe_configuration_settings(ApplicationName=A, EnvironmentName=E) -> look for the OptionSettingDetails entry with OptionSource Origin 'API' for that option.
 4. Cause 6: eb.describe_account_attributes() -> inspect ResourceQuotas for HealthGroupQuota.
 5. Re-replay elasticbeanstalk-configuration-template-lifecycle-and-validation#task#5, #task#6, #task#7, #task#8; elasticbeanstalk-environment-create-option-setting-reflected#task#4, #task#5; elasticbeanstalk-platform-catalog-and-account-quotas#task#1.
+
+## Resolution
+
+All seven causes are implemented: the template writes report the stored
+template's Amazon S3 location derived from the region, the account's storage
+bucket and the request's two names; a read of a configuration set reports one
+`OptionSettingDetails` entry per resolved setting with the source its value came
+from (`API` for a setting the configuration holds, `Service` for a platform
+default), the (empty) `EnvironmentLinkPoints` element and the `Tier` the
+configuration is for; every published option carries the option reference's
+description, the bound that reference states and `UserDefined` false;
+`ResourceQuotas` carries `HealthGroupQuota`; and an `EnvironmentId` is minted in
+AWS's `e-` + 10-character form.
+
+Two things the replay still reports, left here so the gap is not lost:
+
+* the two `TemplateUrl` keys still report a value difference against the
+  recording, whose string the replay withholds. The emulator answers exactly the
+  URL this report's Evidence quotes (host form, `elasticbeanstalk-<region>-<account>`
+  bucket, `/resources/templates/<app>/<template>`), and the ARN keys of the same
+  fixture pass, so the region and account parts are not the difference; what else
+  differs cannot be identified from the withheld value.
+* the `ConfigurationSettings.member.OptionSettings.member[*]` keys (part of
+  causes 3 and 4) stay open, and the attribution above diverges with them on the
+  recorded instance: the resolution RULE is implemented, but this emulator
+  publishes its own per-platform option catalog (~70 options, ordered by
+  namespace then option name) where the recording's platform version publishes
+  ~100 in its own order, so the two lists cannot line up position for position.
+  Closing that needs AWS's published per-platform-version catalog as data.

@@ -38,6 +38,7 @@ use crate::configuration_templates::{
     reported_options as reported_settings,
 };
 use crate::lifecycle::{Answer, Emulator, PAST_DUE};
+use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
 
 /// The application every configuration set below belongs to.
 const APPLICATION: &str = "resolution-app";
@@ -111,8 +112,7 @@ async fn published_defaults(
 /// `wanted` accepts, as `(Namespace, OptionName)`.
 ///
 /// The catalogue is what says which option is of the KIND a test is about — one
-/// it gives no default for, one it reports as the service's own rather than the
-/// caller's — so no test names such an option itself.
+/// it gives no default for, say — so no test names such an option itself.
 async fn published_option_named(
     emulator: &Emulator,
     stack: &str,
@@ -600,10 +600,11 @@ async fn an_option_with_no_published_default_is_reported_only_when_the_set_sets_
 
     // The option comes from the catalogue itself: one it publishes with no
     // `DefaultValue`, which is the caller's to set and nobody else's.
-    let (namespace, option_name) = published_option_named(&emulator, &stack, case, |option| {
-        option.default_value.is_none() && option.user_defined.as_deref() == Some("true")
-    })
-    .await;
+    let (namespace, option_name) =
+        published_option_named(&emulator, &stack, case, |option| {
+            option.default_value.is_none()
+        })
+        .await;
 
     for (name, written) in [
         ("unset", Vec::new()),
@@ -653,11 +654,12 @@ async fn an_option_with_no_published_default_is_reported_only_when_the_set_sets_
 }
 
 /// "Constraint: You can remove only `UserDefined` configuration options": an
-/// option the published catalogue reports as the SERVICE's own is refused, and
-/// the configuration set is left as it stood.
+/// option whose VALUE the service itself sets on the resources it provisions is
+/// not the caller's to take out, so the removal is refused and the configuration
+/// set is left as it stood.
 #[tokio::test]
-async fn removing_an_option_the_catalogue_does_not_report_as_user_defined_is_refused() {
-    let case = "remove an option the catalogue reports as the service's own";
+async fn removing_an_option_whose_value_the_service_sets_is_refused() {
+    let case = "remove an option whose value the service sets";
     let emulator = Emulator::new();
     created(
         &emulator,
@@ -669,10 +671,15 @@ async fn removing_an_option_the_catalogue_does_not_report_as_user_defined_is_ref
     let defaults = published_defaults(&emulator, &stack).await;
     let written: Vec<Setting> = vec![setting(ASG, "MinSize", "6", "")];
 
-    let (namespace, option_name) = published_option_named(&emulator, &stack, case, |option| {
-        option.user_defined.as_deref() == Some("false")
-    })
-    .await;
+    // The Amazon SNS topic an environment's event notifications are published
+    // to is CREATED by the service, so its ARN is a value the service sets
+    // rather than one the caller supplies. Named through the service's own
+    // constants, so the test and the catalogue cannot spell the option two
+    // ways.
+    let (namespace, option_name) = (
+        eb::state::NAMESPACE_SNS_TOPICS.to_string(),
+        eb::state::OPTION_NOTIFICATION_TOPIC_ARN.to_string(),
+    );
 
     let mut params: Vec<(String, String)> = vec![
         ("ApplicationName".to_string(), APPLICATION.to_string()),

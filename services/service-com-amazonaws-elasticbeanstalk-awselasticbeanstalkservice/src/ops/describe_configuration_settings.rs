@@ -219,11 +219,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ),
                     );
                 };
-                vec![crate::state::configuration_settings_description!(
+                let described = crate::state::configuration_settings_description!(
                     CreateConfigurationTemplateOutput,
                     store,
                     &region,
                     template
+                );
+                let details = store.resolved_configuration_setting_details(
+                    &region,
+                    template.solution_stack_name.as_deref(),
+                    template.platform_arn.as_deref(),
+                    &template.option_settings,
+                );
+                // "Templates aren't associated with any environment", so a
+                // template's configuration set is for the tier every
+                // configuration starts in — the EC2-based web server at the
+                // latest compatible tier version.
+                vec![read_of_a_configuration_set(
+                    described,
+                    details,
+                    crate::state::environment_tier_with_defaults(None),
                 )]
             }
             // "The name of the environment to describe" — the configuration set
@@ -257,6 +272,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     environment.platform_arn.as_deref(),
                     &environment.option_settings,
                 );
+                // Where each of those options got its effective value: the
+                // settings deployed to this environment came from the API, the
+                // rest from the platform version's own defaults.
+                let deployed_details = store.resolved_configuration_setting_details(
+                    &region,
+                    environment.solution_stack_name.as_deref(),
+                    environment.platform_arn.as_deref(),
+                    &environment.option_settings,
+                );
+                // The tier this configuration set is for is the environment's
+                // own, which an update cannot change.
+                let tier = crate::state::environment_tier_with_defaults(environment.tier.as_ref());
                 // The draft belongs to the platform version the update that
                 // created it deploys, so it resolves against THAT version's
                 // catalog rather than the running environment's.
@@ -292,11 +319,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     date_created: Some(environment.date_created),
                     date_updated: Some(environment.date_updated),
                     option_settings: Some(deployed_settings),
+                    // A configuration set associated with a running
+                    // environment is not a saved template, so it has no stored
+                    // template document and no location for one; the three
+                    // members a READ carries are added below.
+                    ..Default::default()
                 };
-                let draft = environment
-                    .draft_configuration
-                    .as_ref()
-                    .map(|draft| CreateConfigurationTemplateOutput {
+                let deployed =
+                    read_of_a_configuration_set(deployed, deployed_details, tier.clone());
+                let draft = environment.draft_configuration.as_ref().map(|draft| {
+                    let described = CreateConfigurationTemplateOutput {
                         // The platform version the DRAFT belongs to, which is
                         // the one the update that created it deploys.
                         solution_stack_name: draft.solution_stack_name.clone(),
@@ -324,7 +356,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             draft.platform_arn.as_deref(),
                             &draft.option_settings,
                         )),
-                    });
+                        ..Default::default()
+                    };
+                    // The draft's OWN settings are what its detail is about,
+                    // resolved and attributed against the catalog of the
+                    // platform version IT deploys; an update cannot change the
+                    // environment's tier, so the draft is a configuration for
+                    // the same tier.
+                    let details = store.resolved_configuration_setting_details(
+                        &region,
+                        draft.solution_stack_name.as_deref(),
+                        draft.platform_arn.as_deref(),
+                        &draft.option_settings,
+                    );
+                    read_of_a_configuration_set(described, details, tier.clone())
+                });
                 [Some(deployed), draft].into_iter().flatten().collect()
             }
         };
@@ -332,6 +378,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DescribeConfigurationSettingsOutput {
             configuration_settings: Some(settings),
         })
+    }
+}
+
+/// The members a READ of a configuration set carries beyond the modelled
+/// `ConfigurationSettingsDescription`, added to the projection `description`
+/// holds.
+///
+/// RECORDED BEHAVIOUR, not modelled: every `ConfigurationSettings` member of a
+/// `DescribeConfigurationSettings` answer carries `OptionSettingDetails` (where
+/// each resolved option's value came from), `EnvironmentLinkPoints` and the
+/// `Tier` the configuration is for. `EnvironmentLinkPoints` is reported empty:
+/// a configuration set links to no environment here — `EnvironmentLink` is a
+/// member of an ENVIRONMENT's description, not of a configuration set — so
+/// there is no link point to name in it.
+///
+/// The one place those three are written, so the template branch, the deployed
+/// configuration and the draft cannot report them three ways.
+fn read_of_a_configuration_set(
+    description: CreateConfigurationTemplateOutput,
+    option_setting_details: Vec<OptionSettingDetail>,
+    tier: EnvironmentTier,
+) -> CreateConfigurationTemplateOutput {
+    CreateConfigurationTemplateOutput {
+        option_setting_details: Some(option_setting_details),
+        environment_link_points: Some(String::new()),
+        tier: Some(tier),
+        ..description
     }
 }
 

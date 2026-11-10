@@ -232,7 +232,74 @@ pub struct ConfigurationOptionSetting {
     pub value: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.elasticbeanstalk#ConfigurationSettingsDescription")]
+/// Where the effective value of one option of a resolved configuration set came
+/// from: `Identifier` names the source and `Origin` the kind of source.
+///
+/// RECORDED BEHAVIOUR, not modelled: the on-disk model declares no
+/// `OptionSource` shape, and the awsQuery `ConfigurationSettingsDescription` the
+/// real service answers with carries one per described option (see
+/// [`OptionSettingDetail`]). Hand-written for the reason
+/// `types::unmodelled_member_wire` gives.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OptionSource {
+    pub identifier: Option<String>,
+    pub origin: Option<String>,
+}
+
+eb_schema_and_codec!(
+    OptionSource,
+    OPTION_SOURCE_SCHEMA,
+    "com.amazonaws.elasticbeanstalk#OptionSource",
+    "com.amazonaws.elasticbeanstalk",
+    "OptionSource",
+    (M_IDENTIFIER, identifier, "Identifier", 0, opt, string),
+    (M_ORIGIN, origin, "Origin", 1, opt, string),
+);
+
+/// One option of a resolved configuration set, with the source its effective
+/// value came from — the entry `ConfigurationSettingsDescription`'s
+/// `OptionSettingDetails` list carries.
+///
+/// RECORDED BEHAVIOUR, not modelled, as [`OptionSource`] is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OptionSettingDetail {
+    pub namespace: Option<String>,
+    pub option_name: Option<String>,
+    pub option_source: Option<OptionSource>,
+}
+
+eb_schema_and_codec!(
+    OptionSettingDetail,
+    OPTION_SETTING_DETAIL_SCHEMA,
+    "com.amazonaws.elasticbeanstalk#OptionSettingDetail",
+    "com.amazonaws.elasticbeanstalk",
+    "OptionSettingDetail",
+    (M_NAMESPACE, namespace, "Namespace", 0, opt, string),
+    (M_OPTION_NAME, option_name, "OptionName", 1, opt, string),
+    (
+        M_OPTION_SOURCE,
+        option_source,
+        "OptionSource",
+        2,
+        opt,
+        struct_of(OptionSource)
+    ),
+);
+
+/// What a configuration set reports: the modelled
+/// `ConfigurationSettingsDescription`, plus the four members the real service's
+/// awsQuery responses carry beyond it.
+///
+/// Member set and order from
+/// `smithy_query(query="shape", shape="ConfigurationSettingsDescription")`,
+/// followed by the unmodelled four — `TemplateUrl` (the stored template's Amazon
+/// S3 location, which the template WRITES report), `OptionSettingDetails`,
+/// `EnvironmentLinkPoints` and `Tier` (which a READ of a configuration set
+/// reports). The model binds this one shape to `CreateConfigurationTemplate`,
+/// `UpdateConfigurationTemplate` and `DescribeConfigurationSettings`, so every
+/// member lives on this struct and each handler fills in the ones its own
+/// response carries. See `types::unmodelled_member_wire` for why the shape is
+/// hand-written.
 #[derive(Debug, Clone, Default)]
 pub struct CreateConfigurationTemplateOutput {
     pub solution_stack_name: Option<String>,
@@ -245,7 +312,103 @@ pub struct CreateConfigurationTemplateOutput {
     pub date_created: Option<::aws_smithy_types::DateTime>,
     pub date_updated: Option<::aws_smithy_types::DateTime>,
     pub option_settings: Option<Vec<ConfigurationOptionSetting>>,
+    pub template_url: Option<String>,
+    pub option_setting_details: Option<Vec<OptionSettingDetail>>,
+    pub environment_link_points: Option<String>,
+    pub tier: Option<EnvironmentTier>,
 }
+
+eb_schema_and_codec!(
+    CreateConfigurationTemplateOutput,
+    CREATE_CONFIGURATION_TEMPLATE_OUTPUT_SCHEMA,
+    "com.amazonaws.elasticbeanstalk#ConfigurationSettingsDescription",
+    "com.amazonaws.elasticbeanstalk",
+    "ConfigurationSettingsDescription",
+    (
+        M_SOLUTION_STACK_NAME,
+        solution_stack_name,
+        "SolutionStackName",
+        0,
+        opt,
+        string
+    ),
+    (M_PLATFORM_ARN, platform_arn, "PlatformArn", 1, opt, string),
+    (
+        M_APPLICATION_NAME,
+        application_name,
+        "ApplicationName",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_TEMPLATE_NAME,
+        template_name,
+        "TemplateName",
+        3,
+        opt,
+        string
+    ),
+    (M_DESCRIPTION, description, "Description", 4, opt, string),
+    (
+        M_ENVIRONMENT_NAME,
+        environment_name,
+        "EnvironmentName",
+        5,
+        opt,
+        string
+    ),
+    (
+        M_DEPLOYMENT_STATUS,
+        deployment_status,
+        "DeploymentStatus",
+        6,
+        opt,
+        string
+    ),
+    (
+        M_DATE_CREATED,
+        date_created,
+        "DateCreated",
+        7,
+        opt,
+        date_time
+    ),
+    (
+        M_DATE_UPDATED,
+        date_updated,
+        "DateUpdated",
+        8,
+        opt,
+        date_time
+    ),
+    (
+        M_OPTION_SETTINGS,
+        option_settings,
+        "OptionSettings",
+        9,
+        opt,
+        list_of_struct(ConfigurationOptionSetting)
+    ),
+    (M_TEMPLATE_URL, template_url, "TemplateUrl", 10, opt, string),
+    (
+        M_OPTION_SETTING_DETAILS,
+        option_setting_details,
+        "OptionSettingDetails",
+        11,
+        opt,
+        list_of_struct(OptionSettingDetail)
+    ),
+    (
+        M_ENVIRONMENT_LINK_POINTS,
+        environment_link_points,
+        "EnvironmentLinkPoints",
+        12,
+        opt,
+        string
+    ),
+    (M_TIER, tier, "Tier", 13, opt, struct_of(EnvironmentTier)),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.elasticbeanstalk#TooManyBucketsException")]
 #[derive(Debug, Clone, Default)]
