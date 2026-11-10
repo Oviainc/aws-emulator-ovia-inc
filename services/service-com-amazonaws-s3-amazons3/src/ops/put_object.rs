@@ -547,6 +547,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
                 match crate::state::tag_set_from_header(
                     header,
                     crate::state::OBJECT_TAG_SET_LIMITS,
+                    crate::state::tag_key_origin(ctx),
                 ) {
                     Ok(tags) => tags,
                     Err(rejection) => {

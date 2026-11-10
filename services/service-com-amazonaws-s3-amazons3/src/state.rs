@@ -1036,9 +1036,15 @@ pub const TAG_REJECTION_STATUS: u16 = 400;
 /// checked before the per-tag rules so an enormous set is refused for what it is rather than
 /// for whichever of its tags happens to come first, and a key's own bounds are checked
 /// before the reservation so the key the refusal NAMES is one within those bounds.
+///
+/// The reservation is the one rule of the set that depends on WHO stated the key: a tag in
+/// that namespace is AWS's own, so a requester may not write one, while the AWS services that
+/// own such a tag set it from inside AWS through no public API ([`TagKeyOrigin`]). Every other
+/// restriction here is the set's own and holds whichever path it arrived on.
 pub fn validate_tag_set(
     tags: &[ResourceTag],
     limits: TagSetLimits,
+    origin: TagKeyOrigin,
 ) -> Result<(), TagSetRejection> {
     // A restriction on the SET names no tag; one a single tag breaks carries that tag, so
     // the error document can name it.
@@ -1078,8 +1084,9 @@ pub fn validate_tag_set(
             );
         }
         // Judged after the key's own bounds, so the key this refusal names in the error
-        // document is one those bounds admit.
-        if tag.key.starts_with(RESERVED_TAG_KEY_PREFIX) {
+        // document is one those bounds admit — and only for a key a REQUESTER stated, since
+        // the namespace is AWS's to write in.
+        if origin == TagKeyOrigin::Caller && tag.key.starts_with(RESERVED_TAG_KEY_PREFIX) {
             return refuse_tag(
                 TagSetRejectionCause::ReservedKeyPrefix {
                     key: tag.key.clone(),
@@ -1140,6 +1147,7 @@ pub fn validate_tag_set(
 pub fn tag_set_from_header(
     header: &str,
     limits: TagSetLimits,
+    origin: TagKeyOrigin,
 ) -> Result<Vec<ResourceTag>, TagSetRejection> {
     let pairs = header.split('&').filter(|pair| !pair.is_empty()).count();
     if pairs > limits.max_tags {
@@ -1154,7 +1162,7 @@ pub fn tag_set_from_header(
             .into_iter()
             .map(|(key, value)| ResourceTag { key, value })
             .collect();
-    validate_tag_set(&tags, limits)?;
+    validate_tag_set(&tags, limits, origin)?;
     Ok(tags)
 }
 
@@ -4751,6 +4759,9 @@ mod renames;
 mod sessions;
 // The bucket map itself, and the operations the store performs on it.
 mod store;
+// Who named the tag keys one request carries, which is what decides whether a key in the
+// namespace AWS keeps for its own tags may be stored.
+mod tag_key_origin;
 // A multipart upload in progress, with the integrity checks and minted ids it shares.
 mod uploads;
 
@@ -4762,6 +4773,7 @@ pub use refusals::*;
 pub use renames::*;
 pub use sessions::*;
 pub use store::*;
+pub use tag_key_origin::*;
 pub use uploads::*;
 
 #[cfg(test)]

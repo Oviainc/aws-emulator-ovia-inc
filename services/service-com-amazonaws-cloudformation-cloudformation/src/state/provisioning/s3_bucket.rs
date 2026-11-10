@@ -130,7 +130,9 @@ async fn put_versioning(
 
 /// Bring the tags of a bucket the stack ALREADY has back into step with the set it must
 /// carry: the declaration's own `Tags` plus the ones CloudFormation propagates to it
-/// ([`crate::state::provisioner::tags_of`], the one reading of that set).
+/// ([`crate::state::provisioner::tags_of`], the one reading of that set) — the three
+/// `aws:cloudformation:*` ones among them, since Amazon S3 takes a key in the reserved
+/// namespace from this in-process provisioning path and refuses one only to an API caller.
 ///
 /// `PutBucketTagging` "sets the tags for a bucket", replacing the whole set, and
 /// `DeleteBucketTagging` "removes the entire tag set" — which is what a bucket that must end
@@ -147,7 +149,7 @@ pub(super) async fn retag(
 
     let client = s3_client(ctx, region);
     let bucket = &resource.physical_resource_id;
-    let wanted = tags_of(declared, &applicable(propagated));
+    let wanted = tags_of(declared, propagated);
     // "NoSuchTagSet" is what Amazon S3 answers for a bucket carrying no tag set at all,
     // which is a bucket whose tags are the empty set rather than a read that failed.
     let in_force: Vec<(String, String)> = match client
@@ -205,11 +207,10 @@ pub(super) async fn retag(
     Ok(())
 }
 
-/// AWS's reserved tag-key namespace and the tags an owning service's tagging call will take
-/// are read through the ONE predicate the module beside this one holds
-/// ([`super::is_reserved_tag_key`], [`super::applicable_tags`]), so this provider and the
-/// nested-stack one cannot come to read the rule differently.
-use super::{applicable_tags as applicable, tag_sets_agree};
+/// Whether two tag sets are the same SET is read through the ONE predicate the module beside
+/// this one holds ([`super::tag_sets_agree`]), so this provider and the nested-stack one
+/// cannot come to read the rule differently.
+use super::tag_sets_agree;
 
 /// The properties whose VALUE the two documents state differently, in a stable order: what a
 /// changed declaration asks this provider to apply.

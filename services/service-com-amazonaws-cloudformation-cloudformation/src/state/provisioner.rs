@@ -1520,9 +1520,11 @@ impl Provisioner {
     /// reserved namespace in its own crate's tag validation, the one check `TagResource`
     /// runs too.
     ///
-    /// A type whose owning service ADMITS the three on that in-process path — Amazon S3
-    /// Vectors, whose crate refuses a reserved key to an API caller and takes one from a
-    /// provisioning call, and Amazon EventBridge Pipes, whose crate reads the same signal —
+    /// A type whose owning service ADMITS the three on that in-process path — Amazon S3,
+    /// whose crate refuses a reserved key to an API caller and takes one from a provisioning
+    /// call, Amazon S3
+    /// Vectors, whose crate does the same, and Amazon EventBridge Pipes, whose crate reads
+    /// the same signal —
     /// is NOT in the set below: the three travel with the create, and that service's own
     /// read of the resource's tags on the handle the stack publishes answers with them. A
     /// type stays in the set only until its own crate reads that path too.
@@ -1548,13 +1550,6 @@ impl Provisioner {
                 // `AddTagsToStream` alike — so a stream carries the stack's own tags
                 // without the three.
                 | Self::KinesisStream
-                // Amazon S3 refuses a tag key in the reserved namespace on every call that
-                // takes a tag set — the `Tagging` payload of `PutBucketTagging` and
-                // `PutObjectTagging` and the `x-amz-tagging` header of a write alike, in the
-                // one check its own crate's tag-set validation makes ("Your TagKey cannot be
-                // prefixed with aws:") — so a bucket carries the stack's own tags without
-                // the three.
-                | Self::S3Bucket
                 | Self::SchedulerScheduleGroup
                 | Self::AcmAcmeEndpoint
                 // ACM refuses a tag key in the reserved namespace on every call that takes

@@ -285,9 +285,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObjectTagging<
         // not pass input validation is `InvalidTag`. Neither is a shape in this model, so
         // both go out through the unmodelled channel carrying the code a client branches
         // on.
-        if let Err(rejection) =
-            crate::state::validate_tag_set(&tags, crate::state::OBJECT_TAG_SET_LIMITS)
-        {
+        //
+        // One of those restrictions depends on WHO stated the key: a tag in the namespace
+        // AWS keeps for itself is AWS's own, so a requester may not write one, while the
+        // services that own such a tag set it from inside AWS over the in-process path
+        // ([`crate::state::tag_key_origin`]).
+        if let Err(rejection) = crate::state::validate_tag_set(
+            &tags,
+            crate::state::OBJECT_TAG_SET_LIMITS,
+            crate::state::tag_key_origin(ctx),
+        ) {
             return Err(crate::scaffolded::Scaffolded::tag_set(&rejection));
         }
 

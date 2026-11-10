@@ -26,10 +26,12 @@
 //! are what `DescribeStacks` reports as `Stack$Tags`, which is where a client looks for the
 //! set the resources are expected to carry.
 //!
-//! A type whose owning API refuses its CALLERS the reserved `aws:` key namespace
-//! (`iam:CreateRole`, and `s3:PutBucketTagging` for a bucket) carries the stack's own tags
-//! WITHOUT the three CloudFormation records, and the stack still completes: that is the one
-//! documented exception to the set, and it is also the last test here.
+//! A type whose owning API refuses its CALLERS the reserved `aws:` key namespace AND does not
+//! distinguish the in-process provisioning path from a caller's request (`iam:CreateRole`)
+//! carries the stack's own tags WITHOUT the three CloudFormation records, and the stack still
+//! completes: that is the one exception to the set, and it is also the last test here. Amazon
+//! S3 is NOT such a type — it refuses the namespace to an API caller and takes a key in it
+//! from the provisioning path — so a bucket carries all three.
 //!
 //! Every expected value is computed from what the row declares plus the stack id
 //! `DescribeStacks` reports — never read back out of the tag answer being checked.
@@ -180,26 +182,20 @@ fn expected_tags(
     expected
 }
 
-/// The tag set a provisioned BUCKET must carry: [`expected_tags`] without the three
-/// CloudFormation records.
+/// The tag set a provisioned BUCKET must carry: exactly [`expected_tags`].
 ///
-/// Amazon S3 refuses a tag key in the reserved `aws:` namespace on every call that takes a
-/// tag set, which is AWS's rule for a CALLER's request, and CloudFormation has no
-/// privileged channel here to set those three from inside itself — so a bucket carries the
-/// stack's own tags and whatever its own declaration asks for, the way every other type
-/// whose owning API refuses that namespace does.
-fn expected_tags_without_the_cloudformation_records(
+/// Amazon S3 refuses a tag key in the reserved `aws:` namespace to an API CALLER, which is
+/// AWS's rule for a caller's request, and takes one from the in-process provisioning path
+/// CloudFormation sets its own tags on — so a bucket carries the stack's own tags, whatever
+/// its own declaration asks for, and the three CloudFormation records.
+fn expected_bucket_tags(
     stack_tags: &[(&str, &str)],
     declared: &[(&str, &str)],
+    stack_name: &str,
+    stack_id: &str,
+    logical_id: &str,
 ) -> BTreeMap<String, String> {
-    let mut expected: BTreeMap<String, String> = stack_tags
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect();
-    for (key, value) in declared {
-        expected.insert((*key).to_string(), (*value).to_string());
-    }
-    expected
+    expected_tags(stack_tags, declared, stack_name, stack_id, logical_id)
 }
 
 #[tokio::test]
@@ -459,8 +455,13 @@ async fn a_provisioned_resource_carries_the_stacks_tags_and_the_cloudformation_o
 
         for bucket in case.buckets {
             let name = output_value(&described, bucket.output_key);
-            let expected =
-                expected_tags_without_the_cloudformation_records(case.stack_tags, bucket.declared);
+            let expected = expected_bucket_tags(
+                case.stack_tags,
+                bucket.declared,
+                case.stack_name,
+                &stack_id,
+                bucket.logical_id,
+            );
             let (status, held) = bucket_tags(&router, &name).await;
             assert_eq!(
                 status, 200,

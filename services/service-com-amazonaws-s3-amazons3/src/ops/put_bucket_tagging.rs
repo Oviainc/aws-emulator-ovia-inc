@@ -220,7 +220,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(refusal);
         }
-        let _ = ctx;
+        // Which path this write arrived on, read before the store is reached: it is what
+        // decides whether a key in the namespace AWS keeps for its own tags may be stored.
+        let origin = crate::state::tag_key_origin(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The store is unreachable only when this service is mounted on an engine
             // that is not the shared `InMemoryEngine`; nothing can then be persisted, and
@@ -261,9 +263,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bucket may hold is `BadRequest`, and a tag that does not pass input validation
         // is `InvalidTag`. Neither is a shape in this model, so both go out through the
         // unmodelled channel carrying the code a client branches on.
-        if let Err(rejection) =
-            crate::state::validate_tag_set(&tags, crate::state::BUCKET_TAG_SET_LIMITS)
-        {
+        //
+        // One of those restrictions depends on WHO stated the key: a tag in the namespace
+        // AWS keeps for itself is AWS's own, so a requester may not write one, while the
+        // services that own such a tag set it from inside AWS over the in-process path
+        // ([`crate::state::tag_key_origin`]).
+        if let Err(rejection) = crate::state::validate_tag_set(
+            &tags,
+            crate::state::BUCKET_TAG_SET_LIMITS,
+            origin,
+        ) {
             return Err(crate::scaffolded::Scaffolded::tag_set(&rejection));
         }
 

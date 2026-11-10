@@ -13,7 +13,10 @@
 //!
 //! The rows differ along what the rule generalises over: whether the declaration ADDS a tag
 //! set to a bucket that had none, changes a tag's VALUE, adds a second key, DROPS the set
-//! altogether, turns versioning on, suspends it, or changes both properties at once.
+//! altogether, turns versioning on, suspends it, or changes both properties at once. Beside
+//! whatever the declaration asks for, the bucket carries the three tags CloudFormation records
+//! on every resource it provisions, which are CloudFormation's to set and which no revision of
+//! the declaration changes.
 //!
 //! **The second rule.** What CloudFormation quotes in a failed resource's
 //! `ResourceStatusReason` is the message the resource's own PROVIDER reported, and the bucket
@@ -45,6 +48,16 @@ fn bucket_template(properties: Value) -> String {
     json!({"Resources": {"Store": {"Type": "AWS::S3::Bucket", "Properties": declared}}})
         .to_string()
 }
+
+/// The tag keys CloudFormation records on every resource it provisions. Source: the
+/// `aws:cloudformation:*` tags CloudFormation's own documentation names
+/// (`crate::state::provisioning`'s `STACK_NAME_TAG` / `STACK_ID_TAG` / `LOGICAL_ID_TAG`).
+const STACK_NAME_TAG: &str = "aws:cloudformation:stack-name";
+const STACK_ID_TAG: &str = "aws:cloudformation:stack-id";
+const LOGICAL_ID_TAG: &str = "aws:cloudformation:logical-id";
+
+/// The logical id the bucket is declared under in every revision below.
+const LOGICAL_ID: &str = "Store";
 
 /// One declared tag, as a template writes it.
 fn tag(key: &str, value: &str) -> Value {
@@ -138,7 +151,7 @@ async fn physical_id(case: &str, router: &MultiServiceRouter, stack: &str) -> St
     let (code, body) = call(
         router,
         "DescribeStackResource",
-        &[member("StackName", stack), member("LogicalResourceId", "Store")],
+        &[member("StackName", stack), member("LogicalResourceId", LOGICAL_ID)],
     )
     .await;
     assert_eq!(
@@ -163,6 +176,12 @@ async fn a_changed_bucket_declaration_is_applied_to_the_bucket_that_exists() {
         created, BUCKET,
         "the bucket must be created under the name the template states, got {created:?}"
     );
+    // The stack's own id, which is the value of the `stack-id` tag every one of its
+    // resources carries.
+    let (code, described) = describe_stack(&router, stack).await;
+    let stack_id = xml_text(&described, "StackId").unwrap_or_else(|| {
+        panic!("the stack must report a StackId, got {code} {described}")
+    });
 
     for row in revisions() {
         let case = row.case;
@@ -194,7 +213,8 @@ async fn a_changed_bucket_declaration_is_applied_to_the_bucket_that_exists() {
             reported, BUCKET,
             "case {case:?}: expected the bucket to keep its identity"
         );
-        // ...and Amazon S3 itself reports what the declaration now asks for.
+        // ...and Amazon S3 itself reports what the declaration now asks for, beside the three
+        // tags CloudFormation records on the resource.
         let mut reported_tags = bucket_tags(case, &router).await;
         reported_tags.sort();
         let mut expected_tags: Vec<(String, String)> = row
@@ -202,6 +222,9 @@ async fn a_changed_bucket_declaration_is_applied_to_the_bucket_that_exists() {
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
+        expected_tags.push((STACK_NAME_TAG.to_string(), stack.to_string()));
+        expected_tags.push((STACK_ID_TAG.to_string(), stack_id.clone()));
+        expected_tags.push((LOGICAL_ID_TAG.to_string(), LOGICAL_ID.to_string()));
         expected_tags.sort();
         assert_eq!(
             reported_tags, expected_tags,

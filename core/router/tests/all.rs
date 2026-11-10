@@ -749,8 +749,6 @@ mod eks_cluster_security_group;
 mod eks_wrapped_peer_refusals;
 // Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
 // reason their entries record: the appended tail at the end of this file and the `e…` span
-// beside the other `eks_*` suites are both regions every concurrently landing router suite
-// puts its line in.
 #[path = "all/eks_bootstrap_cluster_creator_access_entry.rs"]
 mod eks_bootstrap_cluster_creator_access_entry;
 // Declared HERE, in this same quiet `n`/`o` gap rather than in the appended tail at the end
@@ -1083,7 +1081,6 @@ mod cloudformation_wafv2_protection_stack;
 // four in the sorted head, the fifth at line 34, and the wafv2 one at line 1006). Two
 // from compiling; the duplicate lines are removed here and the first declaration of each
 // stands.
-// Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
 // reason those entries record: the appended tail at the end of this file and the `e…` span
 #[path = "all/eks_control_plane_logs.rs"]
 mod eks_control_plane_logs;
@@ -1278,3 +1275,7 @@ mod opensearch_domain_vpc_placement;
 // handed nothing more.
 #[path = "all/cloudformation_stack_update_redirects_a_schedule.rs"]
 mod cloudformation_stack_update_redirects_a_schedule;
+// Declared here, in this same head region, for the reason the entry above records: the tags
+// a bucket a stack created carries, which CloudFormation stamps and Amazon S3 reports.
+#[path = "all/cloudformation_stamps_s3_bucket_stack_provenance.rs"]
+mod cloudformation_stamps_s3_bucket_stack_provenance;

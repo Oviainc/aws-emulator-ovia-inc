@@ -384,7 +384,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // limits — the same rule, and the same refusal envelope, `PutBucketTagging` judges a
         // tag set by — BEFORE the bucket is recorded, so a create carrying a tag set S3 does
         // not hold leaves nothing behind.
-        let tags = requested_tags(configuration)?;
+        let tags = requested_tags(configuration, crate::state::tag_key_origin(ctx))?;
         if ownership == crate::state::BUCKET_OWNER_ENFORCED
             && grants
                 .as_deref()
@@ -787,8 +787,12 @@ fn invalid_location_constraint(constraint: &str) -> CreateBucketError {
 /// [`crate::scaffolded::Scaffolded::tag_set`]) — so a tag set is accepted at create exactly
 /// when it is accepted afterwards, and refused with the same code either way. Judged here,
 /// before the bucket is recorded, so a refused create leaves nothing behind.
+///
+/// `origin` is which path the create arrived on, which is what the reserved-namespace half of
+/// that rule turns on ([`crate::state::tag_key_origin`]).
 fn requested_tags(
     configuration: Option<&CreateBucketConfiguration>,
+    origin: crate::state::TagKeyOrigin,
 ) -> Result<Vec<crate::state::ResourceTag>, CreateBucketError> {
     let tags: Vec<crate::state::ResourceTag> = configuration
         .and_then(|configuration| configuration.tags.as_ref())
@@ -805,7 +809,7 @@ fn requested_tags(
         return Ok(tags);
     }
     if let Err(rejection) =
-        crate::state::validate_tag_set(&tags, crate::state::BUCKET_TAG_SET_LIMITS)
+        crate::state::validate_tag_set(&tags, crate::state::BUCKET_TAG_SET_LIMITS, origin)
     {
         return Err(crate::scaffolded::Scaffolded::tag_set(&rejection));
     }
