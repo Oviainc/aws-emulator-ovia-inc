@@ -220,6 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetOpenIdToken<En
         } else {
             crate::state::registered_oidc_providers(&*self.engine)
         };
+        // What an integrated user pool says about a user-pool token this call presents is
+        // that service's record, so it too is read before this service's store is locked
+        // ([`crate::state::user_pool_logins`]).
+        let integrated = crate::state::user_pool_logins(&*self.engine, &logins);
         let mut store = state.lock();
 
         // "using a known Cognito ID. This known Cognito ID is returned by GetId": the token
@@ -264,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetOpenIdToken<En
             )
             .into());
         }
-        if let Some(refusal) = pool.refuse_logins(&registered, &logins) {
+        if let Some(refusal) = pool.refuse_logins(&registered, &integrated, &logins) {
             return Err(GetOpenIdTokenErrorModeled::NotAuthorizedException(
                 NotAuthorizedException {
                     message: Some(refusal.message(&identity_pool_id).into_owned()),

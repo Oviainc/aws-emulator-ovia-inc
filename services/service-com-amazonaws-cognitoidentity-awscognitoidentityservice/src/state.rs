@@ -16,6 +16,11 @@ pub mod authorization;
 
 use crate::ops::types::{CognitoIdentityProvider, MappingRule, RoleMapping};
 use emulator_server::CredentialStore;
+/// What an integrated Amazon Cognito user pool says about a token presented as the login of
+/// one of its users, re-exported from the service that OWNS that record so this service
+/// names it rather than keeping a second copy of it
+/// ([`IntegratedUserPools`]).
+pub use ::service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice::state::PresentedTokenUser;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -322,8 +327,9 @@ impl IdentityPool {
     }
 
     /// Why the `Logins` map of a request authorizes nothing, if so: what the PRESENTED
-    /// TOKENS themselves say, and then what this pool's stored configuration trusts
-    /// ([`PoolLoginTrust::refuse`]).
+    /// TOKENS themselves say, then what this pool's stored configuration trusts
+    /// ([`PoolLoginTrust::refuse`]), and last what the user pool a token was issued by says
+    /// about the user it stands for ([`Self::refuse_server_side_token_check`]).
     ///
     /// The entries are decided in a stable order, so a map that breaks the rule in two
     /// places is refused the same way every time, and the token's own form and issuer are
@@ -341,14 +347,75 @@ impl IdentityPool {
     pub fn refuse_logins(
         &self,
         registered: &RegisteredOidcProviders,
+        integrated: &IntegratedUserPools,
         logins: &HashMap<String, String>,
     ) -> Option<LoginProviderRefusal> {
         let mut presented: Vec<(&String, &String)> = logins.iter().collect();
         presented.sort();
         presented
-            .into_iter()
+            .iter()
             .find_map(|(provider_name, token)| self.refuse_presented_token(provider_name, token))
             .or_else(|| self.login_trust(registered).refuse(logins))
+            .or_else(|| {
+                presented.iter().find_map(|(provider_name, _)| {
+                    self.refuse_server_side_token_check(integrated, provider_name)
+                })
+            })
+    }
+
+    /// Why the login presented under `provider_name` is refused by the USER POOL that
+    /// provider names, if so.
+    ///
+    /// "Once you set `ServerSideTokenCheck` to TRUE for an identity pool, that identity pool
+    /// will check with the integrated user pools to make sure that the user has not been
+    /// globally signed out or deleted before the identity pool provides an OIDC token or
+    /// Amazon Web Services credentials for the user. If the user is signed out or deleted,
+    /// the identity pool will return a 400 Not Authorized error"
+    /// (`smithy_query(query="doc",shape="CognitoIdentityProvider",member="ServerSideTokenCheck")`).
+    /// So for a provider entry that asks for the check, the token is only as good as the
+    /// user pool still says it is ([`IntegratedUserPools`]): a user that pool has signed
+    /// out, deactivated or deleted leaves the token it minted standing for nobody, and the
+    /// login is refused however well formed and however trusted its issuer is.
+    ///
+    /// An entry that does not ask for the check is decided by its issuer alone, and so is
+    /// one whose user pool this emulator does not hold: there is no integrated pool to check
+    /// WITH, so nothing about the token is decided here.
+    fn refuse_server_side_token_check(
+        &self,
+        integrated: &IntegratedUserPools,
+        provider_name: &str,
+    ) -> Option<LoginProviderRefusal> {
+        if !self.checks_tokens_server_side(provider_name) {
+            return None;
+        }
+        matches!(
+            integrated.presented_token_user(provider_name),
+            Some(PresentedTokenUser::Inactive)
+        )
+        .then_some(LoginProviderRefusal::InactiveToken)
+    }
+
+    /// Whether this pool's `CognitoIdentityProviders` entry for the issuer `provider_name`
+    /// names asks for server-side token validation — `ServerSideTokenCheck` is "TRUE if
+    /// server-side token validation is enabled for the identity provider's token" (this
+    /// service's model), and a pool may name one user pool in more than one entry, so the
+    /// check is on where ANY entry for that issuer asks for it.
+    ///
+    /// The member is optional and the validation is what a caller opts IN to, so an entry
+    /// that stored no value for it asks for none.
+    pub fn checks_tokens_server_side(&self, provider_name: &str) -> bool {
+        let issuer = login_provider_issuer(provider_name);
+        self.cognito_identity_providers
+            .iter()
+            .flatten()
+            .filter(|provider| {
+                provider
+                    .provider_name
+                    .as_deref()
+                    .map(login_provider_issuer)
+                    .is_some_and(|named| named == issuer)
+            })
+            .any(|provider| provider.server_side_token_check == Some(true))
     }
 
     /// Why the value presented for ONE login is not the token its provider issues, if so.
@@ -509,6 +576,65 @@ pub fn registered_oidc_providers<Eng: Send + Sync + 'static>(engine: &Eng) -> Re
     }
 }
 
+/// What an INTEGRATED Amazon Cognito user pool says about a user-pool token one request
+/// presents: the answer that pool gives for each `Logins` entry made under a user pool's
+/// provider name, keyed by that provider name (the `Logins` member is a map, so one
+/// provider carries one login per request).
+///
+/// A SNAPSHOT, read through the user-pools service's own state accessor in the same engine
+/// before a handler locks this service's store, so no request holds two services' stores at
+/// once and the user a token stands for is the one that service holds rather than a second
+/// copy of it kept here. Empty for an engine carrying no user-pool store, and for a request
+/// presenting no user-pool login: either way no entry is decided by an integrated pool.
+#[derive(Debug, Default, Clone)]
+pub struct IntegratedUserPools {
+    presented: BTreeMap<String, PresentedTokenUser>,
+}
+
+impl IntegratedUserPools {
+    /// What the user pool `provider_name` names says about the token presented under it, or
+    /// `None` when no integrated pool answered for that entry at all — an entry of some
+    /// other kind of provider, and one naming a user pool this emulator does not hold.
+    pub fn presented_token_user(&self, provider_name: &str) -> Option<PresentedTokenUser> {
+        self.presented.get(provider_name).copied()
+    }
+}
+
+/// What the account's Amazon Cognito user pools say about the user-pool tokens `logins`
+/// presents ([`IntegratedUserPools`]), read through the user-pools service's OWN state
+/// accessor in the same engine: the user a token stands for, and whether that pool has
+/// signed it out, is that service's record.
+///
+/// Only an entry whose provider name names a user pool
+/// ([`names_cognito_user_pool`]) is asked about — every other provider is decided by the
+/// issuer that issued its credential — and the pool asked is the one the provider name
+/// names, which carries the pool's id ([`cognito_user_pool_named`]).
+pub fn user_pool_logins<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    logins: &HashMap<String, String>,
+) -> IntegratedUserPools {
+    let Some(user_pools) =
+        ::service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice::state::service_state(
+            engine,
+        )
+    else {
+        return IntegratedUserPools::default();
+    };
+    let user_pools = user_pools.lock();
+    let mut presented = BTreeMap::new();
+    for (provider_name, token) in logins {
+        let Some((_, user_pool_id)) = cognito_user_pool_named(login_provider_issuer(provider_name))
+        else {
+            continue;
+        };
+        presented.insert(
+            provider_name.clone(),
+            user_pools.presented_token_user(user_pool_id, token),
+        );
+    }
+    IntegratedUserPools { presented }
+}
+
 /// The audiences the trusts an identity pool states for ONE issuer accept.
 #[derive(Debug, Default, Clone)]
 struct TrustedAudiences {
@@ -625,6 +751,10 @@ pub enum LoginProviderRefusal {
     NoIdentityProviders,
     /// It states one, and the token names an audience that trust does not accept.
     IncorrectAudience,
+    /// The trust is a `CognitoIdentityProviders` entry asking for server-side token
+    /// validation, and the user pool it names says the token stands for no user that still
+    /// signs in: one it has signed out, deactivated or deleted.
+    InactiveToken,
 }
 
 impl LoginProviderRefusal {
@@ -643,6 +773,7 @@ impl LoginProviderRefusal {
                 Cow::Owned(no_identity_providers_message(identity_pool_id))
             }
             Self::IncorrectAudience => Cow::Borrowed(INCORRECT_TOKEN_AUDIENCE_MESSAGE),
+            Self::InactiveToken => Cow::Borrowed(INACTIVE_LOGIN_TOKEN_MESSAGE),
         }
     }
 }
@@ -959,6 +1090,17 @@ pub fn no_identity_providers_message(identity_pool_id: &str) -> String {
 /// registering that client with the provider.
 pub const INCORRECT_TOKEN_AUDIENCE_MESSAGE: &str =
     "Invalid login token. Incorrect token audience.";
+
+/// The message a `NotAuthorizedException` carries for a login the INTEGRATED user pool no
+/// longer stands behind: a pool entry asking for server-side token validation, whose user
+/// pool reports the token's user signed out, deactivated or deleted
+/// ([`IdentityPool::refuse_server_side_token_check`]).
+///
+/// One fixed sentence, as the refusals above are and for the same reason — the caller holds
+/// no credential — naming neither the user pool consulted nor what it said about the user:
+/// what a client has to act on is that the token it presented is no longer live, which is
+/// the one thing it can fix, by signing in again.
+pub const INACTIVE_LOGIN_TOKEN_MESSAGE: &str = "Token is inactive";
 
 /// The message a `NotAuthorizedException` carries for a request naming a developer-identity
 /// mapping the identity pool does not hold: a developer user identifier it has indexed

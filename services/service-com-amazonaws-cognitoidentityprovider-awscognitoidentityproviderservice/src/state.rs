@@ -27,7 +27,11 @@ mod identity_providers;
 mod attributes;
 /// The tokens a pool issues, and the key its JWTs are signed with.
 mod tokens;
+/// What a pool says about a token another service was presented: the server-side
+/// validation an integrated identity pool asks for.
+mod presented_tokens;
 pub use attributes::*;
+pub use presented_tokens::*;
 pub use identity_providers::*;
 pub use pool_preconditions::*;
 pub use pool_resources::*;

@@ -85,6 +85,8 @@ mod resource_not_found_precedence;
 mod resource_tags;
 #[path = "all/response_request_id.rs"]
 mod response_request_id;
+#[path = "all/server_side_token_check.rs"]
+mod server_side_token_check;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/unlink_developer_identity.rs"]

@@ -201,6 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetId<Eng> {
         } else {
             crate::state::registered_oidc_providers(&*self.engine)
         };
+        // What an integrated user pool says about a user-pool token this call presents is
+        // that service's record, so it too is read before this service's store is locked
+        // ([`crate::state::user_pool_logins`]).
+        let integrated = crate::state::user_pool_logins(&*self.engine, &logins);
         let mut store = state.lock();
 
         let Some(pool) = store.identity_pools.get(&input.identity_pool_id) else {
@@ -221,8 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetId<Eng> {
         // issues, and one issued by someone other than the provider it is presented under,
         // authorize nothing — and then this pool's stored trust for that token's issuer,
         // which a `Logins` entry carries in the provider name, together with the audience
-        // that trust accepts.
-        if let Some(refusal) = pool.refuse_logins(&registered, &logins) {
+        // that trust accepts — and last what the user pool an entry asking for server-side
+        // token validation names says about the user its token stands for.
+        if let Some(refusal) = pool.refuse_logins(&registered, &integrated, &logins) {
             return Err(GetIdErrorModeled::NotAuthorizedException(NotAuthorizedException {
                 message: Some(refusal.message(&pool.identity_pool_id).into_owned()),
             })

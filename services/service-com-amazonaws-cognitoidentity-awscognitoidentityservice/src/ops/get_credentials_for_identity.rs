@@ -270,6 +270,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
         } else {
             crate::state::registered_oidc_providers(&*self.engine)
         };
+        // What an integrated user pool says about a user-pool token this vend presents is
+        // that service's record, so it too is read before this service's store is locked
+        // ([`crate::state::user_pool_logins`]).
+        let integrated = match input.logins.as_ref() {
+            Some(logins) => crate::state::user_pool_logins(&*self.engine, logins),
+            None => crate::state::IntegratedUserPools::default(),
+        };
         // The pool's own configuration is read FIRST, and only the facts this vend needs
         // are copied out, so the identity-pool store is not held while the IAM and STS
         // stores in the same engine are read.
@@ -306,7 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
             // entry presents is decided before either.
             let logins = input.logins.clone().unwrap_or_default();
             if !logins.is_empty() {
-                if let Some(refusal) = pool.refuse_logins(&registered, &logins) {
+                if let Some(refusal) = pool.refuse_logins(&registered, &integrated, &logins) {
                     return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
                         NotAuthorizedException {
                             message: Some(refusal.message(&identity_pool_id).into_owned()),
