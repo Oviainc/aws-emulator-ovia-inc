@@ -20,7 +20,50 @@
 //! what keeps the suites from drifting on it.
 
 use serde_json::json;
+use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
+
+/// The property definitions `properties`, each carrying the id the asset model
+/// `model_id` already holds for a property of that NAME.
+///
+/// `UpdateAssetModel` replaces the whole model, and an id-less definition whose
+/// name an existing property already holds would RE-CREATE that property under a
+/// new id — losing the id every time series, variable reference and ingest path
+/// addressing it names — so the service refuses one. A suite that resubmits a
+/// stored property in order to KEEP it therefore names it by its stored id, which
+/// is what a client of the real service does; a definition the model holds no
+/// property of that name for is new and stays as written.
+pub(crate) async fn named_by_stored_id(
+    router: &MultiServiceRouter,
+    model_id: &str,
+    properties: Value,
+) -> Value {
+    let (status, described) = crate::asset_lifecycle::call(
+        router,
+        "GET",
+        &format!("/asset-models/{model_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "DescribeAssetModel({model_id}): got {status} {described}"
+    );
+    let stored = described["assetModelProperties"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut named = properties.as_array().cloned().unwrap_or_default();
+    for property in &mut named {
+        if property.get("id").is_some() {
+            continue;
+        }
+        if let Some(held) = stored.iter().find(|held| held["name"] == property["name"]) {
+            property["id"] = held["id"].clone();
+        }
+    }
+    Value::Array(named)
+}
 
 /// Open workspace `name` unless this router already holds it.
 ///

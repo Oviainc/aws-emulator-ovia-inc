@@ -105,6 +105,14 @@ async fn describe_model(router: &MultiServiceRouter, model_id: &str) -> Value {
     body
 }
 
+/// The model's property definitions as `DescribeAssetModel` reports them — each
+/// carrying its stored id, which is how an update KEEPS a property: an id-less
+/// definition whose name the model already holds asks for the replacement the
+/// service refuses.
+async fn stored_properties(router: &MultiServiceRouter, model_id: &str) -> Value {
+    describe_model(router, model_id).await["assetModelProperties"].clone()
+}
+
 /// `GET /assets/{assetId}`, asserting it answered.
 async fn describe_asset(router: &MultiServiceRouter, asset_id: &str) -> Value {
     let (status, body) = call(router, "GET", &format!("/assets/{asset_id}"), None).await;
@@ -744,10 +752,14 @@ async fn update_asset_model_evaluates_its_conditional_headers_before_writing() {
         let seed_name = format!("Boiler-{at}");
         let model_id = create_model(&router, &seed_name, base_properties()).await;
         let stale = describe_e_tag(&router, &model_id).await;
+        // The seeding update resubmits the stored properties BY THEIR IDS, which
+        // is what keeps them: an id-less definition whose name the model already
+        // holds asks for a replacement the service refuses.
+        let kept = stored_properties(&router, &model_id).await;
         let (status, answered) = update_model(
             &router,
             &model_id,
-            json!({"assetModelName": seed_name, "assetModelProperties": base_properties()}),
+            json!({"assetModelName": seed_name, "assetModelProperties": kept}),
             &[],
         )
         .await;
@@ -785,7 +797,11 @@ async fn update_asset_model_evaluates_its_conditional_headers_before_writing() {
         let (status, answered) = update_model(
             &router,
             model_id,
-            json!({"assetModelName": conditioned, "assetModelProperties": base_properties()}),
+            json!({
+                "assetModelName": conditioned,
+                // The properties this update KEEPS, named by their stored ids.
+                "assetModelProperties": stored_properties(&router, model_id).await,
+            }),
             &headers,
         )
         .await;
@@ -854,6 +870,8 @@ async fn the_conditional_headers_target_a_version_that_may_not_exist_yet() {
         // exists behind it.
         let model_id = create_model(&router, case, base_properties()).await;
         let tag = describe_e_tag(&router, &model_id).await;
+        // The properties this update KEEPS, named by their stored ids.
+        let kept = stored_properties(&router, &model_id).await;
         let headers: Vec<(&str, &str)> = headers
             .iter()
             .map(|(name, value)| {
@@ -864,7 +882,7 @@ async fn the_conditional_headers_target_a_version_that_may_not_exist_yet() {
         let (status, answered) = update_model(
             &router,
             &model_id,
-            json!({"assetModelName": "Conditioned", "assetModelProperties": base_properties()}),
+            json!({"assetModelName": "Conditioned", "assetModelProperties": kept}),
             &headers,
         )
         .await;

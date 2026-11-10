@@ -567,6 +567,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
+        // The definition is resolved and PARSED before a single field is written,
+        // exactly as it is on the create: a property name two definitions share, a
+        // variable that resolves to nothing in its scope, a formula that does not
+        // parse against its declared variables and a window outside the published
+        // limits are all refused here, so a refused update leaves the model as it
+        // was.
+        let definition = store.definition_under_write(
+            &properties,
+            &hierarchies,
+            &composite_models,
+            &composite_model_links,
+        );
+        store
+            .check_asset_model_definition(&definition)
+            .map_err(invalid_request)?;
+
         // Nothing can be refused from here on, so the writes land together.
         let record = store
             .asset_models

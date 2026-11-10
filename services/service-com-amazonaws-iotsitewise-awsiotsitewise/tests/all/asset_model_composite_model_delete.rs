@@ -826,19 +826,17 @@ async fn a_formula_reading_a_property_a_component_model_lends_refuses_the_delete
         )
         .await;
 
-        let model_properties = match row {
-            Row::ModelMetricById => vec![metric_property(
-                "ModelAverage",
-                json!({"propertyId": LENT_PROPERTY_ID}),
-            )],
-            _ => Vec::new(),
-        };
+        // The asset model starts out with no formula of its own: a variable
+        // resolves only inside the model it is written in, and until the
+        // component-model-based composite model below lends it, the property the
+        // row's formula reads belongs to another model. The row that puts the
+        // formula ON THE MODEL adds it once the composite model lends it.
         let model_id = create_model_from(
             &router,
             case,
             json!({
                 "assetModelName": "Boiler",
-                "assetModelProperties": model_properties,
+                "assetModelProperties": [],
             }),
         )
         .await;
@@ -879,6 +877,35 @@ async fn a_formula_reading_a_property_a_component_model_lends_refuses_the_delete
             contributed.contains(&LENT_PROPERTY_ID),
             "case {case:?}: the composite model must contribute {LENT_PROPERTY_ID}, got {described}"
         );
+
+        // The formula the row puts on the asset model ITSELF, added now that the
+        // composite model lends the property it reads. The composite model is
+        // resubmitted by its id and with no properties of its own, which is what
+        // keeps the component model it reuses lending them.
+        if matches!(row, Row::ModelMetricById) {
+            let (status, updated) = call(
+                &router,
+                "PUT",
+                &format!("/asset-models/{model_id}"),
+                Some(json!({
+                    "assetModelName": "Boiler",
+                    "assetModelProperties": [metric_property(
+                        "ModelAverage",
+                        json!({"propertyId": LENT_PROPERTY_ID}),
+                    )],
+                    "assetModelCompositeModels": [{
+                        "id": &source_id,
+                        "name": "ThePump",
+                        "type": "CUSTOM",
+                    }],
+                })),
+            )
+            .await;
+            assert_eq!(
+                status, 202,
+                "case {case:?}: adding the model's own metric got {status} {updated}"
+            );
+        }
 
         // The surviving formula, where the row puts it.
         let sibling = match row {

@@ -495,6 +495,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
+        // The definition this write would leave the asset model with is resolved
+        // and PARSED before anything is written, exactly as it is on the model's
+        // own writes: a property name this composite model's list repeats, a
+        // variable that resolves to nothing in the model's scope, a formula that
+        // does not parse against its declared variables and a window outside the
+        // published limits are all refused here.
+        let definition = store.definition_with_composite_model(
+            store
+                .asset_models
+                .get(&asset_model_id)
+                .ok_or_else(internal_failure)?,
+            &composite_model_id,
+            properties.as_deref(),
+            composed_asset_model_id.as_deref(),
+        );
+        store
+            .check_asset_model_definition(&definition)
+            .map_err(invalid_request)?;
+
         let record = store
             .asset_models
             .get_mut(&asset_model_id)

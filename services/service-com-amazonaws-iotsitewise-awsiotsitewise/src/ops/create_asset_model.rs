@@ -319,6 +319,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
             ));
         }
+        // The same two bounds `UpdateAssetModel` holds a new definition to, for
+        // the same reason, so a model cannot be created outside what an update of
+        // it would accept: how many composite models one asset model carries, and
+        // how many properties each of them states ("You can specify up to 200
+        // properties per composite model").
+        if input
+            .asset_model_composite_models
+            .as_deref()
+            .unwrap_or(&[])
+            .len()
+            > crate::state::MAX_COMPOSITE_MODELS_PER_ASSET_MODEL
+        {
+            return Err(CreateAssetModelError::Modeled(
+                CreateAssetModelErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "This emulator holds at most {} composite models per asset model.",
+                        crate::state::MAX_COMPOSITE_MODELS_PER_ASSET_MODEL
+                    ),
+                }),
+            ));
+        }
+        for definition in input.asset_model_composite_models.iter().flatten() {
+            if definition.properties.as_deref().unwrap_or(&[]).len()
+                > crate::state::MAX_PROPERTIES_PER_COMPOSITE_MODEL
+            {
+                return Err(CreateAssetModelError::Modeled(
+                    CreateAssetModelErrorModeled::LimitExceededException(LimitExceededException {
+                        message: format!(
+                            "A composite model carries at most {} properties.",
+                            crate::state::MAX_PROPERTIES_PER_COMPOSITE_MODEL
+                        ),
+                    }),
+                ));
+            }
+        }
 
         // A caller-supplied id must be globally unique; an absent one is minted.
         let asset_model_id = match input.asset_model_id.clone() {
@@ -409,6 +444,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // top-level and inline: the definition shape has neither a parent nor a
         // composed-model member, so it links to nothing.
         let composite_model_links = ::std::collections::HashMap::new();
+
+        // The definition is resolved and PARSED before a single field is written:
+        // a property name two definitions share, a variable that resolves to
+        // nothing in its scope, a formula that does not parse against its declared
+        // variables and a window outside the published limits are all refused
+        // here, so a refused create stores no model at all. The same rule the
+        // update holds a new definition to, so a model cannot be created outside
+        // what an update of it would accept.
+        let definition = store.definition_under_write(
+            &properties,
+            &hierarchies,
+            &composite_models,
+            &composite_model_links,
+        );
+        store
+            .check_asset_model_definition(&definition)
+            .map_err(invalid_request)?;
 
         let record = crate::state::AssetModelRecord {
             id: asset_model_id.clone(),

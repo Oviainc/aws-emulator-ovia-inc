@@ -117,6 +117,10 @@ async fn rewrite_component_model(
     component_id: &str,
     properties: Value,
 ) {
+    // A property this component model already holds is resubmitted by its stored
+    // id, so the rewrite KEEPS it instead of asking for the replacement
+    // `UpdateAssetModel` refuses; see `crate::support::named_by_stored_id`.
+    let properties = crate::support::named_by_stored_id(router, component_id, properties).await;
     let (status, body) = call(
         router,
         "PUT",

@@ -618,16 +618,21 @@ async fn a_composite_model_added_to_or_removed_from_the_model_reaches_its_assets
     // Removing the composite model from the model takes its per-asset properties
     // with it, so the property stops being addressable on the asset. Removed
     // through `UpdateAssetModel`, whose request states the whole definition, so
-    // what it leaves out is what the model stops holding.
+    // what it leaves out is what the model stops holding. The property it KEEPS
+    // is resubmitted by its stored id, the way a kept property has to be.
+    let kept = crate::support::named_by_stored_id(
+        &router,
+        &model_id,
+        json!([{"name": "Uptime", "dataType": "DOUBLE", "type": {"measurement": {}}}]),
+    )
+    .await;
     let (status, updated) = call(
         &router,
         "PUT",
         &format!("/asset-models/{model_id}"),
         Some(json!({
             "assetModelName": "Boiler",
-            "assetModelProperties": [
-                {"name": "Uptime", "dataType": "DOUBLE", "type": {"measurement": {}}},
-            ],
+            "assetModelProperties": kept,
         })),
     )
     .await;

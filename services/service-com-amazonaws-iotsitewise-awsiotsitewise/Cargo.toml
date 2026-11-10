@@ -28,6 +28,10 @@ hex = { workspace = true }
 # The SQL parser for `ExecuteQuery`: the IoT SiteWise query language is SQL, so its
 # statements are parsed by a real parser rather than matched on as text.
 sqlparser = "0.59"
+# `iso8601_span`: the ISO 8601 duration a tumbling window's interval and offset
+# may be spelled as, read through the workspace's one maintained reading of that
+# grammar rather than a second one here.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

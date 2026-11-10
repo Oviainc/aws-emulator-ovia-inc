@@ -446,52 +446,30 @@ fn formula_dependent(
         // another model stops exposing that same definition — the component
         // model a composite model reuses keeps the properties it lends.
         let exposed = exposed_property_ids(store, model, removed);
-        exposed_properties(store, model, removed)
+        store
+            .exposed_asset_model_properties(model, removed)
             .into_iter()
             .find(|property| depends_on(property, &doomed_properties, doomed, &exposed))
             .map(|property| (model.id.clone(), property.name))
     })
 }
 
-/// Every property asset model `model` exposes once the composite models in
-/// `removed` are gone: its OWN definitions, plus the ones each remaining
-/// composite model CONTRIBUTES.
+/// The ids of the properties `model` goes on exposing once the composite models
+/// in `removed` are gone, for the membership questions the dependency rule asks.
 ///
-/// What a composite model contributes is its own definitions, or — for a
-/// component-model-based one, which stores none of its own — the properties of
-/// the `COMPONENT_MODEL` it reuses, so this asks
-/// [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::composite_model_properties`],
-/// the crate's one definition of "the properties of a composite model", rather
-/// than the raw stored field. That is what makes the dependency rule here see
-/// the same properties `DescribeAssetModelCompositeModel` reports.
-fn exposed_properties(
-    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
-    model: &crate::state::AssetModelRecord,
-    removed: &HashSet<String>,
-) -> Vec<AssetModelProperty> {
-    model
-        .properties
-        .iter()
-        .cloned()
-        .chain(
-            model
-                .composite_models
-                .iter()
-                .filter_map(|composite| composite.id.as_deref())
-                .filter(|id| !removed.contains(*id))
-                .flat_map(|id| store.composite_model_properties(model, id)),
-        )
-        .collect()
-}
-
-/// The ids of [`exposed_properties`], for the membership questions the
-/// dependency rule asks.
+/// The list itself comes from
+/// [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::exposed_asset_model_properties`],
+/// the crate's one definition of "the properties an asset model exposes", so the
+/// dependency rule here sees the same properties
+/// `DescribeAssetModelCompositeModel` reports and the same scope an asset-model
+/// write resolves a variable in.
 fn exposed_property_ids(
     store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
     model: &crate::state::AssetModelRecord,
     removed: &HashSet<String>,
 ) -> HashSet<String> {
-    exposed_properties(store, model, removed)
+    store
+        .exposed_asset_model_properties(model, removed)
         .into_iter()
         .filter_map(|property| property.id)
         .collect()
