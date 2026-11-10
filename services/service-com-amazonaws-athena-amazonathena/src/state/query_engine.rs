@@ -258,6 +258,8 @@ impl Database {
         // nothing here widens it.
         let reads_stored_data = Arc::new(AtomicBool::new(false));
         let observer = Arc::clone(&reads_stored_data);
+        // The install is CHECKED: a connection whose authorizer could not be installed
+        // would run a query unconfined, so the open fails instead of handing one back.
         connection.authorizer(Some(
             move |context: rusqlite::hooks::AuthContext<'_>| -> rusqlite::hooks::Authorization {
                 if matches!(context.action, rusqlite::hooks::AuthAction::Read { .. }) {

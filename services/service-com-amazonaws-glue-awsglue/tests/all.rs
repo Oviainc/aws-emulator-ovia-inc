@@ -203,8 +203,12 @@ mod integration_resource_properties;
 mod integration_table_properties;
 #[path = "all/job_bookmarks.rs"]
 mod job_bookmarks;
+#[path = "all/job_capacity_refusal.rs"]
+mod job_capacity_refusal;
 #[path = "all/job_deletion.rs"]
 mod job_deletion;
+#[path = "all/job_glue_version_pattern.rs"]
+mod job_glue_version_pattern;
 #[path = "all/job_listing.rs"]
 mod job_listing;
 #[path = "all/job_not_found_message.rs"]

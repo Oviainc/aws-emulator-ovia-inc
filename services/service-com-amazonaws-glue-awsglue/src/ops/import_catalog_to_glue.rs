@@ -182,7 +182,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // ONE migration record per catalog, so a second import REPLACES it: the status a
         // read reports is of the migration last performed, stamped with the instant this
-        // request was served and the identity it speaks for.
+        // request was served. The importer a later read names is the service's own marker,
+        // not this request's identity: the record holds no initiator to report.
         catalog.migration = Some(crate::state::CatalogMigrationEntry::from_import(
             ::std::time::SystemTime::now(),
         ));

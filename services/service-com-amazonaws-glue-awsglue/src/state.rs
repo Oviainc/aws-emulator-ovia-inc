@@ -968,6 +968,15 @@ pub(super) fn id_draw(sequence: u64, index: usize) -> u64 {
 pub struct ComAmazonawsGlueAwsglueState {
     /// Every Data Catalog this emulator holds, keyed by `CatalogId`.
     pub catalogs: HashMap<String, Catalog>,
+    /// The instant the Data Catalogs of this store carry their DEFAULT migration status
+    /// from ([`CatalogStatusStamp`]): the instant a status read reports as
+    /// `CatalogImportStatus$ImportTime` for a catalog no `ImportCatalogToGlue` has
+    /// migrated, which is every catalog until one does.
+    ///
+    /// On the store rather than on a catalog because the status is reported for a
+    /// `CatalogId` whether or not this store holds a record under it: the account's own
+    /// Data Catalog answers a status read before any create has materialised it.
+    pub catalog_status_stamp: CatalogStatusStamp,
     /// Every crawler this emulator holds, keyed by its name.
     ///
     /// Crawlers live BESIDE the catalog tree rather than inside it: `GetCrawler`,
@@ -1859,18 +1868,24 @@ impl ComAmazonawsGlueAwsglueState {
     }
 
     /// The migration status `catalog_id` REPORTS: whether a migration of an
-    /// Athena-managed data catalog into it has completed, who initiated it, and, when an
-    /// `ImportCatalogToGlue` migrated one here, the instant that import was served
-    /// ([`CatalogMigrationEntry`]).
+    /// Athena-managed data catalog into it has completed, the marker the service names as
+    /// its importer, and the instant that status was stamped — the instant an
+    /// `ImportCatalogToGlue` was served here ([`CatalogMigrationEntry`]) where one was.
     ///
     /// A Data Catalog this emulator serves is a Glue Data Catalog and holds no migration
     /// still running: an import has nothing left to copy once it has been served, so the
     /// catalog's migration is complete whether an import ran here or the catalog was a
     /// Glue Data Catalog all along — which is what "`True` if the migration has
-    /// completed" reports. The catalog whose status no caller's import set carries it by
-    /// DEFAULT, so the principal reported for it is the service's own marker
-    /// ([`STATUS_SET_BY_DEFAULT`]) rather than a person, and it carries no instant at all:
-    /// no import was served, so there is no time a migration was started.
+    /// completed" reports.
+    ///
+    /// Both of the other members are the SERVICE's, not the caller's. The importer is the
+    /// service's own marker ([`STATUS_SET_BY_DEFAULT`]) rather than a person or a
+    /// principal: no request this service serves carries "the person who initiated the
+    /// migration", so there is none to report. The instant is the one the reported status
+    /// was stamped at — the instant of the migration the catalog's record holds, or the
+    /// store's own stamp ([`Self::catalog_status_stamp`]) for a catalog no import has
+    /// migrated — so the member is reported for every catalog rather than only for a
+    /// migrated one.
     pub fn catalog_import_status(&self, catalog_id: &str) -> CatalogImportStatus {
         let migration = self
             .catalogs
@@ -1878,11 +1893,11 @@ impl ComAmazonawsGlueAwsglueState {
             .and_then(|catalog| catalog.migration.as_ref());
         CatalogImportStatus {
             import_completed: true,
-            import_time: migration.map(|stored| to_date_time(stored.import_time)),
-            imported_by: Some(migration.map_or_else(
-                || STATUS_SET_BY_DEFAULT.to_string(),
-                |stored| stored.imported_by.clone(),
-            )),
+            import_time: Some(to_date_time(migration.map_or_else(
+                || self.catalog_status_stamp.instant(),
+                |stored| stored.import_time,
+            ))),
+            imported_by: Some(STATUS_SET_BY_DEFAULT.to_string()),
         }
     }
 

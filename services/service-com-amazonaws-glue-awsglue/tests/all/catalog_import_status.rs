@@ -3,21 +3,23 @@
 //! The Data Catalog's MIGRATION record: `ImportCatalogToGlue` and
 //! `GetCatalogImportStatus`.
 //!
-//! The rule under test: a catalog's migration is ONE record per catalog that an import
-//! writes and the status read reports — "`True` if the migration has completed"
-//! (`CatalogImportStatus$ImportCompleted`), with "the time that the migration was started"
-//! (`$ImportTime`) reported only for a catalog an import has actually migrated and "the
-//! name of the person who initiated the migration" (`$ImportedBy`) reported as that
-//! caller's identity, or as the service's own marker for a catalog carrying the status it
-//! has by default. A Data Catalog this account holds is a Glue Data Catalog, so its
-//! migration is complete whether an import ran against it or not; the read reports, so it
-//! never changes what a later read sees; and a `CatalogId` this account does not hold is
-//! refused by both operations rather than served or created.
+//! The rule under test: the migration status of a Data Catalog is the SERVICE's own
+//! record, not the caller's — "`True` if the migration has completed"
+//! (`CatalogImportStatus$ImportCompleted`), "the time that the migration was started"
+//! (`$ImportTime`) reported for every catalog whose status is read, and "the name of the
+//! person who initiated the migration" (`$ImportedBy`) reported as the service's own
+//! marker, because no request this service serves carries such a person and the calling
+//! identity is never put in their place. A Data Catalog this account holds is a Glue Data
+//! Catalog, so its migration is complete whether an import ran against it or not; an
+//! import stamps the instant the status reports; the read reports, so it never changes what
+//! a later read sees; and a `CatalogId` this account does not hold is refused by both
+//! operations rather than served or created.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: whether
 //! the request names its `CatalogId` or lets it default, whether an import has run, how
-//! many imports have run, and which catalog id a foreign request names. The recorded case —
-//! reading the status of the account's own catalog — is one row among them.
+//! many imports have run, and which catalog id a foreign request names. The recorded cases
+//! — reading the status of the account's own catalog, with and without an import before it
+//! — are rows among them.
 //!
 //! Every call goes over the wire through the shared [`crate::wire`] harness; the one
 //! direct touch of the store seeds an OLDER migration record, so that a later import can be
@@ -68,12 +70,43 @@ fn epoch_seconds(at: SystemTime) -> f64 {
         .as_secs_f64()
 }
 
+/// Assert of one reported status the three things that hold of EVERY status this service
+/// reports, and answer the instant it was stamped at: the migration is complete, the
+/// importer is the service's own marker rather than any identity, and an instant is
+/// reported.
+fn assert_service_authored(case: &str, reported: &Value) -> f64 {
+    assert_eq!(
+        reported["ImportCompleted"],
+        json!(true),
+        "case {case}: expected a completed migration, got {reported}"
+    );
+    assert_eq!(
+        reported["ImportedBy"],
+        json!(STATUS_SET_BY_DEFAULT),
+        "case {case}: expected the service's own marker as the importer, got {reported}"
+    );
+    assert!(
+        !reported.to_string().contains(CALLER_PRINCIPAL),
+        "case {case}: the status is the service's own, so no part of it may report the \
+         calling identity, got {reported}"
+    );
+    let stamped_at = reported["ImportTime"].as_f64().unwrap_or_else(|| {
+        panic!("case {case}: expected the instant the status was stamped, got {reported}")
+    });
+    assert!(
+        stamped_at > 0.0,
+        "case {case}: expected an instant past the epoch, got {stamped_at}"
+    );
+    stamped_at
+}
+
 /// A catalog nothing has migrated reports its migration as complete, under the service's
-/// own marker and with no instant, and the read reports rather than writes: repeated reads,
-/// with and without the `CatalogId` named, answer the same thing.
+/// own marker and stamped with an instant, and the read reports rather than writes:
+/// repeated reads, with and without the `CatalogId` named, answer the same thing.
 #[tokio::test]
 async fn an_unmigrated_catalog_reports_the_status_it_carries_by_default() {
     let router = emulator();
+    let before = epoch_seconds(SystemTime::now()).ceil();
 
     // (case, the request body)
     let cases: Vec<(&str, Value)> = vec![
@@ -86,13 +119,14 @@ async fn an_unmigrated_catalog_reports_the_status_it_carries_by_default() {
         ),
     ];
 
+    let mut first_reported: Option<Value> = None;
     for (case, request) in &cases {
         let first = import_status(&router, request).await;
-        assert_eq!(
-            first,
-            json!({ "ImportCompleted": true, "ImportedBy": STATUS_SET_BY_DEFAULT }),
-            "case {case}: expected a completed migration carrying the default marker and no \
-             instant, got {first}"
+        let stamped_at = assert_service_authored(case, &first);
+        assert!(
+            stamped_at <= before,
+            "case {case}: a catalog no import has migrated carries a stamp taken before the \
+             read, at most {before}, got {stamped_at}"
         );
         // Reporting, not mutating: a second read of the same catalog answers the same, and
         // so does a read of the other spelling of the same catalog id.
@@ -102,20 +136,25 @@ async fn an_unmigrated_catalog_reports_the_status_it_carries_by_default() {
             "case {case}: a read must not change what a later read sees; got {first} then \
              {second}"
         );
+        let expected = first_reported.get_or_insert_with(|| first.clone());
+        assert_eq!(
+            &first, expected,
+            "case {case}: both spellings of one catalog id address one status; expected \
+             {expected}, got {first}"
+        );
     }
 
     let after_reads = import_status(&router, &json!({})).await;
     assert_eq!(
-        after_reads,
-        json!({ "ImportCompleted": true, "ImportedBy": STATUS_SET_BY_DEFAULT }),
+        Some(&after_reads),
+        first_reported.as_ref(),
         "case after four reads: the same status must still be reported, got {after_reads}"
     );
 }
 
 /// An import is reported by every later status read of the same catalog: the migration is
-/// complete, its instant is the one the import was served at, and it was initiated by the
-/// identity the request speaks for — whichever spelling of the catalog id the two calls
-/// used.
+/// complete, its instant is the one the import was served at, and the importer is still the
+/// service's own marker — whichever spelling of the catalog id the two calls used.
 #[tokio::test]
 async fn an_import_is_reported_by_a_later_status_read() {
     // (case, the CatalogId the import names, the read's request body)
@@ -145,23 +184,11 @@ async fn an_import_is_reported_by_a_later_status_read() {
         let after = epoch_seconds(SystemTime::now()).ceil();
 
         let reported = import_status(&router, read_request).await;
-        assert_eq!(
-            reported["ImportCompleted"],
-            json!(true),
-            "case {case}: expected a completed migration, got {reported}"
-        );
-        let import_time = reported["ImportTime"].as_f64().unwrap_or_else(|| {
-            panic!("case {case}: expected an ImportTime on a migrated catalog, got {reported}")
-        });
+        let import_time = assert_service_authored(case, &reported);
         assert!(
             (before..=after).contains(&import_time),
             "case {case}: expected the instant the import was served, in {before}..={after}, \
              got {import_time}"
-        );
-        assert_eq!(
-            reported["ImportedBy"],
-            json!(CALLER_PRINCIPAL),
-            "case {case}: expected the identity the request speaks for, got {reported}"
         );
 
         // Stored, not computed per call: a second read answers the same record.
@@ -178,18 +205,13 @@ async fn an_import_is_reported_by_a_later_status_read() {
 /// and never afterwards.
 #[tokio::test]
 async fn a_later_import_replaces_the_recorded_migration() {
-    // (case, how many seconds before now the seeded record was written, the principal it
-    // records)
-    let cases: Vec<(&str, u64, &str)> = vec![
-        (
-            "a record written by another identity",
-            0,
-            "arn:aws:iam::000000000000:role/CatalogMigration",
-        ),
-        ("a record written long ago", 86_400, CALLER_PRINCIPAL),
+    // (case, how many seconds before the seeded epoch the record was written)
+    let cases: Vec<(&str, u64)> = vec![
+        ("a record written at the seeded instant", 0),
+        ("a record written a day earlier", 86_400),
     ];
 
-    for (case, seeded_offset, seeded_principal) in &cases {
+    for (case, seeded_offset) in &cases {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let router = emulator_on(Arc::clone(&engine));
 
@@ -202,43 +224,24 @@ async fn a_later_import_replaces_the_recorded_migration() {
             .expect("the account's own catalog is admitted")
             .migration = Some(CatalogMigrationEntry {
             import_time: seeded_at,
-            imported_by: (*seeded_principal).to_string(),
         });
 
         let seeded = import_status(&router, &json!({})).await;
-        assert_eq!(
-            seeded["ImportCompleted"],
-            json!(true),
-            "case {case}: expected the stored record reported as complete, got {seeded}"
-        );
+        assert_service_authored(case, &seeded);
         assert_eq!(
             seeded["ImportTime"].as_f64(),
             Some(epoch_seconds(seeded_at)),
             "case {case}: expected the stored instant reported as it was written, got {seeded}"
         );
-        assert_eq!(
-            seeded["ImportedBy"],
-            json!(seeded_principal),
-            "case {case}: expected the stored principal reported as it was written, got \
-             {seeded}"
-        );
 
         import_catalog(&router, case, None).await;
         let replaced = import_status(&router, &json!({})).await;
-        let import_time = replaced["ImportTime"].as_f64().unwrap_or_else(|| {
-            panic!("case {case}: expected an ImportTime after the import, got {replaced}")
-        });
+        let import_time = assert_service_authored(case, &replaced);
         assert!(
             import_time > epoch_seconds(seeded_at),
             "case {case}: expected the instant of the migration last performed, after \
              {}, got {import_time}",
             epoch_seconds(seeded_at)
-        );
-        assert_eq!(
-            replaced["ImportedBy"],
-            json!(CALLER_PRINCIPAL),
-            "case {case}: expected the identity that initiated the last migration, got \
-             {replaced}"
         );
     }
 }
@@ -255,6 +258,10 @@ async fn a_catalog_id_this_account_does_not_hold_is_refused_by_both_operations()
 
     for foreign in foreign_ids {
         let router = emulator();
+        let stamped_before = assert_service_authored(
+            &format!("{foreign:?} before the refusals"),
+            &import_status(&router, &json!({})).await,
+        );
 
         let requests: Vec<(&str, Value)> = vec![
             ("GetCatalogImportStatus", json!({ "CatalogId": foreign })),
@@ -280,13 +287,13 @@ async fn a_catalog_id_this_account_does_not_hold_is_refused_by_both_operations()
         }
 
         // The refused import stored nothing: this account's catalog still carries the
-        // status it has by default.
+        // status it had before, stamp and all.
         let reported = import_status(&router, &json!({})).await;
+        let stamped_after = assert_service_authored(&format!("{foreign:?}"), &reported);
         assert_eq!(
-            reported,
-            json!({ "ImportCompleted": true, "ImportedBy": STATUS_SET_BY_DEFAULT }),
-            "case {foreign:?}: a refused import must leave this account's catalog alone, got \
-             {reported}"
+            stamped_after, stamped_before,
+            "case {foreign:?}: a refused import must leave this account's catalog alone; \
+             expected the stamp {stamped_before}, got {reported}"
         );
     }
 }

@@ -158,9 +158,9 @@ pub fn dpu_per_worker(worker_type: &str) -> Option<f64> {
 
 /// The `Timeout` a job created without one carries, which depends on its Glue version
 /// (see [`DEFAULT_TIMEOUT_MINUTES_THROUGH_GLUE_4`]). The major version is the leading
-/// integer of the `GlueVersion` string (`^(\w+\.)+\w+$`); a version whose major part is
-/// not a number is treated as the current default, which is what an absent
-/// `GlueVersion` resolves to.
+/// integer of the `GlueVersion` string (`^((\w+\.)+\w+|auto)$`); a version whose major
+/// part is not a number — the literal `auto` among them — is treated as the current
+/// default, which is what an absent `GlueVersion` resolves to.
 pub fn default_timeout_minutes(glue_version: &str) -> i32 {
     let major = glue_version
         .split('.')

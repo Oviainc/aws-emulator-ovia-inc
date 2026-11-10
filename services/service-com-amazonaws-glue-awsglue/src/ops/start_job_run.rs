@@ -272,13 +272,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Do not set `MaxCapacity` if using `WorkerType` and `NumberOfWorkers`": the
         // two name the same capacity two ways, so a request carrying both is ambiguous
-        // rather than merely redundant.
+        // rather than merely redundant. The sentence is the service's own for this
+        // refusal, shared with the create and the update of a job definition.
         if input.max_capacity.is_some()
             && (input.worker_type.is_some() || input.number_of_workers.is_some())
         {
             return Err(invalid_input(
-                "Please do not set MaxCapacity if using WorkerType and NumberOfWorkers"
-                    .to_string(),
+                crate::state::messages::MAX_CAPACITY_EXCLUDES_WORKERS.to_string(),
             ));
         }
 

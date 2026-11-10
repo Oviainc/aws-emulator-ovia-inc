@@ -347,6 +347,19 @@ pub fn predicate_logical_required(conditions: usize) -> String {
 /// miss whichever operation reported it.
 pub const JOB_NOT_FOUND: &str = "Job not found.";
 
+/// A job definition or a job run that asks for its capacity BOTH ways: "do not set
+/// `MaxCapacity` if using `WorkerType` and `NumberOfWorkers`"
+/// (`CreateJobRequest$MaxCapacity`), the requirement `CreateJob`, `UpdateJob` and
+/// `StartJobRun` each hold their request to.
+///
+/// Recorded constant, and the whole message: entirely fixed text with no variable part,
+/// which states the two capacity members in the service's SPACED-OUT prose spelling rather
+/// than in the model's member spelling, and ends in a period. One constant, shared by every
+/// operation that takes a capacity, so a client matching the sentence recognises the refusal
+/// whichever of them reported it.
+pub const MAX_CAPACITY_EXCLUDES_WORKERS: &str =
+    "Please do not set Max Capacity if using Worker Type and Number of Workers.";
+
 /// `CreateJob` for a `Name` the request's Region already holds a job definition
 /// under, where the definition submitted is the stored one — so the create is a
 /// retry of the one that stored it rather than a second, different job under one

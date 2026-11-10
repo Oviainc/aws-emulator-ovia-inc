@@ -3,10 +3,11 @@
 //! @op GetCatalogImportStatus
 //!
 //! Reports the migration status of ONE Data Catalog: whether the import of an
-//! Athena-managed data catalog into the catalog this request addresses has completed and
-//! who initiated it — the identity behind an `ImportCatalogToGlue` served here, beside the
-//! instant it was served, or the service's own marker for a catalog carrying the status it
-//! has by default. A pure read — it stores nothing, so two reads with no import between
+//! Athena-managed data catalog into the catalog this request addresses has completed, the
+//! service's own marker as its importer — the status is the service's, so no caller
+//! identity is reported in place of the person who initiated a migration — and the instant
+//! that status was stamped, which is the instant an `ImportCatalogToGlue` was served here
+//! where one was. A pure read — it stores nothing, so two reads with no import between
 //! them answer the same.
 //!
 //! ## Shape of an operation

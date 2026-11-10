@@ -28,7 +28,9 @@ pub struct Catalog {
     /// ONE record per catalog, like [`Self::encryption_settings`]: every operation that
     /// starts or reports a migration names only a `CatalogId`, so a later migration of the
     /// same catalog REPLACES this record rather than adding to it. What a read reports from
-    /// it is [`ComAmazonawsGlueAwsglueState::catalog_import_status`].
+    /// it is [`ComAmazonawsGlueAwsglueState::catalog_import_status`], which reports the
+    /// instant of the migration this record holds for a catalog that has one and the
+    /// store's own stamp ([`CatalogStatusStamp`]) for a catalog that has none.
     pub migration: Option<CatalogMigrationEntry>,
     /// The catalog RESOURCE record a `CreateCatalog` wrote for this catalog id, or
     /// `None` for a catalog that is only a container — the account's own Data Catalog,
@@ -65,39 +67,57 @@ impl Catalog {
     }
 }
 
-/// `CatalogImportStatus$ImportedBy` of a Data Catalog whose migration status no caller's
-/// import set: the marker the service reports in place of "the name of the person who
-/// initiated the migration", because nobody initiated it — the catalog's status is the one
-/// it carries by default.
+/// `CatalogImportStatus$ImportedBy` of a Data Catalog: the service's own marker, reported
+/// in place of "the name of the person who initiated the migration" because the migration
+/// status of a Data Catalog this service serves is one the SERVICE set — no request it
+/// serves carries the person who initiated a migration of an Athena-managed catalog, so
+/// there is no such person to report and the caller's identity is never put in their place.
 ///
 /// A value of the member's own `NameString` shape (len 1..255), reported for every catalog
-/// no `ImportCatalogToGlue` has migrated, and replaced on one that has by the identity that
-/// initiated that migration ([`CatalogMigrationEntry::imported_by`]).
+/// whose status is read, whether or not an `ImportCatalogToGlue` has stamped that status.
 pub const STATUS_SET_BY_DEFAULT: &str = "StatusSetByDefault";
 
+/// The instant a Data Catalog whose migration status NO import has stamped carries that
+/// status from: the store's own instant, taken once when the store is materialised.
+///
+/// `CatalogImportStatus$ImportTime` — "the time that the migration was started" — is part
+/// of every migration status the service reports, so a catalog no import has migrated needs
+/// an instant of its own; taking it once, with the store, is what keeps it from moving
+/// between two reads of the same catalog.
+#[derive(Debug, Clone, Copy)]
+pub struct CatalogStatusStamp(SystemTime);
+
+impl CatalogStatusStamp {
+    /// The instant this stamp was taken.
+    pub fn instant(self) -> SystemTime {
+        self.0
+    }
+}
+
+impl Default for CatalogStatusStamp {
+    fn default() -> Self {
+        Self(SystemTime::now())
+    }
+}
+
 /// The migration of an Athena-managed data catalog into one Data Catalog that an
-/// `ImportCatalogToGlue` performed: when it ran and who initiated it, which is what a
-/// later `GetCatalogImportStatus` of that catalog reports beside its completion.
+/// `ImportCatalogToGlue` performed: WHEN it ran, which is the instant a later
+/// `GetCatalogImportStatus` of that catalog reports beside its completion.
+///
+/// It records no initiator: the status the service reports names its own marker as the
+/// importer ([`STATUS_SET_BY_DEFAULT`]) rather than the identity that asked for the import.
 #[derive(Debug, Clone)]
 pub struct CatalogMigrationEntry {
     /// `CatalogImportStatus$ImportTime`: "the time that the migration was started" — the
     /// instant the import was served, stored so every later read reports the same
     /// timestamp.
     pub import_time: SystemTime,
-    /// `CatalogImportStatus$ImportedBy`: "the name of the person who initiated the
-    /// migration" — the identity the request speaks for ([`request_principal`]), never a
-    /// value the request itself carried.
-    pub imported_by: String,
 }
 
 impl CatalogMigrationEntry {
-    /// Record the migration an `ImportCatalogToGlue` served at `now` on behalf of the
-    /// calling identity.
+    /// Record the migration an `ImportCatalogToGlue` served at `now`.
     pub fn from_import(now: SystemTime) -> Self {
-        Self {
-            import_time: now,
-            imported_by: request_principal(),
-        }
+        Self { import_time: now }
     }
 }
 
