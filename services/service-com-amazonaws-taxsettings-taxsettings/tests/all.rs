@@ -31,6 +31,8 @@ mod batch_refusal_rows;
 mod batch_row_error_codes;
 #[path = "all/batch_tax_registration.rs"]
 mod batch_tax_registration;
+#[path = "all/conflict_refusal_messages.rs"]
+mod conflict_refusal_messages;
 #[path = "all/country_requirements.rs"]
 mod country_requirements;
 #[path = "all/country_rules.rs"]

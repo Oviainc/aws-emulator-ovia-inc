@@ -428,16 +428,36 @@ pub const ERROR_CODE_GST_EXISTENCE_BLOCK_SET_PAN: &str = "GSTExistenceBlockSetPA
 /// `ConflictException` is the one refusal this service answers when "the input is
 /// creating conflict with the given state"
 /// (`smithy_query(query="shape", shape="ConflictException")`), and that class has
-/// one published code and one published message
-/// ([`STATE_CONFLICT_MESSAGE`]) — neither interpolates anything from the request
-/// or from state, so every conflict of this service renders the same envelope
-/// ([`state_conflict`]).
+/// one published code, which every conflict of this service carries whichever
+/// state it conflicted with.
+///
+/// The `message` is NOT one per class: a refusal carries the fixed text the
+/// service words for the condition it is refusing — the general state conflict
+/// ([`STATE_CONFLICT_MESSAGE`]) or the pending-TRN rule
+/// ([`PENDING_REGISTRATION_CONFLICT_MESSAGE`]) — so `errorCode` is what a caller
+/// branches on and the message is what tells it WHICH state conflicted.
 pub const ERROR_CODE_GENERAL_CONFLICT: &str = "GeneralConflict";
 
-/// The `message` every `ConflictException` of this service carries — the fixed
-/// text of the conflict class, as a recorded 409 of this service words it. See
-/// [`ERROR_CODE_GENERAL_CONFLICT`].
+/// The `message` a `ConflictException` of this service carries when the state it
+/// conflicted with is not one the service words its own sentence for — the fixed
+/// text of the general conflict condition, as a recorded 409 of this service
+/// words it. See [`ERROR_CODE_GENERAL_CONFLICT`] and [`state_conflict`].
 pub const STATE_CONFLICT_MESSAGE: &str = "Operation cannot be performed due to conflict in current state.";
+
+/// The `message` a write of an account's tax registration is refused with while
+/// that account's stored TRN is still awaiting validation — the fixed text this
+/// service words for the pending-TRN condition, as a recorded 409 of
+/// `PutTaxRegistration` words it. See [`pending_registration_conflict`].
+///
+/// This is the condition the write's own documentation states — "You can't set a
+/// TRN if there's a pending TRN. You'll need to delete the pending TRN first"
+/// (`smithy_query(query="doc",shape="com.amazonaws.taxsettings#PutTaxRegistration")`)
+/// — and the sentence the refusal carries is the service's own wording of it,
+/// not that documentation sentence. Entirely fixed text: it names no account, no
+/// registration and no jurisdiction, because the request it refused already
+/// names them.
+pub const PENDING_REGISTRATION_CONFLICT_MESSAGE: &str =
+    "There is a pending TRN for the account. Please delete that first and retry the request.";
 
 /// The `message` the per-account row of `BatchDeleteTaxRegistration` carries for
 /// an account that holds no tax registration: the token naming the class of the
@@ -763,15 +783,18 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     /// * the account's stored TRN is still outstanding: both writers document
     ///   "You can't set a TRN if there's a pending TRN. You'll need to delete the
     ///   pending TRN first", so a record in [`STATUS_PENDING`] is NOT replaced —
-    ///   it is left exactly as it was and the write is refused
-    ///   ([`state_conflict`]). The validation the clock had
+    ///   it is left exactly as it was and the write is refused, carrying the
+    ///   sentence this service words for that condition
+    ///   ([`pending_registration_conflict`]). The validation the clock had
     ///   already made due at `written_at` is materialised first, because it was
     ///   owed at that instant whether or not anybody wrote: a TRN whose
     ///   validation has run is not an outstanding one, so it may be rewritten.
     /// * `accountId` is caller-supplied, so a write that would ADD a record is
     ///   refused once the store holds as many as this emulator keeps resident
     ///   ([`MAX_STORED_REGISTRATIONS`]) while rewriting an account that already
-    ///   has one adds nothing.
+    ///   has one adds nothing. That is a conflict with the store's own state,
+    ///   which this service words no sentence of its own for, so it carries the
+    ///   general one ([`state_conflict`]).
     pub fn store_registration(
         &mut self,
         account_id: &str,
@@ -786,7 +809,7 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
                 // since it fell due.
                 stored.settle(written_at);
                 if stored.status == STATUS_PENDING {
-                    return Err(state_conflict());
+                    return Err(pending_registration_conflict());
                 }
                 Some(stored.revision)
             }
@@ -1113,7 +1136,11 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     /// as submitted.
     ///
     /// Three refusals, each the modelled `ConflictException` ([`state_conflict`]),
-    /// and a refused write stores nothing and mints no id:
+    /// and a refused write stores nothing and mints no id. All three carry the
+    /// class's general sentence ([`STATE_CONFLICT_MESSAGE`]): the sentence this
+    /// service words for the pending-TRN condition belongs to the write of an
+    /// ACCOUNT's own registration ([`pending_registration_conflict`]), and a
+    /// recorded 409 of this operation words its conflict with the general one.
     ///
     /// * a supplemental tax registration SUPPLEMENTS the account's own: the
     ///   account must therefore hold a tax registration whose validation has
@@ -3896,20 +3923,39 @@ pub fn no_tax_registration() -> ResourceNotFoundException {
     }
 }
 
-/// This service's modelled `ConflictException` (HTTP 409): the envelope EVERY
-/// refusal of the conflict class carries.
+/// This service's modelled `ConflictException` (HTTP 409) for a state conflict
+/// the service words no sentence of its own for.
 ///
-/// The class has one published code and one published message
-/// ([`ERROR_CODE_GENERAL_CONFLICT`], [`STATE_CONFLICT_MESSAGE`]), neither of
-/// which interpolates anything from the request or from state, so there is one
-/// envelope rather than one per site and no caller can be told a conflict two
-/// different ways. WHICH state conflicts is the business of the call sites —
-/// a stored TRN whose validation is still outstanding, and the resident bounds
-/// [`MAX_STORED_REGISTRATIONS`] / [`MAX_STORED_SUPPLEMENTAL_REGISTRATIONS`] —
-/// each of which documents its own rule where it applies it.
+/// The class publishes one code ([`ERROR_CODE_GENERAL_CONFLICT`]) and this
+/// condition's message is the class's general sentence
+/// ([`STATE_CONFLICT_MESSAGE`]), neither of which interpolates anything from the
+/// request or from state. WHICH state conflicts is the business of the call
+/// sites — the resident bounds [`MAX_STORED_REGISTRATIONS`] /
+/// [`MAX_STORED_SUPPLEMENTAL_REGISTRATIONS`], and the account state a
+/// supplemental registration supplements — each of which documents its own rule
+/// where it applies it. A write refused because the account's own TRN is still
+/// awaiting validation carries the sentence this service words for THAT
+/// condition instead ([`pending_registration_conflict`]).
 pub fn state_conflict() -> ConflictException {
     ConflictException {
         message: STATE_CONFLICT_MESSAGE.to_string(),
+        error_code: ERROR_CODE_GENERAL_CONFLICT.to_string(),
+    }
+}
+
+/// This service's modelled `ConflictException` (HTTP 409) for a write of an
+/// account's tax registration aimed at an account whose stored TRN is still
+/// awaiting validation — the refusal [`ComAmazonawsTaxsettingsTaxsettingsState::store_registration`]
+/// makes, rendered by `PutTaxRegistration` on its own error channel and by the
+/// per-account rows of `BatchPutTaxRegistration`.
+///
+/// Same class and therefore the same published code as [`state_conflict`], and
+/// the message this service words for the pending-TRN condition
+/// ([`PENDING_REGISTRATION_CONFLICT_MESSAGE`]): a caller is told which state
+/// conflicted by the message, because the code is the whole class's.
+pub fn pending_registration_conflict() -> ConflictException {
+    ConflictException {
+        message: PENDING_REGISTRATION_CONFLICT_MESSAGE.to_string(),
         error_code: ERROR_CODE_GENERAL_CONFLICT.to_string(),
     }
 }

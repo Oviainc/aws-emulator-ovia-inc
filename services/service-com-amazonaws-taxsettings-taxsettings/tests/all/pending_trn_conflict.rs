@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
     ComAmazonawsTaxsettingsTaxsettingsState, StoredTaxRegistration, ERROR_CODE_GENERAL_CONFLICT,
-    STATE_CONFLICT_MESSAGE, STATUS_PENDING, STATUS_VERIFIED,
+    PENDING_REGISTRATION_CONFLICT_MESSAGE, STATUS_PENDING, STATUS_VERIFIED,
 };
 
 use crate::country_rules::{document, write, WRITERS};
@@ -238,8 +238,11 @@ fn assert_refused(case: &str, writer: &str, answer: &Answer, account_id: &str) {
         );
         assert_eq!(
             (rows[0].1.as_str(), rows[0].2.as_str()),
-            (ERROR_CODE_GENERAL_CONFLICT, STATE_CONFLICT_MESSAGE),
-            "case {case:?}: the row must carry the envelope the conflict class publishes, got \
+            (
+                ERROR_CODE_GENERAL_CONFLICT,
+                PENDING_REGISTRATION_CONFLICT_MESSAGE,
+            ),
+            "case {case:?}: the row must carry the envelope this refusal publishes, got \
              {rows:?}"
         );
         assert!(
@@ -254,8 +257,9 @@ fn assert_refused(case: &str, writer: &str, answer: &Answer, account_id: &str) {
         (409, "ConflictException"),
         "case {case:?}: the write must be refused with a conflict, got {answer:?}"
     );
-    // The conflict class publishes one code and one message, so the single-account
-    // refusal carries the same envelope the batch row above does.
+    // The conflict class publishes one code, and this condition has one
+    // sentence, so the single-account refusal carries the same envelope the
+    // batch row above does.
     assert_eq!(
         (
             answer.get("errorCode").as_str(),
@@ -263,9 +267,9 @@ fn assert_refused(case: &str, writer: &str, answer: &Answer, account_id: &str) {
         ),
         (
             Some(ERROR_CODE_GENERAL_CONFLICT),
-            Some(STATE_CONFLICT_MESSAGE),
+            Some(PENDING_REGISTRATION_CONFLICT_MESSAGE),
         ),
-        "case {case:?}: expected the conflict class's own envelope, got {:?}",
+        "case {case:?}: expected the pending-TRN refusal's own envelope, got {:?}",
         answer.body
     );
 }
@@ -560,8 +564,11 @@ async fn a_batch_reports_each_outstanding_account_and_stores_the_rest() {
         for (account_id, code, message) in &error_list {
             assert_eq!(
                 (code.as_str(), message.as_str()),
-                (ERROR_CODE_GENERAL_CONFLICT, STATE_CONFLICT_MESSAGE),
-                "case {case:?}: {account_id}'s row must carry the envelope the conflict class \
+                (
+                    ERROR_CODE_GENERAL_CONFLICT,
+                    PENDING_REGISTRATION_CONFLICT_MESSAGE,
+                ),
+                "case {case:?}: {account_id}'s row must carry the envelope this refusal \
                  publishes, got {error_list:?}"
             );
         }

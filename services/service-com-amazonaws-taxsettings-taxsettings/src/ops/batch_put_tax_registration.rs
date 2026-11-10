@@ -290,8 +290,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     account_id: account_id.to_string(),
                     // Both refusals are the `ConflictException`
                     // `PutTaxRegistration` answers this account's own write
-                    // with, and this service publishes no code for a state
-                    // conflict, so the row carries none.
+                    // with, so the row carries that refusal's own envelope: the
+                    // one code the conflict class publishes, and the sentence
+                    // the write words for the state it conflicted with.
                     code: conflict.row_error_code(),
                     message: conflict.message,
                 }),
