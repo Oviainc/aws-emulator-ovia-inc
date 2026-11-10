@@ -31,6 +31,8 @@ mod channel_lifecycle;
 mod channel_listing;
 #[path = "all/client_vpc_connection_listing.rs"]
 mod client_vpc_connection_listing;
+#[path = "all/client_vpc_connection_rejection.rs"]
+mod client_vpc_connection_rejection;
 #[path = "all/clock_owed_cluster_values.rs"]
 mod clock_owed_cluster_values;
 #[path = "all/cluster_arn_refusal.rs"]

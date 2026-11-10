@@ -133,6 +133,10 @@
 //! cluster, rendering each record with
 //! [`VpcConnection::to_client_vpc_connection`], so a cluster's client
 //! connections are that same one record seen from the cluster's side.
+//! The cluster owner's `RejectClientVpcConnection` writes to that same record
+//! through [`VpcConnection::reject`], which starts the `REJECTING` ->
+//! `REJECTED` transition [`VpcConnection::settle`] then materialises, so every
+//! reader of a rejected connection reports the one state it holds.
 
 /// The account's EC2 subnets, which the creates that place a resource in a client
 /// VPC resolve what they are given against. They are not this service's resources,
@@ -423,6 +427,34 @@ pub const MAX_SERVERLESS_VPC_ENTRIES: usize = 16;
 /// 250–750 ms, so a caller that describes the connection immediately still
 /// observes `CREATING` while a caller that waits sees `AVAILABLE`.
 pub const VPC_CONNECTION_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The `VpcConnectionState` of a connection whose PrivateLink endpoint is still
+/// being placed. One of the model's `VpcConnectionState` values
+/// (`crate::ops::types::VPC_CONNECTION_STATE_VALUES`), as are the three below.
+pub const VPC_CONNECTION_STATE_CREATING: &str = "CREATING";
+
+/// The `VpcConnectionState` of a connection that is in service.
+pub const VPC_CONNECTION_STATE_AVAILABLE: &str = "AVAILABLE";
+
+/// The `VpcConnectionState` of a connection the target cluster's owner has
+/// rejected and whose rejection is still being applied.
+pub const VPC_CONNECTION_STATE_REJECTING: &str = "REJECTING";
+
+/// The `VpcConnectionState` of a connection whose rejection by the target
+/// cluster's owner has been applied: the connection stays a resource every
+/// reader resolves, in the state that says it carries no traffic.
+pub const VPC_CONNECTION_STATE_REJECTED: &str = "REJECTED";
+
+/// How long after `RejectClientVpcConnection` a rejected connection reaches
+/// `REJECTED`.
+///
+/// CHOSEN, not documented, for the same reason as
+/// [`VPC_CONNECTION_ACTIVATION_DELAY`] and sized the same: the real service
+/// withdraws the PrivateLink endpoint's acceptance, and the project fixes an
+/// emulated clock-owed transition at 250–750 ms, so a caller that reads the
+/// connection immediately still observes `REJECTING` while a caller that waits
+/// sees `REJECTED`.
+pub const VPC_CONNECTION_REJECTION_DELAY: Duration = Duration::from_millis(500);
 
 /// Absolute ceiling on the VPC-connection registry.
 ///
@@ -2197,6 +2229,10 @@ pub struct VpcConnection {
     /// The instant the clock owes this connection its `CREATING` ->
     /// `AVAILABLE` transition. Stored, never slept on.
     pub available_due: SystemTime,
+    /// The instant the clock owes this connection its `REJECTING` ->
+    /// `REJECTED` transition, or `None` while no rejection is in flight.
+    /// Stored, never slept on, like [`Self::available_due`].
+    pub rejected_due: Option<SystemTime>,
     /// A `VpcConnectionState` value.
     pub state: String,
     /// Ordered so every reader renders a stable map.
@@ -3095,18 +3131,50 @@ impl VpcConnection {
             security_groups: input.security_groups,
             creation_time: now,
             available_due: now + VPC_CONNECTION_ACTIVATION_DELAY,
-            state: "CREATING".to_string(),
+            rejected_due: None,
+            state: VPC_CONNECTION_STATE_CREATING.to_string(),
             tags: input.tags.unwrap_or_default().into_iter().collect(),
         }
     }
 
-    /// Apply the `CREATING` -> `AVAILABLE` transition once `now` has reached
-    /// [`Self::available_due`]. Idempotent, and a no-op for every other state:
-    /// only a transition the clock already owed is materialised here.
+    /// Apply the transitions the clock already owed this connection: the
+    /// `CREATING` -> `AVAILABLE` placement once `now` has reached
+    /// [`Self::available_due`], and the `REJECTING` -> `REJECTED` rejection once
+    /// it has reached [`Self::rejected_due`]. Idempotent, and a no-op for every
+    /// other state: only a transition the clock already owed is materialised
+    /// here.
     pub fn settle(&mut self, now: SystemTime) {
-        if self.state == "CREATING" && now >= self.available_due {
-            self.state = "AVAILABLE".to_string();
+        if self.state == VPC_CONNECTION_STATE_CREATING && now >= self.available_due {
+            self.state = VPC_CONNECTION_STATE_AVAILABLE.to_string();
         }
+        if self.state == VPC_CONNECTION_STATE_REJECTING
+            && self.rejected_due.is_some_and(|due| now >= due)
+        {
+            self.state = VPC_CONNECTION_STATE_REJECTED.to_string();
+        }
+    }
+
+    /// Whether the target cluster's owner has already rejected this connection —
+    /// the rejection still being applied (`REJECTING`) or applied
+    /// (`REJECTED`).
+    pub fn is_rejected(&self) -> bool {
+        self.state == VPC_CONNECTION_STATE_REJECTING || self.state == VPC_CONNECTION_STATE_REJECTED
+    }
+
+    /// Reject the connection on the target cluster owner's behalf: it stops
+    /// carrying traffic at once (`REJECTING`) and the clock owes it `REJECTED`
+    /// at [`VPC_CONNECTION_REJECTION_DELAY`]. The record is kept — a rejected
+    /// connection is still a resource every reader resolves, which is what
+    /// leaves its own account able to delete it.
+    ///
+    /// A connection already rejected keeps the rejection it carries, so asking
+    /// again for a state it already holds changes nothing about it.
+    pub fn reject(&mut self, now: SystemTime) {
+        if self.is_rejected() {
+            return;
+        }
+        self.state = VPC_CONNECTION_STATE_REJECTING.to_string();
+        self.rejected_due = Some(now + VPC_CONNECTION_REJECTION_DELAY);
     }
 
     /// The connection's tags as the map every reader reports.
@@ -4315,6 +4383,11 @@ pub const TARGET_CLUSTER_ARN_MEMBER: &str = "targetClusterArn";
 /// The member the readers of one cluster OPERATION carry their target's ARN in,
 /// named the same way.
 pub const CLUSTER_OPERATION_ARN_MEMBER: &str = "clusterOperationArn";
+
+/// The member an operation acting on one client VPC CONNECTION of a cluster
+/// carries that connection's ARN in, under the same rule: the wire name of
+/// `RejectClientVpcConnectionRequest$VpcConnectionArn`.
+pub const VPC_CONNECTION_ARN_MEMBER: &str = "vpcConnectionArn";
 
 /// The cluster-ARN-SPECIFIC refusal wording, which the SCRAM-secret surface and
 /// the client-VPC-connection listing answer a cluster ARN they cannot parse with

@@ -409,15 +409,29 @@ impl ComAmazonawsKafkaKafkaState {
         self.vpc_connections.remove(arn)
     }
 
-    /// The same lookup, with the `CREATING` -> `AVAILABLE` transition the clock
-    /// already owed THIS connection materialised. Scoped to the one connection
-    /// being reported, for the same reason as [`Self::settled_cluster_in`].
+    /// The same lookup, with the transitions the clock already owed THIS
+    /// connection materialised. Scoped to the one connection being reported, for
+    /// the same reason as [`Self::settled_cluster_in`].
     pub fn settled_vpc_connection_in(
         &mut self,
         region: &str,
         arn: &str,
         now: SystemTime,
     ) -> Option<&VpcConnection> {
+        self.settled_vpc_connection_mut_in(region, arn, now)
+            .map(|connection| &*connection)
+    }
+
+    /// The write counterpart of [`Self::settled_vpc_connection_in`], with the
+    /// same regional scoping and the same settling, so an operation that CHANGES
+    /// a connection can only ever reach one a reader of this endpoint also sees,
+    /// and decides on the state the clock already owed it.
+    pub fn settled_vpc_connection_mut_in(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<&mut VpcConnection> {
         let connection = self.vpc_connections.get_mut(arn)?;
         if connection.region != region {
             return None;

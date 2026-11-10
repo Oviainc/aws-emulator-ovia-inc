@@ -21,6 +21,7 @@ use service_com_amazonaws_kafka_kafka::state::{
     CHANNEL_ACTIVATION_DELAY, CHANNEL_UPDATE_DELAY, CLUSTER_ACTIVATION_DELAY, CLUSTER_UPDATE_DELAY,
     CONFIGURATION_ARN_NOT_FOUND_MESSAGE, CONFIGURATION_DELETION_DELAY,
     CONFIGURATION_STATES_A_CHANGE_IS_ACCEPTED_FROM, VPC_CONNECTION_ACTIVATION_DELAY,
+    VPC_CONNECTION_REJECTION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -542,9 +543,43 @@ impl Emulator {
         self.call("GET", &vpc_connection_uri(arn), None).await
     }
 
+    /// The same read, as the endpoint of `region` serves it.
+    pub async fn describe_vpc_connection_in(&self, region: &str, arn: &str) -> Reply {
+        self.call_in(region, "GET", &vpc_connection_uri(arn), None)
+            .await
+    }
+
     /// `DeleteVpcConnection`, on the same resource URI.
     pub async fn delete_vpc_connection(&self, arn: &str) -> Reply {
         self.call("DELETE", &vpc_connection_uri(arn), None).await
+    }
+
+    /// `RejectClientVpcConnection`, which the model binds to
+    /// `PUT /v1/clusters/{ClusterArn}/client-vpc-connection` with the
+    /// connection's ARN in the body (`vpcConnectionArn`).
+    pub async fn reject_client_vpc_connection(
+        &self,
+        cluster_arn: &str,
+        vpc_connection_arn: &str,
+    ) -> Reply {
+        self.reject_client_vpc_connection_in(REGION, cluster_arn, vpc_connection_arn)
+            .await
+    }
+
+    /// The same reject, as the endpoint of `region` serves it.
+    pub async fn reject_client_vpc_connection_in(
+        &self,
+        region: &str,
+        cluster_arn: &str,
+        vpc_connection_arn: &str,
+    ) -> Reply {
+        self.call_in(
+            region,
+            "PUT",
+            &format!("/v1/clusters/{}/client-vpc-connection", pct(cluster_arn)),
+            Some(json!({ "vpcConnectionArn": vpc_connection_arn })),
+        )
+        .await
     }
 
     /// Create `request`, assert it succeeded, and hand back the minted ARN.
@@ -1187,6 +1222,13 @@ impl ConnectionRequest {
 /// sees a settled VPC connection.
 pub fn sleep_past_vpc_connection_activation() {
     std::thread::sleep(VPC_CONNECTION_ACTIVATION_DELAY + Duration::from_millis(250));
+}
+
+/// Sleep past the emulator's own `REJECTING` -> `REJECTED` span, so a later read
+/// sees the rejection the clock now owes a connection the cluster's owner
+/// rejected — what a caller polling that rejection to completion waits for.
+pub fn sleep_past_vpc_connection_rejection() {
+    std::thread::sleep(VPC_CONNECTION_REJECTION_DELAY + Duration::from_millis(250));
 }
 
 /// Sleep past the emulator's own `UPDATING` -> `ACTIVE` span, so a later read

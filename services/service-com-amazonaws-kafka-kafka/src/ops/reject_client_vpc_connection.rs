@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RejectClientVpcConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RejectClientVpcConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The target cluster's owner rejects one of the client VPC connections made
+//! to that cluster: the connection stops carrying traffic at once
+//! (`REJECTING`) and the clock owes it `REJECTED`, which is what every reader
+//! of the record ([`crate::state::VpcConnection`]) then reports —
+//! `DescribeVpcConnection`, `ListVpcConnections` and the cluster's own
+//! `ListClientVpcConnections`. The record is KEPT rather than removed: a
+//! rejected connection is still a resource, which is what leaves the account
+//! that created it able to delete it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RejectClientVpcConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The connection has to be one of the connections made to the cluster the
+//! request names, because that cluster's owner is who may reject it — so both
+//! references are resolved and the rejection is applied only to a connection
+//! that targets the resolved cluster. The cluster also has to be in a state
+//! Amazon MSK manages its VPC connections from
+//! ([`crate::state::vpc_connection_admission`], whose one sentence names this
+//! operation beside the create and the delete).
+//!
+//! The call asks for a state rather than for a step, so it is IDEMPOTENT: a
+//! connection whose rejection is already in flight or already applied keeps
+//! the rejection it carries ([`crate::state::VpcConnection::reject`]), and the
+//! same empty 200 is answered.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +151,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RejectClientVpcConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RejectClientVpcConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RejectClientVpcConnection"))
+        // Decided FIRST, on the ARN as submitted and from the request alone: the
+        // action applies to the CLUSTER whose client connections are being
+        // managed, and the caller holds no resource-based policy over a cluster
+        // of another account. See [`crate::state::authorization`].
+        crate::state::authorization::authorize_operation(Self::NAME, &input.cluster_arn)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                RejectClientVpcConnectionErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // The shape checks depend on the request alone, so they run before the
+        // state lock is taken. This is a cluster's client-VPC-connection
+        // surface, so a value that is not a cluster ARN is answered the
+        // cluster-ARN-specific wording its listing answers, while a value that
+        // is not a VPC-connection ARN earns the service's generic parameter
+        // sentence, as the connection's own reader and delete answer it.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(RejectClientVpcConnectionErrorModeled::BadRequestException(
+                crate::state::invalid_cluster_arn(),
+            )
+            .into());
+        }
+        if !crate::state::is_vpc_connection_arn(&input.vpc_connection_arn) {
+            return Err(RejectClientVpcConnectionErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::VPC_CONNECTION_ARN_MEMBER),
+            )
+            .into());
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        // The CLUSTER first: its owner is who rejects a connection made to it,
+        // and what the cluster is doing decides whether its connections are
+        // managed at all. A regional endpoint knows only its own region's
+        // clusters, so an ARN from another region names nothing here; the
+        // settling lookup materialises the transitions the clock already owed
+        // THAT cluster, which were due at the same instant whether or not
+        // anybody called.
+        let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
+            return Err(bad_request(
+                crate::state::CLUSTER_ARN_MEMBER,
+                crate::state::UNRESOLVED_REFERENCE_MESSAGE.to_string(),
+            ));
+        };
+        // The cluster's OWN ARN, as the registry stores it on every connection
+        // that targets it, so the connection below is matched against the
+        // resolved cluster rather than against the spelling of the request.
+        let cluster_arn = cluster.arn.clone();
+        let cluster_state = cluster.state.clone();
+        if !crate::state::vpc_connection_admission::vpc_connections_managed_from_cluster_state(
+            &cluster_state,
+        ) {
+            return Err(bad_request(
+                crate::state::CLUSTER_ARN_MEMBER,
+                crate::state::vpc_connection_admission::invalid_cluster_state_for_vpc_connection_message(),
+            ));
+        }
+
+        // Then the CONNECTION, through the write counterpart of the lookup the
+        // readers use, so the rejection is applied to a connection this
+        // endpoint also reports, and on the state the clock already owed it.
+        let Some(connection) =
+            state.settled_vpc_connection_mut_in(&region, &input.vpc_connection_arn, now)
+        else {
+            return Err(bad_request(
+                crate::state::VPC_CONNECTION_ARN_MEMBER,
+                crate::state::UNRESOLVED_REFERENCE_MESSAGE.to_string(),
+            ));
+        };
+        // A connection made to another cluster is none of this cluster's client
+        // connections, so from here it names nothing to reject — the same answer
+        // an ARN no connection carries earns, and nothing of the other
+        // cluster's connections is disclosed.
+        if connection.target_cluster_arn != cluster_arn {
+            return Err(bad_request(
+                crate::state::VPC_CONNECTION_ARN_MEMBER,
+                crate::state::UNRESOLVED_REFERENCE_MESSAGE.to_string(),
+            ));
+        }
+        connection.reject(now);
+        // The response is modelled empty: what the call did is observable on the
+        // connection, through the readers that report its state.
+        Ok(RejectClientVpcConnectionOutput {})
     }
+}
+
+/// The modelled 400 for a request member this operation cannot act on, naming
+/// the member at fault by its wire name.
+///
+/// This operation models no `NotFoundException`, so a reference it cannot
+/// resolve is a bad PARAMETER here, in the service's one fixed sentence for one
+/// — exactly as `ListClientVpcConnections` and `CreateVpcConnection` refuse an
+/// unresolved cluster.
+fn bad_request(parameter: &str, message: String) -> RejectClientVpcConnectionError {
+    RejectClientVpcConnectionErrorModeled::BadRequestException(BadRequestException {
+        invalid_parameter: Some(parameter.to_string()),
+        message: Some(message),
+    })
+    .into()
 }
