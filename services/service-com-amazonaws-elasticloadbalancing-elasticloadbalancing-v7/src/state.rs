@@ -188,6 +188,11 @@ pub const MAX_REGIONS: usize = 64;
 mod instance_checks;
 pub use instance_checks::*;
 
+/// Whether the account's network puts a load balancer in a VPC of its own rather than in
+/// EC2-Classic or the default VPC, which is what the EC2-Classic zone API turns on.
+mod vpc_placement;
+pub use vpc_placement::*;
+
 /// One instance's registration with one load balancer.
 ///
 /// A registration is not only a membership: it is what the load balancer CHECKS, so it
@@ -988,6 +993,20 @@ impl LoadBalancer {
         if !self.subnets.iter().any(|held| held == subnet_id) {
             self.subnets.push(subnet_id.to_string());
         }
+    }
+
+    /// Add `zone` to the zones a request named DIRECTLY.
+    ///
+    /// The counterpart of [`LoadBalancer::attach_subnet`] for the placement that names a
+    /// zone rather than a subnet: a zone the load balancer is already in — named directly
+    /// before, or carried by one of its subnets — re-states the same placement, so the set
+    /// keeps its order and its length and [`LoadBalancer::zones`] reports the same zones
+    /// as before.
+    pub fn enable_zone(&mut self, zone: &str) {
+        if self.zones().iter().any(|held| held == zone) {
+            return;
+        }
+        self.availability_zones.push(zone.to_string());
     }
 
     /// Detach `subnet_id`, and with it the zone it put the load balancer in. A subnet the

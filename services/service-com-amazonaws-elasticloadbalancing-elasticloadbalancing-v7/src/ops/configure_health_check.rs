@@ -221,7 +221,11 @@ fn target_protocol_refusal() -> String {
 /// the RELATION the two members have to each other rather than over the two values the
 /// request carried: the rule is what the caller has to satisfy, and it is the same rule
 /// whichever pair of values broke it.
-const HEALTH_CHECK_TIMEOUT_RELATION: &str = "HealthCheck timeout must be less than interval.";
+///
+/// The sentence closes with a SPACE after the period, which is how the service words this
+/// refusal: the whole string is the fixed text, and a message that differs from it by that
+/// character is a different message to a client matching on it.
+const HEALTH_CHECK_TIMEOUT_RELATION: &str = "HealthCheck timeout must be less than interval. ";
 
 /// The ports a health-check target may name, from the same paragraph: "The range of valid
 /// ports is one (1) through 65535."

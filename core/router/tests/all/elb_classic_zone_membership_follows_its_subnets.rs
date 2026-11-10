@@ -39,7 +39,11 @@ const ABSENT_SUBNET: &str = "subnet-00000000000000090";
 
 /// Drive one awsQuery action against the Classic model, on the signing name its front door
 /// claims.
-fn classic(
+///
+/// `pub(crate)` because the sibling suite `elb_classic_zone_enable_turns_on_the_vpc.rs`
+/// drives the same model over the same wire: one copy of the Classic request plumbing, so
+/// the two cannot drift into sending different envelopes.
+pub(crate) fn classic(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     action: &str,
@@ -55,7 +59,9 @@ fn classic(
 
 /// The `<member>` texts of the list element `name`, in document order — empty when the
 /// answer carries the list with no members at all.
-fn list(body: &str, name: &str) -> Vec<String> {
+///
+/// `pub(crate)` for the reason [`classic`] is.
+pub(crate) fn list(body: &str, name: &str) -> Vec<String> {
     opt_element(body, name)
         .map(|inner| elements(&inner, "member"))
         .unwrap_or_default()

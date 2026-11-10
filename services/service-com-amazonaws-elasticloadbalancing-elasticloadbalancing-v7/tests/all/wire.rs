@@ -298,6 +298,24 @@ pub(crate) fn error_message(answer: &Wire) -> String {
         .to_string()
 }
 
+/// The `<Message>` of an answer's `<Error>` read from the RAW body, byte for byte.
+///
+/// [`parse`] trims each element's character data, which is what a suite comparing a
+/// sentence wants — and exactly what a suite asserting the message's own TEXT must not do:
+/// a refusal whose wording ends in a space is a different message to a client matching on
+/// it, and a trimming reader cannot tell the two apart. So this reads between the tags
+/// instead, changing nothing about what the serializer wrote.
+pub(crate) fn error_message_bytes(answer: &Wire) -> String {
+    let (_, after) = answer
+        .body
+        .split_once("<Message>")
+        .unwrap_or_else(|| panic!("no <Message> element in {}", answer.body));
+    let (text, _) = after
+        .split_once("</Message>")
+        .unwrap_or_else(|| panic!("unterminated <Message> in {}", answer.body));
+    unescape(text)
+}
+
 pub(crate) fn kid_text(node: &Element, tag: &str) -> Option<String> {
     kid(node, tag).and_then(Element::text).map(str::to_string)
 }

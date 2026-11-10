@@ -17,6 +17,8 @@ mod described_load_balancer_policies;
 mod documented_rule_refusals;
 #[path = "all/elbv2_listener_chain_on_the_shared_endpoint.rs"]
 mod elbv2_listener_chain_on_the_shared_endpoint;
+#[path = "all/health_check_relation_message_text.rs"]
+mod health_check_relation_message_text;
 #[path = "all/instance_health_follows_the_backend.rs"]
 mod instance_health_follows_the_backend;
 #[path = "all/instance_health_timeline.rs"]
@@ -43,3 +45,5 @@ mod state_roundtrip;
 mod stickiness_policies;
 #[path = "all/wire.rs"]
 mod wire;
+#[path = "all/zone_membership_by_name.rs"]
+mod zone_membership_by_name;

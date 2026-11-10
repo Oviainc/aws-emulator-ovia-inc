@@ -557,6 +557,10 @@ mod elb_classic_zone_membership_follows_its_subnets;
 // than in the appended tail, for the same reason the notes above give.
 #[path = "all/elb_classic_network_resources_resolve_in_ec2.rs"]
 mod elb_classic_network_resources_resolve_in_ec2;
+// Declared beside its sibling Classic suites above, in this span of the sorted list rather
+// than in the appended tail, for the same reason the notes above give.
+#[path = "all/elb_classic_zone_enable_turns_on_the_vpc.rs"]
+mod elb_classic_zone_enable_turns_on_the_vpc;
 // Alphabetically between the `elbv2_` and `es_` suites, rather than appended at the end
 // of this file, which is where every new suite lands and therefore where two changes
 // collide.
