@@ -13,6 +13,8 @@
 mod account_limits;
 #[path = "all/agentcore_stack_outputs.rs"]
 mod agentcore_stack_outputs;
+#[path = "all/appconfig_estate_provisioning.rs"]
+mod appconfig_estate_provisioning;
 #[path = "all/appconfig_resource_types.rs"]
 mod appconfig_resource_types;
 #[path = "all/application_auto_scaling_resources.rs"]

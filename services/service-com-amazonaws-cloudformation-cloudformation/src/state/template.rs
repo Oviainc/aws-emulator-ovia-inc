@@ -2661,6 +2661,15 @@ pub fn name_property(resource_type: &str, properties: &Value) -> Option<String> 
 pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
     match resource_type {
         IAM_ACCESS_KEY => &["Serial", "UserName"],
+        // An AppConfig environment and configuration profile belong to the application their
+        // `ApplicationId` names, and a profile reads its configuration from the source its
+        // `LocationUri` and `Type` fix: each is a member of that type's create and of no
+        // member of its update (`UpdateConfigurationProfile` takes neither `LocationUri` nor
+        // `Type`), so a declaration restating one asks for a different resource. A deployment
+        // strategy's `ReplicateTo` is the same case against `UpdateDeploymentStrategy`.
+        APPCONFIG_ENVIRONMENT => &["ApplicationId"],
+        APPCONFIG_CONFIGURATION_PROFILE => &["ApplicationId", "LocationUri", "Type"],
+        APPCONFIG_DEPLOYMENT_STRATEGY => &["ReplicateTo"],
         _ => composite_identity_properties(resource_type),
     }
 }
@@ -2889,6 +2898,17 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // full ARN — "If you specify only the function name, it is limited to 64 characters
         // in length" (`FunctionName`, AWS Lambda API reference).
         "AWS::Lambda::Function" => rules(64, Characters::AsGenerated),
+        // AppConfig `CreateApplication.Name`, `CreateEnvironment.Name` and
+        // `CreateDeploymentStrategy.Name`: each `Name`, `@length(min: 1, max: 64)`
+        // (AppConfig's own Smithy model), which a generated name is already inside
+        // character-wise and may only be longer than.
+        APPCONFIG_APPLICATION | APPCONFIG_ENVIRONMENT | APPCONFIG_DEPLOYMENT_STRATEGY => {
+            rules(64, Characters::AsGenerated)
+        }
+        // The same service's `CreateConfigurationProfile.Name`: `LongName`,
+        // `@length(min: 1, max: 128)` (that same model), the one of the four that takes the
+        // longer name.
+        APPCONFIG_CONFIGURATION_PROFILE => rules(128, Characters::AsGenerated),
         // Amazon SQS `CreateQueue.QueueName`: "A queue name can have up to 80 characters"
         // (Amazon SQS API reference) — SQS's model carries no `@length` for it.
         SQS_QUEUE => rules(80, Characters::AsGenerated),

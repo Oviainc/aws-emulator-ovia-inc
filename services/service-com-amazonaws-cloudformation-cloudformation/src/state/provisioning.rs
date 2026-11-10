@@ -199,6 +199,10 @@ use super::provisioner::{provisioner_for, Provisioner};
 use super::StoredResource;
 
 mod apigateway_rest_api;
+/// The four `AWS::AppConfig::*` types a stack declares — the application, its environment,
+/// the configuration profile that reads a configuration and the deployment strategy that
+/// rolls one out: created in AWS AppConfig itself ([`appconfig_resources`]).
+mod appconfig_resources;
 /// The two `AWS::ApplicationAutoScaling::*` types a stack declares — the scalable target and
 /// the policy that steers it: visible to the rest of this service's state because the types'
 /// own NAMES live here, beside the arms that provision them
@@ -748,6 +752,11 @@ pub(super) enum Owner {
     /// association that puts a key in a plan. Which of them it is travels with the owner, as
     /// it does for the Amazon EC2 types above.
     ApiGatewayRestApi(apigateway_rest_api::Kind),
+    /// One of the four `AWS::AppConfig::*` types [`appconfig_resources`] creates in AWS
+    /// AppConfig: the application, an environment of it, a configuration profile of it and the
+    /// deployment strategy a rollout follows. Which of them it is travels with the owner, as
+    /// it does for the types above.
+    AppConfigResource(appconfig_resources::Kind),
     /// One of the two `AWS::ApplicationAutoScaling::*` types
     /// [`application_auto_scaling`] registers in Application Auto Scaling: the scalable
     /// target, and the scaling policy that steers one. Which of them it is travels with the
@@ -811,6 +820,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = application_auto_scaling::kind_of(resource_type) {
         return Some(Owner::ApplicationAutoScaling(kind));
+    }
+    if let Some(kind) = appconfig_resources::kind_of(resource_type) {
+        return Some(Owner::AppConfigResource(kind));
     }
     provisioner_for(resource_type).map(Owner::Builtin)
 }

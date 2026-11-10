@@ -29,11 +29,14 @@
 //! plural, a wrong case, an invented resource and the service model's own name as the
 //! namespace — so admitting the published set is not admitting `AWS::AppConfig::<anything>`.
 //!
-//! None of these types has a provisioner, so each is declared-only
-//! (`unprovisioned_resources.rs` pins that: nothing is called in the owning service and the
-//! stack completes), and each carries the physical resource id CloudFormation's own naming
-//! rules give it — which is what a `Ref` to one resolves to. What `Fn::GetAtt` reads off
-//! these types (an experiment definition's `Id`, a hosted configuration version's
+//! The four types whose resources a stack really creates in AWS AppConfig
+//! (`state::provisioning::appconfig_resources`) carry the identifier that service minted as
+//! their physical resource id, which is what a `Ref` to one resolves to;
+//! `appconfig_estate_provisioning.rs` is the suite for that half of the rule. Every OTHER
+//! published type of the namespace is declared-only (`unprovisioned_resources.rs` pins that:
+//! nothing is called in the owning service and the stack completes) and carries the physical
+//! resource id CloudFormation's own naming rules give it. What `Fn::GetAtt` reads off the
+//! declared-only types (an experiment definition's `Id`, a hosted configuration version's
 //! `VersionNumber`) is their published RETURN VALUES, a separate question this suite asserts
 //! nothing about: it belongs to the open stack-outputs issue
 //! (`20261023T032202Z-appconfig-getconfiguration-and-getexperimentdefinition-answer-501-and-cloudformation.md`).
@@ -93,13 +96,66 @@ fn stack_name_for(resource_type: &str) -> String {
     format!("appconfig-{resource}")
 }
 
+/// The four types of this namespace whose resources a stack really CREATES in AWS AppConfig
+/// (`state::provisioning::appconfig_resources`): each one's physical resource id is the `Id`
+/// that service minted — modelled `^[a-z0-9]{4,7}$` — rather than a name CloudFormation
+/// generated, which `appconfig_estate_provisioning.rs` is the suite for. Every other
+/// published type of the namespace is still declared-only.
+const PROVISIONED: &[&str] = &[
+    "AWS::AppConfig::Application",
+    "AWS::AppConfig::ConfigurationProfile",
+    "AWS::AppConfig::DeploymentStrategy",
+    "AWS::AppConfig::Environment",
+];
+
+/// The logical id of the application a child of the namespace is declared under, for the rows
+/// whose own create takes one.
+const PARENT: &str = "Parent";
+
 /// A one-resource template declaring `resource_type` under the logical id `Subject`.
 ///
-/// No properties: a published type may be declared with whatever properties its own
-/// reference gives it, and what this suite is about is the TYPE. The reported template's own
+/// A type this emulator leaves declared-only is declared with NO properties: a published type
+/// may be declared with whatever properties its own reference gives it, and what this suite is
+/// about is the TYPE. A type whose resource the stack really creates carries the properties
+/// that create REQUIRES — and, where the create takes one, the application the subject belongs
+/// to beside it — because a create the owning service could not make is reported as the
+/// resource's failure rather than as a stack that completed. The reported template's own
 /// properties are the separate case below.
 fn one_resource_template(resource_type: &str) -> String {
-    json!({ "Resources": { "Subject": { "Type": resource_type } } }).to_string()
+    let mut resources = serde_json::Map::new();
+    let subject = match resource_type {
+        "AWS::AppConfig::Environment" => {
+            resources.insert(PARENT.to_string(), parent_application());
+            json!({
+                "Type": resource_type,
+                "Properties": { "ApplicationId": { "Ref": PARENT } }
+            })
+        }
+        "AWS::AppConfig::ConfigurationProfile" => {
+            resources.insert(PARENT.to_string(), parent_application());
+            json!({
+                "Type": resource_type,
+                "Properties": {
+                    "ApplicationId": { "Ref": PARENT },
+                    "LocationUri": "hosted"
+                }
+            })
+        }
+        // `CreateDeploymentStrategy` requires both of these members
+        // (`smithy_query(query="operation",operation="CreateDeploymentStrategy")`).
+        "AWS::AppConfig::DeploymentStrategy" => json!({
+            "Type": resource_type,
+            "Properties": { "DeploymentDurationInMinutes": 0, "GrowthFactor": 100 }
+        }),
+        _ => json!({ "Type": resource_type }),
+    };
+    resources.insert("Subject".to_string(), subject);
+    json!({ "Resources": Value::Object(resources) }).to_string()
+}
+
+/// The application a child of the namespace is declared under, named by CloudFormation itself.
+fn parent_application() -> Value {
+    json!({ "Type": "AWS::AppConfig::Application" })
 }
 
 /// The catalogue's own `AWS::AppConfig::` group, in catalogue order.
@@ -173,29 +229,40 @@ async fn every_published_appconfig_type_may_be_declared_and_is_recorded() {
              {status_code} with body {body}"
         );
         let reported = wire_resources(&body);
+        let subject = reported
+            .iter()
+            .find(|resource| resource.logical_id.as_deref() == Some("Subject"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {resource_type:?}: expected the declared subject to be recorded, got \
+                     {reported:?}"
+                )
+            });
         assert_eq!(
-            reported.len(),
-            1,
-            "case {resource_type:?}: expected the one declared resource, got {reported:?}"
-        );
-        assert_eq!(
-            reported[0].resource_type.as_deref(),
+            subject.resource_type.as_deref(),
             Some(*resource_type),
             "case {resource_type:?}: expected the declared type to be reported, got {:?}",
-            reported[0].resource_type
+            subject.resource_type
         );
-        assert_eq!(
-            reported[0].logical_id.as_deref(),
-            Some("Subject"),
-            "case {resource_type:?}: expected the declared logical id, got {:?}",
-            reported[0].logical_id
-        );
-        let physical_id = reported[0].physical_id.clone().unwrap_or_default();
-        assert!(
-            physical_id.contains(&stack_name) && physical_id.contains("Subject"),
-            "case {resource_type:?}: expected a generated physical id built from the stack \
-             name and the logical id, got {physical_id:?}"
-        );
+        let physical_id = subject.physical_id.clone().unwrap_or_default();
+        if PROVISIONED.contains(resource_type) {
+            // The resource really exists in AppConfig, so its physical id is the `Id` that
+            // service minted rather than a name CloudFormation generated.
+            assert!(
+                (4..=7).contains(&physical_id.len())
+                    && physical_id
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                "case {resource_type:?}: expected the id AppConfig mints (4-7 lowercase \
+                 alphanumerics), got {physical_id:?}"
+            );
+        } else {
+            assert!(
+                physical_id.contains(&stack_name) && physical_id.contains("Subject"),
+                "case {resource_type:?}: expected a generated physical id built from the stack \
+                 name and the logical id, got {physical_id:?}"
+            );
+        }
     }
 }
 

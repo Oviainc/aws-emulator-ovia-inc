@@ -10020,6 +10020,7 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-apigatewayv2-apigatewayv2",
+ "service-com-amazonaws-appconfig-amazonappconfig",
  "service-com-amazonaws-applicationautoscaling-anyscalefrontendservice",
  "service-com-amazonaws-autoscaling-autoscaling-2011-01-01",
  "service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda",

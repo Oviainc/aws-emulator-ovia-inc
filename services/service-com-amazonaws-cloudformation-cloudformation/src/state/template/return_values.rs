@@ -2007,6 +2007,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // in force is the one that service answered. The pool's own NAME is its `Name`
         // attribute, which the create reports.
         || resource_type == COGNITO_IDENTITY_POOL
+        // The four AWS AppConfig types are four more, for the reason their own constants
+        // record ([`APPCONFIG_APPLICATION`] and its siblings): every one of those creates
+        // takes the resource's NAME and no identifier, and answers the `Id` AppConfig minted
+        // (`^[a-z0-9]{4,7}$`, which no name CloudFormation decides satisfies), and that id is
+        // what every later call on the resource takes.
+        || resource_type == APPCONFIG_APPLICATION
+        || resource_type == APPCONFIG_ENVIRONMENT
+        || resource_type == APPCONFIG_CONFIGURATION_PROFILE
+        || resource_type == APPCONFIG_DEPLOYMENT_STRATEGY
         // A Secrets Manager secret is one more: `CreateSecret` takes the secret's NAME and
         // answers the `ARN` that service built for it, whose six trailing characters it draws
         // per secret ([`SECRETSMANAGER_SECRET`]) — so no naming rule could compute it — and
@@ -2574,6 +2583,25 @@ pub const EKS_CLUSTER: &str = "AWS::EKS::Cluster";
 /// and id, which is why this type's identity is the owning service's
 /// ([`identity_is_service_assigned`]).
 pub const EKS_POD_IDENTITY_ASSOCIATION: &str = "AWS::EKS::PodIdentityAssociation";
+
+/// The `AWS::<cloudFormationName>::<Resource>` types of the AWS AppConfig resources a
+/// configuration estate declares. The middle segment is that model's own
+/// `awsService.cloudFormationName` (`AppConfig`).
+///
+/// Each one's identity is AppConfig's OWN to mint: every create takes the resource's NAME and
+/// no identifier, and answers the `Id` that service assigned — modelled `Id` with pattern
+/// `^[a-z0-9]{4,7}$`, which no name CloudFormation decides could satisfy. "Ref returns the
+/// application ID" and "Ref returns the deployment strategy ID", and the ids a child's
+/// `Fn::GetAtt EnvironmentId`/`ConfigurationProfileId` reports are the ones its create
+/// answered — which is also the `ApplicationId`, `EnvironmentId`, `ConfigurationProfileId`
+/// and `DeploymentStrategyId` every later AppConfig call takes
+/// (`CreateHostedConfigurationVersion`, `StartDeployment`). That is what
+/// [`identity_is_service_assigned`] names all four for, and
+/// [`crate::state::provisioning::appconfig_resources`] is what creates them.
+pub const APPCONFIG_APPLICATION: &str = "AWS::AppConfig::Application";
+pub const APPCONFIG_ENVIRONMENT: &str = "AWS::AppConfig::Environment";
+pub const APPCONFIG_CONFIGURATION_PROFILE: &str = "AWS::AppConfig::ConfigurationProfile";
+pub const APPCONFIG_DEPLOYMENT_STRATEGY: &str = "AWS::AppConfig::DeploymentStrategy";
 
 /// The separator CloudFormation joins the parts of a COMPOSITE physical resource id with.
 pub(super) const COMPOSITE_IDENTITY_SEPARATOR: &str = "|";

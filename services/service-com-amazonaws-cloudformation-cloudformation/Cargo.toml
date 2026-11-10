@@ -181,6 +181,12 @@ service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { workspace = t
 # owning service mounted beside CloudFormation, or the create is refused and the stack fails —
 # and the group's zones and ARN are read back through that service's own wire.
 service-com-amazonaws-autoscaling-autoscaling-2011-01-01 = { workspace = true }
+# AWS AppConfig, for the `AWS::AppConfig::Application`, `::Environment`,
+# `::ConfigurationProfile` and `::DeploymentStrategy` a stack really creates there
+# (`state::provisioning::appconfig_resources`): a suite that deploys one must have its owning
+# service mounted beside CloudFormation, or the create is refused and the stack fails — and
+# the ids the stack publishes are read back through that service's own wire.
+service-com-amazonaws-appconfig-amazonappconfig = { workspace = true }
 
 [lints]
 workspace = true

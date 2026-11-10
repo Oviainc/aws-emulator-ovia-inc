@@ -111,6 +111,12 @@ impl Owner {
             Self::ApplicationAutoScaling(kind) => {
                 application_auto_scaling::create(ctx, region, kind, resource).await
             }
+            // Every one of these types IS taggable: its `Tags` property is the tag map each
+            // AppConfig create takes, so the resource carries the tags CloudFormation gives it
+            // beside its own.
+            Self::AppConfigResource(kind) => {
+                appconfig_resources::create(ctx, region, kind, resource, propagated).await
+            }
         }
     }
 
@@ -187,6 +193,9 @@ impl Owner {
             // A target is registered, and a policy is in force, from the moment the owning
             // service's own call answers.
             Self::ApplicationAutoScaling(_) => Ok(application_auto_scaling::ready()),
+            // An application, an environment, a configuration profile and a deployment
+            // strategy each exist from the moment their own create answers.
+            Self::AppConfigResource(_) => Ok(appconfig_resources::ready()),
         }
     }
 
@@ -257,6 +266,11 @@ impl Owner {
             // A target publishes no attribute at all, and a policy's `Arn` is the one its own
             // put answered with, so there is nothing left to read once either is up.
             Self::ApplicationAutoScaling(_) => Ok(BTreeMap::new()),
+            // Each of these resources publishes the identifier its own create answered — which
+            // the resource already carries as its physical id — and a profile's `KmsKeyArn`
+            // came back with that same create, so there is nothing left to read once the
+            // resource is up.
+            Self::AppConfigResource(_) => Ok(BTreeMap::new()),
         }
     }
 
@@ -329,6 +343,10 @@ impl Owner {
             // call answers: Application Auto Scaling reports no state a deleted one is still
             // being removed in.
             Self::ApplicationAutoScaling(_) => Ok(Removal::Gone),
+            // Each AppConfig delete takes the resource away as it answers: that service reports
+            // no state a deleted application, environment, profile or strategy is still being
+            // removed in.
+            Self::AppConfigResource(_) => Ok(appconfig_resources::removal()),
         }
     }
 
@@ -436,6 +454,9 @@ impl Owner {
             Self::ApplicationAutoScaling(kind) => {
                 application_auto_scaling::update(ctx, region, kind, resource, declared).await
             }
+            Self::AppConfigResource(kind) => {
+                appconfig_resources::update(ctx, region, kind, resource, declared).await
+            }
         }
     }
 
@@ -510,6 +531,9 @@ impl Owner {
             Self::ApiGatewayRestApi(_) => Ok(()),
             // Neither of these types is taggable, so nothing is asked about their tags.
             Self::ApplicationAutoScaling(_) => Ok(()),
+            // The tags of an AppConfig resource that already exists are reconciled by no arm
+            // here yet ([`Provisioner::retag`]'s own default), so nothing is asked about them.
+            Self::AppConfigResource(_) => Ok(()),
         }
     }
 
@@ -611,6 +635,12 @@ impl Owner {
             Self::ApplicationAutoScaling(kind) => {
                 application_auto_scaling::delete(ctx, region, kind, resource).await
             }
+            // AppConfig takes no snapshot of an application, an environment, a profile or a
+            // strategy on the way out: there is no such call, so a `Snapshot` deletion policy
+            // on one of them deletes the resource with no snapshot invented for it.
+            Self::AppConfigResource(kind) => {
+                appconfig_resources::delete(ctx, region, kind, resource).await
+            }
         }
     }
 
@@ -698,6 +728,9 @@ impl Owner {
             // arm reads nothing back for drift detection, so nothing of either is reported as
             // drifted rather than guessed at.
             Self::ApplicationAutoScaling(_) => Ok(None),
+            Self::AppConfigResource(kind) => {
+                appconfig_resources::actual_configuration(ctx, region, kind, resource).await
+            }
         }
     }
 
@@ -732,6 +765,8 @@ impl Owner {
             Self::ApiGatewayRestApi(_) => message.to_string(),
             // Application Auto Scaling's does the same.
             Self::ApplicationAutoScaling(_) => message.to_string(),
+            // AWS AppConfig's does the same.
+            Self::AppConfigResource(_) => message.to_string(),
         }
     }
 }
