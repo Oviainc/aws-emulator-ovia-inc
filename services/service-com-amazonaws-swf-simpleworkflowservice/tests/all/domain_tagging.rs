@@ -26,7 +26,9 @@ use crate::workflow_execution_lifecycle::{
 
 /// Tags one SWF domain may carry. The crate's `MAX_TAGS_PER_DOMAIN`, from
 /// `TagResource`'s own doc: "Amazon SWF supports a maximum of 50 tags per resource."
-const MAX_TAGS_PER_DOMAIN: usize = 50;
+/// `pub(crate)` so a sibling suite fills a domain to the same documented bound rather
+/// than keeping a second copy of it.
+pub(crate) const MAX_TAGS_PER_DOMAIN: usize = 50;
 
 /// The modelled maximum length of `ResourceTag$key`
 /// (`smithy_query(query="shape",shape="ResourceTag")`: key `ResourceTagKey`, len
@@ -90,6 +92,52 @@ pub(crate) fn reported_tags(case: &str, body: &Value) -> BTreeSet<Tag> {
         "case {case:?}: every reported tag must be distinct, got {body:?}"
     );
     tags
+}
+
+/// The awsJson type discriminator every returned `ResourceTag` carries: the id of the
+/// shape the element IS, as the service reports it. Fixed text naming the shape,
+/// identical for every tag of every response. `pub(crate)` so every suite that reads a
+/// tag list asserts the one shape id rather than keeping a copy of it.
+pub(crate) const RESOURCE_TAG_SHAPE_ID: &str = "com.amazonaws.swf.base.model#ResourceTag";
+
+/// Every member a returned `ResourceTag` may carry, from
+/// `smithy_query(query="shape",shape="ResourceTag")`: `key` (required), `value`, and the
+/// `__type` discriminator. A response that invented another member would be reporting a
+/// shape AWS never emits just as surely as one that omits `__type`.
+pub(crate) const RESOURCE_TAG_MEMBERS: &[&str] = &["__type", "key", "value"];
+
+/// The tags a response reports, having asserted the FORM of every element it carried:
+/// each is a `ResourceTag` object naming its own shape in `__type` and carrying no member
+/// outside the modelled three. `pub(crate)` so every suite that reads a tag list applies
+/// the one check rather than a copy of it, and so a case also pins that the discriminator
+/// sits BESIDE the stored data rather than in place of it.
+pub(crate) fn checked_tags(case: &str, body: &Value) -> BTreeSet<Tag> {
+    let elements = body
+        .get("tags")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a tags array, got {body:?}"));
+    for element in elements {
+        let members = element
+            .as_object()
+            .unwrap_or_else(|| panic!("case {case:?}: a tag is an object, got {element:?}"));
+        let unexpected: Vec<&String> = members
+            .keys()
+            .filter(|member| !RESOURCE_TAG_MEMBERS.contains(&member.as_str()))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "case {case:?}: a reported tag carries only the modelled members \
+             {RESOURCE_TAG_MEMBERS:?}, got {unexpected:?} in {element:?}"
+        );
+        assert_eq!(
+            members.get("__type").and_then(Value::as_str),
+            Some(RESOURCE_TAG_SHAPE_ID),
+            "case {case:?}: tag {:?} must carry the ResourceTag type discriminator, \
+             got {element:?}",
+            members.get("key"),
+        );
+    }
+    reported_tags(case, body)
 }
 
 /// Register `domain` carrying `tags` and return the ARN the service minted for it,

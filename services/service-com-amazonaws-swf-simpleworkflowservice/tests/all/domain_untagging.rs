@@ -25,39 +25,16 @@
 
 use std::collections::BTreeSet;
 
-use serde_json::{json, Value};
+use serde_json::json;
 
-use super::domain_tagging::{registered_with_tags, Tag, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN};
-use super::workflow_execution_lifecycle::{error_code, string_at, Emulator, ACCOUNT, REGION};
+use super::domain_tagging::{
+    checked_tags, registered_with_tags, Tag, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN,
+};
+use super::workflow_execution_lifecycle::{error_code, Emulator, ACCOUNT, REGION};
 
-/// The awsJson type discriminator every returned `ResourceTag` carries. Fixed text
-/// naming the element's own shape, identical for every tag of every response.
-const RESOURCE_TAG_SHAPE_ID: &str = "com.amazonaws.swf.base.model#ResourceTag";
-
-/// The tags one response reports, as `(key, value, discriminator)` triples, so a case can
-/// assert the key/value data AND the form each element is reported in.
-fn reported(case: &str, body: &Value) -> BTreeSet<(String, Option<String>, Option<String>)> {
-    let tags = body
-        .get("tags")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("case {case:?}: expected a tags array, got {body:?}"));
-    tags.iter()
-        .map(|tag| {
-            (
-                string_at(tag, "/key"),
-                tag.get("value")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                tag.get("__type")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            )
-        })
-        .collect()
-}
-
-/// Read the tags of `resource_arn` back, asserting rule 2 on every element, and answer
-/// the `(key, value)` pairs the response reported.
+/// Read the tags of `resource_arn` back, asserting rule 2 on every element through the
+/// check `domain_tagging` shares, and answer the `(key, value)` pairs the response
+/// reported.
 async fn tags_of(
     emulator: &Emulator,
     case: &str,
@@ -70,18 +47,9 @@ async fn tags_of(
             &json!({ "resourceArn": resource_arn }),
         )
         .await;
-    let reported = reported(case, &body);
-    for (key, _, discriminator) in &reported {
-        assert_eq!(
-            discriminator.as_deref(),
-            Some(RESOURCE_TAG_SHAPE_ID),
-            "case {case:?}: tag {key:?} must carry the ResourceTag type discriminator, \
-             got {body:?}"
-        );
-    }
-    reported
+    checked_tags(case, &body)
         .into_iter()
-        .map(|(key, value, _)| (key, value))
+        .map(|tag| (tag.key, tag.value))
         .collect()
 }
 

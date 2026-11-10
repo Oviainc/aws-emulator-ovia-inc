@@ -71,6 +71,8 @@ mod poller_cap_limit_message;
 mod record_activity_task_heartbeat;
 #[path = "all/request_cancel_workflow_execution.rs"]
 mod request_cancel_workflow_execution;
+#[path = "all/resource_tag_type_discriminator.rs"]
+mod resource_tag_type_discriminator;
 #[path = "all/respond_decision_task_completed.rs"]
 mod respond_decision_task_completed;
 #[path = "all/run_id_shape.rs"]
