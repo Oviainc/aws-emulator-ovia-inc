@@ -416,50 +416,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the only one of its errors that means the call was turned away rather
             // than that the request was malformed.
             return Err(CreateQueueErrorModeled::RequestThrottled(RequestThrottled {
-                message: Some(format!(
-                    "Cannot create queue {}: this emulator already holds {} queues.",
-                    input.queue_name,
-                    state::MAX_QUEUES,
-                )),
+                message: Some(state::queues_quota_message(&input.queue_name)),
             })
             .into());
         }
 
-        let url = state::queue_url(&region, &input.queue_name);
-        let queue = state::Queue {
-            name: input.queue_name.clone(),
-            region: region.clone(),
-            // A create makes a NEW incarnation of the name, whether or not a queue has
-            // carried it before: the handles the previous one minted name that one, so
-            // presenting one to this queue is presenting a handle of a queue that is gone.
-            incarnation: state::new_identifier(),
-            url: url.clone(),
-            arn: state::queue_arn(&region, &input.queue_name),
+        let queue = state::Queue::created(
+            &region,
+            &input.queue_name,
             attributes,
-            tags: tags.unwrap_or_default(),
-            messages: ::std::collections::VecDeque::new(),
-            handles: ::std::collections::HashMap::new(),
-            // A queue nobody has deleted a message from yet has retired no receipt
-            // handle.
-            deleted_handles: ::std::collections::VecDeque::new(),
-            // Nor has any receive of it been superseded by a later one.
-            superseded_handles: ::std::collections::VecDeque::new(),
-            deduplication: ::std::collections::BTreeMap::new(),
-            receive_attempts: ::std::collections::BTreeMap::new(),
-            // Nothing has been sequenced yet, so the first message this queue
-            // sequences gets the first sequence number.
-            sequenced: 0,
-            created_at: now,
-            // Nothing has changed the queue yet, so it was last modified when it was
-            // created.
-            last_modified_at: now,
-            // A queue nobody has purged holds no purge instant, so the first
-            // `PurgeQueue` on it is accepted.
-            purged_at: None,
-            // No receive has handed anything over yet, so the first FIFO receive starts
-            // its walk at the oldest message group.
-            group_cursor: None,
-        };
+            tags.unwrap_or_default(),
+            now,
+        );
+        let url = queue.url.clone();
         store.insert_queue(queue);
 
         Ok(CreateQueueOutput {

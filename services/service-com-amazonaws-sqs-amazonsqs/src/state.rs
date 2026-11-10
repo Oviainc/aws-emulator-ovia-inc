@@ -683,6 +683,17 @@ pub fn integer_bounds(name: &str) -> (i64, i64) {
 /// How many queues this emulator will hold; `CreateQueue` refuses past it.
 pub const MAX_QUEUES: usize = 1_000;
 
+/// How this store states that it holds as many queues as it will, naming the queue that
+/// could not be made.
+///
+/// The emulator's own ceiling rather than a published Amazon SQS quota, so the sentence
+/// says what it is. One wording for every API that provisions a queue — `CreateQueue`, and
+/// the Cloud Control API resource handler that stands behind `AWS::SQS::Queue` — so two
+/// paths cannot drift on how they state the same ceiling.
+pub fn queues_quota_message(name: &str) -> String {
+    format!("Cannot create queue {name}: this emulator already holds {MAX_QUEUES} queues.")
+}
+
 /// How many recently-deleted queue names the store remembers (see
 /// [`ComAmazonawsSqsAmazonsqsState::recently_deleted`]).
 ///
@@ -1172,6 +1183,55 @@ pub struct Queue {
 }
 
 impl Queue {
+    /// A queue as a create makes one: held in `region`'s namespace under `name`, carrying
+    /// `attributes` and `tags`, with nothing in its message plane yet.
+    ///
+    /// The one place a queue record comes into being, so every API that provisions one —
+    /// `CreateQueue`, and the Cloud Control API resource handler that stands behind
+    /// `AWS::SQS::Queue` — makes the SAME record: the same url and ARN for the name, a
+    /// fresh incarnation, and a queue nothing has sent to, purged or received from.
+    pub fn created(
+        region: &str,
+        name: &str,
+        attributes: BTreeMap<String, String>,
+        tags: BTreeMap<String, String>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            region: region.to_string(),
+            // A create makes a NEW incarnation of the name, whether or not a queue has
+            // carried it before: the handles the previous one minted name that one, so
+            // presenting one to this queue is presenting a handle of a queue that is gone.
+            incarnation: new_identifier(),
+            url: queue_url(region, name),
+            arn: queue_arn(region, name),
+            attributes,
+            tags,
+            messages: VecDeque::new(),
+            handles: HashMap::new(),
+            // A queue nobody has deleted a message from yet has retired no receipt handle.
+            deleted_handles: VecDeque::new(),
+            // Nor has any receive of it been superseded by a later one.
+            superseded_handles: VecDeque::new(),
+            deduplication: BTreeMap::new(),
+            receive_attempts: BTreeMap::new(),
+            // Nothing has been sequenced yet, so the first message this queue sequences
+            // gets the first sequence number.
+            sequenced: 0,
+            created_at: now,
+            // Nothing has changed the queue yet, so it was last modified when it was
+            // created.
+            last_modified_at: now,
+            // A queue nobody has purged holds no purge instant, so the first `PurgeQueue`
+            // on it is accepted.
+            purged_at: None,
+            // No receive has handed anything over yet, so the first FIFO receive starts
+            // its walk at the oldest message group.
+            group_cursor: None,
+        }
+    }
+
     /// Every attribute this queue has a value for: its stored configuration, the three
     /// the record itself derives (`QueueArn`, `CreatedTimestamp`,
     /// `LastModifiedTimestamp`), the three that count the messages it holds and the
@@ -4122,6 +4182,19 @@ pub fn apply_attributes<'a>(
             None => attributes.remove(name),
         };
     }
+}
+
+/// One value as an attribute's wire text carries it: a string stays itself, and every other
+/// JSON form is its own compact JSON (`30`, `true`, `{"maxReceiveCount":3}`).
+///
+/// An `Attributes` value is TEXT on this service's wire, while the same value is typed
+/// wherever a resource model declares it — an `AWS::SQS::Queue`'s `VisibilityTimeout` is a
+/// number and its `RedrivePolicy` an object. Several services need that conversion, so the
+/// rule itself is stated once in the shared crate
+/// ([`::service_common::json_wire_values::value_text`]) and named here, beside the attribute
+/// vocabulary it belongs to, for the callers that hand this service an attribute map.
+pub fn attribute_text(value: &::serde_json::Value) -> String {
+    ::service_common::json_wire_values::value_text(value)
 }
 
 /// The form attribute `name` is STORED in when a call supplies `value` for it, or `None`

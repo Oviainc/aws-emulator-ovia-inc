@@ -1751,12 +1751,11 @@ pub(super) fn queue_attributes(properties: &Value) -> Map<String, Value> {
 /// The ONE spelling of that, shared by the queue attributes it was written for and by every
 /// other member whose value a template may declare as a document while the called operation
 /// takes its TEXT — an api's inline OpenAPI definition among them
-/// ([`import_apigatewayv2_api`]).
+/// ([`import_apigatewayv2_api`]). The rule itself is stated once in the shared crate
+/// ([`::service_common::json_wire_values::value_text`]), so this crate and the services that
+/// take such a member cannot disagree about what a number or an object spells as.
 pub(crate) fn attribute_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
+    ::service_common::json_wire_values::value_text(value)
 }
 
 /// The `tags` map an `AWS::SQS::Queue`'s `Tags` property is.

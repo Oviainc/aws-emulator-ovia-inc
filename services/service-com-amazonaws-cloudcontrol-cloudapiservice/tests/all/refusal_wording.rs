@@ -450,6 +450,11 @@ async fn a_patch_of_a_create_only_property_is_refused_with_the_schema_pointer() 
 
     for (case, type_name, desired, property) in rows {
         let identifier = emulator.provision(type_name, &desired).await;
+        // The model the created resource reads back as, which a refused update has to
+        // leave exactly as it is: the desired state itself for a type whose resources live
+        // in this service's own store, and the model the OWNING service holds for a type
+        // it holds the resources of.
+        let model = emulator.properties(type_name, &identifier).await;
         let patches = [
             (
                 "replacing it",
@@ -489,7 +494,7 @@ async fn a_patch_of_a_create_only_property_is_refused_with_the_schema_pointer() 
             );
             let stored = emulator.properties(type_name, &identifier).await;
             assert_eq!(
-                stored, desired,
+                stored, model,
                 "case {case:?}: a refused update must change nothing, got {stored:?}"
             );
         }
@@ -508,6 +513,9 @@ async fn a_patch_of_a_create_only_property_the_model_does_not_carry_is_still_ref
     // together.
     let desired = json!({ "QueueName": "fifo-less-queue" });
     let identifier = emulator.provision(QUEUE, &desired).await;
+    // The model the OWNING service holds for the created queue, which a refused update
+    // has to leave exactly as it is.
+    let model = emulator.properties(QUEUE, &identifier).await;
     let rows: [(&str, Value, &str); 4] = [
         (
             "replacing a create-only property the model does not carry",
@@ -551,7 +559,7 @@ async fn a_patch_of_a_create_only_property_the_model_does_not_carry_is_still_ref
         );
         let stored = emulator.properties(QUEUE, &identifier).await;
         assert_eq!(
-            stored, desired,
+            stored, model,
             "case {case:?}: a refused update must change nothing, got {stored:?}"
         );
     }
@@ -665,6 +673,9 @@ async fn a_patch_document_the_front_door_refuses_is_a_validation_failure() {
     let identifier = emulator
         .provision(QUEUE, &json!({ "QueueName": "patched-queue", "Tags": [] }))
         .await;
+    // The model the OWNING service holds for the created queue, which a refused update has
+    // to leave exactly as it is.
+    let model = emulator.properties(QUEUE, &identifier).await;
 
     // The rows differ along WHICH HALF of the service judges the document: one the front
     // door will not read, or whose operation names a path the resource model does not
@@ -744,7 +755,7 @@ async fn a_patch_document_the_front_door_refuses_is_a_validation_failure() {
         let stored = emulator.properties(QUEUE, &identifier).await;
         assert_eq!(
             stored,
-            json!({ "QueueName": "patched-queue", "Tags": [] }),
+            model,
             "case {case:?}: a refused update must change nothing, got {stored:?}"
         );
     }
@@ -753,8 +764,12 @@ async fn a_patch_document_the_front_door_refuses_is_a_validation_failure() {
 #[tokio::test]
 async fn a_patch_that_grows_the_model_past_what_it_can_hold_is_refused_and_changes_nothing() {
     let emulator = Emulator::new();
-    let model = json!({ "QueueName": "grown-queue", "Tags": [] });
-    let identifier = emulator.provision(QUEUE, &model).await;
+    let identifier = emulator
+        .provision(QUEUE, &json!({ "QueueName": "grown-queue", "Tags": [] }))
+        .await;
+    // The model the OWNING service holds for the created queue, which a refused update has
+    // to leave exactly as it is.
+    let model = emulator.properties(QUEUE, &identifier).await;
 
     // What one patch document can make of a resource model is bounded in BOTH dimensions
     // RFC 6902's `copy` and `move` multiply — a copy of the model into a point inside
@@ -857,6 +872,9 @@ async fn a_create_whose_resource_exists_fails_with_the_handlers_already_exists_v
 
     for (case, type_name, desired, expected_message) in rows {
         let identifier = emulator.provision(type_name, &desired).await;
+        // The model the created resource reads back as, which a failed create has to leave
+        // exactly as it is.
+        let model = emulator.properties(type_name, &identifier).await;
 
         // The duplicate names the identifier the first create resolved.
         let (status, body) = emulator.create(type_name, &desired, None).await;
@@ -889,7 +907,7 @@ async fn a_create_whose_resource_exists_fails_with_the_handlers_already_exists_v
         );
         let stored = emulator.properties(type_name, &identifier).await;
         assert_eq!(
-            stored, desired,
+            stored, model,
             "case {case:?}: the failed create must leave the resource as it was, got {stored:?}"
         );
     }

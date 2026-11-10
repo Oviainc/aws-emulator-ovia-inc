@@ -137,10 +137,10 @@ async fn a_type_a_provider_stands_behind_is_served() {
     // model that service holds, read-only properties included.
     let rows = [
         (
-            "AWS::SQS::Queue",
-            json!({ "QueueName": "provisionable-queue" }),
-            "QueueName",
-            json!({ "QueueName": "provisionable-queue" }),
+            "AWS::SNS::Topic",
+            json!({ "TopicName": "provisionable-topic" }),
+            "TopicName",
+            json!({ "TopicName": "provisionable-topic" }),
         ),
         (
             "AWS::CloudFormation::Stack",

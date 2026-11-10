@@ -33,6 +33,14 @@ pub(crate) const LOGS_SIGNING_NAME: &str = "logs";
 /// Smithy service shape.
 pub(crate) const LOGS_TARGET_PREFIX: &str = "Logs_20140328";
 
+/// The sigv4 signing name of the Amazon SQS service, whose own store holds the queues
+/// `AWS::SQS::Queue` names.
+pub(crate) const SQS_SIGNING_NAME: &str = "sqs";
+
+/// The `X-Amz-Target` prefix a client writes for that service: the local name of its
+/// Smithy service shape.
+pub(crate) const SQS_TARGET_PREFIX: &str = "AmazonSQS";
+
 /// How long a wait for a resource operation request to complete runs before the case
 /// fails.
 ///
@@ -60,35 +68,49 @@ pub(crate) struct Emulator {
 }
 
 impl Emulator {
-    /// One emulator, mounted the way the assembled router mounts this service.
-    pub(crate) fn new() -> Self {
+    /// One emulator, mounted the way the assembled router mounts this service: this service
+    /// over one shared engine, and whatever `owning` registers beside it on that SAME engine
+    /// — which is what the assembled router is, and what a case about a resource created
+    /// over an OWNING service's own API needs.
+    ///
+    /// The one router construction every constructor below goes through, so mounting a
+    /// further owning service adds a registration rather than a copy of this block.
+    fn mounted(owning: impl FnOnce(&mut MultiServiceRouter, Arc<engine::InMemoryEngine>)) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Pinned off so the suites do not depend on the process-wide default; the
         // Authorization header below is still what carries the credential scope.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_cloudcontrol_cloudapiservice::EmulatedService::new(engine),
-        );
-        Self { router }
-    }
-
-    /// One emulator with the service that OWNS `AWS::Logs::LogGroup` mounted beside this
-    /// one over the SAME shared engine — which is what the assembled router is, and what
-    /// a case about a resource created over the OWNING service's own API needs.
-    pub(crate) fn with_cloudwatch_logs() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        router.set_request_authentication(false);
-        router.register_service(
             service_com_amazonaws_cloudcontrol_cloudapiservice::EmulatedService::new(Arc::clone(
                 &engine,
             )),
         );
-        router.register_service(
-            service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(engine),
-        );
+        owning(&mut router, engine);
         Self { router }
+    }
+
+    /// One emulator holding this service alone.
+    pub(crate) fn new() -> Self {
+        Self::mounted(|_, _| {})
+    }
+
+    /// One emulator with the service that OWNS `AWS::Logs::LogGroup` mounted beside this
+    /// one.
+    pub(crate) fn with_cloudwatch_logs() -> Self {
+        Self::mounted(|router, engine| {
+            router.register_service(
+                service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(engine),
+            );
+        })
+    }
+
+    /// One emulator with the service that OWNS `AWS::SQS::Queue` mounted beside this one.
+    pub(crate) fn with_sqs() -> Self {
+        Self::mounted(|router, engine| {
+            router
+                .register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(engine));
+        })
     }
 
     /// One operation of this service, as a `(status, body)` pair.
@@ -117,6 +139,28 @@ impl Emulator {
     /// One operation of the CloudWatch Logs service, required to succeed.
     pub(crate) async fn logs_ok(&self, operation: &str, body: Value) -> Value {
         let (status, decoded) = self.logs(operation, body).await;
+        assert_eq!(
+            status, 200,
+            "{operation}: expected HTTP 200, got {status} with body {decoded:?}"
+        );
+        decoded
+    }
+
+    /// One operation of the Amazon SQS service — the OWNING service's own API, the one a
+    /// client uses when it is not going through Cloud Control API.
+    pub(crate) async fn sqs(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.post(
+            SQS_SIGNING_NAME,
+            "application/x-amz-json-1.0",
+            &format!("{SQS_TARGET_PREFIX}.{operation}"),
+            body,
+        )
+        .await
+    }
+
+    /// One operation of the Amazon SQS service, required to succeed.
+    pub(crate) async fn sqs_ok(&self, operation: &str, body: Value) -> Value {
+        let (status, decoded) = self.sqs(operation, body).await;
         assert_eq!(
             status, 200,
             "{operation}: expected HTTP 200, got {status} with body {decoded:?}"

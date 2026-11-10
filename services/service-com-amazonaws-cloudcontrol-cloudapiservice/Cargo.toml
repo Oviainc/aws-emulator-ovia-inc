@@ -14,6 +14,9 @@ service-common = { path = "../common" }
 # inventory of its own: an `AWS::Logs::LogGroup` lives in the CloudWatch Logs
 # service's store, so this crate reads and writes it THERE.
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# The same rule for `AWS::SQS::Queue`: a queue lives in the Amazon SQS service's store,
+# whichever API created it, so this crate reads and writes it THERE.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

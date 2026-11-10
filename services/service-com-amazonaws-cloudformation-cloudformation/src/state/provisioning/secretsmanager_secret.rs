@@ -536,11 +536,12 @@ fn stated<'a>(properties: &'a Value, property: &str) -> Option<&'a Value> {
 /// One declared value as the TEXT a string member carries: a JSON string as it is, and any
 /// other scalar as the template spelled it — a template may write a value through a `Ref` to
 /// a parameter of another type, and the owning service's own validation is what judges it.
+///
+/// The rule is stated once in the shared crate
+/// ([`::service_common::json_wire_values::value_text`]); this names it for the declarations
+/// this module reads.
 fn attribute_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
+    ::service_common::json_wire_values::value_text(value)
 }
 
 /// The refusal for a declared property this module does not apply, naming which property it

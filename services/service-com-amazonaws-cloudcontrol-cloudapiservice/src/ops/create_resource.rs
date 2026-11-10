@@ -261,8 +261,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries the type's primary identifier has to hold something that can be one.
         let properties = crate::state::parse_properties("DesiredState", &input.desired_state)
             .map_err(invalid_request)?;
-        let (identifier, identifier_property, properties) =
-            match crate::state::derive_identifier(&properties, &input.type_name) {
+        // The Region this call addressed, as its SigV4 credential scope names it: the
+        // Region a resource the OWNING service provisions is created in.
+        let region = crate::state::request_region(ctx.parts());
+        let native = crate::state::native::NativeResources::for_engine(&*self.engine);
+        // For a type whose primary identifier the OWNING service ASSIGNS — one the type's
+        // schema declares read-only, so no desired state carries it — the identifier is
+        // that service's to name rather than something read off the model.
+        let assigned = native
+            .provider(&input.type_name)
+            .and_then(|provider| {
+                provider
+                    .assigned_identifier(&region, &properties)
+                    .map(|identifier| (identifier, provider.identifier_property().to_string()))
+            });
+        let (identifier, identifier_property, properties) = match assigned {
+            Some((identifier, property)) => (identifier, property, properties),
+            None => match crate::state::derive_identifier(&properties, &input.type_name) {
                 crate::state::DerivedIdentifier::Carried {
                     property,
                     identifier,
@@ -291,10 +306,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::MAX_IDENTIFIER_CHARACTERS
                     )));
                 }
-            };
+            },
+        };
 
         let now = ::std::time::SystemTime::now();
-        let native = crate::state::native::NativeResources::for_engine(&*self.engine);
         let mut store = state.lock();
         store.materialise_due(now, &native);
 
@@ -395,7 +410,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 type_version_id: input.type_version_id.clone(),
                 // Where the resource is provisioned by the service that OWNS the type,
                 // this is the Region it is created in — the one this call was signed for.
-                region: crate::state::request_region(ctx.parts()),
+                region,
             },
         );
         let progress_event = crate::state::progress_event(&record);

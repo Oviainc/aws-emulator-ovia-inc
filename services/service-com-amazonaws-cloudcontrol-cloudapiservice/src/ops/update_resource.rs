@@ -236,6 +236,7 @@ enum StoreVerdict {
 fn judge_against_store(
     store: &crate::state::ComAmazonawsCloudcontrolCloudapiserviceState,
     native: &crate::state::native::NativeResources,
+    region: &str,
     input: &UpdateResourceInput,
     fingerprint: &str,
 ) -> Result<StoreVerdict, UpdateResourceError> {
@@ -271,7 +272,8 @@ fn judge_against_store(
     if let Some(holding) = store.in_flight_request(&input.type_name, &input.identifier) {
         return Err(concurrent_operation(&input.identifier, Some(holding)));
     }
-    let Some(resolved) = store.resolve(native, &input.type_name, &input.identifier) else {
+    let Some(resolved) = store.resolve(native, region, &input.type_name, &input.identifier)
+    else {
         // A not-found is the OWNING handler's verdict, so the refusal carries that
         // handler's whole answer: its diagnostic, the handler error code it failed with
         // and the token of the invocation that failed.
@@ -304,6 +306,7 @@ fn judge_against_store(
 fn overlapping_operation(
     store: &crate::state::ComAmazonawsCloudcontrolCloudapiserviceState,
     native: &crate::state::native::NativeResources,
+    region: &str,
     input: &UpdateResourceInput,
     base: &::serde_json::Value,
 ) -> Option<UpdateResourceError> {
@@ -311,7 +314,7 @@ fn overlapping_operation(
         .in_flight_request(&input.type_name, &input.identifier)
         .map(str::to_string);
     let moved = store
-        .resolve(native, &input.type_name, &input.identifier)
+        .resolve(native, region, &input.type_name, &input.identifier)
         .is_none_or(|resolved| &resolved.properties != base);
     (holding.is_some() || moved)
         .then(|| concurrent_operation(&input.identifier, holding.as_deref()))
@@ -401,6 +404,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(&input.patch_document),
         ]);
         let resource = crate::state::resource_label(&input.type_name, &input.identifier);
+        // The Region this call addressed, as its SigV4 credential scope names it: where the
+        // owning service holds one namespace per Region, this is the Region the resource is
+        // resolved in and the one the patch is applied in.
+        let region = crate::state::request_region(ctx.parts());
         let native = crate::state::native::NativeResources::for_engine(&*self.engine);
 
         // Everything this service's own store answers is judged first, under a lock that
@@ -409,7 +416,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (base, identifier_property) = {
             let mut store = state.lock();
             store.materialise_due(::std::time::SystemTime::now(), &native);
-            match judge_against_store(&store, &native, &input, &fingerprint)? {
+            match judge_against_store(&store, &native, &region, &input, &fingerprint)? {
                 StoreVerdict::Replay(progress_event, request_token) => {
                     drop(store);
                     crate::state::audit(
@@ -461,7 +468,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // model, which is contention rather than a bad request.
             let mut store = state.lock();
             store.materialise_due(::std::time::SystemTime::now(), &native);
-            if let Some(overlap) = overlapping_operation(&store, &native, &input, &base) {
+            if let Some(overlap) = overlapping_operation(&store, &native, &region, &input, &base) {
                 return Err(overlap);
             }
             drop(store);
@@ -491,7 +498,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.materialise_due(now, &native);
-        match judge_against_store(&store, &native, &input, &fingerprint)? {
+        match judge_against_store(&store, &native, &region, &input, &fingerprint)? {
             StoreVerdict::Replay(progress_event, request_token) => {
                 drop(store);
                 crate::state::audit(
@@ -531,6 +538,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
             crate::state::ResourceEffect::Update {
                 properties: patched,
+                // Where the resource is patched by the service that OWNS the type, this is
+                // the Region it is patched in — the one this call was signed for.
+                region,
             },
         );
         let progress_event = crate::state::progress_event(&record);

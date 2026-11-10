@@ -207,7 +207,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListResourcesErrorModeled::ServiceInternalErrorException(
                 ServiceInternalErrorException {
@@ -255,6 +254,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // The Region this call addressed, as its SigV4 credential scope names it: a
+        // listing reports the resources of one account and Region, so a type whose owning
+        // service holds one namespace per Region is enumerated THERE.
+        let region = crate::state::request_region(ctx.parts());
         // What the clock already owes the store, so one listing cannot report a resource
         // another read says no longer exists.
         let native = crate::state::native::NativeResources::for_engine(&*self.engine);
@@ -292,8 +295,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The inventory is the one that EXISTS: for a type another service owns the
         // resources of, that service's own state is what is listed, so a resource it
         // holds is reported whichever API created it.
-        let mut examined =
-            store.resolve_type(&native, &input.type_name, resume_after.as_deref(), page_size + 1);
+        let mut examined = store.resolve_type(
+            &native,
+            &region,
+            &input.type_name,
+            resume_after.as_deref(),
+            page_size + 1,
+        );
         // A window that came back full may have more behind it; one that came back short
         // reached the end of the type, which is what tells a client to stop.
         let further = examined.len() > page_size;

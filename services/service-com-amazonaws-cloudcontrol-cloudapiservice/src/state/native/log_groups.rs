@@ -106,11 +106,15 @@ impl NativeResourceProvider for LogGroupProvider {
         IDENTIFIER_PROPERTY
     }
 
-    fn read(&self, identifier: &str) -> Option<Value> {
+    fn read(&self, region: &str, identifier: &str) -> Option<Value> {
+        // The owning service holds its log groups in ONE namespace, so a group is the same
+        // group whichever Region a call that names it was signed for.
+        let _ = region;
         self.state.lock().log_groups.get(identifier).map(model)
     }
 
-    fn list(&self, after: Option<&str>, limit: usize) -> Vec<(String, Value)> {
+    fn list(&self, region: &str, after: Option<&str>, limit: usize) -> Vec<(String, Value)> {
+        let _ = region;
         // The owning store keys its groups by name, so its own ordered range IS the
         // window a listing pages over — nothing is sorted, and nothing outside the
         // window is read.
@@ -122,9 +126,9 @@ impl NativeResourceProvider for LogGroupProvider {
 
     fn create(
         &self,
+        region: &str,
         identifier: &str,
         properties: &Value,
-        region: &str,
         at: SystemTime,
     ) -> Result<Value, NativeRefusal> {
         // The name a group is created under is the OWNING service's to accept: the domain
@@ -171,7 +175,16 @@ impl NativeResourceProvider for LogGroupProvider {
         Ok(created)
     }
 
-    fn update(&self, identifier: &str, properties: &Value) -> Result<Value, NativeRefusal> {
+    fn update(
+        &self,
+        region: &str,
+        identifier: &str,
+        properties: &Value,
+        at: SystemTime,
+    ) -> Result<Value, NativeRefusal> {
+        // One namespace per account, and a group's record carries no instant a model
+        // changes.
+        let _ = (region, at);
         let mut store = self.state.lock();
         let held = store
             .log_groups
@@ -199,7 +212,8 @@ impl NativeResourceProvider for LogGroupProvider {
         Ok(model(group))
     }
 
-    fn delete(&self, identifier: &str) -> Result<(), NativeRefusal> {
+    fn delete(&self, region: &str, identifier: &str, at: SystemTime) -> Result<(), NativeRefusal> {
+        let _ = (region, at);
         let mut store = self.state.lock();
         let group = store
             .log_groups

@@ -20,6 +20,14 @@
 //! out of this service's own store exactly as before — that store is the only place such a
 //! resource can live.
 //!
+//! Every one of those answers is about ONE Region: this service "can be used to return
+//! information about an existing resource in your account and Amazon Web Services Region",
+//! and an owning service that holds a resource per Region resolves a reference in the
+//! Region the call was made in. So the Region a request was signed for travels into each
+//! method, and the work a request OWES carries the Region it was accepted in
+//! ([`crate::state::ResourceEffect`]) — a type whose owning store is one namespace per
+//! Region can then never be read in one Region and written in another.
+//!
 //! LOCK ORDER: a caller holds this service's own store guard while taking a provider's
 //! ([`crate::state::ComAmazonawsCloudcontrolCloudapiserviceState::materialise_due`]), so
 //! the request record and the resource it owes are settled together. Never the other way
@@ -27,6 +35,7 @@
 
 mod destinations;
 mod log_groups;
+mod queues;
 
 use ::serde_json::Value;
 use ::std::collections::BTreeMap;
@@ -84,34 +93,50 @@ pub trait NativeResourceProvider: Send + Sync {
     /// The property of the resource model that carries the type's primary identifier.
     fn identifier_property(&self) -> &'static str;
 
-    /// The resource model of `identifier`, or `None` when the owning service holds no
-    /// such resource.
-    fn read(&self, identifier: &str) -> Option<Value>;
+    /// The primary identifier the resource `properties` describes will answer to in
+    /// `region`, for a type whose primary identifier the OWNING service ASSIGNS — one the
+    /// type's schema declares read-only, so no desired state carries it — and `None` for a
+    /// type whose desired state names its own identifier, which is the rule every other
+    /// type follows ([`crate::state::derive_identifier`]).
+    fn assigned_identifier(&self, region: &str, properties: &Value) -> Option<String> {
+        let _ = (region, properties);
+        None
+    }
 
-    /// The resources of this type the owning service holds, as
+    /// The resource model of `identifier` in `region`, or `None` when the owning service
+    /// holds no such resource there.
+    fn read(&self, region: &str, identifier: &str) -> Option<Value>;
+
+    /// The resources of this type the owning service holds in `region`, as
     /// `(primary identifier, resource model)` in identifier order: at most `limit` of
     /// them, and only those whose identifier sorts AFTER `after`.
     ///
     /// Bounded at the owning store, so a listing builds the window it is about to report
     /// rather than the whole inventory behind it.
-    fn list(&self, after: Option<&str>, limit: usize) -> Vec<(String, Value)>;
+    fn list(&self, region: &str, after: Option<&str>, limit: usize) -> Vec<(String, Value)>;
 
     /// Provision `identifier` from `properties`, in `region`, as of `at` — answering the
     /// model the owning service holds for it once it is there.
     fn create(
         &self,
+        region: &str,
         identifier: &str,
         properties: &Value,
-        region: &str,
         at: SystemTime,
     ) -> Result<Value, NativeRefusal>;
 
-    /// Apply `properties` to `identifier` — answering the model the owning service holds
-    /// for it afterwards.
-    fn update(&self, identifier: &str, properties: &Value) -> Result<Value, NativeRefusal>;
+    /// Apply `properties` to `identifier` in `region`, as of `at` — answering the model the
+    /// owning service holds for it afterwards.
+    fn update(
+        &self,
+        region: &str,
+        identifier: &str,
+        properties: &Value,
+        at: SystemTime,
+    ) -> Result<Value, NativeRefusal>;
 
-    /// Remove `identifier` from the owning service's store.
-    fn delete(&self, identifier: &str) -> Result<(), NativeRefusal>;
+    /// Remove `identifier` from the owning service's store, in `region`, as of `at`.
+    fn delete(&self, region: &str, identifier: &str, at: SystemTime) -> Result<(), NativeRefusal>;
 }
 
 /// The providers reachable from one engine: the owning stores this service resolves
@@ -153,6 +178,9 @@ impl NativeResources {
         if let Some(provider) = destinations::DestinationProvider::for_engine(engine) {
             providers.push(Box::new(provider));
         }
+        if let Some(provider) = queues::QueueProvider::for_engine(engine) {
+            providers.push(Box::new(provider));
+        }
         Self { providers }
     }
 
@@ -180,6 +208,11 @@ fn epoch_millis(at: SystemTime) -> i64 {
 /// is what its own readers report.
 pub type LogsState =
     ::service_com_amazonaws_cloudwatchlogs_logs_20140328::ComAmazonawsCloudwatchlogsLogs20140328State;
+
+/// The Amazon SQS store the resources of the `AWS::SQS::*` types live in — that service's
+/// OWN state struct, reached through the shared engine, so a queue this emulator holds is
+/// the queue Cloud Control API acts on whichever API created it.
+pub type SqsState = ::service_com_amazonaws_sqs_amazonsqs::state::ComAmazonawsSqsAmazonsqsState;
 
 /// The window `(after, limit)` names of an owning store keyed by its resources' own
 /// identifiers: the entries whose key sorts AFTER `after`, in key order, at most `limit`
@@ -274,6 +307,10 @@ mod tests {
         assert!(
             native.provider("AWS::Logs::Destination").is_some(),
             "expected the destination provider, got {native:?}"
+        );
+        assert!(
+            native.provider("AWS::SQS::Queue").is_some(),
+            "expected the queue provider, got {native:?}"
         );
         for unbacked in ["AWS::S3::Bucket", "AWS::Kinesis::Stream", "AWS::Logs"] {
             assert!(

@@ -256,6 +256,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        // The Region this call addressed, as its SigV4 credential scope names it: where
+        // the owning service holds one namespace per Region, this is the Region the
+        // resource is resolved in and the one it is removed from.
+        let region = crate::state::request_region(ctx.parts());
         let native = crate::state::native::NativeResources::for_engine(&*self.engine);
         let mut store = state.lock();
         store.materialise_due(now, &native);
@@ -315,7 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         if store
-            .resolve(&native, &input.type_name, &input.identifier)
+            .resolve(&native, &region, &input.type_name, &input.identifier)
             .is_none()
         {
             // A not-found is the OWNING handler's verdict, so the refusal carries that
@@ -350,7 +354,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(input.identifier.clone()),
             crate::state::OPERATION_DELETE,
             now,
-            crate::state::ResourceEffect::Delete,
+            crate::state::ResourceEffect::Delete {
+                // Where the resource is removed by the service that OWNS the type, this is
+                // the Region it is removed from — the one this call was signed for.
+                region,
+            },
         );
         let progress_event = crate::state::progress_event(&record);
         if store.record_request(record).is_err() {

@@ -6,10 +6,19 @@
 //! the rule under test is about the resource model as a whole rather than about any one
 //! type: the identifier is the value of the type's own identifier property in the
 //! desired state, and a desired state naming none gets one the service allocates.
+//!
+//! A type whose primary identifier the OWNING service assigns — one its schema declares
+//! read-only, like `AWS::SQS::Queue`'s `QueueUrl` — takes neither path: that service names
+//! the resource, which is what `sqs_queue_read_through` holds it to.
 
 use serde_json::{json, Value};
 
 use super::emulator::{code, message, progress, text, Emulator};
+
+/// A type whose resources live in this service's own store and whose identifier a
+/// desired state may leave to the service, so a row about an ALLOCATED identifier is
+/// about the allocation rather than about one owning service.
+const STREAM: &str = "AWS::Kinesis::Stream";
 
 /// One row of the identifier table.
 struct Case {
@@ -98,8 +107,8 @@ async fn the_primary_identifier_is_the_value_of_the_types_own_identifier_propert
         },
         Case {
             name: "a model that names no identifier",
-            type_name: "AWS::SQS::Queue",
-            desired: json!({ "DelaySeconds": 5 }),
+            type_name: STREAM,
+            desired: json!({ "ShardCount": 2 }),
             expected: None,
         },
     ];
@@ -163,11 +172,10 @@ async fn the_primary_identifier_is_the_value_of_the_types_own_identifier_propert
 #[tokio::test]
 async fn two_creates_naming_no_identifier_are_two_resources() {
     let emulator = Emulator::new();
-    const QUEUE: &str = "AWS::SQS::Queue";
-    let desired = json!({ "DelaySeconds": 5 });
+    let desired = json!({ "ShardCount": 2 });
 
-    let first = emulator.create_ok(QUEUE, &desired, None).await;
-    let second = emulator.create_ok(QUEUE, &desired, None).await;
+    let first = emulator.create_ok(STREAM, &desired, None).await;
+    let second = emulator.create_ok(STREAM, &desired, None).await;
     let first = emulator.settled(&text(&first, "RequestToken")).await;
     let second = emulator.settled(&text(&second, "RequestToken")).await;
 
@@ -176,7 +184,7 @@ async fn two_creates_naming_no_identifier_are_two_resources() {
         one, other,
         "two allocated identifiers must differ, got {one:?} twice"
     );
-    let mut listed = emulator.walk(QUEUE, None).await;
+    let mut listed = emulator.walk(STREAM, None).await;
     listed.sort();
     let mut expected = vec![one, other];
     expected.sort();

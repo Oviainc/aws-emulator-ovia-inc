@@ -66,11 +66,14 @@ impl NativeResourceProvider for DestinationProvider {
         IDENTIFIER_PROPERTY
     }
 
-    fn read(&self, identifier: &str) -> Option<Value> {
+    fn read(&self, region: &str, identifier: &str) -> Option<Value> {
+        // One namespace per account, as for a log group ([`super::log_groups`]).
+        let _ = region;
         self.state.lock().destinations.get(identifier).map(model)
     }
 
-    fn list(&self, after: Option<&str>, limit: usize) -> Vec<(String, Value)> {
+    fn list(&self, region: &str, after: Option<&str>, limit: usize) -> Vec<(String, Value)> {
+        let _ = region;
         // As for a log group ([`super::log_groups`]): the owning store keys its
         // destinations by name, so its own ordered range is the window a listing reports.
         let store = self.state.lock();
@@ -81,9 +84,9 @@ impl NativeResourceProvider for DestinationProvider {
 
     fn create(
         &self,
+        region: &str,
         identifier: &str,
         properties: &Value,
-        region: &str,
         at: SystemTime,
     ) -> Result<Value, NativeRefusal> {
         // The name a destination is created under is the OWNING service's to accept: the
@@ -124,7 +127,14 @@ impl NativeResourceProvider for DestinationProvider {
         Ok(created)
     }
 
-    fn update(&self, identifier: &str, properties: &Value) -> Result<Value, NativeRefusal> {
+    fn update(
+        &self,
+        region: &str,
+        identifier: &str,
+        properties: &Value,
+        at: SystemTime,
+    ) -> Result<Value, NativeRefusal> {
+        let _ = (region, at);
         let mut store = self.state.lock();
         let held_arn = store
             .destinations
@@ -141,7 +151,8 @@ impl NativeResourceProvider for DestinationProvider {
         Ok(model(destination))
     }
 
-    fn delete(&self, identifier: &str) -> Result<(), NativeRefusal> {
+    fn delete(&self, region: &str, identifier: &str, at: SystemTime) -> Result<(), NativeRefusal> {
+        let _ = (region, at);
         let mut store = self.state.lock();
         store
             .destinations

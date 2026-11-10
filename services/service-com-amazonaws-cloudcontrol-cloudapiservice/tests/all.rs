@@ -25,6 +25,8 @@ mod refusal_wording;
 mod resource_lifecycle;
 #[path = "all/resource_listing.rs"]
 mod resource_listing;
+#[path = "all/sqs_queue_read_through.rs"]
+mod sqs_queue_read_through;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/unsupported_actions.rs"]

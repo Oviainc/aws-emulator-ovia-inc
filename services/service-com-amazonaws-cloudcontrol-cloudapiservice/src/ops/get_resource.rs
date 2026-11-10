@@ -204,7 +204,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetResourceErrorModeled::ServiceInternalErrorException(
                 ServiceInternalErrorException {
@@ -241,6 +240,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // The Region this call addressed, as its SigV4 credential scope names it: this
+        // operation "can be used to return information about an existing resource in your
+        // account and Amazon Web Services Region", so a resource of a type whose owning
+        // service holds one namespace per Region is resolved THERE.
+        let region = crate::state::request_region(ctx.parts());
         // What the clock already owes the store: a create whose work has fallen due has
         // provisioned its resource and a delete whose work has fallen due has removed
         // one, whether or not anybody called in between.
@@ -252,7 +256,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // LIVES — the owning service's own state for a type that service holds the
         // resources of — so a resource this service never created still reads, and one
         // the owning service has since removed no longer does.
-        let Some(resolved) = store.resolve(&native, &input.type_name, &input.identifier) else {
+        let Some(resolved) = store.resolve(&native, &region, &input.type_name, &input.identifier)
+        else {
             // A not-found is the OWNING handler's verdict, so the refusal carries that
             // handler's whole answer: its diagnostic, the handler error code it failed
             // with and the token of the invocation that failed.

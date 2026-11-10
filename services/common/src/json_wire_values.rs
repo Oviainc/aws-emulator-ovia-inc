@@ -13,6 +13,9 @@
 //! carries in a fixed form — but all three then have to say the SAME two things: which
 //! class of JSON value arrived, and what it could not be read into. Those two live here,
 //! so the sentence a caller is refused with is written once.
+//!
+//! The reverse direction lives here too ([`value_text`]): the TEXT a member whose wire form
+//! is a string carries for a value a caller wrote as a number, a flag or a document.
 
 use aws_smithy_schema::{Schema, ShapeType};
 use serde_json::Value;
@@ -48,6 +51,24 @@ pub fn json_value_class(value: &Value) -> &'static str {
         Value::String(_) => STRING_VALUE,
         Value::Array(_) => ARRAY_VALUE,
         Value::Object(_) => OBJECT_VALUE,
+    }
+}
+
+/// One JSON value as the TEXT a member that carries it as a string holds: a string stays
+/// itself, and every other form is its own compact JSON (`30`, `true`,
+/// `{"maxReceiveCount":3}`).
+///
+/// Several services take a value as text on the wire while the same value is TYPED wherever
+/// a model declares it — an Amazon SQS queue attribute is a string while the
+/// `AWS::SQS::Queue` property that carries it is a number, a boolean or an object, and a
+/// template may declare any such member as the document it is. This is the one conversion
+/// between the two, so two services cannot disagree about what a number or an object spells
+/// as.
+#[must_use]
+pub fn value_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -163,5 +184,34 @@ mod tests {
             "STRING_VALUE can not be converted to milliseconds since epoch",
             "a wire form is stated as submitted, with no article added"
         );
+    }
+
+    /// A value a member carries as TEXT keeps a string as it is and renders every other
+    /// form as its own compact JSON.
+    #[test]
+    fn a_typed_value_is_carried_as_the_text_it_spells() {
+        // (the value, the text a member that carries it as a string holds)
+        let cases = [
+            (json!("already text"), "already text"),
+            (json!(""), ""),
+            (json!(30), "30"),
+            (json!(-1), "-1"),
+            (json!(1.5), "1.5"),
+            (json!(true), "true"),
+            (json!(false), "false"),
+            (json!(null), "null"),
+            (json!([1, "two"]), "[1,\"two\"]"),
+            (
+                json!({"deadLetterTargetArn": "arn", "maxReceiveCount": 3}),
+                "{\"deadLetterTargetArn\":\"arn\",\"maxReceiveCount\":3}",
+            ),
+        ];
+        for (value, expected) in cases {
+            let carried = value_text(&value);
+            assert_eq!(
+                carried, expected,
+                "case {value}: expected the text {expected:?}, got {carried:?}"
+            );
+        }
     }
 }

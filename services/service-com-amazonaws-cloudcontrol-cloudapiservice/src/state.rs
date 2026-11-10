@@ -216,9 +216,16 @@ pub enum ResourceEffect {
     Update {
         /// The resource model the patch produced.
         properties: Value,
+        /// The Region the call that accepted the update was signed for, which is the
+        /// Region the resource is patched in.
+        region: String,
     },
     /// Remove the resource from the store.
-    Delete,
+    Delete {
+        /// The Region the call that accepted the delete was signed for, which is the
+        /// Region the resource is removed from.
+        region: String,
+    },
 }
 
 /// The work a request owes, and the instant it falls due.
@@ -500,15 +507,15 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
                 ResourceEffect::Create {
                     properties, region, ..
                 } => provider
-                    .create(&identifier, &properties, &region, now)
+                    .create(&region, &identifier, &properties, now)
                     .map(|model| Some(rendered_properties(&model)))
                     .map_err(EffectFailure::from),
-                ResourceEffect::Update { properties } => provider
-                    .update(&identifier, &properties)
+                ResourceEffect::Update { properties, region } => provider
+                    .update(&region, &identifier, &properties, now)
                     .map(|model| Some(rendered_properties(&model)))
                     .map_err(EffectFailure::from),
-                ResourceEffect::Delete => provider
-                    .delete(&identifier)
+                ResourceEffect::Delete { region } => provider
+                    .delete(&region, &identifier, now)
                     .map(|()| None)
                     .map_err(EffectFailure::from),
             };
@@ -543,7 +550,7 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
                 );
                 Ok(Some(model))
             }
-            ResourceEffect::Update { properties } => {
+            ResourceEffect::Update { properties, .. } => {
                 // The resource this update was accepted against is gone, so there is
                 // nothing to patch: the request FAILED, and reporting it as anything else
                 // would claim a write that was discarded.
@@ -555,7 +562,7 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
                 stored.updated_at = now;
                 Ok(Some(rendered_properties(&stored.properties)))
             }
-            ResourceEffect::Delete => {
+            ResourceEffect::Delete { .. } => {
                 self.resources.remove(&key);
                 Ok(None)
             }
@@ -577,20 +584,25 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
     ///
     /// Where a provider stands behind the type, the OWNING service's state is what
     /// answers: a resource that service holds is resolved whichever API created it, and
-    /// one it no longer holds resolves to nothing even if this service created it.
+    /// one it no longer holds resolves to nothing even if this service created it. Such a
+    /// resource is resolved in `region` — the Region the call was signed for — because that
+    /// is the account and Region this service reports a resource of.
     pub fn resolve(
         &self,
         native: &NativeResources,
+        region: &str,
         type_name: &str,
         identifier: &str,
     ) -> Option<ResolvedResource> {
         if let Some(provider) = native.provider(type_name) {
-            return provider.read(identifier).map(|properties| ResolvedResource {
-                type_name: type_name.to_string(),
-                identifier: identifier.to_string(),
-                identifier_property: provider.identifier_property().to_string(),
-                properties,
-            });
+            return provider
+                .read(region, identifier)
+                .map(|properties| ResolvedResource {
+                    type_name: type_name.to_string(),
+                    identifier: identifier.to_string(),
+                    identifier_property: provider.identifier_property().to_string(),
+                    properties,
+                });
         }
         self.resources
             .get(&ResourceKey::new(type_name, identifier))
@@ -609,13 +621,14 @@ impl ComAmazonawsCloudcontrolCloudapiserviceState {
     pub fn resolve_type(
         &self,
         native: &NativeResources,
+        region: &str,
         type_name: &str,
         after: Option<&str>,
         limit: usize,
     ) -> Vec<ResolvedResource> {
         if let Some(provider) = native.provider(type_name) {
             return provider
-                .list(after, limit)
+                .list(region, after, limit)
                 .into_iter()
                 .map(|(identifier, properties)| ResolvedResource {
                     type_name: type_name.to_string(),
