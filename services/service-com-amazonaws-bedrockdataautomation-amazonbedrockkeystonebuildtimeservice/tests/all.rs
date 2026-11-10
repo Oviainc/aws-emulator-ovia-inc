@@ -33,6 +33,8 @@ mod identity_authorization;
 mod optimization_profile_resolution;
 #[path = "all/project_effective_configuration.rs"]
 mod project_effective_configuration;
+#[path = "all/project_not_found_wording.rs"]
+mod project_not_found_wording;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/state_roundtrip.rs"]
