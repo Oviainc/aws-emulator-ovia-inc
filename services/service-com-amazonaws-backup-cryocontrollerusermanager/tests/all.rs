@@ -27,6 +27,8 @@ mod copy_job;
 mod error_bodies;
 #[path = "all/framework.rs"]
 mod framework;
+#[path = "all/framework_listing.rs"]
+mod framework_listing;
 #[path = "all/framework_update.rs"]
 mod framework_update;
 #[path = "all/job_state_change_events.rs"]

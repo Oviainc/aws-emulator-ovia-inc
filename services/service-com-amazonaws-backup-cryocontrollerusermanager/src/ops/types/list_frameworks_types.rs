@@ -11,7 +11,12 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-backup-cryocontrollerusermanager.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.backup#ListFrameworksInput")]
+// `MaxResults`'s `@range` is checked by the HANDLER — see the note on
+// `ListProtectedResourcesInput` and `crate::state::rejected_max_results`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.backup#ListFrameworksInput",
+    skip_validation = ["MaxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListFrameworksInput {
     pub max_results: Option<i32>,
