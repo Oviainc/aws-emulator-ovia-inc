@@ -371,8 +371,10 @@ async fn an_encryption_member_s3_could_not_honour_is_refused_and_stores_nothing(
         absent.status
     );
 
-    // An SSE-C write keeps the 501: the key it carries is one S3 itself does not store,
-    // so an object written with it could not be read back here.
+    // An SSE-C write whose three members do not name one usable key is refused for the
+    // member that does not hold, and stores nothing: this one supplies the algorithm and the
+    // key with no digest of it, so the integrity check the third member exists for cannot be
+    // made at all.
     let customer_key = put_object(
         &router,
         "encryption-refusals",
@@ -391,17 +393,24 @@ async fn an_encryption_member_s3_could_not_honour_is_refused_and_stores_nothing(
     )
     .await;
     assert_eq!(
-        customer_key.status, 501,
-        "case \"a customer-provided key\": expected the scaffold's 501, got {} with body \
+        customer_key.status, 400,
+        "case \"a customer-provided key with no digest\": expected HTTP 400, got {} with body \
          {:?}",
         customer_key.status,
         text(&customer_key)
     );
     assert_eq!(
         customer_key.error_code(),
-        "NotImplemented",
-        "case \"a customer-provided key\": expected NotImplemented, got {:?}",
+        "InvalidArgument",
+        "case \"a customer-provided key with no digest\": expected InvalidArgument, got {:?}",
         customer_key.error_code()
+    );
+    let absent_sse_c = get_object(&router, "encryption-refusals", "sse-c.csv", "", &[]).await;
+    assert_eq!(
+        absent_sse_c.status, 404,
+        "case \"a customer-provided key with no digest\": a refused write must store nothing, \
+         got GetObject {}",
+        absent_sse_c.status
     );
 }
 

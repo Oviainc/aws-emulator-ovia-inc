@@ -345,18 +345,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Beyond its deserialized input this read needs only WHO is asking, which decides
         // whether the bucket's public grants are what admits it (below).
 
-        // What this read cannot answer faithfully: nothing here encrypts with a
-        // customer-provided key, so a read presenting one is refused as `PutObject` refuses
-        // it. Everything else is served: `Range` and `PartNumber` select a span of the object
+        // What this read cannot answer faithfully is below ([`unserved_feature`]).
+        // Everything else is served: `Range` and `PartNumber` select a span of the object
         // (answered 206 with a `Content-Range`), `If-Match` and `If-Unmodified-Since` are
         // judged against the version the read resolves, `If-None-Match` and
-        // `If-Modified-Since` answer 304 for a caller whose copy is the current one, and
-        // `VersionId` names one stored version of the key.
+        // `If-Modified-Since` answer 304 for a caller whose copy is the current one,
+        // `VersionId` names one stored version of the key, and the SSE-C members carry the
+        // key an object stored under a customer-provided one is read with.
         if let Some(unserved) = unserved_feature(&input) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "HeadObject with {unserved}"
             )));
         }
+
+        // The CUSTOMER-PROVIDED key this read presents, read through the one rule every call
+        // of this service reads the three members by
+        // ([`crate::state::requested_customer_key`]); whether it is the object's own is
+        // judged below, against the version the address resolves to.
+        let presented_key = crate::state::requested_customer_key(
+            input.sse_customer_algorithm.as_deref(),
+            input.sse_customer_key.as_deref(),
+            input.sse_customer_key_md5.as_deref(),
+            None,
+        )
+        .map_err(crate::scaffolded::Scaffolded::customer_key)?;
 
         // "If the account ID that you provide does not match the actual owner of the
         // bucket, the request fails with the HTTP status code 403 Forbidden (access
@@ -513,6 +525,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
 
+        // The object's plaintext comes of the CUSTOMER-PROVIDED key it was stored under, when
+        // it was stored under one, so this read is decided by the key it presents through the
+        // one rule `GetObject` is decided by ([`crate::state::sse_customer::read_refusal`]) —
+        // a HEAD reports no bytes, but what it reports about such an object is reported only
+        // to a caller holding its key, which is what AWS answers a HEAD without one.
+        if let Some(refusal) =
+            crate::state::sse_customer::read_refusal(&object.encryption, presented_key.as_ref())
+        {
+            return Err(crate::scaffolded::Scaffolded::customer_key_read(refusal));
+        }
+
         // The preconditions this read is subject to, judged against the version it
         // resolved, through the one rule `GetObject` judges its own by
         // ([`crate::state::unmet_read_precondition`]) — so a GET and a HEAD of the same
@@ -654,6 +677,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             server_side_encryption: object.encryption.sse_algorithm.clone(),
             ssekms_key_id: object.encryption.kms_key_id.clone(),
             bucket_key_enabled: object.encryption.bucket_key_enabled,
+            // And, for an object stored under a CUSTOMER-provided key: the algorithm and the
+            // digest of that key (`HeadObjectOutput$SSECustomerAlgorithm` and
+            // `$SSECustomerKeyMD5`), the same pair a GET of the same object reports.
+            sse_customer_algorithm: object.encryption.sse_customer_algorithm.clone(),
+            sse_customer_key_md5: object.encryption.sse_customer_key_md5.clone(),
             // "If the object expiration is configured (see PutBucketLifecycleConfiguration
             // ), the response includes this header" (`HeadObjectOutput$Expiration`): the
             // bucket's lifecycle configuration applied to THIS version, matched against
@@ -718,11 +746,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// 501 that refuses it.
 fn unserved_feature(input: &HeadObjectInput) -> Option<&'static str> {
     [
-        (
-            input.sse_customer_algorithm.is_some(),
-            "SSECustomerAlgorithm",
-        ),
-        (input.sse_customer_key.is_some(), "SSECustomerKey"),
         // Nothing here charges a requester, so a request asking to be charged is refused
         // rather than answered as if it had been honoured.
         (input.request_payer.is_some(), "RequestPayer"),

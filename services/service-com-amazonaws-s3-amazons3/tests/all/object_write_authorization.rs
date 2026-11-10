@@ -63,13 +63,22 @@ const NO_SUCH_KEY: &str = "NoSuchKey";
 const NOT_THE_OWNER: &str = "111122223333";
 
 /// A policy document carrying `statements`, in the form a client sends one.
-fn policy_document(statements: &str) -> String {
+///
+/// `pub(crate)`, like the two below it: the suite that pins what a policy written over the
+/// CUSTOMER-KEY condition decides ([`super::object_customer_key_encryption`]) builds its
+/// documents through these rather than spelling a second JSON shape.
+pub(crate) fn policy_document(statements: &str) -> String {
     format!("{{\"Version\":\"2012-10-17\",\"Statement\":[{statements}]}}")
 }
 
 /// One statement reaching every principal: the effect, the action, the resource ARN, and the
 /// whole `Condition` clause when the row carries one.
-fn statement(effect: &str, action: &str, resource: &str, condition: Option<&str>) -> String {
+pub(crate) fn statement(
+    effect: &str,
+    action: &str,
+    resource: &str,
+    condition: Option<&str>,
+) -> String {
     let condition = condition
         .map(|clause| format!(",\"Condition\":{clause}"))
         .unwrap_or_default();
@@ -83,7 +92,7 @@ fn statement(effect: &str, action: &str, resource: &str, condition: Option<&str>
 /// with: the principal, the action and the resource ARN, and the reason clause IAM publishes
 /// for that decision. Written out here rather than built from the service's own helper, so
 /// the wording has something to be wrong about.
-fn explicit_deny_message(action: &str, resource: &str) -> String {
+pub(crate) fn explicit_deny_message(action: &str, resource: &str) -> String {
     format!(
         "User: {} is not authorized to perform: {action} on resource: \"{resource}\" with an \
          explicit deny in a resource-based policy",

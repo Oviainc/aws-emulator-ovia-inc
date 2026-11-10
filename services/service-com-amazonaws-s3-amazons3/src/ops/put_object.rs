@@ -426,12 +426,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
         // report, and answering 200 anyway would claim behaviour nothing performed, so
         // the request is refused rather than quietly stripped of its meaning:
         //
-        // * the SSE-C members carry a customer-provided KEY. S3 "doesn't store the
-        //   encryption key you provide", and every later read of the object has to carry
-        //   it again for S3 to decrypt — so serving them would mean either keeping a key
-        //   S3 does not keep, or answering reads of an object whose key was never checked.
-        //   `GetObject` refuses them for the same reason, so no object here is addressed
-        //   by one.
         // * the Object Lock EVENT hold members start a period running from an event nothing
         //   here raises, so no stored version can carry one.
         //
@@ -452,30 +446,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
         // back by this write and by every later read of it — see
         // `crate::state::ObjectEncryption`.
         //
+        // Nor are the SSE-C members: they carry a customer-provided KEY, and what the object
+        // records of it is the algorithm and the key's DIGEST — exactly what S3 itself keeps
+        // — which is what every later read of the object is matched against
+        // (`crate::state::sse_customer`).
+        //
         // The checksum members are NOT in this list either: the algorithm one of them names
         // is what this write computes the object's checksum WITH (see below), and a value
         // one of them carries is the client's own for the same bytes, which is neither
         // verified nor echoed.
-        for (member, present) in [
-            (
-                "x-amz-server-side-encryption-customer-algorithm",
-                input.sse_customer_algorithm.is_some(),
-            ),
-            (
-                "x-amz-server-side-encryption-customer-key",
-                input.sse_customer_key.is_some(),
-            ),
-            (
-                "x-amz-object-lock-event-hold",
-                input.object_lock_event_hold.is_some(),
-            ),
-        ] {
-            if present {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                    "PutObject with {member}"
-                )));
-            }
+        if input.object_lock_event_hold.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutObject with x-amz-object-lock-event-hold",
+            ));
         }
+
+        // The CUSTOMER-PROVIDED key this write asks the object to be encrypted under, read
+        // off the three members that carry it through the one rule every call of this service
+        // reads them by ([`crate::state::requested_customer_key`]): the algorithm S3 serves,
+        // a key of the length it takes, and the client's own digest of that key, which is the
+        // integrity check the third member exists for. Any of the three that does not hold is
+        // a value the request carried that S3 cannot use, refused before anything is stored.
+        let customer_key = crate::state::requested_customer_key(
+            input.sse_customer_algorithm.as_deref(),
+            input.sse_customer_key.as_deref(),
+            input.sse_customer_key_md5.as_deref(),
+            input.server_side_encryption.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::customer_key)?;
 
         // The Object Lock this write asks for the version it stores to be locked under, read
         // off the three members that carry it through the one rule every write in this
@@ -581,17 +579,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
 
         // The encryption configuration this write ASKED for, taken from the modelled
         // members the request carried: `ServerSideEncryption` and the three that qualify
-        // it. What is recorded is the CONFIGURATION, not a key and not a ciphertext — this
+        // it, or — for a write supplying its OWN key — that key's algorithm and digest.
+        // What is recorded is the CONFIGURATION, not a key and not a ciphertext — this
         // emulator holds the bytes in this process's memory and performs no cryptography —
         // and it is exactly what `PutObject`, `GetObject` and `HeadObject` report back as
         // `x-amz-server-side-encryption` and its companions. A request that names none of
-        // the four inherits the bucket's default configuration instead, resolved below once
+        // them inherits the bucket's default configuration instead, resolved below once
         // the store is reachable.
-        let requested = crate::state::ObjectEncryption {
-            sse_algorithm: input.server_side_encryption.clone(),
-            kms_key_id: input.ssekms_key_id.clone(),
-            kms_encryption_context: input.ssekms_encryption_context.clone(),
-            bucket_key_enabled: input.bucket_key_enabled,
+        //
+        // A customer-provided key and an S3-managed one are alternatives, which the reading
+        // above already refused; what is left here is which of the two this write records.
+        let requested = match &customer_key {
+            Some(key) => crate::state::customer_key_encryption(key),
+            None => crate::state::ObjectEncryption {
+                sse_algorithm: input.server_side_encryption.clone(),
+                kms_key_id: input.ssekms_key_id.clone(),
+                kms_encryption_context: input.ssekms_encryption_context.clone(),
+                bucket_key_enabled: input.bucket_key_enabled,
+                ..crate::state::ObjectEncryption::default()
+            },
         };
         // "This parameter is allowed if and only if SSEAlgorithm is set to aws:kms or
         // aws:kms:dsse" (`ApplyServerSideEncryptionByDefault$KMSMasterKeyID`), and the
@@ -728,6 +734,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
             storage_class: input.storage_class.as_deref(),
             server_side_encryption: input.server_side_encryption.as_deref(),
             kms_key_id: input.ssekms_key_id.as_deref(),
+            sse_customer_algorithm: input.sse_customer_algorithm.as_deref(),
             ..crate::service::authorization::ObjectWriteContext::default()
         };
         if let Some(message) = crate::service::request_authorization::denial(
@@ -770,7 +777,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::INVALID_REQUEST_CODE,
                 crate::state::INVALID_REQUEST_STATUS,
-                crate::state::OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE,
+                crate::state::OBJECT_LOCK_CONFIGURATION_MISSING_ON_WRITE_MESSAGE,
             ));
         }
 
@@ -1102,6 +1109,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
             ssekms_key_id: encryption.kms_key_id.clone(),
             ssekms_encryption_context: encryption.kms_encryption_context.clone(),
             bucket_key_enabled: encryption.bucket_key_enabled,
+            // And for a write that supplied its OWN key: the algorithm it named and the
+            // digest of that key — "the response headers … include the encryption algorithm
+            // and the MD5 digest of the encryption key" (`PutObject`'s own documentation of
+            // the SSE-C headers). The key itself is never answered back; it is not kept.
+            sse_customer_algorithm: encryption.sse_customer_algorithm.clone(),
+            sse_customer_key_md5: encryption.sse_customer_key_md5.clone(),
             // "If the expiration is configured for the object … the response includes this
             // header" (`PutObjectOutput$Expiration`), which is the bucket's own lifecycle
             // configuration applied to the object just stored — computed from it rather
@@ -1129,9 +1142,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
             // is.
             size: appended.then_some(stored_size),
             // Everything else this output can carry describes a feature no stored object
-            // here has, so none of it is reported rather than being invented: the SSE-C
-            // members are refused above, and `RequestCharged` reports a Requester Pays
-            // charge this emulator does not model.
+            // here has, so none of it is reported rather than being invented:
+            // `RequestCharged` reports a Requester Pays charge this emulator does not model.
             ..PutObjectOutput::default()
         };
 

@@ -299,6 +299,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // in full, so the object carries none afterwards.
             kms_encryption_context: None,
             bucket_key_enabled: requested.bucket_key_enabled,
+            // The configuration is replaced in full with the SSE-KMS one named above, so the
+            // object carries no customer-provided key afterwards either.
+            ..crate::state::ObjectEncryption::default()
         };
 
         match store.replace_object_encryption(&input.bucket, &input.key, version_id, updated) {

@@ -207,15 +207,12 @@ async fn a_read_asking_for_a_member_this_operation_cannot_answer_is_refused() {
 
     // Each bound header below names a feature no object here has: a 200 full-metadata read
     // could not report it. The two conditional headers that answer 304 are NOT here — they
-    // are served (see [`super::object_conditional_reads`]).
-    for (case, header, value) in [
-        (
-            "customer-provided encryption",
-            "x-amz-server-side-encryption-customer-algorithm",
-            "AES256",
-        ),
-        ("a requester-pays read", "x-amz-request-payer", "requester"),
-    ] {
+    // are served (see [`super::object_conditional_reads`]) — and neither are the SSE-C
+    // members, which carry the key an object stored under a customer-provided one is read
+    // with (see [`super::object_customer_key_encryption`]).
+    let rows: [(&str, &str, &str); 1] =
+        [("a requester-pays read", "x-amz-request-payer", "requester")];
+    for (case, header, value) in rows {
         let answer = head_object(&router, bucket, "held.txt", &[(header, value)]).await;
         assert_eq!(
             answer.status, 501,

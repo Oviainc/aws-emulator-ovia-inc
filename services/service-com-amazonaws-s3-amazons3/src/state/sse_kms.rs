@@ -387,6 +387,7 @@ mod tests {
                 kms_key_id: Some("alias/ledger".to_string()),
                 kms_encryption_context: supplied,
                 bucket_key_enabled,
+                ..super::super::ObjectEncryption::default()
             };
             let context = encryption_context(&EncryptedObject {
                 bucket: "ledger",

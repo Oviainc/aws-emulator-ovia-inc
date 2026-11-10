@@ -223,6 +223,8 @@ mod object_conditional_deletes;
 mod object_conditional_reads;
 #[path = "all/object_conditional_writes.rs"]
 mod object_conditional_writes;
+#[path = "all/object_customer_key_encryption.rs"]
+mod object_customer_key_encryption;
 #[path = "all/object_default_encryption.rs"]
 mod object_default_encryption;
 #[path = "all/object_encryption.rs"]
@@ -299,6 +301,8 @@ mod post_object_form_upload;
 mod presigned_object_reads;
 #[path = "all/presigned_query_authentication.rs"]
 mod presigned_query_authentication;
+#[path = "all/presigned_url_serving.rs"]
+mod presigned_url_serving;
 #[path = "all/published_refusal_wording.rs"]
 mod published_refusal_wording;
 #[path = "all/public_access_block_default.rs"]

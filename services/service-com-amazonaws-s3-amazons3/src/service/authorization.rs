@@ -68,6 +68,13 @@ const SERVER_SIDE_ENCRYPTION_KEY: &str = "s3:x-amz-server-side-encryption";
 /// answers (`s3:x-amz-server-side-encryption-aws-kms-key-id`, same published list).
 const KMS_KEY_ID_KEY: &str = "s3:x-amz-server-side-encryption-aws-kms-key-id";
 
+/// The condition key an object write's `x-amz-server-side-encryption-customer-algorithm`
+/// header answers (`s3:x-amz-server-side-encryption-customer-algorithm`, same published
+/// list) — the key a policy that requires, or refuses, a CUSTOMER-provided key is written
+/// over. The two other SSE-C headers answer no condition key of their own: the published
+/// list carries this one, which is what says the write supplied its own key.
+const SSE_CUSTOMER_ALGORITHM_KEY: &str = "s3:x-amz-server-side-encryption-customer-algorithm";
+
 /// The condition key a copy's `x-amz-copy-source` header answers (`s3:x-amz-copy-source`,
 /// same published list).
 const COPY_SOURCE_KEY: &str = "s3:x-amz-copy-source";
@@ -127,6 +134,7 @@ pub const PUBLISHED_CONDITION_KEYS: &[&str] = &[
     STORAGE_CLASS_KEY,
     SERVER_SIDE_ENCRYPTION_KEY,
     KMS_KEY_ID_KEY,
+    SSE_CUSTOMER_ALGORITHM_KEY,
     COPY_SOURCE_KEY,
     METADATA_DIRECTIVE_KEY,
     MAX_KEYS_KEY,
@@ -152,6 +160,7 @@ pub const CALLER_FREE_CONDITION_KEYS: &[&str] = &[
     STORAGE_CLASS_KEY,
     SERVER_SIDE_ENCRYPTION_KEY,
     KMS_KEY_ID_KEY,
+    SSE_CUSTOMER_ALGORITHM_KEY,
     COPY_SOURCE_KEY,
     METADATA_DIRECTIVE_KEY,
     MAX_KEYS_KEY,
@@ -269,6 +278,9 @@ pub struct ObjectWriteContext<'a> {
     pub server_side_encryption: Option<&'a str>,
     /// `x-amz-server-side-encryption-aws-kms-key-id` — the KMS key the write names.
     pub kms_key_id: Option<&'a str>,
+    /// `x-amz-server-side-encryption-customer-algorithm` — the algorithm a write supplying
+    /// its OWN key names.
+    pub sse_customer_algorithm: Option<&'a str>,
     /// `x-amz-copy-source` — the object a copy reads, for the write half of a copy.
     pub copy_source: Option<&'a str>,
     /// `x-amz-metadata-directive` — whether a copy keeps or replaces the source's metadata.
@@ -288,6 +300,7 @@ impl ObjectWriteContext<'_> {
             (STORAGE_CLASS_KEY, self.storage_class),
             (SERVER_SIDE_ENCRYPTION_KEY, self.server_side_encryption),
             (KMS_KEY_ID_KEY, self.kms_key_id),
+            (SSE_CUSTOMER_ALGORITHM_KEY, self.sse_customer_algorithm),
             (COPY_SOURCE_KEY, self.copy_source),
             (METADATA_DIRECTIVE_KEY, self.metadata_directive),
         ] {

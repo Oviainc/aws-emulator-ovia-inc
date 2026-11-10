@@ -646,6 +646,21 @@ pub const OBJECT_LOCK_ACCESS_DENIED_MESSAGE: &str =
 pub const OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE: &str =
     "Bucket is missing Object Lock Configuration";
 
+/// The `<Message>` S3 sends beside the 400 [`INVALID_REQUEST_CODE`] of an object WRITE that
+/// asks for an Object Lock — a mode, a retain-until date or a legal hold among its headers —
+/// into a bucket that has no Object Lock configuration: "Bucket is missing
+/// ObjectLockConfiguration", which names the configuration by the SHAPE the bucket would
+/// carry it in (`ObjectLockConfiguration`) rather than in prose.
+///
+/// The write path and the object-level lock SUBRESOURCE calls word the same cause
+/// differently, and each is answered in its own words: the subresource calls'
+/// ([`OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE`]) spells the configuration out, and a write
+/// that carries the lock among its own headers names the shape. Fixed text either way — it
+/// names neither the bucket nor the key — which is why both live here beside the other
+/// code/message pairs rather than being built in each handler that answers one.
+pub const OBJECT_LOCK_CONFIGURATION_MISSING_ON_WRITE_MESSAGE: &str =
+    "Bucket is missing ObjectLockConfiguration";
+
 /// The code a read of a BUCKET's Object Lock configuration answers with when the bucket
 /// carries none, with HTTP 404.
 ///

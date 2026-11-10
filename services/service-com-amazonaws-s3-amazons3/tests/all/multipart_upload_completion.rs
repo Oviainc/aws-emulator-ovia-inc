@@ -654,7 +654,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
             message: "Access Denied",
         },
         RefusalCase {
-            case: "a customer-provided encryption key, which no upload here is stored under",
+            case: "SSE-C members that do not name one usable key",
             bucket_override: None,
             key_override: None,
             upload_id_override: None,
@@ -663,8 +663,8 @@ fn refusal_cases() -> Vec<RefusalCase> {
                 "x-amz-server-side-encryption-customer-algorithm",
                 "AES256",
             )],
-            status: 501,
-            code: "NotImplemented",
+            status: 400,
+            code: "InvalidArgument",
             message: "",
         },
         RefusalCase {

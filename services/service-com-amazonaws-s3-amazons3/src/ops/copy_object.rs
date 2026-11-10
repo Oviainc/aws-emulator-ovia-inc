@@ -561,6 +561,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             kms_key_id: input.ssekms_key_id.clone(),
             kms_encryption_context: input.ssekms_encryption_context.clone(),
             bucket_key_enabled: input.bucket_key_enabled,
+            // A copy that supplies a CUSTOMER-provided key for either half is refused above,
+            // so no object this operation writes is stored under one.
+            ..crate::state::ObjectEncryption::default()
         };
         // "This parameter is allowed if and only if SSEAlgorithm is set to aws:kms or
         // aws:kms:dsse" (`ApplyServerSideEncryptionByDefault$KMSMasterKeyID`) — each of
@@ -672,7 +675,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::INVALID_REQUEST_CODE,
                 crate::state::INVALID_REQUEST_STATUS,
-                crate::state::OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE,
+                crate::state::OBJECT_LOCK_CONFIGURATION_MISSING_ON_WRITE_MESSAGE,
             ));
         }
 
@@ -687,6 +690,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             kms_key_id: input.ssekms_key_id.as_deref(),
             copy_source: Some(input.copy_source.as_str()),
             metadata_directive: input.metadata_directive.as_deref(),
+            // A copy supplying a customer-provided key is refused above, so this request
+            // carries no value for that key.
+            sse_customer_algorithm: None,
         };
         if let Some(message) = crate::service::request_authorization::denial(
             &caller,

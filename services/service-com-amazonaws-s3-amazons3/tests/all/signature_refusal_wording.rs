@@ -52,11 +52,14 @@ pub(crate) const WRONG_SIGNATURE: &str =
 /// One request as a row names it: the URI it addresses and the headers it carries.
 type Presented = (String, Vec<(String, String)>);
 
-/// An emulator with request authentication ON, plus the access key id it published for this
-/// run — the credential a refusal has RESOLVED.
+/// An emulator with request authentication ON, plus the KEY PAIR it published for this run —
+/// the credential a refusal has RESOLVED, and the one a presigned URL is really signed with.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
     pub(crate) access_key_id: String,
+    /// The secret half of that pair, for a suite that must produce a signature the emulator
+    /// VERIFIES rather than one it refuses ([`super::presigned_url_serving`]).
+    pub(crate) secret_access_key: String,
     /// The shared engine, so a suite can take a SESSION on a directory bucket and then
     /// present that credential — a second credential form the emulator ISSUED.
     engine: Arc<engine::InMemoryEngine>,
@@ -67,10 +70,12 @@ impl Emulator {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(true);
-        let access_key_id = match router.vended_credentials().into_iter().next() {
-            Some(emulator_server::VendedCredentials::AwsAccessKey { access_key_id, .. }) => {
-                access_key_id
-            }
+        let (access_key_id, secret_access_key) = match router.vended_credentials().into_iter().next()
+        {
+            Some(emulator_server::VendedCredentials::AwsAccessKey {
+                access_key_id,
+                secret_access_key,
+            }) => (access_key_id, secret_access_key),
             other => panic!(
                 "with authentication on the emulator must vend a SigV4 key pair, got {other:?}"
             ),
@@ -79,13 +84,14 @@ impl Emulator {
         Self {
             router,
             access_key_id,
+            secret_access_key,
             engine,
         }
     }
 
     /// Turn request authentication OFF, so a fixture can be created without signing it —
     /// which is not what this suite is about — and ON again for the request under test.
-    fn enforce_signatures(&mut self, enabled: bool) {
+    pub(crate) fn enforce_signatures(&mut self, enabled: bool) {
         self.router.set_request_authentication(enabled);
     }
 
@@ -102,10 +108,31 @@ impl Emulator {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Answer {
+        self.fetch(
+            REGIONAL_ENDPOINT_HOST,
+            method,
+            &format!("https://{REGIONAL_ENDPOINT_HOST}{uri}"),
+            headers,
+            body,
+        )
+        .await
+    }
+
+    /// Dispatch one request at the absolute `url`, carrying `host` as the host it was
+    /// addressed to — which is the host a signature covers, so a suite whose case is the
+    /// ADDRESS form drives its requests through here.
+    pub(crate) async fn fetch(
+        &self,
+        host: &str,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Answer {
         let mut builder = http::Request::builder()
             .method(method)
-            .uri(format!("https://s3.us-east-1.amazonaws.com{uri}"))
-            .header("host", "s3.us-east-1.amazonaws.com");
+            .uri(url)
+            .header("host", host);
         for (name, value) in headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
@@ -121,6 +148,10 @@ impl Emulator {
         }
     }
 }
+
+/// The endpoint every request this harness sends is addressed to unless the case names
+/// another: the Regional one, which carries no bucket, so the request is PATH-STYLE.
+pub(crate) const REGIONAL_ENDPOINT_HOST: &str = "s3.us-east-1.amazonaws.com";
 
 /// `YYYYMMDDTHHMMSSZ` for this instant, as SigV4 writes a signing date — rendered by the
 /// library's own calendar (`DateTime::fmt`, RFC 3339 in UTC) with the separators SigV4

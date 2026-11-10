@@ -287,6 +287,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 kms_key_id: input.ssekms_key_id.clone(),
                 kms_encryption_context: input.ssekms_encryption_context.clone(),
                 bucket_key_enabled: input.bucket_key_enabled,
+                // A session carries no CUSTOMER-provided key: `CreateSession` binds no SSE-C
+                // member at all (`smithy_query(query="operation",operation="CreateSession")`).
+                ..crate::state::ObjectEncryption::default()
             };
             if requested.names_no_member() {
                 bucket.default_object_encryption()

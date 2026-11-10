@@ -370,22 +370,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
         // upload it assembles is named by the bucket, the key and the upload id, and the
         // parts to assemble arrive as the `@httpPayload` member `MultipartUpload`.
         // What this emulator cannot carry out faithfully, refused rather than answered with
-        // an object that would claim it. The SSE-C members carry a customer-provided KEY
-        // that S3 itself does not store, so no upload here was initiated with one
-        // (`CreateMultipartUpload` and `UploadPart` refuse them identically), `RequestPayer`
-        // asks to be charged for the request, which nothing here does, and `If-None-Match`
-        // "expects the '*' (asterisk) character"
+        // an object that would claim it: `RequestPayer` asks to be charged for the request,
+        // which nothing here does, and `If-None-Match` "expects the '*' (asterisk) character"
         // (`CompleteMultipartUploadRequest$IfNoneMatch`) — any other value asks for a
         // conditional S3 itself answers `NotImplemented`.
         //
         // The checksum members are NOT in this list: each carries the client's own value for
         // bytes this emulator holds, judged against the checksum this completion computes
-        // itself (see below) rather than echoed back.
+        // itself (see below) rather than echoed back. Nor are the SSE-C members: a completion
+        // of an upload initiated under a customer-provided key presents that same key, which
+        // is matched against the digest the initiation recorded (see below).
         if let Some(unserved) = unserved_feature(&input) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "CompleteMultipartUpload with {unserved}"
             )));
         }
+
+        // The CUSTOMER-PROVIDED key this completion presents, read through the one rule every
+        // call of this service reads the three members by
+        // ([`crate::state::requested_customer_key`]); whether it is the upload's own is judged
+        // below, once the upload has been read.
+        let presented_key = crate::state::requested_customer_key(
+            input.sse_customer_algorithm.as_deref(),
+            input.sse_customer_key.as_deref(),
+            input.sse_customer_key_md5.as_deref(),
+            None,
+        )
+        .map_err(crate::scaffolded::Scaffolded::customer_key)?;
 
         // "If the account ID that you provide does not match the actual owner of the
         // bucket, the request fails with the HTTP status code 403 Forbidden (access
@@ -472,6 +483,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
         else {
             return Err(CompleteMultipartUploadErrorModeled::NoSuchUpload(NoSuchUpload {}).into());
         };
+
+        // The key half: a completion of an upload initiated under a customer-provided key
+        // must present that key, and one of an upload initiated without a key must present
+        // none — the same comparison, against the same recorded digest, that a part write and
+        // a READ of the finished object are decided by
+        // ([`crate::state::sse_customer::read_refusal`]). Judged before anything is stored,
+        // so a completion under the wrong key assembles no object and takes no upload away.
+        if let Some(refusal) =
+            crate::state::sse_customer::read_refusal(&upload.encryption, presented_key.as_ref())
+        {
+            return Err(crate::scaffolded::Scaffolded::customer_key_read(refusal));
+        }
 
         // "For each part in the list, you must provide the PartNumber value and the ETag
         // value that are returned after that part was uploaded" (this operation's own
@@ -842,11 +865,6 @@ const ENTITY_TOO_SMALL_MESSAGE: &str = "Your proposed upload is smaller than the
 /// 501 that refuses it, the way `UploadPart` and `AbortMultipartUpload` name their own.
 fn unserved_feature(input: &CompleteMultipartUploadInput) -> Option<&'static str> {
     [
-        (
-            input.sse_customer_algorithm.is_some(),
-            "SSECustomerAlgorithm",
-        ),
-        (input.sse_customer_key.is_some(), "SSECustomerKey"),
         (input.request_payer.is_some(), "RequestPayer"),
         (
             // "Expects the '*' (asterisk) character"

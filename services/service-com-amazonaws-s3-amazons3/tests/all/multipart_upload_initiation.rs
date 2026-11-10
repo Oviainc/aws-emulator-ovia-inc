@@ -23,9 +23,10 @@
 //!    bucket that is not there is `NoSuchBucket`, and an upload id the store never minted
 //!    — or one named under another key — is `NoSuchUpload`.
 //! 5. A request asking for something this emulator does not serve is refused rather than
-//!    answered: a customer-provided encryption key with 501, a KMS-only member beside no
-//!    KMS algorithm with 400 `InvalidArgument`, a tag set past an object's published limit
-//!    with 400, and `x-amz-expected-bucket-owner` naming another account with 403.
+//!    answered: SSE-C members that name no usable key with 400 `InvalidArgument`, a KMS-only
+//!    member beside no KMS algorithm with 400 `InvalidArgument`, a tag set past an object's
+//!    published limit with 400, and `x-amz-expected-bucket-owner` naming another account
+//!    with 403.
 
 use std::sync::Arc;
 
@@ -622,15 +623,15 @@ async fn an_address_or_a_feature_this_emulator_does_not_hold_is_refused() {
             code: "AccessDenied",
         },
         RefusalCase {
-            case: "an initiation with a customer-provided encryption key",
+            case: "an initiation whose SSE-C members name no usable key",
             method: "POST",
             uri: format!("/{bucket}/{key}?uploads"),
             headers: vec![(
                 "x-amz-server-side-encryption-customer-algorithm",
                 "AES256".to_string(),
             )],
-            status: 501,
-            code: "NotImplemented",
+            status: 400,
+            code: "InvalidArgument",
         },
         RefusalCase {
             case: "an initiation asking to be charged for the request",

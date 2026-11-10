@@ -330,22 +330,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // What this emulator cannot carry out faithfully, refused rather than answered
-        // with an entity tag that would claim it. The SSE-C members carry a
-        // customer-provided KEY that S3 itself does not store and that every later read of
-        // the object would have to carry again, so no upload here is addressed by one
-        // (`CreateMultipartUpload` refuses an initiation that names one for the same
-        // reason), and `RequestPayer` asks to be charged for the request, which nothing
-        // here does — `ListParts` refuses both identically.
+        // with an entity tag that would claim it: `RequestPayer` asks to be charged for the
+        // request, which nothing here does — `ListParts` refuses it identically.
         //
         // The checksum members are NOT in this list: the algorithm one of them names is
         // what this write computes the PART's own digest under (see below), and a value
         // that does not describe the bytes is refused rather than rejected as unserved —
-        // exactly as `PutObject` treats its own.
+        // exactly as `PutObject` treats its own. Nor are the SSE-C members: a part of an
+        // upload initiated under a customer-provided key carries that same key, which is
+        // matched against the digest the initiation recorded (see below).
         if let Some(unserved) = unserved_feature(&input) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "UploadPart with {unserved}"
             )));
         }
+
+        // The CUSTOMER-PROVIDED key this part presents, read through the one rule every call
+        // of this service reads the three members by ([`crate::state::requested_customer_key`]).
+        // "The key must be appropriate for use with the algorithm specified in the
+        // x-amz-server-side-encryption-customer-algorithm header. This must be the same
+        // encryption key specified in the initiate multipart upload request"
+        // (`UploadPartRequest$SSECustomerKey`) — so the key itself is judged here and the
+        // SAME-key half below, once the upload it belongs to has been read.
+        let presented_key = crate::state::requested_customer_key(
+            input.sse_customer_algorithm.as_deref(),
+            input.sse_customer_key.as_deref(),
+            input.sse_customer_key_md5.as_deref(),
+            None,
+        )
+        .map_err(crate::scaffolded::Scaffolded::customer_key)?;
 
         // "If the account ID that you provide does not match the actual owner of the
         // bucket, the request fails with the HTTP status code 403 Forbidden (access
@@ -428,14 +441,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // initiation asked S3 to create the object's checksum with. Read under the lock and
         // nothing else: the digest below is computed with the lock RELEASED, so hashing a
         // part does not hold every other request on this store behind it.
-        let (encryption, initiated_algorithm) = {
+        let recorded_upload = {
             let store = state.lock();
             store
                 .bucket(&input.bucket)
                 .and_then(|bucket| bucket.multipart_upload(&input.upload_id))
                 .map(|upload| (upload.encryption.clone(), upload.checksum_algorithm.clone()))
-                .unwrap_or_default()
         };
+        // And the SAME-key half: a part of an upload initiated under a customer-provided key
+        // must present that key, and a part of an upload initiated without one must present
+        // none — the same comparison, against the same recorded digest, that a READ of the
+        // finished object is decided by ([`crate::state::sse_customer::read_refusal`]), so
+        // one rule answers both. Judged before the part is recorded, so a part under the
+        // wrong key leaves the slot its number addresses exactly as it was. An upload this
+        // bucket does not hold is answered by the record below, which reports that instead.
+        if let Some((recorded, _)) = &recorded_upload {
+            if let Some(refusal) =
+                crate::state::sse_customer::read_refusal(recorded, presented_key.as_ref())
+            {
+                return Err(crate::scaffolded::Scaffolded::customer_key_read(refusal));
+            }
+        }
+        let (encryption, initiated_algorithm) = recorded_upload.unwrap_or_default();
         // The algorithm this part's digest is computed under: the one an individual
         // `Checksum*` member named — "if you provide an individual checksum, Amazon S3
         // ignores any provided ChecksumAlgorithm parameter"
@@ -524,6 +551,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             server_side_encryption: encryption.sse_algorithm.clone(),
             ssekms_key_id: encryption.kms_key_id.clone(),
             bucket_key_enabled: encryption.bucket_key_enabled,
+            // And, for an upload initiated under a CUSTOMER-provided key: the algorithm and
+            // the digest of that key, "to confirm the encryption algorithm that's used" and
+            // "to provide the round-trip message integrity verification of the
+            // customer-provided encryption key" (`UploadPartOutput$SSECustomerAlgorithm` and
+            // `$SSECustomerKeyMD5`).
+            sse_customer_algorithm: encryption.sse_customer_algorithm.clone(),
+            sse_customer_key_md5: encryption.sse_customer_key_md5.clone(),
             // The digest of this part's own bytes, under the member its algorithm names —
             // mapped by the one place that mapping lives
             // ([`crate::state::reported_checksums`]), so the value a part write answers,
@@ -542,8 +576,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             checksum_xxhash3: reported.xxhash3,
             checksum_xxhash128: reported.xxhash128,
             // Everything else this output can carry describes something no recorded part
-            // has: the SSE-C members are refused above, and `RequestCharged` reports a
-            // Requester Pays charge nothing here makes.
+            // has: `RequestCharged` reports a Requester Pays charge nothing here makes.
             ..UploadPartOutput::default()
         })
     }
@@ -570,14 +603,7 @@ fn declared_checksums(input: &UploadPartInput) -> crate::state::DeclaredChecksum
 /// The feature `input` asks for that this emulator does not serve, if any — named for the
 /// 501 that refuses it, the way `ListParts` names its own.
 fn unserved_feature(input: &UploadPartInput) -> Option<&'static str> {
-    [
-        (
-            input.sse_customer_algorithm.is_some(),
-            "SSECustomerAlgorithm",
-        ),
-        (input.sse_customer_key.is_some(), "SSECustomerKey"),
-        (input.request_payer.is_some(), "RequestPayer"),
-    ]
-    .into_iter()
-    .find_map(|(asked, name)| asked.then_some(name))
+    [(input.request_payer.is_some(), "RequestPayer")]
+        .into_iter()
+        .find_map(|(asked, name)| asked.then_some(name))
 }

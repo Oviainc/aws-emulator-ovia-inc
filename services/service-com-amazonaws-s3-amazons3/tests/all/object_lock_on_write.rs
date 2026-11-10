@@ -37,7 +37,7 @@ use aws_smithy_types::DateTime;
 use service_com_amazonaws_s3_amazons3::state::{
     ACCESS_DENIED_CODE, COMPLIANCE_RETENTION_MODE, GOVERNANCE_RETENTION_MODE,
     INVALID_REQUEST_CODE, LEGAL_HOLD_OFF_STATUS, LEGAL_HOLD_ON_STATUS,
-    OBJECT_LOCK_ACCESS_DENIED_MESSAGE, OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE,
+    OBJECT_LOCK_ACCESS_DENIED_MESSAGE, OBJECT_LOCK_CONFIGURATION_MISSING_ON_WRITE_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -445,13 +445,13 @@ async fn a_lock_the_service_cannot_record_is_refused_and_nothing_is_written() {
                 ("x-amz-object-lock-mode", COMPLIANCE_RETENTION_MODE),
                 ("x-amz-object-lock-retain-until-date", until.as_str()),
             ],
-            OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE,
+            OBJECT_LOCK_CONFIGURATION_MISSING_ON_WRITE_MESSAGE,
         ),
         (
             "a legal hold on a bucket with no Object Lock configuration",
             unlocked,
             vec![("x-amz-object-lock-legal-hold", LEGAL_HOLD_ON_STATUS)],
-            OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE,
+            OBJECT_LOCK_CONFIGURATION_MISSING_ON_WRITE_MESSAGE,
         ),
     ];
 

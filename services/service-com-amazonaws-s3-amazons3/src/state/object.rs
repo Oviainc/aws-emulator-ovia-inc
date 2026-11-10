@@ -235,8 +235,10 @@ impl Annotation {
 /// ciphertext: this emulator holds an object's bytes in this process's memory and
 /// performs no cryptography, so the only thing it can answer faithfully is which
 /// configuration the object was stored under — which is exactly what those response
-/// members report. The SSE-C members (a customer-provided KEY, which S3 itself never
-/// stores) are NOT here: `PutObject` refuses a write that carries them.
+/// members report. For SSE-C that configuration is the algorithm and the DIGEST of the
+/// customer-provided key, which is what S3 itself keeps: "Amazon S3 does not store the
+/// encryption key you provide" (`PutObject`'s own documentation of the SSE-C headers), and
+/// the digest is what every later read of the object is matched against.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObjectEncryption {
     /// A `ServerSideEncryption` value (`AES256`, `aws:kms`, …), or `None` for an object
@@ -253,6 +255,14 @@ pub struct ObjectEncryption {
     pub kms_encryption_context: Option<String>,
     /// `BucketKeyEnabled`: whether the object uses an S3 Bucket Key for SSE-KMS.
     pub bucket_key_enabled: Option<bool>,
+    /// `SSECustomerAlgorithm` — the algorithm a write encrypted the object under with a
+    /// CUSTOMER-provided key ([`SSE_CUSTOMER_ALGORITHM`]), and `None` for an object stored
+    /// under any other kind of encryption.
+    pub sse_customer_algorithm: Option<String>,
+    /// `SSECustomerKeyMD5` — the digest of that key, which is the only thing about it S3
+    /// keeps and what a later read's own key is matched against
+    /// ([`sse_customer::read_refusal`]).
+    pub sse_customer_key_md5: Option<String>,
 }
 
 impl ObjectEncryption {
@@ -301,6 +311,8 @@ impl ObjectEncryption {
             &self.sse_algorithm,
             &self.kms_key_id,
             &self.kms_encryption_context,
+            &self.sse_customer_algorithm,
+            &self.sse_customer_key_md5,
         ]
         .iter()
         .filter_map(|member| member.as_ref())

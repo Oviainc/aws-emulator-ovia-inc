@@ -27,9 +27,9 @@
 //!    number outside the published 1..=10,000 range with 400 `InvalidArgument`, a
 //!    `Content-MD5` that is not the digest of the bytes with 400 `BadDigest`, an upload id
 //!    the store never minted — or one named under another key — with 404 `NoSuchUpload`, a
-//!    bucket this emulator does not hold with 404 `NoSuchBucket`, a customer-provided
-//!    encryption key with 501, and `x-amz-expected-bucket-owner` naming another account
-//!    with 403.
+//!    bucket this emulator does not hold with 404 `NoSuchBucket`, SSE-C members that do not
+//!    name one usable key with 400 `InvalidArgument`, and `x-amz-expected-bucket-owner`
+//!    naming another account with 403.
 
 use std::sync::Arc;
 
@@ -797,14 +797,18 @@ async fn a_part_upload_this_emulator_cannot_serve_as_asked_is_refused() {
             ..RefusalCase::against("multipart-part-absent-bucket", key)
         },
         RefusalCase {
-            case: "a customer-provided encryption key",
+            // A part presenting SSE-C members that do not name one usable key is refused for
+            // the member that does not hold — here the algorithm with no key beside it —
+            // before the part is recorded (see
+            // [`super::object_customer_key_encryption`] for the whole rule).
+            case: "a customer-provided encryption key with no key beside it",
             upload_id: upload_id.clone(),
             headers: vec![(
                 "x-amz-server-side-encryption-customer-algorithm",
                 "AES256",
             )],
-            status: 501,
-            code: "NotImplemented",
+            status: 400,
+            code: "InvalidArgument",
             ..RefusalCase::against(bucket, key)
         },
         RefusalCase {

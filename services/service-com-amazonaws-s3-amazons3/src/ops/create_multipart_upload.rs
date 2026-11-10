@@ -345,19 +345,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with an upload id that would claim it. Each member decides something about the
         // object the upload completes into that nothing here performs:
         //
-        // * the SSE-C members carry a customer-provided KEY. S3 "doesn't store the
-        //   encryption key you provide", and every later part upload and read has to
-        //   carry it again — so serving them would mean keeping a key S3 does not keep,
-        //   or serving parts whose key was never checked. `PutObject` and `GetObject`
-        //   refuse them for the same reason, so no object here is addressed by one.
-        // * the Object Lock members decide whether a later delete is allowed; no
-        //   retention or hold is emulated.
+        // * the Object Lock EVENT hold members start a period running from an event nothing
+        //   here raises, so no completed version can carry one.
         // * `RequestPayer` asks to be charged for the request; nothing here charges a
         //   requester, so `RequestCharged` is never reported either.
         //
         // The SSE / SSE-KMS members are NOT in this list: they name the encryption
         // CONFIGURATION the upload is initiated under, which is recorded with it below
-        // and reported back by this response and by `ListParts`. Neither is
+        // and reported back by this response and by `ListParts`. Nor are the SSE-C members:
+        // they carry a customer-provided KEY, of which the upload records the algorithm and
+        // the key's DIGEST — exactly what S3 itself keeps — which every later part of this
+        // upload is matched against (`crate::state::sse_customer`). Neither is
         // `x-amz-tagging`, whose tag set is stored on the upload, nor the checksum
         // members, which name the algorithm the upload is configured for and are recorded
         // and reported as exactly that — a configuration, never a checksum value this
@@ -410,14 +408,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The CUSTOMER-PROVIDED key this upload asks its parts to be encrypted under, read
+        // off the three members that carry it through the one rule every call of this
+        // service reads them by ([`crate::state::requested_customer_key`]) — exactly as
+        // `PutObject` reads its own. Every later part of this upload has to present the
+        // same key, which is matched against the digest recorded here.
+        let customer_key = crate::state::requested_customer_key(
+            input.sse_customer_algorithm.as_deref(),
+            input.sse_customer_key.as_deref(),
+            input.sse_customer_key_md5.as_deref(),
+            input.server_side_encryption.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::customer_key)?;
+
         // The encryption configuration this upload ASKED for, taken from the modelled
         // members the request carried — the CONFIGURATION, not a key and not a ciphertext,
-        // the same record `PutObject` keeps on a stored object.
-        let requested = crate::state::ObjectEncryption {
-            sse_algorithm: input.server_side_encryption.clone(),
-            kms_key_id: input.ssekms_key_id.clone(),
-            kms_encryption_context: input.ssekms_encryption_context.clone(),
-            bucket_key_enabled: input.bucket_key_enabled,
+        // the same record `PutObject` keeps on a stored object (for a customer-provided key:
+        // the algorithm and that key's digest, which is what S3 itself keeps of one).
+        let requested = match &customer_key {
+            Some(key) => crate::state::customer_key_encryption(key),
+            None => crate::state::ObjectEncryption {
+                sse_algorithm: input.server_side_encryption.clone(),
+                kms_key_id: input.ssekms_key_id.clone(),
+                kms_encryption_context: input.ssekms_encryption_context.clone(),
+                bucket_key_enabled: input.bucket_key_enabled,
+                ..crate::state::ObjectEncryption::default()
+            },
         };
         // "This parameter is allowed if and only if SSEAlgorithm is set to aws:kms or
         // aws:kms:dsse" (`ApplyServerSideEncryptionByDefault$KMSMasterKeyID`): each of the
@@ -580,6 +596,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // WHO is asking, judged before the upload is recorded. "You must be allowed to
+        // perform the `s3:PutObject` action on an object to initiate a multipart upload"
+        // (`CreateMultipartUpload`'s own documentation of the permissions it needs), so an
+        // initiation is authorized exactly as a one-shot write of the same object is: against
+        // the documents in force on the principal that signed it and against the bucket's own
+        // policy, which is a resource-based policy and so in force on this call too
+        // ([`crate::service::request_authorization`] carries IAM's order). The context is
+        // THIS request's own write members — the encryption it asks for included, a
+        // customer-provided key among them — which is what makes a policy written over the
+        // encryption of a write mandatory for the multipart form of that write as well.
+        //
+        // WHO is resolved while no guard of this service is held, for the reason `PutObject`
+        // resolves its caller before locking: it reaches the STS and IAM stores through the
+        // shared engine.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
+        let write_context = crate::service::authorization::ObjectWriteContext {
+            acl: input.acl.as_deref(),
+            storage_class: input.storage_class.as_deref(),
+            server_side_encryption: input.server_side_encryption.as_deref(),
+            kms_key_id: input.ssekms_key_id.as_deref(),
+            sse_customer_algorithm: input.sse_customer_algorithm.as_deref(),
+            ..crate::service::authorization::ObjectWriteContext::default()
+        };
+        // The bucket's own policy, copied out under a guard taken and released here: the
+        // decision itself reads no state of this service, and a bucket this emulator does not
+        // hold is answered by the initiation below rather than by this gate.
+        let bucket_policy = {
+            let store = state.lock();
+            store
+                .bucket(&input.bucket)
+                .and_then(|bucket| bucket.policy.clone())
+        };
+        if let Some(message) = crate::service::request_authorization::denial(
+            &caller,
+            bucket_policy.as_deref(),
+            PUT_OBJECT_ACTION,
+            &crate::state::object_arn(&input.bucket, &input.key),
+            &write_context.conditions(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
+
         // The KEY the upload's SSE-KMS encryption names has to be one KMS can mint a data key
         // under, judged exactly as a one-shot write judges its own and through the same seam
         // ([`crate::state::sse_kms::missing_key_refusal`]): the initiation settles the
@@ -669,7 +731,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::INVALID_REQUEST_CODE,
                     crate::state::INVALID_REQUEST_STATUS,
-                    crate::state::OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE,
+                    crate::state::OBJECT_LOCK_CONFIGURATION_MISSING_ON_WRITE_MESSAGE,
                 ));
             }
             store.create_multipart_upload(&input.bucket, upload)
@@ -759,6 +821,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ssekms_key_id: encryption.kms_key_id.clone(),
             ssekms_encryption_context: encryption.kms_encryption_context.clone(),
             bucket_key_enabled: encryption.bucket_key_enabled,
+            // And, for an initiation that supplied its OWN key: the algorithm it named and
+            // the digest of that key, which is what every later part of this upload has to
+            // present. The key itself is never answered back; it is not kept.
+            sse_customer_algorithm: encryption.sse_customer_algorithm.clone(),
+            sse_customer_key_md5: encryption.sse_customer_key_md5.clone(),
             // "The algorithm that was used to create a checksum of the object" and "the
             // checksum type that you want Amazon S3 to use to calculate the object's
             // checksum value" (`CreateMultipartUploadOutput$ChecksumType`): the
@@ -780,8 +847,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|abort| ::aws_smithy_types::DateTime::from(abort.aborts_at)),
             abort_rule_id: abort.map(|abort| abort.rule_id),
             // Everything else this output can carry describes something no upload here
-            // has: the SSE-C members are refused above, and `RequestCharged` reports a
-            // Requester Pays charge nothing here makes.
+            // has: `RequestCharged` reports a Requester Pays charge nothing here makes.
             ..CreateMultipartUploadOutput::default()
         })
     }
@@ -792,11 +858,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn unserved_feature(input: &CreateMultipartUploadInput) -> Option<&'static str> {
     [
         (
-            input.sse_customer_algorithm.is_some(),
-            "SSECustomerAlgorithm",
-        ),
-        (input.sse_customer_key.is_some(), "SSECustomerKey"),
-        (
             input.object_lock_event_hold.is_some(),
             "ObjectLockEventHold",
         ),
@@ -805,3 +866,9 @@ fn unserved_feature(input: &CreateMultipartUploadInput) -> Option<&'static str> 
     .into_iter()
     .find_map(|(asked, name)| asked.then_some(name))
 }
+
+/// The IAM action an initiation is authorized under — "you must be allowed to perform the
+/// `s3:PutObject` action on an object to initiate a multipart upload"
+/// (`CreateMultipartUpload`'s own documentation), which is also the action a refusal of this
+/// call names.
+const PUT_OBJECT_ACTION: &str = "s3:PutObject";

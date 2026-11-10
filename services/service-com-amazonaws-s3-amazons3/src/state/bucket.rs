@@ -1848,6 +1848,10 @@ impl Bucket {
             kms_key_id: rule.kms_master_key_id,
             kms_encryption_context: None,
             bucket_key_enabled: rule.bucket_key_enabled,
+            // A bucket default never names a CUSTOMER-provided key: SSE-C is a per-request
+            // key the caller supplies and S3 does not keep, so no configuration can carry
+            // one to inherit.
+            ..ObjectEncryption::default()
         };
         if inherited.uses_kms() {
             inherited

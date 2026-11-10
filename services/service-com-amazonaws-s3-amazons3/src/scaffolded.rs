@@ -1658,6 +1658,23 @@ impl<E> Scaffolded<E> {
         .naming(ErrorDetail::Arguments(arguments))
     }
 
+    /// The refusal every call that may supply a CUSTOMER-PROVIDED encryption key answers one
+    /// of the three SSE-C members it cannot use with: the code, the status and the sentence
+    /// that rejection publishes ([`crate::state::CustomerKeyRejection`]).
+    ///
+    /// One place, so a write and a read refuse the same unusable key alike, and nothing about
+    /// the key the request carried travels in the answer.
+    pub fn customer_key(rejection: crate::state::CustomerKeyRejection) -> Self {
+        Self::unmodeled(rejection.code(), rejection.status(), rejection.message())
+    }
+
+    /// The refusal a READ of an object stored under a customer-provided key answers a request
+    /// that does not present the key it was stored with
+    /// ([`crate::state::sse_customer::read_refusal`] decides which it is).
+    pub fn customer_key_read(refusal: crate::state::sse_customer::ReadRefusal) -> Self {
+        Self::unmodeled(refusal.code, refusal.status, refusal.message)
+    }
+
     /// The refusal every operation that takes a `versionId` answers one that is not shaped
     /// like a version id with ([`crate::state::version_id_is_well_formed`] decides it): the
     /// `InvalidArgument` above, naming the `versionId` parameter and echoing the token it

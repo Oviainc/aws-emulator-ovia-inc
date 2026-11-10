@@ -4759,6 +4759,9 @@ mod renames;
 mod sessions;
 // The bucket map itself, and the operations the store performs on it.
 mod store;
+// The customer-provided key an SSE-C write supplies, and what a read of such an object must
+// present.
+pub mod sse_customer;
 // Who named the tag keys one request carries, which is what decides whether a key in the
 // namespace AWS keeps for its own tags may be stored.
 mod tag_key_origin;
@@ -4772,6 +4775,10 @@ pub use object::*;
 pub use refusals::*;
 pub use renames::*;
 pub use sessions::*;
+pub use sse_customer::{
+    customer_key_encryption, read_refusal, requested_customer_key, CustomerKey,
+    CustomerKeyRejection, SSE_CUSTOMER_ALGORITHM,
+};
 pub use store::*;
 pub use tag_key_origin::*;
 pub use uploads::*;

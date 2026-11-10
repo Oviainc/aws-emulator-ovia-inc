@@ -24,7 +24,11 @@
 //!    URL outside the range is refused the same way whether or not its signature would
 //!    verify.
 //! 2. The window is inside that range but has PASSED. The signature is intact and the
-//!    request is refused for the EXPIRY, which S3 states as such.
+//!    request is refused for the EXPIRY, which S3 states as such — and the document names
+//!    the window it was refused on: the seconds the request itself asked for, the instant
+//!    they ran to, and this service's clock when it refused, which is what lets a caller
+//!    tell an expired URL from any other refusal and see whether its clock or its
+//!    `ExpiresIn` is what to correct.
 //! 3. The instant the request says it was signed at is outside the window S3 accepts around
 //!    its own clock ([`MAX_REQUEST_SKEW`]). A signature is only as good as the moment it
 //!    covers, so a request stamped too far from now is refused for its TIME, whatever its
@@ -156,7 +160,8 @@ const MAX_REQUEST_SKEW: Duration = Duration::from_secs(15 * 60);
 /// signature is intact and the caller resolved, so what refused it is the window.
 const REQUEST_EXPIRED_CODE: &str = "AccessDenied";
 
-/// How AWS words that one. Fixed text: it names neither the window nor the instant.
+/// How AWS words that one. Fixed text: the window and the instants it was refused on travel
+/// beside it as the elements S3's own document holds them in ([`Expiry`]).
 const REQUEST_EXPIRED_MESSAGE: &str = "Request has expired";
 
 /// The longest validity SigV4 query-string authentication accepts: seven days ("the maximum
@@ -344,18 +349,29 @@ impl Presented {
         }
     }
 
-    /// Whether this is a presigned request whose validity window has already PASSED — its
-    /// signing instant plus the seconds it asked for are behind the clock. A request that is
-    /// not presigned, or that asked for a window outside the accepted range (answered ahead
-    /// of this one), or whose window cannot be read, is not an expired one.
-    fn window_passed(&self) -> bool {
-        let stated = self.stated_expires.as_deref().unwrap_or_default().trim();
+    /// The window of a presigned request whose validity has already PASSED at `now` — its
+    /// signing instant plus the seconds it asked for are behind the clock — or `None` for
+    /// one still open. A request that is not presigned, or that asked for a window outside
+    /// the accepted range (answered ahead of this one), or whose window cannot be read, is
+    /// not an expired one.
+    fn window_passed(&self, now: SystemTime) -> Option<Expiry> {
+        let stated = self.stated_expires.as_deref()?.trim();
         let (Some(signed_at), Ok(expires_secs)) = (self.signed_at, stated.parse::<u64>()) else {
-            return false;
+            return None;
         };
-        signed_at
-            .checked_add(Duration::from_secs(expires_secs))
-            .is_none_or(|valid_until| valid_until < SystemTime::now())
+        let valid_until = signed_at.checked_add(Duration::from_secs(expires_secs));
+        if valid_until.is_some_and(|valid_until| valid_until >= now) {
+            return None;
+        }
+        Some(Expiry {
+            stated_expires: stated.to_string(),
+            expires: valid_until
+                .map(|valid_until| {
+                    rendered(valid_until, ::aws_smithy_types::date_time::Format::DateTime)
+                })
+                .unwrap_or_default(),
+            server_time: rendered(now, ::aws_smithy_types::date_time::Format::DateTime),
+        })
     }
 
     /// How far outside the accepted window around `now` this request's signing instant is, or
@@ -405,10 +421,37 @@ impl Skew {
     }
 }
 
+/// The window S3's EXPIRY refusal states — what a caller cannot see from the code and the
+/// sentence alone: which validity window closed, and when.
+///
+/// Every value comes from the request as received or from this service's own clock; nothing
+/// here is stored or recorded.
+struct Expiry {
+    /// `<X-Amz-Expires>` — the count of seconds the request itself asked for, as its own
+    /// parameter carried it.
+    stated_expires: String,
+    /// `<Expires>` — the instant that window ran to: the signing instant plus those seconds,
+    /// in ISO 8601.
+    ///
+    /// Empty for a sum this calendar cannot hold, which is the one case the instant cannot be
+    /// stated: such a request is refused for its window all the same (the layer that verifies
+    /// the signature reads an unrepresentable validity the same way), and the element is left
+    /// empty rather than filled with an instant nothing computed.
+    expires: String,
+    /// `<ServerTime>` — this service's clock when it refused the request, in ISO 8601, which
+    /// is at or after `<Expires>`: that is what the refusal consists of.
+    server_time: String,
+}
+
 /// `instant` in `format`, or the empty string for an instant no calendar can render — which
 /// leaves the element empty rather than failing the refusal that carries it.
+///
+/// Rendered to the SECOND: every instant an S3 error document states is a whole second
+/// (`2026-01-01T00:00:00Z`), and a clock reading carries a fraction no element of one spells,
+/// so the sub-second part is dropped before the calendar renders it.
 fn rendered(instant: SystemTime, format: ::aws_smithy_types::date_time::Format) -> String {
-    ::aws_smithy_types::DateTime::from(instant)
+    let instant = ::aws_smithy_types::DateTime::from(instant);
+    ::aws_smithy_types::DateTime::from_secs(instant.secs())
         .fmt(format)
         .unwrap_or_default()
 }
@@ -711,6 +754,7 @@ pub(super) fn refusal_for(
     issued: &dyn Fn(&str) -> bool,
     anonymous_message: &dyn Fn(Option<&str>) -> &'static str,
 ) -> Option<AuthRefusal> {
+    let now = SystemTime::now();
     if let Some(message) = presented
         .stated_expires
         .as_deref()
@@ -722,27 +766,30 @@ pub(super) fn refusal_for(
             message,
             diagnostics: None,
             skew: None,
+            expiry: None,
         });
     }
-    if presented.window_passed() {
+    if let Some(expiry) = presented.window_passed(now) {
         return Some(AuthRefusal {
             code: REQUEST_EXPIRED_CODE,
             status: UNAUTHENTICATED_STATUS,
             message: REQUEST_EXPIRED_MESSAGE,
             diagnostics: None,
             skew: None,
+            expiry: Some(expiry),
         });
     }
     // The signing INSTANT, before anything about the signature: a stamp too far from this
     // clock is refused for its time whatever the signature computes to, which is what lets a
     // caller tell a drifted clock from a wrong secret.
-    if let Some(skew) = presented.skew_outside_window(SystemTime::now()) {
+    if let Some(skew) = presented.skew_outside_window(now) {
         return Some(AuthRefusal {
             code: CLOCK_SKEW_CODE,
             status: UNAUTHENTICATED_STATUS,
             message: CLOCK_SKEW_MESSAGE,
             diagnostics: None,
             skew: Some(skew),
+            expiry: None,
         });
     }
     if !presented.carries_credential {
@@ -758,6 +805,7 @@ pub(super) fn refusal_for(
             message: anonymous_message(presented.addressed_bucket.as_deref()),
             diagnostics: None,
             skew: None,
+            expiry: None,
         });
     }
     if !issued(&presented.access_key_id) {
@@ -772,6 +820,7 @@ pub(super) fn refusal_for(
             .as_ref()
             .map(|signing| Diagnostics::of(presented, signing)),
         skew: None,
+        expiry: None,
     })
 }
 
@@ -817,6 +866,8 @@ pub(super) struct AuthRefusal {
     diagnostics: Option<Diagnostics>,
     /// The instants and the accepted window, for the one refusal that carries them.
     skew: Option<Skew>,
+    /// The validity window that closed, for the one refusal that carries it.
+    expiry: Option<Expiry>,
 }
 
 /// The signing diagnostics S3's signature refusal carries, every one of them derived from
@@ -899,6 +950,8 @@ diagnostic_member!(
     "MaxAllowedSkewMilliseconds",
     9
 );
+diagnostic_member!(STATED_EXPIRES, "xAmzExpires", "X-Amz-Expires", 10);
+diagnostic_member!(EXPIRES, "expires", "Expires", 11);
 
 /// The shape of this service's authentication-refusal document.
 ///
@@ -924,6 +977,8 @@ pub(super) static REFUSAL_SCHEMA: Schema = Schema::new_struct(
         &REQUEST_TIME,
         &SERVER_TIME,
         &MAX_ALLOWED_SKEW,
+        &STATED_EXPIRES,
+        &EXPIRES,
     ],
 );
 
@@ -934,6 +989,14 @@ pub(super) static REFUSAL_SCHEMA: Schema = Schema::new_struct(
 impl SerializableStruct for AuthRefusal {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
         s.write_string(&MESSAGE, self.message)?;
+        // The window a refused presigned request asked for, and the instants that bound it:
+        // which window closed, and when — stated by the one refusal that is the window
+        // having closed.
+        if let Some(expiry) = &self.expiry {
+            s.write_string(&STATED_EXPIRES, &expiry.stated_expires)?;
+            s.write_string(&EXPIRES, &expiry.expires)?;
+            s.write_string(&SERVER_TIME, &expiry.server_time)?;
+        }
         if let Some(skew) = &self.skew {
             s.write_string(&REQUEST_TIME, &skew.request_time)?;
             s.write_string(&SERVER_TIME, &skew.server_time)?;

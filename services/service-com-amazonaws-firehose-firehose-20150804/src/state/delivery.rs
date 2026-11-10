@@ -1889,6 +1889,9 @@ fn object_encryption(
             kms_key_id: Some(key.clone()),
             kms_encryption_context: None,
             bucket_key_enabled: None,
+            // A delivery supplies no customer-provided key: the destination configuration
+            // names a KMS key or nothing at all.
+            ..Default::default()
         },
         None => store
             .bucket(&object.bucket)

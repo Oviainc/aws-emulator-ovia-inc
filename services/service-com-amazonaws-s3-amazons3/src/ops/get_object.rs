@@ -355,24 +355,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //   copy is the current one is answered 304 with no document
         //   ([`crate::scaffolded::Scaffolded::not_modified`]).
         // * `versionId` is SERVED (below): it names one stored version of the key.
-        // * the SSE-C members are the key an encrypted object would be decrypted with;
-        //   `PutObject` refuses to store one, so no object here was encrypted with it.
-        for (member, present) in [
-            (
-                "x-amz-server-side-encryption-customer-algorithm",
-                input.sse_customer_algorithm.is_some(),
-            ),
-            (
-                "x-amz-server-side-encryption-customer-key",
-                input.sse_customer_key.is_some(),
-            ),
-        ] {
-            if present {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                    "GetObject with {member}"
-                )));
-            }
-        }
+        // * the SSE-C members are SERVED too: they carry the key an object stored under a
+        //   customer-provided one is read with, matched below against the digest that object
+        //   records ([`crate::state::sse_customer`]).
+
+        // The CUSTOMER-PROVIDED key this read presents, read through the one rule every call
+        // of this service reads the three members by
+        // ([`crate::state::requested_customer_key`]): a key the request itself could not have
+        // encrypted anything with is refused before the store is reached, and WHETHER it is
+        // the object's own is judged below, against the version the address resolves to.
+        let presented_key = crate::state::requested_customer_key(
+            input.sse_customer_algorithm.as_deref(),
+            input.sse_customer_key.as_deref(),
+            input.sse_customer_key_md5.as_deref(),
+            None,
+        )
+        .map_err(crate::scaffolded::Scaffolded::customer_key)?;
 
         // "If the account ID that you provide does not match the actual owner of the bucket,
         // the request fails with the HTTP status code 403 Forbidden (access denied)"
@@ -516,6 +514,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+
+        // The object's plaintext comes of the CUSTOMER-PROVIDED key it was stored under, when
+        // it was stored under one: a read presenting none cannot be served it, and one
+        // presenting a key that is not the object's is refused the way any caller not
+        // authorized for its bytes is ([`crate::state::sse_customer::read_refusal`] holds the
+        // rule, and every call of this service that touches such an object is decided by it).
+        // Judged against the version the address resolved to, before anything about the
+        // object is reported.
+        if let Some(refusal) =
+            crate::state::sse_customer::read_refusal(&object.encryption, presented_key.as_ref())
+        {
+            return Err(crate::scaffolded::Scaffolded::customer_key_read(refusal));
+        }
 
         // The preconditions this read is subject to, judged against the version it
         // resolved: a read whose `If-Match` or `If-Unmodified-Since` does not hold is
@@ -757,6 +768,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             server_side_encryption: object.encryption.sse_algorithm.clone(),
             ssekms_key_id: object.encryption.kms_key_id.clone(),
             bucket_key_enabled: object.encryption.bucket_key_enabled,
+            // And, for an object stored under a CUSTOMER-provided key: the algorithm and the
+            // digest of that key, "to confirm the encryption algorithm that's used" and "to
+            // provide the round-trip message integrity verification of the customer-provided
+            // encryption key" (`GetObjectOutput$SSECustomerAlgorithm` and
+            // `$SSECustomerKeyMD5`). The key the read presented is never answered back.
+            sse_customer_algorithm: object.encryption.sse_customer_algorithm.clone(),
+            sse_customer_key_md5: object.encryption.sse_customer_key_md5.clone(),
             // See the lifecycle note above, where this is read off the bucket while the
             // store's guard is still held.
             expiration,
