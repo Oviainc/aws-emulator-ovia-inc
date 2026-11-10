@@ -151,6 +151,10 @@ mod stage_export;
 mod stage_invoke;
 #[path = "all/stage_lifecycle.rs"]
 mod stage_lifecycle;
+// The client SDK a deployed stage is generated into: which languages a generator is written
+// for, how a generator is configured, and what the generated project is made of.
+#[path = "all/stage_sdk.rs"]
+mod stage_sdk;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_reads_by_arn.rs"]

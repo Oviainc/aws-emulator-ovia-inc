@@ -134,6 +134,12 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # services in this tree use for certificate material, at the same version, so this emulator
 # has one way of issuing a certificate rather than a hand-rolled DER writer.
 rcgen = "0.13"
+# The .zip archive a generated client SDK is downloaded as (`GetSdk`): the maintained
+# writer for the format, the same one the sibling services in this tree read and write an
+# archive with, so what a caller saves to a file is an archive every unzip tool opens.
+# `deflate` is the compression a .zip entry carries, and no other feature is needed: the
+# archive is written in memory and nothing of the host's file system is read.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -156,8 +162,9 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # service's own `BatchGetTraces`, so it is mounted on that suite's engine too.
 service-com-amazonaws-xray-awsxray = { workspace = true }
 # The .zip deployment package such a function is created from, written in memory the way a
-# caller uploads one — the same reader/writer the Lambda crate's own invoke suites use.
-zip = { version = "9", default-features = false, features = ["deflate"] }
+# caller uploads one — the same reader/writer the Lambda crate's own invoke suites use, and
+# the same one `GetSdk` writes a generated SDK with (it is a runtime dependency of this
+# crate for that reason, so the suites reach it through that declaration).
 # A domain name access association's source is resolved against the VPC endpoints Amazon
 # EC2 holds, so that service is mounted beside this one on the suite's own engine and every
 # endpoint a case names is created through EC2's OWN API rather than written into a store by

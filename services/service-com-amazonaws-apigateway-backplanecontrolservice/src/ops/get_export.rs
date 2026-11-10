@@ -280,7 +280,7 @@ const RESERVED_SCHEME_NAMES: &[&str] = &[SIGV4_SCHEME_NAME, API_KEY_SCHEME_NAME]
 const API_KEY_SCHEME_TYPE: &str = "apiKey";
 
 /// Where a security scheme's value is carried: a request header.
-const HEADER_LOCATION: &str = "header";
+pub(crate) const HEADER_LOCATION: &str = "header";
 
 /// The header an `AWS_IAM` or Cognito method's credential is carried in.
 const AUTHORIZATION_HEADER: &str = "Authorization";
@@ -326,7 +326,7 @@ const HEADER_LOCATION_SEGMENT: &str = "header.";
 
 /// The OpenAPI parameter location of a path parameter, which the resource path's own
 /// template declares.
-const PATH_LOCATION: &str = "path";
+pub(crate) const PATH_LOCATION: &str = "path";
 
 /// The schema type every parameter and header of an exported definition carries. API
 /// Gateway's method request parameters and method response headers are untyped mapping
@@ -336,7 +336,7 @@ const STRING_SCHEMA_TYPE: &str = "string";
 /// The scheme an API's default invoke endpoint is reached over: "clients can invoke your
 /// API with the default https://{api_id}.execute-api.{region}.amazonaws.com endpoint"
 /// (`RestApi$disableExecuteApiEndpoint`).
-const INVOKE_SCHEME: &str = "https";
+pub(crate) const INVOKE_SCHEME: &str = "https";
 
 /// The `{basePath}` server variable an `oas30` document's single server is parameterized
 /// by, so the exported URL names the stage the export is of.
@@ -777,7 +777,10 @@ fn content_disposition(
 /// `RestApi$disableExecuteApiEndpoint`. Built from the same label the data plane claims a
 /// request on ([`crate::service::invoke::EXECUTE_API_LABEL`]), so the endpoint this
 /// document names is the endpoint the emulator answers.
-fn invoke_host(api_id: &str, region: &str) -> String {
+///
+/// `pub(crate)` for [`super::get_sdk`], which generates a client bound to that same
+/// endpoint: a generated SDK and an exported definition must name one invoke URL.
+pub(crate) fn invoke_host(api_id: &str, region: &str) -> String {
     format!(
         "{api_id}.{}.{region}.amazonaws.com",
         crate::service::invoke::EXECUTE_API_LABEL
@@ -934,7 +937,10 @@ fn info_object(api: &RestApiEntry, deployment: &DeploymentEntry) -> Value {
 /// `RestApi` — what identifies the definition instead, the instant the deployment was
 /// created or its id. All three are stored values, so two exports of one stage carry the
 /// same version.
-fn document_version(api: &RestApiEntry, deployment: &DeploymentEntry) -> String {
+///
+/// `pub(crate)` for [`super::get_sdk`]: the generated SDK carries the version of the same
+/// definition, and its attachment is named for it the same way.
+pub(crate) fn document_version(api: &RestApiEntry, deployment: &DeploymentEntry) -> String {
     api.version.clone().unwrap_or_else(|| {
         deployment
             .created_date
@@ -1103,7 +1109,10 @@ fn parameter_objects(
 
 /// The parameter names a resource path's template declares, in path order: `/pets/{petId}`
 /// declares `petId`, and the greedy `{proxy+}` path part declares `proxy`.
-fn path_parameters(path: &str) -> Vec<String> {
+///
+/// `pub(crate)` for [`super::get_sdk`], whose generated client takes one argument per
+/// template parameter: both read a path template the same way.
+pub(crate) fn path_parameters(path: &str) -> Vec<String> {
     path.split('/')
         .filter_map(|segment| segment.strip_prefix('{')?.strip_suffix('}'))
         .map(|name| name.trim_end_matches('+').to_string())
@@ -1113,7 +1122,10 @@ fn path_parameters(path: &str) -> Vec<String> {
 
 /// A `method.request.{location}.{name}` mapping expression as the OpenAPI parameter
 /// location and name it names; `None` for a key outside that documented form.
-fn request_parameter(expression: &str) -> Option<(&'static str, &str)> {
+///
+/// `pub(crate)` for [`super::get_sdk`], whose generated client sends the parameters the
+/// method declares: one reading of the mapping expression for both.
+pub(crate) fn request_parameter(expression: &str) -> Option<(&'static str, &str)> {
     let rest = expression.strip_prefix(REQUEST_PARAMETER_PREFIX)?;
     REQUEST_PARAMETER_LOCATIONS
         .iter()

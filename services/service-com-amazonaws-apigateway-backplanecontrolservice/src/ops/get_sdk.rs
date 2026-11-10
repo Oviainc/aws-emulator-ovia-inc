@@ -1,15 +1,45 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSdk
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSdk`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: GENERATES a client SDK for the API definition the named stage SERVES — the
+//! `Deployment` the stage points at, the same snapshot `GetExport` renders — with the
+//! generator `sdkType` names, and answers it as the downloadable archive a client saves to
+//! a file.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSdk::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every value of the generated project comes from the stored records and from the
+//! request's own `parameters`:
+//!
+//! * which generators exist at all is the set `GetSdkRequest$sdkType` documents as
+//!   supported — `java`, `javascript`, `android`, `objectivec`, `swift` and `ruby` — so an
+//!   `sdkType` outside that set is refused rather than generated for. The set is WIDER than
+//!   the catalog `GetSdkTypes` publishes ([`crate::state::sdk_type`], which holds `java` and
+//!   `ruby`): the catalog is what a client enumerates and configures a generator by, and
+//!   this is what the operation generates;
+//! * what a generator may be configured with is that catalog entry's
+//!   `configurationProperties` where the catalog publishes one, and otherwise the parameters
+//!   `GetSdkRequest$parameters` documents for that sdkType (`classPrefix` for `objectivec`
+//!   and `swift`; `groupId`, `artifactId`, `artifactVersion` and `invokerPackage` for
+//!   `android`) — a property declared `required` has to be set, and the rest fall back to
+//!   the default the property's own published description states. A parameter is matched by
+//!   the name the catalog publishes (`service.name`) or by that name's camelCase spelling
+//!   (`serviceName`), which is how `GetSdkRequest$parameters` documents the same keys;
+//! * each resource of the deployment that carries a method becomes one client method, named
+//!   for the method's `operationName` where it has one and otherwise for its verb and the
+//!   resource path, taking one argument per parameter the path template declares and
+//!   carrying the query string, header and body parameters the method's `requestParameters`
+//!   and `requestModels` declare;
+//! * the api id, the Region the api was created in and the stage name become the invoke
+//!   endpoint the client is bound to — the SAME endpoint the exported definition names
+//!   ([`super::get_export::invoke_host`]) and the one this emulator's data plane answers —
+//!   and a method whose `apiKeyRequired` is set sends the api key the client was constructed
+//!   with.
+//!
+//! The project is answered as the FILE it is: a ZIP archive, reported as such in
+//! `contentType`, with a `contentDisposition` attachment named for the generator and the
+//! version of the definition the SDK was generated from.
+//!
+//! This is a REPORTING operation: it writes nothing, so two calls for one stage and one
+//! configuration answer the same archive.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +118,2362 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use crate::state::{DeploymentEntry, MethodEntry, ResourceEntry, RestApiEntry, StageEntry};
+
+/// The media type a generated SDK is answered as: the archive the project is packed into.
+const MEDIA_TYPE_ZIP: &str = "application/zip";
+
+/// The file extension of that archive, which the attachment is named with.
+const ARCHIVE_EXTENSION: &str = "zip";
+
+/// The catalog id of the Java generator ([`crate::state::sdk_type`]).
+const SDK_TYPE_JAVA: &str = "java";
+
+/// The catalog id of the Ruby generator ([`crate::state::sdk_type`]).
+const SDK_TYPE_RUBY: &str = "ruby";
+
+/// The `javascript` generator, from `GetSdkRequest$sdkType`'s documented set.
+const SDK_TYPE_JAVASCRIPT: &str = "javascript";
+
+/// The `android` generator, from `GetSdkRequest$sdkType`'s documented set.
+const SDK_TYPE_ANDROID: &str = "android";
+
+/// The `objectivec` generator (for iOS), from `GetSdkRequest$sdkType`'s documented set.
+const SDK_TYPE_OBJECTIVEC: &str = "objectivec";
+
+/// The `swift` generator (for iOS), from `GetSdkRequest$sdkType`'s documented set.
+const SDK_TYPE_SWIFT: &str = "swift";
+
+/// The class name prefix `objectivec` and `swift` require: "For sdkType of objectivec or
+/// swift, a parameter named classPrefix is required" (`GetSdkRequest$parameters`).
+const CLASS_PREFIX: &str = "classPrefix";
+
+/// `android`'s group id: "For sdkType of android, parameters named groupId, artifactId,
+/// artifactVersion, and invokerPackage are required" (`GetSdkRequest$parameters`).
+const GROUP_ID: &str = "groupId";
+
+/// `android`'s artifact id; see [`GROUP_ID`].
+const ARTIFACT_ID: &str = "artifactId";
+
+/// `android`'s artifact version; see [`GROUP_ID`].
+const ARTIFACT_VERSION: &str = "artifactVersion";
+
+/// The package `android`'s client is generated under; see [`GROUP_ID`].
+const INVOKER_PACKAGE: &str = "invokerPackage";
+
+/// The configuration property every generator of the catalog declares required: "Name of
+/// the service which is used to derive the Java interface name for your client" / "… the
+/// name for your client".
+const SERVICE_NAME: &str = "service.name";
+
+/// `java`'s required package name: "Name of the Java package your code will be generated
+/// under".
+const JAVA_PACKAGE_NAME: &str = "java.package-name";
+
+/// `java`'s build system: "Build system to setup for project; Currently supported: maven,
+/// gradle".
+const JAVA_BUILD_SYSTEM: &str = "java.build-system";
+
+/// `java`'s Maven or Gradle group id: "Group id for your Maven or Gradle project. Defaults
+/// to package name".
+const JAVA_GROUP_ID: &str = "java.group-id";
+
+/// `java`'s artifact id: "Artifact Id for your Maven project or project name for your Gradle
+/// project. Defaults to service name".
+const JAVA_ARTIFACT_ID: &str = "java.artifact-id";
+
+/// `java`'s artifact version: "Version of your Maven or Gradle project. Defaults to
+/// 1.0-SNAPSHOT".
+const JAVA_ARTIFACT_VERSION: &str = "java.artifact-version";
+
+/// `java`'s license banner: "Customer provided license to inject into source file headers".
+const JAVA_LICENSE_TEXT: &str = "java.license-text";
+
+/// `ruby`'s gem name: "Name of the Ruby gem your code will be generated under".
+const RUBY_GEM_NAME: &str = "ruby.gem-name";
+
+/// `ruby`'s gem version: "Version number for your service gem. Defaults to 1.0.0".
+const RUBY_GEM_VERSION: &str = "ruby.gem-version";
+
+/// The build systems the `java` generator sets a project up for, from
+/// [`JAVA_BUILD_SYSTEM`]'s own published description ("Currently supported: maven,
+/// gradle"). A request naming one of them gets that project; one naming anything else gets
+/// the first, which is the project a request configuring no build system gets too.
+const JAVA_BUILD_SYSTEMS: &[&str] = &[MAVEN, GRADLE];
+
+/// The Maven build system, and the project layout generated for it (a `pom.xml`). The
+/// layout a `java` request that configures no build system gets, being the first of the two
+/// the property publishes.
+const MAVEN: &str = "maven";
+
+/// The Gradle build system, and the project layout generated for it (a `build.gradle` and
+/// the `settings.gradle` that names the project).
+const GRADLE: &str = "gradle";
+
+/// The artifact version a `java` project carries when the request configures none, as
+/// [`JAVA_ARTIFACT_VERSION`]'s published description states it ("Defaults to 1.0-SNAPSHOT").
+const DEFAULT_JAVA_ARTIFACT_VERSION: &str = "1.0-SNAPSHOT";
+
+/// The gem version a `ruby` project carries when the request configures none, as
+/// [`RUBY_GEM_VERSION`]'s published description states it ("Defaults to 1.0.0").
+const DEFAULT_RUBY_GEM_VERSION: &str = "1.0.0";
+
+/// The module a generated JavaScript package's `main` names, and the file it is.
+const JAVASCRIPT_MODULE: &str = "index.js";
+
+/// The version a generated project carries when its generator publishes no version parameter
+/// at all (`javascript`, `swift`), and the version an `android` project falls back to: the
+/// same first version a `ruby` gem's own property states as its default.
+const DEFAULT_PACKAGE_VERSION: &str = DEFAULT_RUBY_GEM_VERSION;
+
+/// The language level the generated Java project is built at: the first long-term release
+/// whose standard library carries the HTTP client the generated code is written against
+/// (`java.net.http`, added in Java 11).
+const JAVA_RELEASE: &str = "11";
+
+/// The header a method with `apiKeyRequired` sends its api key in — the one API Gateway
+/// reads an api key from, as this emulator's own data plane reads it.
+const API_KEY_HEADER: &str = "x-api-key";
+
+/// The media type a generated client sends a request body as when the method's records name
+/// none: the type `Method$requestModels` and a mapping template are keyed by in API
+/// Gateway's own examples.
+const DEFAULT_REQUEST_MEDIA_TYPE: &str = "application/json";
+
+/// The verbs whose generated client method carries a request body: the ones HTTP defines a
+/// payload for, plus the catch-all, which stands for every verb including those.
+const BODY_VERBS: &[&str] = &["POST", "PUT", "PATCH", ANY_VERB];
+
+/// The catch-all method verb, which matches every verb — the generated method takes the
+/// verb to send as its first argument, because that is what the caller chooses.
+const ANY_VERB: &str = "ANY";
+
+/// Which generator a `GetSdk` call asks for.
+///
+/// The variants are the ids `GetSdkRequest$sdkType` documents as supported ("Currently
+/// java, javascript, android, objectivec (for iOS), swift (for iOS), and ruby are
+/// supported"): that set is what this operation generates for, and it is wider than the
+/// catalog `GetSdkTypes` publishes, which is what a client enumerates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Generator {
+    /// `java`: a Maven or Gradle project with a client interface and its implementation.
+    Java,
+    /// `javascript`: a package whose module hands back a client over `fetch`.
+    JavaScript,
+    /// `android`: a Gradle project with a client over the HTTP client Android ships.
+    Android,
+    /// `objectivec`: a class pair over `NSURLSession`.
+    ObjectiveC,
+    /// `swift`: a package whose one target is a client over `URLSession`.
+    Swift,
+    /// `ruby`: a gem with a client class.
+    Ruby,
+}
+
+impl Generator {
+    /// The generator `sdk_type` names, or the refusal for a language no generator of this
+    /// service writes a client in.
+    ///
+    /// Resolved before anything of the caller's is read, so a request naming a language
+    /// API Gateway generates no SDK for is refused the same way whether or not the api
+    /// exists.
+    fn parse(sdk_type: &str) -> Result<Self, GetSdkError> {
+        match sdk_type {
+            SDK_TYPE_JAVA => Ok(Self::Java),
+            SDK_TYPE_JAVASCRIPT => Ok(Self::JavaScript),
+            SDK_TYPE_ANDROID => Ok(Self::Android),
+            SDK_TYPE_OBJECTIVEC => Ok(Self::ObjectiveC),
+            SDK_TYPE_SWIFT => Ok(Self::Swift),
+            SDK_TYPE_RUBY => Ok(Self::Ruby),
+            _ => Err(GetSdkError::from(GetSdkErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(no_such_sdk_generator(sdk_type)),
+                },
+            ))),
+        }
+    }
+
+    /// This generator's `sdkType`, the id a request names it by.
+    fn id(self) -> &'static str {
+        match self {
+            Self::Java => SDK_TYPE_JAVA,
+            Self::JavaScript => SDK_TYPE_JAVASCRIPT,
+            Self::Android => SDK_TYPE_ANDROID,
+            Self::ObjectiveC => SDK_TYPE_OBJECTIVEC,
+            Self::Swift => SDK_TYPE_SWIFT,
+            Self::Ruby => SDK_TYPE_RUBY,
+        }
+    }
+
+    /// The configuration properties of this generator: the name a `parameters` entry sets
+    /// each under, and whether the generator cannot be run without it.
+    ///
+    /// Where the catalog publishes an entry for this generator, its own
+    /// `configurationProperties` ARE the properties — that is what a client reads to learn
+    /// what it may configure, so the two cannot differ. For a generator the catalog
+    /// publishes no entry for, the properties are the ones `GetSdkRequest$parameters`
+    /// documents as required for that sdkType.
+    fn properties(self) -> Vec<(String, bool)> {
+        if let Some(published) = crate::state::sdk_type(self.id()) {
+            return published
+                .configuration_properties
+                .iter()
+                .flatten()
+                .filter_map(|property| {
+                    property
+                        .name
+                        .as_deref()
+                        .map(|name| (name.to_string(), property.required))
+                })
+                .collect();
+        }
+        let documented: &[&str] = match self {
+            Self::ObjectiveC | Self::Swift => &[CLASS_PREFIX],
+            Self::Android => &[GROUP_ID, ARTIFACT_ID, ARTIFACT_VERSION, INVOKER_PACKAGE],
+            // `GetSdkRequest$parameters` documents no required parameter for `javascript`,
+            // and the two above are published by the catalog, so nothing is required here.
+            _ => &[],
+        };
+        documented
+            .iter()
+            .map(|name| ((*name).to_string(), true))
+            .collect()
+    }
+
+    /// The project this generator writes for one stage: the archive entry path and the text
+    /// of every file of it, in the order the archive carries them.
+    fn project(self, target: ClientTarget<'_>, configuration: &Configuration) -> Vec<ProjectFile> {
+        let operations = client_operations(target.deployment);
+        match self {
+            Self::Java => java_project(target, configuration, &operations),
+            Self::JavaScript => javascript_project(target, &operations),
+            Self::Android => android_project(target, configuration, &operations),
+            Self::ObjectiveC => objectivec_project(target, configuration, &operations),
+            Self::Swift => swift_project(target, configuration, &operations),
+            Self::Ruby => ruby_project(target, configuration, &operations),
+        }
+    }
+}
+
+/// The `BadRequestException` message a request naming a language this service generates no
+/// SDK in is refused with: fixed text naming the GENERATOR it has none of, quoting the
+/// sdkType the request asked for, which is the only variable part and comes from the
+/// request's own path label.
+///
+/// It is this OPERATION's sentence, which is not the one `GetSdkType` refuses an id the
+/// CATALOG does not publish with ([`crate::state::no_such_sdk_type`]): API Gateway words the
+/// two differently — this one names the TYPE asked for — so they are kept apart rather than
+/// shared, and each stays what its own operation answers.
+fn no_such_sdk_generator(sdk_type: &str) -> String {
+    format!("No SDK generator for type '{sdk_type}'")
+}
+
+/// One file of a generated project: its path inside the archive, and its text.
+type ProjectFile = (String, String);
+
+/// What a generated SDK is a client OF: the records it was generated from, and the endpoint
+/// it calls.
+#[derive(Debug, Clone, Copy)]
+struct ClientTarget<'a> {
+    /// The api the SDK is a client of.
+    api: &'a RestApiEntry,
+    /// The stage the SDK calls.
+    stage: &'a StageEntry,
+    /// The deployment that stage serves: the definition the client's methods are the
+    /// methods of.
+    deployment: &'a DeploymentEntry,
+    /// The stage's invoke URL, which the generated client is bound to.
+    endpoint: &'a str,
+}
+
+impl ClientTarget<'_> {
+    /// The sentence a generated project states what it is by: the api, the stage and the
+    /// deployment the client calls.
+    fn generated_from(&self) -> String {
+        format!(
+            "Generated by Amazon API Gateway from deployment {} of the {} API ({}), as served \
+             by its {} stage.",
+            self.deployment.id, self.api.name, self.api.id, self.stage.stage_name
+        )
+    }
+}
+
+/// The configuration a `GetSdk` call carries for one generator: every property of that
+/// generator the request set a value for, keyed by the name the catalog publishes the
+/// property under.
+///
+/// Keyed by the PUBLISHED name whichever spelling the request used, so a generator reads one
+/// name per property.
+type Configuration = BTreeMap<String, String>;
+
+/// How a generator reads its configuration.
+trait ConfigurationOf {
+    /// The value the request set for the property the catalog publishes as `name`, or `None`
+    /// when it set none.
+    fn property(&self, name: &str) -> Option<&str>;
+
+    /// The value for `name`, or `default` when the request set none: the fallback the
+    /// property's own published description states.
+    fn property_or<'a>(&'a self, name: &str, default: &'a str) -> &'a str {
+        self.property(name).unwrap_or(default)
+    }
+}
+
+impl ConfigurationOf for Configuration {
+    fn property(&self, name: &str) -> Option<&str> {
+        self.get(name).map(String::as_str)
+    }
+}
+
+/// Read the `parameters` of a request as the configuration `generator` describes, or the
+/// sentence the request is refused with.
+///
+/// A property is looked up under the name it is published as (`service.name`) and under that
+/// name's camelCase spelling (`serviceName`), which is the spelling
+/// `GetSdkRequest$parameters` documents the same keys in ("For sdkType of java, parameters
+/// named serviceName and javaPackageName are required"): the two name ONE property, so
+/// either satisfies it. A property the generator declares `required` has to be set to a
+/// non-blank value; one it does not is simply absent from the configuration, and the
+/// generator falls back to the default that property's description states.
+fn read_configuration(
+    generator: Generator,
+    parameters: Option<&HashMap<String, String>>,
+) -> Result<Configuration, String> {
+    let mut configuration = Configuration::new();
+    for (name, required) in generator.properties() {
+        let value = parameters
+            .and_then(|parameters| {
+                parameters
+                    .get(&name)
+                    .or_else(|| parameters.get(&camel_case_name(&name)))
+            })
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty());
+        match value {
+            Some(value) => {
+                configuration.insert(name, value.to_string());
+            }
+            None if required => return Err(missing_property(generator, &name)),
+            None => {}
+        }
+    }
+    Ok(configuration)
+}
+
+/// The `BadRequestException` message a request missing a required configuration property is
+/// refused with: the property the generator cannot be run without, named as it is published,
+/// and the generator that requires it.
+///
+/// Both variable parts come from the request itself — the sdkType it named, and that
+/// generator's own property — and the sentence is the form the model states the requirement
+/// in ("For sdkType of java, parameters named serviceName and javaPackageName are
+/// required").
+fn missing_property(generator: Generator, name: &str) -> String {
+    format!(
+        "A parameter named {name} is required for sdkType of {}",
+        generator.id()
+    )
+}
+
+/// The camelCase spelling of a published property name: the segments of the dotted,
+/// hyphenated name joined up, the first lowercase and each following one capitalized, so
+/// `service.name` is also `serviceName` and `java.package-name` also `javaPackageName`.
+fn camel_case_name(name: &str) -> String {
+    camel_case(&words(name))
+}
+
+/// What this operation answers when the archive of a generated project could not be written.
+///
+/// The archive is written in memory, from text this handler produced, so nothing of the
+/// caller's can make it fail; this is the emulator's OWN failure rather than anything the
+/// request did, so it is reported through the same channel the store being unreachable is
+/// ([`crate::state::state_unavailable`]), with a sentence stating what failed rather than
+/// blaming the caller.
+fn sdk_not_generated(sdk_type: &str) -> GetSdkError {
+    crate::scaffolded::Scaffolded::NotImplemented(crate::scaffolded::NotImplemented {
+        message: format!(
+            "the generated {sdk_type} SDK could not be written as an archive by this emulator"
+        ),
+    })
+}
+
+/// The `Content-Disposition` of the generated SDK: an attachment named for the generator and
+/// the VERSION of the definition the SDK was generated from
+/// (`attachment; filename="java_1.0.zip"`).
+///
+/// The version is the one the exported definition states for the same deployment
+/// ([`super::get_export::document_version`]), so the SDK and the definition it was generated
+/// from are named for the same version, and two calls for one stage download the same file
+/// name rather than one stamped with the instant of the call.
+fn content_disposition(sdk_type: &str, version: &str) -> String {
+    format!("attachment; filename=\"{sdk_type}_{version}.{ARCHIVE_EXTENSION}\"")
+}
+
+/// One operation of the deployment the generated client carries a method for.
+#[derive(Debug, Clone)]
+struct ClientOperation {
+    /// The resource path the method sits on, as the deployment stored it (`/pets/{petId}`).
+    path: String,
+    /// The method's uppercase verb, or [`ANY_VERB`].
+    verb: String,
+    /// The words the client method's name is built from: the method's `operationName` where
+    /// it has one, else its verb and the resource path.
+    words: Vec<String>,
+    /// The parameters the resource path's template declares, in path order.
+    path_parameters: Vec<String>,
+    /// The query string parameters the method declares, with whether each is required.
+    query_parameters: Vec<(String, bool)>,
+    /// The headers the method declares, with whether each is required.
+    header_parameters: Vec<(String, bool)>,
+    /// Whether the method requires an api key (`Method$apiKeyRequired`).
+    api_key_required: bool,
+    /// The method's `authorizationType`, which says how a call of it has to be authorized.
+    authorization_type: String,
+    /// The media type the client sends a body as: the first content type the method's
+    /// `requestModels` and its integration's `requestTemplates` name.
+    request_media_type: String,
+    /// The status codes the method declares a response for, in status-code order.
+    response_status_codes: Vec<String>,
+}
+
+impl ClientOperation {
+    /// Whether the generated method carries a request body: the verb has a payload, or it is
+    /// the catch-all that stands for every verb.
+    fn carries_body(&self) -> bool {
+        BODY_VERBS.contains(&self.verb.as_str())
+    }
+
+    /// Whether the caller chooses the verb to send: the method is the catch-all.
+    fn chooses_verb(&self) -> bool {
+        self.verb == ANY_VERB
+    }
+
+    /// The literal and parameter parts the request path is built from.
+    fn path_parts(&self) -> Vec<PathPart> {
+        path_parts(&self.path)
+    }
+
+    /// What the generated client says about how a call of this method has to be authorized,
+    /// from the method's own `authorizationType` and `apiKeyRequired`.
+    fn authorization_note(&self) -> String {
+        let mut note = format!("Authorization: {}.", self.authorization_type);
+        if self.api_key_required {
+            note.push_str(" An api key is required.");
+        }
+        note
+    }
+
+    /// The lines a generated comment states this operation with: its verb and path, how a
+    /// call is authorized, the responses it declares and the parameters it takes.
+    fn documentation(&self) -> Vec<String> {
+        let mut lines = vec![
+            format!("{} {}", self.verb, self.path),
+            self.authorization_note(),
+        ];
+        if !self.response_status_codes.is_empty() {
+            lines.push(format!(
+                "Declared responses: {}.",
+                self.response_status_codes.join(", ")
+            ));
+        }
+        for (name, required) in &self.query_parameters {
+            lines.push(format!(
+                "Query string parameter {name}{}.",
+                if *required { " (required)" } else { "" }
+            ));
+        }
+        for (name, required) in &self.header_parameters {
+            lines.push(format!(
+                "Header {name}{}.",
+                if *required { " (required)" } else { "" }
+            ));
+        }
+        lines
+    }
+}
+
+/// One part of a resource path as a generated client builds it.
+#[derive(Debug, Clone)]
+enum PathPart {
+    /// Text the path carries as it stands.
+    Literal(String),
+    /// A path template parameter, whose value the caller passes in.
+    Parameter(String),
+}
+
+/// The parts `path` is built from, literal runs merged: `/pets/{petId}/toys` is `/pets/`,
+/// the `petId` parameter, then `/toys`, and the root resource is the stage's own `/`.
+fn path_parts(path: &str) -> Vec<PathPart> {
+    let mut parts: Vec<PathPart> = Vec::new();
+    let mut literal = String::new();
+    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+        literal.push('/');
+        match segment
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix('}'))
+            .map(|name| name.trim_end_matches('+'))
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => {
+                parts.push(PathPart::Literal(std::mem::take(&mut literal)));
+                parts.push(PathPart::Parameter(name.to_string()));
+            }
+            None => literal.push_str(segment),
+        }
+    }
+    if parts.is_empty() && literal.is_empty() {
+        // The root resource: the invoke endpoint already carries the stage, so the path of a
+        // call to the root is the stage's own base path.
+        literal.push('/');
+    }
+    if !literal.is_empty() {
+        parts.push(PathPart::Literal(literal));
+    }
+    parts
+}
+
+/// Every operation of the deployment, in resource-path then verb order, with a client method
+/// name that is unique within the generated client.
+///
+/// The DEPLOYMENT's own resource tree is what the stage serves — "a Deployment resource is a
+/// snapshot of your REST API configuration" — so a method put on the api after this
+/// deployment was created is not in the SDK until the api is redeployed, exactly as it is
+/// not served until then.
+fn client_operations(deployment: &DeploymentEntry) -> Vec<ClientOperation> {
+    let mut resources: Vec<&ResourceEntry> = deployment.resources.values().collect();
+    resources.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut operations: Vec<ClientOperation> = Vec::new();
+    let mut taken: BTreeSet<Vec<String>> = BTreeSet::new();
+    for resource in resources {
+        for (verb, method) in &resource.methods {
+            let mut operation = client_operation(resource, verb, method);
+            // Two methods of one api can carry the same `operationName`, and two paths can
+            // reduce to the same words; a client whose two methods had one name would not
+            // compile, so a repeat is distinguished by its position in the order above.
+            let mut words = operation.words.clone();
+            let mut next = 2;
+            while !taken.insert(words.clone()) {
+                words = operation.words.clone();
+                words.push(next.to_string());
+                next += 1;
+            }
+            operation.words = words;
+            operations.push(operation);
+        }
+    }
+    operations
+}
+
+/// One method of the deployment as the operation the client carries a method for.
+fn client_operation(resource: &ResourceEntry, verb: &str, method: &MethodEntry) -> ClientOperation {
+    let template = super::get_export::path_parameters(&resource.path);
+    let mut query_parameters: Vec<(String, bool)> = Vec::new();
+    let mut header_parameters: Vec<(String, bool)> = Vec::new();
+    for (expression, required) in &method.request_parameters {
+        let Some((location, name)) = super::get_export::request_parameter(expression) else {
+            continue;
+        };
+        if location == super::get_export::PATH_LOCATION {
+            // A `method.request.path.{name}` entry names a parameter the path template
+            // already declares, which is that same parameter rather than a second one.
+            continue;
+        }
+        if location == super::get_export::HEADER_LOCATION {
+            header_parameters.push((name.to_string(), *required));
+        } else {
+            query_parameters.push((name.to_string(), *required));
+        }
+    }
+    ClientOperation {
+        path: resource.path.clone(),
+        verb: verb.to_string(),
+        words: method_words(verb, &resource.path, method.operation_name.as_deref()),
+        path_parameters: template,
+        query_parameters,
+        header_parameters,
+        api_key_required: method.api_key_required,
+        authorization_type: method.authorization_type.clone(),
+        request_media_type: request_media_type(method),
+        response_status_codes: method.method_responses.keys().cloned().collect(),
+    }
+}
+
+/// The words a client method's name is built from: the method's own `operationName` — "a
+/// human-friendly operation identifier for the method", which is what an SDK names the
+/// method after — or, for a method that carries none, its verb and the resource path.
+fn method_words(verb: &str, path: &str, operation_name: Option<&str>) -> Vec<String> {
+    if let Some(operation_name) = operation_name.map(str::trim).filter(|name| !name.is_empty()) {
+        let named = words(operation_name);
+        if !named.is_empty() {
+            return named;
+        }
+    }
+    let mut named = words(verb);
+    named.extend(words(path));
+    named
+}
+
+/// The media type a generated client sends a request body as: the first content type the
+/// method's `requestModels` names ("data schemas … the key is a content type"), else the
+/// first its integration's `requestTemplates` is keyed by, else
+/// [`DEFAULT_REQUEST_MEDIA_TYPE`].
+fn request_media_type(method: &MethodEntry) -> String {
+    method
+        .request_models
+        .keys()
+        .next()
+        .cloned()
+        .or_else(|| {
+            method
+                .integration
+                .as_ref()
+                .and_then(|integration| integration.request_templates.as_ref())
+                .and_then(|templates| {
+                    let ordered: BTreeSet<&String> = templates.keys().collect();
+                    ordered.into_iter().next().cloned()
+                })
+        })
+        .unwrap_or_else(|| DEFAULT_REQUEST_MEDIA_TYPE.to_string())
+}
+
+/// The words of a name, however it is written: split at every character that is not a letter
+/// or a digit, and at each lowercase-to-uppercase boundary, so `service.name`,
+/// `java.package-name`, `GetPets` and `/pets/{petId}` all read as their own words,
+/// lowercased.
+fn words(text: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut previous_lowercase = false;
+    for character in text.chars() {
+        if !character.is_ascii_alphanumeric() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            previous_lowercase = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() && previous_lowercase && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+        previous_lowercase = character.is_ascii_lowercase() || character.is_ascii_digit();
+        word.push(character.to_ascii_lowercase());
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// `word` with its first character uppercased.
+fn capitalized(word: &str) -> String {
+    let mut characters = word.chars();
+    match characters.next() {
+        None => String::new(),
+        Some(first) => first.to_ascii_uppercase().to_string() + characters.as_str(),
+    }
+}
+
+/// `words` as one PascalCase name (`PetStore`), the spelling a Java type and a Ruby module
+/// carry.
+fn pascal_case(words: &[String]) -> String {
+    words.iter().map(|word| capitalized(word)).collect()
+}
+
+/// `words` as one camelCase name (`getPetsPetId`), the spelling a Java method and argument
+/// carry.
+fn camel_case(words: &[String]) -> String {
+    let mut camel = String::new();
+    for (at, word) in words.iter().enumerate() {
+        if at == 0 {
+            camel.push_str(word);
+        } else {
+            camel.push_str(&capitalized(word));
+        }
+    }
+    camel
+}
+
+/// `words` as one snake_case name (`get_pets_pet_id`), the spelling a Ruby method and a gem
+/// file carry.
+fn snake_case(words: &[String]) -> String {
+    words.join("_")
+}
+
+/// `words` as one kebab-case name (`pet-store`), the spelling a Maven artifact id carries.
+fn kebab_case(words: &[String]) -> String {
+    words.join("-")
+}
+
+/// A name built from `words` by `spell`, falling back to `fallback` when the words are empty
+/// — a configured value made entirely of punctuation would otherwise name nothing.
+fn named(words: &[String], fallback: &str, spell: impl Fn(&[String]) -> String) -> String {
+    let spelled = spell(words);
+    if spelled.is_empty() {
+        fallback.to_string()
+    } else {
+        spelled
+    }
+}
+
+/// The ZIP archive of a generated project: one entry per file, in the order the project
+/// lists them.
+///
+/// `Err` is the sentence the archive could not be written with, which is reported as
+/// [`sdk_not_generated`] rather than blamed on the caller.
+fn archive(files: &[ProjectFile]) -> Result<Vec<u8>, String> {
+    let mut archive = ::zip::ZipWriter::new(::std::io::Cursor::new(Vec::new()));
+    let options = ::zip::write::SimpleFileOptions::default();
+    for (path, contents) in files {
+        archive
+            .start_file(path.as_str(), options)
+            .map_err(|error| error.to_string())?;
+        ::std::io::Write::write_all(&mut archive, contents.as_bytes())
+            .map_err(|error| error.to_string())?;
+    }
+    archive
+        .finish()
+        .map_err(|error| error.to_string())
+        .map(::std::io::Cursor::into_inner)
+}
+
+/// `text` as the contents of a double-quoted string literal in the C-like languages
+/// generated here — Java, Groovy, JavaScript, Objective-C and Swift: the two characters such
+/// a literal cannot carry as they stand, escaped.
+fn escaped_text(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// `text` as the contents of an XML element: the three characters that would otherwise open
+/// markup, escaped.
+fn xml_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// `text` as a Ruby double-quoted string literal's contents: the escape character, the
+/// quote, and the `#` that would otherwise start an interpolation.
+fn ruby_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('#', "\\#")
+}
+
+/// `text` as the body of a comment, each line prefixed with `prefix`.
+fn commented(text: &str, prefix: &str) -> String {
+    text.lines()
+        .map(|line| format!("{prefix}{line}").trim_end().to_string())
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// The names every file of a generated Java project is written from, resolved from the
+/// request's configuration and the defaults each property's description states.
+#[derive(Debug)]
+struct JavaNames<'a> {
+    /// The package the sources are generated under, from `java.package-name`
+    /// ([`java_package`]).
+    package: String,
+    /// The client interface's type name, derived from the service name.
+    interface: String,
+    /// The implementing class's type name.
+    implementation: String,
+    /// The license text to inject into each source file's header, where the request
+    /// configured one.
+    license: Option<&'a str>,
+    /// The build system the project is set up for: one of [`JAVA_BUILD_SYSTEMS`].
+    build_system: &'static str,
+    /// The Maven or Gradle group id; defaults to the package name.
+    group_id: String,
+    /// The artifact id; defaults to the service name.
+    artifact_id: String,
+    /// The artifact version; defaults to [`DEFAULT_JAVA_ARTIFACT_VERSION`].
+    version: &'a str,
+}
+
+impl<'a> JavaNames<'a> {
+    /// The names `configuration` asks for.
+    fn of(configuration: &'a Configuration) -> Self {
+        let service = words(configuration.property_or(SERVICE_NAME, ""));
+        let package = java_package(configuration.property_or(JAVA_PACKAGE_NAME, ""));
+        let interface = format!("{}Client", named(&service, "Api", pascal_case));
+        Self {
+            group_id: configuration
+                .property(JAVA_GROUP_ID)
+                .map_or_else(|| package.clone(), str::to_string),
+            package,
+            implementation: format!("{interface}Impl"),
+            interface,
+            license: configuration.property(JAVA_LICENSE_TEXT),
+            // The build system is one of the two the property publishes: the one the request
+            // named, else Maven, which is the project a request naming no supported build
+            // system gets.
+            build_system: JAVA_BUILD_SYSTEMS
+                .iter()
+                .copied()
+                .find(|supported| {
+                    configuration
+                        .property(JAVA_BUILD_SYSTEM)
+                        .is_some_and(|named| named.eq_ignore_ascii_case(supported))
+                })
+                .unwrap_or(MAVEN),
+            artifact_id: configuration
+                .property(JAVA_ARTIFACT_ID)
+                .map_or_else(|| named(&service, "api", kebab_case), str::to_string),
+            version: configuration
+                .property_or(JAVA_ARTIFACT_VERSION, DEFAULT_JAVA_ARTIFACT_VERSION),
+        }
+    }
+
+    /// The directory the sources of this package sit in.
+    fn source_directory(&self) -> String {
+        format!("src/main/java/{}", self.package.replace('.', "/"))
+    }
+
+    /// The license banner the configured license text is injected into each source file as,
+    /// or nothing when the request configured none.
+    fn license_banner(&self) -> String {
+        match self.license {
+            None => String::new(),
+            Some(license) => format!("/*\n{}\n */\n", commented(license, " * ")),
+        }
+    }
+}
+
+/// The Java project a `java` SDK is: the build file the configured build system asks for,
+/// the client interface, its implementation, and the README that states what the project is.
+fn java_project(
+    target: ClientTarget<'_>,
+    configuration: &Configuration,
+    operations: &[ClientOperation],
+) -> Vec<ProjectFile> {
+    let names = JavaNames::of(configuration);
+    let mut files: Vec<ProjectFile> = Vec::new();
+    if names.build_system == GRADLE {
+        files.push(("build.gradle".to_string(), java_build_gradle(&names)));
+        files.push((
+            "settings.gradle".to_string(),
+            format!("rootProject.name = '{}'\n", escaped_text(&names.artifact_id)),
+        ));
+    } else {
+        files.push(("pom.xml".to_string(), java_pom(target, &names)));
+    }
+    files.push((
+        "README.md".to_string(),
+        readme(
+            target,
+            operations,
+            &[
+                ("Package", names.package.clone()),
+                ("Client", names.interface.clone()),
+                ("Build system", names.build_system.to_string()),
+                (
+                    "Artifact",
+                    format!(
+                        "{}:{}:{}",
+                        names.group_id, names.artifact_id, names.version
+                    ),
+                ),
+            ],
+        ),
+    ));
+    files.push((
+        format!("{}/{}.java", names.source_directory(), names.interface),
+        java_interface(target, &names, operations),
+    ));
+    files.push((
+        format!("{}/{}.java", names.source_directory(), names.implementation),
+        java_implementation(target, &names, operations),
+    ));
+    files
+}
+
+/// The `pom.xml` of a generated Maven project.
+fn java_pom(target: ClientTarget<'_>, names: &JavaNames<'_>) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <project xmlns=\"http://maven.apache.org/POM/4.0.0\"\n\
+         \x20        xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n\
+         \x20        xsi:schemaLocation=\"http://maven.apache.org/POM/4.0.0 \
+         http://maven.apache.org/xsd/maven-4.0.0.xsd\">\n\
+         \x20 <modelVersion>4.0.0</modelVersion>\n\
+         \n\
+         \x20 <groupId>{group}</groupId>\n\
+         \x20 <artifactId>{artifact}</artifactId>\n\
+         \x20 <version>{version}</version>\n\
+         \x20 <name>{name}</name>\n\
+         \x20 <description>{description}</description>\n\
+         \n\
+         \x20 <properties>\n\
+         \x20   <maven.compiler.release>{JAVA_RELEASE}</maven.compiler.release>\n\
+         \x20   <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>\n\
+         \x20 </properties>\n\
+         </project>\n",
+        group = xml_text(&names.group_id),
+        artifact = xml_text(&names.artifact_id),
+        version = xml_text(names.version),
+        name = xml_text(&target.api.name),
+        description = xml_text(&target.generated_from()),
+    )
+}
+
+/// The `build.gradle` of a generated Gradle project: the Java library the client is, at the
+/// group and version the request configured.
+///
+/// Shared by the `java` generator (when the request asks for a Gradle project) and the
+/// `android` one, which is always one.
+fn gradle_build(group_id: &str, version: &str) -> String {
+    format!(
+        "plugins {{\n\
+         \x20   id 'java-library'\n\
+         }}\n\
+         \n\
+         group = '{group}'\n\
+         version = '{version}'\n\
+         \n\
+         java {{\n\
+         \x20   sourceCompatibility = JavaVersion.VERSION_{JAVA_RELEASE}\n\
+         \x20   targetCompatibility = JavaVersion.VERSION_{JAVA_RELEASE}\n\
+         }}\n",
+        group = escaped_text(group_id),
+        version = escaped_text(version),
+    )
+}
+
+/// The `build.gradle` of a generated `java` Gradle project.
+fn java_build_gradle(names: &JavaNames<'_>) -> String {
+    gradle_build(&names.group_id, names.version)
+}
+
+/// The client INTERFACE of a generated Java project: one method per operation of the
+/// deployment, with what the records say about each in its doc comment.
+fn java_interface(
+    target: ClientTarget<'_>,
+    names: &JavaNames<'_>,
+    operations: &[ClientOperation],
+) -> String {
+    let mut source = names.license_banner();
+    source.push_str(&format!(
+        "package {package};\n\
+         \n\
+         import java.io.IOException;\n\
+         import java.net.http.HttpResponse;\n\
+         import java.util.Map;\n\
+         \n\
+         /**\n\
+         \x20* Client for the {api} API, stage {stage}.\n\
+         \x20*\n\
+         {generated}\n\
+         \x20*/\n\
+         public interface {interface} {{\n\
+         \n\
+         \x20   /** The invoke endpoint of the stage this client was generated for. */\n\
+         \x20   String ENDPOINT = \"{endpoint}\";\n",
+        package = names.package,
+        api = target.api.name,
+        stage = target.stage.stage_name,
+        generated = commented(&target.generated_from(), " * "),
+        interface = names.interface,
+        endpoint = escaped_text(target.endpoint),
+    ));
+    for operation in operations {
+        source.push('\n');
+        source.push_str(&java_documentation(operation));
+        source.push_str(&format!(
+            "    HttpResponse<String> {name}({arguments}) throws IOException, \
+             InterruptedException;\n",
+            name = camel_case(&operation.words),
+            arguments = java_arguments(operation),
+        ));
+    }
+    source.push_str("}\n");
+    source
+}
+
+/// The doc comment one generated Java method carries, at the indentation a member of a type
+/// sits at.
+fn java_documentation(operation: &ClientOperation) -> String {
+    let body = operation
+        .documentation()
+        .iter()
+        .map(|line| format!("     * {line}").trim_end().to_string())
+        .collect::<Vec<String>>()
+        .join("\n");
+    format!("    /**\n{body}\n     */\n")
+}
+
+/// The argument list of one generated Java method: the verb when the method is the
+/// catch-all, one argument per path template parameter, then the query string, the headers
+/// and the body the method carries.
+fn java_arguments(operation: &ClientOperation) -> String {
+    let mut arguments: Vec<String> = Vec::new();
+    if operation.chooses_verb() {
+        arguments.push("String httpMethod".to_string());
+    }
+    for name in &operation.path_parameters {
+        arguments.push(format!("String {}", camel_case(&words(name))));
+    }
+    arguments.push("Map<String, String> queryParameters".to_string());
+    arguments.push("Map<String, String> headers".to_string());
+    if operation.carries_body() {
+        arguments.push("String body".to_string());
+    }
+    arguments.join(", ")
+}
+
+/// The client IMPLEMENTATION of a generated Java project: each method builds its request
+/// from the records' own path, verb and api key requirement and sends it to the stage's
+/// invoke endpoint.
+fn java_implementation(
+    target: ClientTarget<'_>,
+    names: &JavaNames<'_>,
+    operations: &[ClientOperation],
+) -> String {
+    let mut source = names.license_banner();
+    source.push_str(&format!(
+        "package {package};\n\
+         \n\
+         import java.io.IOException;\n\
+         import java.net.URI;\n\
+         import java.net.URLEncoder;\n\
+         import java.net.http.HttpClient;\n\
+         import java.net.http.HttpRequest;\n\
+         import java.net.http.HttpResponse;\n\
+         import java.nio.charset.StandardCharsets;\n\
+         import java.util.Map;\n\
+         \n\
+         /**\n\
+         \x20* The default {interface} implementation, over the HTTP client of the Java \
+         standard library.\n\
+         \x20*\n\
+         {generated}\n\
+         \x20*/\n\
+         public class {implementation} implements {interface} {{\n\
+         \n\
+         \x20   private final HttpClient http = HttpClient.newHttpClient();\n\
+         \x20   private final String endpoint;\n\
+         \x20   private final String apiKey;\n\
+         \n\
+         \x20   /** A client of the stage's own invoke endpoint, sending no api key. */\n\
+         \x20   public {implementation}() {{\n\
+         \x20       this(ENDPOINT, null);\n\
+         \x20   }}\n\
+         \n\
+         \x20   /** A client of {{@code endpoint}}, sending {{@code apiKey}} where a method \
+         requires one. */\n\
+         \x20   public {implementation}(String endpoint, String apiKey) {{\n\
+         \x20       this.endpoint = endpoint;\n\
+         \x20       this.apiKey = apiKey;\n\
+         \x20   }}\n",
+        package = names.package,
+        interface = names.interface,
+        implementation = names.implementation,
+        generated = commented(&target.generated_from(), " * "),
+    ));
+    for operation in operations {
+        source.push('\n');
+        source.push_str(&java_method(operation));
+    }
+    source.push_str(&format!(
+        "\n\
+         \x20   /** The query string of {{@code parameters}}, each name and value \
+         percent-encoded. */\n\
+         \x20   private static String queryString(Map<String, String> parameters) {{\n\
+         \x20       if (parameters == null || parameters.isEmpty()) {{\n\
+         \x20           return \"\";\n\
+         \x20       }}\n\
+         \x20       StringBuilder query = new StringBuilder(\"?\");\n\
+         \x20       for (Map.Entry<String, String> parameter : parameters.entrySet()) {{\n\
+         \x20           if (query.length() > 1) {{\n\
+         \x20               query.append('&');\n\
+         \x20           }}\n\
+         \x20           query.append(encode(parameter.getKey()))\n\
+         \x20               .append('=')\n\
+         \x20               .append(encode(parameter.getValue()));\n\
+         \x20       }}\n\
+         \x20       return query.toString();\n\
+         \x20   }}\n\
+         \n\
+         \x20   /** One path segment, percent-encoded. */\n\
+         \x20   private static String encodePath(String value) {{\n\
+         \x20       return encode(value).replace(\"+\", \"%20\");\n\
+         \x20   }}\n\
+         \n\
+         \x20   private static String encode(String value) {{\n\
+         \x20       return URLEncoder.encode(value == null ? \"\" : value, \
+         StandardCharsets.UTF_8);\n\
+         \x20   }}\n\
+         \n\
+         \x20   /** The caller's headers, and the api key where the method requires one. */\n\
+         \x20   private void applyHeaders(HttpRequest.Builder request, Map<String, String> \
+         headers, boolean apiKeyRequired) {{\n\
+         \x20       if (headers != null) {{\n\
+         \x20           headers.forEach(request::header);\n\
+         \x20       }}\n\
+         \x20       if (apiKeyRequired && this.apiKey != null) {{\n\
+         \x20           request.header(\"{API_KEY_HEADER}\", this.apiKey);\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n",
+    ));
+    source
+}
+
+/// One method of a generated Java client.
+fn java_method(operation: &ClientOperation) -> String {
+    let path = operation
+        .path_parts()
+        .iter()
+        .map(|part| match part {
+            PathPart::Literal(text) => format!("\"{}\"", escaped_text(text)),
+            PathPart::Parameter(name) => format!("encodePath({})", camel_case(&words(name))),
+        })
+        .collect::<Vec<String>>()
+        .join(" + ");
+    let verb = if operation.chooses_verb() {
+        "httpMethod".to_string()
+    } else {
+        format!("\"{}\"", escaped_text(&operation.verb))
+    };
+    let publisher = if operation.carries_body() {
+        "body == null ? HttpRequest.BodyPublishers.noBody() \
+         : HttpRequest.BodyPublishers.ofString(body)"
+    } else {
+        "HttpRequest.BodyPublishers.noBody()"
+    };
+    let content_type = if operation.carries_body() {
+        format!(
+            "        if (body != null) {{\n\
+             \x20           request.header(\"Content-Type\", \"{}\");\n\
+             \x20       }}\n",
+            escaped_text(&operation.request_media_type)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{documentation}\
+         \x20   @Override\n\
+         \x20   public HttpResponse<String> {name}({arguments}) throws IOException, \
+         InterruptedException {{\n\
+         \x20       String path = {path};\n\
+         \x20       HttpRequest.Builder request = HttpRequest.newBuilder()\n\
+         \x20           .uri(URI.create(this.endpoint + path + queryString(queryParameters)))\n\
+         \x20           .method({verb}, {publisher});\n\
+         {content_type}\
+         \x20       applyHeaders(request, headers, {api_key_required});\n\
+         \x20       return this.http.send(request.build(), HttpResponse.BodyHandlers.ofString());\n\
+         \x20   }}\n",
+        documentation = java_documentation(operation),
+        name = camel_case(&operation.words),
+        arguments = java_arguments(operation),
+        api_key_required = operation.api_key_required,
+    )
+}
+
+/// The names every file of a generated Ruby gem is written from, resolved from the request's
+/// configuration and the defaults each property's description states.
+#[derive(Debug)]
+struct RubyNames {
+    /// The gem's name (`ruby.gem-name`); defaults to the service name.
+    gem: String,
+    /// The module the client class sits in, derived from the gem name.
+    module_name: String,
+    /// The gem's version; defaults to [`DEFAULT_RUBY_GEM_VERSION`].
+    version: String,
+    /// The gem's one library file, the path the gemspec lists and `require` loads.
+    library: String,
+}
+
+impl RubyNames {
+    /// The names `configuration` asks for.
+    fn of(configuration: &Configuration) -> Self {
+        let service = words(configuration.property_or(SERVICE_NAME, ""));
+        let gem = configuration
+            .property(RUBY_GEM_NAME)
+            .map_or_else(|| named(&service, "api", snake_case), ruby_gem_name);
+        Self {
+            module_name: named(&words(&gem), "Api", pascal_case),
+            library: format!("lib/{gem}.rb"),
+            gem,
+            version: configuration
+                .property_or(RUBY_GEM_VERSION, DEFAULT_RUBY_GEM_VERSION)
+                .to_string(),
+        }
+    }
+}
+
+/// The gem a generated Ruby project is named for: the configured name where it is a gem
+/// name, and otherwise the name its words spell.
+///
+/// The gem name is the only configured value that NAMES FILES of the project — the gemspec
+/// and the one library file under `lib/` — so, like the Java package the sources sit under
+/// ([`java_package`]), it is a single path segment or it is derived into one: a value
+/// carrying a separator or a relative segment would name a file outside the project rather
+/// than one of it.
+fn ruby_gem_name(configured: &str) -> String {
+    let is_gem_name = !configured.is_empty()
+        && configured.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
+        && configured
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric() || first == '_');
+    if is_gem_name {
+        return configured.to_string();
+    }
+    named(&words(configured), "api", snake_case)
+}
+
+/// The Ruby project a `ruby` SDK is: the gemspec, the client the gem's one library file
+/// declares, and the README that states what the gem is.
+fn ruby_project(
+    target: ClientTarget<'_>,
+    configuration: &Configuration,
+    operations: &[ClientOperation],
+) -> Vec<ProjectFile> {
+    let names = RubyNames::of(configuration);
+    vec![
+        (
+            format!("{}.gemspec", names.gem),
+            ruby_gemspec(target, &names),
+        ),
+        (
+            "README.md".to_string(),
+            readme(
+                target,
+                operations,
+                &[
+                    ("Gem", format!("{} {}", names.gem, names.version)),
+                    ("Client", format!("{}::Client", names.module_name)),
+                ],
+            ),
+        ),
+        (
+            names.library.clone(),
+            ruby_client(target, &names, operations),
+        ),
+    ]
+}
+
+/// The gemspec of a generated gem.
+fn ruby_gemspec(target: ClientTarget<'_>, names: &RubyNames) -> String {
+    format!(
+        "# frozen_string_literal: true\n\
+         \n\
+         Gem::Specification.new do |spec|\n\
+         \x20 spec.name = \"{gem}\"\n\
+         \x20 spec.version = \"{version}\"\n\
+         \x20 spec.summary = \"Ruby client for the {api} API, stage {stage}\"\n\
+         \x20 spec.description = \"{description}\"\n\
+         \x20 spec.authors = [\"Amazon API Gateway\"]\n\
+         \x20 spec.files = [\"{library}\"]\n\
+         \x20 spec.require_paths = [\"lib\"]\n\
+         \x20 spec.metadata = {{\n\
+         \x20   \"rest_api_id\" => \"{api_id}\",\n\
+         \x20   \"stage\" => \"{stage}\",\n\
+         \x20   \"deployment_id\" => \"{deployment_id}\"\n\
+         \x20 }}\n\
+         end\n",
+        gem = ruby_text(&names.gem),
+        version = ruby_text(&names.version),
+        api = ruby_text(&target.api.name),
+        stage = ruby_text(&target.stage.stage_name),
+        description = ruby_text(&target.generated_from()),
+        library = ruby_text(&names.library),
+        api_id = ruby_text(&target.api.id),
+        deployment_id = ruby_text(&target.deployment.id),
+    )
+}
+
+/// The client class of a generated gem: one method per operation of the deployment.
+fn ruby_client(
+    target: ClientTarget<'_>,
+    names: &RubyNames,
+    operations: &[ClientOperation],
+) -> String {
+    let mut source = format!(
+        "# frozen_string_literal: true\n\
+         \n\
+         require \"cgi\"\n\
+         require \"net/http\"\n\
+         require \"uri\"\n\
+         \n\
+         # Client for the {api} API, stage {stage}.\n\
+         {generated}\n\
+         module {module_name}\n\
+         \x20 # The invoke endpoint of the stage this client was generated for.\n\
+         \x20 ENDPOINT = \"{endpoint}\"\n\
+         \n\
+         \x20 # The gem this client is generated under.\n\
+         \x20 GEM_NAME = \"{gem}\"\n\
+         \n\
+         \x20 # One call of the api, on behalf of the api key the client carries.\n\
+         \x20 class Client\n\
+         \x20   def initialize(endpoint: ENDPOINT, api_key: nil)\n\
+         \x20     @endpoint = endpoint\n\
+         \x20     @api_key = api_key\n\
+         \x20   end\n",
+        api = ruby_text(&target.api.name),
+        stage = ruby_text(&target.stage.stage_name),
+        generated = commented(&target.generated_from(), "# "),
+        module_name = names.module_name,
+        endpoint = ruby_text(target.endpoint),
+        gem = ruby_text(&names.gem),
+    );
+    for operation in operations {
+        source.push('\n');
+        source.push_str(&ruby_method(operation));
+    }
+    // The one request every generated method makes, in three parts so the api key header is
+    // written from the same constant the Java client sends it under.
+    source.push_str(
+        "\n    private\n\
+         \n\
+         \x20   # One request to the stage's invoke endpoint, carrying the query string, the\n\
+         \x20   # headers and the body the caller passed.\n\
+         \x20   def call(verb, path, query, headers, body, media_type, api_key_required)\n\
+         \x20     uri = URI(\"#{@endpoint}#{path}\")\n\
+         \x20     uri.query = URI.encode_www_form(query) unless query.nil? || query.empty?\n\
+         \x20     request = Net::HTTPGenericRequest.new(verb.to_s.upcase, !body.nil?, true, uri)\n\
+         \x20     headers&.each { |name, value| request[name] = value }\n",
+    );
+    source.push_str(&format!(
+        "      request[\"{API_KEY_HEADER}\"] = @api_key if api_key_required && \
+         !@api_key.nil?\n"
+    ));
+    source.push_str(
+        "      unless body.nil?\n\
+         \x20       request[\"Content-Type\"] = media_type\n\
+         \x20       request.body = body\n\
+         \x20     end\n\
+         \x20     Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == \"https\") \
+         do |http|\n\
+         \x20       http.request(request)\n\
+         \x20     end\n\
+         \x20   end\n\
+         \x20 end\n\
+         end\n",
+    );
+    source
+}
+
+/// One method of a generated Ruby client.
+fn ruby_method(operation: &ClientOperation) -> String {
+    let path = operation
+        .path_parts()
+        .iter()
+        .map(|part| match part {
+            PathPart::Literal(text) => ruby_text(text),
+            PathPart::Parameter(name) => {
+                format!("#{{CGI.escape({}.to_s)}}", snake_case(&words(name)))
+            }
+        })
+        .collect::<String>();
+    let mut arguments: Vec<String> = Vec::new();
+    if operation.chooses_verb() {
+        arguments.push("http_method".to_string());
+    }
+    for name in &operation.path_parameters {
+        arguments.push(snake_case(&words(name)));
+    }
+    arguments.push("query: {}".to_string());
+    arguments.push("headers: {}".to_string());
+    if operation.carries_body() {
+        arguments.push("body: nil".to_string());
+    }
+    let verb = if operation.chooses_verb() {
+        "http_method".to_string()
+    } else {
+        format!("\"{}\"", ruby_text(&operation.verb))
+    };
+    let body = if operation.carries_body() { "body" } else { "nil" };
+    format!(
+        "{documentation}\
+         \x20   def {name}({arguments})\n\
+         \x20     call({verb}, \"{path}\", query, headers, {body}, \"{media_type}\", \
+         {api_key_required})\n\
+         \x20   end\n",
+        documentation = ruby_documentation(operation),
+        name = snake_case(&operation.words),
+        arguments = arguments.join(", "),
+        media_type = ruby_text(&operation.request_media_type),
+        api_key_required = operation.api_key_required,
+    )
+}
+
+/// The comment one generated Ruby method carries, at the indentation a method of a class
+/// sits at.
+fn ruby_documentation(operation: &ClientOperation) -> String {
+    operation
+        .documentation()
+        .iter()
+        .map(|line| format!("    # {line}\n"))
+        .collect()
+}
+
+/// The JavaScript project a `javascript` SDK is: the package manifest, the module that
+/// hands back a client, and the README that states what the package is.
+///
+/// `GetSdkRequest$parameters` documents no parameter for this generator, so the package is
+/// named for the api itself rather than for anything configured.
+fn javascript_project(
+    target: ClientTarget<'_>,
+    operations: &[ClientOperation],
+) -> Vec<ProjectFile> {
+    let package = named(&words(&target.api.name), "api", kebab_case);
+    vec![
+        (
+            "package.json".to_string(),
+            javascript_manifest(target, &package),
+        ),
+        (
+            "README.md".to_string(),
+            readme(
+                target,
+                operations,
+                &[
+                    ("Package", format!("{package} {DEFAULT_PACKAGE_VERSION}")),
+                    ("Module", JAVASCRIPT_MODULE.to_string()),
+                ],
+            ),
+        ),
+        (
+            JAVASCRIPT_MODULE.to_string(),
+            javascript_module(target, operations),
+        ),
+    ]
+}
+
+/// The `package.json` of a generated JavaScript package, written through this crate's JSON
+/// writer so the manifest is a JSON document rather than text assembled by hand.
+fn javascript_manifest(target: ClientTarget<'_>, package: &str) -> String {
+    let manifest = ::serde_json::json!({
+        "name": package,
+        "version": DEFAULT_PACKAGE_VERSION,
+        "description": target.generated_from(),
+        "main": JAVASCRIPT_MODULE,
+        // Not published to a registry: the package is the caller's own client of their own
+        // api, generated for them.
+        "private": true,
+        "apiGateway": {
+            "restApiId": target.api.id,
+            "stage": target.stage.stage_name,
+            "deploymentId": target.deployment.id,
+        },
+    });
+    format!(
+        "{}\n",
+        ::serde_json::to_string_pretty(&manifest).unwrap_or_default()
+    )
+}
+
+/// The module of a generated JavaScript package: one client method per operation of the
+/// deployment, over the `fetch` of the runtime the module is loaded in.
+fn javascript_module(target: ClientTarget<'_>, operations: &[ClientOperation]) -> String {
+    let mut source = format!(
+        "'use strict';\n\
+         \n\
+         {generated}\n\
+         \n\
+         /** The invoke endpoint of the stage this client was generated for. */\n\
+         const ENDPOINT = \"{endpoint}\";\n\
+         \n\
+         /** The header a method that requires an api key sends it in. */\n\
+         const API_KEY_HEADER = \"{API_KEY_HEADER}\";\n",
+        generated = commented(&target.generated_from(), "// "),
+        endpoint = escaped_text(target.endpoint),
+    );
+    source.push_str(
+        "\n\
+         /** The query string of `query`, each name and value percent-encoded. */\n\
+         function queryString(query) {\n\
+         \x20 const entries = Object.entries(query || {});\n\
+         \x20 if (entries.length === 0) {\n\
+         \x20   return '';\n\
+         \x20 }\n\
+         \x20 return '?' + entries.map(function (entry) {\n\
+         \x20   return encodeURIComponent(entry[0]) + '=' + encodeURIComponent(entry[1]);\n\
+         \x20 }).join('&');\n\
+         }\n\
+         \n\
+         /** A client of the stage, over the `fetch` of this runtime. */\n\
+         function client(options) {\n\
+         \x20 const settings = Object.assign(\n\
+         \x20   { endpoint: ENDPOINT, apiKey: null, fetch: globalThis.fetch },\n\
+         \x20   options || {}\n\
+         \x20 );\n\
+         \n\
+         \x20 function call(verb, path, query, headers, body, mediaType, apiKeyRequired) {\n\
+         \x20   const sent = Object.assign({}, headers || {});\n\
+         \x20   if (apiKeyRequired && settings.apiKey) {\n\
+         \x20     sent[API_KEY_HEADER] = settings.apiKey;\n\
+         \x20   }\n\
+         \x20   if (body !== null && body !== undefined) {\n\
+         \x20     sent['Content-Type'] = mediaType;\n\
+         \x20   }\n\
+         \x20   return settings.fetch(settings.endpoint + path + queryString(query), {\n\
+         \x20     method: verb,\n\
+         \x20     headers: sent,\n\
+         \x20     body: body === undefined ? null : body\n\
+         \x20   });\n\
+         \x20 }\n\
+         \n\
+         \x20 return {\n",
+    );
+    for operation in operations {
+        source.push_str(&javascript_method(operation));
+    }
+    source.push_str(
+        "\x20 };\n\
+         }\n\
+         \n\
+         module.exports = { client: client, ENDPOINT: ENDPOINT };\n",
+    );
+    source
+}
+
+/// One method of a generated JavaScript client, as an entry of the object the factory hands
+/// back.
+fn javascript_method(operation: &ClientOperation) -> String {
+    let mut arguments: Vec<String> = Vec::new();
+    if operation.chooses_verb() {
+        arguments.push("httpMethod".to_string());
+    }
+    for name in &operation.path_parameters {
+        arguments.push(camel_case(&words(name)));
+    }
+    arguments.push("query".to_string());
+    arguments.push("headers".to_string());
+    if operation.carries_body() {
+        arguments.push("body".to_string());
+    }
+    let path = operation
+        .path_parts()
+        .iter()
+        .map(|part| match part {
+            PathPart::Literal(text) => format!("\"{}\"", escaped_text(text)),
+            PathPart::Parameter(name) => {
+                format!("encodeURIComponent({})", camel_case(&words(name)))
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" + ");
+    let verb = if operation.chooses_verb() {
+        "httpMethod".to_string()
+    } else {
+        format!("\"{}\"", escaped_text(&operation.verb))
+    };
+    let body = if operation.carries_body() {
+        "body"
+    } else {
+        "null"
+    };
+    format!(
+        "{documentation}\
+         \x20   {name}: function ({arguments}) {{\n\
+         \x20     return call({verb}, {path}, query, headers, {body}, \"{media_type}\", \
+         {api_key_required});\n\
+         \x20   }},\n",
+        documentation = operation
+            .documentation()
+            .iter()
+            .map(|line| format!("    // {line}\n"))
+            .collect::<String>(),
+        name = camel_case(&operation.words),
+        arguments = arguments.join(", "),
+        media_type = escaped_text(&operation.request_media_type),
+        api_key_required = operation.api_key_required,
+    )
+}
+
+/// The names every file of a generated Android project is written from: the four parameters
+/// `GetSdkRequest$parameters` documents as required for the sdkType, so every one of them is
+/// set by the time a project is written.
+#[derive(Debug)]
+struct AndroidNames {
+    /// The Gradle group id (`groupId`).
+    group_id: String,
+    /// The Gradle project name (`artifactId`).
+    artifact_id: String,
+    /// The project's version (`artifactVersion`).
+    version: String,
+    /// The package the client is generated under (`invokerPackage`).
+    package: String,
+    /// The client class's type name, derived from the artifact id.
+    client: String,
+}
+
+impl AndroidNames {
+    /// The names `configuration` asks for.
+    fn of(configuration: &Configuration) -> Self {
+        let artifact_id = configuration.property_or(ARTIFACT_ID, "").to_string();
+        Self {
+            group_id: configuration.property_or(GROUP_ID, "").to_string(),
+            client: format!(
+                "{}Client",
+                named(&words(&artifact_id), "Api", pascal_case)
+            ),
+            artifact_id,
+            version: configuration
+                .property_or(ARTIFACT_VERSION, DEFAULT_PACKAGE_VERSION)
+                .to_string(),
+            package: java_package(configuration.property_or(INVOKER_PACKAGE, "")),
+        }
+    }
+}
+
+/// The Android project an `android` SDK is: a Gradle project whose one class calls the stage
+/// over the HTTP client Android ships (`java.net.HttpURLConnection`), and the README that
+/// states what the project is.
+fn android_project(
+    target: ClientTarget<'_>,
+    configuration: &Configuration,
+    operations: &[ClientOperation],
+) -> Vec<ProjectFile> {
+    let names = AndroidNames::of(configuration);
+    vec![
+        (
+            "build.gradle".to_string(),
+            gradle_build(&names.group_id, &names.version),
+        ),
+        (
+            "settings.gradle".to_string(),
+            format!("rootProject.name = '{}'\n", escaped_text(&names.artifact_id)),
+        ),
+        (
+            "README.md".to_string(),
+            readme(
+                target,
+                operations,
+                &[
+                    ("Package", names.package.clone()),
+                    ("Client", names.client.clone()),
+                    (
+                        "Artifact",
+                        format!(
+                            "{}:{}:{}",
+                            names.group_id, names.artifact_id, names.version
+                        ),
+                    ),
+                ],
+            ),
+        ),
+        (
+            format!(
+                "src/main/java/{}/{}.java",
+                names.package.replace('.', "/"),
+                names.client
+            ),
+            android_client(target, &names, operations),
+        ),
+    ]
+}
+
+/// The client class of a generated Android project.
+fn android_client(
+    target: ClientTarget<'_>,
+    names: &AndroidNames,
+    operations: &[ClientOperation],
+) -> String {
+    let mut source = format!(
+        "package {package};\n\
+         \n\
+         import java.io.ByteArrayOutputStream;\n\
+         import java.io.IOException;\n\
+         import java.io.InputStream;\n\
+         import java.io.OutputStream;\n\
+         import java.net.HttpURLConnection;\n\
+         import java.net.URL;\n\
+         import java.net.URLEncoder;\n\
+         import java.nio.charset.StandardCharsets;\n\
+         import java.util.Map;\n\
+         \n\
+         /**\n\
+         \x20* Client for the {api} API, stage {stage}.\n\
+         \x20*\n\
+         {generated}\n\
+         \x20*/\n\
+         public class {client} {{\n\
+         \n\
+         \x20   /** The invoke endpoint of the stage this client was generated for. */\n\
+         \x20   public static final String ENDPOINT = \"{endpoint}\";\n\
+         \n\
+         \x20   private final String endpoint;\n\
+         \x20   private final String apiKey;\n\
+         \n\
+         \x20   /** A client of the stage's own invoke endpoint, sending no api key. */\n\
+         \x20   public {client}() {{\n\
+         \x20       this(ENDPOINT, null);\n\
+         \x20   }}\n\
+         \n\
+         \x20   public {client}(String endpoint, String apiKey) {{\n\
+         \x20       this.endpoint = endpoint;\n\
+         \x20       this.apiKey = apiKey;\n\
+         \x20   }}\n",
+        package = names.package,
+        api = target.api.name,
+        stage = target.stage.stage_name,
+        generated = commented(&target.generated_from(), " * "),
+        client = names.client,
+        endpoint = escaped_text(target.endpoint),
+    );
+    for operation in operations {
+        source.push('\n');
+        source.push_str(&android_method(operation));
+    }
+    source.push_str(&format!(
+        "\n\
+         \x20   /** The response of one request to the stage, as text. */\n\
+         \x20   private String send(String verb, String path, Map<String, String> \
+         queryParameters, Map<String, String> headers, String body, String mediaType, boolean \
+         apiKeyRequired) throws IOException {{\n\
+         \x20       URL url = new URL(this.endpoint + path + queryString(queryParameters));\n\
+         \x20       HttpURLConnection connection = (HttpURLConnection) url.openConnection();\n\
+         \x20       connection.setRequestMethod(verb);\n\
+         \x20       if (headers != null) {{\n\
+         \x20           for (Map.Entry<String, String> header : headers.entrySet()) {{\n\
+         \x20               connection.setRequestProperty(header.getKey(), header.getValue());\n\
+         \x20           }}\n\
+         \x20       }}\n\
+         \x20       if (apiKeyRequired && this.apiKey != null) {{\n\
+         \x20           connection.setRequestProperty(\"{API_KEY_HEADER}\", this.apiKey);\n\
+         \x20       }}\n\
+         \x20       if (body != null) {{\n\
+         \x20           connection.setDoOutput(true);\n\
+         \x20           connection.setRequestProperty(\"Content-Type\", mediaType);\n\
+         \x20           try (OutputStream out = connection.getOutputStream()) {{\n\
+         \x20               out.write(body.getBytes(StandardCharsets.UTF_8));\n\
+         \x20           }}\n\
+         \x20       }}\n\
+         \x20       try (InputStream in = connection.getInputStream()) {{\n\
+         \x20           return read(in);\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         \n\
+         \x20   private static String read(InputStream in) throws IOException {{\n\
+         \x20       ByteArrayOutputStream read = new ByteArrayOutputStream();\n\
+         \x20       byte[] buffer = new byte[8192];\n\
+         \x20       int taken;\n\
+         \x20       while ((taken = in.read(buffer)) != -1) {{\n\
+         \x20           read.write(buffer, 0, taken);\n\
+         \x20       }}\n\
+         \x20       return read.toString(StandardCharsets.UTF_8.name());\n\
+         \x20   }}\n\
+         \n\
+         \x20   private static String queryString(Map<String, String> parameters) throws \
+         IOException {{\n\
+         \x20       if (parameters == null || parameters.isEmpty()) {{\n\
+         \x20           return \"\";\n\
+         \x20       }}\n\
+         \x20       StringBuilder query = new StringBuilder(\"?\");\n\
+         \x20       for (Map.Entry<String, String> parameter : parameters.entrySet()) {{\n\
+         \x20           if (query.length() > 1) {{\n\
+         \x20               query.append('&');\n\
+         \x20           }}\n\
+         \x20           query.append(encode(parameter.getKey()))\n\
+         \x20               .append('=')\n\
+         \x20               .append(encode(parameter.getValue()));\n\
+         \x20       }}\n\
+         \x20       return query.toString();\n\
+         \x20   }}\n\
+         \n\
+         \x20   /** One path segment, percent-encoded. */\n\
+         \x20   private static String encodePath(String value) throws IOException {{\n\
+         \x20       return encode(value).replace(\"+\", \"%20\");\n\
+         \x20   }}\n\
+         \n\
+         \x20   private static String encode(String value) throws IOException {{\n\
+         \x20       return URLEncoder.encode(value == null ? \"\" : value, \
+         StandardCharsets.UTF_8.name());\n\
+         \x20   }}\n\
+         }}\n",
+    ));
+    source
+}
+
+/// One method of a generated Android client.
+fn android_method(operation: &ClientOperation) -> String {
+    let path = operation
+        .path_parts()
+        .iter()
+        .map(|part| match part {
+            PathPart::Literal(text) => format!("\"{}\"", escaped_text(text)),
+            PathPart::Parameter(name) => format!("encodePath({})", camel_case(&words(name))),
+        })
+        .collect::<Vec<String>>()
+        .join(" + ");
+    let verb = if operation.chooses_verb() {
+        "httpMethod".to_string()
+    } else {
+        format!("\"{}\"", escaped_text(&operation.verb))
+    };
+    let body = if operation.carries_body() {
+        "body"
+    } else {
+        "null"
+    };
+    format!(
+        "{documentation}\
+         \x20   public String {name}({arguments}) throws IOException {{\n\
+         \x20       return send({verb}, {path}, queryParameters, headers, {body}, \
+         \"{media_type}\", {api_key_required});\n\
+         \x20   }}\n",
+        documentation = java_documentation(operation),
+        name = camel_case(&operation.words),
+        arguments = java_arguments(operation),
+        media_type = escaped_text(&operation.request_media_type),
+        api_key_required = operation.api_key_required,
+    )
+}
+
+/// The class name prefix an `objectivec` or `swift` project's types carry: the configured
+/// `classPrefix` where it is one a type name can start with, and otherwise the name its
+/// words spell, which is what makes the generated types' names valid.
+fn class_prefix(configuration: &Configuration) -> String {
+    let configured = configuration.property_or(CLASS_PREFIX, "");
+    if !configured.is_empty()
+        && configured
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && configured
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return configured.to_string();
+    }
+    named(&words(configured), "Api", pascal_case)
+}
+
+/// The Objective-C project an `objectivec` SDK is: the class pair whose methods call the
+/// stage over `NSURLSession`, and the README that states what the sources are.
+fn objectivec_project(
+    target: ClientTarget<'_>,
+    configuration: &Configuration,
+    operations: &[ClientOperation],
+) -> Vec<ProjectFile> {
+    let client = format!("{}Client", class_prefix(configuration));
+    vec![
+        (
+            "README.md".to_string(),
+            readme(
+                target,
+                operations,
+                &[("Client", client.clone()), ("Framework", "Foundation".to_string())],
+            ),
+        ),
+        (
+            format!("{client}.h"),
+            objectivec_header(target, &client, operations),
+        ),
+        (
+            format!("{client}.m"),
+            objectivec_implementation(target, &client, operations),
+        ),
+    ]
+}
+
+/// The declaration of one generated Objective-C method, without its trailing `;` or body:
+/// the method's own name takes the first path parameter, each further path parameter is its
+/// own keyword, and the query string, the headers, the body and the completion handler
+/// follow.
+fn objectivec_signature(operation: &ClientOperation) -> String {
+    let dictionary = "NSDictionary<NSString *, NSString *> *";
+    let name = camel_case(&operation.words);
+    let mut signature = String::from("- (void)");
+    let mut keywords: Vec<String> = Vec::new();
+    if operation.chooses_verb() {
+        keywords.push(format!("{name}:(NSString *)httpMethod"));
+    }
+    for parameter in &operation.path_parameters {
+        let argument = camel_case(&words(parameter));
+        if keywords.is_empty() {
+            keywords.push(format!("{name}:(NSString *){argument}"));
+        } else {
+            keywords.push(format!("{argument}:(NSString *){argument}"));
+        }
+    }
+    if keywords.is_empty() {
+        keywords.push(format!("{name}WithQuery:({dictionary})query"));
+    } else {
+        keywords.push(format!("query:({dictionary})query"));
+    }
+    keywords.push(format!("headers:({dictionary})headers"));
+    if operation.carries_body() {
+        keywords.push("body:(NSData *)body".to_string());
+    }
+    keywords.push(
+        "completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler"
+            .to_string(),
+    );
+    signature.push_str(&keywords.join(" "));
+    signature
+}
+
+/// The header of a generated Objective-C client: the class, its two settings, and one
+/// declaration per operation of the deployment.
+fn objectivec_header(
+    target: ClientTarget<'_>,
+    client: &str,
+    operations: &[ClientOperation],
+) -> String {
+    let mut source = format!(
+        "{generated}\n\
+         \n\
+         #import <Foundation/Foundation.h>\n\
+         \n\
+         /// Client for the {api} API, stage {stage}.\n\
+         @interface {client} : NSObject\n\
+         \n\
+         /// The invoke endpoint of the stage this client was generated for.\n\
+         @property (nonatomic, copy) NSString *endpoint;\n\
+         \n\
+         /// The api key sent where a method requires one.\n\
+         @property (nonatomic, copy) NSString *apiKey;\n",
+        generated = commented(&target.generated_from(), "// "),
+        api = target.api.name,
+        stage = target.stage.stage_name,
+    );
+    for operation in operations {
+        source.push('\n');
+        source.push_str(&objectivec_documentation(operation));
+        source.push_str(&format!("{};\n", objectivec_signature(operation)));
+    }
+    source.push_str("\n@end\n");
+    source
+}
+
+/// The implementation of a generated Objective-C client: each method hands its own verb,
+/// path and api key requirement to the one request the class makes.
+fn objectivec_implementation(
+    target: ClientTarget<'_>,
+    client: &str,
+    operations: &[ClientOperation],
+) -> String {
+    let mut source = format!(
+        "{generated}\n\
+         \n\
+         #import \"{client}.h\"\n\
+         \n\
+         static NSString *const {client}Endpoint = @\"{endpoint}\";\n\
+         static NSString *const {client}ApiKeyHeader = @\"{API_KEY_HEADER}\";\n\
+         \n\
+         @implementation {client}\n",
+        generated = commented(&target.generated_from(), "// "),
+        endpoint = escaped_text(target.endpoint),
+    );
+    source.push_str(&format!(
+        "\n- (instancetype)init {{\n\
+         \x20   self = [super init];\n\
+         \x20   if (self) {{\n\
+         \x20       _endpoint = {client}Endpoint;\n\
+         \x20   }}\n\
+         \x20   return self;\n\
+         }}\n",
+    ));
+    for operation in operations {
+        source.push('\n');
+        source.push_str(&objectivec_method(operation));
+    }
+    source.push_str(&format!(
+        "\n- (void)sendMethod:(NSString *)verb\n\
+         \x20             path:(NSString *)path\n\
+         \x20            query:(NSDictionary<NSString *, NSString *> *)query\n\
+         \x20          headers:(NSDictionary<NSString *, NSString *> *)headers\n\
+         \x20             body:(NSData *)body\n\
+         \x20        mediaType:(NSString *)mediaType\n\
+         \x20   apiKeyRequired:(BOOL)apiKeyRequired\n\
+         \x20completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler \
+         {{\n\
+         \x20   NSURLComponents *components =\n\
+         \x20       [NSURLComponents componentsWithString:[self.endpoint \
+         stringByAppendingString:path]];\n\
+         \x20   NSMutableArray<NSURLQueryItem *> *items = [NSMutableArray array];\n\
+         \x20   for (NSString *name in query) {{\n\
+         \x20       [items addObject:[NSURLQueryItem queryItemWithName:name value:query[name]]];\n\
+         \x20   }}\n\
+         \x20   if (items.count > 0) {{\n\
+         \x20       components.queryItems = items;\n\
+         \x20   }}\n\
+         \x20   NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:components.URL];\n\
+         \x20   request.HTTPMethod = verb;\n\
+         \x20   for (NSString *name in headers) {{\n\
+         \x20       [request setValue:headers[name] forHTTPHeaderField:name];\n\
+         \x20   }}\n\
+         \x20   if (apiKeyRequired && self.apiKey != nil) {{\n\
+         \x20       [request setValue:self.apiKey forHTTPHeaderField:{client}ApiKeyHeader];\n\
+         \x20   }}\n\
+         \x20   if (body != nil) {{\n\
+         \x20       [request setValue:mediaType forHTTPHeaderField:@\"Content-Type\"];\n\
+         \x20       request.HTTPBody = body;\n\
+         \x20   }}\n\
+         \x20   [[[NSURLSession sharedSession] dataTaskWithRequest:request\n\
+         \x20                                   completionHandler:completionHandler] resume];\n\
+         }}\n\
+         \n\
+         /// One path segment, percent-encoded.\n\
+         - (NSString *)escape:(NSString *)value {{\n\
+         \x20   return [value stringByAddingPercentEncodingWithAllowedCharacters:\n\
+         \x20               [NSCharacterSet alphanumericCharacterSet]] ?: @\"\";\n\
+         }}\n\
+         \n\
+         @end\n",
+    ));
+    source
+}
+
+/// One method of a generated Objective-C client.
+fn objectivec_method(operation: &ClientOperation) -> String {
+    let (path, arguments) = formatted_path(operation, "%@", |parameter| {
+        format!("[self escape:{}]", camel_case(&words(parameter)))
+    });
+    let path = if arguments.is_empty() {
+        format!("@\"{path}\"")
+    } else {
+        format!(
+            "[NSString stringWithFormat:@\"{path}\", {}]",
+            arguments.join(", ")
+        )
+    };
+    let verb = if operation.chooses_verb() {
+        "httpMethod".to_string()
+    } else {
+        format!("@\"{}\"", escaped_text(&operation.verb))
+    };
+    let body = if operation.carries_body() {
+        "body"
+    } else {
+        "nil"
+    };
+    format!(
+        "{documentation}\
+         {signature} {{\n\
+         \x20   [self sendMethod:{verb}\n\
+         \x20               path:{path}\n\
+         \x20              query:query\n\
+         \x20            headers:headers\n\
+         \x20               body:{body}\n\
+         \x20          mediaType:@\"{media_type}\"\n\
+         \x20     apiKeyRequired:{api_key_required}\n\
+         \x20  completionHandler:completionHandler];\n\
+         }}\n",
+        documentation = objectivec_documentation(operation),
+        signature = objectivec_signature(operation),
+        media_type = escaped_text(&operation.request_media_type),
+        api_key_required = if operation.api_key_required {
+            "YES"
+        } else {
+            "NO"
+        },
+    )
+}
+
+/// The comment one generated Objective-C declaration or definition carries.
+fn objectivec_documentation(operation: &ClientOperation) -> String {
+    operation
+        .documentation()
+        .iter()
+        .map(|line| format!("/// {line}\n"))
+        .collect()
+}
+
+/// A request path as a format string and the arguments that fill it: `/pets/%@` and the
+/// escaped parameters, which is how an Objective-C client builds one.
+fn formatted_path(
+    operation: &ClientOperation,
+    placeholder: &str,
+    escape: impl Fn(&str) -> String,
+) -> (String, Vec<String>) {
+    let mut path = String::new();
+    let mut arguments: Vec<String> = Vec::new();
+    for part in operation.path_parts() {
+        match part {
+            PathPart::Literal(text) => path.push_str(&escaped_text(&text)),
+            PathPart::Parameter(name) => {
+                path.push_str(placeholder);
+                arguments.push(escape(&name));
+            }
+        }
+    }
+    (path, arguments)
+}
+
+/// The Swift project a `swift` SDK is: the package manifest, the one target's client over
+/// `URLSession`, and the README that states what the package is.
+fn swift_project(
+    target: ClientTarget<'_>,
+    configuration: &Configuration,
+    operations: &[ClientOperation],
+) -> Vec<ProjectFile> {
+    let client = format!("{}Client", class_prefix(configuration));
+    vec![
+        (
+            "Package.swift".to_string(),
+            swift_manifest(&client),
+        ),
+        (
+            "README.md".to_string(),
+            readme(
+                target,
+                operations,
+                &[
+                    ("Package", format!("{client} {DEFAULT_PACKAGE_VERSION}")),
+                    ("Client", client.clone()),
+                ],
+            ),
+        ),
+        (
+            format!("Sources/{client}/{client}.swift"),
+            swift_client(target, &client, operations),
+        ),
+    ]
+}
+
+/// The `Package.swift` of a generated Swift package: one library product, one target.
+fn swift_manifest(client: &str) -> String {
+    format!(
+        "// swift-tools-version:5.7\n\
+         import PackageDescription\n\
+         \n\
+         let package = Package(\n\
+         \x20   name: \"{client}\",\n\
+         \x20   products: [\n\
+         \x20       .library(name: \"{client}\", targets: [\"{client}\"])\n\
+         \x20   ],\n\
+         \x20   targets: [\n\
+         \x20       .target(name: \"{client}\")\n\
+         \x20   ]\n\
+         )\n",
+    )
+}
+
+/// The client of a generated Swift package: one method per operation of the deployment.
+fn swift_client(
+    target: ClientTarget<'_>,
+    client: &str,
+    operations: &[ClientOperation],
+) -> String {
+    let mut source = format!(
+        "{generated}\n\
+         \n\
+         import Foundation\n\
+         \n\
+         /// Client for the {api} API, stage {stage}.\n\
+         public struct {client} {{\n\
+         \n\
+         \x20   /// The invoke endpoint of the stage this client was generated for.\n\
+         \x20   public static let endpoint = \"{endpoint}\"\n\
+         \n\
+         \x20   /// The header a method that requires an api key sends it in.\n\
+         \x20   public static let apiKeyHeader = \"{API_KEY_HEADER}\"\n\
+         \n\
+         \x20   private let endpoint: String\n\
+         \x20   private let apiKey: String?\n\
+         \n\
+         \x20   public init(endpoint: String = {client}.endpoint, apiKey: String? = nil) {{\n\
+         \x20       self.endpoint = endpoint\n\
+         \x20       self.apiKey = apiKey\n\
+         \x20   }}\n",
+        generated = commented(&target.generated_from(), "// "),
+        api = target.api.name,
+        stage = target.stage.stage_name,
+        endpoint = escaped_text(target.endpoint),
+    );
+    for operation in operations {
+        source.push('\n');
+        source.push_str(&swift_method(operation));
+    }
+    source.push_str(&format!(
+        "\n\
+         \x20   /// One request to the stage's invoke endpoint.\n\
+         \x20   private func send(verb: String, path: String, query: [String: String], headers: \
+         [String: String], body: Data?, mediaType: String, apiKeyRequired: Bool, completion: \
+         @escaping (Data?, URLResponse?, Error?) -> Void) {{\n\
+         \x20       var components = URLComponents(string: self.endpoint + path)\n\
+         \x20       if !query.isEmpty {{\n\
+         \x20           components?.queryItems = query.map {{ URLQueryItem(name: $0.key, value: \
+         $0.value) }}\n\
+         \x20       }}\n\
+         \x20       guard let url = components?.url else {{\n\
+         \x20           completion(nil, nil, URLError(.badURL))\n\
+         \x20           return\n\
+         \x20       }}\n\
+         \x20       var request = URLRequest(url: url)\n\
+         \x20       request.httpMethod = verb\n\
+         \x20       for (name, value) in headers {{\n\
+         \x20           request.setValue(value, forHTTPHeaderField: name)\n\
+         \x20       }}\n\
+         \x20       if apiKeyRequired, let apiKey = self.apiKey {{\n\
+         \x20           request.setValue(apiKey, forHTTPHeaderField: {client}.apiKeyHeader)\n\
+         \x20       }}\n\
+         \x20       if let body = body {{\n\
+         \x20           request.setValue(mediaType, forHTTPHeaderField: \"Content-Type\")\n\
+         \x20           request.httpBody = body\n\
+         \x20       }}\n\
+         \x20       URLSession.shared.dataTask(with: request) {{ data, response, error in\n\
+         \x20           completion(data, response, error)\n\
+         \x20       }}.resume()\n\
+         \x20   }}\n\
+         \n\
+         \x20   /// One path segment, percent-encoded.\n\
+         \x20   private func escape(_ value: String) -> String {{\n\
+         \x20       return value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? \
+         value\n\
+         \x20   }}\n\
+         }}\n",
+    ));
+    source
+}
+
+/// One method of a generated Swift client.
+fn swift_method(operation: &ClientOperation) -> String {
+    let mut arguments: Vec<String> = Vec::new();
+    if operation.chooses_verb() {
+        arguments.push("_ httpMethod: String".to_string());
+    }
+    for parameter in &operation.path_parameters {
+        arguments.push(format!("_ {}: String", camel_case(&words(parameter))));
+    }
+    arguments.push("query: [String: String] = [:]".to_string());
+    arguments.push("headers: [String: String] = [:]".to_string());
+    if operation.carries_body() {
+        arguments.push("body: Data? = nil".to_string());
+    }
+    arguments.push("completion: @escaping (Data?, URLResponse?, Error?) -> Void".to_string());
+    // Swift builds the path by interpolating the escaped parameters into the literal.
+    let mut path = String::new();
+    for part in operation.path_parts() {
+        match part {
+            PathPart::Literal(text) => path.push_str(&escaped_text(&text)),
+            PathPart::Parameter(name) => {
+                path.push_str(&format!("\\(escape({}))", camel_case(&words(&name))));
+            }
+        }
+    }
+    let verb = if operation.chooses_verb() {
+        "httpMethod".to_string()
+    } else {
+        format!("\"{}\"", escaped_text(&operation.verb))
+    };
+    let body = if operation.carries_body() {
+        "body"
+    } else {
+        "nil"
+    };
+    format!(
+        "{documentation}\
+         \x20   public func {name}({arguments}) {{\n\
+         \x20       send(verb: {verb}, path: \"{path}\", query: query, headers: headers, \
+         body: {body}, mediaType: \"{media_type}\", apiKeyRequired: {api_key_required}, \
+         completion: completion)\n\
+         \x20   }}\n",
+        documentation = operation
+            .documentation()
+            .iter()
+            .map(|line| format!("    /// {line}\n"))
+            .collect::<String>(),
+        name = camel_case(&operation.words),
+        arguments = arguments.join(", "),
+        media_type = escaped_text(&operation.request_media_type),
+        api_key_required = operation.api_key_required,
+    )
+}
+
+/// The README every generated project carries: what the SDK is for, where it calls, the
+/// configuration it was generated with, and which operation each client method is.
+fn readme(
+    target: ClientTarget<'_>,
+    operations: &[ClientOperation],
+    facts: &[(&str, String)],
+) -> String {
+    let mut readme = format!(
+        "# {api} SDK\n\
+         \n\
+         {generated}\n\
+         \n\
+         * REST API: `{api_id}`\n\
+         * Stage: `{stage}`\n\
+         * Deployment: `{deployment_id}`\n\
+         * Endpoint: `{endpoint}`\n",
+        api = target.api.name,
+        generated = target.generated_from(),
+        api_id = target.api.id,
+        stage = target.stage.stage_name,
+        deployment_id = target.deployment.id,
+        endpoint = target.endpoint,
+    );
+    for (fact, value) in facts {
+        readme.push_str(&format!("* {fact}: `{value}`\n"));
+    }
+    readme.push_str("\n## Operations\n\n");
+    if operations.is_empty() {
+        readme.push_str(
+            "The deployment this SDK was generated from carries no method, so the client \
+             carries no call.\n",
+        );
+        return readme;
+    }
+    for operation in operations {
+        readme.push_str(&format!(
+            "* `{}` — {} {}. {}\n",
+            camel_case(&operation.words),
+            operation.verb,
+            operation.path,
+            operation.authorization_note(),
+        ));
+    }
+    readme
+}
+
+/// The package a generated Java or Android project's sources sit under: the configured
+/// package name where it is one, and otherwise the package its words spell — a configured
+/// value that is not a package name cannot name a directory of sources, and `client` for a
+/// value that spells nothing at all.
+///
+/// A segment that would start with a digit is prefixed with `_`, which is what makes it a
+/// Java identifier.
+fn java_package(configured: &str) -> String {
+    if is_java_package_name(configured) {
+        return configured.to_string();
+    }
+    let segments: Vec<String> = words(configured)
+        .into_iter()
+        .map(|word| {
+            if word.starts_with(|first: char| first.is_ascii_digit()) {
+                format!("_{word}")
+            } else {
+                word
+            }
+        })
+        .collect();
+    if segments.is_empty() {
+        return "client".to_string();
+    }
+    segments.join(".")
+}
+
+/// Whether `package` is a Java package name: dot-separated identifiers, each starting with a
+/// letter or an underscore and carrying only letters, digits and underscores.
+///
+/// A configured package name that is not one cannot name a directory of sources, so the
+/// generated package is the one [`java_package`] derives from it instead.
+fn is_java_package_name(package: &str) -> bool {
+    !package.is_empty()
+        && package.split('.').all(|segment| {
+            segment
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && segment
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,18 +2547,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSdk` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSdkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSdk"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let bad_request = |message: String| -> Self::Error {
+            GetSdkErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // What the request asks for is resolved before the store is read, so a request
+        // naming a generator this service publishes none of, or configuring one with what
+        // it cannot be run on, is refused the same way whether or not the api exists.
+        let generator = Generator::parse(&input.sdk_type)?;
+        let configuration =
+            read_configuration(generator, input.parameters.as_ref()).map_err(bad_request)?;
+        let region = crate::state::request_region(ctx.parts());
+
+        let store = state.lock();
+        // The SDK is a client of ONE stage, so the `(restApiId, stageName)` pair is resolved
+        // as ONE lookup for that stage, exactly as an export of the same stage resolves it:
+        // an identifier no stored api answers to leaves the addressed stage unresolvable
+        // too, and the refusal names the stage.
+        let (api, stage) = store
+            .api_and_stage(&input.rest_api_id, &input.stage_name)
+            .map_err(|message| {
+                GetSdkErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(message),
+                })
+            })?;
+        // The stage serves ONE deployment, and that deployment is the definition the
+        // generated client calls.
+        let deployment = api.deployments.get(&stage.deployment_id).ok_or_else(|| {
+            GetSdkErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_DEPLOYMENT.to_string()),
+            })
+        })?;
+
+        // The endpoint the generated client is bound to is the stage's own invoke URL — the
+        // endpoint the exported definition names, and the one this emulator's data plane
+        // answers.
+        let endpoint = format!(
+            "{}://{}/{}",
+            super::get_export::INVOKE_SCHEME,
+            super::get_export::invoke_host(&api.id, &region),
+            stage.stage_name
+        );
+        let project = generator.project(
+            ClientTarget {
+                api,
+                stage,
+                deployment,
+                endpoint: &endpoint,
+            },
+            &configuration,
+        );
+        let body = archive(&project).map_err(|_| sdk_not_generated(&input.sdk_type))?;
+        Ok(GetSdkOutput {
+            content_type: Some(MEDIA_TYPE_ZIP.to_string()),
+            content_disposition: Some(content_disposition(
+                &input.sdk_type,
+                &super::get_export::document_version(api, deployment),
+            )),
+            body: Some(body),
+        })
     }
 }
