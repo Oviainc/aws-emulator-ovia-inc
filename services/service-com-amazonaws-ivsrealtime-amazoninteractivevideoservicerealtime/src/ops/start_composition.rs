@@ -320,38 +320,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // about to disappear.
         store.materialize_due_compositions(now);
 
-        // `idempotencyToken` carries the `@idempotencyToken` trait, so a retry of one
-        // start request must not start a second composition: the composition the first
-        // call created is answered again, with whatever state the clock has since owed
-        // it. A token offered again for a DIFFERENT request names two things at once,
-        // which is the inconsistent state this operation's `ConflictException` (HTTP 409)
-        // covers. Both are decided before anything is minted, so neither grows the store.
+        // `idempotencyToken` carries the `@idempotencyToken` trait, so the token is one of
+        // the attributes a start asks for: a start whose token a composition of this
+        // account and Region was already started under names a composition that is
+        // already there, and is refused with the modelled `ConflictException` (HTTP 409)
+        // instead of minting a second one — which is what keeps a client's retry from
+        // double-billing the stage and double-writing to the destination. A token offered
+        // again for a DIFFERENT request names two requests at once, the inconsistent state
+        // the same modelled error covers, and is refused in the words that state THAT
+        // (nothing with the attributes it carries exists). Both are decided before
+        // anything is minted, so neither grows the store.
         if let Some(token) = input.idempotency_token.as_deref() {
-            let started = store
+            if let Some(started_fingerprint) = store
                 .composition_by_idempotency_token(&region, token)
-                .map(|composition| (composition.arn.clone(), composition.request_fingerprint.clone()));
-            if let Some((arn, started_fingerprint)) = started {
-                if started_fingerprint != fingerprint {
-                    return Err(crate::state::conflict(
-                        StartCompositionErrorModeled::ConflictException,
-                        crate::state::idempotency_token_reused_message(Self::NAME, token),
-                    ));
-                }
-                // The ARN was found under this same lock, after the clock's own writes, so
-                // the record is there; a miss is answered as the modelled server fault
-                // rather than as an empty 200, which a client could not tell from a real
-                // composition.
-                let composition = store
-                    .composition_in(&region, &arn)
-                    .map(crate::state::CompositionRecord::to_composition)
-                    .ok_or_else(|| {
-                        crate::state::store_unavailable(
-                            StartCompositionErrorModeled::InternalServerException,
-                        )
-                    })?;
-                return Ok(StartCompositionOutput {
-                    composition: Some(composition),
-                });
+                .map(|composition| composition.request_fingerprint.clone())
+            {
+                let message = if started_fingerprint == fingerprint {
+                    crate::state::DUPLICATE_COMPOSITION_MESSAGE.to_string()
+                } else {
+                    crate::state::idempotency_token_reused_message(Self::NAME, token)
+                };
+                return Err(crate::state::conflict(
+                    StartCompositionErrorModeled::ConflictException,
+                    message,
+                ));
             }
         }
 

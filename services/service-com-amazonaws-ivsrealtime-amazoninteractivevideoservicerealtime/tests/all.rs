@@ -163,6 +163,8 @@ mod stage_storage_configuration_reference;
 mod stages;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/storage_configuration_bucket_grant.rs"]
+mod storage_configuration_bucket_grant;
 #[path = "all/storage_configurations.rs"]
 mod storage_configurations;
 #[path = "all/taggable_resource_kinds.rs"]

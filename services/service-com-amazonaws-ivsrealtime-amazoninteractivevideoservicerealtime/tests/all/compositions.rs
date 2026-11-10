@@ -27,9 +27,9 @@
 //! 5. ONE PLACE PER DESTINATION, ONE LAYOUT PER COMPOSITION. A destination naming neither
 //!    or both of `channel`/`s3`, and a layout configuring both `grid` and `pip`, are
 //!    refused with HTTP 400.
-//! 6. IDEMPOTENCY. `idempotencyToken` carries `@idempotencyToken`, so repeating one start
-//!    request answers with the composition the first call created rather than starting a
-//!    second one.
+//! 6. IDEMPOTENCY. `idempotencyToken` carries `@idempotencyToken`, so it is one of the
+//!    attributes a start asks for: offering it again names the composition the first call
+//!    created, which is the modelled conflict rather than a second composition.
 //! 7. A composition is TAGGABLE through the shared `/tags/{resourceArn}` surface, and goes
 //!    away with the stage it composites.
 
@@ -57,6 +57,10 @@ const COMPOSITION_ARN_PATTERN: &str = "^arn:aws:ivs:[a-z0-9-]+:[0-9]+:compositio
 
 /// The modelled `@length` maximum of `CompositionArn`.
 const COMPOSITION_ARN_MAX_LENGTH: usize = 128;
+
+/// The sentence a start whose `@idempotencyToken` already names a composition is refused
+/// with, read from the crate so this suite cannot drift from the wording it answers.
+const DUPLICATE_COMPOSITION_MESSAGE: &str = state::DUPLICATE_COMPOSITION_MESSAGE;
 
 // The `CompositionState` and `DestinationState` values this suite asserts, from
 // `smithy_query(query="shape",shape="CompositionState,DestinationState")`:
@@ -237,6 +241,20 @@ impl RealTime {
              got {status} {response}"
         );
         response["composition"].clone()
+    }
+
+    /// How many compositions this region's view holds, read through
+    /// `ListCompositions` — the count a refused start must not have grown.
+    async fn held_compositions(&self, case: &str) -> usize {
+        let (status, response) = self.call("ListCompositions", &json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: ListCompositions must answer HTTP 200, got {status} {response}"
+        );
+        response["compositions"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default()
     }
 }
 
@@ -973,9 +991,11 @@ async fn start_composition_separates_an_unknown_resource_from_a_malformed_reques
     }
 }
 
-/// `idempotencyToken` carries `@idempotencyToken`: repeating one start request answers
-/// with the composition the first call created rather than starting a second one, and a
-/// different token starts a different composition.
+/// `idempotencyToken` carries `@idempotencyToken`, so the token is one of the attributes a
+/// start asks for: offering it again names the composition the first call created, which
+/// already exists — the modelled `ConflictException` (HTTP 409) stating that, no second
+/// composition, and the first one left exactly as it was. A different token is a different
+/// request and starts a composition of its own.
 #[tokio::test]
 async fn repeating_a_start_under_one_idempotency_token_starts_one_composition() {
     let service = RealTime::new();
@@ -999,19 +1019,33 @@ async fn repeating_a_start_under_one_idempotency_token_starts_one_composition() 
             "idempotencyToken": token,
         });
         let first = service.start(case, &request).await;
-        let second = service.start(case, &request).await;
+        let (status, response) = service.call("StartComposition", &request).await;
         assert_eq!(
-            member(&second, "arn"),
-            member(&first, "arn"),
-            "case {case:?}: the repeat must answer with the composition the first call \
-             created, got {second} against {first}"
+            status, 409,
+            "case {case:?}: repeating the start under {token:?} must answer HTTP 409, \
+             got {status} {response}"
         );
         assert_eq!(
-            second["startTime"], first["startTime"],
-            "case {case:?}: the repeat must not restart the composition, got {} against {}",
-            second["startTime"], first["startTime"]
+            error_code(&response),
+            "ConflictException",
+            "case {case:?}: the refusal must be the modelled conflict, got {response}"
+        );
+        assert_eq!(
+            member(&response, "message"),
+            DUPLICATE_COMPOSITION_MESSAGE,
+            "case {case:?}: the refusal must state {DUPLICATE_COMPOSITION_MESSAGE:?}, \
+             got {response}"
         );
         let arn = member(&first, "arn");
+        // The refused repeat started nothing and moved nothing: the composition the token
+        // first named is still the one it names, with the start time it was minted with.
+        let read = service.get(case, &arn).await;
+        assert_eq!(
+            read["startTime"], first["startTime"],
+            "case {case:?}: the refused repeat must not restart the composition, got {} \
+             against {}",
+            read["startTime"], first["startTime"]
+        );
         assert!(
             !minted.contains(&arn),
             "case {case:?}: a different token must start a different composition, \
@@ -1029,11 +1063,19 @@ async fn repeating_a_start_under_one_idempotency_token_starts_one_composition() 
             "the composition {arn:?} must read back as itself, got {read}"
         );
     }
+    let listed = service.held_compositions("idempotency").await;
+    assert_eq!(
+        listed, minted.len(),
+        "the refused repeats must have started no composition, got {listed} against {}",
+        minted.len()
+    );
 }
 
-/// A token stands for ONE request: offering it again for a DIFFERENT request is the
-/// modelled `ConflictException` (HTTP 409), not a second composition and not the first
-/// one. The rows differ in WHICH part of the request changed.
+/// A token stands for ONE request, so a start that offers one already used is refused
+/// whatever else it carries — and WHICH refusal says so follows the rest of the request: a
+/// repeat of the same request is the composition that already exists, while a DIFFERENT
+/// request under that token is a token standing for two requests. The rows differ in WHICH
+/// part of the request changed.
 #[tokio::test]
 async fn reusing_an_idempotency_token_for_a_different_request_is_a_conflict() {
     let service = RealTime::new();
@@ -1049,7 +1091,11 @@ async fn reusing_an_idempotency_token_for_a_different_request_is_a_conflict() {
     });
     let started = service.start("the first use of the token", &first).await;
 
-    let cases: Vec<(&str, Value)> = vec![
+    let reused_message = format!(
+        "StartComposition.idempotencyToken is required to name the request it was first \
+         used for, found {token} which already names a different request"
+    );
+    let cases: Vec<(&str, Value, &str)> = vec![
         (
             "the same token against another stage",
             json!({
@@ -1057,6 +1103,7 @@ async fn reusing_an_idempotency_token_for_a_different_request_is_a_conflict() {
                 "destinations": [{ "channel": { "channelArn": channel } }],
                 "idempotencyToken": token,
             }),
+            &reused_message,
         ),
         (
             "the same token with another destination",
@@ -1065,6 +1112,7 @@ async fn reusing_an_idempotency_token_for_a_different_request_is_a_conflict() {
                 "destinations": [{ "channel": { "channelArn": arn("channel", "elsewhere") } }],
                 "idempotencyToken": token,
             }),
+            &reused_message,
         ),
         (
             "the same token with another layout",
@@ -1074,6 +1122,7 @@ async fn reusing_an_idempotency_token_for_a_different_request_is_a_conflict() {
                 "layout": { "pip": {} },
                 "idempotencyToken": token,
             }),
+            &reused_message,
         ),
         (
             "the same token with another tag set",
@@ -1083,10 +1132,16 @@ async fn reusing_an_idempotency_token_for_a_different_request_is_a_conflict() {
                 "tags": { "env": "test" },
                 "idempotencyToken": token,
             }),
+            &reused_message,
+        ),
+        (
+            "the same token for the very same request",
+            first.clone(),
+            DUPLICATE_COMPOSITION_MESSAGE,
         ),
     ];
 
-    for (case, request) in cases {
+    for (case, request, expected_message) in cases {
         let (status, response) = service.call("StartComposition", &request).await;
         assert_eq!(
             status, 409,
@@ -1098,6 +1153,11 @@ async fn reusing_an_idempotency_token_for_a_different_request_is_a_conflict() {
             "ConflictException",
             "case {case:?}: expected the modelled conflict code, got {response}"
         );
+        assert_eq!(
+            member(&response, "message"),
+            expected_message,
+            "case {case:?}: the refusal must state {expected_message:?}, got {response}"
+        );
     }
 
     // The refused reuses changed nothing: the composition the token first named is
@@ -1108,8 +1168,8 @@ async fn reusing_an_idempotency_token_for_a_different_request_is_a_conflict() {
         "the refused reuses must leave the first composition as it was, got {read} \
          against {started}"
     );
-    // A tag set spelled in another order is the SAME request, so the token still
-    // replays rather than conflicting.
+    // A tag set spelled in another order is the SAME request, so the token names the
+    // composition that already exists rather than standing for a second request.
     let tagged = json!({
         "stageArn": referenced.stage_arn,
         "destinations": [{ "channel": { "channelArn": channel } }],
@@ -1122,12 +1182,16 @@ async fn reusing_an_idempotency_token_for_a_different_request_is_a_conflict() {
         "tags": { "b": "2", "a": "1" },
         "idempotencyToken": "ordered-tags",
     });
-    let one = service.start("a tag set in one order", &tagged).await;
-    let two = service.start("the same tag set in another order", &reordered).await;
+    service.start("a tag set in one order", &tagged).await;
+    let (status, response) = service.call("StartComposition", &reordered).await;
     assert_eq!(
-        member(&two, "arn"),
-        member(&one, "arn"),
-        "a tag set spelled in another order is the same request, got {two} against {one}"
+        status, 409,
+        "the same tag set in another order is the same request, got {status} {response}"
+    );
+    assert_eq!(
+        member(&response, "message"),
+        DUPLICATE_COMPOSITION_MESSAGE,
+        "a tag set spelled in another order is the same request, got {response}"
     );
 }
 

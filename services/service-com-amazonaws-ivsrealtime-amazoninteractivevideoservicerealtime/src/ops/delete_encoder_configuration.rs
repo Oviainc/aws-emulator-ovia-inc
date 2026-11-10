@@ -174,12 +174,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ARN and whose stop has not completed (`composition_using`, the one lookup for
         // that question), so the modelled `ConflictException` (HTTP 409) is answered and
         // the configuration stays exactly as a read reports it.
-        if let Some(composition) = store.composition_using(&input.arn) {
-            let message = crate::state::resource_in_use_by_composition_message(
-                &input.arn,
-                &composition.arn,
-                &composition.state,
-            );
+        if store.composition_using(&input.arn).is_some() {
+            let message = crate::state::resource_in_use_by_composition_message(&input.arn);
             return Err(crate::state::conflict(
                 DeleteEncoderConfigurationErrorModeled::ConflictException,
                 message,

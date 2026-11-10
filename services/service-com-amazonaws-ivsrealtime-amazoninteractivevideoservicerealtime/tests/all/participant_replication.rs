@@ -789,9 +789,9 @@ async fn a_start_this_store_cannot_honour_is_refused_as_modelled() {
                 "destinationStageArn": destination,
                 "participantId": "ghost-1",
             }),
-            status: 404,
-            code: "ResourceNotFoundException",
-            message: Some("Resource: participant \"ghost-1\" not found".to_string()),
+            status: 409,
+            code: "ConflictException",
+            message: Some("ghost-1 is not publishing".to_string()),
         },
         RefusalCase {
             case: "a participant of the destination stage rather than the source",
@@ -800,9 +800,9 @@ async fn a_start_this_store_cannot_honour_is_refused_as_modelled() {
                 "destinationStageArn": destination,
                 "participantId": elsewhere,
             }),
-            status: 404,
-            code: "ResourceNotFoundException",
-            message: Some(format!("Resource: participant \"{elsewhere}\" not found")),
+            status: 409,
+            code: "ConflictException",
+            message: Some(format!("{elsewhere} is not publishing")),
         },
         RefusalCase {
             case: "a participant whose token grants no publish capability",
@@ -811,13 +811,9 @@ async fn a_start_this_store_cannot_honour_is_refused_as_modelled() {
                 "destinationStageArn": destination,
                 "participantId": subscriber,
             }),
-            status: 400,
-            code: "ValidationException",
-            message: Some(format!(
-                "StartParticipantReplication.participantId is required to name a participant \
-                 publishing in {source}, found {subscriber} which holds no \
-                 {PUBLISH_CAPABILITY} capability"
-            )),
+            status: 409,
+            code: "ConflictException",
+            message: Some(format!("{subscriber} is not publishing")),
         },
         RefusalCase {
             case: "one stage named as both ends of the replication",

@@ -461,6 +461,15 @@ async fn assert_delete_refused(service: &RealTime, case: &str, arn: &str, expect
         (409, "ConflictException"),
         &refused,
     );
+    // The refusal names the resource the request named and nothing else — the same
+    // sentence `DeleteEncoderConfiguration` states for a resource a composition holds.
+    assert_eq!(
+        member(&refused.1, "message"),
+        format!("Resource: {arn} is attached to a composition"),
+        "case {case:?}: the refusal must state that {arn} is attached to a composition, \
+         got {:?}",
+        refused.1
+    );
     let after = service.read(arn).await;
     assert_eq!(
         after.0, 200,

@@ -1863,13 +1863,13 @@ pub struct CompositionRecord {
     /// The composition's destinations, in the order the request listed them.
     pub destinations: Vec<DestinationRecord>,
     pub tags: HashMap<String, String>,
-    /// The `@idempotencyToken` the starting request carried, if any: a repeat of that
-    /// same request answers with this composition instead of starting a second one.
+    /// The `@idempotencyToken` the starting request carried, if any: a start offering it
+    /// again names this composition rather than a second one to mint, so it is refused.
     pub idempotency_token: Option<String>,
     /// What the starting request asked for, as one comparable value — see
     /// [`composition_fingerprint`]. A repeat under [`Self::idempotency_token`] is only a
-    /// repeat when it asks for the same thing; a token reused for a different request is
-    /// refused rather than answered with this composition.
+    /// repeat of this composition's own request when it asks for the same thing, which is
+    /// what decides WHICH refusal a token offered again is stated with.
     pub request_fingerprint: String,
     /// When the composition started (`Composition$startTime`).
     pub started_at: SystemTime,
@@ -3217,11 +3217,11 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
     /// region's view holds one.
     ///
     /// A composition is keyed by its own ARN, so the token is searched for rather than
-    /// indexed: the store is bounded by [`MAX_COMPOSITIONS`], and a repeat of a start
-    /// request is what this answers. A token is a token of the region it was first used
-    /// in — the composition it names exists only there — so the same token offered
-    /// through another region's endpoint names nothing and starts a composition of its
-    /// own.
+    /// indexed: the store is bounded by [`MAX_COMPOSITIONS`], and whether a start offers a
+    /// token this region's view already holds a composition under is what this answers. A
+    /// token is a token of the region it was first used in — the composition it names
+    /// exists only there — so the same token offered through another region's endpoint
+    /// names nothing and starts a composition of its own.
     pub fn composition_by_idempotency_token(
         &self,
         region: &str,
@@ -4449,8 +4449,10 @@ mod tests;
 // The parts this module is split into, each one concern of the store, re-exported so
 // every path a handler already uses (`crate::state::…`) keeps resolving.
 mod page_tokens;
+mod recording_bucket;
 mod refusals;
 mod sessions;
 pub use page_tokens::*;
+pub use recording_bucket::*;
 pub use refusals::*;
 pub use sessions::*;

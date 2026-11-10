@@ -292,9 +292,9 @@ fn rows() -> Vec<Row> {
 }
 
 /// Every layout member the request left out is reported at its own documented default,
-/// and that value is decided once: the idempotent replay of the same start, and a read
-/// after the clock has moved the composition to `ACTIVE`, both report the identical
-/// layout.
+/// and that value is decided once: a read of the composition, and a read after the clock
+/// has moved it to `ACTIVE`, report the identical layout — and the start cannot be made to
+/// decide the defaults a second time under the token it was first made with.
 #[tokio::test]
 async fn a_layout_default_is_stored_once_and_repeated_by_every_later_report() {
     let service = RealTime::new();
@@ -325,21 +325,21 @@ async fn a_layout_default_is_stored_once_and_repeated_by_every_later_report() {
             row.reported, composition["layout"]
         );
 
-        // IDEMPOTENCE: the same request under the same token names the composition the
-        // first call started, so it reports that same stored layout rather than deciding
-        // the defaults again.
+        // THE STORED LAYOUT IS DECIDED ONCE: repeating the same request under the same
+        // `@idempotencyToken` names the composition the first call started, which already
+        // exists — the modelled conflict rather than a second decision of the defaults —
+        // and a read of that composition reports the layout the start stored.
         let arn = arn_of(case, &composition);
-        let replayed = service.start(case, &request).await;
+        let (status, refused) = service.call("StartComposition", &request).await;
         assert_eq!(
-            arn_of(case, &replayed),
-            arn,
-            "case {case:?}: expected the replay to answer with the composition {arn}, \
-             got {replayed}"
+            status, 409,
+            "case {case:?}: repeating the start must answer HTTP 409, got {status} {refused}"
         );
+        let read = service.get(case, &arn).await;
         assert_eq!(
-            replayed["layout"], row.reported,
-            "case {case:?}: expected the replay to report the layout {}, got {}",
-            row.reported, replayed["layout"]
+            read["layout"], row.reported,
+            "case {case:?}: expected the read to report the layout {}, got {}",
+            row.reported, read["layout"]
         );
 
         started.push((case, row.reported, arn));

@@ -252,31 +252,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The participant has to be one of the SOURCE stage's, and it has to be a
         // publisher: this operation replicates "a publishing participant" (the model's
-        // own doc for it), and a participant with no publish capability publishes
-        // nothing that could be replicated.
+        // own doc for it). A source stage that is publishing nothing under this id —
+        // because it holds no such participant, or holds one with no publish capability —
+        // has nothing to replicate YET, which is a state conflict about what that stage is
+        // doing rather than a lookup that failed: the modelled `ConflictException`
+        // (HTTP 409), stated in the words this service words that class with
+        // (`crate::state::participant_not_publishing_message`). The two stages the
+        // request names are resolved above, and a missing one of those IS the modelled
+        // not-found.
+        let not_publishing = || {
+            crate::state::conflict(
+                StartParticipantReplicationErrorModeled::ConflictException,
+                crate::state::participant_not_publishing_message(&input.participant_id),
+            )
+        };
         let Some(participant) =
             crate::state::stage_participant(&store, &input.source_stage_arn, &input.participant_id)
         else {
-            return Err(crate::state::resource_not_found(
-                StartParticipantReplicationErrorModeled::ResourceNotFoundException,
-                &crate::state::named_resource(
-                    crate::state::PARTICIPANT_RESOURCE,
-                    &input.participant_id,
-                ),
-            ));
+            return Err(not_publishing());
         };
         if !participant.publishes {
-            return Err(crate::state::validation_failed(
-                StartParticipantReplicationErrorModeled::ValidationException,
-                format!(
-                    "{}.participantId is required to name a participant publishing in {}, \
-                     found {} which holds no {} capability",
-                    Self::NAME,
-                    input.source_stage_arn,
-                    input.participant_id,
-                    crate::state::PUBLISH_CAPABILITY,
-                ),
-            ));
+            return Err(not_publishing());
         }
 
         // What this operation stores on the replica participant is the composition the

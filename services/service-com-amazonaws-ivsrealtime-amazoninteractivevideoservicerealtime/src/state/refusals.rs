@@ -40,6 +40,18 @@ pub fn quota_exceeded_message(resource: &str, limit: usize) -> String {
 pub const DUPLICATE_PUBLIC_KEY_MESSAGE: &str =
     "A public-key resource already exists with the given publicKeyMaterial";
 
+/// How this service states a start of a composition it already holds one of under the same
+/// request (`ConflictException`, HTTP 409): one fixed sentence, with nothing of the request
+/// in it.
+///
+/// The recorded refusal of a `StartComposition` replayed under the `@idempotencyToken` of a
+/// composition this account and Region already hold, worded as the family states a create
+/// of a resource that already exists ([`DUPLICATE_PUBLIC_KEY_MESSAGE`]): the token is one of
+/// the attributes a start asks for, so a replay of it names a composition that is already
+/// there rather than a second one to mint.
+pub const DUPLICATE_COMPOSITION_MESSAGE: &str =
+    "A composition resource already exists with the given attributes";
+
 /// How this service states a rejection of one member's VALUE for a reason the model
 /// cannot express: it names the member and the constraint the value failed.
 ///
@@ -179,13 +191,13 @@ pub fn at_most_one_element_per_choice_message(
 
 /// What one start request asked for, as one comparable value.
 ///
-/// `@idempotencyToken` makes a retry of ONE request answer with what the first call
-/// created; it does not make one token stand for two different requests. So the token is
-/// stored beside a fingerprint of the rest of the request — the stage, the effective
+/// A start carrying an `@idempotencyToken` a composition of this account and Region was
+/// already started under is refused: the token is one of the attributes the start asks
+/// for. WHICH refusal it is stated with depends on whether the rest of the request matches
+/// too, so the token is stored beside a fingerprint of that rest — the stage, the effective
 /// layout, the effective destination configurations in the order they were given, and the
-/// tag set —
-/// and a token offered again with a different fingerprint is refused instead of answered
-/// with the wrong composition.
+/// tag set — and a token offered again with a different fingerprint is refused as a token
+/// standing for two requests rather than as a composition that already exists.
 ///
 /// The tag pairs are sorted first: a `Tags` map has no request order, so two spellings of
 /// one tag set must fingerprint alike. Nothing else here is a map, so the rendering is
@@ -433,20 +445,41 @@ pub fn replication_identifier(
     )
 }
 
-/// How this service states a delete of a resource a composition is still using: it names
-/// the resource, the composition using it and the state that composition is in, so the
-/// caller can see what has to stop before the delete can succeed.
+/// How this service states a delete of a resource a composition is still using: fixed text
+/// around the ARN the request named, and nothing else.
 ///
-/// AWS documents no text for `ConflictException` beyond what it means ("Updating or
-/// deleting a resource can cause an inconsistent state"), so the sentence is built from
-/// the request and the store, the way every other refusal of this service is.
-pub fn resource_in_use_by_composition_message(
-    arn: &str,
-    composition_arn: &str,
-    composition_state: &str,
-) -> String {
-    format!("Resource: {arn} is in use: composition {composition_arn} is {composition_state}")
+/// One rule for every resource of this service a composition's destinations can name — the
+/// encoder configuration `DeleteEncoderConfiguration`'s doc "ensures that no Compositions
+/// are using", and the storage configuration `DeleteStorageConfiguration` says the same
+/// about — so both are refused in the same words. It is the sentence the service was
+/// recorded answering, whose only variable part is the ARN the request sent: neither the
+/// composition using it nor that composition's state is part of it, so the sentence a caller
+/// matches on cannot vary with a value this store keeps, and the refusal names no resource
+/// identity the request did not already carry.
+pub fn resource_in_use_by_composition_message(arn: &str) -> String {
+    format!("Resource: {arn} is attached to a composition")
 }
+
+/// How this service states a request to replicate a participant the source stage reports no
+/// publisher for: the participant id the request sent, then fixed text.
+///
+/// The sentence the service was recorded answering, and the one rule for the whole class:
+/// `StartParticipantReplication` replicates "a publishing participant" (its own doc), so a
+/// source participant that is not publishing in the stage the request names — whether that
+/// stage holds no such participant at all or holds one that publishes nothing — is a state
+/// conflict about what the stage is doing, not a lookup that failed.
+pub fn participant_not_publishing_message(participant_id: &str) -> String {
+    format!("{participant_id} is not publishing")
+}
+
+/// How this service states a storage configuration over a bucket Amazon S3 holds none of in
+/// this Region (`ValidationException`, HTTP 400): one fixed sentence, with nothing of the
+/// request in it — not the bucket name, and not the Region.
+///
+/// The sentence the service was recorded answering. A storage configuration records to the
+/// bucket its `s3.bucketName` names, in the Region the configuration is created in, so a
+/// name that resolves to no bucket there is a value the request has to fix.
+pub const BUCKET_NOT_FOUND_MESSAGE: &str = "bucket not found in this region";
 
 /// How this service states an update of a member that cannot be changed while a
 /// recording is running: it names the stage, the participant whose recording is running

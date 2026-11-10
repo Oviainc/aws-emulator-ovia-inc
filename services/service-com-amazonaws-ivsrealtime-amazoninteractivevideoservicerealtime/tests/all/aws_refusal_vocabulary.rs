@@ -67,6 +67,9 @@ const TAGGING_BAD_REQUEST_CODE: &str = "BadRequestException";
 const RESOURCE_NOT_FOUND_CODE: &str = "ResourceNotFoundException";
 const VALIDATION_CODE: &str = "ValidationException";
 
+/// The modelled code for a request that contradicts the state the store already holds.
+const CONFLICT_CODE: &str = "ConflictException";
+
 /// The modelled `@length` maximum of `Tags` (`smithy_query(query="shape", shape="Tags")`):
 /// the tags one resource carries.
 const MAX_TAGS: usize = 50;
@@ -708,12 +711,22 @@ async fn the_capability_default_is_applied_even_though_it_is_not_reported() {
                 stop.status, stop.body
             );
         } else {
+            // A participant that publishes nothing has nothing to replicate YET, which is
+            // the modelled conflict about what the source stage is doing rather than a
+            // malformed request.
             assert_eq!(
                 (reply.status, reply.code.as_str()),
-                (400, VALIDATION_CODE),
+                (409, CONFLICT_CODE),
                 "case {case:?}: a participant holding no {PUBLISH_CAPABILITY} must be \
                  refused, got {} {}",
                 reply.status,
+                reply.body
+            );
+            assert_eq!(
+                reply.message,
+                format!("{participant_id} is not publishing"),
+                "case {case:?}: the refusal must state that the participant is not \
+                 publishing, got {}",
                 reply.body
             );
         }
@@ -998,7 +1011,6 @@ async fn the_video_resolution_budget_carries_the_named_detail_code() {
 async fn a_not_found_names_the_kind_of_a_bare_identifier() {
     let realtime = RealTime::new();
     let stage_arn = realtime.stage("the stage", &json!({ "name": "sessions" })).await;
-    let other_stage = realtime.stage("another stage", &json!({})).await;
     let absent_stage = arn("stage", "ffffffffffff");
 
     // A `sessionId` the model admits — `@length(16,16)` and `^st-[a-zA-Z0-9]+$` — that
@@ -1025,19 +1037,12 @@ async fn a_not_found_names_the_kind_of_a_bare_identifier() {
             format!("stage session \"{absent_session}\""),
         ),
         (
-            // `DisconnectParticipant` is NOT among these rows: a participant id its stage
-            // holds nothing for names no connection to end, so that call is the idempotent
-            // empty success rather than a refusal (see the `disconnect_participant` suite).
-            "a participant named for replication",
-            "StartParticipantReplication",
-            json!({
-                "sourceStageArn": stage_arn,
-                "destinationStageArn": other_stage,
-                "participantId": absent_participant,
-            }),
-            format!("participant \"{absent_participant}\""),
-        ),
-        (
+            // Neither `DisconnectParticipant` nor `StartParticipantReplication` is among
+            // these rows: a participant id its stage holds nothing for names no connection
+            // to end, so the disconnect is the idempotent empty success (see the
+            // `disconnect_participant` suite), and the replication start answers the
+            // modelled conflict about what the source stage is publishing (see the
+            // `participant_replication` suite) rather than a not-found.
             "the stage of a session read, addressed by ARN",
             "GetStageSession",
             json!({ "stageArn": absent_stage, "sessionId": absent_session }),

@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `state::recording_bucket`: the Amazon S3 client a storage configuration's bucket is
+# resolved through, and whose policy carries the recording grant the create writes — over
+# the in-process callback into this same emulator. No network client feature is enabled:
+# the transport is the emulator's own.
+aws-sdk-s3 = { version = "1", default-features = false }
 # `state`: the tree's one base64url coder and JOSE reading, which the compact form of an
 # issued participant token is encoded with — a path dependency on this repository's own
 # shared service crate, not a third-party component.
@@ -47,6 +52,10 @@ emulator-core-build-support = { workspace = true }
 # Real key pairs for the public-key tests, so what they import is a genuine public key
 # rather than a hand-built byte string.
 rcgen = "0.13"
+# The storage-configuration suite mounts the service that OWNS a recording bucket beside
+# this one on a single engine — exactly as the assembled emulator does — because a create
+# resolves that bucket and amends its policy by calling it in process.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

@@ -160,9 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // "Creates a new storage configuration, used to enable recording to Amazon S3":
         // a mutation the spec names, so this call mints the configuration's ARN and
-        // persists it. The bucket policy the real service modifies belongs to S3, which
-        // this emulator does not hold, so nothing outside this service's store is
-        // touched.
+        // persists it. The same doc states the other half of what it does — "When a
+        // StorageConfiguration is created, IVS will modify the S3 bucketPolicy of the
+        // provided bucket" — so the bucket is resolved where Amazon S3 holds it before
+        // anything is minted, and that bucket's policy carries the recording grant
+        // afterwards (`crate::state::recording_bucket`).
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
                 CreateStorageConfigurationErrorModeled::InternalServerException,
@@ -187,46 +189,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx);
-        let mut store = state.lock();
 
-        // The store grows only here, and a record is reclaimed only by an explicit
-        // `DeleteStorageConfiguration`, so the bound is checked before anything is
-        // minted or persisted.
-        if store.storage_configurations.len() >= crate::state::MAX_STORAGE_CONFIGURATIONS {
-            return Err(crate::state::quota_exceeded(
-                CreateStorageConfigurationErrorModeled::ServiceQuotaExceededException,
-                STORAGE_CONFIGURATION_QUOTA_RESOURCE,
-                crate::state::MAX_STORAGE_CONFIGURATIONS,
+        // A configuration records to the bucket its `s3.bucketName` names, in the Region it
+        // is created in: a name Amazon S3 holds no bucket under records nothing, so it is
+        // refused with the modelled `ValidationException` (HTTP 400) and nothing is
+        // persisted. Asked BEFORE this service's own store is locked, because it awaits the
+        // service that owns the bucket.
+        if crate::state::recording_bucket_is_absent(ctx, &region, &input.s3.bucket_name).await {
+            return Err(crate::state::validation_failed(
+                CreateStorageConfigurationErrorModeled::ValidationException,
+                crate::state::BUCKET_NOT_FOUND_MESSAGE,
             ));
         }
 
-        // A fresh id per creation, re-minted on the (vanishingly unlikely) chance the
-        // digest already names a live configuration, so one ARN never denotes two of
-        // them — minted through the one place `crate::state` applies that rule. The
-        // NAME is not an identity: `CreateStorageConfigurationRequest$name` states "The
-        // value does not need to be unique", so two configurations may share one.
-        let crate::state::MintedResource { sequence, arn, .. } = crate::state::mint_unique_arn(
-            &mut store,
-            crate::state::STORAGE_CONFIGURATION_ID_LEN,
-            |configuration_id| crate::state::storage_configuration_arn(&region, configuration_id),
-            |store, candidate| store.storage_configurations.contains_key(candidate),
-        );
+        // Everything this service's own store decides happens inside this block, so the
+        // guard is released before the grant below awaits the service that owns the
+        // bucket: a lock is never held across an await.
+        let (storage_configuration, bucket_name) = {
+            let mut store = state.lock();
 
-        let record = crate::state::StorageConfigurationRecord {
-            arn: arn.clone(),
-            name: input.name,
-            // `s3` is `@required`, and `S3StorageConfiguration$bucketName` is
-            // `@required` inside it, so the destination is always the one the request
-            // named. The bucket is not looked up: this emulator holds no S3 state, so a
-            // `ResourceNotFoundException` here would be a verdict nothing checked.
-            bucket_name: input.s3.bucket_name,
-            tags,
-            created_at: ::std::time::SystemTime::now(),
-            sequence,
+            // The store grows only here, and a record is reclaimed only by an explicit
+            // `DeleteStorageConfiguration`, so the bound is checked before anything is
+            // minted or persisted.
+            if store.storage_configurations.len() >= crate::state::MAX_STORAGE_CONFIGURATIONS {
+                return Err(crate::state::quota_exceeded(
+                    CreateStorageConfigurationErrorModeled::ServiceQuotaExceededException,
+                    STORAGE_CONFIGURATION_QUOTA_RESOURCE,
+                    crate::state::MAX_STORAGE_CONFIGURATIONS,
+                ));
+            }
+
+            // A fresh id per creation, re-minted on the (vanishingly unlikely) chance the
+            // digest already names a live configuration, so one ARN never denotes two of
+            // them — minted through the one place `crate::state` applies that rule. The
+            // NAME is not an identity: `CreateStorageConfigurationRequest$name` states
+            // "The value does not need to be unique", so two configurations may share one.
+            let crate::state::MintedResource { sequence, arn, .. } =
+                crate::state::mint_unique_arn(
+                    &mut store,
+                    crate::state::STORAGE_CONFIGURATION_ID_LEN,
+                    |configuration_id| {
+                        crate::state::storage_configuration_arn(&region, configuration_id)
+                    },
+                    |store, candidate| store.storage_configurations.contains_key(candidate),
+                );
+
+            let record = crate::state::StorageConfigurationRecord {
+                arn: arn.clone(),
+                name: input.name,
+                // `s3` is `@required`, and `S3StorageConfiguration$bucketName` is
+                // `@required` inside it, so the destination is always the one the request
+                // named — and it is a bucket Amazon S3 reported holding, resolved above.
+                bucket_name: input.s3.bucket_name,
+                tags,
+                created_at: ::std::time::SystemTime::now(),
+                sequence,
+            };
+
+            let storage_configuration = record.to_storage_configuration();
+            let bucket_name = record.bucket_name.clone();
+            store.storage_configurations.insert(arn, record);
+            (storage_configuration, bucket_name)
         };
 
-        let storage_configuration = record.to_storage_configuration();
-        store.storage_configurations.insert(arn, record);
+        // "IVS will modify the S3 bucketPolicy of the provided bucket. This will ensure
+        // that IVS has sufficient permissions to write content to the provided bucket":
+        // the grant goes into the bucket's own policy, where Amazon S3 keeps it, so a
+        // caller reading that policy sees the permission this create granted.
+        crate::state::grant_recording_access(ctx, &region, &bucket_name).await;
 
         Ok(CreateStorageConfigurationOutput {
             storage_configuration: Some(storage_configuration),
