@@ -45,13 +45,13 @@ use crate::vault_and_backup_job::{
 /// implementation cannot make a test pass. Source: the EventBridge reference for AWS
 /// Backup, whose job state change events carry `"source": "aws.backup"` with
 /// `"detail-type": "Backup Job State Change"` and `"detail-type": "Copy Job State Change"`.
-const EVENT_SOURCE: &str = "aws.backup";
-const BACKUP_JOB_STATE_CHANGE: &str = "Backup Job State Change";
+pub(crate) const EVENT_SOURCE: &str = "aws.backup";
+pub(crate) const BACKUP_JOB_STATE_CHANGE: &str = "Backup Job State Change";
 const COPY_JOB_STATE_CHANGE: &str = "Copy Job State Change";
 
 /// The terminal state both job kinds reach, as the model's `BackupJobState` and
 /// `CopyJobState` spell it.
-const COMPLETED: &str = "COMPLETED";
+pub(crate) const COMPLETED: &str = "COMPLETED";
 
 /// The source vault every case backs a resource up into, and the destination vault every
 /// case copies into.
@@ -66,7 +66,7 @@ const OTHER_RULE: &str = "unrelated-events";
 /// One emulator: Backup, EventBridge and SQS mounted on ONE shared engine, each claiming
 /// only requests scoped to its own signing name, so no Backup request is routed any
 /// differently for their presence.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -138,7 +138,7 @@ async fn events_in(
 }
 
 /// One SQS operation (`awsJson1_0`, target prefix `AmazonSQS`) in `region`.
-async fn sqs_in(
+pub(crate) async fn sqs_in(
     router: &MultiServiceRouter,
     region: &str,
     operation: &str,
@@ -206,7 +206,11 @@ async fn given_queue_in(
 }
 
 /// [`given_queue_in`] in [`REGION`].
-async fn given_queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, String) {
+pub(crate) async fn given_queue(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> (String, String) {
     given_queue_in(router, REGION, case, name).await
 }
 
@@ -250,7 +254,7 @@ async fn given_rule_in(
 }
 
 /// [`given_rule_in`] in [`REGION`].
-async fn given_rule(
+pub(crate) async fn given_rule(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -301,7 +305,7 @@ async fn delivered_in(
 }
 
 /// [`delivered_in`] in [`REGION`].
-async fn delivered(router: &MultiServiceRouter, case: &str, url: &str) -> Vec<Value> {
+pub(crate) async fn delivered(router: &MultiServiceRouter, case: &str, url: &str) -> Vec<Value> {
     delivered_in(router, REGION, case, url).await
 }
 
@@ -334,12 +338,12 @@ async fn delivered_at_least(
 
 /// The ARN of a backup vault of this account in `region`, as the model documents the form
 /// ("for example, `arn:aws:backup:us-east-1:123456789012:backup-vault:aBackupVault`").
-fn vault_arn(region: &str, name: &str) -> String {
+pub(crate) fn vault_arn(region: &str, name: &str) -> String {
     format!("arn:aws:backup:{region}:{ACCOUNT}:backup-vault:{name}")
 }
 
 /// The role a job is run with.
-fn role() -> String {
+pub(crate) fn role() -> String {
     format!("arn:aws:iam::{ACCOUNT}:role/service-role/AWSBackupDefaultServiceRole")
 }
 
@@ -382,7 +386,7 @@ async fn backup_in(
 }
 
 /// `GET /backup-jobs/{BackupJobId}`, as the model binds `DescribeBackupJob`.
-async fn describe_backup_job(router: &MultiServiceRouter, job_id: &str) -> Value {
+pub(crate) async fn describe_backup_job(router: &MultiServiceRouter, job_id: &str) -> Value {
     let (status, body) = call(router, "GET", &format!("/backup-jobs/{job_id}"), None).await;
     assert_eq!(
         status, 200,
@@ -403,7 +407,7 @@ async fn describe_copy_job(router: &MultiServiceRouter, copy_job_id: &str) -> Va
 }
 
 /// The envelopes of `detail_type` among `delivered`.
-fn of_type(delivered: &[Value], detail_type: &str) -> Vec<Value> {
+pub(crate) fn of_type(delivered: &[Value], detail_type: &str) -> Vec<Value> {
     delivered
         .iter()
         .filter(|event| event["detail-type"] == json!(detail_type))

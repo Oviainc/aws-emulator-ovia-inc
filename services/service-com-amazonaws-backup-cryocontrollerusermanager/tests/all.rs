@@ -4,10 +4,8 @@
 //!
 //! Put a new suite at `tests/all/<name>.rs` and declare it below, keeping the list
 //! sorted.
-//!
 //! A suite that is not declared here compiles nowhere and its tests never run. A
 //! suite left at the top level of `tests/` fails the build.
-
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
@@ -83,3 +81,5 @@ mod vault_read_projection;
 mod vault_read_visibility;
 #[path = "all/vault_type_and_parameter_refusals.rs"]
 mod vault_type_and_parameter_refusals;
+#[path = "all/plan_driven_job_event_delivery.rs"]
+mod plan_driven_job_event_delivery;
