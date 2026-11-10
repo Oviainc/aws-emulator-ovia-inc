@@ -20,14 +20,17 @@
 //! was. `GetResourcePolicy` reports it immediately — this store holds one copy of it.
 //!
 //! A document past the documented 20 KB is `LimitExceededException` and one that is
-//! not a policy document is `ValidationException`. A statement `Condition` is stored
-//! and reported back, but it is not evaluated — a condition is matched against a
-//! request context (network, identity, time) this emulator does not have — so a Deny
-//! that carries one is applied anyway, and its refusal says so: the emulator refuses
-//! rather than serves what the attached policy may deny.
-//! `ConfirmRemoveSelfResourceAccess` is accepted and not acted on: whether a policy
-//! removes the caller's own access depends on the identity-based policies this
-//! emulator does not hold.
+//! not a policy document is `ValidationException`. A statement `Condition` is part of
+//! the document, so it is stored and reported back verbatim and never a reason to
+//! refuse the attach; it is not evaluated — a condition is matched against a request
+//! context (network, identity, time) this emulator does not have — so a Deny that
+//! carries one is applied anyway on the data plane, and its refusal says so.
+//! `ConfirmRemoveSelfResourceAccess` is required for a document that would deny THIS
+//! CALLER the policy-management actions in every request context, which is what that
+//! member confirms; a deny gated on a `Condition` leaves the caller able to change the
+//! policy again, so it needs no confirmation. Whether the caller's identity-based
+//! policies would still let it through is not decided here: this emulator does not hold
+//! them.
 //!
 //! ## Shape of an operation
 //!
@@ -247,7 +250,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`ConfirmRemoveSelfResourceAccess`): a document that denies the caller the
         // policy-management actions does exactly that, so without the confirmation it
         // is refused rather than attached — once attached, no later call could take it
-        // off again.
+        // off again. Only a deny that applies to EVERY request counts: a statement
+        // whose deny is gated on a `Condition` leaves the caller able to change the
+        // policy from a request the condition does not select, so it is not a
+        // lock-out (see [`crate::state::locks_the_caller_out`]).
         if !input.confirm_remove_self_resource_access
             && crate::state::locks_the_caller_out(&policy, &resource.arn)
         {

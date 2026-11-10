@@ -152,6 +152,26 @@ impl AttachedPolicy {
             .map(PolicyStatement::conditioned)
     }
 
+    /// Whether this policy denies `action` on `resource_arn` to a caller any of
+    /// `principals` names in EVERY request context — a matching Deny that carries no
+    /// `Condition`.
+    ///
+    /// What [`denies_any`](Self::denies_any) reports with its condition flag set is a
+    /// deny of only the requests whose context satisfies the condition, so it is not an
+    /// answer to "would this document refuse the action whatever the request looks
+    /// like"; this is. Used where the question is what the document DEFINITELY does
+    /// ([`locks_the_caller_out`]) rather than what to do with one request.
+    pub fn denies_unconditionally(
+        &self,
+        principals: &[String],
+        action: &str,
+        resource_arn: &str,
+    ) -> bool {
+        self.statements.iter().any(|statement| {
+            statement.denies(principals, action, resource_arn) && !statement.conditioned()
+        })
+    }
+
     /// Whether this policy GRANTS `action` on `resource_arn` to a caller any of
     /// `principals` names.
     ///
@@ -741,6 +761,14 @@ pub(super) const POLICY_MANAGEMENT_ACTIONS: [&str; 3] = [
 /// carries: the lock-out is what the NEW document would do, and it is decided before
 /// anything is stored so a refused request leaves the table exactly as it was.
 ///
+/// Only a deny that applies to EVERY request counts. A statement carrying a `Condition`
+/// applies only to the requests whose context satisfies it, so such a statement does not
+/// establish that the caller could never change the policy again — which is the one thing
+/// `ConfirmRemoveSelfResourceAccess` is there to confirm — and a document whose deny of
+/// the policy-management actions is conditioned is attached without it. That the emulator
+/// does not evaluate a condition is a fact about the emulator, not about the document: it
+/// is no ground for refusing to STORE one.
+///
 /// Every spelling a statement may name this account by is compared — the root user's ARN
 /// and the bare account id that stands for it ([`::service_common::iam_authorization::account_principals`]) —
 /// because a statement that denies the ACCOUNT denies each of its principals, so a
@@ -754,7 +782,7 @@ pub fn locks_the_caller_out(policy: &AttachedPolicy, resource_arn: &str) -> bool
     ));
     POLICY_MANAGEMENT_ACTIONS
         .iter()
-        .any(|action| policy.denies_any(&named, action, resource_arn).is_some())
+        .any(|action| policy.denies_unconditionally(&named, action, resource_arn))
 }
 
 /// The `AccessDeniedException` message a data-plane request earns when the policies in

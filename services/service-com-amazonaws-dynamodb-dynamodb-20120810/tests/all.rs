@@ -33,6 +33,8 @@ mod billing_mode_and_table_class_summaries;
 mod cmk_shared_by_several_tables;
 #[path = "all/collection_cap_constraint_reports.rs"]
 mod collection_cap_constraint_reports;
+#[path = "all/conditioned_resource_policy_attach.rs"]
+mod conditioned_resource_policy_attach;
 #[path = "all/consumed_capacity_arms.rs"]
 mod consumed_capacity_arms;
 #[path = "all/continuous_backups.rs"]

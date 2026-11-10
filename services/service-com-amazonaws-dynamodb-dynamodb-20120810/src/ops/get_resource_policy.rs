@@ -7,10 +7,11 @@
 //! `PolicyNotFoundException`; an unknown table is `ResourceNotFoundException`.
 //!
 //! This is a REPORTING operation: it reads the stored policy and writes nothing. The
-//! doc below describes an eventually consistent read ("DynamoDB might return your
-//! previous policy"); this store holds one copy of the policy, so a read of it is
-//! strongly consistent — which is inside what the doc allows, since it says only that
-//! a stale answer MIGHT come back.
+//! doc below describes an eventually consistent read ("DynamoDB might return a
+//! PolicyNotFoundException" for a read made straight after an attach); this store holds
+//! one copy of the policy, so a read of it reports what is attached — which is inside
+//! what the doc allows, since it says only that a stale answer MIGHT come back, and it
+//! is what lets a caller verify the document it just attached.
 //!
 //! ## Shape of an operation
 //!
