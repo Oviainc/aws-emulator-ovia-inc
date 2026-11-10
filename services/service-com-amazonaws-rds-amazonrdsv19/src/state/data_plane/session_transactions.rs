@@ -238,14 +238,22 @@ impl OpenTransactions {
 ///
 /// Every row the engine changes on this connection is reported to `transactions`, which
 /// keeps it only while a transaction is recording ([`OpenTransactions::recording_for`]).
-pub fn record_changes_of(conn: &Connection, database: &str, transactions: &Arc<OpenTransactions>) {
+///
+/// The engine's own error when it will not install the hook: a connection whose changes are
+/// not reported cannot have a session's rows put back, so it is never handed out as one
+/// that can.
+pub fn record_changes_of(
+    conn: &mut Connection,
+    database: &str,
+    transactions: &Arc<OpenTransactions>,
+) -> rusqlite::Result<()> {
     let transactions = Arc::clone(transactions);
     let database = database.to_string();
     conn.update_hook(Some(
         move |_action, _schema: &str, table: &str, rowid: i64| {
             transactions.note_rows(&database, [(table.to_string(), rowid)]);
         },
-    ));
+    ))
 }
 
 /// Put the rows `rows` of one database back as `before` holds them, on the live connection
@@ -376,11 +384,7 @@ fn column_names(conn: &Connection, table: &str) -> Vec<String> {
     let Ok(statement) = conn.prepare(&format!("SELECT * FROM {} LIMIT 0", quoted(table))) else {
         return Vec::new();
     };
-    statement
-        .column_names()
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+    statement.column_names().map(str::to_string).collect()
 }
 
 /// One identifier, quoted so a name that is also a keyword reaches the engine as a name.

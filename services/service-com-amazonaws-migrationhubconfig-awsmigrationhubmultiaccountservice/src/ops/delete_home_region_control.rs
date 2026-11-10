@@ -152,11 +152,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(removed) = store.home_region_controls.remove(&input.control_id) else {
             // Nothing was deleted, so the request named a control that does not
-            // exist: the modelled `InvalidInputException` (HTTP 400) states it.
+            // exist: the modelled `InvalidInputException` (HTTP 400) states it,
+            // naming the id the request asked for.
             return Err(DeleteHomeRegionControlErrorModeled::InvalidInputException(
                 InvalidInputException {
                     message: Some(format!(
-                        "No home region control with id '{}' exists",
+                        "Home Region Control ID \"{}\" does not exist",
                         input.control_id
                     )),
                 },
@@ -164,11 +165,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The account that pointed at this control has no home region any more, so
-        // the index entry goes with it and `GetHomeRegion` reports the region unset.
+        // The account that pointed at this control has no home region any more, so the
+        // index entry goes with it and `GetHomeRegion` reports the region unset. Only an
+        // entry that really points AT the deleted control is dropped, and — where the
+        // control records the account it was created for — only that account's: deleting one
+        // control can never clear the home region another control holds.
         store
             .home_region_by_account
-            .retain(|_, control_id| *control_id != removed.control_id);
+            .retain(|account, control_id| {
+                *control_id != removed.control_id
+                    || removed
+                        .target_id
+                        .as_deref()
+                        .is_some_and(|owner| owner != account)
+            });
 
         Ok(DeleteHomeRegionControlOutput {})
     }

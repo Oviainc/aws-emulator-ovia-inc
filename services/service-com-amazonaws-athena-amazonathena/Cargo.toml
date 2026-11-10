@@ -28,7 +28,7 @@ service-common = { path = "../common" }
 # posture". In short: this crate contains no `unsafe` and keeps the workspace's
 # `unsafe_code = "forbid"` lint; the native component the `bundled` feature links is the
 # SAME engine the workspace already links through `vendor/emulator-telemetry`
-# (`rusqlite` 0.37, `bundled`), so no new native library enters the emulator process.
+# (`rusqlite` 0.41, `bundled`), so no new native library enters the emulator process.
 #
 # CAPABILITY: this is an EXECUTION SUBSTRATE — it compiles caller-supplied SQL into
 # instructions and runs them — and a NATIVE component: `bundled` makes libsqlite3-sys
@@ -40,7 +40,14 @@ service-common = { path = "../common" }
 # no URI filenames, `temp_store = MEMORY`, `max_page_count`, `hard_heap_limit`, plus
 # length, column, depth and compound-select limits. `limits` and `hooks` are the features
 # those controls need; `load_extension` is deliberately absent.
-rusqlite = { version = "0.37", features = ["bundled", "column_decltype", "hooks", "limits"] }
+#
+# PINNED at 0.41, the release reviewed and built here: it is the first one whose
+# `libsqlite3-sys` (0.39) carries a SQLite C library without RUSTSEC-2026-0459 (a
+# page-cache disclosure through an undersized-page WAL file, fixed in SQLite 3.54.0),
+# which 0.37's `libsqlite3-sys` 0.35 shipped. The two components 0.41 adds —
+# `sqlite-wasm-rs` and its `rsqlite-vfs` — are gated to `wasm32` upstream and are not
+# linked into a host build, so the engine in the process is still one bundled SQLite.
+rusqlite = { version = "0.41", features = ["bundled", "column_decltype", "hooks", "limits"] }
 # `regex`: the pattern a `SHOW TABLES`/`SHOW VIEWS` statement narrows its answer by is
 # matched by the linear-time matcher the Data Catalog's own listings use, not by a
 # hand-rolled one.

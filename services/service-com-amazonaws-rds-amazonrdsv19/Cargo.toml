@@ -39,7 +39,14 @@ tracing = { workspace = true }
 # is planned and run by the engine. The `hooks` feature carries the engine's own account of
 # WHICH rows a statement changed (SQLite's update hook), which is what a session's
 # `ROLLBACK` puts back.
-rusqlite = { version = "0.37", features = [
+#
+# PINNED at 0.41, the release reviewed and built here: it is the first one whose
+# `libsqlite3-sys` (0.39) carries a SQLite C library without RUSTSEC-2026-0459 (a
+# page-cache disclosure through an undersized-page WAL file, fixed in SQLite 3.54.0),
+# which 0.37's `libsqlite3-sys` 0.35 shipped. The two components 0.41 adds —
+# `sqlite-wasm-rs` and its `rsqlite-vfs` — are gated to `wasm32` upstream and are not
+# linked into a host build, so the engine in the process is still one bundled SQLite.
+rusqlite = { version = "0.41", features = [
     "backup",
     "bundled",
     "column_decltype",

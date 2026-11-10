@@ -2,9 +2,9 @@
 
 //! @op GetHomeRegion
 //!
-//! Reports the calling account's home region from [`crate::state`], or raises
-//! `InvalidInputException` when the account has not set one. This is the ONLY
-//! file to touch for this operation.
+//! Reports the calling account's home region from [`crate::state`]. The output member is
+//! optional, so an account that has not set one is reported by a success carrying no
+//! region. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,23 +159,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .control_for_account(account)
             .map(|control| control.home_region.clone());
 
-        match home_region {
-            Some(home_region) => Ok(GetHomeRegionOutput {
-                home_region: Some(home_region),
-            }),
-            // No control exists, so the account has no home region to report. The
-            // operation models no "not found" error; an unset home region is a state
-            // the caller must fix with `CreateHomeRegionControl`, which the modelled
-            // `InvalidInputException` (HTTP 400) states.
-            None => Err(GetHomeRegionErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(format!(
-                        "No home region is set for account {account}; call \
-                         CreateHomeRegionControl to set one"
-                    )),
-                },
-            )
-            .into()),
-        }
+        // `GetHomeRegionResult$HomeRegion` is OPTIONAL and the operation's doc reads
+        // "Returns the calling account's home region, IF CONFIGURED": an account with
+        // no home region control is reported by a success carrying no region, not by an
+        // error. The model declares no "not configured" error, and this is the call
+        // other Migration Hub services make to DISCOVER the home region, so "not set
+        // yet" has to be an answer they can read rather than a failure.
+        Ok(GetHomeRegionOutput { home_region })
     }
 }

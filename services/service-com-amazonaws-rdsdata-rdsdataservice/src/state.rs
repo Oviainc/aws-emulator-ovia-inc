@@ -1014,7 +1014,7 @@ impl Database {
     /// An empty database, CONFINED before it can run anything: see the module
     /// docs for the whole list. This is the only place a connection is created.
     pub fn open() -> Result<Self, SqlError> {
-        let conn = Connection::open_in_memory().map_err(SqlError::unavailable)?;
+        let mut conn = Connection::open_in_memory().map_err(SqlError::unavailable)?;
 
         // Memory, value size, statement size and complexity. Set first, so they
         // hold for every statement the connection ever prepares.
@@ -1109,7 +1109,8 @@ impl Database {
 
         // Default deny on every SQL action, installed LAST so the settings above
         // (which are themselves pragmas) are not refused by it.
-        conn.authorizer(Some(confine_to_data_plane));
+        conn.authorizer(Some(confine_to_data_plane))
+            .map_err(SqlError::unavailable)?;
         Ok(Self {
             conn,
             sequence_columns: HashMap::new(),
@@ -1237,17 +1238,20 @@ impl Database {
         parameters: &[SqlParameter],
     ) -> Result<StatementOutcome, SqlError> {
         let deadline = budget.deadline;
-        self.conn.progress_handler(
-            PROGRESS_HANDLER_OPS,
-            Some(move || Instant::now() >= deadline),
-        );
+        self.conn
+            .progress_handler(
+                PROGRESS_HANDLER_OPS,
+                Some(move || Instant::now() >= deadline),
+            )
+            .map_err(SqlError::unavailable)?;
         let watchdog = Watchdog::arm(self.conn.get_interrupt_handle(), deadline);
         let outcome = self.run_bounded(budget, sql, parameters);
         // Dismissed first, so the engine is never asked to unwind a statement
         // that is no longer running.
         drop(watchdog);
         self.conn
-            .progress_handler(PROGRESS_HANDLER_OPS, None::<fn() -> bool>);
+            .progress_handler(PROGRESS_HANDLER_OPS, None::<fn() -> bool>)
+            .map_err(SqlError::unavailable)?;
         // A statement that CHANGED this database takes it to a new version, which is
         // what tells a transaction reading this database that it has moved.
         if outcome.as_ref().is_ok_and(StatementOutcome::changed_it) {
@@ -1585,7 +1589,6 @@ impl Database {
         let count = statement.column_count();
         statement
             .columns()
-            .iter()
             .enumerate()
             .map(|(index, column)| {
                 let label = column.name().to_string();

@@ -1053,7 +1053,7 @@ impl Database {
             | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
             | rusqlite::OpenFlags::SQLITE_OPEN_MEMORY
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let connection = rusqlite::Connection::open_in_memory_with_flags(flags)?;
+        let mut connection = rusqlite::Connection::open_in_memory_with_flags(flags)?;
 
         // `temp_store = MEMORY`: a large sort or hash must not spill a file into
         // the host's temp directory. `max_page_count` on BOTH `main` and `temp`:
@@ -1100,7 +1100,7 @@ impl Database {
         // Default-deny: every action a Data API statement legitimately needs is
         // named, and anything else — including an action a future engine version
         // introduces — is refused.
-        connection.authorizer(Some(authorize));
+        connection.authorizer(Some(authorize))?;
 
         Ok(Self { connection })
     }
@@ -1340,12 +1340,12 @@ pub fn run_on(
     timeout: Duration,
     bound: &ExecutionBound,
 ) -> Execution {
-    let database = handle
+    let mut database = handle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut budget = Retention::new();
     run_sql(
-        &database,
+        &mut database,
         sql,
         parameters,
         Binding::Every,
@@ -1376,7 +1376,7 @@ pub fn run_batch_on(
     timeout: Duration,
     bound: &ExecutionBound,
 ) -> Vec<Execution> {
-    let database = handle
+    let mut database = handle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let deadline = Instant::now() + timeout;
@@ -1404,7 +1404,7 @@ pub fn run_batch_on(
     for sql in sqls {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let execution = run_sql(
-            &database,
+            &mut database,
             sql,
             parameters,
             Binding::Referenced,
@@ -1455,7 +1455,7 @@ pub fn run_batch_on(
 /// the engine did. A statement the engine rejects or interrupts fails with the
 /// engine's own message — the service never guesses at a result it did not get.
 fn run_sql(
-    database: &Database,
+    database: &mut Database,
     sql: &str,
     parameters: &[SqlParameter],
     binding: Binding,
@@ -1468,10 +1468,14 @@ fn run_sql(
     // between statements, so abandoning one cannot abandon another.
     let guard = std::sync::Arc::clone(&bound.0);
     let handler_guard = std::sync::Arc::clone(&guard);
-    database.connection.progress_handler(
+    if let Err(error) = database.connection.progress_handler(
         PROGRESS_HANDLER_OPS,
         Some(move || handler_guard.should_interrupt()),
-    );
+    ) {
+        // The bound is what makes an abandoned statement stop; a statement that could
+        // only run without it does not run at all.
+        return Execution::failed(scrub_paths(&error.to_string()));
+    }
 
     let started = Instant::now();
     guard.arm(timeout, step_budget(timeout));
@@ -1588,7 +1592,6 @@ fn execute_once(
     // mutably.
     let columns: Vec<(String, Option<String>)> = statement
         .columns()
-        .iter()
         .map(|column| {
             (
                 column.name().to_string(),
@@ -2059,17 +2062,19 @@ pub fn catalog_on(
     timeout: Duration,
     bound: &ExecutionBound,
 ) -> Result<Vec<TableColumns>, String> {
-    let database = handle
+    let mut database = handle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let connection = &database.connection;
+    let connection = &mut database.connection;
 
     let guard = std::sync::Arc::clone(&bound.0);
     let handler_guard = std::sync::Arc::clone(&guard);
-    connection.progress_handler(
-        PROGRESS_HANDLER_OPS,
-        Some(move || handler_guard.should_interrupt()),
-    );
+    connection
+        .progress_handler(
+            PROGRESS_HANDLER_OPS,
+            Some(move || handler_guard.should_interrupt()),
+        )
+        .map_err(|error| scrub_paths(&error.to_string()))?;
     guard.arm(timeout, step_budget(timeout));
     let read = read_catalog(connection, table);
     guard.disarm();
@@ -2111,7 +2116,6 @@ fn read_catalog(
         let probe = connection.prepare(&format!("SELECT * FROM \"{quoted}\" LIMIT 0"))?;
         let columns = probe
             .columns()
-            .iter()
             .map(|column| {
                 let declared = column
                     .decl_type()

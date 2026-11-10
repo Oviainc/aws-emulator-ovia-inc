@@ -29,7 +29,7 @@ hex = { workspace = true }
 # SQL engine, and its memory-safety posture". In short: this crate itself keeps
 # `#![forbid(unsafe_code)]` and contains no `unsafe`; the native component the
 # `bundled` feature links is the SAME engine the workspace already links through
-# `vendor/emulator-telemetry` (`rusqlite` 0.37, `bundled`), so no new native
+# `vendor/emulator-telemetry` (`rusqlite` 0.41, `bundled`), so no new native
 # library enters the emulator process.
 #
 # CAPABILITY: this is an EXECUTION SUBSTRATE — it compiles caller-supplied text
@@ -50,7 +50,15 @@ hex = { workspace = true }
 # a warehouse's databases with: both ends are in-memory databases this crate
 # opened through `Database::open`, so the copy names no path and opens no file —
 # unlike `VACUUM INTO`, which the authorizer denies for exactly that reason.
-rusqlite = { version = "0.37", features = ["backup", "bundled", "column_decltype", "hooks", "limits"] }
+#
+# PINNED at 0.41, the release reviewed and built here: it is the first one whose
+# `libsqlite3-sys` (0.39) carries a SQLite C library without RUSTSEC-2026-0459 (a
+# page-cache disclosure through an undersized-page WAL file, fixed in SQLite
+# 3.54.0), which 0.37's `libsqlite3-sys` 0.35 shipped. The two components 0.41
+# adds — `sqlite-wasm-rs` and its `rsqlite-vfs` — are gated to `wasm32` upstream
+# and are not linked into a host build, so the engine in the process is still one
+# bundled SQLite.
+rusqlite = { version = "0.41", features = ["backup", "bundled", "column_decltype", "hooks", "limits"] }
 # `ops::get_statement_result_v2`: the CSV form of a statement's result is
 # WRITTEN by this CSV writer, so the separator, the quoting of a value carrying a
 # comma, a quote or a newline, and the line terminator are a CSV

@@ -215,7 +215,7 @@ impl Database {
             | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
             | rusqlite::OpenFlags::SQLITE_OPEN_MEMORY
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let connection = rusqlite::Connection::open_in_memory_with_flags(flags)?;
+        let mut connection = rusqlite::Connection::open_in_memory_with_flags(flags)?;
 
         // `temp_store = MEMORY`: a large sort must not spill a file into the host's temp
         // directory. `max_page_count` on BOTH `main` and `temp`, because the pragma
@@ -265,7 +265,7 @@ impl Database {
                 }
                 authorize(context)
             },
-        ));
+        ))?;
 
         Ok(Self {
             connection,
@@ -569,12 +569,24 @@ pub fn run_over(
     parameters: &[String],
     scanned_bytes: i64,
 ) -> Completion {
-    let database = handle.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut database = handle.lock().unwrap_or_else(PoisonError::into_inner);
     let guard = Arc::new(RunGuard::default());
     let handler = Arc::clone(&guard);
-    database
+    if let Err(error) = database
         .connection
-        .progress_handler(PROGRESS_HANDLER_OPS, Some(move || handler.should_interrupt()));
+        .progress_handler(PROGRESS_HANDLER_OPS, Some(move || handler.should_interrupt()))
+    {
+        // The bound is what makes an abandoned statement stop; a statement that could only
+        // run without it does not run at all, and the engine's own words say why.
+        let failure = RunFailure::Engine(error);
+        return Completion {
+            outcome: Outcome::Failed {
+                message: failure.message(),
+                cause: failure.cause(),
+            },
+            engine_time: std::time::Duration::ZERO,
+        };
+    }
 
     let started = Instant::now();
     guard.arm(MAX_QUERY_DEADLINE, step_budget());
@@ -796,7 +808,6 @@ fn execute_once(
     // immutable borrow of the prepared statement ends before `query` takes it mutably.
     let columns: Vec<(String, Option<ColumnType>)> = statement
         .columns()
-        .iter()
         .map(|column| {
             (
                 column.name().to_string(),

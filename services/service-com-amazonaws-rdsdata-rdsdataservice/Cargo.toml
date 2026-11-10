@@ -37,7 +37,14 @@ tracing = { workspace = true }
 # foreign virtual tables and the file-touching SQL functions are refused by the
 # authorizer, extension loading is off, defensive mode is on, and memory, value
 # size, statement size, expression depth and query complexity are all capped.
-rusqlite = { version = "0.37", features = ["bundled", "backup", "column_decltype", "functions", "hooks", "limits"] }
+#
+# PINNED at 0.41, the release reviewed and built here: it is the first one whose
+# `libsqlite3-sys` (0.39) carries a SQLite C library without RUSTSEC-2026-0459 (a
+# page-cache disclosure through an undersized-page WAL file, fixed in SQLite 3.54.0),
+# which 0.37's `libsqlite3-sys` 0.35 shipped. The two components 0.41 adds —
+# `sqlite-wasm-rs` and its `rsqlite-vfs` — are gated to `wasm32` upstream and are not
+# linked into a host build, so the engine in the process is still one bundled SQLite.
+rusqlite = { version = "0.41", features = ["bundled", "backup", "column_decltype", "functions", "hooks", "limits"] }
 # The PostgreSQL and MySQL parsers in front of that engine: a Data API statement is
 # written in the dialect of the engine the caller addresses, so it is parsed with this
 # crate's PostgreSQL dialect and, failing that, its MySQL one, and rendered

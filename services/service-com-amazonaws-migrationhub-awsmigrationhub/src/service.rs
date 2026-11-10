@@ -74,13 +74,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `mgh`, a signing name it SHARES with MigrationHub Config
+        // (endpointPrefix `migrationhub-config`, against `mgh` here), so the routing key
+        // alone has both services claiming every request — which the router refuses rather
+        // than serving by an arbitrary one. `claims_request`'s own documentation states the
+        // rule that separates them: for a model that declares an RPC protocol, the service
+        // its wire form NAMES. Both models are `awsJson1_1`, so that is the service-shape
+        // prefix of `X-Amz-Target` (`AWSMigrationHub.<OperationName>`, `OPERATIONS.md`) —
+        // the only discriminator either publishes, neither binding a URI for the `/` both
+        // post to.
+        service_common::claims_request(
+            parts,
+            self.entry.identity().signing_name(),
+            crate::ROUTE_PATH_SEGMENTS,
+            Some(self.entry.identity().shape_id()),
+        )
     }
 
     fn override_operation(

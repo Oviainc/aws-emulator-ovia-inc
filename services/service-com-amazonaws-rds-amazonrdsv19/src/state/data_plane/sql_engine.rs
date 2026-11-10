@@ -534,9 +534,12 @@ impl InstanceDatabase {
             current.deadline = Some(deadline);
         }
         let conn = connection(&mut databases, &self.view, &self.transactions, database)?;
-        conn.progress_handler(PROGRESS_HANDLER_OPS, Some(move || Instant::now() >= deadline));
+        conn.progress_handler(PROGRESS_HANDLER_OPS, Some(move || Instant::now() >= deadline))
+            .map_err(from_engine)?;
         let answer = run_statement(conn, sql, params);
-        conn.progress_handler(PROGRESS_HANDLER_OPS, None::<fn() -> bool>);
+        // The bound is removed once the statement is over. The next statement installs its
+        // own, so a failure to remove this one cannot leave anything running unbounded.
+        let _ = conn.progress_handler(PROGRESS_HANDLER_OPS, None::<fn() -> bool>);
         self.transactions.recording_for(None);
         match answer {
             // The statement did not finish inside its budget: whatever the engine said
@@ -702,13 +705,18 @@ impl InstanceDatabase {
             };
             let live = connection(&mut databases, &self.view, &self.transactions, name)?;
             let undone = {
-                let _unconfined = Unconfined::of(live);
+                let mut unconfined = Unconfined::of(live);
+                let live = unconfined.connection();
                 live.progress_handler(
                     PROGRESS_HANDLER_OPS,
                     Some(move || Instant::now() >= deadline),
-                );
+                )
+                .map_err(from_engine)?;
                 let undone = session_transactions::put_back(live, before, rows, deadline);
-                live.progress_handler(PROGRESS_HANDLER_OPS, None::<fn() -> bool>);
+                // The bound is removed once the restore is over. The next statement on this
+                // connection installs its own, so a failure to remove this one cannot leave
+                // anything running unbounded.
+                let _ = live.progress_handler(PROGRESS_HANDLER_OPS, None::<fn() -> bool>);
                 undone
             };
             undone?;
@@ -720,10 +728,14 @@ impl InstanceDatabase {
     /// caller is about to run with `params` bound to it.
     ///
     /// The row query is the CALLER's predicate, so it is bounded exactly as the caller's own
-    /// statement is: the engine's progress handler is installed with the same deadline
-    /// [`Self::execute_as`] gives a statement (this endpoint's budget, clamped by the
-    /// session's `statement_timeout`), so the scan has a cancellation point and cannot hold
-    /// this endpoint's engine for longer than one statement may.
+    /// statement is: this session's view, carrying the same deadline [`Self::execute_as`]
+    /// gives a statement (this endpoint's budget, clamped by the session's
+    /// `statement_timeout`), is published on the engine BEFORE the scan runs, and the
+    /// engine's progress handler is installed with that deadline. The publication is what
+    /// bounds a server function the progress handler cannot reach into — one that waits —
+    /// because such a function reads its budget from the published view; the handler bounds
+    /// the scan itself. So the scan cannot hold this endpoint's engine for longer than one
+    /// statement may.
     ///
     /// `None` where the rows cannot be identified: a row query the engine will not run or
     /// could not finish inside that budget, a statement whose bound parameters cannot be
@@ -739,11 +751,18 @@ impl InstanceDatabase {
     ) -> Option<Vec<i64>> {
         let (deadline, _) = statement_deadline(view);
         let mut databases = self.lock();
-        let conn: &Connection =
+        {
+            let mut current = self.view.lock().unwrap_or_else(PoisonError::into_inner);
+            *current = view.clone();
+            current.deadline = Some(deadline);
+        }
+        let conn: &mut Connection =
             connection(&mut databases, &self.view, &self.transactions, database).ok()?;
-        conn.progress_handler(PROGRESS_HANDLER_OPS, Some(move || Instant::now() >= deadline));
+        conn.progress_handler(PROGRESS_HANDLER_OPS, Some(move || Instant::now() >= deadline))
+            .ok()?;
         let ids = identified_rows(conn, rows_sql, sql, params);
-        conn.progress_handler(PROGRESS_HANDLER_OPS, None::<fn() -> bool>);
+        // As above: the next statement installs its own bound.
+        let _ = conn.progress_handler(PROGRESS_HANDLER_OPS, None::<fn() -> bool>);
         ids
     }
 
@@ -755,7 +774,6 @@ impl InstanceDatabase {
         let statement = conn.prepare(sql).map_err(from_engine)?;
         Ok(statement
             .columns()
-            .iter()
             .map(|column| named_column(column.name(), column.decl_type()))
             .collect())
     }
@@ -937,8 +955,8 @@ fn open_recorded_database(
     transactions: &Arc<OpenTransactions>,
     name: &str,
 ) -> Result<Connection, EngineError> {
-    let conn = open_confined_database(view)?;
-    session_transactions::record_changes_of(&conn, name, transactions);
+    let mut conn = open_confined_database(view)?;
+    session_transactions::record_changes_of(&mut conn, name, transactions).map_err(unavailable)?;
     Ok(conn)
 }
 
@@ -959,8 +977,13 @@ fn probe_the_engine_starts(view: &Arc<Mutex<ServerView>>) -> Result<(), EngineEr
 /// statement has.
 pub fn statement_deadline(view: &ServerView) -> (Instant, bool) {
     let endpoint_deadline = Instant::now() + STATEMENT_DEADLINE;
+    // `statement_timeout` is a value the SESSION sets over the wire, and
+    // `Instant + Duration` PANICS on overflow rather than saturating, so the addition is
+    // checked: a timeout too large to represent cannot be smaller than this endpoint's
+    // budget, so it loses the comparison below exactly as a representable large one does.
     let timeout = (view.statement_timeout_ms > 0)
-        .then(|| Instant::now() + Duration::from_millis(view.statement_timeout_ms));
+        .then(|| Instant::now().checked_add(Duration::from_millis(view.statement_timeout_ms)))
+        .flatten();
     match timeout {
         Some(timeout) if timeout <= endpoint_deadline => (timeout, true),
         _ => (endpoint_deadline, false),
@@ -1006,19 +1029,32 @@ fn identified_rows(
 /// `defer_foreign_keys` ([`InstanceDatabase::put_the_rows_back`]). Holding the lift in a guard
 /// is what makes the confinement come back on every path out of that span, an early return and
 /// an unwind included — a connection left unconfined would stay so for every later session.
-struct Unconfined<'a>(&'a Connection);
+struct Unconfined<'a>(&'a mut Connection);
 
 impl<'a> Unconfined<'a> {
     /// Lift the authorizer on `conn` until the guard is dropped.
-    fn of(conn: &'a Connection) -> Self {
-        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    ///
+    /// A lift the engine refuses leaves the connection CONFINED, which the restore below
+    /// then fails on with the engine's own refusal — never running unconfined.
+    fn of(conn: &'a mut Connection) -> Self {
+        let _ = conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
         Self(conn)
+    }
+
+    /// The lifted connection, for the server's own work inside this span. Reached through
+    /// the guard so the connection cannot be used while the lift is not held.
+    fn connection(&mut self) -> &mut Connection {
+        self.0
     }
 }
 
 impl Drop for Unconfined<'_> {
     fn drop(&mut self) {
-        self.0.authorizer(Some(confine_to_the_instance));
+        // The confinement comes back on every path out of the span. The engine refuses to
+        // set an authorizer only on a connection that is no longer usable at all — every
+        // later statement on it fails — and a drop has nothing to report, so the refusal is
+        // not propagated here.
+        let _ = self.0.authorizer(Some(confine_to_the_instance));
     }
 }
 
@@ -1026,7 +1062,7 @@ impl Drop for Unconfined<'_> {
 /// functions this endpoint defines registered on it ([`register_server_functions`]) —
 /// before any client statement can reach it.
 fn open_confined_database(view: &Arc<Mutex<ServerView>>) -> Result<Connection, EngineError> {
-    let conn = Connection::open_in_memory().map_err(unavailable)?;
+    let mut conn = Connection::open_in_memory().map_err(unavailable)?;
     // Temp database in memory FIRST, so naming `temp` below opens it in memory and
     // not as a host file; then the page ceiling on both schemas.
     conn.pragma_update(None, "temp_store", TEMP_STORE_MEMORY)
@@ -1057,7 +1093,8 @@ fn open_confined_database(view: &Arc<Mutex<ServerView>>) -> Result<Connection, E
     }
     // Installed LAST, so the settings above — themselves pragmas — are not refused
     // by it.
-    conn.authorizer(Some(confine_to_the_instance));
+    conn.authorizer(Some(confine_to_the_instance))
+        .map_err(unavailable)?;
     register_server_functions(&conn, view)?;
     Ok(conn)
 }
@@ -1162,25 +1199,34 @@ fn register_server_functions(
     // `pg_sleep(seconds)` — "Makes the current session's process sleep until the given
     // number of seconds have elapsed". It really waits, and it stops waiting when the
     // statement's deadline passes, which is what makes a `statement_timeout` observable
-    // through it. The wait is bounded twice over: by the deadline the statement runs
-    // under, which is at most `STATEMENT_DEADLINE`, and by an hour for the argument
-    // itself, so the connection this holds cannot be held by a caller's own number.
+    // through it. The wait is bounded three times over: by the deadline the statement runs
+    // under, by this endpoint's own budget from the moment the wait starts — which is the
+    // bound that holds when no statement has published a deadline on this connection yet —
+    // and by an hour for the argument itself, so the connection this holds, and the
+    // instance's engine lock with it, cannot be held by a caller's own number.
     let sleeping = Arc::clone(view);
     conn.create_scalar_function("pg_sleep", 1, FunctionFlags::SQLITE_UTF8, move |context| {
         let seconds = context.get::<f64>(0).unwrap_or(0.0).max(0.0);
         let view = read(&sleeping);
-        let until = Instant::now() + Duration::from_secs_f64(seconds.min(3_600.0));
+        let entered = Instant::now();
+        let endpoint_ceiling = entered + STATEMENT_DEADLINE;
+        let ceiling = view
+            .deadline
+            .map_or(endpoint_ceiling, |deadline| deadline.min(endpoint_ceiling));
+        let until = entered
+            .checked_add(Duration::from_secs_f64(seconds.min(3_600.0)))
+            .unwrap_or(ceiling);
         loop {
             let now = Instant::now();
             if now >= until {
                 return Ok(Option::<String>::None);
             }
-            if view.deadline.is_some_and(|deadline| now >= deadline) {
+            if now >= ceiling {
                 return Err(rusqlite::Error::UserFunctionError(
                     STATEMENT_TIMEOUT_CANCELLATION.into(),
                 ));
             }
-            std::thread::sleep(SLEEP_SLICE.min(until - now));
+            std::thread::sleep(SLEEP_SLICE.min(until.saturating_duration_since(now)));
         }
     })
     .map_err(unavailable)?;
@@ -1232,7 +1278,6 @@ fn run_statement(
     }
     let columns: Vec<ColumnInfo> = statement
         .columns()
-        .iter()
         .map(|column| named_column(column.name(), column.decl_type()))
         .collect();
     if columns.is_empty() {

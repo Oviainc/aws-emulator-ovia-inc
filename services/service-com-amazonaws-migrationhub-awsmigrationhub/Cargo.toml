@@ -8,6 +8,8 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The shared claim rule that separates two services under one SigV4 signing name.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

@@ -2,175 +2,34 @@
 
 //! End-to-end tests for the MigrationHub Config home-region-control lifecycle.
 //!
-//! Every case drives the service the way a client does: a `POST /` with
+//! Every case drives the service the way a client does, through the shared
+//! [`crate::harness`]: a `POST /` with
 //! `X-Amz-Target: AWSMigrationHubMultiAccountService.<Operation>` through the
 //! `MultiServiceRouter`, so routing, deserialization, constraint validation,
 //! the handler and serialization all run.
 
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_migrationhubconfig_awsmigrationhubmultiaccountservice::state::{
-    ComAmazonawsMigrationhubconfigAwsmigrationhubmultiaccountserviceState as MhcState,
-    HomeRegionControlRecord,
+use service_com_amazonaws_migrationhubconfig_awsmigrationhubmultiaccountservice::state::HomeRegionControlRecord;
+
+use crate::harness::{
+    account, control_ids, create_body, error_code, is_well_formed_control_id, Emulator,
+    HOME_REGIONS,
 };
-use service_com_amazonaws_migrationhubconfig_awsmigrationhubmultiaccountservice::EmulatedService;
-
-/// The `X-Amz-Target` prefix for this service (OPERATIONS.md, "Wire protocol").
-const TARGET_PREFIX: &str = "AWSMigrationHubMultiAccountService";
-
-/// Regions spanning the model's `HomeRegion` pattern
-/// (`^([a-z]+)-([a-z]+)-([0-9]+)$`, from
-/// `smithy_query(query="operation", operation="CreateHomeRegionControl")`), none of
-/// which the issue cited: two-letter and three-letter area codes, several middle
-/// words, and a two-digit ordinal.
-const HOME_REGIONS: &[&str] = &[
-    "eu-central-1",
-    "ap-southeast-3",
-    "sa-east-1",
-    "me-south-1",
-    "cn-northwest-1",
-    "us-west-12",
-];
-
-/// One emulator: the shared engine plus a router carrying only this service.
-struct Emulator {
-    engine: Arc<engine::InMemoryEngine>,
-    router: smithy_server_runtime::MultiServiceRouter,
-}
-
-impl Emulator {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = smithy_server_runtime::MultiServiceRouter::new();
-        // These tests exercise the service, not SigV4: the Authorization header
-        // below is a routing signal only.
-        router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(Arc::clone(&engine)));
-        Self { engine, router }
-    }
-
-    /// Call `operation` with `body`, returning the HTTP status and the parsed
-    /// response body (`Value::Null` for an empty body).
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("https://migrationhub-config.us-west-2.amazonaws.com/")
-            .header("content-type", "application/x-amz-json-1.1")
-            .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
-            // The SigV4 credential scope names the signing name (`mgh`), which is
-            // how the router picks the service that claims the request.
-            .header(
-                "authorization",
-                "AWS4-HMAC-SHA256 \
-                 Credential=AKIDEMULATOR/20260102/us-west-2/mgh/aws4_request, \
-                 SignedHeaders=host;x-amz-target, Signature=0000",
-            )
-            .body(bytes::Bytes::from(
-                serde_json::to_vec(body).expect("a test body always serializes"),
-            ))
-            .expect("a valid request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let bytes = response.into_body();
-        let parsed = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-                panic!(
-                    "{operation} answered a body that is not JSON ({error}): {}",
-                    String::from_utf8_lossy(&bytes)
-                )
-            })
-        };
-        (status, parsed)
-    }
-
-    /// The controls currently in the store, in store order.
-    fn stored_control_ids(&self) -> Vec<String> {
-        self.engine
-            .state::<MhcState>()
-            .lock()
-            .home_region_controls
-            .keys()
-            .cloned()
-            .collect()
-    }
-
-    /// Put `records` in the store directly, so a filter/pagination case can span
-    /// more controls than one account's lifecycle ever holds. Only the control map
-    /// is seeded: `DescribeHomeRegionControls` reports what the store holds and
-    /// does not read the per-account index.
-    fn seed(&self, records: Vec<HomeRegionControlRecord>) {
-        let state = self.engine.state::<MhcState>();
-        let mut store = state.lock();
-        for record in records {
-            store
-                .home_region_controls
-                .insert(record.control_id.clone(), record);
-        }
-    }
-}
-
-/// The account every emulated caller is: the canonical account id the vendored
-/// `engine` crate vends (`engine::emulator_account_id`).
-fn account() -> &'static str {
-    engine::emulator_account_id()
-}
-
-fn create_body(home_region: &str, dry_run: bool) -> Value {
-    json!({
-        "HomeRegion": home_region,
-        "Target": { "Type": "ACCOUNT", "Id": account() },
-        "DryRun": dry_run,
-    })
-}
-
-/// Whether `control_id` satisfies the model's `ControlId` pattern
-/// `^hrc-[a-z0-9]{12}$`.
-fn is_well_formed_control_id(control_id: &str) -> bool {
-    match control_id.strip_prefix("hrc-") {
-        Some(suffix) => {
-            suffix.len() == 12
-                && suffix
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        }
-        None => false,
-    }
-}
-
-fn error_code(body: &Value) -> &str {
-    body["__type"].as_str().unwrap_or("<no __type>")
-}
-
-fn control_ids(body: &Value) -> Vec<String> {
-    body["HomeRegionControls"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(|control| {
-            control["ControlId"]
-                .as_str()
-                .unwrap_or("<no ControlId>")
-                .to_string()
-        })
-        .collect()
-}
 
 #[tokio::test]
 async fn the_home_region_control_lifecycle_round_trips_through_the_store() {
     let emulator = Emulator::new();
 
-    // Nothing is configured yet: GetHomeRegion must not answer a hollow 200.
+    // Nothing is configured yet: `GetHomeRegionResult$HomeRegion` is optional, so the
+    // answer is a success carrying no region.
     let (status, body) = emulator.call("GetHomeRegion", &json!({})).await;
     assert_eq!(
-        (status, error_code(&body)),
-        (400, "InvalidInputException"),
-        "GetHomeRegion before any control: expected 400 InvalidInputException, got {status} {body}"
+        (status, body.clone()),
+        (200, json!({})),
+        "GetHomeRegion before any control: expected 200 with no HomeRegion, got {status} {body}"
     );
 
     let (status, created) = emulator
@@ -279,8 +138,8 @@ async fn the_home_region_control_lifecycle_round_trips_through_the_store() {
 
     let (status, body) = emulator.call("GetHomeRegion", &json!({})).await;
     assert_eq!(
-        (status, error_code(&body)),
-        (400, "InvalidInputException"),
+        (status, body.clone()),
+        (200, json!({})),
         "GetHomeRegion after delete: expected the region to be unset, got {status} {body}"
     );
 
@@ -430,8 +289,8 @@ async fn a_dry_run_create_reports_dry_run_operation_and_persists_nothing() {
     );
     let (status, body) = emulator.call("GetHomeRegion", &json!({})).await;
     assert_eq!(
-        (status, error_code(&body)),
-        (400, "InvalidInputException"),
+        (status, body.clone()),
+        (200, json!({})),
         "a dry run must leave the home region unset, got {status} {body}"
     );
 
