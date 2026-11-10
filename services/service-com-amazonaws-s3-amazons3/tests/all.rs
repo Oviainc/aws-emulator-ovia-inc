@@ -261,6 +261,8 @@ mod object_replication;
 mod object_retention;
 #[path = "all/object_restore.rs"]
 mod object_restore;
+#[path = "all/object_scoped_refusal_envelope.rs"]
+mod object_scoped_refusal_envelope;
 #[path = "all/object_select_content.rs"]
 mod object_select_content;
 #[path = "all/object_storage.rs"]
@@ -349,5 +351,7 @@ mod version_id_classification;
 mod write_checksum_header_count;
 #[path = "all/write_response_identity.rs"]
 mod write_response_identity;
+#[path = "all/zz_host_style_probe.rs"]
+mod zz_host_style_probe;
 #[path = "all/zz_probe.rs"]
 mod zz_probe;

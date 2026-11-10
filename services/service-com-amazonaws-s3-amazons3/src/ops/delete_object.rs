@@ -533,11 +533,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
             let outcome = store.remove_object_version(&input.bucket, &input.key, version_id);
             return match outcome {
                 None => Err(DeleteObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into()),
+                // The version the request named is not one this bucket holds. The document
+                // names the object it is about — the key, and the version that was not there
+                // — and names it HERE rather than leaving it to the request-scoped note this
+                // service writes an object-scoped envelope from
+                // ([`crate::state::addressed_bucket`]): this handler AWAITS before it
+                // refuses, so it may answer on a worker thread that never read the note.
                 Some(false) => Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::NO_SUCH_VERSION_CODE,
                     404,
                     crate::state::NO_SUCH_VERSION_MESSAGE,
-                )),
+                )
+                .naming_object(&input.key, Some(version_id))),
                 // "Returns the version ID of the delete marker created as a result of the
                 // DELETE operation" (`DeleteObjectOutput$VersionId`): for a delete that
                 // named a version, the version it removed.
