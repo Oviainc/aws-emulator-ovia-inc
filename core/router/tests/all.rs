@@ -17,6 +17,11 @@
 // else appends to.
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
+// Declared here, in this same head region, for the reason the entry above records: what an
+// EventBridge rule hands a Lambda target and which function qualifier the target ARN
+// addresses, which spans EventBridge and Lambda at once.
+#[path = "all/events_lambda_target_qualified_arn_envelope.rs"]
+mod events_lambda_target_qualified_arn_envelope;
 // Declared here, in this same head region, for the reason the entry above records: the two
 // services sharing the `mgh` signing name are two crates, so neither crate's own test
 // target can mount both and ask which of them claims a request.
