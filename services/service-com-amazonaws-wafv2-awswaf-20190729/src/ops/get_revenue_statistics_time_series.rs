@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRevenueStatisticsTimeSeries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRevenueStatisticsTimeSeries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! "Time series data for monetization revenue" (`DataPoints`): the scope's
+//! settlement ledger ([`crate::state::SettlementRecordEntry`]) — the transactions
+//! whose settlement instant the `TimeWindow` contains and which satisfy every
+//! filter the request applied, the same selection a settlement listing and the
+//! revenue summary report — aggregated into "data points aggregated at the
+//! specified interval": one point per `Interval`-wide bucket that holds a
+//! transaction, and, when the request names a `GroupBy` dimension, one per value
+//! of that dimension within the bucket.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRevenueStatisticsTimeSeries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A bucket starts at a whole multiple of the interval from the Unix epoch, so a
+//! `MINUTELY`, `FIVE_MINUTELY`, `HOURLY` or `DAILY` series falls on the minute,
+//! the five minutes, the hour or the UTC day whatever instant the window starts
+//! at. A bucket no transaction falls in is no data point: the series reports the
+//! intervals that have data, which is why a window that settled nothing reports
+//! none at all.
+//!
+//! Over a bucket's transactions a point reports `MonetizeServedCount`, the HTTP
+//! 402 Payment Required answers served, which is one per monetized request because
+//! the `Monetize` action "returns an HTTP 402 Payment Required response containing
+//! pricing information that the requesting client uses to complete payment";
+//! `SettledCount`, those whose `Status` is `SETTLED`, the one status whose
+//! transfer "is confirmed"; and — for the `DATE_HISTOGRAM` statistic, the one
+//! documented as revenue over time — `TotalAmount`, the sum of `Amount` over
+//! exactly those settled transactions. A `PAYMENT_TRAFFIC` series is documented as
+//! payment traffic patterns, so its points carry the traffic counts and no revenue
+//! amount.
+//!
+//! A payment is settled by WAF's DATA plane, when a rule's `Monetize` action
+//! settles one for a request a web ACL evaluated. This emulator serves the WAFv2
+//! control plane only, so no operation writes that ledger and a window reports an
+//! empty series, which is the answer WAF gives for an account whose window settled
+//! nothing. The aggregation is still the whole answer: a ledger that holds
+//! transactions reports exactly the points those come to.
+//!
+//! "This operation is only available for CLOUDFRONT scope", so a request naming the
+//! regional namespace is refused as the unavailable operation it is, and "the
+//! maximum supported time window is 90 days", so a wider window is refused too.
+//! `Limit` is "the maximum number of data points to return", so a longer series is
+//! cut into pages and `NextMarker` names where the next one resumes.
+//!
+//! The call REPORTS: it reads the ledger and changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +206,312 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRevenueStatisticsTimeSeries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRevenueStatisticsTimeSeriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A read: `ctx` carries the request's own metadata (the endpoint region the
+        // scope is judged against) and nothing here writes to the store.
+
+        // The request's own members first, so a bad one is refused whatever the
+        // ledger holds.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRevenueStatisticsTimeSeries"))
+        // `Scope` is judged from the request alone: an unknown value, and the global
+        // scope at an endpoint that does not serve it, are the same bad parameter
+        // (`crate::service::requests::validate_scope`).
+        if let Err(refusal) = crate::service::requests::validate_scope(&input.scope, ctx.parts()) {
+            return Err(
+                GetRevenueStatisticsTimeSeriesErrorModeled::WAFInvalidParameterException(refusal)
+                    .into(),
+            );
+        }
+        // "This operation is only available for CLOUDFRONT scope": monetization is a
+        // CloudFront-delivery feature, so under the regional namespace this
+        // operation does not exist rather than carrying a bad parameter value — the
+        // same modelled `WAFInvalidOperationException` every monetization query
+        // answers there (`crate::state::monetization_not_available_exception`).
+        if input.scope != crate::state::SCOPE_CLOUDFRONT {
+            return Err(
+                GetRevenueStatisticsTimeSeriesErrorModeled::WAFInvalidOperationException(
+                    crate::state::monetization_not_available_exception(),
+                )
+                .into(),
+            );
+        }
+        if !crate::state::is_known_currency(&input.currency) {
+            return Err(invalid_parameter_without_field(
+                &input.currency,
+                "the currency names the denomination of the amounts in the response",
+            ));
+        }
+        if !TIME_SERIES_STATISTIC_TYPE_VALUES.contains(&input.statistic_type.as_str()) {
+            return Err(invalid_parameter_without_field(
+                &input.statistic_type,
+                "a revenue time series reports one of DATE_HISTOGRAM or PAYMENT_TRAFFIC",
+            ));
+        }
+        // The interval is the width of one data point's bucket, so a value naming no
+        // interval is what makes the request unanswerable.
+        let Some(interval) = interval_millis(&input.interval) else {
+            return Err(invalid_parameter_without_field(
+                &input.interval,
+                "data points are aggregated at one of MINUTELY, FIVE_MINUTELY, HOURLY or DAILY",
+            ));
+        };
+        if let Some(group_by) = input.group_by.as_deref() {
+            if !GROUP_BY_TYPE_VALUES.contains(&group_by) {
+                return Err(invalid_parameter_without_field(
+                    group_by,
+                    "results group by one of NAME, CATEGORY, INTENT, ORGANIZATION or WEBACL",
+                ));
+            }
+        }
+        let filters = input.filters.as_deref().unwrap_or_default();
+        crate::state::validate_monetization_filters(filters)
+            .map_err(GetRevenueStatisticsTimeSeriesErrorModeled::WAFInvalidParameterException)?;
+        let window = crate::state::monetization_window(&input.time_window)
+            .map_err(GetRevenueStatisticsTimeSeriesErrorModeled::WAFInvalidParameterException)?;
+        let page_size = data_point_page_size(input.limit);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetRevenueStatisticsTimeSeriesErrorModeled::WAFInternalErrorException(
+                    WAFInternalErrorException {
+                        message: Some("the wafv2 store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        // Every transaction of this scope's ledger that the window contains and the
+        // filters select, counted into the bucket it belongs to: the interval it
+        // settled in, and the value of the dimension the request grouped by. The map
+        // is ordered, so the series runs oldest bucket first and two dimension values
+        // of one bucket always come in the same order — which is what lets a marker
+        // name one position.
+        let mut buckets: ::std::collections::BTreeMap<(i64, Option<String>), DataPointAggregate> =
+            ::std::collections::BTreeMap::new();
+        for entry in state.settlement_records(&input.scope) {
+            let settled_at = crate::state::date_time_millis(&entry.record.timestamp);
+            if !window.contains(&settled_at)
+                || !crate::state::monetization_filters_select(entry, filters)
+            {
+                continue;
+            }
+            let key = (
+                bucket_start(settled_at, interval),
+                group_value(entry, input.group_by.as_deref()),
+            );
+            buckets.entry(key).or_default().add(&entry.record);
+        }
+
+        // One data point per bucket, carried with its position in the series: the
+        // position is what a marker names, so a page always resumes where the one
+        // before it ended.
+        let mut points: Vec<(usize, DataPointEntry)> = buckets
+            .into_iter()
+            .enumerate()
+            .map(|(position, ((bucket, group), aggregate))| {
+                (
+                    position,
+                    aggregate.data_point(
+                        bucket,
+                        group,
+                        &input.statistic_type,
+                        input.group_by.as_deref(),
+                    ),
+                )
+            })
+            .collect();
+
+        // A `NextMarker` is "the marker from the prior call": the cursor of the last
+        // data point of the page before this one, so this page resumes at the point
+        // after it. A marker naming no point of this series names no position to
+        // resume from.
+        if let Some(marker) = input.next_marker.as_deref() {
+            match points
+                .iter()
+                .position(|(position, _)| cursor(*position) == marker)
+            {
+                Some(index) => {
+                    points.drain(..=index);
+                }
+                None => points.clear(),
+            }
+        }
+        // `NextMarker` "indicates that additional results are available", so a page
+        // that ends the series carries none, which is what ends a paginator's loop.
+        let truncated = points.len() > page_size;
+        points.truncate(page_size);
+        let next_marker = truncated
+            .then(|| points.last().map(|(position, _)| cursor(*position)))
+            .flatten();
+
+        Ok(GetRevenueStatisticsTimeSeriesOutput {
+            data_points: Some(points.into_iter().map(|(_, point)| point).collect()),
+            next_marker,
+        })
     }
 }
+
+/// The modelled `WAFInvalidParameterException` for a parameter the enum
+/// `ParameterExceptionField` names no settings group for: the rejected value and
+/// why, lifted into this operation's error channel.
+fn invalid_parameter_without_field(
+    parameter: &str,
+    reason: &str,
+) -> GetRevenueStatisticsTimeSeriesError {
+    GetRevenueStatisticsTimeSeriesErrorModeled::WAFInvalidParameterException(
+        crate::state::invalid_parameter_exception_without_field(parameter, reason),
+    )
+    .into()
+}
+
+/// The cursor naming the data point at `position` in the series: the form every
+/// `NextMarker` of this service takes.
+fn cursor(position: usize) -> String {
+    crate::state::listing_cursor(u64::try_from(position).unwrap_or(u64::MAX))
+}
+
+/// The widest page this operation answers with: the upper bound of the model's
+/// `MaxDataPoints` (`smithy_query(query="shape",shape="MaxDataPoints")` → `range
+/// 1..10000`), which is what `Limit`, "the maximum number of data points to
+/// return", is bounded by.
+const MAX_DATA_POINTS: i32 = 10_000;
+
+/// How many data points one page holds, for a request whose `Limit` is `limit`.
+///
+/// Absent `Limit`, a page holds as many as the modelled maximum allows. The member
+/// carries its own `range 1..10000`, refused before this handler runs, so the
+/// clamp states that invariant rather than hiding a case.
+fn data_point_page_size(limit: Option<i32>) -> usize {
+    let requested = limit.unwrap_or(MAX_DATA_POINTS).clamp(1, MAX_DATA_POINTS);
+    usize::try_from(requested).unwrap_or(1)
+}
+
+/// How wide one data point's bucket is, in milliseconds, for the interval
+/// `Interval` names — "the time interval for aggregating data points: MINUTELY,
+/// FIVE_MINUTELY, HOURLY, or DAILY" — or `None` for a value that names no
+/// interval.
+fn interval_millis(interval: &str) -> Option<i64> {
+    const MINUTE: i64 = 60 * 1_000;
+    match interval {
+        "MINUTELY" => Some(MINUTE),
+        "FIVE_MINUTELY" => Some(5 * MINUTE),
+        "HOURLY" => Some(60 * MINUTE),
+        "DAILY" => Some(24 * 60 * MINUTE),
+        _ => None,
+    }
+}
+
+/// The instant the bucket holding `settled_at` starts at: the whole multiple of
+/// `interval` at or before it, so a series falls on the minute, the five minutes,
+/// the hour or the UTC day rather than on whatever instant a window began at. The
+/// division FLOORS, so an instant before the epoch lands in the bucket that
+/// contains it rather than in the one after.
+fn bucket_start(settled_at: i64, interval: i64) -> i64 {
+    settled_at.div_euclid(interval).saturating_mul(interval)
+}
+
+/// The value of the dimension `group_by` names for one transaction, or `None` when
+/// the request grouped by nothing or the transaction carries no value for that
+/// dimension.
+///
+/// `GroupByType`'s dimensions are the ones a monetization filter names too, so each
+/// reads the same member of the transaction: the bot's name, its category, the
+/// intent it declared, the organization operating it, and the web ACL that
+/// monetized the request.
+fn group_value(
+    entry: &crate::state::SettlementRecordEntry,
+    group_by: Option<&str>,
+) -> Option<String> {
+    let record = &entry.record;
+    let value = match group_by? {
+        GROUP_BY_NAME => record.source_name.as_deref(),
+        GROUP_BY_CATEGORY => record.source_category.as_deref(),
+        GROUP_BY_INTENT => record.intent.as_deref(),
+        GROUP_BY_ORGANIZATION => record.organization.as_deref(),
+        GROUP_BY_WEB_ACL => record.web_acl_arn.as_deref(),
+        _ => None,
+    };
+    value.map(str::to_string)
+}
+
+/// The transactions counted into one data point: how many were monetized, how many
+/// settled, and what those settled came to.
+#[derive(Debug, Default)]
+struct DataPointAggregate {
+    /// One HTTP 402 answer per monetized request, whatever its payment went on to
+    /// settle as.
+    monetize_served_count: i64,
+    /// The transactions whose `Status` is `SETTLED`.
+    settled_count: i64,
+    /// The `Amount` of each settled transaction, summed when the point is built so
+    /// the total is the exact decimal the operands spell.
+    settled_amounts: Vec<String>,
+}
+
+impl DataPointAggregate {
+    /// Count one more selected transaction into this data point.
+    fn add(&mut self, record: &SettlementRecord) {
+        self.monetize_served_count = self.monetize_served_count.saturating_add(1);
+        if record.status == crate::state::SETTLEMENT_STATUS_SETTLED {
+            self.settled_count = self.settled_count.saturating_add(1);
+            self.settled_amounts.push(record.amount.clone());
+        }
+    }
+
+    /// This aggregate as the data point of the bucket starting at `bucket`.
+    ///
+    /// `TotalAmount` is "the total revenue amount during this interval", which is
+    /// what the `DATE_HISTOGRAM` statistic retrieves (revenue over time); a
+    /// `PAYMENT_TRAFFIC` series retrieves payment traffic patterns, so its points
+    /// carry the counts alone. `Category` and `Intent` are the dimension value "when
+    /// grouped by category" and "when grouped by intent", and `GroupByValue` carries
+    /// it for whichever dimension the request grouped by.
+    fn data_point(
+        &self,
+        bucket: i64,
+        group: Option<String>,
+        statistic_type: &str,
+        group_by: Option<&str>,
+    ) -> DataPointEntry {
+        let grouped_by = |dimension: &str| group_by == Some(dimension);
+        DataPointEntry {
+            date: Some(::aws_smithy_types::DateTime::from_millis(bucket)),
+            monetize_served_count: self.monetize_served_count,
+            settled_count: self.settled_count,
+            total_amount: (statistic_type == STATISTIC_TYPE_DATE_HISTOGRAM).then(|| {
+                crate::state::monetization_amount_total(
+                    self.settled_amounts.iter().map(String::as_str),
+                )
+            }),
+            category: grouped_by(GROUP_BY_CATEGORY)
+                .then(|| group.clone())
+                .flatten(),
+            intent: grouped_by(GROUP_BY_INTENT)
+                .then(|| group.clone())
+                .flatten(),
+            group_by_value: group,
+        }
+    }
+}
+
+/// `TimeSeriesStatisticType`'s `DATE_HISTOGRAM` value: the series retrieved "for
+/// revenue over time", the one whose points carry a revenue amount.
+const STATISTIC_TYPE_DATE_HISTOGRAM: &str = "DATE_HISTOGRAM";
+
+/// `GroupByType`'s `NAME` value: the bot that paid, as `SourceName` names it.
+const GROUP_BY_NAME: &str = "NAME";
+
+/// `GroupByType`'s `CATEGORY` value, the dimension `DataPointEntry$Category`
+/// reports "when grouped by category".
+const GROUP_BY_CATEGORY: &str = "CATEGORY";
+
+/// `GroupByType`'s `INTENT` value, the dimension `DataPointEntry$Intent` reports
+/// "when grouped by intent".
+const GROUP_BY_INTENT: &str = "INTENT";
+
+/// `GroupByType`'s `ORGANIZATION` value: the organization operating the bot.
+const GROUP_BY_ORGANIZATION: &str = "ORGANIZATION";
+
+/// `GroupByType`'s `WEBACL` value: the web ACL whose rule monetized the request.
+const GROUP_BY_WEB_ACL: &str = "WEBACL";

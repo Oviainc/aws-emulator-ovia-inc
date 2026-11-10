@@ -113,6 +113,8 @@ mod resource_untagging;
 mod response_members;
 #[path = "all/revenue_statistics_summary.rs"]
 mod revenue_statistics_summary;
+#[path = "all/revenue_time_series.rs"]
+mod revenue_time_series;
 #[path = "all/rule_evaluation_order.rs"]
 mod rule_evaluation_order;
 #[path = "all/rule_group_capacity_refusal.rs"]
