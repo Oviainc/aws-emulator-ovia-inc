@@ -163,6 +163,19 @@ pub const DELIVERY_NOT_FOUND_MESSAGE: &str = "Requested Delivery does not exist 
 pub const DELIVERY_SOURCE_NOT_FOUND_MESSAGE: &str =
     "Requested Delivery Source does not exist in this account.";
 
+/// The refusal CloudWatch Logs answers a create with when the calling principal's own
+/// policies do not let it make the write that grants the log-delivery service access to the
+/// destination resource — the resource policy such a resource of this service's carries.
+///
+/// The sentence is FIXED for that error class: it names neither the destination, nor the
+/// resource behind it, nor the principal, nor the action withheld, and it points the caller
+/// at the permissions it needs on the destination resource instead. So every caller that
+/// cannot wire a delivery to a destination is refused identically, whichever destination it
+/// named.
+pub const DELIVERY_DESTINATION_ACCESS_DENIED_MESSAGE: &str =
+    "Access Denied for this Delivery Destination. Please make sure that you have correct \
+     permissions to access the Log Destination Resource.";
+
 /// The refusal CloudWatch Logs answers the delete of a delivery-pipeline resource with while a
 /// delivery still references it — "You can't delete a delivery destination if any current
 /// deliveries are associated with it", and the same for a delivery source.

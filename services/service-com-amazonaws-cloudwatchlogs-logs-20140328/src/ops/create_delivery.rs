@@ -3,8 +3,10 @@
 //! @op CreateDelivery
 //! Implemented: decides the caller's identity-based IAM policies for `logs:CreateDelivery`
 //! on the delivery source and the delivery destination the request pairs, refusing an
-//! unauthorized call with `AccessDeniedException` before anything is read or written, then
-//! pairs one stored delivery source with one stored delivery destination,
+//! unauthorized call with `AccessDeniedException` before anything is read or written; also
+//! decides `logs:PutResourcePolicy` on a destination RESOURCE of this service's own, the
+//! write that grants the log-delivery service access to it; then pairs one stored delivery
+//! source with one stored delivery destination,
 //! minting the delivery `DescribeDeliveries` and `GetDelivery` then report. The pair
 //! identifies the delivery, so a create naming a pair the account already holds is
 //! idempotent: it answers the stored delivery, with its existing id and configuration,
@@ -149,6 +151,15 @@ impl From<CreateDeliveryErrorModeled> for CreateDeliveryError {
     }
 }
 
+/// The operation whose grant a create needs BESIDES its own, when the destination resource is
+/// one of this service's own: what lets logs be delivered to such a resource is the resource
+/// policy on it — the write `PutResourcePolicy` performs, "a resource policy allowing other
+/// Amazon Web Services services to put log events to this account" — so a caller that may not
+/// make that write may not have a delivery wired to that resource either. Named as the
+/// operation, so the action asked about is spelled by the one place that spells this service's
+/// actions ([`crate::state::identity_authorization::action_for`]).
+const DESTINATION_POLICY_WRITE_OPERATION: &str = "PutResourcePolicy";
+
 /// The `CreateDelivery` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -197,6 +208,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // decided against each of them, in the order the request names them. Each ARN is
         // built from the request rather than resolved out of the store, so the decision does
         // not depend on whether the resource exists.
+        let access_denied = |message: String| {
+            CreateDeliveryError::from(CreateDeliveryErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            ))
+        };
         for resource in [
             crate::state::delivery_source_arn(&region, &input.delivery_source_name),
             input.delivery_destination_arn.clone(),
@@ -207,12 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Self::NAME,
                 &resource,
             ) {
-                return Err(CreateDeliveryErrorModeled::AccessDeniedException(
-                    AccessDeniedException {
-                        message: Some(message),
-                    },
-                )
-                .into());
+                return Err(access_denied(message));
             }
         }
 
@@ -223,6 +236,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
+
+        // What lets logs reach the destination is a GRANT of write access on the destination
+        // RESOURCE to the log-delivery service, and when that resource is one of this
+        // service's own the grant is the resource policy it carries — a log group being "the
+        // only resource type a resource policy can be attached to"
+        // ([`crate::state::is_log_group_arn`]). So wiring a delivery to such a resource is
+        // the caller asking for a policy write it may not be allowed to make, and the create
+        // is decided against that write as well, on the resource the policy belongs to: a
+        // caller the policies withhold it from is told it cannot reach the destination
+        // resource rather than handed a delivery that could never write anything.
+        //
+        // A destination resource ANOTHER service owns (a bucket, a delivery stream) carries
+        // no policy of this service's, so there is no write of this service's to decide: that
+        // grant is the owning service's own.
+        //
+        // The destination RESOURCE is a fact about the stored destination, so the lookup
+        // comes first, under a guard that is released before the decision is asked for —
+        // identity policies are read from the IAM and STS stores with no guard of this
+        // service's own store held.
+        let destination_log_group = state
+            .lock()
+            .delivery_destination_by_arn(&region, &input.delivery_destination_arn)
+            .and_then(|destination| destination.destination_resource_arn.clone())
+            .filter(|resource| crate::state::is_log_group_arn(resource));
+        if let Some(log_group) = destination_log_group {
+            // What the refusal SAYS is this class's own fixed sentence, not the identity
+            // decision's: the caller is told that it cannot reach the destination resource
+            // and which permissions to look at, and no value of the request or of the
+            // withheld grant is quoted back to it.
+            if crate::state::identity_authorization::refusal(
+                &*self.engine,
+                ctx,
+                DESTINATION_POLICY_WRITE_OPERATION,
+                &log_group,
+            )
+            .is_some()
+            {
+                return Err(access_denied(
+                    crate::state::DELIVERY_DESTINATION_ACCESS_DENIED_MESSAGE.to_string(),
+                ));
+            }
+        }
+
         let mut store = state.lock();
 
         let not_found = |message: &str| {

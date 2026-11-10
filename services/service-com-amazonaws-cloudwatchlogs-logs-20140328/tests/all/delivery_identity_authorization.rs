@@ -778,3 +778,306 @@ async fn the_accounts_own_credential_is_not_bound_by_a_roles_policies() {
          stored, got {read}"
     );
 }
+
+/// The action a create needs BESIDES its own when the destination resource is one this
+/// service owns: wiring the delivery attaches that resource's own resource policy on the
+/// caller's behalf, and a log group is the only resource a policy of this service can be
+/// attached to (`PutResourcePolicy$resourceArn`: "Currently only supports LogGroup ARN").
+const POLICY_WRITE: &str = "logs:PutResourcePolicy";
+
+/// The whole sentence that refusal carries: fixed text for its class, naming no value of the
+/// request — neither the destination, nor the resource behind it, nor the principal, nor the
+/// action that was withheld.
+const DESTINATION_ACCESS_DENIED: &str = "Access Denied for this Delivery Destination. Please \
+                                         make sure that you have correct permissions to \
+                                         access the Log Destination Resource.";
+
+/// A delivery destination over `destination_resource`, or a TRACE destination when that is
+/// `None` — "deliveryDestinationConfiguration is required for CloudWatch Logs, Amazon S3,
+/// Firehose log delivery destinations and not required for X-Ray trace delivery
+/// destinations" (`PutDeliveryDestination$deliveryDestinationConfiguration`). Answers the
+/// destination's own ARN.
+async fn vendor_delivery_destination(
+    aws: &Emulator,
+    name: &str,
+    destination_resource: Option<&str>,
+) -> String {
+    let body = match destination_resource {
+        Some(resource) => json!({
+            "name": name,
+            "deliveryDestinationConfiguration": {"destinationResourceArn": resource},
+        }),
+        None => json!({"name": name, "deliveryDestinationType": "XRAY"}),
+    };
+    let put = aws.ok("PutDeliveryDestination", &body).await;
+    put["deliveryDestination"]["arn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a put answers the destination's ARN, got {put}"))
+        .to_string()
+}
+
+/// A delivery destination over a LOG GROUP of this account, answering
+/// `(the destination's own ARN, the log group's ARN)` — the log group being the resource the
+/// policy that wires a delivery to it is attached to.
+async fn log_group_delivery_destination(aws: &Emulator, name: &str) -> (String, String) {
+    let group = format!("/aws/vendedlogs/{name}");
+    aws.ok("CreateLogGroup", &json!({"logGroupName": &group}))
+        .await;
+    let described = aws
+        .ok(
+            "DescribeLogGroups",
+            &json!({"logGroupIdentifiers": [&group]}),
+        )
+        .await;
+    let group_arn = described["logGroups"][0]["logGroupArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a log group carries logGroupArn, got {described}"))
+        .to_string();
+    let destination_arn = vendor_delivery_destination(aws, name, Some(&group_arn)).await;
+    (destination_arn, group_arn)
+}
+
+/// RULE: a create whose delivery destination represents a resource THIS service owns is
+/// decided against the write this service makes on the caller's behalf to wire it — the
+/// destination resource's own resource policy — as well as against `logs:CreateDelivery` on
+/// the pair, so a principal whose policies do not let it put that resource's policy is
+/// refused `AccessDeniedException` with that class's fixed sentence and the create stores
+/// nothing.
+///
+/// The rows span what the rule generalises over: whether the policy write is granted broadly,
+/// not granted at all, granted on the destination resource, granted on ANOTHER resource of
+/// the same kind, denied broadly, or denied on the destination resource alone.
+#[tokio::test]
+async fn create_delivery_is_decided_against_the_destination_policy_write() {
+    // (case, how the row's policies are built from its own source, destination and log-group
+    // ARNs, whether the call must be served)
+    type Policies = fn(&str, &str, &str) -> Vec<String>;
+    let rows: Vec<(&str, Policies, bool)> = vec![
+        (
+            "a broad grant over this service",
+            |_source, _destination, _group| vec![statement("Allow", "logs:*", "*")],
+            true,
+        ),
+        (
+            "a broad grant with an explicit deny of the destination policy write",
+            |_source, _destination, _group| {
+                vec![
+                    statement("Allow", "logs:*", "*"),
+                    statement("Deny", POLICY_WRITE, "*"),
+                ]
+            },
+            false,
+        ),
+        (
+            "a grant of the create alone, on the two resources it pairs",
+            |source, destination, _group| {
+                vec![
+                    statement("Allow", "logs:CreateDelivery", source),
+                    statement("Allow", "logs:CreateDelivery", destination),
+                ]
+            },
+            false,
+        ),
+        (
+            "the policy write granted on the destination's own log group",
+            |_source, _destination, group| {
+                vec![
+                    statement("Allow", "logs:CreateDelivery", "*"),
+                    statement("Allow", POLICY_WRITE, group),
+                ]
+            },
+            true,
+        ),
+        (
+            "the policy write granted on another log group",
+            |_source, _destination, _group| {
+                vec![
+                    statement("Allow", "logs:CreateDelivery", "*"),
+                    statement(
+                        "Allow",
+                        POLICY_WRITE,
+                        &format!(
+                            "arn:aws:logs:{REGION}:{}:log-group:/aws/vendedlogs/elsewhere",
+                            engine::emulator_account_id()
+                        ),
+                    ),
+                ]
+            },
+            false,
+        ),
+        (
+            "a broad grant with the policy write denied on the destination's log group alone",
+            |_source, _destination, group| {
+                vec![
+                    statement("Allow", "logs:*", "*"),
+                    statement("Deny", POLICY_WRITE, group),
+                ]
+            },
+            false,
+        ),
+    ];
+
+    for (index, (case, policies, served)) in rows.iter().enumerate() {
+        let aws = Emulator::new();
+        let source_name = format!("source-{index}");
+        let source_arn = delivery_source(&aws, &source_name).await;
+        let (destination_arn, group_arn) =
+            log_group_delivery_destination(&aws, &format!("destination-{index}")).await;
+        let caller = assumed_role(
+            &aws,
+            &format!("PolicyWriteRole{index}"),
+            &policies(&source_arn, &destination_arn, &group_arn),
+        )
+        .await;
+
+        let body = json!({
+            "deliverySourceName": &source_name,
+            "deliveryDestinationArn": &destination_arn,
+        });
+        let (status, answer) = aws.call_as(&caller.access_key_id, CREATE, &body).await;
+        if *served {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200, got {status} {answer}"
+            );
+            let id = answer["delivery"]["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: a create reports an id, got {answer}"))
+                .to_string();
+            // The write is proved through a READ: the delivery the create answered is the one
+            // the store holds afterwards.
+            let read = aws.ok(GET, &json!({"id": &id})).await;
+            assert_eq!(
+                read["delivery"]["deliveryDestinationArn"].as_str(),
+                Some(destination_arn.as_str()),
+                "case {case:?}: {GET} must report the destination the create paired, got {read}"
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} {answer}"
+            );
+            let code = error_code(&answer);
+            assert_eq!(
+                code, ACCESS_DENIED,
+                "case {case:?}: expected {ACCESS_DENIED}, got {code:?} {answer}"
+            );
+            // The sentence is this class's own fixed text, whichever rule withheld the grant
+            // and whatever the request named — including the log group itself.
+            let said = message_of(case, &answer);
+            assert_eq!(
+                said, DESTINATION_ACCESS_DENIED,
+                "case {case:?}: expected {DESTINATION_ACCESS_DENIED:?}, got {said:?}"
+            );
+            assert!(
+                !said.contains(&group_arn) && !said.contains(&caller.arn),
+                "case {case:?}: the sentence names no value of the request, got {said:?}"
+            );
+            let held = described(&aws).await;
+            assert!(
+                held.is_empty(),
+                "case {case:?}: a refused create must store nothing, got {held:?}"
+            );
+        }
+    }
+}
+
+/// RULE: the policy write is decided only for a destination resource whose policy is THIS
+/// service's to attach — a log group. A destination resource another service owns carries no
+/// policy of this service's, so a caller denied this service's policy write still has its
+/// create served; the grant for such a destination is the owning service's own to write.
+///
+/// The rows are the destination resources a delivery destination can represent, from
+/// `DeliveryDestinationConfiguration$destinationResourceArn` ("That Amazon Web Services
+/// destination can be a log group in CloudWatch Logs, an Amazon S3 bucket, or a delivery
+/// stream in Firehose") plus the X-Ray trace destination the model's
+/// `DeliveryDestinationType` adds, which needs no destination resource at all.
+#[tokio::test]
+async fn the_destination_policy_write_is_decided_only_for_a_destination_this_service_owns() {
+    let account = engine::emulator_account_id();
+    // (case, the destination resource the destination represents, whether the create is served)
+    let rows: Vec<(&str, Option<String>, bool)> = vec![
+        (
+            "a log group in CloudWatch Logs",
+            Some(format!(
+                "arn:aws:logs:{REGION}:{account}:log-group:/aws/vendedlogs/owned"
+            )),
+            false,
+        ),
+        (
+            "an Amazon S3 bucket",
+            Some("arn:aws:s3:::vended-destination".to_string()),
+            true,
+        ),
+        (
+            "a delivery stream in Firehose",
+            Some(format!(
+                "arn:aws:firehose:{REGION}:{account}:deliverystream/vended-destination"
+            )),
+            true,
+        ),
+        ("an X-Ray trace destination", None, true),
+    ];
+
+    for (index, (case, destination_resource, served)) in rows.iter().enumerate() {
+        let aws = Emulator::new();
+        let source_name = format!("source-{index}");
+        delivery_source(&aws, &source_name).await;
+        let destination_arn = vendor_delivery_destination(
+            &aws,
+            &format!("destination-{index}"),
+            destination_resource.as_deref(),
+        )
+        .await;
+        // One principal for every row: allowed every action of this service EXCEPT the
+        // destination policy write.
+        let caller = assumed_role(
+            &aws,
+            &format!("NoPolicyWriteRole{index}"),
+            &[
+                statement("Allow", "logs:*", "*"),
+                statement("Deny", POLICY_WRITE, "*"),
+            ],
+        )
+        .await;
+
+        let (status, answer) = aws
+            .call_as(
+                &caller.access_key_id,
+                CREATE,
+                &json!({
+                    "deliverySourceName": &source_name,
+                    "deliveryDestinationArn": &destination_arn,
+                }),
+            )
+            .await;
+        if *served {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200, got {status} {answer}"
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} {answer}"
+            );
+            let code = error_code(&answer);
+            assert_eq!(
+                code, ACCESS_DENIED,
+                "case {case:?}: expected {ACCESS_DENIED}, got {code:?} {answer}"
+            );
+            let said = message_of(case, &answer);
+            assert_eq!(
+                said, DESTINATION_ACCESS_DENIED,
+                "case {case:?}: expected {DESTINATION_ACCESS_DENIED:?}, got {said:?}"
+            );
+        }
+        let held = described(&aws).await;
+        assert_eq!(
+            held.len(),
+            usize::from(*served),
+            "case {case:?}: expected {} stored delivery, got {held:?}",
+            usize::from(*served)
+        );
+    }
+}
