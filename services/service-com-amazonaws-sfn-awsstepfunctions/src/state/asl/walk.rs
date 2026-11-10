@@ -1926,12 +1926,18 @@ impl Interpreter<'_> {
                     ..work.naming()
                 },
             );
+            // The attempt BEGINS here, which is what the start event records: the work
+            // the state handed over is now this service's to perform, and nothing about
+            // how the call turns out is known yet. So the start is written before any of
+            // it — before the role's own decision below, before the allowances that may
+            // stop the walk handing the call over, and before the call itself.
+            me.push_detailed(work.started(), name, at, work.naming());
             // The call is made AS the state machine's execution role, so what that
             // role may do decides whether it is made AT ALL: a call the policies in
             // force on the role do not allow is the invoked service's own
-            // access-denied refusal and this task's own failure, reported before the
-            // request goes anywhere — so nothing is started for it and no submission
-            // is claimed.
+            // access-denied refusal and this attempt's own failure, reported before the
+            // request goes anywhere — so the attempt that started closes as a failure
+            // and no submission is claimed.
             if let Some(refused) = me.tasks.authorize(&call, &request) {
                 let failure = Failure {
                     error: Some(refused.error),
@@ -1940,7 +1946,6 @@ impl Interpreter<'_> {
                 me.push_task_failure(name, &work, &failure, at);
                 return (Err(failure), at);
             }
-            me.push_detailed(work.started(), name, at, work.naming());
             // The interpretation's own work allowance is consulted HERE as well as at
             // each transition: a run that has asked for more work than it may do makes
             // no further call (and a `Retry` cannot keep making them).

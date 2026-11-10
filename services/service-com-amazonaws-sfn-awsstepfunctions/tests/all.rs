@@ -155,6 +155,8 @@ mod refusal_message_fidelity;
 mod refusal_message_wording;
 #[path = "all/refusal_vocabulary.rs"]
 mod refusal_vocabulary;
+#[path = "all/refused_invocation_series.rs"]
+mod refused_invocation_series;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/response_request_id.rs"]

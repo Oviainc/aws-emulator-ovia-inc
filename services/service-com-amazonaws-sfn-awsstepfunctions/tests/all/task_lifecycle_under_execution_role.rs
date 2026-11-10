@@ -6,15 +6,14 @@
 //! handlers hold, the access gate in front of the invocation really runs, and the
 //! function really runs.
 //!
-//! RULE: passing that gate is part of MAKING the call rather than a transition of the
-//! work's own. A call the role's policies ALLOW records exactly the events a call made
-//! with no role to ask about records: the state's entered event, then the work's
-//! hand-over, start and outcome, then the execution's own terminal event, "numbered
-//! sequentially, starting at one" with each event naming the one before it. A call they
-//! do NOT allow is not made at all, so the work has no start and no outcome of its own:
-//! the hand-over is followed straight by the task's failure, carrying the invoked
-//! service's own access-denied refusal. The role decides WHETHER the work happens, never
-//! how many events the work that happened records.
+//! RULE: the gate decides what the attempt CLOSES with, not whether it began. Whatever
+//! the role's policies say, an attempt records the same lifecycle — the state's entered
+//! event, then the work's hand-over, its start and its outcome, then the execution's own
+//! terminal event, "numbered sequentially, starting at one" with each event naming the
+//! one before it — because the hand-over and the start are written before anything about
+//! the call's outcome is known. What the policies decide is the OUTCOME: the run's own
+//! error document where they allowed the call, and the invoked service's own
+//! access-denied refusal where they did not, in which case nothing was invoked.
 //!
 //! The rows differ along what the rule generalises over: what the role's policy says
 //! about the call — a grant naming the function's own ARN, a grant over every resource,
@@ -55,35 +54,27 @@ const REFUSED_ERROR: &str = "Lambda.AWSLambdaException";
 /// What the cause of that refusal carries: the code the answer came back under.
 const REFUSED_CODE: &str = "Error Code: AccessDeniedException";
 
-/// What one row's policy does to the call, and so which events the work writes.
+/// What one row's policy does to the call, and so what the attempt closes with.
 enum Decided {
-    /// The call was made: the work started and the run's own error closed it.
+    /// The call was made: the run's own error closed the attempt.
     Made,
-    /// The call was not made: the work never started, so the hand-over is followed by
-    /// the task's failure alone.
+    /// The call was not made: the attempt closes on the invoked service's access-denied
+    /// refusal instead.
     Refused,
 }
 
 /// The lifecycle a row's work records, as `(type, id, previousEventId)`: the pair the
-/// state was entered with around the events the work itself wrote.
-fn expected(decided: &Decided) -> Vec<(String, i64, i64)> {
-    let types: &[&str] = match decided {
-        Decided::Made => &[
-            "ExecutionStarted",
-            "TaskStateEntered",
-            "TaskScheduled",
-            "TaskStarted",
-            "TaskFailed",
-            "ExecutionFailed",
-        ],
-        Decided::Refused => &[
-            "ExecutionStarted",
-            "TaskStateEntered",
-            "TaskScheduled",
-            "TaskFailed",
-            "ExecutionFailed",
-        ],
-    };
+/// state was entered with around the events the work itself wrote — the SAME events
+/// whatever the role's policies decided, because the attempt began either way.
+fn expected() -> Vec<(String, i64, i64)> {
+    let types: &[&str] = &[
+        "ExecutionStarted",
+        "TaskStateEntered",
+        "TaskScheduled",
+        "TaskStarted",
+        "TaskFailed",
+        "ExecutionFailed",
+    ];
     types
         .iter()
         .enumerate()
@@ -95,11 +86,10 @@ fn expected(decided: &Decided) -> Vec<(String, i64, i64)> {
         .collect()
 }
 
-/// A failing invocation made as a role the policies ALLOW it to be made as records the
-/// whole lifecycle, contiguously numbered; one the policies do not allow records the
-/// hand-over and the task's failure alone, because no work was ever started.
+/// Every attempt records the whole lifecycle, contiguously numbered, whatever the role's
+/// policies decided; what they decide is the failure the attempt closes with.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_roles_decision_decides_whether_the_work_happens_not_how_it_is_recorded() {
+async fn the_roles_decision_decides_what_the_attempt_closes_with_not_how_it_is_recorded() {
     let chain = Chain::with_iam();
     let function = chain
         .given_function_of("lifecycle-under-role", HANDLER_SOURCE, None)
@@ -187,7 +177,7 @@ async fn the_roles_decision_decides_whether_the_work_happens_not_how_it_is_recor
             .unwrap_or_else(|| panic!("case {case:?}: expected events in {answered}"));
         assert_eq!(
             numbered(&events),
-            expected(&decided),
+            expected(),
             "case {case:?}: expected the lifecycle of the work the role decided, got {events:?}"
         );
 
@@ -206,13 +196,10 @@ async fn the_roles_decision_decides_whether_the_work_happens_not_how_it_is_recor
         );
 
         // Every event the work wrote names the work the `Resource` asked for.
-        let named: &[(&str, &str)] = match decided {
-            Decided::Made => &[
-                ("TaskStarted", "taskStartedEventDetails"),
-                ("TaskFailed", "taskFailedEventDetails"),
-            ],
-            Decided::Refused => &[("TaskFailed", "taskFailedEventDetails")],
-        };
+        let named: &[(&str, &str)] = &[
+            ("TaskStarted", "taskStartedEventDetails"),
+            ("TaskFailed", "taskFailedEventDetails"),
+        ];
         for (event_type, member) in named {
             let detail = detail(&events, event_type, member, case);
             assert_eq!(
