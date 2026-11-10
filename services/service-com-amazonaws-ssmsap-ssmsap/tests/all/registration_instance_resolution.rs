@@ -185,8 +185,9 @@ async fn a_component_on_an_instance_the_owner_holds_nothing_for_is_stored_too() 
              {instance_id:?}, got {recorded:?}"
         );
 
-        // The component is one of the application's own, reported by the listing that
-        // walks them.
+        // The component is one of the application's own once the discovery the
+        // registration runs has produced it, reported by the listing that walks them.
+        tokio::time::sleep(settle_wait()).await;
         let components = emulator
             .ssm_sap(
                 "/list-components",

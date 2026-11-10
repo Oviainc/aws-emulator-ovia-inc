@@ -27,7 +27,7 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_ssmsap_ssmsap::ops::types::DATABASE_TYPE_VALUES;
 use service_com_amazonaws_ssmsap_ssmsap::state::MAX_DATABASE_ID_LENGTH;
 
-use crate::application_lifecycle::{valid_registration, Emulator, Reply};
+use crate::application_lifecycle::{settle, valid_registration, Emulator, Reply};
 use crate::list_databases::{credentials, expected_arn, listed, next_token, Summary};
 use crate::validation_message_rendering::{message, VALIDATION_EXCEPTION};
 
@@ -192,13 +192,16 @@ fn expected_summaries(case: &Case) -> Vec<Summary> {
         .collect()
 }
 
-/// Register `body`, asserting the registration itself was accepted.
+/// Register `body`, asserting the registration itself was accepted, and wait out the
+/// clock so the discovery that registration runs has produced the application's
+/// components — the components its databases are reported as connected to.
 async fn register(emulator: &Emulator, name: &str, body: Value) {
     let reply = emulator.send("/register-application", body).await;
     assert_eq!(
         reply.status, 200,
         "case {name:?}: expected 200 from RegisterApplication, got {reply:?}"
     );
+    settle().await;
 }
 
 /// `ListDatabases` with `body`.

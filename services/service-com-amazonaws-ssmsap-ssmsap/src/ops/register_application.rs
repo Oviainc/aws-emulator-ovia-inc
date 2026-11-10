@@ -13,7 +13,9 @@
 //! real service: the application is returned `REGISTERING` and the `OperationId` names
 //! a stored `INPROGRESS` operation record that reaches `SUCCESS`
 //! [`crate::state::TRANSITION_SPAN`] later, materialised by the first request at or
-//! after that instant.
+//! after that instant. Discovery runs as part of that registration, so the components of
+//! the application come into being with it and not with this call
+//! ([`crate::state::StoredApplication::components`]).
 //!
 //! What the registration declares twice it declares once: the credentials it carries are
 //! applied by credential identity ([`crate::state::credentials_with`]), exactly as its
@@ -322,12 +324,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The emulator discovers nothing on the registered instances, so the only
-        // components an application has are the ones the registration described: one per
-        // `ComponentsInfo` entry, plus the SAP HANA component of the SAP system its `Sid`
-        // names — the component its databases belong to, so a `ComponentId` a later
-        // `ListDatabases` or `GetDatabase` reports is one `GetComponent` resolves.
-        let components = crate::state::registered_components(
+        // The registration DESCRIBES the landscape this application's discovery has to
+        // find: one component per `ComponentsInfo` entry, plus the SAP HANA component of
+        // the SAP system its `Sid` names — the component its databases belong to, so a
+        // `ComponentId` a later `ListDatabases` or `GetDatabase` reports is one
+        // `GetComponent` resolves. None of them is a component of the application YET:
+        // discovery is part of the registration this call starts, so the application has
+        // no components until that discovery completes
+        // (`crate::state::StoredApplication::components`).
+        let described_components = crate::state::registered_components(
             input.sid.as_deref(),
             &input.instances,
             input.components_info.unwrap_or_default(),
@@ -351,7 +356,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `StatusMessage` explains a failed status; a registration under way has
             // nothing to explain.
             status_message: None,
-            components,
+            described_components,
+            // Discovery is part of the registration and is still running, so the service
+            // has discovered nothing about this application yet: it has no components
+            // until the discovery result the clock owes it below says `SUCCESS`.
+            discovery_completed: false,
             last_updated: now,
             sid: input.sid,
             sap_instance_number: input.sap_instance_number,
@@ -387,7 +396,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             dbms: crate::state::StoredDbms::running(),
             // Registration is asynchronous: the application becomes ACTIVATED with a
             // SUCCESS discovery one `TRANSITION_SPAN` from now, and the first request at
-            // or after that instant reports it. Nothing sleeps.
+            // or after that instant reports it — the instant its discovery has completed
+            // and the components it describes exist. Nothing sleeps.
             pending: Some(crate::state::PendingTransition {
                 due_at: now + crate::state::TRANSITION_SPAN,
                 change: crate::state::PendingChange::Status {

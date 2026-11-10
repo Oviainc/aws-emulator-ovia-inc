@@ -3,10 +3,15 @@
 //! @op ListComponents
 //!
 //! Reports one `ComponentSummary` per component of the registered applications in the
-//! request's Region, computed from state: the components a registration described
-//! (`RegisterApplication$ComponentsInfo`), narrowed to one application when the request
-//! names one, in (`ApplicationId`, `ComponentId`) order, with `MaxResults` bounding the
-//! page and `NextToken` resuming after the last item of the previous one.
+//! request's Region, computed from state: the components the service's discovery has
+//! produced for them ([`crate::state::StoredApplication::components`]), narrowed to one
+//! application when the request names one, in (`ApplicationId`, `ComponentId`) order,
+//! with `MaxResults` bounding the page and `NextToken` resuming after the last item of
+//! the previous one.
+//!
+//! An application whose discovery has not completed has no components, so this listing
+//! reports none for it rather than what its registration described: a client polling for
+//! discovery to produce components observes exactly that.
 //!
 //! ## Shape of an operation
 //!
@@ -197,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports every component it holds rather than silently serving a short page.
         let candidate_count: usize = applications
             .iter()
-            .map(|application| application.components.len())
+            .map(|application| application.components().len())
             .sum();
         debug_assert!(
             candidate_count <= crate::state::MAX_COMPONENTS_PER_REGION,
@@ -207,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut candidates: Vec<(String, (&str, &crate::state::StoredComponent))> =
             Vec::with_capacity(candidate_count);
         candidates.extend(applications.iter().flat_map(|application| {
-            application.components.iter().map(move |component| {
+            application.components().iter().map(move |component| {
                 (
                     component.page_key(&application.id),
                     (application.id.as_str(), component),

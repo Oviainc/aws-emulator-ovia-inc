@@ -274,13 +274,16 @@ fn registration(case: &Case) -> Value {
     Value::Object(body)
 }
 
-/// Register `body`, asserting the registration itself was accepted.
+/// Register `body`, asserting the registration itself was accepted, and wait out the
+/// clock so the discovery that registration runs has produced the application's
+/// components — the components its databases are reported as connected to.
 async fn register(emulator: &Emulator, name: &str, body: Value) {
     let reply = emulator.send("/register-application", body).await;
     assert_eq!(
         reply.status, 200,
         "case {name:?}: expected 200 from RegisterApplication, got {reply:?}"
     );
+    settle().await;
 }
 
 /// `ListDatabases` in [`REGION`].

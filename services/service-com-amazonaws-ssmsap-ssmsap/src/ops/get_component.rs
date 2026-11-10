@@ -4,9 +4,11 @@
 //!
 //! Reports the component of a registered application a request names by `ApplicationId`
 //! and `ComponentId`, together with the tags held for that component's ARN. The response
-//! is projected from the registration that declared the component
-//! ([`crate::state::StoredApplication::component_view`]); a reference that resolves to
-//! nothing is refused with the modelled `ValidationException`, and nothing the emulator
+//! is projected from the record of the component the application's discovery produced
+//! ([`crate::state::StoredApplication::components`],
+//! [`crate::state::StoredApplication::component_view`]); a reference that resolves to
+//! nothing — including a component of an application whose discovery is still running —
+//! is refused with the modelled `ValidationException`, and nothing the emulator
 //! has not been told — a hostname, a kernel or HANA version, replication or cluster state
 //! — is reported for it.
 //!

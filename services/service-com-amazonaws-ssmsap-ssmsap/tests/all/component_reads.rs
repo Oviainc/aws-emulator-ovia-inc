@@ -575,6 +575,9 @@ async fn every_modelled_component_type_is_readable_as_a_component() {
             registered.status, 200,
             "case {component_type:?}: expected 200 from RegisterApplication, got {registered:?}"
         );
+        // The declared component is the application's once the discovery the
+        // registration runs has produced it.
+        settle().await;
 
         let id = format!("ABC-{component_type}");
         let reply = get_component(&emulator, case.application_id, &id).await;
@@ -607,11 +610,20 @@ async fn a_components_status_is_the_status_its_application_is_in() {
         "expected 200 from RegisterApplication, got {registered:?}"
     );
 
+    // Discovery runs as part of the registration, so while the registration is still
+    // under way the application has no component at all: the reference is refused rather
+    // than answered with a component whose status nothing established.
+    let before = get_component(&emulator, case.application_id, id).await;
+    assert_eq!(
+        before.status, 400,
+        "step \"the registration is still running\": a component discovery has not \
+         produced resolves to nothing, got {before:?}"
+    );
+
     // Each step: what happens to the application, and the `ComponentStatus` its
-    // components are in afterwards. A registration, stop or start still under way has
-    // not established what the component is running, which is what `UNDEFINED` states.
+    // components are in afterwards. A stop or start still under way has not established
+    // what the component is running, which is what the transient statuses state.
     let steps: &[(&str, Step, &str)] = &[
-        ("the registration is still running", Step::Nothing, "UNDEFINED"),
         ("the registration has completed", Step::Settle, RUNNING),
         ("a stop is still running", Step::Call("/stop-application"), "STOPPING"),
         ("the stop has completed", Step::Settle, "STOPPED"),
@@ -621,7 +633,6 @@ async fn a_components_status_is_the_status_its_application_is_in() {
 
     for (label, step, expected) in steps {
         match step {
-            Step::Nothing => {}
             Step::Settle => settle().await,
             Step::Call(path) => {
                 let reply = emulator
@@ -654,8 +665,6 @@ async fn a_components_status_is_the_status_its_application_is_in() {
 /// What happens to the application between two readings of its component's status.
 #[derive(Debug)]
 enum Step {
-    /// Nothing: the status the call that started a change left behind is still the one.
-    Nothing,
     /// Wait out the clock, so the change it owed the application has fallen due.
     Settle,
     /// Call the operation at this path on the application.

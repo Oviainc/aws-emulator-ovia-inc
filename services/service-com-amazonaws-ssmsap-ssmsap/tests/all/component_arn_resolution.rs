@@ -324,6 +324,10 @@ async fn the_component_arn_this_service_reports_is_one_the_tagging_calls_serve()
             registration_declaring(case.application_id, case.declared),
         )
         .await;
+        // Discovery runs as part of the registration, so the components it produces —
+        // and the ARNs the tagging calls serve them under — exist once the clock has
+        // made that registration due.
+        settle().await;
 
         let listed = list_components(&emulator, case.name, case.application_id).await;
         let reported_ids: Vec<String> = listed.iter().map(|item| item.id.clone()).collect();
@@ -427,6 +431,7 @@ async fn a_component_holds_its_own_tag_set() {
         registration_declaring("comp-arn-siblings", &[("ASCS", "AS1"), ("ERS", "ER1")]),
     )
     .await;
+    settle().await;
     let listed = list_components(&emulator, "siblings", "comp-arn-siblings").await;
     assert!(
         listed.len() >= 2,
@@ -481,6 +486,7 @@ async fn a_component_arn_is_no_resource_permission_target() {
         registration_declaring("comp-arn-perm", &[("WEBDISP", "WD1")]),
     )
     .await;
+    settle().await;
     let listed = list_components(&emulator, "a permission target", "comp-arn-perm").await;
     let source = format!("arn:aws:ssm-sap:{REGION}:{ACCOUNT}:database/comp-arn-perm/HDB");
 
@@ -548,6 +554,7 @@ async fn a_component_arn_naming_nothing_here_is_refused_as_not_found() {
         registration_declaring("comp-arn-gone", &[]),
     )
     .await;
+    settle().await;
     let derived = component_id(&registration_sid(), HANA);
     // Tag the component of the application about to be deregistered: what is held for a
     // component cannot outlive the registration the component came from.
@@ -659,6 +666,7 @@ async fn tags_of_a_component_go_with_its_registration() {
         registration_declaring(application_id, &[]),
     )
     .await;
+    settle().await;
     let reply = tag(&emulator, &arn, &pairs(&[("env", "dev"), ("owner", "sap")])).await;
     assert_eq!(
         reply.status, 200,
@@ -694,6 +702,7 @@ async fn tags_of_a_component_go_with_its_registration() {
         registration_declaring(application_id, &[]),
     )
     .await;
+    settle().await;
     let held = tags_held(&emulator, "the second registration", &arn).await;
     assert!(
         held.is_empty(),

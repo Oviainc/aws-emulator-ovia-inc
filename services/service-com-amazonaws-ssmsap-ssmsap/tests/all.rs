@@ -27,10 +27,14 @@ mod associated_applications;
 mod component_arn_resolution;
 #[path = "all/component_cross_references.rs"]
 mod component_cross_references;
+#[path = "all/component_discovery.rs"]
+mod component_discovery;
 #[path = "all/component_listing.rs"]
 mod component_listing;
 #[path = "all/component_reads.rs"]
 mod component_reads;
+#[path = "all/configuration_check_catalogue.rs"]
+mod configuration_check_catalogue;
 #[path = "all/configuration_check_reads.rs"]
 mod configuration_check_reads;
 #[path = "all/configuration_check_rules.rs"]

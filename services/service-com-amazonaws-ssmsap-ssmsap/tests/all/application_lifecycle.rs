@@ -513,7 +513,8 @@ impl RegisterCase {
         Value::Object(body)
     }
 
-    /// The component ids the registration describes: one per `ComponentsInfo` entry (a
+    /// The component ids the registration DESCRIBES, which are the application's
+    /// components once its discovery has completed: one per `ComponentsInfo` entry (a
     /// component is identified by the SID and type it was declared with, so duplicates
     /// collapse), plus the SAP HANA component of the SAP system the registration's own
     /// `Sid` names, when no declaration already describes it.
@@ -665,8 +666,9 @@ async fn register_persists_the_application_and_every_reader_reports_it() {
         );
         assert_eq!(
             string_list(registered.app("Components")),
-            case.expected_components(),
-            "case {case:?}: Components come from the registration, got {:?}",
+            Vec::<String>::new(),
+            "case {case:?}: discovery is still running, so the application has no \
+             components yet, got {:?}",
             registered.app("Components")
         );
         assert!(
@@ -716,8 +718,9 @@ async fn register_persists_the_application_and_every_reader_reports_it() {
             );
             assert_eq!(
                 string_list(fetched.app("Components")),
-                case.expected_components(),
-                "case {case:?} via {reference}: expected the registered components, got {:?}",
+                Vec::<String>::new(),
+                "case {case:?} via {reference}: the discovery that produces the \
+                 components is still running, got {:?}",
                 fetched.app("Components")
             );
             assert_eq!(
@@ -811,6 +814,13 @@ async fn register_persists_the_application_and_every_reader_reports_it() {
             "case {case:?}: a settled discovery is SUCCESS, got {:?}",
             settled.app("DiscoveryStatus")
         );
+        // A succeeded discovery is what produces the application's components.
+        assert_eq!(
+            string_list(settled.app("Components")),
+            case.expected_components(),
+            "case {case:?}: expected the components discovery produced, got {:?}",
+            settled.app("Components")
+        );
         let again = emulator
             .get_application(json!({"ApplicationId": case.id}))
             .await;
@@ -880,11 +890,16 @@ async fn every_modelled_component_type_registers_as_a_component_id() {
             reply.status, 200,
             "case {component_type:?}: expected 200 from RegisterApplication, got {reply:?}"
         );
+        // The declared component is the application's once the discovery the
+        // registration runs has produced it.
+        settle().await;
+        let fetched = emulator
+            .get_application(json!({"ApplicationId": "comp-app"}))
+            .await;
         assert_eq!(
-            string_list(reply.app("Components")),
+            string_list(fetched.app("Components")),
             vec![format!("ABC-{component_type}")],
-            "case {component_type:?}: expected one component id, got {:?}",
-            reply.app("Components")
+            "case {component_type:?}: expected one component id, got {fetched:?}"
         );
     }
 }

@@ -729,23 +729,28 @@ async fn a_run_decides_each_rule_from_the_registered_configuration() {
 /// a row fails if the prose a response carries changes, instead of re-asserting the
 /// literal the handler projects from. The catalogue-versus-listing equality is the
 /// separate consistency check below.
+///
+/// The text is the SERVICE's own published text for each `ConfigurationCheckType`, which
+/// is the same in every account and Region.
 const EXPECTED_PROSE: &[(&str, &str, &str)] = &[
     (
         "SAP_CHECK_01",
-        "SAP system identification",
-        "Checks that the application identifies the SAP system it manages and the Amazon EC2 \
-         instances that system runs on.",
+        "SAP EC2 Instance Type Selection",
+        "Checks any EC2 Instances Associated with this SAP Application, and evaluates whether \
+         the Instance Type complies with SAP Certification requirements and that necessary \
+         hardware settings are in place.",
     ),
     (
         "SAP_CHECK_02",
-        "SAP HANA database connectivity",
-        "Checks the SAP HANA databases of the application and the credentials the service \
-         connects to them with.",
+        "SAP EBS Storage Configuration",
+        "Checks that the EBS Storage Configuration on Amazon EC2 Instances is appropriate for \
+         the SAP workload.",
     ),
     (
         "SAP_CHECK_03",
-        "SAP application component layout",
-        "Checks the components the application declares for its SAP system and where they run.",
+        "SAP on AWS Pacemaker Configuration",
+        "Checks whether the Pacemaker Configuration for the SAP Application follows best \
+         practices.",
     ),
 ];
 

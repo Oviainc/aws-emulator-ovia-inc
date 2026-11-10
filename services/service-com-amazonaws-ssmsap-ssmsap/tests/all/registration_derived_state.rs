@@ -262,12 +262,12 @@ async fn a_settled_registration_reports_its_derived_app_registry_arn_and_compone
         );
         minted.push(arn);
 
-        // The components come from the registration, not from the read that observes it,
-        // so the registration's own reply already reports them.
+        // Discovery is what produces the components, and it is the asynchronous phase
+        // this registration has only just started, so its own reply reports none yet.
         assert_eq!(
             components(&registered),
-            expected(case),
-            "case {name:?}: expected the derived components, got {registered:?}"
+            Vec::<String>::new(),
+            "case {name:?}: a registration still running has discovered no component, got {registered:?}"
         );
     }
 

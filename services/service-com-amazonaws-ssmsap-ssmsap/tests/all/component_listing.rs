@@ -31,7 +31,9 @@ use service_com_amazonaws_ssmsap_ssmsap::state::{
     MAX_COMPONENTS_PER_REGION, MAX_DECLARED_COMPONENTS, MAX_PAGE_SIZE,
 };
 
-use crate::application_lifecycle::{conditional_value, valid_registration, Emulator, Reply};
+use crate::application_lifecycle::{
+    conditional_value, settle, valid_registration, Emulator, Reply,
+};
 use crate::validation_message_rendering::{message, VALIDATION_EXCEPTION};
 
 /// The regional endpoint most rows sign for.
@@ -230,7 +232,14 @@ fn registration(
     body
 }
 
-/// Register an application in `region`, asserting the registration itself succeeded.
+/// Register an application in `region`, asserting the registration itself succeeded, and
+/// wait out the clock so the discovery that registration runs has produced the
+/// application's components.
+///
+/// A component exists only once discovery has produced it, so a listing made while the
+/// registration is still under way reports none — which the discovery-window rows of
+/// `tests/all/component_discovery.rs` pin; every row below is about what the listing
+/// reports once discovery has completed.
 async fn register(
     emulator: &Emulator,
     region: &str,
@@ -250,6 +259,7 @@ async fn register(
         reply.status, 200,
         "case {region:?}/{id:?}: expected 200 from RegisterApplication, got {reply:?}"
     );
+    settle().await;
     reply
 }
 
@@ -684,6 +694,9 @@ async fn a_registration_declaring_more_components_than_allowed_is_refused() {
                 "case {count} components: a declaration at the bound is accepted, got \
                  {reply:?}"
             );
+            // The declared components are the application's once the discovery the
+            // registration runs has produced them.
+            settle().await;
             let listed_components = emulator
                 .send_in_region(REGION, "/list-components", json!({"ApplicationId": id}))
                 .await;
