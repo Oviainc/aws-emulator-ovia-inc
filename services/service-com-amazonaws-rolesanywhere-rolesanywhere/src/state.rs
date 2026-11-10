@@ -69,12 +69,18 @@ pub const MAX_CRLS: usize = 1_000;
 
 /// The most tags one resource holds at once.
 ///
-/// `TagList` is `@length(0, 200)` both where a request carries tags and where a read
-/// reports them (`smithy_query(query="shape", shape="TagList")`), so 200 is also the most
-/// `ListTagsForResource` can answer with: a resource holding more could not be listed.
-/// A `TagResource` that would carry a resource past it is refused with that operation's
-/// modelled `TooManyTagsException` instead of storing tags no read could report.
-pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+/// AWS's documented tag restrictions bound a resource's tag set at 50 tags, with keys of
+/// at most 128 characters and values of at most 256 — the same two lengths this service's
+/// `TagKey` and `TagValue` carry (`smithy_query(query="shape", shape="TagKey,TagValue")`:
+/// `@length(1, 128)` and `@length(0, 256)`), so the count row of that table is the quota
+/// this service's resources are held to as well.
+///
+/// `TagList` is `@length(0, 200)`, which is only the widest list the boundary validator
+/// lets through: a write that would leave a resource holding more distinct keys than this
+/// quota is refused by the handler it came through ([`tags_past_cap_message`], a 400
+/// `ValidationException` — the refusal this service is recorded answering a tag write past
+/// the quota with), and stores nothing.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// The most specifiers one profile maps for one certificate field at once.
 ///
@@ -347,6 +353,26 @@ pub fn merged_tag_count(held: &[Tag], incoming: &[Tag]) -> usize {
         .map(|tag| tag.key.as_str())
         .collect::<BTreeSet<&str>>()
         .len()
+}
+
+/// The tag set a resource starts life with, from the list its create carried: the same
+/// key-addressed set [`merge_tags`] maintains, so a key the request names twice is held
+/// once, with the value that came last, exactly as re-tagging it afterwards would leave
+/// it. A tag set is addressed by key wherever tags enter a resource.
+pub fn keyed_tags(submitted: Vec<Tag>) -> Vec<Tag> {
+    let mut held = Vec::new();
+    merge_tags(&mut held, submitted);
+    held
+}
+
+/// The `message` a write that would leave a resource holding more than
+/// [`MAX_TAGS_PER_RESOURCE`] tags is refused with: the fixed wording this service answers
+/// a tag write past the quota with, naming the quota as its only variable part. It
+/// describes the RESULTANT set — what the resource would hold afterwards — which is what
+/// the quota bounds. No tag is echoed into it, since `TagKey` and `TagValue` are both
+/// `@sensitive`.
+pub fn tags_past_cap_message() -> String {
+    format!("The resultant tag set must not have more than {MAX_TAGS_PER_RESOURCE} user tags.")
 }
 
 /// One page of a `BTreeMap`-backed collection, plus the cursor to resume from.

@@ -27,6 +27,8 @@ mod not_found_refusal_messages;
 mod notification_settings;
 #[path = "all/profile_disablement.rs"]
 mod profile_disablement;
+#[path = "all/resource_tag_quota.rs"]
+mod resource_tag_quota;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

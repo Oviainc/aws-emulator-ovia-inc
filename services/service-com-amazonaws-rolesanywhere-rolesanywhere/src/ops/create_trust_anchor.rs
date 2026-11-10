@@ -156,6 +156,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(validation(member, &constraint));
         }
 
+        // A resource's tag set is addressed by key and bounded by the per-resource
+        // quota, wherever tags enter it: a create naming more distinct keys than one
+        // resource may hold is refused before anything is stored, with the same
+        // validation error a `TagResource` past the quota answers, so no read ever reports
+        // a resource holding more tags than a later tagging call is allowed to leave it
+        // with. A key the list names twice is held once, with the value that came last.
+        let tags = crate::state::keyed_tags(input.tags.unwrap_or_default());
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateTrustAnchorErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::tags_past_cap_message()),
+                },
+            )
+            .into());
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -203,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             updated_at: now,
             notification_settings,
-            tags: input.tags.unwrap_or_default(),
+            tags,
         };
         let trust_anchor = record.to_detail();
         store.trust_anchors.insert(trust_anchor_id, record);

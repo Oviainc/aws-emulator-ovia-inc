@@ -146,15 +146,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // The merged set is what the resource would hold afterwards, so re-tagging keys
-        // it already carries is never over the ceiling however often it is repeated,
-        // while adding keys past it is refused before anything is written.
+        // it already carries is never over the quota however often it is repeated, while
+        // a call whose new keys would carry it past the quota is refused before anything
+        // is written. The refusal is the validation error this service is recorded
+        // answering a tag write past the quota with, whatever the submitted list's own
+        // length; the modelled `TooManyTagsException` is left unconstructed rather than
+        // answered in its place.
         if crate::state::merged_tag_count(held, &input.tags) > crate::state::MAX_TAGS_PER_RESOURCE
         {
-            return Err(TagResourceErrorModeled::TooManyTagsException(TooManyTagsException {
-                // The wording the model documents for this error class ("Too many tags.",
-                // `smithy_query(query="shape", shape="TooManyTagsException")`). Tag keys
-                // and values are `@sensitive`, so none of them is echoed into it.
-                message: Some("Too many tags.".to_string()),
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::tags_past_cap_message()),
             })
             .into());
         }

@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_rolesanywhere_rolesanywhere::state::MAX_TAGS_PER_RESOURCE;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// A placeholder PEM bundle for a trust anchor's certificate source.
@@ -49,9 +50,9 @@ const MAX_TAG_KEY_LENGTH: usize = 128;
 const MIN_TAG_VALUE_LENGTH: usize = 0;
 const MAX_TAG_VALUE_LENGTH: usize = 256;
 
-/// The published `TagList` `@length` maximum, which bounds both the tags one call may
-/// carry and the tags one read may report
-/// (`smithy_query(query="shape", shape="TagList")`: `@length(0, 200)`).
+/// The published `TagList` `@length` maximum, which bounds the tags ONE call may carry
+/// (`smithy_query(query="shape", shape="TagList")`: `@length(0, 200)`). The tags one
+/// RESOURCE may hold is the smaller per-resource quota, `MAX_TAGS_PER_RESOURCE`.
 const MAX_TAG_LIST_LENGTH: usize = 200;
 
 /// A client over one emulator: one engine, one mounted service, so every request in a
@@ -586,22 +587,21 @@ async fn the_tag_path_refuses_an_arn_no_resource_carries() {
     );
 }
 
-/// The tag set one resource can hold is bounded by the published `TagList` maximum, the
-/// most a read can report: adding keys past it is refused with the modelled
-/// `TooManyTagsException` and stores nothing, while re-tagging keys the resource already
-/// holds stays within the bound and is accepted.
+/// The tag set one resource can hold is bounded by the documented per-resource tag
+/// maximum: adding keys past it is refused and stores nothing, while re-tagging keys the
+/// resource already holds stays within the bound and is accepted.
 #[tokio::test]
-async fn tag_resource_refuses_more_keys_than_a_read_can_report() {
+async fn tag_resource_refuses_more_keys_than_a_resource_may_hold() {
     let client = Client::new();
     let arn = create_resource(&client, Kind::TrustAnchor, "bounded-anchor", &[]).await;
 
-    let full: Vec<(String, String)> = (0..MAX_TAG_LIST_LENGTH)
+    let full: Vec<(String, String)> = (0..MAX_TAGS_PER_RESOURCE)
         .map(|index| (format!("key-{index:03}"), format!("value-{index:03}")))
         .collect();
     let at_bound = client.tag_resource(&arn, &full).await;
     assert_eq!(
         at_bound.status, 201,
-        "case \"at-the-bound\": {MAX_TAG_LIST_LENGTH} tags is the published maximum, \
+        "case \"at-the-bound\": {MAX_TAGS_PER_RESOURCE} tags is the documented maximum, \
          got {at_bound:?}"
     );
 
@@ -624,13 +624,19 @@ async fn tag_resource_refuses_more_keys_than_a_read_can_report() {
         .await;
     assert_eq!(
         (over.status, over.error_code.as_str()),
-        (400, "TooManyTagsException"),
+        (400, "ValidationException"),
         "case \"over-the-bound\": a key past the bound must be refused, got {over:?}"
     );
     assert_eq!(
         over.body.get("message").and_then(Value::as_str),
-        Some("Too many tags."),
-        "case \"over-the-bound\": expected the modelled wording, got {over:?}"
+        Some(
+            format!(
+                "The resultant tag set must not have more than {MAX_TAGS_PER_RESOURCE} \
+                 user tags."
+            )
+            .as_str()
+        ),
+        "case \"over-the-bound\": expected the quota wording, got {over:?}"
     );
 
     // The refusal wrote nothing: the set is still the rewritten one, with no extra key.
@@ -641,8 +647,9 @@ async fn tag_resource_refuses_more_keys_than_a_read_can_report() {
         "case \"over-the-bound\": the refused call must leave the stored set alone"
     );
 
-    // A single call carrying more than the published maximum is refused at the boundary,
-    // before the handler runs, as a constraint failure rather than a tag-count failure.
+    // A single call carrying more than the published `TagList` maximum is refused at the
+    // boundary, before the handler runs — and either way, a list naming more keys than
+    // one resource may hold is refused.
     let too_long: Vec<(String, String)> = (0..=MAX_TAG_LIST_LENGTH)
         .map(|index| (format!("extra-{index:03}"), "x".to_string()))
         .collect();
