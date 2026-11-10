@@ -23,7 +23,7 @@
 //! * a `keyArn` is required when encryption is `enabled`; a config that breaks that rule
 //!   is HTTP 400 `ValidationException` and persists nothing.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaigns_amazonconnectcampaignservice::ops::types::INSTANCE_ONBOARDING_JOB_STATUS_CODE_VALUES;
@@ -34,7 +34,7 @@ use service_com_amazonaws_connectcampaigns_amazonconnectcampaignservice::state::
     ONBOARDING_STATUS_SUCCEEDED,
 };
 
-use super::common::{call, router, Answer, Harness};
+use super::common::{call, job_status, reach_the_due_instant, router, Answer, Harness, KEY_ARN};
 
 /// The region every case here signs for; nothing in an onboarding record is
 /// region-dependent, so one is enough.
@@ -92,15 +92,6 @@ async fn status(harness: &Harness, instance: &str) -> Answer {
     .await
 }
 
-/// The `connectInstanceOnboardingJobStatus$status` a success body carries.
-fn job_status(answer: &Answer) -> &str {
-    answer
-        .body
-        .pointer("/connectInstanceOnboardingJobStatus/status")
-        .and_then(Value::as_str)
-        .unwrap_or("<no status>")
-}
-
 /// The `enabled` / `keyArn` / `encryptionType` the STORE holds for `instance`, or `None`
 /// when it holds no onboarding record at all.
 ///
@@ -140,30 +131,10 @@ fn sent_config(encryption_config: &Value) -> (bool, Option<String>, Option<Strin
     )
 }
 
-/// Put the clock past the instant `instance`'s job is due to have finished, without
-/// waiting for it: the record carries that instant, so moving it is the same as letting
-/// the clock reach it. The suite also proves the wall clock alone does it, in
-/// [`the_clock_alone_finishes_a_started_job`].
-fn reach_the_due_instant(harness: &Harness, instance: &str) {
-    let state = harness
-        .engine()
-        .state::<ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState>();
-    let mut store = state.lock();
-    let record = store
-        .instance_onboarding
-        .get_mut(instance)
-        .unwrap_or_else(|| panic!("case {instance:?}: the start call stored no record"));
-    record.succeeds_at = SystemTime::now() - Duration::from_secs(1);
-}
-
 /// `enabled: false` — the service encrypts with its own key, so no `keyArn`.
 fn service_key_config() -> Value {
     json!({"enabled": false})
 }
-
-/// A KMS key ARN, the form `EncryptionConfig$keyArn` takes (an `EncryptionKey`, len
-/// 0..500, from `smithy_query(query="shape", shape="EncryptionConfig")`).
-const KEY_ARN: &str = "arn:aws:kms:us-east-1:000000000000:key/11111111-2222-3333-4444-555555555555";
 
 /// Instance ids and encryption configs spanning what the rule generalises over:
 /// `InstanceId` (len 0..256, pattern `^[a-zA-Z0-9_\-.]*$`, from

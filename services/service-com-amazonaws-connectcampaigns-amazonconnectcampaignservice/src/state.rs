@@ -366,6 +366,30 @@ impl ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState {
         Ok(record)
     }
 
+    /// Delete the onboarding job this service holds for `connect_instance_id`, and
+    /// report what became of the request (see [`DeleteOnboardingOutcome`]).
+    ///
+    /// The one place an onboarding record is dropped, and the one place the rule that
+    /// governs the drop lives: only a job in [`ONBOARDING_STATUS_FAILED`] may be
+    /// deleted, so a job in any other status keeps its record and the status a later
+    /// `GetInstanceOnboardingJobStatus` reports is untouched by a refused delete. The
+    /// status is read off the record at `now`, the same way every other reader of it
+    /// reads it, so the clock alone decides nothing differently here.
+    pub fn delete_instance_onboarding(
+        &mut self,
+        connect_instance_id: &str,
+        now: SystemTime,
+    ) -> DeleteOnboardingOutcome {
+        let Some(record) = self.instance_onboarding.get(connect_instance_id) else {
+            return DeleteOnboardingOutcome::NoSuchJob;
+        };
+        if record.status_at(now) != ONBOARDING_STATUS_FAILED {
+            return DeleteOnboardingOutcome::NotFailed;
+        }
+        self.instance_onboarding.remove(connect_instance_id);
+        DeleteOnboardingOutcome::Deleted
+    }
+
     /// The onboarding record this service holds for `connect_instance_id`, or `None`
     /// when no call has onboarded that instance.
     ///
@@ -572,6 +596,27 @@ pub const ONBOARDING_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// the same catalog.
 pub const ONBOARDING_STATUS_SUCCEEDED: &str = "SUCCEEDED";
 
+/// The `InstanceOnboardingJobStatusCode` value a job that could not onboard the instance
+/// reports, from the same catalog. It is the ONLY status an onboarding job may be
+/// DELETED in (see
+/// [`ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::delete_instance_onboarding`]).
+///
+/// A job carries it exactly while its record names the
+/// `InstanceOnboardingJobFailureCode` it ended on
+/// ([`StoredInstanceOnboarding::failure_code`]); every code that catalog declares names
+/// a dependency of the onboarding outside this service — a KMS key, an IAM role, an
+/// EventBridge rule — so nothing this emulator's onboarding does can end a job here,
+/// and no operation of this crate writes that member yet.
+pub const ONBOARDING_STATUS_FAILED: &str = "FAILED";
+
+/// What this service answers when the onboarding job a request asks it to delete is in
+/// any status but [`ONBOARDING_STATUS_FAILED`], so there is no failed job to clear.
+///
+/// A FIXED service string stating the rule it enforces: it names no instance and carries
+/// nothing from the request, so every refusal of this class reads the same.
+pub const ONBOARDING_JOB_NOT_FAILED_MESSAGE: &str =
+    "Instance onboarding job is not in failed status. Only failed job can be deleted.";
+
 /// How long after the `StartInstanceOnboardingJob` call that started it an onboarding
 /// job is due to report [`ONBOARDING_STATUS_SUCCEEDED`].
 ///
@@ -604,6 +649,14 @@ pub struct StoredInstanceOnboarding {
     /// The instant this job reaches [`ONBOARDING_STATUS_SUCCEEDED`]: the start instant
     /// plus [`ONBOARDING_JOB_DURATION`]. Until then the job is still in progress.
     pub succeeds_at: SystemTime,
+    /// The `InstanceOnboardingJobFailureCode` this job ended on, or `None` for a job
+    /// that has not failed — which is every job this emulator's onboarding starts, for
+    /// the reason [`ONBOARDING_STATUS_FAILED`] states.
+    ///
+    /// It is what makes a record's job a FAILED one: [`Self::status_at`] reports that
+    /// status exactly while this member is set, and [`Self::to_job_status`] reports the
+    /// code beside it, so a job's status and its failure code cannot disagree.
+    pub failure_code: Option<String>,
 }
 
 impl StoredInstanceOnboarding {
@@ -618,16 +671,20 @@ impl StoredInstanceOnboarding {
             connect_instance_id,
             encryption_config,
             succeeds_at: now + ONBOARDING_JOB_DURATION,
+            failure_code: None,
         }
     }
 
-    /// The job's status at `now`: finished once the clock has passed the due instant,
-    /// in progress until then.
+    /// The job's status at `now`: failed when the record names the code it failed with,
+    /// and otherwise finished once the clock has passed the due instant and in progress
+    /// until then.
     ///
-    /// A pure read of the stored instant, so reporting a job's status writes nothing and
+    /// A pure read of the stored record, so reporting a job's status writes nothing and
     /// two callers reading at the same moment see the same value.
     pub fn status_at(&self, now: SystemTime) -> &'static str {
-        if now < self.succeeds_at {
+        if self.failure_code.is_some() {
+            ONBOARDING_STATUS_FAILED
+        } else if now < self.succeeds_at {
             ONBOARDING_STATUS_IN_PROGRESS
         } else {
             ONBOARDING_STATUS_SUCCEEDED
@@ -637,14 +694,14 @@ impl StoredInstanceOnboarding {
     /// This record as the modelled `InstanceOnboardingJobStatus` the onboarding
     /// operations report, so the start and the status read cannot word one job two ways.
     ///
-    /// `failureCode` is absent: the onboarding this emulator performs is writing the
-    /// record, which either happened or was refused before any job started, so no
-    /// stored job is in the modelled failed state.
+    /// `failureCode` is the code the record names, which is absent for every job this
+    /// emulator's onboarding starts: the onboarding it performs is writing the record,
+    /// which either happened or was refused before any job started.
     pub fn to_job_status(&self, now: SystemTime) -> InstanceOnboardingJobStatus {
         InstanceOnboardingJobStatus {
             connect_instance_id: self.connect_instance_id.clone(),
             status: self.status_at(now).to_string(),
-            failure_code: None,
+            failure_code: self.failure_code.clone(),
         }
     }
 }
@@ -660,6 +717,24 @@ pub enum OnboardingRefused {
     /// This emulator's store already holds [`MAX_ONBOARDED_INSTANCES`] records, so it
     /// takes no further instance.
     StoreFull,
+}
+
+/// What became of a request to delete one instance's onboarding job, as
+/// [`ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::delete_instance_onboarding`]
+/// reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOnboardingOutcome {
+    /// The record was in the failed status and is gone, so the instance holds no
+    /// onboarding job any more.
+    Deleted,
+    /// This service holds no onboarding record for that instance, so there is no job to
+    /// delete: the modelled `ResourceNotFoundException` (HTTP 404) carrying
+    /// [`onboarding_record_absent_message`].
+    NoSuchJob,
+    /// The job is in a status other than [`ONBOARDING_STATUS_FAILED`], so it stays: the
+    /// modelled `InvalidStateException` (HTTP 409) carrying
+    /// [`ONBOARDING_JOB_NOT_FAILED_MESSAGE`].
+    NotFailed,
 }
 
 /// What this service answers when the Amazon Connect instance a request names is

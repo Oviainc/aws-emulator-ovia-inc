@@ -12,12 +12,18 @@
 
 use std::ops::Deref;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 use service_com_amazonaws_connect_amazonconnectservice::state as connect_state;
+use service_com_amazonaws_connectcampaigns_amazonconnectcampaignservice::state::ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState;
 use service_com_amazonaws_connectcampaigns_amazonconnectcampaignservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+/// A KMS key ARN, the form `EncryptionConfig$keyArn` takes (an `EncryptionKey`, len
+/// 0..500, from `smithy_query(query="shape", shape="EncryptionConfig")`) — what a case
+/// onboarding an instance with a customer key names.
+pub const KEY_ARN: &str = "arn:aws:kms:us-east-1:000000000000:key/11111111-2222-3333-4444-555555555555";
 
 /// A SigV4 `Authorization` header scoped to this service's signing name, which is what
 /// routes a request to it, and to `region` — the region its ARNs are rooted in.
@@ -96,6 +102,33 @@ impl Answer {
             .and_then(Value::as_str)
             .unwrap_or("<no message>")
     }
+}
+
+/// The `connectInstanceOnboardingJobStatus$status` an onboarding answer carries, or a
+/// stand-in when it carries none — the one member every onboarding suite reads a job's
+/// status out of.
+pub fn job_status(answer: &Answer) -> &str {
+    answer
+        .body
+        .pointer("/connectInstanceOnboardingJobStatus/status")
+        .and_then(Value::as_str)
+        .unwrap_or("<no status>")
+}
+
+/// Put the clock past the instant `instance`'s onboarding job is due to have finished,
+/// without waiting for it: the record carries that instant, so moving it is the same as
+/// letting the clock reach it. Panics when the instance holds no record, because a case
+/// that reaches for a point of a job it never started is a broken case.
+pub fn reach_the_due_instant(harness: &Harness, instance: &str) {
+    let state = harness
+        .engine()
+        .state::<ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState>();
+    let mut store = state.lock();
+    let record = store
+        .instance_onboarding
+        .get_mut(instance)
+        .unwrap_or_else(|| panic!("case {instance:?}: the start call stored no record"));
+    record.succeeds_at = SystemTime::now() - Duration::from_secs(1);
 }
 
 /// Drive one request through the router and report what came back. A `body` of

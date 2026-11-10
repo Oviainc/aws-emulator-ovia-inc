@@ -27,6 +27,8 @@ mod dial_request_batch;
 mod input_constraint_refusals;
 #[path = "all/instance_onboarding.rs"]
 mod instance_onboarding;
+#[path = "all/onboarding_job_deletion.rs"]
+mod onboarding_job_deletion;
 #[path = "all/signing_name_path_claim.rs"]
 mod signing_name_path_claim;
 #[path = "all/state_roundtrip.rs"]
