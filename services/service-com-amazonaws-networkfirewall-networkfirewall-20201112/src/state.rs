@@ -265,6 +265,96 @@ pub fn policy_document_breach(policy: &FirewallPolicy) -> Option<String> {
         })
 }
 
+/// The standard actions a firewall policy's stateless default-action lists may
+/// name.
+///
+/// Documented on both members that take them
+/// (`FirewallPolicy$StatelessDefaultActions` and
+/// `FirewallPolicy$StatelessFragmentDefaultActions`, identical text): "You must
+/// specify one of the standard actions: aws:pass, aws:drop, or
+/// aws:forward_to_sfe. In addition, you can specify custom actions that are
+/// compatible with your standard section choice." The target shape is a plain
+/// list of string rather than an enum, so the vocabulary is enforced here rather
+/// than by the model's constraint validator.
+pub const STATELESS_STANDARD_ACTIONS: [&str; 3] = ["aws:pass", "aws:drop", "aws:forward_to_sfe"];
+
+/// The input paths a firewall policy document's stateless default-action lists
+/// arrive on, which are also the member names its refusals name.
+pub const STATELESS_DEFAULT_ACTION_MEMBERS: [&str; 2] = [
+    "StatelessDefaultActions",
+    "StatelessFragmentDefaultActions",
+];
+
+/// Whether `action` names one of the [`STATELESS_STANDARD_ACTIONS`].
+///
+/// The standard action's TOKEN is what identifies it: the `aws:` namespace
+/// prefix is optional and neither half is case-sensitive, so `aws:forward_to_sfe`
+/// and `forward_to_sfe` name the same action and the service reports it in one
+/// canonical spelling whichever one the request used. RECORDED behaviour: a
+/// policy created with `forward_to_sfe` is accepted and read back as
+/// `AWS:FORWARD_TO_SFE`. A token the vocabulary does not carry names no standard
+/// action, whichever way it is spelled.
+pub fn is_standard_stateless_action(action: &str) -> bool {
+    let token = action
+        .split_once(':')
+        .filter(|(namespace, _)| namespace.eq_ignore_ascii_case("aws"))
+        .map_or(action, |(_, token)| token);
+    STATELESS_STANDARD_ACTIONS.iter().any(|standard| {
+        let standard = standard.split_once(':').map_or(*standard, |(_, token)| token);
+        token.eq_ignore_ascii_case(standard)
+    })
+}
+
+/// Why `policy`'s stateless default actions are not a vocabulary this service
+/// can act on, or `None` when every entry names an action it can.
+///
+/// An entry of either default-action list must name one of the
+/// [`STATELESS_STANDARD_ACTIONS`] ([`is_standard_stateless_action`]) or a custom
+/// action the SAME document declares in `StatelessCustomActions` ("You name each
+/// custom action that you define, and then you can use it by name in your default
+/// actions specifications" — `FirewallPolicy$StatelessCustomActions`; a custom
+/// action is named, not namespaced, so its name must match as declared). Anything
+/// else names no action at all, so the document is refused rather than retained:
+/// a stored policy whose default action nothing implements would silently handle
+/// every non-matching packet differently from the policy the caller asked for.
+///
+/// The refusal is built FROM the request in the service's one request-derived
+/// shape ([`parameter_context_message`]): the stem names the member that failed,
+/// the brackets carry the offending action verbatim, and the context is the input
+/// path it arrived on. The first offending entry is reported, lists in the order
+/// [`STATELESS_DEFAULT_ACTION_MEMBERS`] names them.
+///
+/// The document's own declared custom action names are collected into a SET, so
+/// the scan costs one lookup per default action however many custom actions the
+/// document declares, and the whole check is linear in the document's size. Both
+/// handlers run it after [`policy_document_breach`], which caps every one of
+/// those lists at [`MAX_POLICY_LIST_ENTRIES`].
+pub fn stateless_default_action_breach(policy: &FirewallPolicy) -> Option<String> {
+    let declared: HashSet<&str> = policy
+        .stateless_custom_actions
+        .iter()
+        .flatten()
+        .map(|custom| custom.action_name.as_str())
+        .collect();
+    let lists = [
+        &policy.stateless_default_actions,
+        &policy.stateless_fragment_default_actions,
+    ];
+    STATELESS_DEFAULT_ACTION_MEMBERS
+        .into_iter()
+        .zip(lists)
+        .find_map(|(member, actions)| {
+            actions
+                .iter()
+                .find(|action| {
+                    !is_standard_stateless_action(action) && !declared.contains(&action.as_str())
+                })
+                .map(|action| {
+                    parameter_context_message(&format!("{member} is invalid"), action, member)
+                })
+        })
+}
+
 /// How many `LogDestinationConfigs` entries one logging configuration may carry.
 ///
 /// CHOSEN, not an AWS quota: the model puts NO length constraint on the list, and

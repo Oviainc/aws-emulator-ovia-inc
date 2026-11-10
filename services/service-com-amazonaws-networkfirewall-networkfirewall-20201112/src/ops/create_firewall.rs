@@ -320,9 +320,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
+        // A name that is already taken is a defect of the REQUEST, not a state
+        // conflict on the stored resource: `InvalidRequestException` covers "a
+        // problem with your request", while `InvalidOperationException` is the
+        // in-use/state refusal ("you might have tried to delete a rule group or
+        // firewall policy that's in use").
         if state.firewalls.contains_key(&input.firewall_name) {
-            return Err(CreateFirewallErrorModeled::InvalidOperationException(
-                InvalidOperationException {
+            return Err(CreateFirewallErrorModeled::InvalidRequestException(
+                InvalidRequestException {
                     message: Some(crate::state::RESOURCE_ALREADY_EXISTS_MESSAGE.to_string()),
                 },
             )

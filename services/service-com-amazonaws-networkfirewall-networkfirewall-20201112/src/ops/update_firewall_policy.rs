@@ -198,6 +198,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An update mints no ARN, so it reads nothing off the request's credential
         // scope: the policy it edits is the one already stored.
         let _ = ctx;
+
+        // The two checks that read only the SUBMITTED DOCUMENT run first, before
+        // the store is reached at all, so no caller-driven walk of the document
+        // happens while this service's state guard is held. They are the same
+        // checks the create runs, in the same order: what this emulator will
+        // retain of the document — which is also what caps the lists the next
+        // check reads — and then whether its default stateless actions name
+        // actions this service can take. Both run for a dry run too, and both run
+        // before the record is touched, so a refused update leaves the stored
+        // policy as it was.
+        if let Some(breach) = crate::state::policy_document_breach(&input.firewall_policy) {
+            // This operation's model declares no limit error, so a document
+            // past what this emulator retains is refused as the bad request it
+            // is: `InvalidRequestException` covers "an unsupported parameter
+            // name or value".
+            return Err(UpdateFirewallPolicyErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(breach),
+                },
+            )
+            .into());
+        }
+        if let Some(breach) = crate::state::stateless_default_action_breach(&input.firewall_policy) {
+            return Err(UpdateFirewallPolicyErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(breach),
+                },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateFirewallPolicyErrorModeled::InternalServerError(
                 InternalServerError {
@@ -218,26 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(update_lookup_error)?;
 
-        // The same two checks the create runs on a submitted document, in the
-        // same order, because the document is the same thing: what this emulator
-        // will retain of it, and then whether every rule group it references
-        // exists and is of the kind its reference list is for. Both run for a dry
-        // run too — checking "whether the request can run successfully" is what a
-        // caller pre-flights a swapped reference with — and both run before the
-        // record is touched, so a refused update leaves the stored policy as it
-        // was.
-        if let Some(breach) = crate::state::policy_document_breach(&input.firewall_policy) {
-            // This operation's model declares no limit error, so a document
-            // past what this emulator retains is refused as the bad request it
-            // is: `InvalidRequestException` covers "an unsupported parameter
-            // name or value".
-            return Err(UpdateFirewallPolicyErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(breach),
-                },
-            )
-            .into());
-        }
+        // Whether every rule group the document references exists, and is of the
+        // kind its reference list is for, is the one document check that needs
+        // state — so it runs here, in the same critical section the record is
+        // written in.
         if let Some(breach) = state.policy_reference_breach(&input.firewall_policy) {
             return Err(UpdateFirewallPolicyErrorModeled::InvalidRequestException(
                 InvalidRequestException {

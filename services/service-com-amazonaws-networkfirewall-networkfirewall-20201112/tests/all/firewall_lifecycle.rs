@@ -342,7 +342,7 @@ async fn a_duplicate_name_is_refused_and_does_not_overwrite() {
         .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (400, "InvalidOperationException"),
+        (400, "InvalidRequestException"),
         "case policy: expected a duplicate name to be refused, got {status} {body:?}"
     );
 
@@ -385,7 +385,7 @@ async fn a_duplicate_name_is_refused_and_does_not_overwrite() {
         .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (400, "InvalidOperationException"),
+        (400, "InvalidRequestException"),
         "case firewall: expected a duplicate name to be refused, got {status} {body:?}"
     );
     let described = harness
@@ -977,8 +977,11 @@ async fn a_policy_document_past_the_retained_size_bound_is_refused() {
     let bound = state::MAX_POLICY_LIST_ENTRIES;
     let builders: [(&str, ListBuilder); 3] = [
         ("StatelessDefaultActions", |count| {
+            // Every entry has to name an action the service supports, so the
+            // length is reached by repeating one standard action rather than by
+            // inventing distinct ones (the list declares no `@uniqueItems`).
             (0..count)
-                .map(|index| json!(format!("aws:pass{index}")))
+                .map(|_| json!("aws:pass"))
                 .collect::<Vec<Value>>()
                 .into()
         }),

@@ -53,6 +53,8 @@ mod rule_group_policy_associations;
 mod rule_group_response_members;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stateless_default_actions.rs"]
+mod stateless_default_actions;
 #[path = "all/subnet_associations.rs"]
 mod subnet_associations;
 #[path = "all/subnet_disassociations.rs"]

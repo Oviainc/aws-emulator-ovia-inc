@@ -179,6 +179,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Bound what one caller can make this emulator retain BEFORE anything
+        // walks the submitted document: the model puts no length constraint on
+        // the policy document's lists, so this is what caps every list the
+        // checks below read. It needs no state, so it runs before the store is
+        // reached, and it runs for a dry run too — which is what "check whether
+        // the request can run successfully" means.
+        if let Some(breach) = crate::state::policy_document_breach(&input.firewall_policy) {
+            return Err(
+                CreateFirewallPolicyErrorModeled::LimitExceededException(LimitExceededException {
+                    message: Some(breach),
+                })
+                .into(),
+            );
+        }
+
+        // The submitted document's default stateless actions must name actions
+        // this service can act on — a value outside the documented vocabulary is
+        // "an unsupported parameter name or value", which is what
+        // `InvalidRequestException` covers. It reads only the request, over lists
+        // the check above has already bounded, and runs before anything is looked
+        // up or inserted, so a refused request consumes neither the name nor any
+        // other state.
+        if let Some(breach) = crate::state::stateless_default_action_breach(&input.firewall_policy) {
+            return Err(
+                CreateFirewallPolicyErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(breach),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let region = crate::state::request_region(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateFirewallPolicyErrorModeled::InternalServerError(
@@ -190,32 +223,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
+        // A name that is already taken is a defect of the REQUEST, not a state
+        // conflict on the stored resource: `InvalidRequestException` covers "a
+        // problem with your request", while `InvalidOperationException` is the
+        // in-use/state refusal ("you might have tried to delete a rule group or
+        // firewall policy that's in use"), so a create under a taken name takes
+        // the request class — as every other create in this service does.
         if state
             .firewall_policies
             .contains_key(&input.firewall_policy_name)
         {
-            return Err(CreateFirewallPolicyErrorModeled::InvalidOperationException(
-                InvalidOperationException {
-                    message: Some(crate::state::RESOURCE_ALREADY_EXISTS_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
-
-        // Bound what one caller can make this emulator retain: the model puts no
-        // length constraint on the policy document's lists, and nothing caps the
-        // number of stored policies, so both are refused here with the modelled
-        // `LimitExceededException` before anything is built or inserted. The
-        // checks run for a dry run too, which is what "check whether the request
-        // can run successfully" means.
-        if let Some(breach) = crate::state::policy_document_breach(&input.firewall_policy) {
             return Err(
-                CreateFirewallPolicyErrorModeled::LimitExceededException(LimitExceededException {
-                    message: Some(breach),
-                })
+                CreateFirewallPolicyErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::RESOURCE_ALREADY_EXISTS_MESSAGE.to_string()),
+                    },
+                )
                 .into(),
             );
         }
+
+        // Nothing else caps the number of stored policies, so a request past the
+        // ceiling is refused with the modelled `LimitExceededException` before
+        // the record is built or inserted.
         if state.firewall_policies.len() >= crate::state::MAX_STORED_FIREWALL_POLICIES {
             return Err(
                 CreateFirewallPolicyErrorModeled::LimitExceededException(LimitExceededException {
