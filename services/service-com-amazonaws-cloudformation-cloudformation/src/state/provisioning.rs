@@ -1464,9 +1464,9 @@ pub async fn reconcile(
     // The identifiers the owning services MINTED in this walk, each against the stand-in
     // the naming rules had computed for that resource ([`repoint_references`]).
     let mut minted: Vec<Minted> = Vec::new();
-    // The resources of this walk whose own attributes are NOT PUBLISHED yet: a custom
-    // resource held for its provider's answer, and every resource withheld behind one
-    // ([`awaits_a_dependency`]).
+    // The resources of this walk whose own attributes are NOT PUBLISHED yet: a resource the
+    // owning service is still bringing up, a custom resource held for its provider's answer,
+    // and every resource withheld behind one of them ([`awaits_a_dependency`]).
     let mut unpublished: BTreeSet<String> = BTreeSet::new();
     let mut declared = declared.into_iter();
     // Every `{{resolve:...}}` DYNAMIC REFERENCE the declarations carry is resolved by
@@ -2145,6 +2145,18 @@ pub async fn reconcile(
                             // there is no provider request it is for.
                             provider_request: None,
                         });
+                        // A resource that is still coming up has not published the values its
+                        // owning service only reports once it IS up — the address a cluster
+                        // serves on, the endpoint a stream is written to — so nothing that
+                        // READS one of them may be created ahead of that answer
+                        // ([`awaits_a_dependency`]): the document such a create would carry
+                        // does not have the value yet. The dependents are held at waits of
+                        // their own and created by the pass that runs once this one releases
+                        // ([`deferred::resume`]), which is the order CloudFormation creates a
+                        // stack's resources in — the same hold a custom resource whose
+                        // provider has not answered yet puts on the resources that read its
+                        // `Data`.
+                        unpublished.insert(resource.logical_id.clone());
                         outcome.transitions.push(ResourceTransition::finished(
                             &resource,
                             super::resource_status::CREATE_COMPLETE,

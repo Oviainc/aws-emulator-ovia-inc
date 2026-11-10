@@ -228,6 +228,20 @@ pub fn role_identity_documents<Eng: Send + Sync + 'static>(
     Some(identity_policies(&iam, NamedIdentity::Role(&role_name)).documents)
 }
 
+/// Whether `principal_arn` is the principal the account's OWN published credential speaks
+/// for — the long-term key this emulator publishes at start
+/// ([`sts_store::ambient_identity`]), which is the position AWS account root credentials are
+/// in.
+///
+/// No identity-based policy bounds it, which is why [`caller`] answers `None` for it and this
+/// gate SERVES it (see the module docs). A decision taken OUTSIDE a modelled operation's own
+/// gate — the domain's data plane, where a resource-based policy is read as well — asks this
+/// to tell that caller apart from a principal whose identity documents simply could not be
+/// read: the two are both "no documents", and only this one is a caller nothing bounds.
+pub fn is_account_credential(principal_arn: &str) -> bool {
+    !principal_arn.is_empty() && principal_arn == sts_store::ambient_identity().arn
+}
+
 /// The refusal IAM states an authorization failure with: who was refused, which action,
 /// on which resource, and which of IAM's two rules refused it. Every value in it comes
 /// from the request and from the stored policies.

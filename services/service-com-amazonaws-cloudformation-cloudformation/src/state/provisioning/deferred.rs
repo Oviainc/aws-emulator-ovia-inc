@@ -7,33 +7,47 @@
 //! CloudFormation creates a stack's resources in dependency order — "a resource that
 //! depends on another is scheduled only once that one has finished" — and what a
 //! declaration reads of the resource it depends on is that resource's PUBLISHED values: the
-//! physical id a `Ref` resolves to, and the attributes an `Fn::GetAtt` resolves against. For
-//! a CUSTOM RESOURCE those attributes are the `Data` its provider answers with
-//! ([`super::custom_resource`]), which arrives after the create was sent — so a resource
-//! whose declaration reads one of them cannot be created in the same pass as the custom
-//! resource it reads: the document that would be sent does not carry the value yet.
+//! physical id a `Ref` resolves to, and the attributes an `Fn::GetAtt` resolves against. A
+//! resource whose create the owning service has ACCEPTED has not finished while that service
+//! is still bringing it up, and the values it only publishes once it is up — the address a
+//! cluster serves on, the endpoint a stream is written to — are not there to be read yet. The
+//! same relation holds for a CUSTOM RESOURCE, whose attributes are the `Data` its provider
+//! answers with ([`super::custom_resource`]), which arrives after the create was sent. Either
+//! way a resource whose declaration reads one of those values cannot be created in the same
+//! pass as the resource it reads: the document that would be sent does not carry the value
+//! yet.
 //!
 //! So the walk WITHHOLDS such a resource ([`super::awaits_a_dependency`]) and holds it at a
 //! wait of its own ([`crate::state::stabilising::Awaited::Deferred`]), which keeps the stack
-//! operation open exactly as the custom resource's own wait does. [`resume`] is the pass
+//! operation open exactly as the awaited resource's own wait does. [`resume`] is the pass
 //! that finishes the walk: once the waits a withheld resource was waiting for have released,
 //! the declarations are resolved ONCE MORE against the records as they now stand
 //! ([`crate::state::StoredStack::resolve_deferred_declarations`]) and the resource is created
 //! with the document that resolution produced.
 //!
 //! A declaration that STILL reads an attribute the resource it names does not publish has
-//! read one the provider's `Data` does not carry: the answer is in hand, so the attribute
-//! does not exist, and the consuming resource fails with CloudFormation's attribute error
+//! read one that resource does not have: the answer is in hand — the owning service reports
+//! it ready, or the provider's `Data` has arrived — so the attribute does not exist, and the
+//! consuming resource fails with CloudFormation's attribute error
 //! ([`crate::state::template::unsupported_attribute_reason`]) — which rolls the stack back,
 //! as any resource's failed create does.
 //!
+//! A withheld resource's own dependents are withheld behind IT, so one pass releases ONE
+//! level of a chain. [`resume`] therefore keeps passing while a pass still creates something:
+//! what a level's creation unblocks is the next level, and holding that over to the next call
+//! would make the rest of the walk wait on how often the client happens to read the stack —
+//! and spend a withheld resource's own window ([`crate::state::stabilising`]) waiting for its
+//! turn rather than for the service that owns it.
+//!
 //! ## Bounds
 //!
-//! One pass per call, over the deferred waits of the stacks of one Region: each withheld
-//! resource is created at most once, because creating it releases its wait, and the waits
-//! themselves are bounded with the operation that opened them
-//! ([`crate::state::stabilising`]). A wait that never unblocks runs out on the same window
-//! every other wait of a creation does.
+//! Every pass creates at least one withheld resource or the cascade stops, and a resource is
+//! created at most once, because creating it releases its wait — so the passes of one call are
+//! bounded by the resources a template may declare
+//! ([`crate::state::template::MAX_RESOURCES_PER_TEMPLATE`]), which is the same walk a
+//! single-pass deployment makes. The waits themselves are bounded with the operation that
+//! opened them ([`crate::state::stabilising`]). A wait that never unblocks runs out on the
+//! same window every other wait of a creation does.
 
 use super::*;
 
@@ -63,6 +77,23 @@ pub(super) async fn resume(
     state: &::engine::ServiceState<super::super::ComAmazonawsCloudformationCloudformationState>,
     region: &str,
 ) {
+    // One pass per LEVEL of a withheld chain, for as long as a pass still creates something:
+    // see the module docs for why the cascade is not left to the next call, and for what
+    // bounds it.
+    for _ in 0..super::super::template::MAX_RESOURCES_PER_TEMPLATE {
+        if !resume_pass(ctx, state, region).await {
+            return;
+        }
+    }
+}
+
+/// ONE pass of [`resume`]: create the resources whose waits have answered, and answer whether
+/// it created any — which is whether another level may now be creatable.
+async fn resume_pass(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    state: &::engine::ServiceState<super::super::ComAmazonawsCloudformationCloudformationState>,
+    region: &str,
+) -> bool {
     let resumptions: Vec<Resumption> = {
         let mut store = state.lock();
         let now = SystemTime::now();
@@ -73,6 +104,9 @@ pub(super) async fn resume(
             .filter_map(|stack| resumption_of(stack, now))
             .collect()
     };
+    let progressed = resumptions
+        .iter()
+        .any(|resumption| !resumption.create.is_empty());
     for resumption in resumptions {
         let materialised = reconcile(
             ctx,
@@ -157,6 +191,7 @@ pub(super) async fn resume(
             );
         }
     }
+    progressed
 }
 
 /// What `stack` can resume now, or `None` for a stack with nothing withheld — or nothing

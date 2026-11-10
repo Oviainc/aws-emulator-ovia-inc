@@ -108,12 +108,12 @@ pub enum Awaited {
     /// ON are still waiting for their own answers, so what this barrier waits for is those
     /// waits releasing — which is when its own creation can START.
     ///
-    /// It is held because the declaration that would be sent reads an attribute of a resource
-    /// whose OWN wait is still open — a custom resource's attributes are the `Data` its
-    /// provider answers with — so the resource is created once that wait releases, by the
-    /// same walk that would have created it ([`super::provisioning::deferred`]). Not a
-    /// question for any owning service, which is why it is not one of the readiness answers
-    /// above.
+    /// It is held because the declaration that would be sent reads a value of a resource
+    /// whose OWN wait is still open — an attribute the owning service publishes only once it
+    /// reports the resource ready, or, for a custom resource, the `Data` its provider answers
+    /// with — so the resource is created once that wait releases, by the same walk that would
+    /// have created it ([`super::provisioning::deferred`]). Not a question for any owning
+    /// service, which is why it is not one of the readiness answers above.
     Deferred,
 }
 

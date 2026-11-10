@@ -341,6 +341,22 @@ pub fn iam_decision(
     if iam::is_allowed(identity_decision, resource_decision) {
         return Ok(());
     }
+    // The ACCOUNT'S OWN published credential is bounded by no identity policy at all — the
+    // position AWS account root credentials are in, and the caller this service's
+    // control-plane gate SERVES rather than evaluates
+    // ([`super::authorization::is_account_credential`]) — so a domain's access policy
+    // saying nothing about it does not refuse it either: IAM grants a request of this
+    // account that either side allows, and for this caller the identity side is not one
+    // this emulator can read. What still refuses it is the rule that wins over every allow
+    // whichever side states it: an explicit `Deny`.
+    if super::authorization::is_account_credential(principal_arn)
+        && resource_decision != Decision::Denied
+    {
+        return Ok(());
+    }
+    // Neither side states anything and there is no policy on either side to state it: an
+    // engine holding no identity store, and a domain carrying no access policy, is a domain
+    // nothing bounds.
     if identity.is_none()
         && access_policy.is_none()
         && identity_decision == Decision::NotStated

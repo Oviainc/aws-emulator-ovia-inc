@@ -874,17 +874,18 @@ impl StoredStack {
     /// records as they now stand.
     ///
     /// A declaration that reads an attribute of a resource whose own wait was still open
-    /// resolved to nothing when the deployment computed it: a CUSTOM RESOURCE's attributes
-    /// are the `Data` its provider answers with, and that answer lands later
-    /// ([`provisioning::advance_stabilisations`] records it). Once it has, the declaration
-    /// the owning service is asked for is the one that reads it, so the properties are
-    /// evaluated again here — over the same template, parameters and scope the deployment
-    /// used, with the recorded attributes in place.
+    /// resolved to nothing when the deployment computed it: an attribute the owning service
+    /// publishes only once it reports the resource READY, and, for a CUSTOM RESOURCE, the
+    /// `Data` its provider answers with, both land later
+    /// ([`provisioning::advance_stabilisations`] records them). Once they have, the
+    /// declaration the owning service is asked for is the one that reads them, so the
+    /// properties are evaluated again here — over the same template, parameters and scope the
+    /// deployment used, with the recorded attributes in place.
     ///
     /// The returned map is one entry per resource whose declaration STILL reads an attribute
     /// the resource it names does not publish, with the error that is
-    /// ([`template::unsupported_attribute_reason`]): the answer is in hand and its `Data`
-    /// does not carry the key, so the consuming resource cannot be created at all.
+    /// ([`template::unsupported_attribute_reason`]): the answer is in hand and does not carry
+    /// the key, so the consuming resource cannot be created at all.
     pub fn resolve_deferred_declarations(&mut self) -> BTreeMap<String, String> {
         let Some((declared, parameters)) = self.template_scope() else {
             return BTreeMap::new();

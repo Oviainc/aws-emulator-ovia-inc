@@ -67,6 +67,12 @@ mod workspace_lockfile_covers_every_manifest;
 // CloudFormation at once.
 #[path = "all/s3_notification_invokes_its_lambda_target.rs"]
 mod s3_notification_invokes_its_lambda_target;
+// Declared here, in this same head region, beside the suite above it shares its wiring with:
+// what the handler a bucket's notification runs DOES — the signed index request it sends to a
+// deployed search domain — which spans S3, Lambda, IAM, STS, Amazon OpenSearch Service and
+// CloudFormation at once.
+#[path = "all/s3_notification_indexes_into_its_opensearch_domain.rs"]
+mod s3_notification_indexes_into_its_opensearch_domain;
 #[path = "all/cloudformation_asset_bucket_publishing_role.rs"]
 mod cloudformation_asset_bucket_publishing_role;
 // client SEES of an EventBridge rule's and an SNS subscription's deliveries to their Lambda and
