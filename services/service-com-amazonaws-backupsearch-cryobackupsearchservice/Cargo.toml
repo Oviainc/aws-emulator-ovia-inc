@@ -43,11 +43,27 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 service-com-amazonaws-backup-cryocontrollerusermanager = { workspace = true }
 # `iam_authorization`: the shared evaluation of those documents against an action on a
 # resource, so every service that enforces authorization decides alike. `iam_role` reads
-# which IAM entity a principal ARN names.
+# which IAM entity a principal ARN names. `s3_client` is this tree's one construction of
+# the in-process Amazon S3 client an export's results object is written through.
 service-common = { path = "../common" }
+# The destination of an export: `StartSearchResultExportJob` writes the exported results
+# into the Amazon S3 bucket the request names, over the emulator's own in-process
+# transport, so the SDK's object-store client and its `ByteStream` are needed here. Already
+# in the workspace lockfile (every service that writes an object declares the same line).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The framing of the exported results object: a results CSV is RFC 4180, so the maintained
+# writer frames it rather than a hand-rolled one that would mis-quote a separator, a quote
+# or a newline inside an object key. Already in the workspace lockfile.
+csv = "1.3"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The destination of an export, mounted BESIDE this service in the suites that assert what
+# an export writes: the results object is written into the emulator's own Amazon S3 over
+# the in-process callback, so the bucket a test creates is the bucket the export writes to.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

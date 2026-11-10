@@ -28,8 +28,9 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::ops::types;
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
-    call, emulator_with_engine, recovery_point, seed_recovery_points, settle_a_span_ahead, Answer,
-    PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT, WITHIN_THE_DUE_INSTANT,
+    call, create_bucket, emulator_with_engine, recovery_point, seed_recovery_points,
+    settle_a_span_ahead, Answer, PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT,
+    WITHIN_THE_DUE_INSTANT,
 };
 
 /// A `RoleArn` the service can be passed: a role in the account this emulator attributes
@@ -115,6 +116,17 @@ fn export_cases() -> Vec<ExportCase> {
             tags: Some(json!({"owner": "backup", "env": "test"})),
         },
     ]
+}
+
+/// The destination bucket a row's `ExportSpecification` names, which the object store has
+/// to hold before the export writes into it — the recordings of this surface create it with
+/// `s3:CreateBucket` before starting the export, and an export is judged by what that write
+/// came to.
+fn destination_bucket(specification: &Value) -> String {
+    specification["s3ExportSpecification"]["DestinationBucket"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The `StartSearchResultExportJob` body for one row.
@@ -258,6 +270,7 @@ async fn a_started_export_job_is_persisted_and_every_member_is_read_back_out_of_
         } = case;
         let (search_job_identifier, search_job_arn) =
             settled_search_job(&emulator, &engine, region, name, settled).await;
+        create_bucket(&emulator, region, &destination_bucket(&case.specification)).await;
         let body = export_body(&case, &search_job_identifier);
 
         let started = call(&emulator, region, "PUT", "/export-search-jobs", Some(body.clone())).await;
@@ -338,15 +351,15 @@ async fn a_started_export_job_is_persisted_and_every_member_is_read_back_out_of_
             running.get("CompletionTime")
         );
 
-        // Once the clock has made the owed transition due, the same read reports it —
-        // this search job matched nothing, so the export had nothing to transmit and
-        // completes. The due instant is stored, so the clock is carried to it.
+        // Once the clock has made the owed transition due, the same read reports it — the
+        // destination bucket took the results object, so the export completes. The due
+        // instant is stored, so the clock is carried to it.
         settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
         let settled_export = get_export_job(&emulator, region, &identifier).await;
         assert_eq!(
             settled_export.string("Status"),
             state::COMPLETED,
-            "case {name:?}: an export of an empty result set completes once due, got {:?}",
+            "case {name:?}: an export the destination took completes once due, got {:?}",
             settled_export.get("Status")
         );
         let completion_time = settled_export.get("CompletionTime").as_f64();
@@ -713,16 +726,20 @@ async fn a_client_token_is_idempotent_for_the_same_body_and_conflicts_for_a_diff
 }
 
 #[tokio::test]
-async fn an_export_that_would_have_to_transmit_items_ends_in_the_modelled_failed_status() {
+async fn an_export_of_a_search_job_with_results_writes_them_and_completes() {
     let (emulator, engine) = emulator_with_engine();
     let (search_job_identifier, _) =
         settled_search_job(&emulator, &engine, "us-west-2", "with results", Settled::Completed)
             .await;
+    // The destination exists before the export starts, as a client creates it.
+    let bucket = "with-results-dest";
+    create_bucket(&emulator, "us-west-2", bucket).await;
 
-    // Give the settled search job a result set, which nothing in this emulator can scan
-    // its way to: an export of it would have to transmit objects into the destination
-    // bucket, and that is the transmission the emulator cannot perform. One row per
-    // `ResultItem` member of the union, so the outcome does not depend on the item type.
+    // Give the settled search job a result set with one row per `ResultItem` member of the
+    // union, so what is asserted does not depend on the item type: an export of it has
+    // items to write into the destination bucket. (What the written object CARRIES, and
+    // what happens when the destination is absent, are the subject of
+    // `tests/all/export_results_object.rs`.)
     {
         let state = engine.state::<state::ComAmazonawsBackupsearchCryobackupsearchserviceState>();
         let mut state = state.lock();
@@ -750,7 +767,7 @@ async fn an_export_that_would_have_to_transmit_items_ends_in_the_modelled_failed
         "/export-search-jobs",
         Some(json!({
             "SearchJobIdentifier": search_job_identifier,
-            "ExportSpecification": {"s3ExportSpecification": {"DestinationBucket": "bucket"}}
+            "ExportSpecification": {"s3ExportSpecification": {"DestinationBucket": bucket}}
         })),
     )
     .await;
@@ -778,22 +795,23 @@ async fn an_export_that_would_have_to_transmit_items_ends_in_the_modelled_failed
     );
 
     settle_a_span_ahead(&engine, PAST_THE_DUE_INSTANT);
-    let failed = get_export_job(&emulator, "us-west-2", &identifier).await;
+    let settled = get_export_job(&emulator, "us-west-2", &identifier).await;
     assert_eq!(
-        failed.string("Status"),
-        state::FAILED,
-        "an export whose items cannot be transmitted ends FAILED, got {:?}",
-        failed.get("Status")
-    );
-    let message = failed.string("StatusMessage");
-    assert!(
-        message.contains("cannot transmit"),
-        "a FAILED export must say why it failed, got {message:?}"
+        settled.string("Status"),
+        state::COMPLETED,
+        "an export whose items the destination took completes, got {:?} ({:?})",
+        settled.get("Status"),
+        settled.get("StatusMessage")
     );
     assert!(
-        failed.get("CompletionTime").as_f64().is_some(),
-        "a FAILED export carries the instant it ended, got {:?}",
-        failed.get("CompletionTime")
+        settled.get("StatusMessage").is_null(),
+        "a completed export explains nothing, got {:?}",
+        settled.get("StatusMessage")
+    );
+    assert!(
+        settled.get("CompletionTime").as_f64().is_some(),
+        "a settled export carries the instant it ended, got {:?}",
+        settled.get("CompletionTime")
     );
 }
 

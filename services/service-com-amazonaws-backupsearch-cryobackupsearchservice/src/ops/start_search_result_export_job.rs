@@ -45,11 +45,17 @@
 //!
 //! A refused call creates nothing: the record is inserted only after every step holds.
 //!
-//! What this emulator does NOT do is write the .csv to the destination bucket: that
-//! object lives in another service and nothing here transmits it. So the export's own
-//! lifecycle is recorded honestly — an export of an EMPTY result set has nothing to
-//! transmit and the clock owes it `COMPLETED`, while an export that would have to
-//! transmit items ends in the modelled `FAILED` status whose `StatusMessage` says why.
+//! ## What the export itself does
+//!
+//! The operation "starts a job to export the results of search job to a designated S3
+//! bucket", so the results are WRITTEN there: the record is stored `RUNNING`, the search
+//! job's recorded result items are written into `DestinationBucket` under
+//! `DestinationPrefix` as the results object ([`crate::state::deliver_export_results`]),
+//! and the terminal status the clock owes the export is what that write came to —
+//! `COMPLETED` for an object the destination took, and the modelled `FAILED` carrying the
+//! object store's own reason for one it refused (a bucket it holds none of, among them).
+//! The destination is therefore resolved where the object store holds it, and no export
+//! reports a transfer that did not happen.
 //!
 //! ## Shape of an operation
 //!
@@ -243,203 +249,272 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = SystemTime::now();
-        let Some(state) = crate::state::service_state(&*self.engine) else {
+        let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(store_unavailable());
         };
-        let mut state = state.lock();
-        // A search job whose scan the clock has already finished is COMPLETED before
-        // this call judges whether its results can be exported.
-        state.settle(now);
 
-        let fingerprint = crate::state::request_fingerprint(
-            super::types::START_SEARCH_RESULT_EXPORT_JOB_INPUT_SCHEMA,
-            &input,
-        )
-        .map_err(|reason| {
-            StartSearchResultExportJobError::from(
-                StartSearchResultExportJobErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: format!(
-                            "could not record the StartSearchResultExportJob request: {reason}"
-                        ),
-                        retry_after_seconds: None,
-                    },
-                ),
-            )
-        })?;
-
-        // `ClientToken` idempotency, decided by the one replay rule both `Start`
-        // operations of this service follow (`crate::state::client_token_replay`): inside
-        // the token's validity window the same body answers with the export job the first
-        // call minted and creates nothing, while a different body is a conflict, because
-        // that token already names another export job. Past that window the token names
-        // nothing and the call is a new request. The refusal names THIS operation and the
-        // export-job resource type; the rule itself lives in one place.
-        if let Some(job) = state
-            .export_job_replay(
-                input.client_token.as_deref(),
-                &fingerprint,
-                now,
-                Self::NAME,
-            )
-            .map_err(StartSearchResultExportJobErrorModeled::ConflictException)?
-        {
-            return Ok(StartSearchResultExportJobOutput {
-                export_job_arn: Some(job.arn.clone()),
-                export_job_identifier: job.identifier.clone(),
-            });
-        }
-
-        // The export is of ONE search job's results, so that job has to exist and its
-        // result set has to have settled.
-        let identifier = input.search_job_identifier.clone();
-        let (search_job_arn, search_job_status, results_to_export) = {
-            let search_job = state.job(&identifier).ok_or_else(|| {
-                StartSearchResultExportJobError::from(
-                    StartSearchResultExportJobErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: crate::state::RESOURCE_NOT_FOUND.to_string(),
-                            resource_id: identifier.clone(),
-                            resource_type: SEARCH_JOB_RESOURCE.to_string(),
-                        },
-                    ),
-                )
-            })?;
-            (
-                search_job.arn.clone(),
-                search_job.status.clone(),
-                search_job.results.len(),
-            )
-        };
-        if !crate::state::EXPORTABLE_SEARCH_JOB_STATES.contains(&search_job_status.as_str()) {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::export_status_refusal_message(&search_job_status),
-            ));
-        }
-
-        // The union the request carried, which `ReceivedExportSpecification` let through
-        // deserialization even with no member set: the service accepts it at the input
-        // boundary and fails on it here, as a server fault.
-        let Some(export_specification) = input.export_specification.specification.clone() else {
-            return Err(
-                StartSearchResultExportJobErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: "Internal Server Error. Please try again".to_string(),
-                        retry_after_seconds: None,
-                    },
-                )
-                .into(),
-            );
-        };
-
-        // Writing the results means assuming the submitted role, so the role has to be
-        // one this service can be passed. Every well-formed ARN reaches this check rather
-        // than being turned away by input validation — including one that names no IAM
-        // role, which is a role this account cannot pass either.
-        if let Some(role_arn) = input.role_arn.as_deref() {
-            if let Some(message) = crate::state::pass_role_denial(role_arn) {
-                return Err(
-                    StartSearchResultExportJobErrorModeled::AccessDeniedException(
-                        AccessDeniedException { message },
-                    )
-                    .into(),
-                );
-            }
-        }
-
-        // The tags this export job would be stored with have to pass the admission rule
-        // every write of a tag in this service passes (`crate::state::check_tag_map`): the
-        // characters `Tags` documents, and the caps bounding one record. So a create
-        // cannot mint a job carrying a tag a write would be refused for, nor grow a
-        // stored job without bound. A create merges into nothing, so the count checked is
-        // the one the request carries.
-        let tags = input.tags.clone().unwrap_or_default();
-        crate::state::check_tag_map(&tags, None)?;
-
-        // This store holds its export jobs for the life of the process and only this
-        // operation adds one, so it is capped: past the cap the service's own quota error
-        // is the honest answer, by the one cap rule every capped store of this service
-        // follows (`crate::state::check_store_capacity`,
-        // `crate::state::MAX_EXPORT_JOBS`). The refusal is lifted into THIS operation's
-        // error channel; the rule itself lives in one place.
-        state
-            .check_export_job_capacity(ctx.identity().signing_name())
-            .map_err(StartSearchResultExportJobErrorModeled::ServiceQuotaExceededException)?;
-
-        let export_identifier = state.mint_export_identifier().ok_or_else(|| {
-            StartSearchResultExportJobError::from(
-                StartSearchResultExportJobErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: crate::state::MINT_EXHAUSTED.to_string(),
-                        retry_after_seconds: None,
-                    },
-                ),
-            )
-        })?;
-        let arn = crate::state::export_job_arn(
-            ctx.identity().signing_name(),
-            &crate::state::request_region(ctx),
-            &export_identifier,
-        );
-
-        // The status the clock owes this export, and the message that status comes with.
-        // Writing the .csv into the destination bucket is a transmission this emulator
-        // cannot perform, so an export that would have to transmit items ends in the
-        // service's own modelled FAILED status saying so, rather than reporting a
-        // transfer nothing ran. An export of an empty result set transmits nothing, so it
-        // has nothing left to do and the clock owes it COMPLETED. The message travels
-        // WITH the owed status, so the record cannot report failure text while RUNNING.
-        let (owed_status, owed_message) = if results_to_export == 0 {
-            (crate::state::COMPLETED, None)
-        } else {
-            (
-                crate::state::FAILED,
-                Some(format!(
-                    "this emulator cannot transmit the {results_to_export} result(s) of search \
-                     job '{identifier}' to the destination bucket"
-                )),
-            )
-        };
-
-        let job = ExportJob {
-            identifier: export_identifier.clone(),
-            arn,
-            search_job_identifier: identifier,
-            search_job_arn,
-            // A new export job is RUNNING; the clock owes it the status above once the
-            // export's span has passed (`crate::state::TRANSITION_DELAY`).
-            status: crate::state::RUNNING.to_string(),
-            creation_time: crate::state::timestamp(now),
-            completion_time: None,
-            status_message: None,
+        // Everything the store decides is decided HERE, under one lock: the replay rule,
+        // the lookups, the admission checks and the mint. It holds no lock across the write
+        // below, because that write is an await.
+        let minted = mint_export_job(&store, &input, ctx, Self::NAME, now)?;
+        let MintedExport {
+            identifier: export_identifier,
             export_specification,
-            role_arn: input.role_arn.clone(),
-            tags,
-            // The window the token takes part in idempotency for starts when the
-            // request that used it completed, which is this call.
-            client_token: input
-                .client_token
-                .clone()
-                .map(|token| crate::state::ClientToken::minted(token, now)),
-            request_fingerprint: fingerprint,
-            next_status_due: Some((
-                crate::state::due_at(now, crate::state::TRANSITION_DELAY),
-                owed_status,
-                owed_message,
-            )),
+            results,
+        } = match minted {
+            // A repeat inside the token's validity window is answered out of the export job
+            // the first call minted and exports nothing again: that call already wrote the
+            // results object, so a second write is not owed.
+            MintExportOutcome::Replayed(output) => return Ok(output),
+            MintExportOutcome::Minted(minted) => minted,
         };
-        state.insert_export_job(job);
+
+        // THE EXPORT ITSELF: the search job's results are written into the destination
+        // bucket the request named, in the service that owns that bucket, over the
+        // emulator's own in-process transport. What comes back is that service's own answer
+        // — the key it now holds the results object under, or why it holds none — and the
+        // status the clock owes this export reports exactly that, so no export completes
+        // over an object nothing wrote and none is failed with text this emulator made up.
+        let delivery = crate::state::deliver_export_results(
+            ctx.callback(),
+            &crate::state::request_region(ctx),
+            &export_specification,
+            &export_identifier,
+            &results,
+        )
+        .await;
+        let (owed_status, owed_message) = match delivery {
+            crate::state::ExportDelivery::Written(_) => (crate::state::COMPLETED, None),
+            crate::state::ExportDelivery::Failed(reason) => (crate::state::FAILED, Some(reason)),
+        };
+
+        // The owed transition is recorded on the stored record, due one span after THIS
+        // call — the instant the clock makes it due is counted from the request that
+        // started the export, not from when the write finished. The message travels WITH
+        // the owed status, so the record cannot report failure text while RUNNING.
+        let mut state = store.lock();
+        let stored = state
+            .export_job_mut(&export_identifier)
+            .ok_or_else(store_unavailable)?;
+        stored.next_status_due = Some((
+            crate::state::due_at(now, crate::state::TRANSITION_DELAY),
+            owed_status,
+            owed_message,
+        ));
 
         // Answer out of the STORED record, so this response cannot differ from what
         // GetSearchResultExportJob reports for the same export job.
-        let stored = state
-            .export_job(&export_identifier)
-            .ok_or_else(store_unavailable)?;
         Ok(StartSearchResultExportJobOutput {
             export_job_arn: Some(stored.arn.clone()),
             export_job_identifier: stored.identifier.clone(),
         })
     }
+}
+
+/// What a `StartSearchResultExportJob` that got past every refusal came to, under the
+/// store's lock.
+enum MintExportOutcome {
+    /// The call was a repeat under a `ClientToken` still inside its validity window, so it
+    /// is answered out of the export job the first call minted and nothing was created.
+    Replayed(StartSearchResultExportJobOutput),
+    /// A new export job was stored, and this is what its export has left to do.
+    Minted(MintedExport),
+}
+
+/// The export job this call minted: the identifier it was stored under, the destination it
+/// is to write to, and the result items it is to write there.
+struct MintedExport {
+    identifier: String,
+    export_specification: ExportSpecification,
+    /// The matches the search job RECORDED — what `ListSearchJobResults` pages for it — read
+    /// out of the store under the same lock that judged the job's status, so the export
+    /// writes the result set that job settled with.
+    results: Vec<ResultItem>,
+}
+
+/// Judge the request against the store and mint the export job, holding the store's lock
+/// for exactly that.
+///
+/// SYNCHRONOUS on purpose: every step here reads or writes the store, and the write the
+/// export then performs is an await, so the two are kept apart — the lock is released when
+/// this returns.
+fn mint_export_job(
+    store: &::engine::ServiceState<crate::state::ComAmazonawsBackupsearchCryobackupsearchserviceState>,
+    input: &StartSearchResultExportJobInput,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    operation: &'static str,
+    now: SystemTime,
+) -> Result<MintExportOutcome, StartSearchResultExportJobError> {
+    let mut state = store.lock();
+    // A search job whose scan the clock has already finished is COMPLETED before
+    // this call judges whether its results can be exported.
+    state.settle(now);
+
+    let fingerprint = crate::state::request_fingerprint(
+        super::types::START_SEARCH_RESULT_EXPORT_JOB_INPUT_SCHEMA,
+        input,
+    )
+    .map_err(|reason| {
+        StartSearchResultExportJobError::from(
+            StartSearchResultExportJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!(
+                        "could not record the StartSearchResultExportJob request: {reason}"
+                    ),
+                    retry_after_seconds: None,
+                },
+            ),
+        )
+    })?;
+
+    // `ClientToken` idempotency, decided by the one replay rule both `Start`
+    // operations of this service follow (`crate::state::client_token_replay`): inside
+    // the token's validity window the same body answers with the export job the first
+    // call minted and creates nothing, while a different body is a conflict, because
+    // that token already names another export job. Past that window the token names
+    // nothing and the call is a new request. The refusal names THIS operation and the
+    // export-job resource type; the rule itself lives in one place.
+    if let Some(job) = state
+        .export_job_replay(input.client_token.as_deref(), &fingerprint, now, operation)
+        .map_err(StartSearchResultExportJobErrorModeled::ConflictException)?
+    {
+        return Ok(MintExportOutcome::Replayed(
+            StartSearchResultExportJobOutput {
+                export_job_arn: Some(job.arn.clone()),
+                export_job_identifier: job.identifier.clone(),
+            },
+        ));
+    }
+
+    // The export is of ONE search job's results, so that job has to exist and its
+    // result set has to have settled — and the results THEMSELVES are read here,
+    // because they are what the export writes into the destination bucket.
+    let identifier = input.search_job_identifier.clone();
+    let (search_job_arn, search_job_status, results) = {
+        let search_job = state.job(&identifier).ok_or_else(|| {
+            StartSearchResultExportJobError::from(
+                StartSearchResultExportJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::RESOURCE_NOT_FOUND.to_string(),
+                        resource_id: identifier.clone(),
+                        resource_type: SEARCH_JOB_RESOURCE.to_string(),
+                    },
+                ),
+            )
+        })?;
+        (
+            search_job.arn.clone(),
+            search_job.status.clone(),
+            search_job.results.clone(),
+        )
+    };
+    if !crate::state::EXPORTABLE_SEARCH_JOB_STATES.contains(&search_job_status.as_str()) {
+        return Err(crate::scaffolded::Scaffolded::validation(
+            crate::state::export_status_refusal_message(&search_job_status),
+        ));
+    }
+
+    // The union the request carried, which `ReceivedExportSpecification` let through
+    // deserialization even with no member set: the service accepts it at the input
+    // boundary and fails on it here, as a server fault.
+    let Some(export_specification) = input.export_specification.specification.clone() else {
+        return Err(
+            StartSearchResultExportJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "Internal Server Error. Please try again".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into(),
+        );
+    };
+
+    // Writing the results means assuming the submitted role, so the role has to be
+    // one this service can be passed. Every well-formed ARN reaches this check rather
+    // than being turned away by input validation — including one that names no IAM
+    // role, which is a role this account cannot pass either.
+    if let Some(role_arn) = input.role_arn.as_deref() {
+        if let Some(message) = crate::state::pass_role_denial(role_arn) {
+            return Err(
+                StartSearchResultExportJobErrorModeled::AccessDeniedException(
+                    AccessDeniedException { message },
+                )
+                .into(),
+            );
+        }
+    }
+
+    // The tags this export job would be stored with have to pass the admission rule
+    // every write of a tag in this service passes (`crate::state::check_tag_map`): the
+    // characters `Tags` documents, and the caps bounding one record. So a create
+    // cannot mint a job carrying a tag a write would be refused for, nor grow a
+    // stored job without bound. A create merges into nothing, so the count checked is
+    // the one the request carries.
+    let tags = input.tags.clone().unwrap_or_default();
+    crate::state::check_tag_map(&tags, None)?;
+
+    // This store holds its export jobs for the life of the process and only this
+    // operation adds one, so it is capped: past the cap the service's own quota error
+    // is the honest answer, by the one cap rule every capped store of this service
+    // follows (`crate::state::check_store_capacity`,
+    // `crate::state::MAX_EXPORT_JOBS`). The refusal is lifted into THIS operation's
+    // error channel; the rule itself lives in one place.
+    state
+        .check_export_job_capacity(ctx.identity().signing_name())
+        .map_err(StartSearchResultExportJobErrorModeled::ServiceQuotaExceededException)?;
+
+    let export_identifier = state.mint_export_identifier().ok_or_else(|| {
+        StartSearchResultExportJobError::from(
+            StartSearchResultExportJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::MINT_EXHAUSTED.to_string(),
+                    retry_after_seconds: None,
+                },
+            ),
+        )
+    })?;
+    let arn = crate::state::export_job_arn(
+        ctx.identity().signing_name(),
+        &crate::state::request_region(ctx),
+        &export_identifier,
+    );
+
+    // The status the clock owes this export is what the WRITE the caller performs next
+    // came to, so it is not decided here: the record is stored in the status a new export
+    // job is in, and the transition is owed once the destination has answered. Storing it
+    // before the write is also what keeps a repeat under the same `ClientToken` from
+    // starting a second export — the record the token names exists before this call lets
+    // go of the store.
+    let job = ExportJob {
+        identifier: export_identifier.clone(),
+        arn,
+        search_job_identifier: identifier,
+        search_job_arn,
+        // A new export job is RUNNING; the clock owes it a terminal status once the
+        // export's span has passed (`crate::state::TRANSITION_DELAY`).
+        status: crate::state::RUNNING.to_string(),
+        creation_time: crate::state::timestamp(now),
+        completion_time: None,
+        status_message: None,
+        export_specification: export_specification.clone(),
+        role_arn: input.role_arn.clone(),
+        tags,
+        // The window the token takes part in idempotency for starts when the
+        // request that used it completed, which is this call.
+        client_token: input
+            .client_token
+            .clone()
+            .map(|token| crate::state::ClientToken::minted(token, now)),
+        request_fingerprint: fingerprint,
+        next_status_due: None,
+    };
+    state.insert_export_job(job);
+
+    Ok(MintExportOutcome::Minted(MintedExport {
+        identifier: export_identifier,
+        export_specification,
+        results,
+    }))
 }
 
 /// The server fault to answer with when this emulator's job store cannot be reached: a

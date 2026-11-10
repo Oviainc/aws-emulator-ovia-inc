@@ -37,6 +37,8 @@ mod export_listing;
 mod export_listing_order;
 #[path = "all/export_refusal_classes.rs"]
 mod export_refusal_classes;
+#[path = "all/export_results_object.rs"]
+mod export_results_object;
 #[path = "all/iam_authorization.rs"]
 mod iam_authorization;
 #[path = "all/job_identifier_syntax.rs"]

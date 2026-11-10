@@ -61,6 +61,20 @@
 //! [`SearchJob::backups`]. A scan that left one of its covered recovery points out that
 //! way did not get through the scope it covered, so the terminal status it settles to
 //! carries the `StatusMessage` saying so ([`scan_outcome`]).
+//!
+//! ## An export produces an object, in another service
+//!
+//! An export job is not finished by its own record: `StartSearchResultExportJob` exports a
+//! search job's results "to a designated S3 bucket", so the results are WRITTEN into the
+//! bucket the export names, and the status the clock owes the export is what that write came
+//! to ([`export_delivery`]). The destination therefore lives where the object store holds
+//! it, and a bucket nothing holds fails the export rather than being reported as exported
+//! to.
+
+/// Writing a search job's results into the destination bucket an export names, which is
+/// the work the export performs.
+mod export_delivery;
+pub use export_delivery::*;
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1634,6 +1648,12 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// export job.
     pub fn export_job(&self, identifier: &str) -> Option<&ExportJob> {
         self.export_jobs.get(identifier)
+    }
+
+    /// The export job `identifier` names, mutably — how the call that started an export
+    /// records on it what writing the results into the destination bucket came to.
+    pub fn export_job_mut(&mut self, identifier: &str) -> Option<&mut ExportJob> {
+        self.export_jobs.get_mut(identifier)
     }
 
     /// Every export job NEWEST-CREATED FIRST, which is the sequence

@@ -57,6 +57,12 @@ pub(crate) const WITHIN_THE_DUE_INSTANT: Duration = Duration::from_millis(50);
 /// `StartSearchJob`'s `EncryptionKeyArn` is an `@arnReference` to a KMS key and is
 /// resolved in KMS's own store: a row that starts a job under a key creates that key here
 /// first ([`create_kms_key`]).
+///
+/// Amazon S3 is mounted for the same reason: `StartSearchResultExportJob` WRITES the
+/// exported results into the destination bucket the request names, and that bucket lives in
+/// the object store's own records — so an export of this emulator reaches the object store
+/// mounted here, and a suite that expects an export to complete creates its destination
+/// bucket first ([`create_bucket`]).
 pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -65,7 +71,40 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
     router.register_service(
         service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(&engine)),
     );
+    router.register_service(
+        service_com_amazonaws_s3_amazons3::EmulatedService::new(Arc::clone(&engine)),
+    );
     (router, engine)
+}
+
+/// An Amazon S3 client over this emulator's own in-process callback — the very seam an
+/// export writes its results object through, so a bucket created here is the bucket that
+/// write lands in and an object listed here is the object it wrote.
+pub(crate) fn s3(emulator: &MultiServiceRouter, region: &str) -> ::aws_sdk_s3::Client {
+    let callback = smithy_server_runtime::EmbeddedEmulator::from_router(emulator.clone());
+    ::service_common::s3_client::s3_client(&callback, region)
+}
+
+/// Create `bucket` through Amazon S3's OWN `CreateBucket`, so a destination an export names
+/// is a bucket the object store really holds.
+///
+/// A regional endpoint requires the create to state its own location constraint, which
+/// `us-east-1` — the one Region that constraint is not stated for — is the exception to.
+pub(crate) async fn create_bucket(emulator: &MultiServiceRouter, region: &str, bucket: &str) {
+    let mut create = s3(emulator, region).create_bucket().bucket(bucket);
+    if region != state::DEFAULT_REGION {
+        create = create.create_bucket_configuration(
+            ::aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                .location_constraint(::aws_sdk_s3::types::BucketLocationConstraint::from(region))
+                .build(),
+        );
+    }
+    let created = create.send().await;
+    assert!(
+        created.is_ok(),
+        "seed: s3:CreateBucket must create {bucket:?} in {region}, got {:?}",
+        created.err()
+    );
 }
 
 /// Create a customer managed KMS key through KMS's OWN `CreateKey` and answer its key
