@@ -54,7 +54,10 @@
 //! identifier of this service at all ([`is_resource_identifier`], refused by
 //! [`validate_cluster_identifier`] / [`validate_stream_identifier`]) lives here on
 //! the same terms: eleven routes carry such an identifier, and all of them have to
-//! refuse one value the same way.
+//! refuse one value the same way. The narrower check the three operations that
+//! state the minted value range as a precondition add
+//! ([`validate_minted_cluster_identifier`]) is built from that same predicate, so
+//! the two cannot disagree about the alphabet.
 //!
 //! The tagging operations address a resource by a caller-supplied `resourceArn`
 //! rather than by identifier, so the read of that ARN ([`parse_resource_arn`]), the
@@ -1805,25 +1808,49 @@ fn kms_key_arn(region: &str, kms_encryption_key: &str) -> String {
 /// (`smithy_query(query="shape", shape="ClusterId,StreamId")`).
 pub const RESOURCE_ID_LEN: usize = 26;
 
-/// Whether `value` is an identifier of this service at all: the 26-character
-/// base32 rendering of a 128-bit value, which is the form every cluster and
-/// stream identifier Aurora DSQL issues takes ([`new_resource_identifier`]).
+/// Whether `value` is an identifier of this service at all: 26 symbols of the
+/// base32 alphabet every cluster and stream identifier Aurora DSQL issues is
+/// written in ([`CROCKFORD_SYMBOLS`], the alphabet [`new_resource_identifier`]
+/// renders with).
 ///
 /// `ClusterId`'s and `StreamId`'s `^[a-z0-9]{26}$` is the OUTER form — the
 /// boundary constraint walk refuses every value outside it before a handler runs
-/// (`crate::service::validation`) — but it is wider than the encoding: it admits
-/// symbols the base32 alphabet leaves out ([`CROCKFORD_SYMBOLS`]) and leading
-/// symbols that would carry the value past 128 bits. A value inside the pattern
-/// that is no rendering of a 128-bit value names no resource of this service and
-/// is refused as INPUT ([`validate_cluster_identifier`] /
-/// [`validate_stream_identifier`]); one that IS such a rendering is an identifier
-/// this account may simply not hold, which the lookup reports as
-/// [`cluster_not_found`] or [`stream_not_found`].
+/// (`crate::service::validation`) — and it is wider than the alphabet, which
+/// leaves out the four letters that read as other symbols or as nothing (`i` and
+/// `l` read as `1`, `o` as `0`, and `u` is left out of the encoding altogether).
+/// A value inside the pattern that uses one of those letters is written in no
+/// alphabet this service's identifiers use, names no resource, and is refused as
+/// INPUT ([`validate_cluster_identifier`] / [`validate_stream_identifier`]) by
+/// every operation that carries an identifier.
+///
+/// The alphabet is all this asks. 26 symbols carry 130 bits while the values this
+/// service mints occupy 128 of them, so the alphabet admits strings above every
+/// value it could have minted; such a string is an identifier no resource of this
+/// account uses, reported as [`cluster_not_found`] or [`stream_not_found`] —
+/// except on the few operations that state the narrower range as a precondition
+/// of their own ([`renders_a_minted_identifier`], reached through
+/// [`validate_minted_cluster_identifier`]).
+pub fn is_resource_identifier(value: &str) -> bool {
+    value.len() == RESOURCE_ID_LEN
+        && value
+            .bytes()
+            .all(|symbol| CROCKFORD_SYMBOLS.contains(&symbol))
+}
+
+/// Whether `value` is inside the value range this service MINTS an identifier
+/// from: 26 symbols of the alphabet carry 130 bits, and a minted identifier
+/// renders the 128 bits [`new_resource_identifier`] builds, so the leading symbol
+/// is what decides it.
+///
+/// Narrower than [`is_resource_identifier`], and asked only where the range is
+/// part of what a caller has to send ([`validate_minted_cluster_identifier`]) or
+/// where this service is reading back something it issued itself
+/// ([`decode_pagination_cursor`]).
 ///
 /// Decided by the ROUND TRIP through the renderer this service mints with, so the
-/// encoding is spelled in exactly one place: a value is an identifier when it
-/// decodes to a 128-bit value that renders back to that same value.
-pub fn is_resource_identifier(value: &str) -> bool {
+/// range is spelled in exactly one place: a value is inside it when it decodes to
+/// a 128-bit value that renders back to that same value.
+fn renders_a_minted_identifier(value: &str) -> bool {
     decode_resource_identifier(value).is_some_and(|bits| crockford_base32(bits) == value)
 }
 
@@ -1832,7 +1859,8 @@ pub fn is_resource_identifier(value: &str) -> bool {
 ///
 /// 26 symbols carry 130 bits, so the two bits above the 128th are dropped here
 /// and the leading symbol of the re-rendering differs from the one that was read:
-/// the round trip in [`is_resource_identifier`] is what rejects such a value.
+/// the round trip in [`renders_a_minted_identifier`] is what sees such a value is
+/// outside the minted range.
 fn decode_resource_identifier(value: &str) -> Option<u128> {
     if value.len() != RESOURCE_ID_LEN {
         return None;
@@ -1903,8 +1931,9 @@ pub fn encode_pagination_cursor(scope: &str, last_identifier: &str) -> String {
 /// the page it ended stopped on.
 ///
 /// `None` for every value this service did not issue for THIS walk — a token that
-/// is not hex, one whose identifier half is not a value [`is_resource_identifier`]
-/// accepts, one whose integrity check does not match the walk and the identifier it
+/// is not hex, one whose identifier half is no identifier this service minted
+/// ([`renders_a_minted_identifier`]: a cursor only ever carries one this service
+/// issued), one whose integrity check does not match the walk and the identifier it
 /// is read with (so a fabricated cursor, or one carrying an identifier no page of
 /// this walk ever stopped on, resolves to no page rather than to a seek after some
 /// arbitrary key), and one issued by a different walk, whose check is over that
@@ -1916,7 +1945,7 @@ pub fn decode_pagination_cursor(scope: &str, token: &str) -> Option<String> {
     }
     let (tag, identifier) = decoded.split_at(CURSOR_TAG_LEN);
     let identifier = String::from_utf8(identifier.to_vec()).ok()?;
-    if !is_resource_identifier(&identifier) {
+    if !renders_a_minted_identifier(&identifier) {
         return None;
     }
     (cursor_tag(scope, &identifier) == tag).then_some(identifier)
@@ -2087,6 +2116,10 @@ pub fn new_resource_identifier() -> String {
 
 /// The 32 symbols Crockford base32 (and therefore ULID) uses, lowercased: the
 /// digits plus the letters with `i`, `l`, `o` and `u` left out.
+///
+/// The alphabet an identifier of this service is both WRITTEN and READ in
+/// ([`crockford_base32`] renders with it, [`is_resource_identifier`] recognises a
+/// value by it), so the two cannot disagree about which letters are symbols.
 const CROCKFORD_SYMBOLS: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
 /// Render the 128 bits of `value` as the 26 Crockford base32 characters a ULID
@@ -2274,11 +2307,13 @@ pub const CLUSTER_IDENTIFIER_MEMBER: &str = "clusterIdentifier";
 pub const STREAM_IDENTIFIER_MEMBER: &str = "streamIdentifier";
 
 /// The form an identifier of this service has to be in, as a refusal of a value
-/// that is not in it states it: the 26-character base32 rendering of a 128-bit
-/// value ([`is_resource_identifier`]).
+/// that is not in it states it: 26 characters of the base32 alphabet
+/// ([`is_resource_identifier`]).
 const IDENTIFIER_FORMAT: &str = "a valid base32-encoded 26-character string";
 
-/// Check a CLUSTER identifier a request carried, before anything is looked up.
+/// Check a CLUSTER identifier a request carried, before anything is looked up:
+/// the identifier has to be written in the alphabet an identifier of this service
+/// is rendered in ([`is_resource_identifier`]).
 ///
 /// `member` is the input member the value arrived in ([`IDENTIFIER_MEMBER`] on the
 /// cluster-addressed operations, [`CLUSTER_IDENTIFIER_MEMBER`] on the
@@ -2287,12 +2322,53 @@ const IDENTIFIER_FORMAT: &str = "a valid base32-encoded 26-character string";
 /// identifier from a cluster that is gone.
 ///
 /// Every operation that carries a cluster identifier calls this, so one value is
-/// refused identically whichever route it arrives on.
+/// refused identically whichever route it arrives on. The three that state the
+/// narrower minted RANGE as a precondition of their own go through
+/// [`validate_minted_cluster_identifier`], which is this check and then the range.
 pub fn validate_cluster_identifier(member: &str, value: &str) -> Result<(), ValidationException> {
     if is_resource_identifier(value) {
         return Ok(());
     }
-    Err(ValidationException {
+    Err(invalid_cluster_identifier(member, value))
+}
+
+/// Check a CLUSTER identifier on an operation that states the minted value RANGE
+/// as a precondition too: the value has to be written in the alphabet AND be one
+/// the minting range covers ([`renders_a_minted_identifier`]), or the call is
+/// refused before the cluster is looked up.
+///
+/// Which operations those are is not something the model says — `ClusterId`
+/// carries one `@pattern` and every cluster-addressed operation models both
+/// `ValidationException` and `ResourceNotFoundException` — so it is read off the
+/// wire behaviour recorded for each one: `GetCluster`, `DeleteCluster` and
+/// `GetClusterPolicy` answer a value above the range with this refusal (recorded
+/// in `dsql-cluster-error-paths` steps task#1 and task#2 and in
+/// `dsql-request-validation-error-surface` step task#5), while the other
+/// cluster-addressed operations resolve every value of the alphabet against the
+/// store and report an absent cluster ([`cluster_not_found`], recorded in
+/// `dsql-missing-cluster-error-surface` steps task#1 to task#5). The precondition
+/// is about the VALUE and not about the request that carried it, so each of those
+/// three applies it to every value it is sent.
+///
+/// The refusal is worded exactly as [`validate_cluster_identifier`] words one, so
+/// a caller cannot tell which half of the form a value failed.
+pub fn validate_minted_cluster_identifier(
+    member: &str,
+    value: &str,
+) -> Result<(), ValidationException> {
+    validate_cluster_identifier(member, value)?;
+    if renders_a_minted_identifier(value) {
+        return Ok(());
+    }
+    Err(invalid_cluster_identifier(member, value))
+}
+
+/// The modelled `ValidationException` a cluster identifier outside the form is
+/// refused with, worded the way Aurora DSQL words that case: the sentence names
+/// the member and quotes the value, and `fieldList` states the form the value had
+/// to be in.
+fn invalid_cluster_identifier(member: &str, value: &str) -> ValidationException {
+    ValidationException {
         message: format!(
             "Invalid input '{member}: {value}'. The cluster identifier format is invalid. \
              Provide a valid cluster identifier and try again."
@@ -2302,7 +2378,7 @@ pub fn validate_cluster_identifier(member: &str, value: &str) -> Result<(), Vali
             name: member.to_string(),
             message: format!("Member must be {IDENTIFIER_FORMAT}"),
         }]),
-    })
+    }
 }
 
 /// Check a STREAM identifier a request carried, before anything is looked up, on

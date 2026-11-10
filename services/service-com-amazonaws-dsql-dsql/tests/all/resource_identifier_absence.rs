@@ -3,30 +3,32 @@
 //! What an identifier-addressed operation answers for an identifier the account
 //! does not hold, and what it answers for a value that is no identifier at all.
 //!
-//! RULE under test: an identifier of this service is the 26-character base32
-//! rendering of a 128-bit value, the form every cluster and stream identifier is
-//! issued in, and every value of that form is resolved AGAINST THE STORE — an
-//! identifier the account does not hold is the modelled
+//! RULE under test: an identifier of this service is 26 characters of the base32
+//! alphabet every cluster and stream identifier is rendered with, and every value
+//! inside the range this service mints from is resolved AGAINST THE STORE on every
+//! route — an identifier the account does not hold is the modelled
 //! `ResourceNotFoundException`, HTTP 404 with the wire code
 //! `ResourceNotFoundException` and all three of its `@required` members filled:
 //! `message` naming the ARN the call addressed, `resourceId` the identifier the
 //! request carried, and `resourceType` the type of the resource the lookup stopped
 //! at. Nothing about which value the store holds may be refused, because a value
 //! of that form is well formed whether or not this service ever issued that
-//! particular one. The two complements are pinned beside this suite, over this
-//! suite's route table: a value outside `ClusterId`'s and `StreamId`'s
-//! `^[a-z0-9]{26}$` (`smithy_query(query="shape", shape="ClusterId,StreamId")`) is
-//! refused at the boundary (`tests/all/malformed_resource_identifier.rs`), and one
-//! inside that pattern which the encoding does not render is refused as input
-//! (`tests/all/identifier_format_refusal.rs`).
+//! particular one. The complements are pinned beside this suite, over this suite's
+//! route table: a value outside `ClusterId`'s and `StreamId`'s `^[a-z0-9]{26}$`
+//! (`smithy_query(query="shape", shape="ClusterId,StreamId")`) is refused at the
+//! boundary (`tests/all/malformed_resource_identifier.rs`), one inside that pattern
+//! using a letter the alphabet leaves out is refused as input on every route
+//! (`tests/all/identifier_format_refusal.rs`), and one written in the alphabet but
+//! ABOVE the minted range is answered per operation — refused by the three that
+//! state that range as a precondition, an absent resource on the rest
+//! (`tests/all/identifier_value_range.rs`).
 //!
 //! The identifier table spans what the form generalises over — which symbols the
-//! value uses and where, from the smallest value the encoding renders to the
-//! largest, including the renderings this service's own minting scheme would never
-//! have produced — and the route table spans every operation that carries such an
-//! identifier in its URI, so the rule is asserted on the member each one binds
-//! rather than on one reader, and on the nested stream route as well as the
-//! cluster ones.
+//! value uses and where, across the range this service's own minting scheme draws
+//! from, including the renderings it would never have produced — and the route
+//! table spans every operation that carries such an identifier in its URI, so the
+//! rule is asserted on the member each one binds rather than on one reader, and on
+//! the nested stream route as well as the cluster ones.
 //!
 //! Every case drives the real request path through the `Dsql` harness in
 //! `tests/all/harness.rs`, this crate's one test client.
@@ -45,9 +47,12 @@ pub const IDENTIFIER_LEN: usize = 26;
 /// `CROCKFORD_SYMBOLS`).
 pub const IDENTIFIER_SYMBOLS: &str = "0123456789abcdefghjkmnpqrstvwxyz";
 
-/// The largest leading symbol a rendering of a 128-bit value can carry:
-/// [`IDENTIFIER_LEN`] symbols carry 130 bits, so the leading one spells only the
-/// value's top 3 bits and the eight symbols up to this are the whole range.
+/// The largest leading symbol an identifier this service MINTS can carry:
+/// [`IDENTIFIER_LEN`] symbols carry 130 bits while a minted identifier renders
+/// 128, so the leading one spells only the value's top 3 bits and the eight
+/// symbols up to this are the range the mint draws from. It is not an input
+/// requirement — `tests/all/identifier_value_range.rs` pins what a value above it
+/// answers.
 pub const LEADING_SYMBOL_MAX: char = '7';
 
 /// The resource types a refusal of this service names, as the service spells them
@@ -70,7 +75,7 @@ pub enum Class {
 
 impl Class {
     /// The `resourceType` a refusal of this class reports.
-    fn resource_type(self) -> &'static str {
+    pub fn resource_type(self) -> &'static str {
         match self {
             Class::Cluster => TYPE_CLUSTER,
             Class::Stream => TYPE_STREAM,
@@ -79,7 +84,7 @@ impl Class {
 
     /// The ARN a refusal of `identifier` names, in `region` and under `cluster`
     /// for a stream.
-    fn arn(self, region: &str, cluster: &str, identifier: &str) -> String {
+    pub fn arn(self, region: &str, cluster: &str, identifier: &str) -> String {
         match self {
             Class::Cluster => expected_arn(region, identifier),
             Class::Stream => expected_stream_arn(region, cluster, identifier),
@@ -87,13 +92,33 @@ impl Class {
     }
 }
 
+/// What a route answers for an identifier written in the identifier alphabet
+/// whose symbols spell a value ABOVE the range this service mints from.
+///
+/// The model does not say: `ClusterId` and `StreamId` carry one `@pattern` each,
+/// and every one of these operations models both `ValidationException` and
+/// `ResourceNotFoundException` (`smithy_query(query="digest")`). It is the wire
+/// behaviour of each operation that says, and the two answers are pinned per route
+/// in `tests/all/identifier_value_range.rs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AboveTheMintedRange {
+    /// The operation states the minted range as a precondition of its own: such a
+    /// value is refused as input, 400 `ValidationException`, before any lookup.
+    Refused,
+    /// The operation states no range precondition: such a value is an identifier
+    /// it resolves against the store, so an account that does not hold it answers
+    /// 404 `ResourceNotFoundException`.
+    Absent,
+}
+
 /// One route that carries a resource identifier: how to issue it with the
-/// identifier under test, which member that identifier arrives in, and which
-/// resource it addresses.
+/// identifier under test, which member that identifier arrives in, which
+/// resource it addresses, and what it answers for a value above the minted range.
 pub struct Route {
     pub operation: &'static str,
     pub member: &'static str,
     pub class: Class,
+    pub above_the_minted_range: AboveTheMintedRange,
     /// The request, given the identifier under test and a live cluster, so a row
     /// that puts the identifier under test in one label can fill the other with a
     /// cluster that is really held.
@@ -146,18 +171,21 @@ pub fn routes() -> Vec<Route> {
             operation: "GetCluster",
             member: "identifier",
             class: Class::Cluster,
+            above_the_minted_range: AboveTheMintedRange::Refused,
             request: |id, _| ("GET", format!("/cluster/{id}"), None),
         },
         Route {
             operation: "DeleteCluster",
             member: "identifier",
             class: Class::Cluster,
+            above_the_minted_range: AboveTheMintedRange::Refused,
             request: |id, _| ("DELETE", format!("/cluster/{id}"), None),
         },
         Route {
             operation: "UpdateCluster",
             member: "identifier",
             class: Class::Cluster,
+            above_the_minted_range: AboveTheMintedRange::Absent,
             request: |id, _| {
                 (
                     "POST",
@@ -170,12 +198,14 @@ pub fn routes() -> Vec<Route> {
             operation: "GetClusterPolicy",
             member: "identifier",
             class: Class::Cluster,
+            above_the_minted_range: AboveTheMintedRange::Refused,
             request: |id, _| ("GET", format!("/cluster/{id}/policy"), None),
         },
         Route {
             operation: "PutClusterPolicy",
             member: "identifier",
             class: Class::Cluster,
+            above_the_minted_range: AboveTheMintedRange::Absent,
             request: |id, _| {
                 (
                     "POST",
@@ -188,6 +218,7 @@ pub fn routes() -> Vec<Route> {
             operation: "DeleteClusterPolicy",
             member: "identifier",
             class: Class::Cluster,
+            above_the_minted_range: AboveTheMintedRange::Absent,
             request: |id, _| {
                 (
                     "DELETE",
@@ -200,6 +231,7 @@ pub fn routes() -> Vec<Route> {
             operation: "GetVpcEndpointServiceName",
             member: "identifier",
             class: Class::Cluster,
+            above_the_minted_range: AboveTheMintedRange::Absent,
             request: |id, _| {
                 (
                     "GET",
@@ -212,30 +244,35 @@ pub fn routes() -> Vec<Route> {
             operation: "CreateStream",
             member: "clusterIdentifier",
             class: Class::Cluster,
+            above_the_minted_range: AboveTheMintedRange::Absent,
             request: |id, _| ("POST", format!("/stream/{id}"), Some(stream_request())),
         },
         Route {
             operation: "ListStreams",
             member: "clusterIdentifier",
             class: Class::Cluster,
+            above_the_minted_range: AboveTheMintedRange::Absent,
             request: |id, _| ("GET", format!("/stream/{id}"), None),
         },
         Route {
             operation: "GetStream on the cluster label",
             member: "clusterIdentifier",
             class: Class::Cluster,
+            above_the_minted_range: AboveTheMintedRange::Absent,
             request: |id, _| ("GET", format!("/stream/{id}/{}", absent_identifier()), None),
         },
         Route {
             operation: "GetStream on the stream label",
             member: "streamIdentifier",
             class: Class::Stream,
+            above_the_minted_range: AboveTheMintedRange::Absent,
             request: |id, live| ("GET", format!("/stream/{live}/{id}"), None),
         },
         Route {
             operation: "DeleteStream on the cluster label",
             member: "clusterIdentifier",
             class: Class::Cluster,
+            above_the_minted_range: AboveTheMintedRange::Absent,
             request: |id, _| {
                 (
                     "DELETE",
@@ -248,6 +285,7 @@ pub fn routes() -> Vec<Route> {
             operation: "DeleteStream on the stream label",
             member: "streamIdentifier",
             class: Class::Stream,
+            above_the_minted_range: AboveTheMintedRange::Absent,
             request: |id, live| ("DELETE", format!("/stream/{live}/{id}"), None),
         },
     ]
@@ -259,12 +297,13 @@ pub struct IdCase {
     pub value: String,
 }
 
-/// Identifiers of this service's own FORM that no call ever created: every row is
-/// 26 symbols of the identifier alphabet whose leading symbol keeps the value
-/// inside 128 bits, so every row is a value the encoding renders, and the rows
-/// differ in which symbols they use and where — from the smallest value the
-/// encoding renders to the largest, including the renderings this service's own
-/// minting scheme would never have produced.
+/// Identifiers of this service's own MINTED form that no call ever created: every
+/// row is 26 symbols of the identifier alphabet whose leading symbol keeps the
+/// value inside the range the mint draws from, and the rows differ in which
+/// symbols they use and where — from the smallest value the mint renders to the
+/// largest, including the renderings this service's own minting scheme would never
+/// have produced. Values ABOVE that range are identifiers too, pinned in
+/// `tests/all/identifier_value_range.rs`.
 fn well_formed_absent_identifiers() -> Vec<IdCase> {
     let mut cases = vec![
         IdCase {
@@ -289,8 +328,8 @@ fn well_formed_absent_identifiers() -> Vec<IdCase> {
         },
     ];
 
-    // The leading symbol, across the range the 128-bit ceiling admits: a value
-    // this service would not have minted is an identifier all the same.
+    // The leading symbol, across the range the mint draws from: a value this
+    // service would not have minted is an identifier all the same.
     for leading in ['4', '5', '6'] {
         cases.push(IdCase {
             name: format!("a leading {leading:?}"),
@@ -337,13 +376,60 @@ fn well_formed_absent_identifiers() -> Vec<IdCase> {
                 .chars()
                 .next()
                 .is_some_and(|leading| leading <= LEADING_SYMBOL_MAX),
-            "case {:?}: every row's leading symbol must keep the value inside 128 bits, \
-             got {:?}",
+            "case {:?}: every row's leading symbol must keep the value inside the \
+             minted range, got {:?}",
             case.name,
             case.value
         );
     }
     cases
+}
+
+/// Assert that `route` reports `case` as an ABSENT resource: the modelled 404
+/// with every `@required` member of `ResourceNotFoundException` taken from the
+/// request and the ARN the call addressed.
+///
+/// The one place that body is spelled, so every suite that asserts an absent
+/// resource over this route table — this one for the minted range,
+/// `tests/all/identifier_value_range.rs` above it — asserts the same thing.
+pub async fn reported_absent(dsql: &Dsql, route: &Route, live: &str, case: &IdCase) {
+    let (method, path, body) = (route.request)(&case.value, live);
+    let answer = dsql.call(method, &path, body).await;
+    let name = format!("{} on {}", case.name, route.operation);
+
+    assert_eq!(
+        answer.status, 404,
+        "case {name}: an identifier of the service's form that names nothing must \
+         answer 404, got {} {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error.as_deref(),
+        Some("ResourceNotFoundException"),
+        "case {name}: the wire code must be ResourceNotFoundException, got {:?}",
+        answer.error
+    );
+    let arn = route.class.arn(dsql.region(), live, &case.value);
+    assert_eq!(
+        answer.message(),
+        format!("The resource with ARN {arn} doesn't exist. Verify the ARN and try again."),
+        "case {name}: expected the sentence naming {arn:?}, got {:?}",
+        answer.message()
+    );
+    assert_eq!(
+        answer.str("resourceId"),
+        case.value,
+        "case {name}: resourceId is @required and is the identifier the request \
+         carried, got {:?}",
+        answer.body
+    );
+    assert_eq!(
+        answer.str("resourceType"),
+        route.class.resource_type(),
+        "case {name}: resourceType is @required and is the addressed resource's \
+         own type, got {:?}",
+        answer.body
+    );
 }
 
 /// RULE: every value of the identifier form is resolved against the store, so an
@@ -361,43 +447,7 @@ async fn a_well_formed_identifier_the_account_does_not_hold_is_not_found() {
     let routes = routes();
     for case in well_formed_absent_identifiers() {
         for route in &routes {
-            let (method, path, body) = (route.request)(&case.value, &live);
-            let answer = dsql.call(method, &path, body).await;
-            let name = format!("{} on {}", case.name, route.operation);
-
-            assert_eq!(
-                answer.status, 404,
-                "case {name}: an identifier of this service's own form that names \
-                 nothing must answer 404, got {} {:?}",
-                answer.status, answer.body
-            );
-            assert_eq!(
-                answer.error.as_deref(),
-                Some("ResourceNotFoundException"),
-                "case {name}: the wire code must be ResourceNotFoundException, got {:?}",
-                answer.error
-            );
-            let arn = route.class.arn(dsql.region(), &live, &case.value);
-            assert_eq!(
-                answer.message(),
-                format!("The resource with ARN {arn} doesn't exist. Verify the ARN and try again."),
-                "case {name}: expected the sentence naming {arn:?}, got {:?}",
-                answer.message()
-            );
-            assert_eq!(
-                answer.str("resourceId"),
-                case.value,
-                "case {name}: resourceId is @required and is the identifier the request \
-                 carried, got {:?}",
-                answer.body
-            );
-            assert_eq!(
-                answer.str("resourceType"),
-                route.class.resource_type(),
-                "case {name}: resourceType is @required and is the addressed resource's \
-                 own type, got {:?}",
-                answer.body
-            );
+            reported_absent(&dsql, route, &live, &case).await;
         }
     }
 

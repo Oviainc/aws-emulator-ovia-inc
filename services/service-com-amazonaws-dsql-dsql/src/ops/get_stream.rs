@@ -159,10 +159,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // Each identifier's outer FORM is the `^[a-z0-9]{26}$` `ClusterId` and
         // `StreamId` declare, already decided by the boundary constraint walk, but
-        // that pattern is wider than the encoding an identifier of this service is
-        // written in: a value that is no base32 rendering of a 128-bit value names
-        // no resource and is refused as input BEFORE any lookup, each member with
-        // the sentence its own kind of identifier is refused with.
+        // that pattern is wider than the base32 alphabet an identifier of this
+        // service is written in: a value using a letter that alphabet leaves out
+        // names no resource and is refused as input BEFORE any lookup, each member
+        // with the sentence its own kind of identifier is refused with.
         if let Err(invalid) = crate::state::validate_cluster_identifier(
             crate::state::CLUSTER_IDENTIFIER_MEMBER,
             &input.cluster_identifier,

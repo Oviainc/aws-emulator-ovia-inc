@@ -45,6 +45,8 @@ mod fixed_refusal_sentences;
 mod harness;
 #[path = "all/identifier_format_refusal.rs"]
 mod identifier_format_refusal;
+#[path = "all/identifier_value_range.rs"]
+mod identifier_value_range;
 #[path = "all/idempotent_replay_result.rs"]
 mod idempotent_replay_result;
 #[path = "all/incomplete_replay_record.rs"]

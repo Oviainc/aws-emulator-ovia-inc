@@ -65,10 +65,9 @@ fn kinesis_target(region: &str) -> Value {
 }
 
 /// Two never-created stream identifiers, both spelled as a stream identifier is
-/// spelled — the 26-character base32 rendering of a 128-bit value, which
-/// `StreamArn`'s pattern admits (source: `smithy_query(query="shape",
-/// shape="StreamArn")` — the stream segment is `[a-z0-9]{26}`) — so no assertion
-/// depends on one particular value.
+/// spelled — 26 characters of the base32 alphabet, which `StreamArn`'s pattern
+/// admits (source: `smithy_query(query="shape", shape="StreamArn")` — the stream
+/// segment is `[a-z0-9]{26}`) — so no assertion depends on one particular value.
 fn absent_stream_identifiers() -> [String; 2] {
     [
         absent_identifier(),

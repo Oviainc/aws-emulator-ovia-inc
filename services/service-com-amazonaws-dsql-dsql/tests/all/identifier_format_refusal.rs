@@ -1,34 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! What an identifier-addressed operation answers for a value that is inside
-//! `ClusterId`'s and `StreamId`'s pattern yet is no identifier this service could
-//! ever have issued.
+//! `ClusterId`'s and `StreamId`'s pattern yet is written in no alphabet an
+//! identifier of this service uses.
 //!
-//! RULE under test: an identifier of this service is the 26-character
-//! base32 rendering of a 128-bit value — the alphabet is the digits plus the
-//! letters with `i`, `l`, `o` and `u` left out, and 26 symbols carry 130 bits, so
-//! the leading symbol can only be one of the eight that keep the value inside 128
-//! bits. A value that `^[a-z0-9]{26}$` admits but that encoding does not render
-//! names no resource, so it is refused as INPUT before any state is read: HTTP 400
-//! with the service's own modelled `ValidationException`, its `@required` `reason`
-//! filled and its `fieldList` naming the member the value arrived in — never 404
-//! with a report that some resource is absent, which is what a client reads as a
-//! resource that is gone (`tests/all/resource_identifier_absence.rs` pins that
-//! other half, for the values the encoding DOES render).
+//! RULE under test: an identifier of this service is 26 characters of the base32
+//! alphabet every cluster and stream identifier is rendered with — the digits plus
+//! the letters with `i`, `l`, `o` and `u` left out, because those letters read as
+//! other symbols or as nothing at all. A value that `^[a-z0-9]{26}$` admits but
+//! that alphabet does not spell names no resource, so it is refused as INPUT
+//! before any state is read: HTTP 400 with the service's own modelled
+//! `ValidationException`, its `@required` `reason` filled and its `fieldList`
+//! naming the member the value arrived in — never 404 with a report that some
+//! resource is absent, which is what a client reads as a resource that is gone.
 //!
 //! The sentence is per KIND of identifier: a cluster identifier's refusal quotes
 //! the member and the value it rejected and says the cluster identifier format is
 //! invalid, while a stream identifier's names the member and the form it had to be
 //! in without echoing the value.
 //!
-//! The value table spans the two ways a 26-symbol lowercase-alphanumeric value can
-//! fail to be such a rendering — a symbol the alphabet leaves out, at the front, in
-//! the middle and at the end, and a leading symbol past the 128-bit ceiling, over
-//! every symbol past it — and the second test walks the whole leading-symbol
-//! alphabet so both sides of that bound are asserted. The alphabet and the ceiling
-//! are the ones `resource_identifier_absence` spells, and every row runs over the
-//! ONE route table that module spells, so every operation that carries an
-//! identifier is asserted on the member it binds.
+//! The value table spans where such a letter can sit — at the front, in the middle
+//! and at the end — over every letter the alphabet leaves out, and every row runs
+//! over the ONE route table `resource_identifier_absence` spells, so every
+//! operation that carries an identifier is asserted on the member it binds. The
+//! complements are pinned beside this suite: a value outside the modelled pattern
+//! (`tests/all/malformed_resource_identifier.rs`), a value written in the alphabet
+//! inside the range this service mints from, which every route resolves against
+//! the store (`tests/all/resource_identifier_absence.rs`), and one written in the
+//! alphabet ABOVE that range, which is answered per operation
+//! (`tests/all/identifier_value_range.rs`).
 //!
 //! Every case drives the real request path through the `Dsql` harness in
 //! `tests/all/harness.rs`, this crate's one test client.
@@ -37,16 +37,17 @@ use serde_json::Value;
 
 use crate::harness::Dsql;
 use crate::resource_identifier_absence::{
-    routes, Class, IdCase, Route, IDENTIFIER_LEN, IDENTIFIER_SYMBOLS, LEADING_SYMBOL_MAX,
+    routes, AboveTheMintedRange, Class, IdCase, Route, IDENTIFIER_LEN, IDENTIFIER_SYMBOLS,
+    LEADING_SYMBOL_MAX,
 };
 
-/// The symbols `[a-z0-9]` carries that [`IDENTIFIER_SYMBOLS`] leaves out.
+/// The letters `[a-z0-9]` carries that [`IDENTIFIER_SYMBOLS`] leaves out.
 const OUTSIDE_THE_ALPHABET: [char; 4] = ['i', 'l', 'o', 'u'];
 
-/// A value of the service's own form, which every row below breaks in exactly one
-/// way: [`IDENTIFIER_LEN`] symbols of [`IDENTIFIER_SYMBOLS`] whose leading symbol
-/// is inside the ceiling [`LEADING_SYMBOL_MAX`] fixes.
-fn rendered_identifier() -> String {
+/// A value written in the alphabet, inside the minted range, which every row below
+/// breaks in exactly one way: [`IDENTIFIER_LEN`] symbols of [`IDENTIFIER_SYMBOLS`]
+/// whose leading symbol keeps the value inside [`LEADING_SYMBOL_MAX`].
+pub fn value_in_the_alphabet() -> String {
     let tail: String = IDENTIFIER_SYMBOLS
         .chars()
         .skip(1)
@@ -55,18 +56,10 @@ fn rendered_identifier() -> String {
     format!("0{tail}")
 }
 
-/// Whether `leading` is a leading symbol the 128-bit ceiling admits: 26 symbols
-/// carry 130 bits, so the leading one spells only the value's top 3 bits and the
-/// symbols up to [`LEADING_SYMBOL_MAX`] are the whole range.
-fn inside_the_ceiling(leading: char) -> bool {
-    leading <= LEADING_SYMBOL_MAX
-}
-
-/// Values INSIDE `^[a-z0-9]{26}$` that the encoding does not render: a symbol the
-/// alphabet leaves out, each at the front, in the middle and at the end, and every
-/// leading symbol past the 128-bit ceiling.
-fn values_the_encoding_does_not_render() -> Vec<IdCase> {
-    let base = rendered_identifier();
+/// Values INSIDE `^[a-z0-9]{26}$` that the alphabet does not spell: each letter it
+/// leaves out, at the front, in the middle and at the end.
+fn values_outside_the_alphabet() -> Vec<IdCase> {
+    let base = value_in_the_alphabet();
     let mut cases = Vec::new();
 
     for symbol in OUTSIDE_THE_ALPHABET {
@@ -84,17 +77,12 @@ fn values_the_encoding_does_not_render() -> Vec<IdCase> {
         }
     }
 
-    for leading in IDENTIFIER_SYMBOLS
-        .chars()
-        .filter(|leading| !inside_the_ceiling(*leading))
-    {
-        let mut value: Vec<char> = base.chars().collect();
-        value[0] = leading;
-        cases.push(IdCase {
-            name: format!("a leading {leading:?}, past the 128-bit ceiling"),
-            value: value.into_iter().collect(),
-        });
-    }
+    // The whole lowercase alphabet in order, which carries every letter the
+    // identifier alphabet leaves out at once.
+    cases.push(IdCase {
+        name: "the 26 lowercase letters in order".to_string(),
+        value: ('a'..='z').collect(),
+    });
 
     for case in &cases {
         assert_eq!(
@@ -119,7 +107,7 @@ fn values_the_encoding_does_not_render() -> Vec<IdCase> {
 /// The sentence a refusal of `value` in `route`'s member carries: the cluster
 /// identifier's, which quotes the member and the value, or the stream
 /// identifier's, which names the member and the form without echoing the value.
-fn expected_sentence(route: &Route, value: &str) -> String {
+pub fn expected_sentence(route: &Route, value: &str) -> String {
     match route.class {
         Class::Cluster => format!(
             "Invalid input '{}: {value}'. The cluster identifier format is invalid. \
@@ -138,14 +126,14 @@ fn expected_sentence(route: &Route, value: &str) -> String {
 /// Assert that `route` refuses `value` as input, with the body the modelled
 /// `ValidationException` owes and the sentence its kind of identifier is refused
 /// with.
-async fn refused_as_input(dsql: &Dsql, route: &Route, live: &str, case: &IdCase) {
+pub async fn refused_as_input(dsql: &Dsql, route: &Route, live: &str, case: &IdCase) {
     let (method, path, body) = (route.request)(&case.value, live);
     let answer = dsql.call(method, &path, body).await;
     let name = format!("{} on {}", case.name, route.operation);
 
     assert_eq!(
         answer.status, 400,
-        "case {name}: a value the encoding does not render must answer 400, got {} {:?}",
+        "case {name}: a value outside the form this route states must answer 400, got {} {:?}",
         answer.status, answer.body
     );
     assert_eq!(
@@ -186,7 +174,7 @@ async fn refused_as_input(dsql: &Dsql, route: &Route, live: &str, case: &IdCase)
 /// Assert that nothing any refused call addressed was created, removed or changed:
 /// `live` is still the only cluster, still readable, still without a policy and
 /// still holding no stream.
-async fn the_store_is_untouched(dsql: &Dsql, live: &str) {
+pub async fn the_store_is_untouched(dsql: &Dsql, live: &str) {
     let read = dsql.get(live).await;
     assert_eq!(
         read.status, 200,
@@ -212,19 +200,19 @@ async fn the_store_is_untouched(dsql: &Dsql, live: &str) {
     );
 }
 
-/// RULE: a value inside the modelled pattern that the identifier encoding does not
-/// render is refused as input — 400 `ValidationException`, with the modelled body
+/// RULE: a value inside the modelled pattern that the identifier alphabet does not
+/// spell is refused as input — 400 `ValidationException`, with the modelled body
 /// and the sentence its kind of identifier is refused with — on every route that
 /// carries a resource identifier, and nothing is read or written.
 #[tokio::test]
-async fn a_value_the_identifier_encoding_does_not_render_is_refused_as_input() {
+async fn a_value_outside_the_identifier_alphabet_is_refused_as_input() {
     let dsql = Dsql::new();
     // One live cluster, so a row that puts the value under test in the stream
     // label is refused for that label rather than for a missing cluster.
     let live = dsql.create_settled().await;
 
     let routes = routes();
-    for case in values_the_encoding_does_not_render() {
+    for case in values_outside_the_alphabet() {
         for route in &routes {
             refused_as_input(&dsql, route, &live, &case).await;
         }
@@ -233,35 +221,42 @@ async fn a_value_the_identifier_encoding_does_not_render_is_refused_as_input() {
     the_store_is_untouched(&dsql, &live).await;
 }
 
-/// RULE at the bound: the leading symbol decides which refusal a 26-symbol
-/// lowercase-alphanumeric value gets, so the whole alphabet splits in two — the
-/// eight symbols the 128-bit ceiling admits make the value an identifier, which an
-/// account that does not hold it reports as an absent resource (404), and every
-/// symbol past the bound makes it no identifier at all, refused as input (400).
+/// RULE at the bound: the ALPHABET decides symbol by symbol and on every route, so
+/// each letter the alphabet leaves out is refused in the leading position wherever
+/// it is sent, while a symbol the alphabet carries leaves the value an identifier —
+/// one every route resolves against the store while it stays inside the minted
+/// range, and one answered per operation above that range, which
+/// `tests/all/identifier_value_range.rs` pins.
 #[tokio::test]
-async fn the_leading_symbol_decides_absence_from_a_refused_input() {
+async fn the_alphabet_decides_a_refused_input_symbol_by_symbol() {
     let dsql = Dsql::new();
     let live = dsql.create_settled().await;
 
     let routes = routes();
-    let base = rendered_identifier();
-    for leading in IDENTIFIER_SYMBOLS.chars() {
+    let base = value_in_the_alphabet();
+    for leading in ('0'..='9').chain('a'..='z') {
         let mut value: Vec<char> = base.chars().collect();
         value[0] = leading;
         let case = IdCase {
             name: format!("a leading {leading:?}"),
             value: value.into_iter().collect(),
         };
+        let inside_the_alphabet = IDENTIFIER_SYMBOLS.contains(leading);
+        let inside_the_minted_range = inside_the_alphabet && leading <= LEADING_SYMBOL_MAX;
 
         for route in &routes {
-            if inside_the_ceiling(leading) {
+            let resolved = inside_the_alphabet
+                && (inside_the_minted_range
+                    || route.above_the_minted_range == AboveTheMintedRange::Absent);
+            if resolved {
                 let (method, path, body) = (route.request)(&case.value, &live);
                 let answer = dsql.call(method, &path, body).await;
                 assert_eq!(
                     answer.status,
                     404,
-                    "case {} on {}: a leading symbol inside the ceiling is an identifier, \
-                     so an account that does not hold it must answer 404, got {} {:?}",
+                    "case {} on {}: a leading symbol of the alphabet leaves the value an \
+                     identifier, so an account that does not hold it must answer 404, \
+                     got {} {:?}",
                     case.name,
                     route.operation,
                     answer.status,

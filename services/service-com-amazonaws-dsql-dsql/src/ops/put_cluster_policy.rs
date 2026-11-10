@@ -162,8 +162,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The identifier's outer FORM is `ClusterId`'s `^[a-z0-9]{26}$`, already
         // decided by the boundary constraint walk, but that pattern is wider than
-        // the encoding an identifier of this service is written in: a value that
-        // is no base32 rendering of a 128-bit value names no cluster and is
+        // the base32 alphabet an identifier of this service is written in: a
+        // value using a letter that alphabet leaves out names no cluster and is
         // refused as input ahead of the lookup, the document check and the
         // idempotency ledger alike.
         if let Err(invalid) = crate::state::validate_cluster_identifier(
