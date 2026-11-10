@@ -14,6 +14,9 @@
 #[path = "all/account_configuration.rs"]
 mod account_configuration;
 
+#[path = "all/account_configuration_key_fidelity.rs"]
+mod account_configuration_key_fidelity;
+
 #[path = "all/account_configuration_reads.rs"]
 mod account_configuration_reads;
 

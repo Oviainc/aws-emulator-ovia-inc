@@ -6,10 +6,10 @@
 //!
 //! Rules asserted here:
 //!
-//! * The account always HAS a configuration, and always has a key: a describe
-//!   before any update answers 200 reporting the key MediaLive creates and
-//!   manages for the account, never a 404 and never an absent `kmsKeyId`, and a
-//!   describe changes nothing a later caller would have seen.
+//! * The account always HAS a configuration, but not always a key: a describe
+//!   before any update answers 200 with a configuration carrying no `kmsKeyId`
+//!   at all — never a 404, and never a key of the service's own invention — and
+//!   a describe changes nothing a later caller would have seen.
 //! * An update applies the parameters the request carries and leaves the ones it
 //!   omits as they stood ("List of account configuration parameters to update",
 //!   `smithy_query(query="shape", shape="UpdateAccountConfigurationRequest")`),
@@ -21,7 +21,8 @@
 //!   member="KmsKeyId")`): a KMS key ARN is stored and reported back, a BLANK
 //!   value clears the stored key, and a non-blank value that is not a KMS key
 //!   ARN is refused with the operation's modelled `BadRequestException` (400)
-//!   while the stored configuration stays as it was.
+//!   while the stored configuration stays as it was. What a read reports is the
+//!   stored string byte for byte, with no member where nothing is stored.
 //! * MediaLive is a regional service, so the configuration a regional endpoint
 //!   reports is its own region's, and the per-region store is bounded: a region
 //!   beyond the bound is answered with the modelled `TooManyRequestsException`
@@ -34,16 +35,16 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{call_in_region, error_code, error_message, medialive, ACCOUNT, DEFAULT_REGION};
+use crate::wire::{call_in_region, error_code, error_message, medialive, DEFAULT_REGION};
 
-/// The configuration a region with no CUSTOMER-managed key reports: the key
-/// MediaLive creates and manages for the account, which `KmsKeyId` documents as
-/// what a blank value asks for ("leave blank to use the key that MediaLive
-/// creates and manages for you"). An AWS-managed key is addressed by its
-/// `alias/aws/<service>` alias in the account and region that holds it, so the
-/// ARN is built from the region the request was signed for.
-fn managed_key(region: &str) -> Value {
-    json!({ "kmsKeyId": format!("arn:aws:kms:{region}:{ACCOUNT}:alias/aws/medialive") })
+/// The configuration a region with no customer-managed key reports: one carrying
+/// no `kmsKeyId` at all. `KmsKeyId` holds the key the CALLER created ("Specify
+/// the ARN of a KMS key that you have created. Or leave blank to use the key
+/// that MediaLive creates and manages for you"), so a blank member is the state
+/// of an account that pinned no key of its own, and the service reports no key
+/// in its place.
+fn unconfigured() -> Value {
+    json!({})
 }
 
 /// The URI both operations are bound to: `smithy_query(query="operation",
@@ -134,20 +135,20 @@ async fn reported(router: &MultiServiceRouter, case: &str, region: &str) -> Valu
 }
 
 /// Rule: the account's configuration exists whether or not anything has been
-/// configured, so a describe on a fresh emulator answers 200 with the key
-/// MediaLive creates and manages for the account rather than with an absent
-/// member — an account that configured no key of its own still encrypts with a
-/// key, and which key that is is what the member reports — and repeating the
-/// read answers exactly the same thing (a read changes nothing).
+/// configured, so a describe on a fresh emulator answers 200 — not a 404 — with
+/// a configuration that carries no `kmsKeyId`: the member names the key the
+/// caller created, so nothing configured is reported as nothing rather than as a
+/// key the account never set. Repeating the read answers exactly the same thing
+/// (a read changes nothing).
 #[tokio::test]
-async fn a_describe_before_any_update_reports_the_service_managed_key() {
+async fn a_describe_before_any_update_reports_no_kms_key() {
     let router = medialive();
 
     let first = reported(&router, "fresh account", DEFAULT_REGION).await;
     assert_eq!(
         first,
-        managed_key(DEFAULT_REGION),
-        "case {case:?}: expected the MediaLive-managed key, got {first}",
+        unconfigured(),
+        "case {case:?}: expected no kmsKeyId at all, got {first}",
         case = "fresh account"
     );
 
@@ -194,7 +195,7 @@ async fn every_kms_key_arn_form_round_trips_through_the_store() {
 
 /// Rule: a BLANK `KmsKeyId` is the documented way to ask for "the key that
 /// MediaLive creates and manages for you", so it CLEARS a stored
-/// customer-managed key: the account then reports that managed key again, and it
+/// customer-managed key: the account then reports no `kmsKeyId` at all, and it
 /// stays cleared on the next read.
 ///
 /// The rows are the key forms the clear is applied to.
@@ -220,14 +221,14 @@ async fn a_blank_kms_key_clears_the_stored_key() {
         .await;
         assert_eq!(
             cleared,
-            managed_key(DEFAULT_REGION),
+            unconfigured(),
             "case {case:?}: expected a blank kmsKeyId to clear the customer key, got {cleared}"
         );
 
         let described = reported(&router, case, DEFAULT_REGION).await;
         assert_eq!(
             described,
-            managed_key(DEFAULT_REGION),
+            unconfigured(),
             "case {case:?}: expected the cleared configuration to be what is stored, got {described}"
         );
     }
@@ -340,7 +341,8 @@ async fn a_kms_key_that_is_not_a_key_arn_is_refused_and_stores_nothing() {
 /// [`MAX_ACCOUNT_CONFIGURATION_REGIONS`] of them and answers a region beyond
 /// that with the operation's own modelled `TooManyRequestsException` (429),
 /// storing nothing. A region the store already holds a configuration for is
-/// never refused, and neither is an update that sets no parameter at all.
+/// never refused, and neither is an update that sets no parameter at all — which
+/// then reports no key, there being nothing configured for that region.
 ///
 /// The rows are the three kinds of request a full store can receive: one for a
 /// region it already holds, one that sets a parameter for a new region, and one
@@ -403,7 +405,7 @@ async fn the_per_region_store_is_bounded() {
     let described = reported(&router, case, "emulator-region-overflow").await;
     assert_eq!(
         described,
-        managed_key("emulator-region-overflow"),
+        unconfigured(),
         "case {case:?}: expected the refused region to hold no customer key, got {described}"
     );
 
@@ -427,8 +429,8 @@ async fn the_per_region_store_is_bounded() {
         let quiet = configuration(case, "UpdateAccountConfiguration", status, &response);
         assert_eq!(
             quiet,
-            managed_key(region),
-            "case {case:?}: expected the MediaLive-managed key, got {quiet}"
+            unconfigured(),
+            "case {case:?}: expected no kmsKeyId at all, got {quiet}"
         );
     }
 }
@@ -436,7 +438,7 @@ async fn the_per_region_store_is_bounded() {
 /// Rule: MediaLive is a regional service, so the account configuration a
 /// regional endpoint reports is the one configured through THAT endpoint: a key
 /// set in one region is not reported by another, and a region nothing has
-/// configured reports the key MediaLive manages for it.
+/// configured reports no key at all.
 ///
 /// The rows are the regions, each carrying a different key form, so no row can
 /// pass by reporting another's value.
@@ -468,12 +470,12 @@ async fn the_configuration_belongs_to_the_region_it_was_set_in() {
         );
     }
 
-    let unconfigured = reported(&router, "sa-east-1", "sa-east-1").await;
+    let untouched = reported(&router, "sa-east-1", "sa-east-1").await;
     assert_eq!(
-        unconfigured,
-        managed_key("sa-east-1"),
-        "case {case:?}: expected a region nothing configured to report its own \
-         MediaLive-managed key, got {unconfigured}",
+        untouched,
+        unconfigured(),
+        "case {case:?}: expected a region nothing configured to report no kmsKeyId, \
+         got {untouched}",
         case = "sa-east-1"
     );
 }

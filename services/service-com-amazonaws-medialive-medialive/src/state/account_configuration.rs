@@ -16,12 +16,14 @@
 //! shape="UpdateAccountConfigurationRequest")`) — changes the parameters the
 //! request carries and leaves the ones it omits exactly as they stood.
 //!
-//! What an account that has configured nothing HAS is the key MediaLive creates
-//! and manages for it ([`medialive_managed_kms_key_arn`]): `KmsKeyId` names the
-//! key the account's features encrypt with, and leaving it blank is documented as
-//! asking for that managed key rather than for no key at all. So the store keeps
-//! a record only for a region where a CUSTOMER-managed key was configured, and
-//! the projection fills in the managed key everywhere else.
+//! `KmsKeyId` carries the CALLER'S OWN key — "Specify the ARN of a KMS key that
+//! you have created. Or leave blank to use the key that MediaLive creates and
+//! manages for you" — so it is reported only when an update has set one: the
+//! member is BLANK for an account that configured nothing, which is what asks
+//! for the key the service manages. The store therefore keeps a record only for
+//! a region where a customer-managed key was configured, and the projection
+//! leaves the member absent everywhere else rather than substituting a key of
+//! the service's own, which is not a value a caller could configure back.
 //!
 //! The configuration is held PER REGION, keyed by the region the request was
 //! signed for ([`super::request_region`]): MediaLive is a regional service, so
@@ -61,9 +63,8 @@ pub struct AccountConfigurationRecord {
     /// the meaning of a BLANK value: "Specify the ARN of a KMS key that you have
     /// created. Or leave blank to use the key that MediaLive creates and manages
     /// for you". So a blank update is stored as `None` rather than as an empty
-    /// string, and a read of a region with no customer key reports the key
-    /// MediaLive manages ([`ComAmazonawsMedialiveMedialiveStore::account_configuration`])
-    /// rather than an empty value.
+    /// string, and a read of a region with no customer key reports no `KmsKeyId`
+    /// at all ([`ComAmazonawsMedialiveMedialiveStore::account_configuration`]).
     pub kms_key_id: Option<String>,
 }
 
@@ -80,29 +81,6 @@ impl AccountConfigurationRecord {
     }
 }
 
-/// The alias every AWS-managed KMS key is addressed by: `alias/aws/<service
-/// namespace>`, this service's namespace being the one its own ARNs carry.
-///
-/// `AccountConfiguration$KmsKeyId` is "Specifies the KMS key to use for all
-/// features that use key encryption. Specify the ARN of a KMS key that you have
-/// created. Or leave blank to use the key that MediaLive creates and manages for
-/// you" — so an account that has configured no key of its own still HAS a key,
-/// the one the service creates and manages for it, and that key is what a read
-/// reports ([`medialive_managed_kms_key_arn`]).
-const MEDIALIVE_MANAGED_KEY_ALIAS: &str = "alias/aws/medialive";
-
-/// The ARN of the KMS key MediaLive creates and manages for this account in
-/// `region`.
-///
-/// Derived from the account and the region a request addressed, never from the
-/// clock or from the request's body, so two reads of one region report the same
-/// key and a read after a restart reports the one the read before it did. It is a
-/// KMS key ARN in the alias form [`is_kms_key_arn`] accepts, which is what lets a
-/// caller configure it back explicitly after configuring a key of its own.
-pub fn medialive_managed_kms_key_arn(region: &str) -> String {
-    ::engine::emulator_arn(KMS_SERVICE, region, MEDIALIVE_MANAGED_KEY_ALIAS)
-}
-
 impl ComAmazonawsMedialiveMedialiveStore {
     /// The account's configuration in `region`, as the modelled shape every
     /// operation that reports one answers with.
@@ -111,21 +89,20 @@ impl ComAmazonawsMedialiveMedialiveStore {
     /// `UpdateAccountConfiguration` that preceded it cannot report the same
     /// stored configuration differently.
     ///
-    /// `KmsKeyId` is always reported, because the account always has a key: the
-    /// customer-managed one it configured, and otherwise the key MediaLive
-    /// creates and manages for it ([`medialive_managed_kms_key_arn`]), which is
-    /// what the member documents a blank value as asking for. So a region nothing
-    /// has configured yet answers with the service-managed key rather than with
-    /// an absent member, which would say nothing at all about what this account's
-    /// features encrypt with.
+    /// `KmsKeyId` is reported exactly as the last update that set one left it,
+    /// byte for byte, and is ABSENT where no update has set one: the member
+    /// carries the key the CALLER created ("Specify the ARN of a KMS key that you
+    /// have created. Or leave blank to use the key that MediaLive creates and
+    /// manages for you"), so a blank member is itself the account's state — it
+    /// says the account pinned no key of its own — and no value of this service's
+    /// own is substituted for it. Substituting one would report a key the account
+    /// never configured and that a caller cannot configure back.
     pub fn account_configuration(&self, region: &str) -> AccountConfiguration {
-        let stored = self.account_configurations.get(region);
         AccountConfiguration {
-            kms_key_id: Some(
-                stored
-                    .and_then(|record| record.kms_key_id.clone())
-                    .unwrap_or_else(|| medialive_managed_kms_key_arn(region)),
-            ),
+            kms_key_id: self
+                .account_configurations
+                .get(region)
+                .and_then(|record| record.kms_key_id.clone()),
         }
     }
 
@@ -148,8 +125,8 @@ impl ComAmazonawsMedialiveMedialiveStore {
     /// parameter it omits — and a request that carries no `AccountConfiguration`
     /// at all — leaves the stored value alone. A supplied BLANK `KmsKeyId` is a
     /// value and not an omission: it clears the customer-managed key, which is
-    /// the member's documented way of asking for the key MediaLive manages, and
-    /// is then what a read reports.
+    /// the member's documented way of asking for the key MediaLive manages, and a
+    /// read then reports no `KmsKeyId` at all.
     ///
     /// The write and the read-back are one step in the store, so what the update
     /// answers is what the next read answers.
@@ -172,8 +149,7 @@ impl ComAmazonawsMedialiveMedialiveStore {
             // A record with nothing set reads exactly as no record, so it is
             // dropped instead of kept: clearing the customer-managed key gives
             // the region's slot in the bounded store back rather than holding it
-            // for a configuration that says nothing beyond the managed key every
-            // region has anyway.
+            // for a configuration that pins nothing.
             if record.is_unset() {
                 self.account_configurations.remove(region);
             }

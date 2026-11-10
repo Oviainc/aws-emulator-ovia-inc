@@ -262,8 +262,7 @@ pub use alarm_template_groups::{
 pub mod account_configuration;
 
 pub use account_configuration::{
-    is_kms_key_arn, medialive_managed_kms_key_arn, AccountConfigurationRecord,
-    MAX_ACCOUNT_CONFIGURATION_REGIONS,
+    is_kms_key_arn, AccountConfigurationRecord, MAX_ACCOUNT_CONFIGURATION_REGIONS,
 };
 
 pub use schedules::{

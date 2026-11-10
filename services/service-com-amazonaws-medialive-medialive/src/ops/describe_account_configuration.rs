@@ -7,10 +7,11 @@
 //! Reports the account's MediaLive configuration — REPORTING ONLY: it reads the
 //! [`crate::state::account_configuration`] slice for the region the request was
 //! signed for and writes nothing, so what it answers is whatever the last
-//! `UpdateAccountConfiguration` on that regional endpoint left. An account that
-//! has configured nothing yet is not missing: it answers with the unset
-//! configuration rather than a 404, and this operation models no not-found error
-//! at all.
+//! `UpdateAccountConfiguration` on that regional endpoint left — the stored
+//! `KmsKeyId` byte for byte, and no member at all where no update has set one.
+//! An account that has configured nothing yet is not missing: it answers with
+//! the unset configuration rather than a 404, and this operation models no
+//! not-found error at all.
 //!
 //! ## Shape of an operation
 //!

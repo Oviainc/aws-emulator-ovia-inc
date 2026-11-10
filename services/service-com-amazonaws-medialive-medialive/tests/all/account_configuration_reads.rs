@@ -15,8 +15,8 @@
 //!   configuration, the stored configuration an update then reports, and the room
 //!   left in the emulator's bounded per-region store are all unchanged by a read.
 //! * The account always HAS a configuration, and the operation models no
-//!   not-found error at all, so a region nothing has configured answers 200
-//!   reporting the key MediaLive manages for it rather than a refusal.
+//!   not-found error at all, so a region nothing has configured answers 200 with
+//!   a configuration carrying no `kmsKeyId` rather than a refusal.
 //!
 //! Each rule is a TABLE over the class: the rows differ along what the account
 //! has configured (nothing, a key ARN, an alias ARN, a key that was cleared
@@ -28,14 +28,13 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_medialive_medialive::state::MAX_ACCOUNT_CONFIGURATION_REGIONS;
 
-use crate::wire::{call_in_region, medialive, ACCOUNT, DEFAULT_REGION};
+use crate::wire::{call_in_region, medialive, DEFAULT_REGION};
 
-/// The configuration a region with no CUSTOMER-managed key reports: the key
-/// MediaLive creates and manages for the account, which `KmsKeyId` documents as
-/// what a blank value asks for, addressed by its `alias/aws/<service>` alias in
-/// the account and the region the request was signed for.
-fn managed_key(region: &str) -> Value {
-    json!({ "kmsKeyId": format!("arn:aws:kms:{region}:{ACCOUNT}:alias/aws/medialive") })
+/// The configuration a region with no customer-managed key reports: one carrying
+/// no `kmsKeyId` at all, the member holding the key the CALLER created and a
+/// blank value being the documented way to ask for the key MediaLive manages.
+fn unconfigured() -> Value {
+    json!({})
 }
 
 /// The URI both account-configuration operations are bound to:
@@ -100,22 +99,14 @@ async fn arrange(router: &MultiServiceRouter, case: &str, region: &str, keys: &[
 /// the documented blank value.
 fn states() -> Vec<(&'static str, Vec<&'static str>, Value)> {
     vec![
-        (
-            "nothing configured",
-            vec![],
-            managed_key(DEFAULT_REGION),
-        ),
+        ("nothing configured", vec![], unconfigured()),
         ("a key arn", vec![KEY_ARN], json!({ "kmsKeyId": KEY_ARN })),
         (
             "an alias arn",
             vec![ALIAS_ARN],
             json!({ "kmsKeyId": ALIAS_ARN }),
         ),
-        (
-            "a key cleared again",
-            vec![KEY_ARN, ""],
-            managed_key(DEFAULT_REGION),
-        ),
+        ("a key cleared again", vec![KEY_ARN, ""], unconfigured()),
     ]
 }
 
@@ -179,9 +170,8 @@ async fn reading_a_region_takes_no_room_in_the_bounded_store() {
             let described = reported(&router, &case, &region).await;
             assert_eq!(
                 described,
-                managed_key(&region),
-                "case {case:?}: expected {region} to report its MediaLive-managed key, \
-                 got {described}"
+                unconfigured(),
+                "case {case:?}: expected {region} to report no kmsKeyId, got {described}"
             );
         }
 
@@ -209,8 +199,8 @@ async fn reading_a_region_takes_no_room_in_the_bounded_store() {
 /// Rule: the request carries no members, so the describe answers the region's
 /// stored configuration whatever the request body is — and because the account
 /// always has a configuration and the operation models no not-found error, a
-/// region nothing configured is answered with the key MediaLive manages for it
-/// rather than refused.
+/// region nothing configured is answered with a configuration carrying no
+/// `kmsKeyId` rather than refused.
 ///
 /// The rows differ along the body the GET carries, crossed with whether the
 /// region has a configuration.
@@ -234,7 +224,7 @@ async fn the_read_needs_no_request_members() {
                 arrange(&router, &case, DEFAULT_REGION, &[KEY_ARN]).await;
                 json!({ "kmsKeyId": KEY_ARN })
             } else {
-                managed_key(DEFAULT_REGION)
+                unconfigured()
             };
 
             let (status, response) =
