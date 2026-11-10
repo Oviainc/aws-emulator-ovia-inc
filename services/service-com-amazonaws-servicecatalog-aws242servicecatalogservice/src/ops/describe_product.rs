@@ -188,13 +188,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let product = match product {
             Ok(product) => product,
             Err(identifier) => {
-                // The refusal names the kind of resource that did not resolve and the
-                // identifier the request addressed it by, the way every product lookup
-                // in this service reports one it cannot find. It still does not tell a
-                // product that does not exist from one this view cannot reach.
+                // The END-USER view words its not-found as one sentence that covers both
+                // reasons it can fail — no such product, and a product this view cannot
+                // reach — so a caller cannot learn from the refusal that a product it has
+                // no access to exists. The only variable part is the identifier the
+                // request addressed the product by (`Id`, or `Name` when no id was
+                // given). The ADMIN view (`DescribeProductAsAdmin`) sees every stored
+                // product and so words its own refusal differently; the two sentences are
+                // deliberately not shared.
                 return Err(DescribeProductErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("Product {identifier} not found.")),
+                        message: Some(format!("{identifier} does not exist or access was denied")),
                     },
                 )
                 .into())

@@ -551,10 +551,15 @@ async fn describe_provisioned_product_names_the_provisioned_product_it_cannot_re
     );
 }
 
-/// Every product lookup refuses an identifier it cannot resolve by naming the kind of
-/// resource and the identifier the request used, whichever operation and whichever
-/// member the request addressed the product by — and none of them claims an access
-/// failure.
+/// Every ADMIN-side product lookup refuses an identifier it cannot resolve by naming
+/// the kind of resource and the identifier the request used, whichever operation and
+/// whichever member the request addressed the product by — and none of them claims an
+/// access failure.
+///
+/// The END-USER view, `DescribeProduct`, is not one of these: it reaches a product only
+/// through a launch path, so the service words its refusal as one sentence covering both
+/// a product that does not exist and one the caller cannot see. That sentence is pinned
+/// in `end_user_product_view_messages`.
 #[tokio::test]
 async fn product_lookups_name_the_product_they_cannot_resolve() {
     let router = emulator();
@@ -569,13 +574,7 @@ async fn product_lookups_name_the_product_they_cannot_resolve() {
     );
     // Rows differ along the operation, the member the product is addressed by, and the
     // form of the identifier (a product id, a product ARN).
-    let cases: [(&str, &str, Value, String); 5] = [
-        (
-            "DescribeProduct by Id",
-            "DescribeProduct",
-            json!({"Id": unknown_id}),
-            unknown_id.to_string(),
-        ),
+    let cases: [(&str, &str, Value, String); 4] = [
         (
             "UpdateProduct by Id",
             "UpdateProduct",
