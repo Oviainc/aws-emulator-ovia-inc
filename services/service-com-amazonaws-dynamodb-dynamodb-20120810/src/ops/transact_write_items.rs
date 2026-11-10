@@ -302,6 +302,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .filter(|token| !token.is_empty());
 
+        // Every fact of the REQUEST is settled here, over EVERY element, before any
+        // table is looked up: the name each element addresses its table by, the
+        // substitution tables its expressions dereference, the values those expressions
+        // carry, the value its `ReturnValuesOnConditionCheckFailure` states and the
+        // grammar of the update it applies. None of it depends on the store, so a
+        // transaction that cannot be served however the store looks is refused as the
+        // malformed request it is — rather than as whatever the FIRST element's table
+        // turns out to be — and an element's defect is reported whichever earlier
+        // element names a table that is not there.
+        let names: Vec<String> = actions
+            .iter()
+            .enumerate()
+            .map(|(at, action)| check_element_shape(at, action, &region))
+            .collect::<Result<_, _>>()?;
+
         // WHO this request speaks for, resolved before this service's store is locked
         // ([`crate::state::authorization`]).
         let caller = crate::state::request_caller(&*self.engine, ctx);
@@ -364,42 +379,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // no table to decide, so it stays a request-level refusal and [`lift`]
             // answers it directly.
             let keying = |error| cancelled_by_element(at, elements, error);
-            let name =
-                crate::state::resolve_table_name_in(action.table_name(), &region).map_err(lift)?;
+            // The name this element addresses, resolved in the pass above.
+            let name = names[at].clone();
             let substitutions = crate::state::Substitutions::new(
                 action.expression_attribute_names(),
                 action.expression_attribute_values(),
             );
-            // Every token this element DEFINES must be one of its own expressions
-            // uses: an unused entry of either substitution table makes the whole
-            // request invalid. It is the ELEMENT's tables that are checked, so the
-            // refusal is stated on its own
-            // ([`crate::state::Substitutions::check_all_referenced_in_element`]).
-            substitutions
-                .check_all_referenced_in_element(&[
-                    ("ConditionExpression", action.condition_expression()),
-                    ("UpdateExpression", action.update_expression()),
-                ])
-                .map_err(lift)?;
-            // A value a condition compares against, or one an update writes, is held to
-            // the same limits a stored value is: the documented nesting depth and this
-            // emulator's ceiling on a collection's members.
-            for (placeholder, value) in action.expression_attribute_values().into_iter().flatten() {
-                crate::state::check_attribute_value(placeholder, value).map_err(lift)?;
-            }
-            // "For ReturnValuesOnConditionCheckFailure, the valid values are: NONE and
-            // ALL_OLD."
             let returns_old_on_failure =
-                match action.return_values_on_condition_check_failure() {
-                    None | Some("NONE") => false,
-                    Some("ALL_OLD") => true,
-                    Some(other) => {
-                        return Err(crate::scaffolded::Scaffolded::validation(format!(
-                            "ReturnValuesOnConditionCheckFailure can only be ALL_OLD or \
-                             NONE, got {other}"
-                        )))
-                    }
-                };
+                action.return_values_on_condition_check_failure() == Some("ALL_OLD");
 
             // The items are stored ENCRYPTED under this table's KMS key, so a key KMS
             // will not use leaves nothing this element could read or encrypt — and "the
@@ -413,31 +400,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             let prepared = match action {
                 Requested::Put(put) => {
+                    // The item's own values and its size were settled with the rest of
+                    // the request ([`check_element_shape`]); canonicalizing is idempotent,
+                    // so what is stored below is the item in the one form the store keeps.
                     let mut item = put.item.clone();
-                    for (attribute, value) in &item {
-                        crate::state::check_attribute_value(attribute, value).map_err(lift)?;
-                    }
                     crate::state::canonicalize_item(&mut item).map_err(lift)?;
-                    if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
-                        return Err(crate::scaffolded::Scaffolded::validation(
-                            crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
-                        ));
-                    }
                     let table = store.active_table(&region, &name, now).map_err(lift)?;
                     deny(&caller, table, action, now)?;
                     table.check_index_key_types(&item).map_err(keying)?;
                     table.check_index_key_values(&item).map_err(lift)?;
                     table.check_vector_attributes(&item).map_err(lift)?;
                     Prepared {
-                        key: table.key_of_item(&item).map_err(keying)?,
+                        key: table.key_of_multi_item(&item).map_err(keying)?,
                         addressed: item.clone(),
                         write: PlannedWrite::Put(item),
                     }
                 }
                 Requested::Delete(delete) => {
-                    for (attribute, value) in &delete.key {
-                        crate::state::check_attribute_value(attribute, value).map_err(lift)?;
-                    }
                     let table = store.active_table(&region, &name, now).map_err(lift)?;
                     deny(&caller, table, action, now)?;
                     Prepared {
@@ -447,9 +426,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
                 Requested::Check(check) => {
-                    for (attribute, value) in &check.key {
-                        crate::state::check_attribute_value(attribute, value).map_err(lift)?;
-                    }
                     let table = store.active_table(&region, &name, now).map_err(lift)?;
                     deny(&caller, table, action, now)?;
                     Prepared {
@@ -459,9 +435,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
                 Requested::Update(update) => {
-                    for (attribute, value) in &update.key {
-                        crate::state::check_attribute_value(attribute, value).map_err(lift)?;
-                    }
                     let applied = crate::state::ParsedUpdate::parse(
                         "UpdateExpression",
                         &update.update_expression,
@@ -485,10 +458,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         if attribute.as_str() == partition_key.as_str()
                             || Some(attribute.as_str()) == sort_key.as_deref()
                         {
-                            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                                "One or more parameter values were invalid: Cannot update \
-                                 attribute {attribute}. This attribute is part of the key"
-                            )));
+                            // What the update may change is decided against the TABLE's
+                            // own key schema, so it is this element the transaction
+                            // refuses and the answer is that element's cancellation
+                            // ([`cancelled_by_element`]).
+                            return Err(keying(crate::state::RequestError::Validation(format!(
+                                "Cannot update attribute {attribute}. This attribute is part \
+                                 of the key"
+                            ))));
                         }
                     }
                     for (attribute, value) in &item {
@@ -502,7 +479,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                     let table = store.active_table(&region, &name, now).map_err(lift)?;
                     table.check_index_key_types(&item).map_err(keying)?;
-                    table.check_index_key_values(&item).map_err(lift)?;
+                    table
+                        .check_index_key_values_of_update(&item)
+                        .map_err(lift)?;
                     table.check_vector_attributes(&item).map_err(lift)?;
                     Prepared {
                         key,
@@ -822,6 +801,112 @@ impl<'a> Requested<'a> {
             Self::Update(_) => "Update",
         }
     }
+
+    /// The member of `TransactWriteItem` this action arrived in, as the request
+    /// validator spells a member in the paths it reports (lowerCamel).
+    fn member(&self) -> &'static str {
+        match self {
+            Self::Check(_) => "conditionCheck",
+            Self::Put(_) => "put",
+            Self::Delete(_) => "delete",
+            Self::Update(_) => "update",
+        }
+    }
+}
+
+/// The member list this operation's elements arrive in, as the request validator spells
+/// it in the paths it reports.
+const TRANSACT_ITEMS_MEMBER: &str = "transactItems";
+
+/// Settle every fact of ONE element the request itself decides, and answer the table
+/// name it addresses.
+///
+/// Called over every element BEFORE any table is looked up, so which defect a
+/// malformed transaction is refused with does not depend on what the store holds (see
+/// the call site).
+///
+/// A clause about a member of an element names that member's FULL path — the list, the
+/// element's 1-based position in it, the collection step the walk takes into one
+/// element, the action the element states and the leaf member — so a caller can find
+/// WHICH element of a transaction of up to 100 was refused.
+fn check_element_shape(
+    at: usize,
+    action: &Requested<'_>,
+    region: &str,
+) -> Result<String, TransactWriteItemsError> {
+    let name = crate::state::resolve_table_name_in_member(
+        &format!(
+            "{TRANSACT_ITEMS_MEMBER}.{}.member.{}.{}",
+            at + 1,
+            action.member(),
+            crate::state::TABLE_NAME_MEMBER_PATH
+        ),
+        action.table_name(),
+        region,
+    )
+    .map_err(lift)?;
+    let substitutions = crate::state::Substitutions::new(
+        action.expression_attribute_names(),
+        action.expression_attribute_values(),
+    );
+    // Every token this element DEFINES must be one of its own expressions uses: an
+    // unused entry of either substitution table makes the whole request invalid. It is
+    // the ELEMENT's tables that are checked, so the refusal is stated on its own
+    // ([`crate::state::Substitutions::check_all_referenced_in_element`]).
+    substitutions
+        .check_all_referenced_in_element(&[
+            ("ConditionExpression", action.condition_expression()),
+            ("UpdateExpression", action.update_expression()),
+        ])
+        .map_err(lift)?;
+    // A value a condition compares against, or one an update writes, is held to the
+    // same limits a stored value is: the documented nesting depth and this emulator's
+    // ceiling on a collection's members.
+    for (placeholder, value) in action.expression_attribute_values().into_iter().flatten() {
+        crate::state::check_attribute_value(placeholder, value).map_err(lift)?;
+    }
+    // "For ReturnValuesOnConditionCheckFailure, the valid values are: NONE and ALL_OLD."
+    if !matches!(
+        action.return_values_on_condition_check_failure(),
+        None | Some("NONE" | "ALL_OLD")
+    ) {
+        return Err(crate::scaffolded::Scaffolded::validation(format!(
+            "ReturnValuesOnConditionCheckFailure can only be ALL_OLD or NONE, got {}",
+            action
+                .return_values_on_condition_check_failure()
+                .unwrap_or_default()
+        )));
+    }
+    // The grammar of the update an `Update` applies is a fact of the request too, so a
+    // malformed one is refused here rather than when the element is prepared.
+    if let Requested::Update(update) = action {
+        crate::state::ParsedUpdate::parse(
+            "UpdateExpression",
+            &update.update_expression,
+            substitutions,
+        )
+        .map_err(lift)?;
+    }
+    // Every value the map this element ADDRESSES carries — the item a `Put` writes, the
+    // `Key` every other action names — is held to the documented value rules (the nesting
+    // depth, this emulator's ceiling on a collection's members, the numeric domain), and
+    // the item a `Put` writes to the documented item size. Both are facts of the request,
+    // so the element is held to them before any table is looked up; the item an `Update`
+    // LEAVES is read against the stored one, so it is held to the same rules where it is
+    // computed.
+    for (attribute, value) in action.addressed() {
+        crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+    }
+    if let Requested::Put(put) = action {
+        let mut item = put.item.clone();
+        crate::state::canonicalize_item(&mut item).map_err(lift)?;
+        if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+            ));
+        }
+    }
+    Ok(name)
 }
 
 /// `AccessDeniedException` when the policies in force do not let `caller` perform the

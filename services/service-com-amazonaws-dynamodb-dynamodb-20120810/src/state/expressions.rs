@@ -3100,6 +3100,43 @@ pub fn write_condition_satisfied(
     substitutions: Substitutions<'_>,
     item: Option<&Item>,
 ) -> Result<bool, RequestError> {
+    // Every fact of the REQUEST its condition carries is settled first, by the same
+    // check the handlers make before they look the table up, so one condition cannot be
+    // judged by two different readings of its own members.
+    check_write_condition(
+        condition_expression,
+        expected,
+        conditional_operator,
+        substitutions,
+    )?;
+    let expected = expected.filter(|map| !map.is_empty());
+    match (condition_expression, expected) {
+        (Some(expression), None) => {
+            ParsedCondition::parse("ConditionExpression", expression, substitutions)?.evaluate(item)
+        }
+        (None, Some(expected)) => expected_satisfied(expected, conditional_operator, item),
+        // A request stating its condition both ways was refused above, and one stating
+        // it neither way asks for nothing to be checked.
+        (Some(_), Some(_)) | (None, None) => Ok(true),
+    }
+}
+
+/// Settle every fact of a conditional write's CONDITION that the request alone
+/// decides: which members it stated the condition through, whether the expression
+/// parses, whether each `Expected` entry states something checkable, and whether the
+/// values it compares against are values this service accepts.
+///
+/// None of it depends on the table or on the item, so the three single-item writes
+/// call it BEFORE they look their table up: a request that cannot be served however
+/// the store looks is refused as the malformed request it is, rather than reported as
+/// a missing table. [`write_condition_satisfied`] runs the same check, so the two
+/// readings of the same members cannot drift apart.
+pub fn check_write_condition(
+    condition_expression: Option<&str>,
+    expected: Option<&HashMap<String, ExpectedAttributeValue>>,
+    conditional_operator: Option<&str>,
+    substitutions: Substitutions<'_>,
+) -> Result<(), RequestError> {
     let expected = expected.filter(|map| !map.is_empty());
     match (condition_expression, expected) {
         (Some(_), Some(_)) => Err(expression_conflict("Expected", "ConditionExpression")),
@@ -3110,7 +3147,8 @@ pub fn write_condition_satisfied(
                     "ConditionExpression",
                 ));
             }
-            ParsedCondition::parse("ConditionExpression", expression, substitutions)?.evaluate(item)
+            ParsedCondition::parse("ConditionExpression", expression, substitutions)?;
+            Ok(())
         }
         (None, Some(expected)) => {
             // The member combines the entries of `Expected`, so the map it was sent with
@@ -3132,12 +3170,15 @@ pub fn write_condition_satisfied(
                         .map(move |value| (name.as_str(), value))
                 }),
             )?;
-            expected_satisfied(expected, conditional_operator, item)
+            conditional_operator_any(conditional_operator)?;
+            for (name, condition) in expected {
+                // Read against NO item: every refusal an entry earns is a fact of the
+                // entry, so the walk that evaluates one surfaces exactly those.
+                expected_entry_satisfied(name, condition, None)?;
+            }
+            Ok(())
         }
-        (None, None) => {
-            check_conditional_operator_companion(EXPECTED_MEMBER, conditional_operator, 0)?;
-            Ok(true)
-        }
+        (None, None) => check_conditional_operator_companion(EXPECTED_MEMBER, conditional_operator, 0),
     }
 }
 
@@ -3214,6 +3255,15 @@ fn expected_entry_satisfied(
         )));
     }
     if let Some(operator) = comparison {
+        // An operator that compares a value needs one to compare, and an `Expected`
+        // entry can carry it in either of two members: AWS names both as what the
+        // entry has to state beside the operator it named.
+        if operands.is_none() && condition.value.is_none() && takes_operands(operator) {
+            return Err(refused(format!(
+                "{INVALID_PARAMETER_CLAUSE}: Value or AttributeValueList must be used with \
+                 ComparisonOperator: {operator} for Attribute: {name}"
+            )));
+        }
         return legacy_comparison_matches(operator, held, operands.unwrap_or(&[]));
     }
     match (condition.value.as_ref(), condition.exists) {
@@ -3302,6 +3352,28 @@ pub fn legacy_comparison_matches(
     })
 }
 
+/// How many operands one legacy comparison takes, as the `ComparisonOperator` doc
+/// defines each one: none for the two existence tests, two for `BETWEEN`, as many as
+/// the request chooses for `IN` ([`usize::MAX`] standing for that), and one for every
+/// other comparison. `None` for an operator this service does not serve at all.
+fn required_operands(operator: &str) -> Option<usize> {
+    Some(match operator {
+        "NULL" | "NOT_NULL" => 0,
+        "BETWEEN" => 2,
+        "IN" => usize::MAX,
+        "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" | "CONTAINS" | "NOT_CONTAINS" | "BEGINS_WITH" => 1,
+        _ => return None,
+    })
+}
+
+/// Whether a comparison this service serves compares a VALUE, so an entry naming it
+/// has to state one — which is what tells an `Expected` entry that named an operator
+/// and no value apart from the two existence tests, which state the whole condition in
+/// the operator alone.
+fn takes_operands(operator: &str) -> bool {
+    required_operands(operator).is_some_and(|required| required > 0)
+}
+
 /// Whether one legacy comparison is one the service serves at all, and whether it was
 /// given the operands its operator takes — the facts of the REQUEST, so a reader that
 /// evaluates a legacy condition map against many items settles them once, before it
@@ -3314,17 +3386,11 @@ pub fn check_legacy_comparison(
     operator: &str,
     operands: &[AttributeValue],
 ) -> Result<(), RequestError> {
-    let required = match operator {
-        "NULL" | "NOT_NULL" => 0,
-        "BETWEEN" => 2,
-        "IN" => usize::MAX,
-        "EQ" | "NE" | "LE" | "LT" | "GE" | "GT" | "CONTAINS" | "NOT_CONTAINS" | "BEGINS_WITH" => 1,
-        other => {
-            return Err(RequestError::Validation(format!(
-                "ComparisonOperator must be one of EQ, NE, IN, LE, LT, GE, GT, BETWEEN, NOT_NULL, \
-                 NULL, CONTAINS, NOT_CONTAINS or BEGINS_WITH, got {other}"
-            )))
-        }
+    let Some(required) = required_operands(operator) else {
+        return Err(RequestError::Validation(format!(
+            "ComparisonOperator must be one of EQ, NE, IN, LE, LT, GE, GT, BETWEEN, NOT_NULL, \
+             NULL, CONTAINS, NOT_CONTAINS or BEGINS_WITH, got {operator}"
+        )));
     };
     let count_ok = if required == usize::MAX {
         !operands.is_empty()

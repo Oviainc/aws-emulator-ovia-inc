@@ -103,6 +103,8 @@ mod legacy_conditional_operator_refusals;
 mod list_exports;
 #[path = "all/list_imports.rs"]
 mod list_imports;
+#[path = "all/multi_item_key_defects_and_precedence.rs"]
+mod multi_item_key_defects_and_precedence;
 #[path = "all/new_table_polling.rs"]
 mod new_table_polling;
 #[path = "all/number_canonicalization.rs"]

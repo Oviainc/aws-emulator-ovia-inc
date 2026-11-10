@@ -21,6 +21,18 @@ const CONDITION_PARAMETER_TYPE_MESSAGE: &str =
 /// elements is one.
 const VECTOR_PARAMETER_TYPE: &str = "32-bit floating point number";
 
+/// How the item being held to the secondary-index key rules reached the service: in an
+/// `Item` the request carried, or as what an UPDATE leaves behind.
+///
+/// The rules are the same for both; what differs is the sentence an empty index key
+/// value is refused with, because an update states what to CHANGE rather than the whole
+/// item (see [`Table::check_index_key_values_of_update`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexKeyWrite {
+    Item,
+    Update,
+}
+
 /// The least a write to a vector index meters: a vector write is denominated in BYTES
 /// ("VectorWriteRequestBytes" — `ConsumedCapacity$VectorIndexes`) with a 1 KB floor, so a
 /// small vector costs the floor rather than its own few bytes, the way a write of a small
@@ -362,6 +374,21 @@ impl Table {
         self.key_from(item, KeySource::Item)
     }
 
+    /// The primary key of an item ONE ELEMENT of a batched or transactional write
+    /// carries (a `BatchWriteItem` `PutRequest`, a transactional `Put`).
+    ///
+    /// Those surfaces hold the element's item to the table's KEY SCHEMA as a whole, so
+    /// every way it differs from that schema — a key attribute the item omits, or one
+    /// carrying another type than the table declares for it — is the one mismatch
+    /// sentence ([`KEY_SCHEMA_MISMATCH_MESSAGE`]), with no attribute name and no
+    /// expected/actual type, whichever element and whichever of the two defects it was.
+    /// The single-item write keeps its own per-defect wording
+    /// ([`Self::key_of_item`]), and a `Key`-shaped member of either surface is read
+    /// through [`Self::key_of_key_map`], which states the same mismatch sentence.
+    pub fn key_of_multi_item(&self, item: &Item) -> Result<ItemKey, RequestError> {
+        self.key_from(item, KeySource::MultiItem)
+    }
+
     /// The primary key named by a `Key` member: exactly the key attributes, no more.
     ///
     /// Unlike an `Item`, a `Key` IS the primary key, so every way it can differ
@@ -435,6 +462,15 @@ impl Table {
     pub fn check_index_keys(&self, item: &Item) -> Result<(), RequestError> {
         self.check_index_key_types(item)?;
         self.check_index_key_values(item)?;
+        self.check_vector_attributes(item)
+    }
+
+    /// The same three rules for the item an UPDATE leaves behind, whose empty
+    /// index-key value is worded as the update's own defect
+    /// ([`Self::check_index_key_values_of_update`]).
+    pub fn check_index_keys_of_update(&self, item: &Item) -> Result<(), RequestError> {
+        self.check_index_key_types(item)?;
+        self.check_index_key_values_of_update(item)?;
         self.check_vector_attributes(item)
     }
 
@@ -561,9 +597,33 @@ impl Table {
     /// schema, so the transactional write answers them as the request-level refusals
     /// they are.
     pub fn check_index_key_values(&self, item: &Item) -> Result<(), RequestError> {
+        self.index_key_values_held_to(item, IndexKeyWrite::Item)
+    }
+
+    /// The same rules for the item an UPDATE leaves behind.
+    ///
+    /// An update states what to CHANGE rather than the whole item, so an empty value it
+    /// leaves in a secondary index key is refused as the defect of the UPDATE it is
+    /// ([`empty_updated_index_key`]) rather than as a value the request carried in an
+    /// item. Everything else about the two is the same rule and the same walk: the
+    /// emptiness and the documented key-value size limits.
+    pub fn check_index_key_values_of_update(&self, item: &Item) -> Result<(), RequestError> {
+        self.index_key_values_held_to(item, IndexKeyWrite::Update)
+    }
+
+    /// The one walk both of the above are, over every secondary-index key attribute the
+    /// item carries, with `wrote` deciding only how an empty value is WORDED.
+    fn index_key_values_held_to(
+        &self,
+        item: &Item,
+        wrote: IndexKeyWrite,
+    ) -> Result<(), RequestError> {
         for (index_name, attribute, value) in self.index_key_values(item) {
             if let Some(kind) = empty_key_value_kind(value) {
-                return Err(empty_index_key_attribute(attribute, kind, index_name));
+                return Err(match wrote {
+                    IndexKeyWrite::Item => empty_index_key_attribute(attribute, kind, index_name),
+                    IndexKeyWrite::Update => empty_updated_index_key(kind),
+                });
             }
             self.check_key_limits(attribute, value)?;
         }

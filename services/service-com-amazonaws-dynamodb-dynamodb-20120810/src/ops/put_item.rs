@@ -431,6 +431,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // precision and range), BEFORE any table is looked up, because none of those
         // rules depends on the table.
 
+        // The condition this write states is read for every fact of the REQUEST it
+        // carries — the members it states the condition through, the expression's own
+        // grammar, and what each legacy entry expects — before the table is looked up,
+        // because none of that depends on the table either: a request that cannot be
+        // served however the store looks is refused as the malformed request it is
+        // rather than reported as a missing table.
+        crate::state::check_write_condition(
+            input.condition_expression.as_deref(),
+            input.expected.as_ref(),
+            input.conditional_operator.as_deref(),
+            substitutions,
+        )
+        .map_err(lift)?;
+
         // WHO this request speaks for, resolved before this service's store is locked
         // ([`crate::state::authorization`]).
         let caller = crate::state::request_caller(&*self.engine, ctx);

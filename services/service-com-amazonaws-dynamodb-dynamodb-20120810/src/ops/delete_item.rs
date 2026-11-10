@@ -360,6 +360,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (placeholder, value) in input.expression_attribute_values.iter().flatten() {
             crate::state::check_attribute_value(placeholder, value).map_err(lift)?;
         }
+        // Every fact of the REQUEST the condition carries is settled before the table is
+        // looked up ([`crate::state::check_write_condition`]).
+        crate::state::check_write_condition(
+            input.condition_expression.as_deref(),
+            input.expected.as_ref(),
+            input.conditional_operator.as_deref(),
+            substitutions,
+        )
+        .map_err(lift)?;
 
         // WHO this request speaks for, resolved before this service's store is locked
         // ([`crate::state::authorization`]).

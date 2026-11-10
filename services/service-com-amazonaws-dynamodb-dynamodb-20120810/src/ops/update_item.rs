@@ -415,6 +415,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (None, None) => crate::state::ParsedUpdate::nothing(),
         };
 
+        // Every fact of the REQUEST the condition carries is settled before the table is
+        // looked up ([`crate::state::check_write_condition`]).
+        crate::state::check_write_condition(
+            input.condition_expression.as_deref(),
+            input.expected.as_ref(),
+            input.conditional_operator.as_deref(),
+            substitutions,
+        )
+        .map_err(lift)?;
+
         // WHO this request speaks for, resolved before this service's store is locked
         // ([`crate::state::authorization`]).
         let caller = crate::state::request_caller(&*self.engine, ctx);
@@ -506,11 +516,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The item the update leaves is held to the declared type and the documented
         // key-value limits for every index key it would be projected into, exactly as
         // the same item written by a `PutItem` is: an update must not leave an item an
-        // index cannot represent.
+        // index cannot represent. An EMPTY index key is the one of the three the update
+        // is told about as the update's own defect
+        // ([`crate::state::Table::check_index_keys_of_update`]).
         store
             .active_table(&region, &name, now)
             .map_err(lift)?
-            .check_index_keys(&item)
+            .check_index_keys_of_update(&item)
             .map_err(lift)?;
 
         // The write is ADMITTED before it lands, against the capacity the table is

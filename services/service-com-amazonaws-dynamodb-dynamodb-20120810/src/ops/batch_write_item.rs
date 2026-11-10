@@ -365,7 +365,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         let table = store.active_table(&region, &name, now).map_err(lift)?;
                         table.check_index_keys(&item).map_err(lift)?;
                         PendingWrite::Put {
-                            key: table.key_of_item(&item).map_err(lift)?,
+                            key: table.key_of_multi_item(&item).map_err(lift)?,
                             item,
                         }
                     }

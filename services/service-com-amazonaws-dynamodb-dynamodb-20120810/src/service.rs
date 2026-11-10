@@ -559,6 +559,29 @@ fn as_stated(violation: &Violation) -> Violation {
     }
 }
 
+/// The member whose violation is reported ALONE, masking every other violation the same
+/// request carries, named by the path the validating walk reports it under.
+///
+/// A request's IDEMPOTENCY TOKEN is read before the request it stands for is: the token
+/// is what tells one attempt from a retry of it, so a request whose token is outside its
+/// declared bound cannot be placed against the attempts that came before it at all, and
+/// the refusal states that one violation rather than listing the other members beside
+/// it. The member is the one the model marks as the token (`smithy_query(query="shape",
+/// shape="com.amazonaws.dynamodb#TransactWriteItemsInput")` gives `ClientRequestToken`
+/// with `idempotencyToken: true` and `@length` 1..36); no other member of this service
+/// carries that trait, so this is the only entry.
+///
+/// Every other refusal states one clause per violated member inside the envelope that
+/// counts them ([`validation_envelope`]).
+const MASKING_MEMBERS: &[&str] = &["clientRequestToken"];
+
+/// The violation that masks the rest, when this refusal carries one.
+fn masking_violation(violations: &[Violation]) -> Option<&Violation> {
+    violations
+        .iter()
+        .find(|violation| MASKING_MEMBERS.contains(&violation.path.as_str()))
+}
+
 /// The `ValidationException` message for a framework refusal: the same envelope
 /// `crate::state::validation_message` builds for the bounds this service checks
 /// itself, over one clause per violated member.
@@ -572,6 +595,10 @@ fn validation_envelope(violations: &[Violation]) -> Option<String> {
         return Some(crate::state::missing_parameter_message(&absent));
     }
     let form = served_clause_form();
+    // A violated idempotency token is stated alone ([`MASKING_MEMBERS`]).
+    if let Some(masking) = masking_violation(violations) {
+        return crate::state::validation_message([violation_clause(masking, form)?]);
+    }
     let clauses: Vec<String> = in_stated_member_order(violations)
         .into_iter()
         .map(|violation| violation_clause(violation, form))

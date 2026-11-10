@@ -117,15 +117,20 @@ pub const START_KEY_INVALID_MESSAGE: &str =
 
 /// Which request member a primary key is being read out of.
 ///
-/// The walk over the key schema is the same for all three; only the WORDING of a
+/// The walk over the key schema is the same for all of them; only the WORDING of a
 /// missing or wrongly-typed element differs, which is what this carries. A
 /// `Key` IS the primary key, so any way it differs from the schema is the one
-/// mismatch; an `Item` is the whole item, so a key attribute it does not carry
-/// is reported as the value it did not give; an `ExclusiveStartKey` is a resume
-/// token, so any way it differs from the schema makes it an invalid token.
+/// mismatch; an `Item` a SINGLE-item write carries is the whole item, so a key
+/// attribute it does not carry is reported as the value it did not give, and one
+/// of another type as the mismatch between the two types; an `ExclusiveStartKey`
+/// is a resume token, so any way it differs from the schema makes it an invalid
+/// token; and the item an element of a BATCHED or TRANSACTIONAL write carries is
+/// held to the schema as a whole, so every way it differs from it is the one
+/// mismatch sentence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeySource {
     Item,
+    MultiItem,
     Key,
     StartKey,
 }
@@ -136,7 +141,7 @@ impl KeySource {
     fn absent(self) -> RequestError {
         match self {
             Self::Item => RequestError::Validation(MISSING_KEY_VALUE_MESSAGE.to_string()),
-            Self::Key | Self::StartKey => self.mismatch(),
+            Self::MultiItem | Self::Key | Self::StartKey => self.mismatch(),
         }
     }
 
@@ -145,7 +150,7 @@ impl KeySource {
     fn mismatch(self) -> RequestError {
         match self {
             Self::StartKey => RequestError::Validation(START_KEY_INVALID_MESSAGE.to_string()),
-            Self::Item | Self::Key => {
+            Self::Item | Self::MultiItem | Self::Key => {
                 RequestError::Validation(KEY_SCHEMA_MISMATCH_MESSAGE.to_string())
             }
         }
@@ -755,6 +760,23 @@ fn empty_index_key_attribute(attribute: &str, kind: &str, index_name: &str) -> R
         "One or more parameter values are not valid. A value specified for a secondary index \
          key is not supported. The AttributeValue for a key attribute cannot contain an empty \
          {kind} value. IndexName: {index_name}, IndexKey: {attribute}"
+    ))
+}
+
+/// The same rule when the empty value arrives through an UPDATE rather than in an
+/// item the request carried.
+///
+/// An update states WHAT TO CHANGE rather than the whole item, so the sentence names
+/// the update as the thing that attempted the unsupported change and states the rule
+/// it broke, and names NEITHER the index nor the key: the caller is told its update
+/// may not leave a secondary index key empty, which is a fact of the update it sent
+/// and not a report of this table's indexes ([`empty_index_key_attribute`] is the
+/// other half of the same rule, for the item a write carried).
+fn empty_updated_index_key(kind: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "One or more parameter values are not valid. The update expression attempted to \
+         update a secondary index key to a value that is not supported. The AttributeValue \
+         for a key attribute cannot contain an empty {kind} value."
     ))
 }
 
@@ -3800,6 +3822,20 @@ fn invalid_resource_type(arn: &str) -> RequestError {
 /// constraint violation ([`invalid_member`]), because that is what this check is: the
 /// member, the value and the constraint it broke.
 pub fn resolve_table_name(table_name: &str) -> Result<String, RequestError> {
+    resolve_table_name_of(TABLE_NAME_MEMBER_PATH, table_name)
+}
+
+/// The same resolution for a `TableName` carried by ONE ELEMENT of a request, whose
+/// refusal names the member by the path that element's member sits at (`member`)
+/// rather than by the request-level `tableName`.
+///
+/// A request-validator clause names the FULL path of the member it refused, so a
+/// caller can find which element of a batched or transactional request was rejected:
+/// the list the element came in, its position in that list, the action it states and
+/// the leaf member ([`TABLE_NAME_MEMBER_PATH`]). The constraint and the echoed value
+/// are the same whichever member carried the name, which is why there is one
+/// resolution and only the path differs.
+pub fn resolve_table_name_of(member: &str, table_name: &str) -> Result<String, RequestError> {
     // A value spelled as an ARN is refused in one of THREE ways, and which one depends
     // on what is wrong with it:
     //
@@ -3811,16 +3847,10 @@ pub fn resolve_table_name(table_name: &str) -> Result<String, RequestError> {
     //   * any other well-formed ARN that does not name a table of this service is no way
     //     of naming a table, so it is refused as the table NAME it would have to be,
     //     by the pattern a table name must satisfy.
-    let malformed_arn = || {
-        invalid_member(
-            TABLE_NAME_MEMBER_PATH,
-            Some(table_name),
-            ARN_FORM_REQUIREMENT,
-        )
-    };
+    let malformed_arn = || invalid_member(member, Some(table_name), ARN_FORM_REQUIREMENT);
     let not_a_table_arn = || {
         invalid_member(
-            TABLE_NAME_MEMBER_PATH,
+            member,
             Some(table_name),
             &pattern_requirement(TABLE_NAME_PATTERN),
         )
@@ -3865,14 +3895,14 @@ pub fn resolve_table_name(table_name: &str) -> Result<String, RequestError> {
     let length = name.chars().count();
     if length < MIN_TABLE_NAME_LENGTH {
         return Err(invalid_member(
-            TABLE_NAME_MEMBER_PATH,
+            member,
             Some(name),
             &min_length_requirement(MIN_TABLE_NAME_LENGTH),
         ));
     }
     if length > MAX_TABLE_NAME_LENGTH {
         return Err(invalid_member(
-            TABLE_NAME_MEMBER_PATH,
+            member,
             Some(name),
             &max_length_requirement(MAX_TABLE_NAME_LENGTH),
         ));
@@ -3882,7 +3912,7 @@ pub fn resolve_table_name(table_name: &str) -> Result<String, RequestError> {
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
     {
         return Err(invalid_member(
-            TABLE_NAME_MEMBER_PATH,
+            member,
             Some(name),
             &pattern_requirement(TABLE_NAME_PATTERN),
         ));
@@ -3911,7 +3941,17 @@ fn invalid_arn_region(table_name: &str) -> RequestError {
 /// request is refused rather than served from the same-named table of the region it
 /// reached. A BARE name carries no region and is the endpoint's own, so it is unaffected.
 pub fn resolve_table_name_in(table_name: &str, region: &str) -> Result<String, RequestError> {
-    let name = resolve_table_name(table_name)?;
+    resolve_table_name_in_member(TABLE_NAME_MEMBER_PATH, table_name, region)
+}
+
+/// The same resolution for a `TableName` carried by ONE ELEMENT of a request, naming
+/// the member by its full path ([`resolve_table_name_of`]).
+pub fn resolve_table_name_in_member(
+    member: &str,
+    table_name: &str,
+    region: &str,
+) -> Result<String, RequestError> {
+    let name = resolve_table_name_of(member, table_name)?;
     if table_arn_region(table_name).is_some_and(|addressed| addressed != region) {
         return Err(invalid_arn_region(table_name));
     }

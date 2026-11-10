@@ -239,6 +239,17 @@ fn empty_index_key_message(attribute: &str, kind: &str, index: &str) -> String {
     )
 }
 
+/// The whole message an empty index key earns when it is an UPDATE that would leave it
+/// empty: the sentence names the update as what attempted the unsupported change and
+/// states the rule it broke, naming neither the index nor the key.
+fn empty_updated_index_key_message(kind: &str) -> String {
+    format!(
+        "One or more parameter values are not valid. The update expression attempted to \
+         update a secondary index key to a value that is not supported. The AttributeValue \
+         for a key attribute cannot contain an empty {kind} value."
+    )
+}
+
 /// The sentence a refusal states for `detail`.
 ///
 /// A cancellation reason opens with the documented `ValidationError` clause
@@ -481,9 +492,11 @@ async fn an_empty_index_key_attribute_is_refused_on_every_write_path() {
     create_indexed_table(&router).await;
 
     // Rows differ in the emptiable value type (`S` and `B`), the index's kind
-    // (global and local), the attribute's position in the index key schema, and the
-    // write path.
-    let rows: Vec<(&str, &str, Value, &str, &str, &str)> = vec![
+    // (global and local), the attribute's position in the index key schema, the
+    // write path, and whether the empty value arrives in an ITEM the request carried
+    // or as what an UPDATE would leave behind — which is the one thing the two
+    // sentences differ about. The last field says which of the two the row expects.
+    let rows: Vec<(&str, &str, Value, &str, &str, &str, bool)> = vec![
         (
             "a global index's hash key as an empty string",
             "PutItem",
@@ -492,6 +505,7 @@ async fn an_empty_index_key_attribute_is_refused_on_every_write_path() {
             "gsiS",
             "string",
             "by-str",
+            false,
         ),
         (
             "a global index's hash key as an empty binary value",
@@ -501,6 +515,7 @@ async fn an_empty_index_key_attribute_is_refused_on_every_write_path() {
             "gsiB",
             "binary",
             "by-bin",
+            false,
         ),
         (
             "a two-element index's hash key as an empty string",
@@ -510,6 +525,7 @@ async fn an_empty_index_key_attribute_is_refused_on_every_write_path() {
             "gsiP",
             "string",
             "by-pair",
+            false,
         ),
         (
             "an update that would leave a global index's hash key empty",
@@ -521,6 +537,7 @@ async fn an_empty_index_key_attribute_is_refused_on_every_write_path() {
             "gsiS",
             "string",
             "by-str",
+            true,
         ),
         (
             "a batched put whose binary index key is empty",
@@ -531,6 +548,7 @@ async fn an_empty_index_key_attribute_is_refused_on_every_write_path() {
             "gsiB",
             "binary",
             "by-bin",
+            false,
         ),
         (
             "a transactional put whose index key is an empty string",
@@ -542,14 +560,34 @@ async fn an_empty_index_key_attribute_is_refused_on_every_write_path() {
             "gsiS",
             "string",
             "by-str",
+            false,
+        ),
+        (
+            "a transactional update that would leave a binary index key empty",
+            "TransactWriteItems",
+            json!({"TransactItems": [
+                {"Update": {"TableName": TABLE,
+                            "Key": {"pk": {"S": "e07"}, "sk": {"S": "s"}},
+                            "UpdateExpression": "SET gsiB = :v",
+                            "ExpressionAttributeValues": {":v": {"B": ""}}}},
+            ]}),
+            "gsiB",
+            "binary",
+            "by-bin",
+            true,
         ),
     ];
 
-    for (case, operation, request, attribute, kind, index) in rows {
+    for (case, operation, request, attribute, kind, index, through_an_update) in rows {
         // The emptiness rule speaks about the value the request carried, so it is
         // answered directly on every write path, the transactional one included.
         let cancelled = cancels(operation, false);
-        let expected = stated_for(cancelled, &empty_index_key_message(attribute, kind, index));
+        let detail = if through_an_update {
+            empty_updated_index_key_message(kind)
+        } else {
+            empty_index_key_message(attribute, kind, index)
+        };
+        let expected = stated_for(cancelled, &detail);
         let stated = refused_write_sentence(&router, case, operation, request, cancelled).await;
         assert_eq!(
             stated, expected,
@@ -558,7 +596,7 @@ async fn an_empty_index_key_attribute_is_refused_on_every_write_path() {
     }
 
     // None of those writes landed.
-    for index in 1..=6 {
+    for index in 1..=7 {
         let key = format!("e{index:02}");
         let read = ok(
             &router,
